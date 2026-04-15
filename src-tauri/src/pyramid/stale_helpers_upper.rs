@@ -1405,21 +1405,7 @@ pub async fn dispatch_edge_stale_check(
 
                 if let Some(ref onid) = other_node_id {
                     let cross_detail = format!("Cross-thread propagation from edge {} re-evaluation", eid);
-                    conn.execute(
-                        "INSERT INTO pyramid_pending_mutations
-                         (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
-                         VALUES (?1, ?2, 'confirmed_stale', ?3, ?4, ?5, ?6, 0)",
-                        rusqlite::params![
-                            s,
-                            layer,
-                            onid,
-                            cross_detail,
-                            cascade_depth + 1,
-                            now_str,
-                        ],
-                    )?;
-
-                    // Dual-write: observation event
+                    // Canonical write: observation event (old WAL INSERT removed)
                     let _ = super::observation_events::write_observation_event(
                         &conn,
                         &s,
@@ -2823,20 +2809,7 @@ fn propagate_in_place_update(
     )?;
     for target in propagation_targets {
         let inplace_detail = format!("Node {} updated in place", node_id);
-        conn.execute(
-            "INSERT INTO pyramid_pending_mutations
-             (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
-             VALUES (?1, ?2, 'confirmed_stale', ?3, ?4, 0, ?5, 0)",
-            rusqlite::params![
-                slug,
-                next_layer,
-                target,
-                inplace_detail,
-                now_str,
-            ],
-        )?;
-
-        // Dual-write: observation event
+        // Canonical write: observation event (old WAL INSERT removed)
         let _ = super::observation_events::write_observation_event(
             &conn,
             slug,
@@ -2852,7 +2825,7 @@ fn propagate_in_place_update(
         );
     }
 
-    // edge_stale mutations for edges touching this thread
+    // edge_stale observation events for edges touching this thread
     if let Some(tid) = self_thread_id {
         let mut stmt = conn.prepare(
             "SELECT id FROM pyramid_web_edges
@@ -2864,20 +2837,7 @@ fn propagate_in_place_update(
             .collect();
 
         for eid in edge_ids {
-            conn.execute(
-                "INSERT INTO pyramid_pending_mutations
-                 (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
-                 VALUES (?1, ?2, 'edge_stale', ?3, ?4, 0, ?5, 0)",
-                rusqlite::params![
-                    slug,
-                    depth as i32,
-                    eid.to_string(),
-                    node_id,
-                    now_str,
-                ],
-            )?;
-
-            // Dual-write: observation event (edge_stale)
+            // Canonical write: observation event (old WAL INSERT removed)
             let _ = super::observation_events::write_observation_event(
                 &conn,
                 slug,
@@ -3339,20 +3299,7 @@ async fn execute_supersession_identity_change(
             resolve_evidence_targets_for_node_ids(&conn, &s, std::slice::from_ref(&nid))?;
         for target in propagation_targets {
             let supersession_detail = format!("Child node {} superseded by {}", nid, new_nid);
-            conn.execute(
-                "INSERT INTO pyramid_pending_mutations
-                 (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
-                 VALUES (?1, ?2, 'confirmed_stale', ?3, ?4, 0, ?5, 0)",
-                rusqlite::params![
-                    s,
-                    next_layer,
-                    target,
-                    supersession_detail,
-                    now_str,
-                ],
-            )?;
-
-            // Dual-write: observation event
+            // Canonical write: observation event (old WAL INSERT removed)
             let _ = super::observation_events::write_observation_event(
                 &conn,
                 &s,
@@ -3379,20 +3326,7 @@ async fn execute_supersession_identity_change(
                 .collect();
 
             for eid in edge_ids {
-                conn.execute(
-                    "INSERT INTO pyramid_pending_mutations
-                     (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
-                     VALUES (?1, ?2, 'edge_stale', ?3, ?4, 0, ?5, 0)",
-                    rusqlite::params![
-                        s,
-                        nd.depth as i32,
-                        eid.to_string(),
-                        nid,
-                        now_str,
-                    ],
-                )?;
-
-                // Dual-write: observation event (edge_stale)
+                // Canonical write: observation event (old WAL INSERT removed)
                 let _ = super::observation_events::write_observation_event(
                     &conn,
                     &s,

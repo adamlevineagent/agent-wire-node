@@ -94,33 +94,10 @@ struct DocumentClaims {
 }
 
 /// Initialize stale engines for all pyramids with auto_update enabled and not frozen.
-/// Also runs WAL cleanup on startup. Called after pyramid DB is initialized.
+/// Called after pyramid DB is initialized.
 pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
-    // WAL cleanup: delete processed mutations older than 30 days
-    {
-        let conn = pyramid_state.writer.lock().await;
-        let deleted_processed = conn
-            .execute(
-                "DELETE FROM pyramid_pending_mutations
-             WHERE processed = 1 AND detected_at < datetime('now', '-30 days')",
-                [],
-            )
-            .unwrap_or(0);
-
-        let deleted_runaway = conn.execute(
-            "DELETE FROM pyramid_pending_mutations
-             WHERE processed = 0 AND cascade_depth >= 10 AND detected_at < datetime('now', '-30 days')",
-            [],
-        ).unwrap_or(0);
-
-        if deleted_processed > 0 || deleted_runaway > 0 {
-            tracing::info!(
-                "WAL cleanup: removed {} processed and {} runaway mutations older than 30 days",
-                deleted_processed,
-                deleted_runaway
-            );
-        }
-    }
+    // Old WAL cleanup removed — pyramid_pending_mutations table has been dropped.
+    // Observation events are pruned by the supervisor's own retention policy.
 
     // Migrate relative file_hashes paths to absolute (one-time normalization)
     {
@@ -210,38 +187,31 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
         }
     };
 
-    // Load all pyramid configs where auto_update = 1
+    // Load all enabled DADBEAR slugs (canonical source: pyramid_dadbear_config
+    // existence is enable gate, holds projection anti-join is dispatch gate).
     let configs: Vec<AutoUpdateConfig> = {
         let conn = pyramid_state.reader.lock().await;
+        // Get all slugs with DADBEAR configs on non-archived pyramids
         let mut stmt = match conn.prepare(
-            "SELECT c.slug, c.auto_update, c.debounce_minutes, c.min_changed_files,
-                    c.runaway_threshold, c.breaker_tripped, c.breaker_tripped_at, c.frozen, c.frozen_at
-             FROM pyramid_auto_update_config c
-             JOIN pyramid_slugs s ON s.slug = c.slug
-             WHERE c.auto_update = 1 AND s.archived_at IS NULL",
+            "SELECT DISTINCT d.slug FROM pyramid_dadbear_config d
+             JOIN pyramid_slugs s ON s.slug = d.slug
+             WHERE s.archived_at IS NULL",
         ) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!("Failed to query auto_update configs: {}", e);
+                tracing::warn!("Failed to query dadbear configs: {}", e);
                 return;
             }
         };
+        let slugs: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
 
-        stmt.query_map([], |row| {
-            Ok(AutoUpdateConfig {
-                slug: row.get(0)?,
-                auto_update: row.get::<_, i32>(1)? != 0,
-                debounce_minutes: row.get(2)?,
-                min_changed_files: row.get(3)?,
-                runaway_threshold: row.get(4)?,
-                breaker_tripped: row.get::<_, i32>(5)? != 0,
-                breaker_tripped_at: row.get(6)?,
-                frozen: row.get::<_, i32>(7)? != 0,
-                frozen_at: row.get(8)?,
-            })
-        })
-        .map(|iter| iter.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
+        slugs
+            .iter()
+            .filter_map(|slug| pyramid::db::get_auto_update_config(&conn, slug))
+            .collect()
     };
 
     if configs.is_empty() {
@@ -344,14 +314,18 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
             }
         }
 
-        // Check for unprocessed WAL entries and feed them into the engine's layer timers
+        // Check for unprocessed observation events (canonical source)
         {
             let conn = pyramid_state.reader.lock().await;
             for layer in 0..=3 {
                 let count: i64 = conn
                     .query_row(
-                        "SELECT COUNT(*) FROM pyramid_pending_mutations
-                         WHERE processed = 0 AND slug = ?1 AND layer = ?2",
+                        "SELECT COUNT(*) FROM dadbear_observation_events
+                         WHERE slug = ?1 AND layer = ?2
+                           AND id > COALESCE(
+                               (SELECT last_bridge_observation_id FROM pyramid_build_metadata WHERE slug = ?1),
+                               0
+                           )",
                         rusqlite::params![slug, layer],
                         |row| row.get(0),
                     )
@@ -359,7 +333,7 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
 
                 if count > 0 {
                     tracing::info!(
-                        "Pyramid '{}' layer {} has {} unprocessed WAL entries — starting timer",
+                        "Pyramid '{}' layer {} has {} unprocessed observation events — starting timer",
                         slug,
                         layer,
                         count

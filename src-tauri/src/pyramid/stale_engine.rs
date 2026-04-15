@@ -175,9 +175,12 @@ impl PyramidStaleEngine {
         }
     }
 
-    /// Start a background poll loop that checks the WAL every 60 seconds.
-    /// This is the belt-and-suspenders fallback: even if the watcher can't
-    /// signal the engine directly, pending mutations will be picked up.
+    /// Start a background poll loop.
+    ///
+    /// DECOMMISSIONED: The canonical DADBEAR supervisor handles all dispatch
+    /// via dadbear_observation_events. This poll loop previously checked
+    /// pyramid_pending_mutations every 60s as a fallback. It is now a no-op
+    /// but retained to avoid breaking callers that expect start_poll_loop().
     pub fn start_poll_loop(&mut self) {
         // Cancel any existing poll loop
         if let Some(handle) = self.poll_handle.take() {
@@ -210,10 +213,11 @@ impl PyramidStaleEngine {
 
         let handle = tokio::spawn(async move {
             loop {
-                // TODO(config): WAL poll interval (60s) should move to config once a
-                // wal_poll_interval_secs field is added to Tier2Config / Tier3Config.
-                // Currently structural: belt-and-suspenders fallback for mutation pickup.
+                // DECOMMISSIONED: poll loop body disabled. The canonical supervisor
+                // reads from dadbear_observation_events. This loop now sleeps
+                // indefinitely to keep the task alive (callers check poll_handle).
                 tokio::time::sleep(Duration::from_secs(60)).await;
+                continue;
 
                 // Phase B: defer maintenance if any build is active and policy says so.
                 if defer_maintenance.load(Ordering::Relaxed) {
@@ -490,7 +494,14 @@ impl PyramidStaleEngine {
 
     /// Spawns a tokio task that sleeps for the debounce duration, then
     /// calls `drain_and_dispatch`. Cancels any previous timer for the layer.
+    ///
+    /// DECOMMISSIONED: The canonical DADBEAR supervisor handles dispatch.
+    /// This is now a no-op; callers that call notify_mutation -> start_timer
+    /// will return without spawning tasks.
     pub fn start_timer(&mut self, layer: i32) {
+        // Supervisor handles dispatch; no-op.
+        return;
+
         let timer = match self.layers.get_mut(&layer) {
             Some(t) => t,
             None => return,
@@ -586,7 +597,11 @@ impl PyramidStaleEngine {
         }
     }
 
-    /// Resume from breaker trip. Restarts timers for layers with pending mutations.
+    /// Resume from breaker trip.
+    ///
+    /// DECOMMISSIONED: No longer restarts timers or reads from the old WAL.
+    /// The canonical supervisor handles dispatch via observation events.
+    /// This only persists the breaker-resume to the holds projection.
     pub fn resume_breaker(&mut self) {
         info!(slug = %self.slug, "Resuming from circuit breaker trip");
         self.breaker_tripped = false;
@@ -595,31 +610,18 @@ impl PyramidStaleEngine {
             if let Err(e) = super::auto_update_ops::resume_breaker(&conn, &self.event_bus, &self.slug) {
                 warn!(slug = %self.slug, "Failed to persist circuit breaker reset to DB: {e}");
             }
-
-            let max_depth = query_max_depth(&self.db_path, &self.slug);
-            for layer in 0..=max_depth {
-                let count: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM pyramid_pending_mutations
-                         WHERE processed = 0 AND slug = ?1 AND layer = ?2",
-                        rusqlite::params![self.slug, layer],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-
-                if count > 0 {
-                    if let Some(timer) = self.layers.get_mut(&layer) {
-                        timer.has_pending = true;
-                    }
-                    self.start_timer(layer);
-                }
-            }
         }
     }
 
     /// Run a specific layer immediately, skipping the debounce timer.
     /// Used by the "Run Now" button to flush pending mutations on demand.
+    ///
+    /// DECOMMISSIONED: The canonical DADBEAR supervisor handles dispatch.
+    /// drain_and_dispatch returns Ok(()) immediately, so this is now a no-op.
     pub async fn run_layer_now(&self, layer: i32) {
+        // Supervisor handles dispatch; drain_and_dispatch is a no-op.
+        return;
+
         let slug = self.slug.clone();
         let db_path = self.db_path.clone();
         // Phase 3 fix pass: clone the live LlmConfig instead of api_key so
@@ -648,7 +650,11 @@ impl PyramidStaleEngine {
         .await;
     }
 
-    /// Freeze the engine: cancel timers, mark all WAL entries processed.
+    /// Freeze the engine: cancel timers, persist frozen hold.
+    ///
+    /// DECOMMISSIONED: No longer marks old WAL entries processed (table dropped).
+    /// The canonical supervisor reads from observation events; the holds
+    /// projection anti-join prevents dispatch while frozen.
     pub fn freeze(&mut self) {
         info!(slug = %self.slug, "Freezing stale engine");
         self.frozen = true;
@@ -663,14 +669,6 @@ impl PyramidStaleEngine {
         if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&self.db_path)) {
             if let Err(e) = super::auto_update_ops::freeze(&conn, &self.event_bus, &self.slug) {
                 warn!(slug = %self.slug, "Failed to persist frozen state to DB: {e}");
-            }
-            if let Err(e) = conn.execute(
-                "UPDATE pyramid_pending_mutations
-                 SET processed = 1
-                 WHERE processed = 0 AND slug = ?1",
-                rusqlite::params![self.slug],
-            ) {
-                warn!(slug = %self.slug, "Failed to mark pending mutations as processed on freeze: {e}");
             }
         }
     }
@@ -721,6 +719,14 @@ pub async fn drain_and_dispatch(
     active_build: Arc<tokio::sync::RwLock<HashMap<String, crate::pyramid::BuildHandle>>>,
     defer_maintenance: Arc<AtomicBool>,
 ) -> Result<()> {
+    // DECOMMISSIONED: The canonical DADBEAR supervisor now handles all
+    // prompt materialization, dispatch, result application, and cascade
+    // propagation via dadbear_observation_events. This legacy drain path
+    // (which read from pyramid_pending_mutations) is no longer needed.
+    // The function signature is retained to avoid breaking callers during
+    // the transition; all call sites will return Ok(()) immediately.
+    return Ok(());
+
     // Phase 1 daemon control plane (AD-8 Part 3): defer maintenance dispatch
     // while any build is active and the dispatch_policy says so. Mutations
     // accumulate during the build and batch-drain afterward.

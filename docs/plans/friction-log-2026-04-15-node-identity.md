@@ -61,6 +61,12 @@
 **Resolution:** `operator_handle = claimed_wire_handle ?? login_email`. Never null. Simple once you know the rule, but the rule wasn't documented anywhere.
 **Lesson:** Handle/identity resolution paths should be documented as a utility function, not rediscovered by each feature that needs them.
 
+### F8: Backfill sanitization order — LOWER after REGEXP_REPLACE
+**What:** The backfill SQL ran `LOWER(REGEXP_REPLACE(candidate, '[^a-z0-9-]', '-', 'g'))` — the regex matched `[^a-z0-9-]` which EXCLUDES uppercase letters, so 'W' in "Wire Node" was replaced with '-' before LOWER could save it. Result: "ire--ode" instead of "wire-node".
+**Impact:** 3 nodes got garbled handles. Fixed with a manual UPDATE. Migration SQL corrected for future runs.
+**Fix:** LOWER first, then REGEXP_REPLACE. Order matters.
+**Lesson:** Sanitization pipelines must be ordered: normalize case → filter characters → trim. Not the reverse.
+
 ## Decisions Made
 
 - **Phase 1a/1b split:** Don't rename agent_id. Add new columns alongside. Zero breaking changes.

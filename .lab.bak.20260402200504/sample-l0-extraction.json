@@ -1,0 +1,115 @@
+{
+  "chunk_index": 10,
+  "headline": "Intelligence Operation in a Box",
+  "node_id": "D-L0-010",
+  "orientation": "Exploratory design (Mar\u202f16\u202f2026) argues that collapsing build cost enables any intelligence workflow to be instantiated as a configurable tenant on shared infrastructure. The River provides a communal raw\u2011data stream; Managed Operations (the \u201cbox\u201d) consume, process, and optionally contribute to the permanent Wire Graph market. A 21\u2011stage GNE editorial pipeline is presented as a template that can be re\u2011configured for policy, market, scientific, personal, or investigative use cases. The codebase already supports multi\u2011tenancy; the remaining work is to make pipeline, stage orchestration, delivery, Wire policy, and River subscriptions data\u2011driven. A full reset (\u201cNuke\u201d) of the current GNE instance is required before the template can be validated by running a clean end\u2011to\u2011end daily edition with Wire contributions emitted only at publish time.",
+  "source_node": "D-L0-010",
+  "topics": [
+    {
+      "corrections": [],
+      "current": "Build cost collapse allows an intelligence operation to be deployed as a configuration on shared infrastructure. Newsbleach is the first instance, showing that the same machinery can become a policy shop, market intel desk, scientific monitor, etc. The Wire Graph is the substrate where processed intelligence lives permanently; the River is a shared ingest commons of raw items that never touch the Wire.",
+      "decisions": [],
+      "entities": [
+        "system: Newsbleach",
+        "system: Wire Graph",
+        "system: River"
+      ],
+      "name": "Thesis & Core Concept"
+    },
+    {
+      "corrections": [],
+      "current": "Three zones: River (shared ingest commons), Managed Operations (Intelligence\u2011in\u2011a\u2011Box), and Wire Graph (market). The River streams RSS, APIs, legislative trackers, patent databases, arXiv, scrapers, etc. Everyone can contribute sources and fish items. Managed Operations are multi\u2011tenant, configurable pipelines that select topics, processing rules, delivery methods, and contribution policies. The Wire Graph stores permanent intelligence with provenance, reputation, pricing, and adversarial survival signals.",
+      "decisions": [],
+      "entities": [
+        "system: River",
+        "system: Managed Operations",
+        "system: Wire Graph"
+      ],
+      "name": "Three Zones Architecture"
+    },
+    {
+      "corrections": [],
+      "current": "The current Newsbleach pipeline has 21 stages grouped into four phases: Collection (stages\u202f1\u20113), Research & Enrichment (4\u20116), Adversarial Processing (7\u201114), Edition Assembly & Delivery (15\u201121). Each stage is mapped to a generic intelligence role (e.g., River polling, Signal extraction, Quality gate, Presentation). Auxiliary stages include Source Candidate Evaluation, Compute Reliability, Source Cartography, and a 4\u2011stage Digest Pipeline.",
+      "decisions": [],
+      "entities": [
+        "system: GNE pipeline",
+        "file: triggers.ts",
+        "data: publication_id"
+      ],
+      "name": "GNE Pipeline Mapping"
+    },
+    {
+      "corrections": [],
+      "current": "Purpose: monitor legislative feeds and produce policy briefs. River sources: Congressional Record, Federal Register, state legislature feeds, court filings, regulatory announcements, think\u2011tank blogs. Pipeline: phases\u202f1\u20112 unchanged; phase\u202f3 uses policy analysts, structured brief format, bias\u2011checking adversarial layer; phase\u202f4 delivers alert\u2011style emails, no hero images. Wire contribution: 7\u2011day embargo for first\u2011mover advantage. Uses 16 of 21 stages (skips layout, hero image, front\u2011page polish, arc detection, adds alert trigger).",
+      "decisions": [],
+      "entities": [
+        "system: Federal Register",
+        "system: Congressional Record",
+        "system: Policy Brief"
+      ],
+      "name": "Configuration A \u2013 Policy Shop"
+    },
+    {
+      "corrections": [],
+      "current": "Purpose: track competitor moves, product launches, funding, partnerships. River sources: Crunchbase API, SEC filings, company blogs, GitHub, patents, trade publications, earnings calls. Pipeline: heavy filtering in phase\u202f1; phase\u202f3 uses market analysts, competitive intelligence reports; phase\u202f4 weekly digest with optional hero image, market\u2011moves table. Wire contribution: sanitized summaries with embargo for subscribers. Uses 14 of 21 stages (most edition assembly omitted, digest pipeline added).",
+      "decisions": [],
+      "entities": [
+        "system: Crunchbase",
+        "system: SEC filings",
+        "system: GitHub"
+      ],
+      "name": "Configuration B \u2013 Market Intelligence Desk"
+    },
+    {
+      "corrections": [],
+      "current": "Purpose: monitor new papers and breakthroughs. River sources: arXiv, bioRxiv, medRxiv, PubMed, Google Scholar alerts, lab blogs, conference feeds. Pipeline: novelty\u2011weighted evaluation; phase\u202f3 uses research analysts, research summaries (methods, findings, significance, limitations); phase\u202f4 daily roundup with breakthrough alerts. Wire contribution: open\u2011access, no embargo. Uses 15 of 21 stages.",
+      "decisions": [],
+      "entities": [
+        "system: arXiv",
+        "system: PubMed",
+        "system: bioRxiv"
+      ],
+      "name": "Configuration C \u2013 Scientific Research Monitor"
+    },
+    {
+      "corrections": [],
+      "current": "Purpose: single\u2011user customized feed. River sources: user\u2011chosen feeds plus private corpus. Pipeline: personal relevance scoring; minimal adversarial processing (user is editor); push notifications for high\u2011signal items, daily email digest for others; no edition assembly. Wire contribution optional. Uses 8 of 21 stages (lightest configuration).",
+      "decisions": [],
+      "entities": [
+        "system: Push Notification Service"
+      ],
+      "name": "Configuration D \u2013 Personal Intelligence Agent"
+    },
+    {
+      "corrections": [],
+      "current": "Purpose: deep multi\u2011week investigation on a specific topic. River sources: targeted feeds, manual tips. Pipeline: narrow filter; maximum adversarial processing with multiple independent threads, cross\u2011verification, timeline reconstruction, entity relationship mapping, heavy arc detection. Delivery: evolving investigation dashboard, final publication upon conclusion. Wire contribution: full investigation with sourcing. Uses all 21 stages plus custom evidence\u2011tracking stages.",
+      "decisions": [],
+      "entities": [
+        "system: Investigation Dashboard"
+      ],
+      "name": "Configuration E \u2013 Investigative Slow\u2011Burn"
+    },
+    {
+      "corrections": [],
+      "current": "Existing pipeline supports multi\u2011tenancy via `publication_id`. To become a reusable template, the following changes are required: (1) store editorial constitution, persona definitions, stage selection, and delivery prefs as per\u2011tenant data; (2) make stage orchestration configurable instead of a fixed 21\u2011stage sequence in `triggers.ts`; (3) allow pluggable delivery mechanisms (email, web, API, push); (4) configure Wire contribution policy per tenant (embargo, pricing, contribution vs private); (5) configure River subscription per tenant (topic filters, source categories, custom sources). The main gaps are GNE\u2011specific constitution/persona definitions and the assumption that all 21 stages always run.",
+      "decisions": [],
+      "entities": [
+        "system: publication_id",
+        "file: triggers.ts"
+      ],
+      "name": "Codebase Implications"
+    },
+    {
+      "corrections": [],
+      "current": "Before any templating work, the current GNE instance must be reset (\u201cNuke\u201d) to clear stale greenlit items and drafts that cause pipeline hangs. See `newsbleach-three-layer-architecture.md` for the reset procedure. First milestone after the Nuke: GNE runs cleanly end\u2011to\u2011end, produces a daily edition, and emits Wire contributions only at publish time, proving the template works for its first configuration.",
+      "decisions": [
+        "decision: reset GNE instance before templating",
+        "decision: milestone \u2013 clean end\u2011to\u2011end daily edition with Wire contribution at publish"
+      ],
+      "entities": [
+        "file: newsbleach-three-layer-architecture.md"
+      ],
+      "name": "Nuke & Milestone"
+    }
+  ]
+}

@@ -3,7 +3,7 @@ import { useBuildPolling } from '../hooks/useBuildPolling';
 import { PipelineTimeline } from './theatre/PipelineTimeline';
 import { PyramidSurface } from './pyramid-surface/PyramidSurface';
 import { ActivityLog } from './theatre/ActivityLog';
-import { NodeInspectorPanel } from './theatre/NodeInspectorPanel';
+import { NodeInspectorModal } from './theatre/NodeInspectorModal';
 import type { BuildStatus } from './theatre/types';
 
 interface PyramidTheatreProps {
@@ -141,7 +141,7 @@ export function PyramidTheatre({ slug, onComplete, onClose, onRetry, requestFull
 
             {/* Node Inspector Panel */}
             {inspectedNodeId && (
-                <NodeInspectorPanel
+                <NodeInspectorModal
                     slug={slug}
                     nodeId={inspectedNodeId}
                     allNodes={liveNodes ?? []}

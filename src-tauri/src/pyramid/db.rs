@@ -329,22 +329,9 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
 
     conn.execute_batch(
         "
-        -- DEPRECATED (Phase 7): WAL for crash recovery of pending mutations.
-        -- Retained during transition; dadbear_observation_events is the
-        -- canonical authority for change observations.
-        CREATE TABLE IF NOT EXISTS pyramid_pending_mutations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            slug TEXT NOT NULL REFERENCES pyramid_slugs(slug) ON DELETE CASCADE,
-            layer INTEGER NOT NULL,
-            mutation_type TEXT NOT NULL,
-            target_ref TEXT NOT NULL,
-            detail TEXT,
-            cascade_depth INTEGER NOT NULL DEFAULT 0,
-            detected_at TEXT NOT NULL DEFAULT (datetime('now')),
-            processed INTEGER NOT NULL DEFAULT 0,
-            batch_id TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_pending_unprocessed ON pyramid_pending_mutations(slug, processed, layer);
+        -- Phase 8 (DADBEAR decommission): drop legacy WAL.
+        -- The canonical supervisor reads from dadbear_observation_events.
+        DROP TABLE IF EXISTS pyramid_pending_mutations;
 
         -- File hash tracking
         CREATE TABLE IF NOT EXISTS pyramid_file_hashes (
@@ -357,22 +344,10 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             PRIMARY KEY (slug, file_path)
         );
 
-        -- DEPRECATED (Phase 7): Per-pyramid auto-update settings.
-        -- Retained for backward compatibility; the holds projection
-        -- (dadbear_holds_projection) is the sole authority for frozen/breaker
-        -- state, and contribution existence in pyramid_dadbear_config is the
-        -- enable gate. The enabled column is no longer read by the master gate.
-        CREATE TABLE IF NOT EXISTS pyramid_auto_update_config (
-            slug TEXT PRIMARY KEY REFERENCES pyramid_slugs(slug) ON DELETE CASCADE,
-            auto_update INTEGER NOT NULL DEFAULT 0,
-            debounce_minutes INTEGER NOT NULL DEFAULT 5 CHECK(debounce_minutes >= 1),
-            min_changed_files INTEGER NOT NULL DEFAULT 1 CHECK(min_changed_files >= 1),
-            runaway_threshold REAL NOT NULL DEFAULT 0.5 CHECK(runaway_threshold > 0.0 AND runaway_threshold <= 1.0),
-            breaker_tripped INTEGER NOT NULL DEFAULT 0,
-            breaker_tripped_at TEXT,
-            frozen INTEGER NOT NULL DEFAULT 0,
-            frozen_at TEXT
-        );
+        -- Phase 8 (DADBEAR decommission): drop legacy auto-update config.
+        -- The holds projection is the sole authority for frozen/breaker state.
+        -- Contribution existence in pyramid_dadbear_config is the enable gate.
+        DROP TABLE IF EXISTS pyramid_auto_update_config;
 
         -- Phase 7: Drop legacy tables. Any code still referencing these will crash
         -- loudly, which is how we find consumers that need migration.
@@ -539,19 +514,7 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         "ALTER TABLE pyramid_faq_nodes ADD COLUMN match_triggers TEXT DEFAULT '[]'",
         [],
     );
-    let _ = conn.execute(
-        "ALTER TABLE pyramid_auto_update_config ADD COLUMN ingested_extensions TEXT DEFAULT '[]'",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE pyramid_auto_update_config ADD COLUMN ingested_config_files TEXT DEFAULT '[]'",
-        [],
-    );
-    // Ghost-engine fix: link auto_update_config to the contribution system.
-    let _ = conn.execute(
-        "ALTER TABLE pyramid_auto_update_config ADD COLUMN contribution_id TEXT DEFAULT NULL",
-        [],
-    );
+    // Phase 8: ALTER TABLEs for pyramid_auto_update_config removed — table dropped.
 
     // ── WS3: build_id columns for contribution model ──
     let _ = conn.execute(
@@ -1944,22 +1907,9 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // `contribution_id` column is still NULL.
     migrate_legacy_dadbear_to_contributions(conn)?;
 
-    // DEPRECATED (Phase 7): ghost-engine backfill for pyramid_auto_update_config.
-    // The holds projection is now the dispatch gate, and contribution existence
-    // is the enable gate. This backfill is retained only for backward compatibility
-    // with any code that still reads from the old table.
-    conn.execute(
-        "INSERT OR IGNORE INTO pyramid_auto_update_config (slug)
-         SELECT slug FROM pyramid_slugs WHERE slug NOT IN (
-             SELECT slug FROM pyramid_auto_update_config
-         )",
-        [],
-    )?;
-
-    // DEPRECATED (Phase 7): one-time migration from legacy auto_update_config rows
-    // to contributions. Already ran on all existing installations. Retained as
-    // idempotent no-op for safety — the sentinel check short-circuits immediately.
-    migrate_legacy_auto_update_to_contributions(conn)?;
+    // Phase 8: ghost-engine backfill and migrate_legacy_auto_update_to_contributions
+    // removed — pyramid_auto_update_config table has been dropped. The one-time
+    // migration already ran on all existing installations before this decommission.
 
     // Phase 0 (DADBEAR Canonical Architecture): split dadbear_policy into
     // watch_root + dadbear_norms, and absorb auto_update_policy fields.
@@ -2157,69 +2107,10 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         ",
     )?;
 
-    // ── Seed holds from current frozen/breaker state (one-time migration) ──
-    //
-    // Populates hold events + projection from the old pyramid_auto_update_config
-    // columns. INSERT OR IGNORE makes this idempotent — only runs on first boot
-    // after the tables are created.
-    conn.execute_batch(
-        "INSERT OR IGNORE INTO dadbear_hold_events (slug, hold, action, reason, created_at)
-         SELECT slug, 'frozen', 'placed', 'Migrated from pyramid_auto_update_config', datetime('now')
-         FROM pyramid_auto_update_config WHERE frozen = 1;
-
-         INSERT OR IGNORE INTO dadbear_hold_events (slug, hold, action, reason, created_at)
-         SELECT slug, 'breaker', 'placed', 'Migrated from pyramid_auto_update_config', datetime('now')
-         FROM pyramid_auto_update_config WHERE breaker_tripped = 1;
-
-         INSERT OR IGNORE INTO dadbear_holds_projection (slug, hold, held_since, reason)
-         SELECT slug, 'frozen', COALESCE(frozen_at, datetime('now')), 'Migrated'
-         FROM pyramid_auto_update_config WHERE frozen = 1;
-
-         INSERT OR IGNORE INTO dadbear_holds_projection (slug, hold, held_since, reason)
-         SELECT slug, 'breaker', COALESCE(breaker_tripped_at, datetime('now')), 'Migrated'
-         FROM pyramid_auto_update_config WHERE breaker_tripped = 1;"
-    )?;
-
-    // Populate pyramid_build_metadata from existing pyramid_auto_update_config data
-    conn.execute_batch(
-        "INSERT OR IGNORE INTO pyramid_build_metadata (slug, ingested_extensions, ingested_config_files, updated_at)
-         SELECT slug, COALESCE(ingested_extensions, '[]'), COALESCE(ingested_config_files, '[]'), datetime('now')
-         FROM pyramid_auto_update_config;"
-    )?;
-
-    // Backfill observation events from existing WAL rows (one-time migration).
-    // Only runs if dadbear_observation_events is empty — idempotent.
-    // Translates old mutation_type names to new event_type names per the plan's
-    // backfill translation table, and maps columns correctly:
-    //   - file events: target_ref → file_path, target_node_id = NULL
-    //   - internal events: target_ref → target_node_id, file_path = NULL
-    //   - content_hash is always NULL (not available in old WAL)
-    //   - detail → metadata_json
-    conn.execute_batch(
-        "INSERT INTO dadbear_observation_events
-             (slug, source, event_type, file_path, content_hash, target_node_id, layer, detected_at, metadata_json)
-         SELECT
-             slug,
-             'migration',
-             CASE mutation_type
-                 WHEN 'file_change' THEN 'file_modified'
-                 WHEN 'new_file' THEN 'file_created'
-                 WHEN 'deleted_file' THEN 'file_deleted'
-                 WHEN 'rename_candidate' THEN 'file_renamed'
-                 WHEN 'confirmed_stale' THEN 'cascade_stale'
-                 ELSE mutation_type
-             END,
-             CASE WHEN mutation_type IN ('file_change', 'new_file', 'deleted_file', 'rename_candidate')
-                  THEN target_ref ELSE NULL END,
-             NULL,
-             CASE WHEN mutation_type NOT IN ('file_change', 'new_file', 'deleted_file', 'rename_candidate')
-                  THEN target_ref ELSE NULL END,
-             layer,
-             detected_at,
-             detail
-         FROM pyramid_pending_mutations
-         WHERE NOT EXISTS (SELECT 1 FROM dadbear_observation_events LIMIT 1);"
-    )?;
+    // Phase 8: Hold migration, build_metadata population, and observation event
+    // backfill from pyramid_auto_update_config / pyramid_pending_mutations removed.
+    // Both source tables have been dropped. These one-time migrations already ran
+    // on all existing installations before this decommission.
 
     // ── end DADBEAR Canonical State Model tables ────────────────────────────
 
@@ -3134,14 +3025,8 @@ pub fn create_slug(
     )
     .with_context(|| format!("Failed to create slug '{slug}'"))?;
 
-    // DEPRECATED (Phase 7): pyramid_auto_update_config is no longer the authority.
-    // The holds projection is the sole dispatch gate, and contribution existence
-    // is the enable gate. This INSERT is kept only for backward compatibility with
-    // code that still reads from the old table. No runtime behavior depends on it.
-    let _ = conn.execute(
-        "INSERT OR IGNORE INTO pyramid_auto_update_config (slug) VALUES (?1)",
-        rusqlite::params![slug],
-    );
+    // Phase 8: pyramid_auto_update_config INSERT removed — table dropped.
+    // Contribution existence in pyramid_dadbear_config is the enable gate.
 
     // Read back the row to get server-generated defaults (created_at)
     get_slug(conn, slug)?.ok_or_else(|| anyhow::anyhow!("Slug '{slug}' not found after insert"))
@@ -6174,12 +6059,12 @@ pub fn get_tracked_paths(
     Ok(paths)
 }
 
-/// Get ingested extensions for a slug from pyramid_auto_update_config.
-/// Returns empty Vec if no config exists or column is missing.
+/// Get ingested extensions for a slug from pyramid_build_metadata (canonical source).
+/// Returns empty Vec if no metadata exists.
 pub fn get_ingested_extensions(conn: &Connection, slug: &str) -> Result<Vec<String>> {
     let json_str: String = conn
         .query_row(
-            "SELECT ingested_extensions FROM pyramid_auto_update_config WHERE slug = ?1",
+            "SELECT ingested_extensions FROM pyramid_build_metadata WHERE slug = ?1",
             rusqlite::params![slug],
             |row| row.get(0),
         )
@@ -6188,12 +6073,12 @@ pub fn get_ingested_extensions(conn: &Connection, slug: &str) -> Result<Vec<Stri
     Ok(exts)
 }
 
-/// Get ingested config filenames for a slug from pyramid_auto_update_config.
-/// Returns empty Vec if no config exists or column is missing.
+/// Get ingested config filenames for a slug from pyramid_build_metadata (canonical source).
+/// Returns empty Vec if no metadata exists.
 pub fn get_ingested_config_files(conn: &Connection, slug: &str) -> Result<Vec<String>> {
     let json_str: String = conn
         .query_row(
-            "SELECT ingested_config_files FROM pyramid_auto_update_config WHERE slug = ?1",
+            "SELECT ingested_config_files FROM pyramid_build_metadata WHERE slug = ?1",
             rusqlite::params![slug],
             |row| row.get(0),
         )
@@ -6204,8 +6089,11 @@ pub fn get_ingested_config_files(conn: &Connection, slug: &str) -> Result<Vec<St
 
 // ── Build Pipeline Seeding Helpers ───────────────────────────────────────────
 
-/// Insert default auto_update_config for a slug with ingested extensions and config files.
-/// Uses INSERT OR IGNORE so it won't overwrite an existing config.
+/// Insert build metadata defaults for a slug with ingested extensions and config files.
+/// Uses INSERT OR IGNORE so it won't overwrite existing metadata.
+///
+/// DECOMMISSIONED: No longer writes to pyramid_auto_update_config (table dropped).
+/// Writes to pyramid_build_metadata instead.
 pub fn insert_auto_update_config_defaults(
     conn: &Connection,
     slug: &str,
@@ -6213,10 +6101,16 @@ pub fn insert_auto_update_config_defaults(
     config_files_json: &str,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO pyramid_auto_update_config
-         (slug, auto_update, debounce_minutes, min_changed_files, runaway_threshold,
-          breaker_tripped, frozen, ingested_extensions, ingested_config_files)
-         VALUES (?1, 1, 5, 1, 0.5, 0, 0, ?2, ?3)",
+        "INSERT INTO pyramid_build_metadata (slug, ingested_extensions, ingested_config_files, updated_at)
+         VALUES (?1, ?2, ?3, datetime('now'))
+         ON CONFLICT(slug) DO UPDATE SET
+            ingested_extensions = CASE WHEN pyramid_build_metadata.ingested_extensions = '[]'
+                                       THEN excluded.ingested_extensions
+                                       ELSE pyramid_build_metadata.ingested_extensions END,
+            ingested_config_files = CASE WHEN pyramid_build_metadata.ingested_config_files = '[]'
+                                         THEN excluded.ingested_config_files
+                                         ELSE pyramid_build_metadata.ingested_config_files END,
+            updated_at = datetime('now')",
         rusqlite::params![slug, extensions_json, config_files_json],
     )?;
     Ok(())
@@ -6246,34 +6140,103 @@ pub fn upsert_file_hash(
 
 // ── Shared Query Functions (used by both HTTP routes and Tauri IPC commands) ──
 
-/// Load auto-update config for a slug. Returns None if not found.
+/// Load auto-update config for a slug from canonical sources.
+///
+/// DECOMMISSIONED: No longer reads from pyramid_auto_update_config (table dropped).
+/// Synthesizes from dadbear_norms contributions (for policy fields) and the
+/// holds projection (for frozen/breaker state). Returns None if no DADBEAR
+/// config exists for this slug.
 pub fn get_auto_update_config(
     conn: &Connection,
     slug: &str,
 ) -> Option<super::types::AutoUpdateConfig> {
-    conn.query_row(
-        "SELECT slug, auto_update, debounce_minutes, min_changed_files,
-                runaway_threshold, breaker_tripped, breaker_tripped_at, frozen, frozen_at
-         FROM pyramid_auto_update_config WHERE slug = ?1",
-        rusqlite::params![slug],
-        |row| {
-            Ok(super::types::AutoUpdateConfig {
-                slug: row.get(0)?,
-                auto_update: row.get::<_, i32>(1)? != 0,
-                debounce_minutes: row.get(2)?,
-                min_changed_files: row.get(3)?,
-                runaway_threshold: row.get(4)?,
-                breaker_tripped: row.get::<_, i32>(5)? != 0,
-                breaker_tripped_at: row.get(6)?,
-                frozen: row.get::<_, i32>(7)? != 0,
-                frozen_at: row.get(8)?,
-            })
-        },
-    )
-    .ok()
+    // Check if slug has a dadbear config (enable gate)
+    let has_config: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pyramid_dadbear_config WHERE slug = ?1)",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !has_config {
+        return None;
+    }
+
+    // Load policy from dadbear_norms contribution (if any)
+    let (debounce_minutes, min_changed_files, runaway_threshold) = conn
+        .query_row(
+            "SELECT yaml_content FROM pyramid_config_contributions
+             WHERE slug = ?1 AND schema_type = 'dadbear_norms' AND status = 'active'
+             ORDER BY accepted_at DESC LIMIT 1",
+            rusqlite::params![slug],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|yaml| {
+            serde_yaml::from_str::<serde_json::Value>(&yaml).ok()
+        })
+        .map(|v| {
+            let debounce = v.get("debounce_minutes").and_then(|d| d.as_i64()).unwrap_or(5) as i32;
+            let min_changed = v.get("min_changed_files").and_then(|m| m.as_i64()).unwrap_or(1) as i32;
+            let threshold = v.get("runaway_threshold").and_then(|t| t.as_f64()).unwrap_or(0.5);
+            (debounce, min_changed, threshold)
+        })
+        .unwrap_or((5, 1, 0.5));
+
+    // Load holds from the canonical projection
+    let frozen: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM dadbear_holds_projection WHERE slug = ?1 AND hold = 'frozen')",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    let frozen_at: Option<String> = if frozen {
+        conn.query_row(
+            "SELECT held_since FROM dadbear_holds_projection WHERE slug = ?1 AND hold = 'frozen'",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        )
+        .ok()
+    } else {
+        None
+    };
+
+    let breaker_tripped: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM dadbear_holds_projection WHERE slug = ?1 AND hold = 'breaker')",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    let breaker_tripped_at: Option<String> = if breaker_tripped {
+        conn.query_row(
+            "SELECT held_since FROM dadbear_holds_projection WHERE slug = ?1 AND hold = 'breaker'",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        )
+        .ok()
+    } else {
+        None
+    };
+
+    Some(super::types::AutoUpdateConfig {
+        slug: slug.to_string(),
+        auto_update: true, // If dadbear_config exists, it's enabled
+        debounce_minutes,
+        min_changed_files,
+        runaway_threshold,
+        breaker_tripped,
+        breaker_tripped_at,
+        frozen,
+        frozen_at,
+    })
 }
 
-/// Get auto-update status for a slug (config + pending mutations + last check time).
+/// Get auto-update status for a slug (config + pending observation events + last check time).
 pub fn get_auto_update_status(conn: &Connection, slug: &str) -> Result<Option<serde_json::Value>> {
     let config = match get_auto_update_config(conn, slug) {
         Some(c) => c,
@@ -6284,8 +6247,12 @@ pub fn get_auto_update_status(conn: &Connection, slug: &str) -> Result<Option<se
     for layer in 0..=3 {
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM pyramid_pending_mutations
-                 WHERE processed = 0 AND slug = ?1 AND layer = ?2",
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                 WHERE slug = ?1 AND layer = ?2
+                   AND id > COALESCE(
+                       (SELECT last_bridge_observation_id FROM pyramid_build_metadata WHERE slug = ?1),
+                       0
+                   )",
                 rusqlite::params![slug, layer],
                 |row| row.get(0),
             )
@@ -12071,8 +12038,12 @@ pub fn build_dadbear_overview_rows(
     for (slug, bucket) in buckets {
         let pending_mutations_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM pyramid_pending_mutations
-                 WHERE slug = ?1 AND processed = 0",
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                 WHERE slug = ?1
+                   AND id > COALESCE(
+                       (SELECT last_bridge_observation_id FROM pyramid_build_metadata WHERE slug = ?1),
+                       0
+                   )",
                 rusqlite::params![slug],
                 |r| r.get(0),
             )
@@ -12182,11 +12153,21 @@ pub fn build_dadbear_overview_rows(
             )
             .unwrap_or(0);
 
-        let (frozen, breaker_tripped, auto_update_enabled) = conn.query_row(
-            "SELECT frozen, breaker_tripped, auto_update FROM pyramid_auto_update_config WHERE slug = ?1",
+        let frozen: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dadbear_holds_projection WHERE slug = ?1 AND hold = 'frozen')",
             rusqlite::params![slug],
-            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?, row.get::<_, bool>(2)?)),
-        ).unwrap_or((false, false, false));
+            |row| row.get(0),
+        ).unwrap_or(false);
+        let breaker_tripped: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dadbear_holds_projection WHERE slug = ?1 AND hold = 'breaker')",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        ).unwrap_or(false);
+        let auto_update_enabled: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pyramid_dadbear_config WHERE slug = ?1)",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        ).unwrap_or(false);
 
         rows.push(DadbearOverviewRowDb {
             slug,
@@ -15182,47 +15163,19 @@ pub struct AutoUpdatePolicyYaml {
     pub runaway_threshold: f64,
 }
 
-/// UPSERT an auto-update policy contribution's payload into the existing
-/// `pyramid_auto_update_config` table. Writes only the policy fields
-/// (auto_update, debounce_minutes, min_changed_files, runaway_threshold)
-/// plus the contribution_id FK. Preserves frozen, breaker_tripped, and
-/// ingested_* columns untouched via ON CONFLICT DO UPDATE.
+/// UPSERT an auto-update policy contribution's payload.
 ///
-/// When `slug` is `None`, this is a global-defaults contribution. The
-/// `pyramid_auto_update_config` table has no global row (slug is PRIMARY
-/// KEY with NOT NULL), so we return Ok as a no-op.
+/// DECOMMISSIONED: pyramid_auto_update_config table has been dropped.
+/// Policy fields are now read directly from contributions (dadbear_norms).
+/// This function is a no-op retained to avoid breaking callers during
+/// the transition.
 pub fn upsert_auto_update_policy(
-    conn: &Connection,
-    slug: &Option<String>,
-    yaml: &AutoUpdatePolicyYaml,
-    contribution_id: &str,
+    _conn: &Connection,
+    _slug: &Option<String>,
+    _yaml: &AutoUpdatePolicyYaml,
+    _contribution_id: &str,
 ) -> Result<()> {
-    let Some(slug_str) = slug.as_deref() else {
-        // Global defaults: contribution is the source of truth in
-        // pyramid_config_contributions. No operational row to mirror.
-        return Ok(());
-    };
-
-    conn.execute(
-        "INSERT INTO pyramid_auto_update_config
-            (slug, auto_update, debounce_minutes, min_changed_files,
-             runaway_threshold, contribution_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(slug) DO UPDATE SET
-            auto_update = excluded.auto_update,
-            debounce_minutes = excluded.debounce_minutes,
-            min_changed_files = excluded.min_changed_files,
-            runaway_threshold = excluded.runaway_threshold,
-            contribution_id = excluded.contribution_id",
-        rusqlite::params![
-            slug_str,
-            yaml.auto_update as i64,
-            yaml.debounce_minutes,
-            yaml.min_changed_files,
-            yaml.runaway_threshold,
-            contribution_id,
-        ],
-    )?;
+    // No-op: policy is read directly from contributions.
     Ok(())
 }
 
@@ -17556,7 +17509,7 @@ mod phase15_tests {
         init_pyramid_db(&conn).unwrap();
         // Seed a couple of slugs — the foreign key on
         // pyramid_dadbear_config.slug is relaxed in the schema but we
-        // still want parent rows because cost_log, pending_mutations,
+        // still want parent rows because cost_log, observation_events,
         // and change_manifests all reference pyramid_slugs ON DELETE
         // CASCADE.
         for s in ["p15-alpha", "p15-beta", "p15-gamma"] {
@@ -17637,14 +17590,13 @@ mod phase15_tests {
     fn test_overview_aggregates_single_slug() {
         let conn = mem_conn();
         seed_dadbear_config(&conn, "p15-alpha", "/tmp/a", true, 10);
-        // Two pending mutations, one already processed.
+        // Two unprocessed observation events (replaces old pyramid_pending_mutations inserts).
         conn.execute(
-            "INSERT INTO pyramid_pending_mutations
-                (slug, layer, mutation_type, target_ref, processed)
+            "INSERT INTO dadbear_observation_events
+                (slug, source, event_type, layer, detected_at)
              VALUES
-                ('p15-alpha', 0, 'reextract', 'n1', 0),
-                ('p15-alpha', 0, 'reextract', 'n2', 0),
-                ('p15-alpha', 0, 'reextract', 'n3', 1)",
+                ('p15-alpha', 'test', 'file_modified', 0, datetime('now')),
+                ('p15-alpha', 'test', 'file_modified', 0, datetime('now'))",
             [],
         )
         .unwrap();
@@ -17796,11 +17748,11 @@ mod phase15_tests {
         seed_dadbear_config(&conn, "p15-beta", "/tmp/b", false, 20);
         seed_dadbear_config(&conn, "p15-gamma", "/tmp/c", true, 30);
 
-        // Only alpha has pending mutations.
+        // Only alpha has a pending observation event (replaces old pyramid_pending_mutations insert).
         conn.execute(
-            "INSERT INTO pyramid_pending_mutations
-                (slug, layer, mutation_type, target_ref, processed)
-             VALUES ('p15-alpha', 0, 'reextract', 'n1', 0)",
+            "INSERT INTO dadbear_observation_events
+                (slug, source, event_type, layer, detected_at)
+             VALUES ('p15-alpha', 'test', 'file_modified', 0, datetime('now'))",
             [],
         )
         .unwrap();

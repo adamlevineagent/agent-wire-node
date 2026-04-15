@@ -417,14 +417,7 @@ async fn run_post_build_hooks(
                 }).to_string();
                 let mut notified = 0usize;
                 for referrer in &referrers {
-                    conn.execute(
-                        "INSERT INTO pyramid_pending_mutations
-                         (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
-                         VALUES (?1, 0, 'confirmed_stale', ?2, ?3, 0, ?4, 0)",
-                        rusqlite::params![referrer, &slug_owned, &detail, &now],
-                    )?;
-
-                    // Dual-write: observation event (vine bedrock stale)
+                    // Canonical write: observation event (old WAL INSERT removed)
                     let _ = super::observation_events::write_observation_event(
                         &conn,
                         referrer,

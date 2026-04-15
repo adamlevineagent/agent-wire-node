@@ -1,11 +1,9 @@
 // pyramid/observation_events.rs — Write helper for dadbear_observation_events
 //
-// Every mutation written to pyramid_pending_mutations is ALSO written here
-// via dual-write calls at each WAL site. This is the append-only observation
-// stream that the DADBEAR compiler will consume in later phases.
-//
-// The old WAL (pyramid_pending_mutations) continues to be written and consumed
-// by drain_and_dispatch. This module adds the parallel write path only.
+// This is the canonical append-only observation stream consumed by the
+// DADBEAR supervisor. The old WAL (pyramid_pending_mutations) has been
+// decommissioned and its table dropped. All mutation sites now write
+// exclusively to this observation events table.
 
 use anyhow::{Context, Result};
 use chrono::Utc;

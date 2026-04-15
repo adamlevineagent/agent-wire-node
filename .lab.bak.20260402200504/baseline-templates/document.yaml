@@ -1,0 +1,360 @@
+# Document Pipeline Chain Definition — Four-Axis Semantic Grouping
+#
+# Documents are organized along four axes:
+#   1. TEMPORAL — when was it written, what came before/after
+#   2. CONCEPTUAL — what subject/domain does it cover
+#   3. CANONICAL — is this the authoritative source on its subject
+#   4. TYPE — design doc, audit, worksheet, strategy, etc.
+#
+# Pipeline:
+#   1a. Per-doc classification (parallel, per-doc type/date/title/raw keywords)
+#   1b. Taxonomy normalization (single call, normalize concept tags)
+#   2.  L0 document extraction (per-doc, type-aware)
+#   3a. Concept area identification (single call, headlines + tags → thread defs)
+#   3b. Per-doc thread assignment (parallel, per-doc → thread mapping)
+#   4.  Thread synthesis (temporally-ordered, supersession-aware)
+#   5.  L1 cross-layer webbing
+#   6.  Upper layers (recursive clustering to apex)
+#   7.  L2 cross-layer webbing
+
+schema_version: 1
+id: document-default
+name: Document Pyramid
+description: >
+  Four-axis document analysis: parallel per-doc classification, taxonomy
+  normalization, type-aware extraction, concept-area identification,
+  parallel per-doc thread assignment, temporally-ordered synthesis,
+  cross-layer webbing, recursive clustering.
+content_type: document
+version: "4.0.0"
+author: agent-wire
+
+defaults:
+  model_tier: mid
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  # ── Step 1a: Per-doc classification (parallel) ───────────────────────
+  # Reads first ~20 lines of each document independently.
+  # Tags each document: temporal (date), raw keywords, canonical status, type.
+  # Runs in parallel across all documents for speed.
+  - name: doc_classify_perdoc
+    primitive: classify
+    instruction: "$prompts/document/doc_classify_perdoc.md"
+    for_each: $chunks
+    input:
+      doc: $item
+      header_lines: 20
+    response_schema:
+      type: object
+      properties:
+        source_node:
+          type: string
+          description: "Exact D-L0-XXX chunk ID"
+        title:
+          type: string
+        temporal:
+          type: object
+          properties:
+            date:
+              type: string
+            confidence:
+              type: string
+          required: ["date"]
+          additionalProperties: false
+        raw_keywords:
+          type: array
+          items:
+            type: string
+          description: "Key concepts/subjects from this document"
+        canonical:
+          type: string
+          description: "canonical | superseded | partial | foundational"
+        type:
+          type: string
+          description: "design | audit | implementation | strategy | report | reference | worksheet | meta"
+      required: ["source_node", "title", "temporal", "raw_keywords", "canonical", "type"]
+      additionalProperties: false
+    concurrency: 8
+    model: "qwen/qwen3.5-flash-02-23"
+    temperature: 0.2
+    on_error: "retry(3)"
+
+  # ── Step 1b: Taxonomy normalization (single call) ────────────────────
+  # Takes the per-doc raw keywords and normalizes them into a shared
+  # concept taxonomy. Merges synonyms, produces consistent tags.
+  # Small input: just the per-doc classifications, not full documents.
+  - name: doc_taxonomy
+    primitive: classify
+    instruction: "$prompts/document/doc_taxonomy.md"
+    input:
+      per_doc_classifications: $doc_classify_perdoc
+    response_schema:
+      type: object
+      properties:
+        documents:
+          type: array
+          items:
+            type: object
+            properties:
+              source_node:
+                type: string
+                description: "Exact D-L0-XXX chunk ID"
+              title:
+                type: string
+              temporal:
+                type: object
+                properties:
+                  date:
+                    type: string
+                  confidence:
+                    type: string
+                required: ["date"]
+                additionalProperties: false
+              conceptual:
+                type: array
+                items:
+                  type: string
+                description: "Normalized concept tags"
+              canonical:
+                type: string
+                description: "canonical | superseded | partial | foundational"
+              type:
+                type: string
+                description: "design | audit | implementation | strategy | report | reference | worksheet | meta"
+              supersedes:
+                type: string
+                description: "Source node ID this document replaces, or null"
+              superseded_by:
+                type: string
+                description: "Source node ID that replaces this document, or null"
+            required: ["source_node", "title", "temporal", "conceptual", "canonical", "type"]
+            additionalProperties: false
+        concept_taxonomy:
+          type: object
+          additionalProperties:
+            type: string
+          description: "Map of concept tag → 1-sentence description"
+      required: ["documents", "concept_taxonomy"]
+      additionalProperties: false
+    model: "qwen/qwen3.5-flash-02-23"
+    temperature: 0.2
+    on_error: "retry(3)"
+
+  # ── Step 2: L0 document extraction ──────────────────────────────────
+  # Per-document LLM analysis. The taxonomy from step 1b is available
+  # as context so the extraction knows what TYPE of document it's
+  # reading and what to emphasize.
+  - name: l0_doc_extract
+    primitive: extract
+    instruction: "$prompts/document/doc_extract.md"
+    for_each: $chunks
+    context:
+      classification: $doc_taxonomy
+    node_id_pattern: "D-L0-{index:03}"
+    depth: 0
+    save_as: node
+    concurrency: 8
+    model_tier: mid
+    temperature: 0.3
+    on_error: "retry(3)"
+
+  # ── Step 3a: Concept area identification (single call) ───────────────
+  # Identifies the natural conceptual groupings (thread definitions).
+  # Small input: headlines + concept tags only, not full extractions.
+  # Defines threads; does NOT assign documents to them.
+  - name: doc_concept_areas
+    primitive: classify
+    instruction: "$prompts/document/doc_concept_areas.md"
+    input:
+      topics: $l0_doc_extract
+      classification: $doc_taxonomy
+    compact_inputs: true
+    response_schema:
+      type: object
+      properties:
+        threads:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+                description: "2-6 word thread label based on concept"
+              description:
+                type: string
+              concept_tags:
+                type: array
+                items:
+                  type: string
+                description: "Which concept tags this thread covers"
+            required: ["name", "description", "concept_tags"]
+            additionalProperties: false
+      required: ["threads"]
+      additionalProperties: false
+    model: "qwen/qwen3.5-flash-02-23"
+    temperature: 0.3
+    on_error: "retry(3)"
+
+  # ── Step 3b: Per-doc thread assignment (parallel) ────────────────────
+  # Assigns each document to a thread from the concept areas.
+  # Runs in parallel across all documents.
+  - name: doc_assign
+    primitive: classify
+    instruction: "$prompts/document/doc_assign.md"
+    for_each: $l0_doc_extract
+    context:
+      threads: $doc_concept_areas
+      classification: $doc_taxonomy
+    response_schema:
+      type: object
+      properties:
+        source_node:
+          type: string
+          description: "Exact D-L0-XXX node ID"
+        topic_index:
+          type: integer
+        topic_name:
+          type: string
+        assigned_thread:
+          type: string
+          description: "Thread name from concept areas"
+        assigned_thread_index:
+          type: integer
+        unassigned:
+          type: boolean
+      required: ["source_node", "assigned_thread", "assigned_thread_index", "unassigned"]
+      additionalProperties: false
+    concurrency: 8
+    model: "qwen/qwen3.5-flash-02-23"
+    temperature: 0.2
+    on_error: "retry(3)"
+
+  # ── Step 4: Thread synthesis ────────────────────────────────────────
+  # Per-thread synthesis with temporal ordering and supersession awareness.
+  # Documents within each thread are ordered by date. Later documents
+  # are more authoritative. Superseded content becomes corrections.
+  # Input is constructed from concept areas (thread defs) + assignments.
+  - name: thread_narrative
+    primitive: synthesize
+    instruction: "$prompts/document/doc_thread.md"
+    for_each: $doc_concept_areas.threads
+    context:
+      classification: $doc_taxonomy
+      assignments: $doc_assign
+    node_id_pattern: "L1-{index:03}"
+    depth: 1
+    save_as: node
+    concurrency: 5
+    model_tier: mid
+    temperature: 0.3
+    on_error: "retry(2)"
+
+  # ── Step 5: L1 cross-layer webbing ──────────────────────────────────
+  - name: l1_webbing
+    primitive: web
+    instruction: "$prompts/document/doc_web.md"
+    input:
+      nodes: $thread_narrative
+    response_schema:
+      type: object
+      properties:
+        edges:
+          type: array
+          items:
+            type: object
+            properties:
+              source:
+                type: string
+              target:
+                type: string
+              relationship:
+                type: string
+              shared_resources:
+                type: array
+                items:
+                  type: string
+              strength:
+                type: number
+            required: ["source", "target", "relationship", "shared_resources", "strength"]
+            additionalProperties: false
+      required: ["edges"]
+      additionalProperties: false
+    depth: 1
+    save_as: web_edges
+    model_tier: mid
+    temperature: 0.2
+    on_error: "skip"
+
+  # ── Step 6: Upper layers (recursive clustering → apex) ──────────────
+  - name: upper_layer_synthesis
+    primitive: synthesize
+    instruction: "$prompts/document/doc_distill.md"
+    recursive_cluster: true
+    cluster_instruction: "$prompts/document/doc_recluster.md"
+    cluster_model: "qwen/qwen3.5-flash-02-23"
+    cluster_response_schema:
+      type: object
+      properties:
+        clusters:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+                description: "2-6 word cluster label — unique and concrete"
+              description:
+                type: string
+              node_ids:
+                type: array
+                items:
+                  type: string
+            required: ["name", "description", "node_ids"]
+            additionalProperties: false
+      required: ["clusters"]
+      additionalProperties: false
+    depth: 1
+    save_as: node
+    node_id_pattern: "L{depth}-{index:03}"
+    model_tier: mid
+    temperature: 0.3
+    on_error: "retry(3)"
+
+  # ── Step 7: L2 cross-layer webbing ──────────────────────────────────
+  - name: l2_webbing
+    primitive: web
+    instruction: "$prompts/document/doc_web.md"
+    response_schema:
+      type: object
+      properties:
+        edges:
+          type: array
+          items:
+            type: object
+            properties:
+              source:
+                type: string
+              target:
+                type: string
+              relationship:
+                type: string
+              shared_resources:
+                type: array
+                items:
+                  type: string
+              strength:
+                type: number
+            required: ["source", "target", "relationship", "shared_resources", "strength"]
+            additionalProperties: false
+      required: ["edges"]
+      additionalProperties: false
+    depth: 2
+    save_as: web_edges
+    model_tier: mid
+    temperature: 0.2
+    on_error: "skip"
+
+post_build: []

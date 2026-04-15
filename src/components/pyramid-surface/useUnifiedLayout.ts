@@ -96,10 +96,18 @@ export function addBedrockLayer(nodes: FlatInput[]): FlatInput[] {
 
 // ── Layout ───────────────────────────────────────────────────────────
 
-function nodeRadius(depth: number, maxDepth: number): number {
+function nodeRadius(depth: number, maxDepth: number, usableHeight?: number, depthRange?: number): number {
     if (depth < 0) return BEDROCK_RADIUS;
     if (maxDepth === 0) return APEX_RADIUS;
-    return BASE_RADIUS + (depth / maxDepth) * (APEX_RADIUS - BASE_RADIUS);
+    const baseR = BASE_RADIUS + (depth / maxDepth) * (APEX_RADIUS - BASE_RADIUS);
+    // Scale radii down when the canvas is too small for the number of layers.
+    // Target: each layer should have at least 2.5× the apex radius of vertical space.
+    if (usableHeight != null && depthRange != null && depthRange > 0) {
+        const spacePerLayer = usableHeight / (depthRange + 1);
+        const maxR = spacePerLayer * 0.4; // radius can't exceed 40% of per-layer spacing
+        if (baseR > maxR) return Math.max(maxR, BEDROCK_RADIUS);
+    }
+    return baseR;
 }
 
 export function computeLayout(
@@ -142,7 +150,7 @@ export function computeLayout(
     for (const [depth, group] of byDepth) {
         const normalizedDepth = (depth - minDepth) / depthRange;
         const yCenter = PADDING + usableHeight * (1 - normalizedDepth);
-        const radius = nodeRadius(depth, maxDepth);
+        const radius = nodeRadius(depth, maxDepth, usableHeight, depthRange);
 
         const narrowFactor = depth < 0 ? 0 : maxDepth > 0 ? (depth / maxDepth) * 0.85 : 0;
         const bandHalfWidth = (usableWidth / 2) * (1 - narrowFactor);

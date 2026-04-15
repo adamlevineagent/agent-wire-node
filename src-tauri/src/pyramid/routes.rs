@@ -4678,28 +4678,12 @@ async fn handle_faq_category_drill(
 
 // ── Phase 5: Breaker & Freeze route handlers ────────────────────────
 
-/// Helper: load AutoUpdateConfig from DB for a given slug.
+/// Helper: load AutoUpdateConfig from canonical sources for a given slug.
+///
+/// DECOMMISSIONED: No longer reads from pyramid_auto_update_config (table dropped).
+/// Synthesizes the config from dadbear_norms contributions + holds projection.
 fn load_auto_update_config_from_db(conn: &Connection, slug: &str) -> Option<AutoUpdateConfig> {
-    conn.query_row(
-        "SELECT slug, auto_update, debounce_minutes, min_changed_files,
-                runaway_threshold, breaker_tripped, breaker_tripped_at, frozen, frozen_at
-         FROM pyramid_auto_update_config WHERE slug = ?1",
-        rusqlite::params![slug],
-        |row| {
-            Ok(AutoUpdateConfig {
-                slug: row.get(0)?,
-                auto_update: row.get::<_, i32>(1)? != 0,
-                debounce_minutes: row.get(2)?,
-                min_changed_files: row.get(3)?,
-                runaway_threshold: row.get(4)?,
-                breaker_tripped: row.get::<_, i32>(5)? != 0,
-                breaker_tripped_at: row.get(6)?,
-                frozen: row.get::<_, i32>(7)? != 0,
-                frozen_at: row.get(8)?,
-            })
-        },
-    )
-    .ok()
+    db::get_auto_update_config(conn, slug)
 }
 
 /// GET /pyramid/:slug/auto-update/config
@@ -4765,30 +4749,14 @@ async fn handle_auto_update_config_post(
         ));
     }
 
-    let slug_idx = params.len() + 1;
-    params.push(Box::new(slug_name.clone()));
-    let sql = format!(
-        "UPDATE pyramid_auto_update_config SET {} WHERE slug = ?{}",
-        sets.join(", "),
-        slug_idx
-    );
-
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    match conn.execute(&sql, param_refs.as_slice()) {
-        Ok(0) => Ok(json_error(
+    // DECOMMISSIONED: pyramid_auto_update_config table dropped.
+    // Config is now managed via contributions (dadbear_norms).
+    // Return the current canonical config as acknowledgment.
+    match load_auto_update_config_from_db(&conn, &slug_name) {
+        Some(config) => Ok(json_ok(&config)),
+        None => Ok(json_error(
             warp::http::StatusCode::NOT_FOUND,
-            &format!("No auto-update config for slug '{}'", slug_name),
-        )),
-        Ok(_) => {
-            // Return the updated config
-            match load_auto_update_config_from_db(&conn, &slug_name) {
-                Some(config) => Ok(json_ok(&config)),
-                None => Ok(json_ok(&serde_json::json!({"status": "updated"}))),
-            }
-        }
-        Err(e) => Ok(json_error(
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            &e.to_string(),
+            &format!("No auto-update config for slug '{}'. Use contributions to configure.", slug_name),
         )),
     }
 }
@@ -4807,11 +4775,7 @@ async fn handle_auto_update_freeze(
         if let Err(e) = super::auto_update_ops::freeze(&conn, &state.build_event_bus, &slug_name) {
             tracing::warn!(slug = %slug_name, "auto_update_ops::freeze failed: {e}");
         }
-        // Drain pending mutations so they don't fire on unfreeze
-        let _ = conn.execute(
-            "UPDATE pyramid_pending_mutations SET processed = 1 WHERE processed = 0 AND slug = ?1",
-            rusqlite::params![slug_name],
-        );
+        // Old WAL drain removed — holds projection anti-join prevents dispatch while frozen.
     }
     // Pause file watcher
     let mut watchers = state.file_watchers.lock().await;
@@ -4910,15 +4874,7 @@ fn hash_rescan(conn: &Connection, slug: &str) -> i64 {
                 hex::encode(hasher.finalize())
             }
             Err(_) => {
-                // File was deleted during freeze — write deleted_file mutation
-                let _ = conn.execute(
-                    "INSERT INTO pyramid_pending_mutations
-                     (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at)
-                     VALUES (?1, 0, 'deleted_file', ?2, 'Detected during unfreeze rescan', 0, ?3)",
-                    rusqlite::params![slug, file_path, now],
-                );
-
-                // Dual-write: observation event
+                // File was deleted during freeze — write observation event
                 let _ = super::observation_events::write_observation_event(
                     conn,
                     slug,
@@ -4939,14 +4895,7 @@ fn hash_rescan(conn: &Connection, slug: &str) -> i64 {
         };
 
         if current_hash != *stored_hash {
-            let _ = conn.execute(
-                "INSERT INTO pyramid_pending_mutations
-                 (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at)
-                 VALUES (?1, 0, 'file_change', ?2, 'Detected during unfreeze rescan', 0, ?3)",
-                rusqlite::params![slug, file_path, now],
-            );
-
-            // Dual-write: observation event
+            // Canonical write: observation event (old WAL INSERT removed)
             let _ = super::observation_events::write_observation_event(
                 conn,
                 slug,
@@ -4989,27 +4938,32 @@ pub fn enqueue_full_l0_sweep(conn: &Connection, slug: &str) -> (i64, i64, i64) {
     let mut already_pending = 0i64;
 
     for file_path in &file_paths {
-        let pending_count: i64 = conn
+        // Check observation events for recent unprocessed entries for this file
+        // (replaces old pyramid_pending_mutations check).
+        let recent_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM pyramid_pending_mutations
-                 WHERE slug = ?1 AND layer = 0 AND processed = 0
-                   AND target_ref = ?2
-                   AND mutation_type IN ('file_change', 'deleted_file')",
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                 WHERE slug = ?1 AND layer = 0 AND file_path = ?2
+                   AND event_type IN ('file_modified', 'file_deleted')
+                   AND id > COALESCE(
+                       (SELECT last_bridge_observation_id FROM pyramid_build_metadata WHERE slug = ?1),
+                       0
+                   )",
                 rusqlite::params![slug, file_path],
                 |row| row.get(0),
             )
             .unwrap_or(0);
 
-        if pending_count > 0 {
+        if recent_count > 0 {
             already_pending += 1;
             continue;
         }
 
         let exists_on_disk = std::path::Path::new(file_path).exists();
-        let mutation_type = if exists_on_disk {
-            "file_change"
+        let obs_type = if exists_on_disk {
+            "file_modified"
         } else {
-            "deleted_file"
+            "file_deleted"
         };
         let detail = if exists_on_disk {
             "Forced full L0 sweep"
@@ -5017,19 +4971,7 @@ pub fn enqueue_full_l0_sweep(conn: &Connection, slug: &str) -> (i64, i64, i64) {
             "Forced full L0 sweep (file missing)"
         };
 
-        let _ = conn.execute(
-            "INSERT INTO pyramid_pending_mutations
-             (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
-             VALUES (?1, 0, ?2, ?3, ?4, 0, ?5, 0)",
-            rusqlite::params![slug, mutation_type, file_path, detail, now],
-        );
-
-        // Dual-write: observation event (full L0 sweep)
-        let obs_type = match mutation_type {
-            "file_change" => "file_modified",
-            "deleted_file" => "file_deleted",
-            _ => "full_sweep",
-        };
+        // Canonical write: observation event only (old WAL INSERT removed)
         let _ = super::observation_events::write_observation_event(
             conn,
             slug,
@@ -5213,11 +5155,15 @@ pub fn reconcile_source_files(
 
     // Check each file on disk against DB
     for file_path in &disk_files {
-        // Skip if already has an unprocessed mutation
+        // Skip if already has a recent unprocessed observation event
         let already_pending: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM pyramid_pending_mutations
-                 WHERE slug = ?1 AND layer = 0 AND processed = 0 AND target_ref = ?2",
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                 WHERE slug = ?1 AND layer = 0 AND file_path = ?2
+                   AND id > COALESCE(
+                       (SELECT last_bridge_observation_id FROM pyramid_build_metadata WHERE slug = ?1),
+                       0
+                   )",
                 rusqlite::params![slug, file_path],
                 |row| row.get(0),
             )
@@ -5292,11 +5238,15 @@ pub fn reconcile_source_files(
     // Check for deleted files (in DB but not on disk)
     for tracked_path in &tracked_keys {
         if !disk_files.contains(tracked_path) {
-            // Skip if already has an unprocessed mutation
+            // Skip if already has a recent unprocessed observation event
             let already_pending: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM pyramid_pending_mutations
-                     WHERE slug = ?1 AND layer = 0 AND processed = 0 AND target_ref = ?2",
+                    "SELECT COUNT(*) FROM dadbear_observation_events
+                     WHERE slug = ?1 AND layer = 0 AND file_path = ?2
+                       AND id > COALESCE(
+                           (SELECT last_bridge_observation_id FROM pyramid_build_metadata WHERE slug = ?1),
+                           0
+                       )",
                     rusqlite::params![slug, tracked_path],
                     |row| row.get(0),
                 )
@@ -5528,11 +5478,8 @@ async fn handle_breaker_build_new(
                 ));
             }
         }
-        // Create auto-update config for the new slug with defaults
-        let _ = conn.execute(
-            "INSERT OR IGNORE INTO pyramid_auto_update_config (slug) VALUES (?1)",
-            rusqlite::params![new_slug],
-        );
+        // Old auto_update_config INSERT removed — table dropped.
+        // Contribution existence in pyramid_dadbear_config is the enable gate.
     }
 
     Ok(warp::reply::with_status(
@@ -5563,13 +5510,17 @@ async fn handle_auto_update_status(
         }
     };
 
-    // Count pending mutations by layer
+    // Count pending observation events by layer (canonical source)
     let mut pending_by_layer = std::collections::HashMap::new();
     for layer in 0..=3 {
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM pyramid_pending_mutations
-                 WHERE processed = 0 AND slug = ?1 AND layer = ?2",
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                 WHERE slug = ?1 AND layer = ?2
+                   AND id > COALESCE(
+                       (SELECT last_bridge_observation_id FROM pyramid_build_metadata WHERE slug = ?1),
+                       0
+                   )",
                 rusqlite::params![slug_name, layer],
                 |row| row.get(0),
             )

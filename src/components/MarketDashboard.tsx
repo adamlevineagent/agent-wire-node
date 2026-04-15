@@ -5,6 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 
 interface FleetPeer {
     node_id: string;
+    handle_path?: string;  // "@hello/BEHEM" — preferred display when present
     name: string;
     tunnel_url: string;
     models_loaded: string[];
@@ -92,7 +93,7 @@ export function MarketDashboard() {
                         <h3 className="fleet-peers-title">Fleet Peers</h3>
                         <div className="fleet-peers-grid">
                             {peers.map(peer => (
-                                <FleetPeerCard key={peer.node_id} peer={peer} />
+                                <FleetPeerCard key={peer.handle_path || peer.node_id} peer={peer} />
                             ))}
                         </div>
                     </div>
@@ -133,8 +134,8 @@ function FleetPeerCard({ peer }: { peer: FleetPeer }) {
     return (
         <div className={`fleet-peer-card ${fresh ? 'fleet-peer-card-fresh' : ''}`}>
             <div className="fleet-peer-card-header">
-                <div className="fleet-peer-name" title={peer.node_id}>
-                    {peer.name || peer.node_id}
+                <div className="fleet-peer-name" title={peer.handle_path || peer.node_id}>
+                    {peer.handle_path || peer.name || peer.node_id}
                 </div>
                 <span
                     className={`fleet-peer-status-dot ${fresh ? 'fleet-peer-status-dot-online' : 'fleet-peer-status-dot-stale'}`}

@@ -373,14 +373,7 @@ fn enqueue_vine_manifest_mutations(
             bedrock_slug, apex_node_id, bedrock_build_id
         );
 
-        let rows_changed = conn.execute(
-            "INSERT INTO pyramid_pending_mutations
-             (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
-             VALUES (?1, ?2, 'confirmed_stale', ?3, ?4, 0, ?5, 0)",
-            rusqlite::params![vine_slug, depth, vine_node_id, detail, now],
-        )?;
-
-        // Dual-write: observation event (vine node stale)
+        // Canonical write: observation event (old WAL INSERT removed)
         let _ = super::observation_events::write_observation_event(
             conn,
             vine_slug,
@@ -395,7 +388,7 @@ fn enqueue_vine_manifest_mutations(
             Some(&detail),
         );
 
-        inserted += rows_changed;
+        inserted += 1;
     }
 
     Ok(inserted)
@@ -740,18 +733,19 @@ mod tests {
         // Exactly one pending mutation should land: the KEEP row's target.
         assert_eq!(enqueued, 1, "should enqueue one mutation for the KEEP row only");
 
-        // Verify the pending mutation row is scoped to the parent vine and
+        // Verify the observation event row is scoped to the parent vine and
         // to the KEEP target node at the node's depth.
+        // (Replaces old pyramid_pending_mutations query — table dropped.)
         let mut stmt = conn
             .prepare(
-                "SELECT slug, layer, mutation_type, target_ref
-                 FROM pyramid_pending_mutations
-                 WHERE slug = ?1 AND processed = 0",
+                "SELECT slug, layer, event_type, target_node_id
+                 FROM dadbear_observation_events
+                 WHERE slug = ?1",
             )
             .unwrap();
         let rows: Vec<(String, i64, String, String)> = stmt
             .query_map(rusqlite::params!["parent-v"], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, Option<String>>(3)?.unwrap_or_default()))
             })
             .unwrap()
             .filter_map(Result::ok)
@@ -759,8 +753,8 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "parent-v");
-        assert_eq!(rows[0].1, 2, "pending mutation should land at the vine node's layer");
-        assert_eq!(rows[0].2, "confirmed_stale");
+        assert_eq!(rows[0].1, 2, "observation event should land at the vine node's layer");
+        assert_eq!(rows[0].2, "vine_stale");
         assert_eq!(rows[0].3, "v-node-keep");
 
         // Running the enqueue a second time is additive — the stale engine
@@ -778,17 +772,18 @@ mod tests {
         assert_eq!(enqueued_again, 1);
 
         // Confirm the DISCONNECT target still hasn't been touched.
+        // (Replaces old pyramid_pending_mutations query — table dropped.)
         let disconnect_present: bool = conn
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM pyramid_pending_mutations
-                               WHERE slug = 'parent-v' AND target_ref = 'v-node-disconnect')",
+                "SELECT EXISTS(SELECT 1 FROM dadbear_observation_events
+                               WHERE slug = 'parent-v' AND target_node_id = 'v-node-disconnect')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert!(
             !disconnect_present,
-            "DISCONNECT evidence must never be promoted to a pending mutation"
+            "DISCONNECT evidence must never be promoted to an observation event"
         );
     }
 

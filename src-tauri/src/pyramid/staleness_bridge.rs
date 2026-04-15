@@ -152,8 +152,8 @@ fn advance_bridge_cursor(conn: &Connection, slug: &str, new_cursor: i64) {
 /// Read observation events from `dadbear_observation_events` using a cursor,
 /// converting file-level events to `ChangedFile` entries for the staleness pipeline.
 ///
-/// Falls back to the old `pyramid_pending_mutations` CTE if no observation events
-/// are found (transition period where the backfill hasn't run or the new table is empty).
+/// Read observation events from `dadbear_observation_events` using a cursor,
+/// converting file-level events to `ChangedFile` entries for the staleness pipeline.
 pub fn auto_detect_changed_files(conn: &Connection, slug: &str) -> Result<Vec<ChangedFile>> {
     // Ensure the cursor column exists (idempotent migration)
     ensure_bridge_cursor_column(conn);
@@ -216,62 +216,9 @@ pub fn auto_detect_changed_files(conn: &Connection, slug: &str) -> Result<Vec<Ch
         return Ok(changed_files);
     }
 
-    // Fallback: old WAL path during transition
-    auto_detect_changed_files_from_wal(conn, slug)
-}
-
-/// Legacy fallback: read from `pyramid_pending_mutations` using the atomic CTE.
-/// Kept during the transition period while the new observation events table
-/// may not yet have all historical data.
-fn auto_detect_changed_files_from_wal(conn: &Connection, slug: &str) -> Result<Vec<ChangedFile>> {
-    let mut stmt = conn.prepare(
-        "WITH batch AS (
-             SELECT id, target_ref, mutation_type
-             FROM pyramid_pending_mutations
-             WHERE slug = ?1 AND target_ref IS NOT NULL AND target_ref != ''
-               AND mutation_type IN ('file_change', 'new_file', 'deleted_file', 'rename_candidate')
-               AND processed = 0
-         )
-         UPDATE pyramid_pending_mutations SET processed = 1
-         WHERE id IN (SELECT id FROM batch)
-         RETURNING target_ref, mutation_type",
-    )?;
-
-    let rows = stmt.query_map(rusqlite::params![slug], |row| {
-        let file_path: String = row.get(0)?;
-        let mutation_type: String = row.get(1)?;
-        Ok((file_path, mutation_type))
-    })?;
-
-    let mut seen = std::collections::HashSet::new();
-    let mut changed_files = Vec::new();
-    for row in rows {
-        let (file_path, mutation_type) = row?;
-        if !seen.insert((file_path.clone(), mutation_type.clone())) {
-            continue;
-        }
-        let change_type = match mutation_type.as_str() {
-            "new_file" => ChangeType::Addition,
-            "deleted_file" => ChangeType::Deletion,
-            "file_change" => ChangeType::Modification,
-            "rename_candidate" => ChangeType::Modification,
-            "added" | "add" => ChangeType::Addition,
-            "deleted" | "delete" | "removed" | "remove" => ChangeType::Deletion,
-            _ => ChangeType::Modification,
-        };
-        changed_files.push(ChangedFile {
-            path: file_path,
-            change_type,
-        });
-    }
-
-    info!(
-        slug,
-        count = changed_files.len(),
-        "Auto-detected changed files from pending mutations WAL fallback (marked as processed)"
-    );
-
-    Ok(changed_files)
+    // No fallback — the old WAL (pyramid_pending_mutations) has been dropped.
+    // If observation events are empty, return empty vec.
+    Ok(Vec::new())
 }
 
 /// Convert request body entries to internal `ChangedFile` format.

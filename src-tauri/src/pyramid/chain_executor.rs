@@ -6160,19 +6160,7 @@ async fn execute_process_gaps(
                                     "node_id": node.id,
                                 })
                                 .to_string();
-                                c.execute(
-                                    "INSERT INTO pyramid_pending_mutations
-                                     (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
-                                     VALUES (?1, 0, 'evidence_set_growth', ?2, ?3, 0, ?4, 0)",
-                                    rusqlite::params![
-                                        base_slug_owned,
-                                        node.self_prompt,
-                                        evidence_detail,
-                                        now
-                                    ],
-                                )?;
-
-                                // Dual-write: observation event
+                                // Canonical write: observation event (old WAL INSERT removed)
                                 let _ = super::observation_events::write_observation_event(
                                     &c,
                                     &base_slug_owned,

@@ -3555,26 +3555,8 @@ async fn post_build_seed(
 
     let config = {
         let conn = pyramid_state.reader.lock().await;
-        conn.query_row(
-            "SELECT slug, auto_update, debounce_minutes, min_changed_files,
-                    runaway_threshold, breaker_tripped, breaker_tripped_at, frozen, frozen_at
-             FROM pyramid_auto_update_config WHERE slug = ?1",
-            rusqlite::params![slug],
-            |row| {
-                Ok(wire_node_lib::pyramid::types::AutoUpdateConfig {
-                    slug: row.get(0)?,
-                    auto_update: row.get::<_, i32>(1)? != 0,
-                    debounce_minutes: row.get(2)?,
-                    min_changed_files: row.get(3)?,
-                    runaway_threshold: row.get(4)?,
-                    breaker_tripped: row.get::<_, i32>(5)? != 0,
-                    breaker_tripped_at: row.get(6)?,
-                    frozen: row.get::<_, i32>(7)? != 0,
-                    frozen_at: row.get(8)?,
-                })
-            },
-        )
-        .map_err(|e| e.to_string())?
+        wire_node_lib::pyramid::db::get_auto_update_config(&conn, slug)
+            .ok_or_else(|| format!("No DADBEAR config for slug '{}'", slug))?
     };
 
     let defer_maintenance = {
@@ -6466,39 +6448,88 @@ async fn pyramid_auto_update_config_set(
             return Err("No fields to update".to_string());
         }
 
-        let slug_idx = params.len() + 1;
-        params.push(Box::new(slug.clone()));
-        let sql = format!(
-            "UPDATE pyramid_auto_update_config SET {} WHERE slug = ?{}",
-            sets.join(", "),
-            slug_idx
-        );
+        // Resolve current norms, apply user's changes, supersede the contribution.
+        let mut norms = wire_node_lib::pyramid::config_contributions::resolve_dadbear_norms(
+            &conn, Some(&slug),
+        ).unwrap_or_default();
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let result = match conn.execute(&sql, param_refs.as_slice()) {
-            Ok(0) => Err(format!("No auto-update config for slug '{}'", slug)),
-            Ok(_) => match pyramid_db::get_auto_update_config(&conn, &slug) {
-                Some(config) => {
-                    if config.breaker_tripped
-                        && !wire_node_lib::pyramid::watcher::check_runaway(&conn, &slug, &config)
-                    {
-                        wire_node_lib::pyramid::auto_update_ops::resume_breaker(
-                            &conn,
-                            &state.pyramid.build_event_bus,
-                            &slug,
-                        )
-                        .map_err(|e: anyhow::Error| e.to_string())?;
-                        should_resume_breaker = true;
-                    }
+        // Apply the user's changes to the resolved norms
+        if let Some(d) = debounce_minutes {
+            norms.debounce_secs = (d as i64) * 60;
+        }
+        if let Some(m) = min_changed_files {
+            norms.min_changed_files = m as i64;
+        }
+        if let Some(r) = runaway_threshold {
+            norms.runaway_threshold = r;
+        }
 
-                    let refreshed =
-                        pyramid_db::get_auto_update_config(&conn, &slug).unwrap_or(config);
-                    serde_json::to_value(&refreshed).map_err(|e| e.to_string())
+        // Serialize the updated norms as YAML
+        let yaml_content = serde_yaml::to_string(&norms).map_err(|e| e.to_string())?;
+
+        // Find the active dadbear_norms contribution for this slug and supersede it,
+        // or create a new one if none exists.
+        let existing = wire_node_lib::pyramid::config_contributions::load_active_config_contribution(
+            &conn, "dadbear_norms", Some(&slug),
+        ).ok().flatten();
+
+        if let Some(old_contrib) = existing {
+            // Supersede with updated values
+            wire_node_lib::pyramid::config_contributions::supersede_config_contribution(
+                &conn,
+                &state.pyramid.build_event_bus,
+                &old_contrib.contribution_id,
+                &yaml_content,
+                Some("Updated via DADBEAR panel config save"),
+            ).map_err(|e: anyhow::Error| e.to_string())?;
+        } else {
+            // Create new per-slug norms contribution
+            wire_node_lib::pyramid::config_contributions::create_config_contribution(
+                &conn,
+                &state.pyramid.build_event_bus,
+                "dadbear_norms",
+                Some(&slug),
+                &yaml_content,
+                "local",
+                "operator",
+                None,
+            ).map_err(|e: anyhow::Error| e.to_string())?;
+        }
+
+        // Handle auto_update toggle: if turning off, place a frozen hold;
+        // if turning on, clear frozen hold.
+        if let Some(a) = auto_update {
+            if !a {
+                wire_node_lib::pyramid::auto_update_ops::freeze(
+                    &conn, &state.pyramid.build_event_bus, &slug,
+                ).map_err(|e: anyhow::Error| e.to_string())?;
+            } else {
+                wire_node_lib::pyramid::auto_update_ops::unfreeze(
+                    &conn, &state.pyramid.build_event_bus, &slug,
+                ).map_err(|e: anyhow::Error| e.to_string())?;
+            }
+        }
+
+        // Check if breaker should auto-clear
+        let result = match pyramid_db::get_auto_update_config(&conn, &slug) {
+            Some(config) => {
+                if config.breaker_tripped
+                    && !wire_node_lib::pyramid::watcher::check_runaway(&conn, &slug, &config)
+                {
+                    wire_node_lib::pyramid::auto_update_ops::resume_breaker(
+                        &conn,
+                        &state.pyramid.build_event_bus,
+                        &slug,
+                    )
+                    .map_err(|e: anyhow::Error| e.to_string())?;
+                    should_resume_breaker = true;
                 }
-                None => Ok(serde_json::json!({"status": "updated"})),
-            },
-            Err(e) => Err(e.to_string()),
+
+                let refreshed =
+                    pyramid_db::get_auto_update_config(&conn, &slug).unwrap_or(config);
+                serde_json::to_value(&refreshed).map_err(|e| e.to_string())
+            }
+            None => Err(format!("No config for slug '{}'", slug)),
         };
 
         (result, should_resume_breaker)
@@ -6659,11 +6690,7 @@ async fn pyramid_auto_update_freeze(
         let conn = state.pyramid.writer.lock().await;
         wire_node_lib::pyramid::auto_update_ops::freeze(&conn, &state.pyramid.build_event_bus, &slug)
             .map_err(|e: anyhow::Error| e.to_string())?;
-        // Drain pending mutations so they don't fire on unfreeze
-        let _ = conn.execute(
-            "UPDATE pyramid_pending_mutations SET processed = 1 WHERE processed = 0 AND slug = ?1",
-            rusqlite::params![slug],
-        );
+        // Old WAL drain removed — holds projection anti-join prevents dispatch while frozen.
     }
     let mut watchers = state.pyramid.file_watchers.lock().await;
     if let Some(watcher) = watchers.get_mut(&slug) {
@@ -7781,14 +7808,7 @@ async fn pyramid_freeze_all(
         // (Engines drain their own WAL inside engine.freeze() below.)
         // Must happen while we still hold the writer connection.
         let engines = state.pyramid.stale_engines.lock().await;
-        for slug in &slugs {
-            if !engines.contains_key(slug) {
-                let _ = conn.execute(
-                    "UPDATE pyramid_pending_mutations SET processed = 1 WHERE processed = 0 AND slug = ?1",
-                    rusqlite::params![slug],
-                );
-            }
-        }
+        // Old WAL drain removed — holds projection anti-join prevents dispatch while frozen.
         drop(engines);
         slugs
         // conn (writer lock) dropped here
@@ -8080,10 +8100,8 @@ async fn pyramid_breaker_archive_and_rebuild(
             &slug_info.source_path,
         )
         .map_err(|e| e.to_string())?;
-        let _ = conn.execute(
-            "INSERT OR IGNORE INTO pyramid_auto_update_config (slug) VALUES (?1)",
-            rusqlite::params![new_slug],
-        );
+        // Old auto_update_config INSERT removed — table dropped.
+        // Contribution existence in pyramid_dadbear_config is the enable gate.
     }
 
     Ok(serde_json::json!({

@@ -24,6 +24,7 @@ export interface DensityConfig {
     label_min_radius: number | 'auto';
     max_iterations: number | 'auto';
     center_gravity: number | 'auto';
+    max_nodes: number | 'auto';
 }
 
 // ── Internal simulation types ────────────────────────────────────────
@@ -100,6 +101,11 @@ function resolveMaxIterations(cfg: number | 'auto', nodeCount: number): number {
 function resolveCenterGravity(cfg: number | 'auto'): number {
     if (cfg !== 'auto') return cfg;
     return 0.01;
+}
+
+function resolveMaxNodes(cfg: number | 'auto'): number {
+    if (cfg !== 'auto') return cfg;
+    return 500;
 }
 
 // ── Bezier control point (matches pyramid layout convention) ─────────
@@ -255,7 +261,7 @@ export function useDensityLayout(
     encodings: Map<string, NodeEncoding>,
     densityConfig: DensityConfig,
     active: boolean,
-): { nodes: SurfaceNode[]; edges: SurfaceEdge[]; settled: boolean; labelMinRadius: number } {
+): { nodes: SurfaceNode[]; edges: SurfaceEdge[]; settled: boolean; labelMinRadius: number; disabled: boolean } {
     return useMemo(() => {
         // When not in density mode, pass through unchanged
         if (!active || nodes.length === 0 || width === 0 || height === 0) {
@@ -264,6 +270,19 @@ export function useDensityLayout(
                 edges,
                 settled: true,
                 labelMinRadius: 0,
+                disabled: false,
+            };
+        }
+
+        // OOM guard: skip simulation for large pyramids
+        const maxNodes = resolveMaxNodes(densityConfig.max_nodes);
+        if (nodes.length > maxNodes) {
+            return {
+                nodes,
+                edges,
+                settled: false,
+                labelMinRadius: 0,
+                disabled: true,
             };
         }
 
@@ -436,6 +455,7 @@ export function useDensityLayout(
             edges: densityEdges,
             settled,
             labelMinRadius,
+            disabled: false,
         };
     }, [nodes, edges, width, height, encodings, densityConfig, active]);
 }

@@ -1,0 +1,4 @@
+experiment	branch	parent	commit	metric	secondary_metrics	status	duration_s	description
+0	research/vibesmithy-code-pyramids	-	-	3.9	build_complete=yes;apex_present=yes;shape=34L0-34L1-1L2;eval_mode=provisional_single_evaluator	interesting	0	Baseline from existing vibesmithy5 build: apex exists but L1 failed to form multi-file threads
+1	research/vibesmithy-code-pyramids	0	a50b9a3	5.1	build_complete=complete_with_errors;apex_present=yes;shape=34L0-1L1;single_child_l1=0;failures=1;eval_mode=provisional_single_evaluator	keep	102	Subsystem-role frontend extraction produced a coherent architecture summary node, but over-collapsed to one L1 node
+2	research/vibesmithy-code-pyramids	1	4b1829a	4.2	build_complete=complete_with_errors;apex_present=yes;shape=13L0-13L1-1L2;failures=2;coverage_regressed=yes;eval_mode=provisional_single_evaluator	discard	68	Stronger clustering guidance restored multiple nodes but lost most of the corpus coverage

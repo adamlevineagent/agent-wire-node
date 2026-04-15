@@ -109,14 +109,7 @@ fn enqueue_parent_confirmed_stales(
     let parent_targets = resolve_evidence_targets_for_node_ids(conn, slug, source_node_ids)?;
 
     for target in &parent_targets {
-        conn.execute(
-            "INSERT INTO pyramid_pending_mutations
-             (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
-             VALUES (?1, 1, 'confirmed_stale', ?2, ?3, 0, ?4, 0)",
-            rusqlite::params![slug, target, detail, now],
-        )?;
-
-        // Dual-write: observation event
+        // Canonical write: observation event (old WAL INSERT removed)
         let _ = super::observation_events::write_observation_event(
             conn,
             slug,

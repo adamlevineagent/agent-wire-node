@@ -1,7 +1,7 @@
-// pyramid/watcher.rs — File watcher that detects source changes and writes mutations to the WAL
+// pyramid/watcher.rs — File watcher that detects source changes and writes observation events
 //
 // Watches source directories for file create/modify/remove events, computes SHA-256 hashes,
-// compares against pyramid_file_hashes, and writes pending mutations to pyramid_pending_mutations.
+// compares against pyramid_file_hashes, and writes observation events to dadbear_observation_events.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -609,15 +609,19 @@ pub fn check_runaway(conn: &Connection, slug: &str, config: &AutoUpdateConfig) -
         return false; // pyramid just created, no baseline
     }
 
-    // Count distinct pending L0 file targets excluding new_file and deleted_file.
-    // This matches the operator-facing meaning of the threshold: "what share of
-    // tracked files is currently pending?" Duplicate watcher rows should not
-    // inflate the breaker ratio.
+    // Count distinct pending L0 file targets from observation events.
+    // Uses dadbear_observation_events (canonical stream) instead of the
+    // dropped pyramid_pending_mutations table.
     let mutation_count: i64 = conn
         .query_row(
-            "SELECT COUNT(DISTINCT target_ref) FROM pyramid_pending_mutations
-             WHERE slug = ?1 AND layer = 0 AND processed = 0
-             AND mutation_type NOT IN ('new_file', 'deleted_file')",
+            "SELECT COUNT(DISTINCT file_path) FROM dadbear_observation_events
+             WHERE slug = ?1 AND layer = 0
+             AND event_type NOT IN ('file_created', 'file_deleted')
+             AND file_path IS NOT NULL AND file_path != ''
+             AND id > COALESCE(
+                 (SELECT last_bridge_observation_id FROM pyramid_build_metadata WHERE slug = ?1),
+                 0
+             )",
             rusqlite::params![slug],
             |row| row.get(0),
         )
@@ -629,7 +633,11 @@ pub fn check_runaway(conn: &Connection, slug: &str, config: &AutoUpdateConfig) -
     ratio > config.runaway_threshold
 }
 
-/// Write a pending mutation to the WAL. Returns the inserted row ID.
+/// Write a mutation observation event. Returns the observation event row ID.
+///
+/// DECOMMISSIONED: The old WAL (pyramid_pending_mutations) INSERT has been
+/// removed. Only the canonical observation event is written. The supervisor
+/// consumes dadbear_observation_events directly.
 pub fn write_mutation(
     conn: &Connection,
     slug: &str,
@@ -638,22 +646,6 @@ pub fn write_mutation(
     target_ref: &str,
     detail: Option<&str>,
 ) -> Result<i64> {
-    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    conn.execute(
-        "INSERT INTO pyramid_pending_mutations
-         (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, 0)",
-        rusqlite::params![slug, layer, mutation_type, target_ref, detail, now],
-    )
-    .with_context(|| {
-        format!(
-            "Failed to write mutation type='{}' for slug='{}'",
-            mutation_type, slug
-        )
-    })?;
-    let wal_id = conn.last_insert_rowid();
-
-    // Dual-write: observation event (always written, even during pause)
     let obs_event_type = match mutation_type {
         "file_change" => "file_modified",
         "new_file" => "file_created",
@@ -661,7 +653,7 @@ pub fn write_mutation(
         "rename_candidate" => "file_renamed",
         other => other, // pass through unknown types
     };
-    let _ = super::observation_events::write_observation_event(
+    let event_id = super::observation_events::write_observation_event(
         conn,
         slug,
         "watcher",
@@ -673,9 +665,9 @@ pub fn write_mutation(
         None,            // target_node_id
         Some(layer as i64),
         detail,          // metadata_json = detail
-    );
+    )?;
 
-    Ok(wal_id)
+    Ok(event_id)
 }
 
 /// Multi-pyramid fan-out: find all slugs that track the given file path.
@@ -700,27 +692,15 @@ fn open_conn(db_path: &str) -> Result<Connection> {
 }
 
 /// Load the AutoUpdateConfig for a slug, returning a default if not found.
+///
+/// DECOMMISSIONED: No longer reads from pyramid_auto_update_config (table dropped).
+/// Delegates to db::get_auto_update_config which synthesizes from canonical sources.
 fn load_auto_update_config(conn: &Connection, slug: &str) -> AutoUpdateConfig {
-    conn.query_row(
-        "SELECT slug, auto_update, debounce_minutes, min_changed_files,
-                runaway_threshold, breaker_tripped, breaker_tripped_at, frozen, frozen_at
-         FROM pyramid_auto_update_config WHERE slug = ?1",
-        rusqlite::params![slug],
-        |row| {
-            Ok(AutoUpdateConfig {
-                slug: row.get(0)?,
-                auto_update: row.get::<_, i32>(1)? != 0,
-                debounce_minutes: row.get(2)?,
-                min_changed_files: row.get(3)?,
-                runaway_threshold: row.get(4)?,
-                breaker_tripped: row.get::<_, i32>(5)? != 0,
-                breaker_tripped_at: row.get(6)?,
-                frozen: row.get::<_, i32>(7)? != 0,
-                frozen_at: row.get(8)?,
-            })
-        },
-    )
-    .unwrap_or(AutoUpdateConfig {
+    if let Some(config) = pyramid_db::get_auto_update_config(conn, slug) {
+        return config;
+    }
+    // Fallback: return sensible defaults
+    AutoUpdateConfig {
         slug: slug.to_string(),
         auto_update: false,
         debounce_minutes: 5,
@@ -730,7 +710,7 @@ fn load_auto_update_config(conn: &Connection, slug: &str) -> AutoUpdateConfig {
         breaker_tripped_at: None,
         frozen: false,
         frozen_at: None,
-    })
+    }
 }
 
 /// Check runaway for a slug by loading its config from the database.

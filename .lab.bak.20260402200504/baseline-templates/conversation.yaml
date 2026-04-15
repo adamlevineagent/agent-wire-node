@@ -1,0 +1,255 @@
+# Conversation Pipeline Chain Definition — Maximal Design
+#
+# The forward/reverse/combine pattern is preserved — it's the best
+# compression strategy for sequential content.
+#
+# The KEY CHANGE: after L0 combine, we go directly to semantic thread
+# clustering instead of blind positional pairing. This groups topics
+# across chunks by subject, producing L1 nodes that are coherent
+# knowledge areas instead of arbitrary chunk pairs.
+#
+# Pipeline:
+#   1. Forward pass (sequential, context-accumulating)
+#   2. Reverse pass (sequential, backward annotation)
+#   3. Combine → L0 nodes (fuse forward + reverse)
+#   4. Thread clustering (LLM groups L0 topics by subject)
+#   5. Thread synthesis → L1 nodes (per-thread, temporally-ordered)
+#   6. L1 cross-layer webbing
+#   7. Upper layers (recursive clustering → apex)
+#   8. L2 cross-layer webbing
+
+schema_version: 1
+id: conversation-default
+name: Conversation Pyramid
+description: >
+  Conversation analysis with forward/reverse compression, semantic thread
+  clustering (replacing blind L1 pairing), temporally-ordered synthesis,
+  cross-layer webbing, and recursive clustering to apex.
+content_type: conversation
+version: "2.0.0"
+author: agent-wire
+
+defaults:
+  model_tier: mid
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  # ── Step 1: Forward pass ────────────────────────────────────────────
+  # Sequential chronological compression with running context.
+  - name: forward_pass
+    primitive: compress
+    instruction: "$prompts/conversation/forward.md"
+    for_each: $chunks
+    sequential: true
+    accumulate:
+      field: running_context
+      init: "Beginning of conversation."
+      max_chars: 1500
+      trim_to: 1200
+      trim_side: start
+    input:
+      user_template: "## RUNNING CONTEXT FROM PRIOR CHUNKS\n{running_context}\n\n## CHUNK {chunk_index}\n{chunk_content}"
+    save_as: step_only
+    depth: -1
+
+  # ── Step 2: Reverse pass ────────────────────────────────────────────
+  # Sequential backward annotation — marks what mattered vs noise.
+  - name: reverse_pass
+    primitive: compress
+    instruction: "$prompts/conversation/reverse.md"
+    for_each: $chunks_reversed
+    sequential: true
+    accumulate:
+      field: running_context
+      init: "End of conversation."
+      max_chars: 1500
+      trim_to: 1200
+      trim_side: end
+    input:
+      user_template: "## RUNNING CONTEXT FROM FUTURE CHUNKS\n{running_context}\n\n## CHUNK {chunk_index}\n{chunk_content}"
+    save_as: step_only
+    depth: -1
+
+  # ── Step 3: Combine forward + reverse → L0 nodes ───────────────────
+  # Fuses forward (what was understood) + reverse (what mattered).
+  # Keeps what survived, drops dead ends, preserves corrections.
+  - name: combine_l0
+    primitive: fuse
+    instruction: "$prompts/conversation/combine.md"
+    for_each: $chunks
+    input:
+      user_template: "## FORWARD (STONE)\n{forward_output_pretty}\n\n## REVERSE (WATER)\n{reverse_output_pretty}\n\nCombine into L0."
+      zip_steps:
+        - forward_pass
+        - reverse_pass
+    save_as: node
+    node_id_pattern: "L0-{index:03}"
+    depth: 0
+
+  # ── Step 4: Thread clustering ───────────────────────────────────────
+  # Groups ALL L0 topics by SUBJECT across chunks. A topic discussed in
+  # chunks 3, 7, and 12 becomes ONE thread. Replaces blind L1 pairing.
+  - name: thread_clustering
+    primitive: classify
+    instruction: "$prompts/conversation/conv_cluster.md"
+    input:
+      topics: $combine_l0
+    response_schema:
+      type: object
+      properties:
+        threads:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+                description: "2-6 word thread label"
+              description:
+                type: string
+              assignments:
+                type: array
+                minItems: 1
+                items:
+                  type: object
+                  properties:
+                    source_node:
+                      type: string
+                      description: "Exact L0-XXX node ID"
+                    topic_index:
+                      type: integer
+                    topic_name:
+                      type: string
+                  required: ["source_node", "topic_index", "topic_name"]
+                  additionalProperties: false
+            required: ["name", "description", "assignments"]
+            additionalProperties: false
+      required: ["threads"]
+      additionalProperties: false
+    model: "qwen/qwen3.5-flash-02-23"
+    temperature: 0.3
+    on_error: "retry(3)"
+
+  # ── Step 5: Thread synthesis → L1 nodes ─────────────────────────────
+  # Per-thread synthesis with strong temporal authority. Topics within
+  # each thread sorted by chunk order. Later topics override earlier.
+  # Corrections are first-class content.
+  - name: thread_narrative
+    primitive: synthesize
+    instruction: "$prompts/conversation/conv_thread.md"
+    for_each: $thread_clustering.threads
+    node_id_pattern: "L1-{index:03}"
+    depth: 1
+    save_as: node
+    concurrency: 5
+    model_tier: mid
+    temperature: 0.3
+    on_error: "retry(2)"
+
+  # ── Step 6: L1 cross-layer webbing ──────────────────────────────────
+  - name: l1_webbing
+    primitive: web
+    instruction: "$prompts/conversation/conv_web.md"
+    input:
+      nodes: $thread_narrative
+    response_schema:
+      type: object
+      properties:
+        edges:
+          type: array
+          items:
+            type: object
+            properties:
+              source:
+                type: string
+              target:
+                type: string
+              relationship:
+                type: string
+              shared_resources:
+                type: array
+                items:
+                  type: string
+              strength:
+                type: number
+            required: ["source", "target", "relationship", "shared_resources", "strength"]
+            additionalProperties: false
+      required: ["edges"]
+      additionalProperties: false
+    depth: 1
+    save_as: web_edges
+    model_tier: mid
+    temperature: 0.2
+    on_error: skip
+
+  # ── Step 7: Upper layers (recursive clustering → apex) ──────────────
+  - name: upper_layer_synthesis
+    primitive: synthesize
+    instruction: "$prompts/conversation/conv_distill.md"
+    recursive_cluster: true
+    cluster_instruction: "$prompts/conversation/conv_recluster.md"
+    cluster_model: "qwen/qwen3.5-flash-02-23"
+    cluster_response_schema:
+      type: object
+      properties:
+        clusters:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              description:
+                type: string
+              node_ids:
+                type: array
+                items:
+                  type: string
+            required: ["name", "description", "node_ids"]
+            additionalProperties: false
+      required: ["clusters"]
+      additionalProperties: false
+    depth: 1
+    save_as: node
+    node_id_pattern: "L{depth}-{index:03}"
+    model_tier: mid
+    temperature: 0.3
+    on_error: "retry(3)"
+
+  # ── Step 8: L2 cross-layer webbing ──────────────────────────────────
+  - name: l2_webbing
+    primitive: web
+    instruction: "$prompts/conversation/conv_web.md"
+    response_schema:
+      type: object
+      properties:
+        edges:
+          type: array
+          items:
+            type: object
+            properties:
+              source:
+                type: string
+              target:
+                type: string
+              relationship:
+                type: string
+              shared_resources:
+                type: array
+                items:
+                  type: string
+              strength:
+                type: number
+            required: ["source", "target", "relationship", "shared_resources", "strength"]
+            additionalProperties: false
+      required: ["edges"]
+      additionalProperties: false
+    depth: 2
+    save_as: web_edges
+    model_tier: mid
+    temperature: 0.2
+    on_error: skip
+
+post_build: []

@@ -11,7 +11,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
 import { PyramidSurface } from './PyramidSurface';
 import { GridView } from './GridView';
-import { NodeInspectorPanel } from '../theatre/NodeInspectorPanel';
+import { NodeInspectorModal } from '../theatre/NodeInspectorModal';
 import { useVizConfig } from '../../hooks/useVizConfig';
 import type { LiveNodeInfo } from '../theatre/types';
 
@@ -99,7 +99,7 @@ export function PyramidSurfaceWindow({ slug: initialSlug }: PyramidSurfaceWindow
                     onNodeClick={handleNodeClick}
                 />
                 {inspectedNodeId && currentSlug && (
-                    <NodeInspectorPanel
+                    <NodeInspectorModal
                         slug={currentSlug}
                         nodeId={inspectedNodeId}
                         allNodes={allNodes}

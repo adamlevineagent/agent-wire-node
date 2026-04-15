@@ -1744,13 +1744,10 @@ pub fn migrate_dadbear_policy_to_split(conn: &Connection) -> Result<()> {
         rows.filter_map(|r| r.ok()).collect()
     };
 
-    let disabled_slugs: std::collections::HashSet<String> = {
-        let mut stmt = conn.prepare(
-            "SELECT slug FROM pyramid_auto_update_config WHERE auto_update = 0"
-        )?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
+    // DECOMMISSIONED: pyramid_auto_update_config table dropped.
+    // Contribution existence in pyramid_dadbear_config is the enable gate.
+    // All slugs with a dadbear config are considered enabled.
+    let disabled_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let mut slug_policies: std::collections::HashMap<
         String,

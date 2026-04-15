@@ -37,6 +37,7 @@ export interface PyramidVizConfig {
         label_min_radius: number | 'auto';
         max_iterations: number | 'auto';
         center_gravity: number | 'auto';
+        max_nodes: number | 'auto';
     };
 }
 
@@ -74,6 +75,7 @@ const DEFAULT_VIZ_CONFIG: PyramidVizConfig = {
         label_min_radius: 'auto',
         max_iterations: 'auto',
         center_gravity: 'auto',
+        max_nodes: 'auto',
     },
 };
 

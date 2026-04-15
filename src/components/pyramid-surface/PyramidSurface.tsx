@@ -107,6 +107,7 @@ export function PyramidSurface({
             label_min_radius: d?.label_min_radius ?? 'auto',
             max_iterations: d?.max_iterations ?? 'auto',
             center_gravity: d?.center_gravity ?? 'auto',
+            max_nodes: d?.max_nodes ?? 'auto',
         };
     }, [config]);
 
@@ -115,6 +116,7 @@ export function PyramidSurface({
         edges: densityEdges,
         settled: _densitySettled,
         labelMinRadius,
+        disabled: densityDisabled,
     } = useDensityLayout(
         nodes,
         edges,
@@ -145,6 +147,13 @@ export function PyramidSurface({
             );
         }
     }, [layoutMode, labelMinRadius]);
+
+    // Auto-revert from density mode when OOM guard fires
+    useEffect(() => {
+        if (densityDisabled && layoutMode === 'density') {
+            setLayoutMode('pyramid');
+        }
+    }, [densityDisabled, layoutMode]);
 
     // Auto-enable build overlay and open chronicle when building
     useEffect(() => {
@@ -369,6 +378,8 @@ export function PyramidSurface({
                     <button
                         className={`ps-toggle-btn ${layoutMode === 'density' ? 'active' : ''}`}
                         onClick={() => setLayoutMode('density')}
+                        disabled={densityDisabled}
+                        title={densityDisabled ? `Density view unavailable (>${nodes.length} nodes)` : 'Density layout'}
                     >
                         Density
                     </button>
@@ -423,12 +434,21 @@ export function PyramidSurface({
                 {hoveredNodeId && (() => {
                     const node = activeNodes.find((n) => n.id === hoveredNodeId);
                     if (!node) return null;
+                    // Clamp tooltip to container bounds
+                    const tooltipW = 290; // max-width 280 + margin
+                    const tooltipH = 120; // headline + meta + distilled + padding
+                    let ttLeft = node.x + 12;
+                    let ttTop = node.y - 8;
+                    if (ttLeft + tooltipW > containerSize.width) ttLeft = node.x - tooltipW;
+                    if (ttTop + tooltipH > containerSize.height) ttTop = node.y - tooltipH;
+                    ttLeft = Math.max(0, ttLeft);
+                    ttTop = Math.max(0, ttTop);
                     return (
                         <div
                             className="ps-tooltip"
                             style={{
-                                left: node.x + 12,
-                                top: node.y - 8,
+                                left: ttLeft,
+                                top: ttTop,
                             }}
                         >
                             <div className="ps-tooltip-headline">{node.headline}</div>
@@ -454,19 +474,20 @@ export function PyramidSurface({
                         />
                     </div>
                 )}
-                {/* Chronicle overlay — absolute-positioned at bottom of canvas */}
-                {chronicleOpen && (
-                    <Chronicle
-                        slug={slug}
-                        entries={chronicleEntries}
-                        generation={chronicleGen}
-                        onArtifactClick={onNodeClick}
-                        onClose={toggleChronicle}
-                        showMechanicalOps={config.chronicle.show_mechanical_ops}
-                        autoExpandDecisions={config.chronicle.auto_expand_decisions}
-                    />
-                )}
             </div>
+
+            {/* Chronicle — flex child below canvas, shrinks canvas via ResizeObserver */}
+            {chronicleOpen && (
+                <Chronicle
+                    slug={slug}
+                    entries={chronicleEntries}
+                    generation={chronicleGen}
+                    onArtifactClick={onNodeClick}
+                    onClose={toggleChronicle}
+                    showMechanicalOps={config.chronicle.show_mechanical_ops}
+                    autoExpandDecisions={config.chronicle.auto_expand_decisions}
+                />
+            )}
 
             {/* Event Ticker — bottom bar, always visible when entries exist */}
             {config.ticker.enabled && (

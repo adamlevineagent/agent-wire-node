@@ -81,7 +81,8 @@ fn default_pyramid_viz_config() -> serde_json::Value {
             "settle_threshold": "auto",
             "label_min_radius": "auto",
             "max_iterations": "auto",
-            "center_gravity": "auto"
+            "center_gravity": "auto",
+            "max_nodes": "auto"
         }
     })
 }
