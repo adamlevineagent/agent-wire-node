@@ -1,4 +1,127 @@
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+// ── Node Identity ────────────────────────────────────────────────────────
+
+/// Persistent node identity — unique per physical machine.
+/// Stored in `{data_dir}/node_identity.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeIdentity {
+    pub node_handle: String,
+    pub node_token: String,
+}
+
+impl NodeIdentity {
+    /// Load from disk, or generate + save on first launch / upgrade.
+    pub fn load_or_generate(data_dir: &Path) -> Self {
+        let path = data_dir.join("node_identity.json");
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(identity) = serde_json::from_str::<NodeIdentity>(&data) {
+                tracing::info!("Loaded node identity: handle={}", identity.node_handle);
+                return identity;
+            }
+        }
+
+        // First launch or upgrade — derive handle
+        let handle = derive_handle_from_onboarding(data_dir)
+            .unwrap_or_else(generate_default_handle);
+        let token = generate_node_token();
+
+        let identity = NodeIdentity {
+            node_handle: handle,
+            node_token: token,
+        };
+
+        // Save immediately
+        if let Err(e) = identity.save(data_dir) {
+            tracing::error!("Failed to save node_identity.json: {}", e);
+        }
+
+        tracing::info!("Generated new node identity: handle={}", identity.node_handle);
+        identity
+    }
+
+    /// Persist to disk.
+    pub fn save(&self, data_dir: &Path) -> Result<(), String> {
+        let path = data_dir.join("node_identity.json");
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize node identity: {}", e))?;
+        std::fs::write(&path, json)
+            .map_err(|e| format!("Failed to write node_identity.json: {}", e))?;
+        Ok(())
+    }
+}
+
+/// Try to derive a handle from the existing onboarding.json node_name field.
+/// Returns None if onboarding.json doesn't exist or has no usable node_name.
+fn derive_handle_from_onboarding(data_dir: &Path) -> Option<String> {
+    let onboarding_path = data_dir.join("onboarding.json");
+    let data = std::fs::read_to_string(&onboarding_path).ok()?;
+    let saved: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let node_name = saved.get("node_name")?.as_str()?;
+    let handle = sanitize_handle(node_name);
+    if handle.is_empty() || handle == "wire-node" || handle == "localhost" {
+        None
+    } else {
+        Some(handle)
+    }
+}
+
+/// Generate a default handle from the system hostname (POSIX gethostname,
+/// NOT env vars — env vars are often empty in macOS GUI contexts).
+fn generate_default_handle() -> String {
+    let raw = gethostname::gethostname()
+        .to_string_lossy()
+        .to_lowercase();
+    let sanitized: String = raw
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    let trimmed = sanitized.trim_matches('-');
+    if trimmed.is_empty() || trimmed == "localhost" {
+        format!("node-{}", &uuid::Uuid::new_v4().to_string()[..4])
+    } else if trimmed.len() > 20 {
+        trimmed[..20].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Sanitize a string into a valid handle: lowercase, alphanumeric + hyphens, max 20 chars.
+fn sanitize_handle(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    let sanitized: String = lower
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    let trimmed = sanitized.trim_matches('-');
+    if trimmed.len() > 20 {
+        trimmed[..20].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Generate a cryptographically random node token: 32 bytes, hex-encoded, `nt_` prefix.
+fn generate_node_token() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 32] = rng.gen();
+    format!("nt_{}", hex::encode(bytes))
+}
+
+/// Append a random 4-char suffix to a handle for 409 retry.
+fn handle_with_suffix(base: &str) -> String {
+    let suffix = &uuid::Uuid::new_v4().to_string()[..4];
+    let candidate = format!("{}-{}", base, suffix);
+    if candidate.len() > 24 {
+        // Trim base to make room for suffix
+        let trimmed_base = &base[..base.len().min(19)];
+        format!("{}-{}", trimmed_base, suffix)
+    } else {
+        candidate
+    }
+}
 
 /// Mask an email for safe log output: "a***@example.com"
 fn mask_email(email: &str) -> String {
@@ -28,6 +151,9 @@ pub struct AuthState {
     pub operator_id: Option<String>,
     #[serde(default)]
     pub operator_session_expires_at: Option<String>,
+    /// Operator's Wire handle (e.g. "hello") — populated from registration/heartbeat response.
+    #[serde(default)]
+    pub operator_handle: Option<String>,
 }
 
 impl AuthState {
@@ -159,6 +285,7 @@ pub async fn verify_magic_link_token(
         operator_session_token: None,
         operator_id: None,
         operator_session_expires_at: None,
+        operator_handle: None,
     })
 }
 
@@ -215,6 +342,7 @@ pub async fn verify_otp(
         operator_session_token: None,
         operator_id: None,
         operator_session_expires_at: None,
+        operator_handle: None,
     })
 }
 
@@ -266,6 +394,7 @@ pub async fn login(
         operator_session_token: None,
         operator_id: None,
         operator_session_expires_at: None,
+        operator_handle: None,
     })
 }
 
@@ -315,53 +444,101 @@ pub struct SessionRegistrationResponse {
     pub agent_id: String,
     pub operator_id: String,
     pub jwt_public_key: Option<String>,
+    /// Node handle confirmed by the server (may differ from requested if suffixed).
+    #[serde(default)]
+    pub node_handle: Option<String>,
+    /// Operator's Wire handle (e.g. "hello") — for constructing full handle paths.
+    #[serde(default)]
+    pub operator_handle: Option<String>,
 }
 
 /// Register this desktop node using a Supabase session token.
 /// POST to /api/v1/node/register-with-session
 /// Returns a gne_live_ machine token for all subsequent Wire API calls.
+///
+/// Sends `node_handle` and `node_token` for node identity. If the server
+/// returns 409 "handle taken", retries up to 3 times with a random suffix.
 pub async fn register_with_session(
     api_url: &str,
     supabase_access_token: &str,
-    node_name: &str,
+    node_handle: &str,
+    node_token: &str,
 ) -> Result<SessionRegistrationResponse, String> {
     let client = reqwest::Client::new();
     let url = format!("{}/api/v1/node/register-with-session", api_url);
 
-    let body = serde_json::json!({
-        "supabase_access_token": supabase_access_token,
-        "name": node_name,
-        "capabilities": ["cache", "verify", "grade", "enrich", "storage"],
-    });
+    let mut current_handle = node_handle.to_string();
+    let max_retries = 3;
 
-    let resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Session registration request failed: {}", e))?;
+    for attempt in 0..=max_retries {
+        let body = serde_json::json!({
+            "supabase_access_token": supabase_access_token,
+            "name": &current_handle,
+            "node_handle": &current_handle,
+            "node_token": node_token,
+            "capabilities": ["cache", "verify", "grade", "enrich", "storage"],
+            "app_version": env!("CARGO_PKG_VERSION"),
+        });
 
-    if !resp.status().is_success() {
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Session registration request failed: {}", e))?;
+
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "Session registration failed ({}): {}",
-            status, text
-        ));
+
+        // Handle 409: handle taken — retry with suffix
+        if status.as_u16() == 409 && attempt < max_retries {
+            let text = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                "Handle '{}' taken (attempt {}/{}): {}. Retrying with suffix.",
+                current_handle,
+                attempt + 1,
+                max_retries,
+                text,
+            );
+            current_handle = handle_with_suffix(node_handle);
+            continue;
+        }
+
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "Session registration failed ({}): {}",
+                status, text
+            ));
+        }
+
+        let reg: SessionRegistrationResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse session registration response: {}", e))?;
+
+        tracing::info!(
+            "Session registration complete: node_id={}, agent_id={}, handle={}",
+            reg.node_id,
+            reg.agent_id,
+            current_handle,
+        );
+
+        // If handle changed due to 409 retry, return the accepted handle in the response.
+        // The caller is responsible for updating node_identity.json.
+        if current_handle != node_handle {
+            let mut reg = reg;
+            reg.node_handle = Some(current_handle);
+            return Ok(reg);
+        }
+
+        return Ok(reg);
     }
 
-    let reg: SessionRegistrationResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse session registration response: {}", e))?;
-
-    tracing::info!(
-        "Session registration complete: node_id={}, agent_id={}",
-        reg.node_id,
-        reg.agent_id
-    );
-    Ok(reg)
+    Err(format!(
+        "Handle '{}' taken after {} retries",
+        node_handle, max_retries
+    ))
 }
 
 // --- Heartbeat --------------------------------------------------------------

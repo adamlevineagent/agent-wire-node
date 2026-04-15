@@ -678,6 +678,8 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         step_ctx: ctx.cloned(), // Law 4: StepContext flows through
                         model_id: queue_model_id.clone(),
                         enqueued_at: std::time::Instant::now(),
+                        work_item_id: None, // Non-DADBEAR path
+                        attempt_id: None,
                     },
                 );
                 q.queue_depth(&queue_model_id)
@@ -840,7 +842,8 @@ pub async fn call_model_unified_with_audit_and_ctx(
                                         generation_id: None,
                                         actual_cost_usd: None, // fleet is free (same operator)
                                         provider_id: Some("fleet".to_string()),
-                                        fleet_peer_id: Some(peer_clone.node_id.clone()),
+                                        fleet_peer_id: Some(peer_clone.handle_path.clone()
+                                            .unwrap_or_else(|| peer_clone.node_id.clone())),
                                         fleet_peer_model: fleet_resp.peer_model.clone(),
                                     });
                                 }

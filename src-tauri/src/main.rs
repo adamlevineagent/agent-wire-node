@@ -73,8 +73,21 @@ async fn verify_magic_link(
 
     // Register with Wire using Supabase session token — propagate errors
     let supabase_token = auth_state.access_token.clone().unwrap_or_default();
+    let (nh, nt) = match &state.node_identity {
+        Some(ni) => (ni.node_handle.clone(), ni.node_token.clone()),
+        None => (config.node_name(), String::new()),
+    };
     let registration =
-        auth::register_with_session(&config.api_url, &supabase_token, &config.node_name()).await?;
+        auth::register_with_session(&config.api_url, &supabase_token, &nh, &nt).await?;
+
+    // If handle changed due to 409 retry, update node_identity.json
+    if let Some(ref new_handle) = registration.node_handle {
+        if let Some(ref ni) = state.node_identity {
+            let mut updated = ni.clone();
+            updated.node_handle = new_handle.clone();
+            let _ = updated.save(&config.data_dir());
+        }
+    }
 
     let node_id = Some(registration.node_id.clone());
     let api_token = Some(registration.api_token.clone());
@@ -88,6 +101,7 @@ async fn verify_magic_link(
         node_id: node_id.clone(),
         api_token: api_token.clone(),
         first_started_at: first_started.clone(),
+        operator_handle: registration.operator_handle.clone(),
         ..auth_state
     };
 
@@ -144,8 +158,21 @@ async fn verify_otp(
 
     // Register with Wire using Supabase session token — propagate errors
     let supabase_token = auth_state.access_token.clone().unwrap_or_default();
+    let (nh, nt) = match &state.node_identity {
+        Some(ni) => (ni.node_handle.clone(), ni.node_token.clone()),
+        None => (config.node_name(), String::new()),
+    };
     let registration =
-        auth::register_with_session(&config.api_url, &supabase_token, &config.node_name()).await?;
+        auth::register_with_session(&config.api_url, &supabase_token, &nh, &nt).await?;
+
+    // If handle changed due to 409 retry, update node_identity.json
+    if let Some(ref new_handle) = registration.node_handle {
+        if let Some(ref ni) = state.node_identity {
+            let mut updated = ni.clone();
+            updated.node_handle = new_handle.clone();
+            let _ = updated.save(&config.data_dir());
+        }
+    }
 
     let node_id = Some(registration.node_id.clone());
     let api_token = Some(registration.api_token.clone());
@@ -159,6 +186,7 @@ async fn verify_otp(
         node_id: node_id.clone(),
         api_token: api_token.clone(),
         first_started_at: first_started.clone(),
+        operator_handle: registration.operator_handle.clone(),
         ..auth_state
     };
 
@@ -215,8 +243,21 @@ async fn login(
 
     // Register with Wire using Supabase session token
     let supabase_token = auth_state.access_token.clone().unwrap_or_default();
+    let (nh, nt) = match &state.node_identity {
+        Some(ni) => (ni.node_handle.clone(), ni.node_token.clone()),
+        None => (config.node_name(), String::new()),
+    };
     let registration =
-        auth::register_with_session(&config.api_url, &supabase_token, &config.node_name()).await?;
+        auth::register_with_session(&config.api_url, &supabase_token, &nh, &nt).await?;
+
+    // If handle changed due to 409 retry, update node_identity.json
+    if let Some(ref new_handle) = registration.node_handle {
+        if let Some(ref ni) = state.node_identity {
+            let mut updated = ni.clone();
+            updated.node_handle = new_handle.clone();
+            let _ = updated.save(&config.data_dir());
+        }
+    }
 
     let node_id = Some(registration.node_id.clone());
     let api_token = Some(registration.api_token.clone());
@@ -230,6 +271,7 @@ async fn login(
         node_id: node_id.clone(),
         api_token: api_token.clone(),
         first_started_at: first_started.clone(),
+        operator_handle: registration.operator_handle.clone(),
         ..auth_state
     };
 
@@ -493,9 +535,14 @@ async fn attempt_wire_registration(state: &AppState) -> bool {
         )
     };
 
+    let (nh, nt) = match &state.node_identity {
+        Some(ni) => (ni.node_handle.clone(), ni.node_token.clone()),
+        None => (node_name.clone(), String::new()),
+    };
+
     // Try registration with current access token
     if let Some(ref at) = access_token {
-        match auth::register_with_session(&api_url, at, &node_name).await {
+        match auth::register_with_session(&api_url, at, &nh, &nt).await {
             Ok(reg) => {
                 let mut auth = state.auth.write().await;
                 auth.api_token = Some(reg.api_token.clone());
@@ -503,6 +550,19 @@ async fn attempt_wire_registration(state: &AppState) -> bool {
                 // Propagate operator_id so fleet routing has same-operator identity.
                 if auth.operator_id.is_none() {
                     auth.operator_id = Some(reg.operator_id.clone());
+                }
+                // Propagate operator_handle from registration response.
+                if reg.operator_handle.is_some() {
+                    auth.operator_handle = reg.operator_handle.clone();
+                }
+                // If handle changed due to 409 retry, update node_identity.json
+                if let Some(ref new_handle) = reg.node_handle {
+                    if let Some(ref ni) = state.node_identity {
+                        let mut updated = ni.clone();
+                        updated.node_handle = new_handle.clone();
+                        let config = state.config.read().await;
+                        let _ = updated.save(&config.data_dir());
+                    }
                 }
                 let config = state.config.read().await;
                 save_session(&config, &auth);
@@ -528,7 +588,7 @@ async fn attempt_wire_registration(state: &AppState) -> bool {
                 }
 
                 // Now register with the fresh access token
-                match auth::register_with_session(&api_url, &new_access, &node_name).await {
+                match auth::register_with_session(&api_url, &new_access, &nh, &nt).await {
                     Ok(reg) => {
                         let mut auth = state.auth.write().await;
                         auth.api_token = Some(reg.api_token.clone());
@@ -536,6 +596,19 @@ async fn attempt_wire_registration(state: &AppState) -> bool {
                         // Propagate operator_id so fleet routing has same-operator identity.
                         if auth.operator_id.is_none() {
                             auth.operator_id = Some(reg.operator_id.clone());
+                        }
+                        // Propagate operator_handle from registration response.
+                        if reg.operator_handle.is_some() {
+                            auth.operator_handle = reg.operator_handle.clone();
+                        }
+                        // If handle changed due to 409 retry, update node_identity.json
+                        if let Some(ref new_handle) = reg.node_handle {
+                            if let Some(ref ni) = state.node_identity {
+                                let mut updated = ni.clone();
+                                updated.node_handle = new_handle.clone();
+                                let config_r = state.config.read().await;
+                                let _ = updated.save(&config_r.data_dir());
+                            }
                         }
                         let config = state.config.read().await;
                         save_session(&config, &auth);
@@ -3440,7 +3513,7 @@ async fn post_build_seed(
                     created_at: String::new(),
                     updated_at: String::new(),
                 };
-                match wire_node_lib::pyramid::db::save_dadbear_config(&conn, &config) {
+                match wire_node_lib::pyramid::db::save_dadbear_config_with_contributions(&conn, &config) {
                     Ok(_) => tracing::info!("Post-build: DADBEAR watch config created for '{}' → '{}'", slug, watch_dir),
                     Err(e) => tracing::warn!("Post-build: DADBEAR config creation failed for '{}': {}", slug, e),
                 }
@@ -6263,6 +6336,7 @@ async fn pyramid_vine_integrity(
         supabase_anon_key: state.pyramid.supabase_anon_key.clone(),
         csrf_secret: state.pyramid.csrf_secret,
         dadbear_handle: state.pyramid.dadbear_handle.clone(),
+        dadbear_supervisor_handle: state.pyramid.dadbear_supervisor_handle.clone(),
         dadbear_in_flight: state.pyramid.dadbear_in_flight.clone(),
         provider_registry: state.pyramid.provider_registry.clone(),
         credential_store: state.pyramid.credential_store.clone(),
@@ -6319,6 +6393,7 @@ async fn pyramid_vine_rebuild_upper(
         supabase_anon_key: state.pyramid.supabase_anon_key.clone(),
         csrf_secret: state.pyramid.csrf_secret,
         dadbear_handle: state.pyramid.dadbear_handle.clone(),
+        dadbear_supervisor_handle: state.pyramid.dadbear_supervisor_handle.clone(),
         dadbear_in_flight: state.pyramid.dadbear_in_flight.clone(),
         provider_registry: state.pyramid.provider_registry.clone(),
         credential_store: state.pyramid.credential_store.clone(),
@@ -6915,13 +6990,12 @@ fn resolve_cost_rollup_range(args: &CostRollupArgs) -> anyhow::Result<(String, S
 }
 
 /// Phase 13 + Phase 18c: bulk-pause DADBEAR across pyramids matching
-/// the given scope. Idempotent — returns the number of rows whose
-/// `enabled` column flipped from 1 to 0 (rows already paused
-/// contribute 0 to the count).
+/// Phase 7 (canonical): pause delegates to freeze_all via the holds projection.
+/// The old `enabled` column approach is removed — pausing now places a 'frozen' hold.
 ///
 /// Scopes (per `cross-pyramid-observability.md` "Pause-All Semantics"):
-/// - `"all"` — every enabled config (Phase 13)
-/// - `"folder"` — configs whose `source_path` is exactly `scope_value`
+/// - `"all"` — freeze every unfrozen pyramid (Phase 13)
+/// - `"folder"` — freeze pyramids whose `source_path` is exactly `scope_value`
 ///   or a descendant. `scope_value` is required. (Phase 18c L9)
 /// - `"circle"` — DEFERRED. The local DB has no `pyramid_metadata`
 ///   table with `circle_id` to query against; circle membership lives
@@ -6933,72 +7007,35 @@ async fn pyramid_pause_dadbear_all(
     scope: String,
     scope_value: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let conn = state.pyramid.writer.lock().await;
-    let affected = match scope.as_str() {
-        "all" => pyramid_db::disable_dadbear_all(&conn).map_err(|e| e.to_string())?,
-        "folder" => {
-            let folder = scope_value
-                .as_deref()
-                .filter(|v| !v.is_empty())
-                .ok_or_else(|| {
-                    "pyramid_pause_dadbear_all: scope `folder` requires a non-empty scope_value"
-                        .to_string()
-                })?;
-            pyramid_db::disable_dadbear_by_folder(&conn, folder).map_err(|e| e.to_string())?
-        }
-        "circle" => {
-            return Err(
-                "pyramid_pause_dadbear_all: scope `circle` is deferred — local DB has no \
-                 circle_id column on pyramid_metadata. Tracked in deferral-ledger.md as a \
-                 follow-up to Phase 18c."
-                    .to_string(),
-            )
-        }
-        other => {
-            return Err(format!(
-                "pyramid_pause_dadbear_all: unknown scope `{}` (expected all|folder|circle)",
-                other
-            ))
-        }
-    };
-    Ok(serde_json::json!({ "affected": affected }))
+    if scope == "circle" {
+        return Err(
+            "pyramid_pause_dadbear_all: scope `circle` is deferred — local DB has no \
+             circle_id column on pyramid_metadata. Tracked in deferral-ledger.md as a \
+             follow-up to Phase 18c."
+                .to_string(),
+        );
+    }
+    // Delegate to freeze_all which uses holds projection (canonical path).
+    pyramid_freeze_all(state, scope, scope_value).await
 }
 
-/// Phase 13 + Phase 18c: mirror of `pyramid_pause_dadbear_all`.
+/// Phase 7 (canonical): resume delegates to unfreeze_all via the holds projection.
+/// The old `enabled` column approach is removed — resuming clears the 'frozen' hold.
 #[tauri::command]
 async fn pyramid_resume_dadbear_all(
     state: tauri::State<'_, SharedState>,
     scope: String,
     scope_value: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let conn = state.pyramid.writer.lock().await;
-    let affected = match scope.as_str() {
-        "all" => pyramid_db::enable_dadbear_all(&conn).map_err(|e| e.to_string())?,
-        "folder" => {
-            let folder = scope_value
-                .as_deref()
-                .filter(|v| !v.is_empty())
-                .ok_or_else(|| {
-                    "pyramid_resume_dadbear_all: scope `folder` requires a non-empty scope_value"
-                        .to_string()
-                })?;
-            pyramid_db::enable_dadbear_by_folder(&conn, folder).map_err(|e| e.to_string())?
-        }
-        "circle" => {
-            return Err(
-                "pyramid_resume_dadbear_all: scope `circle` is deferred — see \
-                 deferral-ledger.md for the follow-up note."
-                    .to_string(),
-            )
-        }
-        other => {
-            return Err(format!(
-                "pyramid_resume_dadbear_all: unknown scope `{}` (expected all|folder|circle)",
-                other
-            ))
-        }
-    };
-    Ok(serde_json::json!({ "affected": affected }))
+    if scope == "circle" {
+        return Err(
+            "pyramid_resume_dadbear_all: scope `circle` is deferred — see \
+             deferral-ledger.md for the follow-up note."
+                .to_string(),
+        );
+    }
+    // Delegate to unfreeze_all which uses holds projection (canonical path).
+    pyramid_unfreeze_all(state, scope, scope_value).await
 }
 
 /// Phase 18c (L9): list distinct `source_path` values across all
@@ -7055,185 +7092,20 @@ async fn pyramid_count_dadbear_scope(
     Ok(serde_json::json!({ "count": count }))
 }
 
-// ── Phase 15: DADBEAR Oversight Page ────────────────────────────────────────
+// ── Phase 7: Legacy v1 oversight handlers removed ──────────────────────────
 //
-// Per `docs/specs/evidence-triage-and-dadbear.md` Part 3 (DADBEAR
-// Oversight Page). The Oversight page is a unified view assembling
-// per-pyramid DADBEAR status, pending mutations, in-flight checks,
-// deferred questions, demand signals, cost reconciliation, and
-// activity logs. These IPCs aggregate data from existing operational
-// tables in a single round trip so the frontend can poll cheaply.
+// The following v1 handlers were removed in Phase 7 (legacy cleanup):
+//   - `pyramid_dadbear_overview` → replaced by `pyramid_dadbear_overview_v2`
+//   - `pyramid_dadbear_activity_log` → replaced by `pyramid_dadbear_activity_v2`
 //
-// The `pyramid_dadbear_overview` command is the primary entry point;
-// `pyramid_dadbear_activity_log` powers a per-slug activity drawer;
-// `pyramid_dadbear_pause` / `pyramid_dadbear_resume` are per-slug
-// toggles (the `*_all` variants Phase 13 shipped remain the global
-// controls). `pyramid_acknowledge_orphan_broadcast` closes the loop
-// on Phase 11's leak detection surface by letting the admin dismiss
-// a specific orphan row after review.
+// The v1 types (DadbearOverviewRow, DadbearOverviewTotals, DadbearOverviewResponse,
+// DadbearActivityEntry) and their handlers read from legacy tables
+// (pyramid_auto_update_config, pyramid_pending_mutations).
+// The v2 handlers read from canonical tables (dadbear_work_items,
+// dadbear_holds_projection, dadbear_observation_events, etc.).
 
-#[derive(serde::Serialize)]
-struct DadbearOverviewRow {
-    slug: String,
-    display_name: String,
-    enabled: bool,
-    scan_interval_secs: i64,
-    debounce_secs: i64,
-    last_scan_at: Option<String>,
-    next_scan_at: Option<String>,
-    pending_mutations_count: i64,
-    in_flight_stale_checks: i64,
-    deferred_questions_count: i64,
-    demand_signals_24h: i64,
-    cost_24h_estimated_usd: f64,
-    cost_24h_actual_usd: f64,
-    cost_reconciliation_status: String,
-    recent_manifest_count: i64,
-    frozen: bool,
-    breaker_tripped: bool,
-    auto_update: bool,
-}
-
-#[derive(serde::Serialize)]
-struct DadbearOverviewTotals {
-    total_estimated_24h_usd: f64,
-    total_actual_24h_usd: f64,
-    total_pending_mutations: i64,
-    total_in_flight_checks: i64,
-    total_deferred_questions: i64,
-    paused_count: i64,
-    active_count: i64,
-    frozen_count: usize,
-    breaker_count: usize,
-}
-
-#[derive(serde::Serialize)]
-struct DadbearOverviewResponse {
-    pyramids: Vec<DadbearOverviewRow>,
-    totals: DadbearOverviewTotals,
-}
-
-/// Phase 15: aggregate DADBEAR status across every pyramid that has
-/// a `pyramid_dadbear_config` row. Delegates to
-/// `pyramid_db::build_dadbear_overview_rows` for the pure DB aggregation,
-/// then folds in the runtime `dadbear_in_flight` map to fill the
-/// `in_flight_stale_checks` column and computes per-row
-/// `next_scan_at` + global totals. Called by the Oversight page on
-/// mount and on a polling interval.
-#[tauri::command]
-async fn pyramid_dadbear_overview(
-    state: tauri::State<'_, SharedState>,
-) -> Result<DadbearOverviewResponse, String> {
-    let conn = state.pyramid.reader.lock().await;
-
-    // Snapshot of the in-flight flag map, keyed by
-    // `pyramid_dadbear_config.id`. We only hold the mutex long
-    // enough to copy the current flag values.
-    let in_flight_snapshot: std::collections::HashMap<i64, bool> = {
-        let guard = match state.pyramid.dadbear_in_flight.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard
-            .iter()
-            .map(|(id, flag)| {
-                (*id, flag.load(std::sync::atomic::Ordering::Relaxed))
-            })
-            .collect()
-    };
-
-    let db_rows = pyramid_db::build_dadbear_overview_rows(&conn)
-        .map_err(|e| e.to_string())?;
-    drop(conn);
-
-    let mut pyramids: Vec<DadbearOverviewRow> = Vec::with_capacity(db_rows.len());
-    let mut total_estimated_24h_usd = 0.0;
-    let mut total_actual_24h_usd = 0.0;
-    let mut total_pending_mutations: i64 = 0;
-    let mut total_in_flight_checks: i64 = 0;
-    let mut total_deferred_questions: i64 = 0;
-    let mut paused_count: i64 = 0;
-    let mut active_count: i64 = 0;
-    let mut frozen_count: usize = 0;
-    let mut breaker_count: usize = 0;
-
-    for db_row in db_rows {
-        // In-flight count: configs whose per-id flag is currently
-        // set. `pyramid_stale_check_log` has no `completed_at`
-        // column, so the runtime AtomicBool map is the authoritative
-        // in-flight signal (see the deviation note in the Phase 15
-        // implementation log).
-        let in_flight_stale_checks: i64 = db_row
-            .config_ids
-            .iter()
-            .filter(|id| in_flight_snapshot.get(id).copied().unwrap_or(false))
-            .count() as i64;
-
-        let next_scan_at = db_row.last_scan_at.as_ref().and_then(|ts| {
-            chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
-                .ok()
-                .map(|dt| {
-                    (dt + chrono::Duration::seconds(db_row.scan_interval_secs))
-                        .format("%Y-%m-%d %H:%M:%S")
-                        .to_string()
-                })
-        });
-
-        // Hierarchical classification: Breaker > Frozen > Active.
-        // States are mutually exclusive so the operator sees a clean picture.
-        if db_row.breaker_tripped {
-            breaker_count += 1;
-        } else if db_row.frozen {
-            frozen_count += 1;
-            // Frozen IS the paused state now — unified with per-card toggle.
-            paused_count += 1;
-        } else {
-            active_count += 1;
-        }
-        total_estimated_24h_usd += db_row.cost_24h_estimated_usd;
-        total_actual_24h_usd += db_row.cost_24h_actual_usd;
-        total_pending_mutations += db_row.pending_mutations_count;
-        total_in_flight_checks += in_flight_stale_checks;
-        total_deferred_questions += db_row.deferred_questions_count;
-
-        pyramids.push(DadbearOverviewRow {
-            slug: db_row.slug.clone(),
-            display_name: db_row.slug,
-            enabled: db_row.enabled,
-            scan_interval_secs: db_row.scan_interval_secs,
-            debounce_secs: db_row.debounce_secs,
-            last_scan_at: db_row.last_scan_at,
-            next_scan_at,
-            pending_mutations_count: db_row.pending_mutations_count,
-            in_flight_stale_checks,
-            deferred_questions_count: db_row.deferred_questions_count,
-            demand_signals_24h: db_row.demand_signals_24h,
-            cost_24h_estimated_usd: db_row.cost_24h_estimated_usd,
-            cost_24h_actual_usd: db_row.cost_24h_actual_usd,
-            cost_reconciliation_status: db_row.cost_reconciliation_status,
-            recent_manifest_count: db_row.recent_manifest_count,
-            frozen: db_row.frozen,
-            breaker_tripped: db_row.breaker_tripped,
-            auto_update: db_row.auto_update,
-        });
-    }
-
-    Ok(DadbearOverviewResponse {
-        pyramids,
-        totals: DadbearOverviewTotals {
-            total_estimated_24h_usd,
-            total_actual_24h_usd,
-            total_pending_mutations,
-            total_in_flight_checks,
-            total_deferred_questions,
-            paused_count,
-            active_count,
-            frozen_count,
-            breaker_count,
-        },
-    })
-}
-
+/// Shared activity entry struct used by the v2 activity handler.
+/// (Originally defined alongside the v1 handlers, moved here in Phase 7.)
 #[derive(serde::Serialize)]
 struct DadbearActivityEntry {
     timestamp: String,
@@ -7243,12 +7115,306 @@ struct DadbearActivityEntry {
     details: Option<String>,
 }
 
-/// Phase 15: return recent DADBEAR-adjacent events for a single slug,
-/// merged across the stale-check log, pending mutations, and change
-/// manifests. The activity drawer uses this to render a per-slug
-/// timeline when the user clicks "View Activity" on a pyramid card.
+// ── Phase 6 (Canonical): Work-item-centric overview + activity v2 ──────────
+//
+// New IPC handlers that read from the canonical tables (dadbear_work_items,
+// dadbear_holds_projection, dadbear_observation_events, dadbear_dispatch_previews,
+// dadbear_work_attempts, dadbear_compilation_state). Coexist alongside the old
+// handlers until Phase 7 drops legacy tables.
+
+#[derive(serde::Serialize)]
+struct WorkItemOverviewHold {
+    hold: String,
+    held_since: String,
+    reason: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct WorkItemOverviewRow {
+    slug: String,
+    display_name: String,
+    holds: Vec<WorkItemOverviewHold>,
+    derived_status: String, // 'active' | 'paused' | 'breaker' | 'held'
+    epoch_id: String,
+    recipe_version: Option<String>,
+    pending_observations: i64,
+    compiled_items: i64,
+    blocked_items: i64,
+    previewed_items: i64,
+    dispatched_items: i64,
+    completed_items_24h: i64,
+    applied_items_24h: i64,
+    failed_items_24h: i64,
+    stale_items: i64,
+    preview_total_cost_usd: f64,
+    actual_cost_24h_usd: f64,
+    last_compilation_at: Option<String>,
+    last_dispatch_at: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct WorkItemOverviewTotals {
+    active_count: i64,
+    paused_count: i64,
+    breaker_count: i64,
+    total_compiled: i64,
+    total_dispatched: i64,
+    total_blocked: i64,
+    total_cost_24h_usd: f64,
+}
+
+#[derive(serde::Serialize)]
+struct WorkItemOverviewResponse {
+    pyramids: Vec<WorkItemOverviewRow>,
+    totals: WorkItemOverviewTotals,
+}
+
+/// Phase 6 (Canonical): work-item-centric overview. Reads from the canonical
+/// tables (holds_projection, work_items, dispatch_previews, work_attempts,
+/// compilation_state) instead of the legacy tables. Returns `WorkItemOverviewRow`
+/// per configured slug.
 #[tauri::command]
-async fn pyramid_dadbear_activity_log(
+async fn pyramid_dadbear_overview_v2(
+    state: tauri::State<'_, SharedState>,
+) -> Result<WorkItemOverviewResponse, String> {
+    let conn = state.pyramid.reader.lock().await;
+
+    // 1. ALL non-archived slugs (from pyramid_slugs, the canonical source).
+    // Not just pyramid_dadbear_config — that's only the watch config cache
+    // and misses pyramids that have builds/costs but no DADBEAR watch setup.
+    let slugs: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT slug FROM pyramid_slugs WHERE slug NOT LIKE '%--bunch-%' AND archived_at IS NULL ORDER BY slug")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        let collected: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+        collected
+    };
+
+    let mut pyramids: Vec<WorkItemOverviewRow> = Vec::with_capacity(slugs.len());
+    let mut total_active: i64 = 0;
+    let mut total_paused: i64 = 0;
+    let mut total_breaker: i64 = 0;
+    let mut total_compiled: i64 = 0;
+    let mut total_dispatched: i64 = 0;
+    let mut total_blocked: i64 = 0;
+    let mut total_cost_24h: f64 = 0.0;
+
+    for slug in &slugs {
+        // 2. Active holds for this slug
+        let holds: Vec<WorkItemOverviewHold> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT hold, held_since, reason FROM dadbear_holds_projection WHERE slug = ?1",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(rusqlite::params![slug], |row| {
+                    Ok(WorkItemOverviewHold {
+                        hold: row.get(0)?,
+                        held_since: row.get(1)?,
+                        reason: row.get(2)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?;
+            let collected: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+            collected
+        };
+
+        // Derive status from holds: breaker > frozen/cost_limit > active
+        let has_breaker = holds.iter().any(|h| h.hold == "breaker");
+        let has_frozen = holds.iter().any(|h| h.hold == "frozen");
+        let derived_status = if has_breaker {
+            "breaker"
+        } else if has_frozen {
+            "paused"
+        } else if !holds.is_empty() {
+            "held"
+        } else {
+            "active"
+        };
+
+        match derived_status {
+            "breaker" => total_breaker += 1,
+            "paused" | "held" => total_paused += 1,
+            _ => total_active += 1,
+        }
+
+        // 3. Compilation state (epoch + recipe)
+        let (epoch_id, recipe_version, last_compiled_obs_id): (String, Option<String>, i64) = conn
+            .query_row(
+                "SELECT epoch_id, recipe_contribution_id, COALESCE(last_compiled_observation_id, 0)
+                 FROM dadbear_compilation_state WHERE slug = ?1",
+                rusqlite::params![slug],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap_or_else(|_| ("none".to_string(), None, 0));
+
+        // 4. Pending observations (above the compilation cursor)
+        let pending_observations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                 WHERE slug = ?1 AND id > ?2",
+                rusqlite::params![slug, last_compiled_obs_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        // 5. Work item counts by state
+        let compiled_items: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_work_items WHERE slug = ?1 AND state = 'compiled'",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let blocked_items: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_work_items WHERE slug = ?1 AND state = 'blocked'",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let previewed_items: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_work_items WHERE slug = ?1 AND state = 'previewed'",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let dispatched_items: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_work_items WHERE slug = ?1 AND state = 'dispatched'",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let stale_items: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_work_items WHERE slug = ?1 AND state = 'stale'",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        // 24h window items
+        let completed_items_24h: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_work_items
+                 WHERE slug = ?1 AND state = 'completed'
+                   AND completed_at > datetime('now', '-24 hours')",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let applied_items_24h: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_work_items
+                 WHERE slug = ?1 AND state = 'applied'
+                   AND applied_at > datetime('now', '-24 hours')",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let failed_items_24h: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_work_items
+                 WHERE slug = ?1 AND state = 'failed'
+                   AND state_changed_at > datetime('now', '-24 hours')",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        // 6. Preview cost (committed previews, last 24h)
+        let preview_total_cost_usd: f64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(total_cost_usd), 0.0) FROM dadbear_dispatch_previews
+                 WHERE slug = ?1 AND committed_at IS NOT NULL
+                   AND created_at > datetime('now', '-24 hours')",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(0.0);
+
+        // 7. Actual cost from work attempts (completed, last 24h)
+        let actual_cost_24h_usd: f64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM dadbear_work_attempts
+                 WHERE work_item_id IN (SELECT id FROM dadbear_work_items WHERE slug = ?1)
+                   AND status = 'completed'
+                   AND completed_at > datetime('now', '-24 hours')",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(0.0);
+
+        // 8. Timing
+        let last_compilation_at: Option<String> = conn
+            .query_row(
+                "SELECT MAX(compiled_at) FROM dadbear_work_items WHERE slug = ?1",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(None);
+        let last_dispatch_at: Option<String> = conn
+            .query_row(
+                "SELECT MAX(dispatched_at) FROM dadbear_work_attempts
+                 WHERE work_item_id IN (SELECT id FROM dadbear_work_items WHERE slug = ?1)",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(None);
+
+        total_compiled += compiled_items;
+        total_dispatched += dispatched_items;
+        total_blocked += blocked_items;
+        total_cost_24h += actual_cost_24h_usd;
+
+        pyramids.push(WorkItemOverviewRow {
+            slug: slug.clone(),
+            display_name: slug.clone(),
+            holds,
+            derived_status: derived_status.to_string(),
+            epoch_id,
+            recipe_version,
+            pending_observations,
+            compiled_items,
+            blocked_items,
+            previewed_items,
+            dispatched_items,
+            completed_items_24h,
+            applied_items_24h,
+            failed_items_24h,
+            stale_items,
+            preview_total_cost_usd,
+            actual_cost_24h_usd,
+            last_compilation_at,
+            last_dispatch_at,
+        });
+    }
+
+    Ok(WorkItemOverviewResponse {
+        pyramids,
+        totals: WorkItemOverviewTotals {
+            active_count: total_active,
+            paused_count: total_paused,
+            breaker_count: total_breaker,
+            total_compiled,
+            total_dispatched,
+            total_blocked,
+            total_cost_24h_usd: total_cost_24h,
+        },
+    })
+}
+
+/// Phase 6 (Canonical): unified activity timeline for a single slug.
+/// Reads from the canonical event streams (observation_events, work_items,
+/// work_attempts, hold_events) instead of legacy tables.
+#[tauri::command]
+async fn pyramid_dadbear_activity_v2(
     state: tauri::State<'_, SharedState>,
     slug: String,
     limit: Option<i64>,
@@ -7258,135 +7424,169 @@ async fn pyramid_dadbear_activity_log(
 
     let mut entries: Vec<DadbearActivityEntry> = Vec::new();
 
-    // Stale-check log rows. Each row is a completed check, so we
-    // use it as a proxy for "stale check fired/returned". We tag
-    // the event_type with the stale flag.
-    let mut stale_stmt = conn
-        .prepare(
-            "SELECT checked_at, layer, target_id, stale, reason
-             FROM pyramid_stale_check_log
-             WHERE slug = ?1
-             ORDER BY checked_at DESC
-             LIMIT ?2",
-        )
-        .map_err(|e| e.to_string())?;
-    let stale_rows = stale_stmt
-        .query_map(rusqlite::params![slug, limit], |row| {
-            let checked_at: String = row.get(0)?;
-            let layer: i64 = row.get(1)?;
-            let target_id: String = row.get(2)?;
-            let stale: i32 = row.get(3)?;
-            let reason: String = row.get(4).unwrap_or_default();
-            Ok(DadbearActivityEntry {
-                timestamp: checked_at,
-                event_type: if stale != 0 {
-                    "stale_check_stale".to_string()
-                } else {
-                    "stale_check_fresh".to_string()
-                },
-                slug: slug.clone(),
-                target_id: Some(target_id),
-                details: Some(
-                    serde_json::json!({
-                        "layer": layer,
-                        "reason": reason,
-                    })
-                    .to_string(),
-                ),
+    // 1. Recent observation events
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT detected_at, event_type, source, source_path, file_path, target_node_id
+                 FROM dadbear_observation_events
+                 WHERE slug = ?1
+                 ORDER BY detected_at DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![slug, limit], |row| {
+                let detected_at: String = row.get(0)?;
+                let event_type: String = row.get(1)?;
+                let source: String = row.get(2)?;
+                let source_path: Option<String> = row.get(3)?;
+                let file_path: Option<String> = row.get(4)?;
+                let target_node_id: Option<String> = row.get(5)?;
+                Ok(DadbearActivityEntry {
+                    timestamp: detected_at,
+                    event_type: format!("observation_{}", event_type),
+                    slug: slug.clone(),
+                    target_id: target_node_id.or(file_path),
+                    details: Some(
+                        serde_json::json!({
+                            "source": source,
+                            "source_path": source_path,
+                        })
+                        .to_string(),
+                    ),
+                })
             })
-        })
-        .map_err(|e| e.to_string())?;
-    for row in stale_rows {
-        if let Ok(entry) = row {
-            entries.push(entry);
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            if let Ok(entry) = row {
+                entries.push(entry);
+            }
         }
     }
-    drop(stale_stmt);
 
-    // Pending mutations — each row represents a pending action on
-    // a node. We surface detected_at as the event time.
-    let mut pm_stmt = conn
-        .prepare(
-            "SELECT detected_at, layer, mutation_type, target_ref, detail, processed
-             FROM pyramid_pending_mutations
-             WHERE slug = ?1
-             ORDER BY detected_at DESC
-             LIMIT ?2",
-        )
-        .map_err(|e| e.to_string())?;
-    let pm_rows = pm_stmt
-        .query_map(rusqlite::params![slug, limit], |row| {
-            let detected_at: String = row.get(0)?;
-            let layer: i64 = row.get(1)?;
-            let mutation_type: String = row.get(2)?;
-            let target_ref: String = row.get(3)?;
-            let detail: Option<String> = row.get(4)?;
-            let processed: i32 = row.get(5)?;
-            Ok(DadbearActivityEntry {
-                timestamp: detected_at,
-                event_type: if processed != 0 {
-                    format!("mutation_applied_{}", mutation_type)
-                } else {
-                    format!("mutation_pending_{}", mutation_type)
-                },
-                slug: slug.clone(),
-                target_id: Some(target_ref),
-                details: Some(
-                    serde_json::json!({
-                        "layer": layer,
-                        "detail": detail,
-                    })
-                    .to_string(),
-                ),
+    // 2. Recent work item state transitions
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT state_changed_at, state, primitive, layer, target_id, id
+                 FROM dadbear_work_items
+                 WHERE slug = ?1
+                 ORDER BY state_changed_at DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![slug, limit], |row| {
+                let changed_at: String = row.get(0)?;
+                let state: String = row.get(1)?;
+                let primitive: String = row.get(2)?;
+                let layer: i64 = row.get(3)?;
+                let target_id: Option<String> = row.get(4)?;
+                let work_item_id: String = row.get(5)?;
+                Ok(DadbearActivityEntry {
+                    timestamp: changed_at,
+                    event_type: format!("work_item_{}", state),
+                    slug: slug.clone(),
+                    target_id,
+                    details: Some(
+                        serde_json::json!({
+                            "primitive": primitive,
+                            "layer": layer,
+                            "work_item_id": work_item_id,
+                        })
+                        .to_string(),
+                    ),
+                })
             })
-        })
-        .map_err(|e| e.to_string())?;
-    for row in pm_rows {
-        if let Ok(entry) = row {
-            entries.push(entry);
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            if let Ok(entry) = row {
+                entries.push(entry);
+            }
         }
     }
-    drop(pm_stmt);
 
-    // Change manifests — each row is a supersession event. Use
-    // applied_at as the event time. The manifest_json is only
-    // surfaced in truncated form so the drawer stays readable.
-    let mut cm_stmt = conn
-        .prepare(
-            "SELECT applied_at, node_id, build_version, note
-             FROM pyramid_change_manifests
-             WHERE slug = ?1
-             ORDER BY applied_at DESC
-             LIMIT ?2",
-        )
-        .map_err(|e| e.to_string())?;
-    let cm_rows = cm_stmt
-        .query_map(rusqlite::params![slug, limit], |row| {
-            let applied_at: String = row.get(0)?;
-            let node_id: String = row.get(1)?;
-            let build_version: i64 = row.get(2)?;
-            let note: Option<String> = row.get(3)?;
-            Ok(DadbearActivityEntry {
-                timestamp: applied_at,
-                event_type: "change_manifest_applied".to_string(),
-                slug: slug.clone(),
-                target_id: Some(node_id),
-                details: Some(
-                    serde_json::json!({
-                        "build_version": build_version,
-                        "note": note,
-                    })
-                    .to_string(),
-                ),
+    // 3. Recent dispatch attempts
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT a.dispatched_at, a.status, a.model_id, a.routing, a.cost_usd,
+                        a.work_item_id, a.error
+                 FROM dadbear_work_attempts a
+                 JOIN dadbear_work_items w ON a.work_item_id = w.id
+                 WHERE w.slug = ?1
+                 ORDER BY a.dispatched_at DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![slug, limit], |row| {
+                let dispatched_at: String = row.get(0)?;
+                let status: String = row.get(1)?;
+                let model_id: String = row.get(2)?;
+                let routing: String = row.get(3)?;
+                let cost_usd: Option<f64> = row.get(4)?;
+                let work_item_id: String = row.get(5)?;
+                let error: Option<String> = row.get(6)?;
+                Ok(DadbearActivityEntry {
+                    timestamp: dispatched_at,
+                    event_type: format!("attempt_{}", status),
+                    slug: slug.clone(),
+                    target_id: Some(work_item_id),
+                    details: Some(
+                        serde_json::json!({
+                            "model": model_id,
+                            "routing": routing,
+                            "cost_usd": cost_usd,
+                            "error": error,
+                        })
+                        .to_string(),
+                    ),
+                })
             })
-        })
-        .map_err(|e| e.to_string())?;
-    for row in cm_rows {
-        if let Ok(entry) = row {
-            entries.push(entry);
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            if let Ok(entry) = row {
+                entries.push(entry);
+            }
         }
     }
-    drop(cm_stmt);
+
+    // 4. Recent hold events
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT created_at, hold, action, reason
+                 FROM dadbear_hold_events
+                 WHERE slug = ?1
+                 ORDER BY created_at DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![slug, limit], |row| {
+                let created_at: String = row.get(0)?;
+                let hold: String = row.get(1)?;
+                let action: String = row.get(2)?;
+                let reason: Option<String> = row.get(3)?;
+                Ok(DadbearActivityEntry {
+                    timestamp: created_at,
+                    event_type: format!("hold_{}", action),
+                    slug: slug.clone(),
+                    target_id: Some(hold),
+                    details: reason.map(|r| {
+                        serde_json::json!({ "reason": r }).to_string()
+                    }),
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            if let Ok(entry) = row {
+                entries.push(entry);
+            }
+        }
+    }
 
     // Sort merged events by timestamp DESC and truncate.
     entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -7395,7 +7595,7 @@ async fn pyramid_dadbear_activity_log(
 }
 
 /// Per-slug pause. Freezes via `auto_update_ops::freeze` so the per-card
-/// and global pause share the same mechanism (pyramid_auto_update_config.frozen).
+/// and global pause share the same mechanism (holds projection).
 /// Also syncs in-memory stale engine + file watcher, matching pyramid_freeze_all.
 #[tauri::command]
 async fn pyramid_dadbear_pause(
@@ -10874,6 +11074,11 @@ fn main() {
         }
     }
 
+    // Load or generate node identity BEFORE any registration attempt.
+    // Uses gethostname (POSIX) for hostname detection, not env vars.
+    let _ = std::fs::create_dir_all(config.data_dir());
+    let node_identity = auth::NodeIdentity::load_or_generate(&config.data_dir());
+
     // Set up logging to both stdout and a log file
     let log_path = config.data_dir().join("wire-node.log");
     let _ = std::fs::create_dir_all(config.data_dir());
@@ -11183,6 +11388,7 @@ fn main() {
             s
         },
         dadbear_handle: Arc::new(tokio::sync::Mutex::new(None)),
+        dadbear_supervisor_handle: Arc::new(tokio::sync::Mutex::new(None)),
         // Phase 1 fix: shared per-config DADBEAR in-flight flag map.
         // Consulted by both the tick loop and `trigger_for_slug` so two
         // concurrent `run_tick_for_config` calls for the same config cannot
@@ -11273,6 +11479,7 @@ fn main() {
         let config_compute_queue = compute_queue_handle.clone();
         let config_auth = shared_auth.clone();
         let config_tunnel = shared_tunnel.clone();
+        let config_node_identity = node_identity.clone();
         let mut rx = ps.build_event_bus.tx.subscribe();
         tauri::async_runtime::spawn(async move {
             loop {
@@ -11346,7 +11553,9 @@ fn main() {
                                                         let auth = config_auth.read().await;
                                                         let self_node_id = auth.node_id.clone().unwrap_or_default();
                                                         let self_operator_id = auth.operator_id.clone().unwrap_or_default();
+                                                        let self_operator_handle = auth.operator_handle.clone();
                                                         drop(auth);
+                                                        let self_node_handle = Some(config_node_identity.node_handle.clone());
                                                         let tunnel_url = {
                                                             let ts = config_tunnel.read().await;
                                                             ts.tunnel_url.clone().unwrap_or_default()
@@ -11354,6 +11563,8 @@ fn main() {
                                                         let announcement = wire_node_lib::fleet::FleetAnnouncement {
                                                             node_id: self_node_id,
                                                             name: None,
+                                                            node_handle: self_node_handle,
+                                                            operator_handle: self_operator_handle,
                                                             tunnel_url,
                                                             models_loaded: loaded_models,
                                                             serving_rules,
@@ -11523,6 +11734,27 @@ fn main() {
         });
     }
 
+    // ── Phase 5: DADBEAR Runtime Supervisor ─────────────────────────────
+    //
+    // The supervisor runs ALONGSIDE the existing extend loop during the
+    // transition period (Phases 5–7). It handles dispatch + result
+    // application for work items created by the compiler (Phase 3).
+    // MUST be spawned AFTER the GPU processing loop.
+    {
+        let ps = pyramid_state.clone();
+        let cq = compute_queue_handle.clone();
+        let db_path_str = pyramid_db_path.to_string_lossy().to_string();
+        let bus = pyramid_state.build_event_bus.clone();
+        tauri::async_runtime::spawn(async move {
+            let handle = wire_node_lib::pyramid::dadbear_supervisor::start_dadbear_supervisor(
+                ps.clone(), cq, db_path_str, bus,
+            );
+            let mut sh = ps.dadbear_supervisor_handle.lock().await;
+            *sh = Some(handle);
+            tracing::info!("DADBEAR supervisor started (Phase 5)");
+        });
+    }
+
     // Phase 11: broadcast leak detection sweep.
     //
     // Runs periodically to flip synchronous cost_log rows whose
@@ -11673,6 +11905,7 @@ fn main() {
         pyramid_sync_state: pyramid_sync_state,
         compute_queue: compute_queue_handle.clone(),
         fleet_roster: fleet_roster.clone(),
+        node_identity: Some(node_identity.clone()),
     });
 
     tauri::Builder::default()
@@ -11792,10 +12025,15 @@ fn main() {
                                     };
 
                                     // Call register_with_session WITHOUT holding any lock
+                                    let (nh, nt) = match &s.node_identity {
+                                        Some(ni) => (ni.node_handle.clone(), ni.node_token.clone()),
+                                        None => (c.node_name(), String::new()),
+                                    };
                                     let registration = match auth::register_with_session(
                                         &c.api_url,
                                         &supabase_token,
-                                        &c.node_name(),
+                                        &nh,
+                                        &nt,
                                     ).await {
                                         Ok(reg) => Some(reg),
                                         Err(e) => {
@@ -11803,6 +12041,17 @@ fn main() {
                                             None
                                         }
                                     };
+
+                                    // If handle changed due to 409 retry, update node_identity.json
+                                    if let Some(ref reg) = registration {
+                                        if let Some(ref new_handle) = reg.node_handle {
+                                            if let Some(ref ni) = s.node_identity {
+                                                let mut updated = ni.clone();
+                                                updated.node_handle = new_handle.clone();
+                                                let _ = updated.save(&c.data_dir());
+                                            }
+                                        }
+                                    }
 
                                     let node_id = registration.as_ref().map(|r| r.node_id.clone());
                                     let api_token = registration.as_ref().map(|r| r.api_token.clone());
@@ -11812,6 +12061,12 @@ fn main() {
                                         let mut auth_write = s.auth.write().await;
                                         auth_write.node_id = node_id.clone();
                                         auth_write.api_token = api_token.clone();
+                                        // Propagate operator_handle from registration response.
+                                        if let Some(ref reg) = registration {
+                                            if reg.operator_handle.is_some() {
+                                                auth_write.operator_handle = reg.operator_handle.clone();
+                                            }
+                                        }
                                         let first_started = auth_write.first_started_at.clone()
                                             .or_else(|| Some(chrono::Utc::now().to_rfc3339()));
                                         auth_write.first_started_at = first_started.clone();
@@ -11952,13 +12207,26 @@ fn main() {
 
                             if !has_api_token {
                                 // Register with Wire using refreshed Supabase session token — no lock held
+                                let (nh, nt) = match &startup_state.node_identity {
+                                    Some(ni) => (ni.node_handle.clone(), ni.node_token.clone()),
+                                    None => (startup_config.node_name(), String::new()),
+                                };
                                 match auth::register_with_session(
                                     &startup_config.api_url,
                                     &new_access,
-                                    &startup_config.node_name(),
+                                    &nh,
+                                    &nt,
                                 ).await {
                                     Ok(reg) => {
                                         tracing::info!("Wire node registered on startup: {}", reg.node_id);
+                                        // If handle changed due to 409 retry, update node_identity.json
+                                        if let Some(ref new_handle) = reg.node_handle {
+                                            if let Some(ref ni) = startup_state.node_identity {
+                                                let mut updated = ni.clone();
+                                                updated.node_handle = new_handle.clone();
+                                                let _ = updated.save(&startup_config.data_dir());
+                                            }
+                                        }
                                         // Briefly acquire write lock to store registration results
                                         {
                                             let mut auth_write = startup_state.auth.write().await;
@@ -11969,6 +12237,10 @@ fn main() {
                                             // identity if session.json was lost or this is a fresh start.
                                             if auth_write.operator_id.is_none() {
                                                 auth_write.operator_id = Some(reg.operator_id.clone());
+                                            }
+                                            // Propagate operator_handle from registration response.
+                                            if reg.operator_handle.is_some() {
+                                                auth_write.operator_handle = reg.operator_handle.clone();
                                             }
                                         }
                                         // Update shared JWT public key and node ID
@@ -12167,6 +12439,15 @@ fn main() {
                                     }
                                 }
 
+                                // ── Extract operator_handle from heartbeat ──────
+                                // The heartbeat response may include operator_handle
+                                // so the node always has the latest even if claimed
+                                // between heartbeats.
+                                if let Some(oh) = response.get("operator_handle").and_then(|v| v.as_str()) {
+                                    let mut auth = heartbeat_state.auth.write().await;
+                                    auth.operator_handle = Some(oh.to_string());
+                                }
+
                                 // ── Fleet roster from heartbeat ──────────────────
                                 // Extract fleet_roster array and fleet_jwt from
                                 // the heartbeat response. Update the shared roster.
@@ -12201,7 +12482,12 @@ fn main() {
                                             let auth = heartbeat_state.auth.read().await;
                                             let self_node_id = auth.node_id.clone().unwrap_or_default();
                                             let self_operator_id = auth.operator_id.clone().unwrap_or_default();
+                                            let self_operator_handle = auth.operator_handle.clone();
                                             drop(auth);
+
+                                            let self_node_handle = heartbeat_state.node_identity
+                                                .as_ref()
+                                                .map(|ni| ni.node_handle.clone());
 
                                             let tunnel_url = {
                                                 let ts = heartbeat_state.tunnel_state.read().await;
@@ -12243,6 +12529,8 @@ fn main() {
                                             let announcement = wire_node_lib::fleet::FleetAnnouncement {
                                                 node_id: self_node_id,
                                                 name: None,
+                                                node_handle: self_node_handle,
+                                                operator_handle: self_operator_handle,
                                                 tunnel_url,
                                                 models_loaded,
                                                 serving_rules,
@@ -12727,11 +13015,12 @@ fn main() {
             // Phase 18c (L9): scoped pause/resume helper IPCs
             pyramid_list_dadbear_source_paths,
             pyramid_count_dadbear_scope,
-            // Phase 15: DADBEAR Oversight Page
-            pyramid_dadbear_overview,
-            pyramid_dadbear_activity_log,
+            // Phase 15: DADBEAR Oversight Page (v1 overview + activity_log removed in Phase 7)
             pyramid_dadbear_pause,
             pyramid_dadbear_resume,
+            // Phase 6 (Canonical): work-item-centric oversight v2
+            pyramid_dadbear_overview_v2,
+            pyramid_dadbear_activity_v2,
             pyramid_acknowledge_orphan_broadcast,
             // Phase 6: Multi-Window + Nesting
             pyramid_open_window,

@@ -1431,7 +1431,7 @@ pub fn verify_pyramid_query_jwt(
 // ── Fleet JWT verification and handlers ─────────────────────────────────
 
 /// JWT claims for fleet-internal authentication.
-/// aud: "fleet", op: operator_id, nid: source node_id
+/// aud: "fleet", op: operator_id, nid: source node_id, nh: node handle
 #[derive(Debug, Deserialize)]
 pub struct FleetJwtClaims {
     #[allow(dead_code)]
@@ -1440,6 +1440,10 @@ pub struct FleetJwtClaims {
     pub op: Option<String>,
     #[allow(dead_code)]
     pub nid: Option<String>,
+    /// Node handle (e.g. "BEHEM") — present when server supports node identity.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub nh: Option<String>,
     #[allow(dead_code)]
     pub exp: Option<u64>,
 }

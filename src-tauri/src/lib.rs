@@ -52,6 +52,9 @@ pub struct AppState {
     /// access. Arc<RwLock<>> for concurrent read from LLM path + write
     /// from heartbeat/announce handlers.
     pub fleet_roster: Arc<RwLock<fleet::FleetRoster>>,
+    /// Persistent node identity (handle + token). Loaded before first
+    /// registration attempt. None only if data_dir is unavailable.
+    pub node_identity: Option<auth::NodeIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

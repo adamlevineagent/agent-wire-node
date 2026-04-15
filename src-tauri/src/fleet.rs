@@ -30,6 +30,10 @@ pub struct FleetPeer {
     #[serde(default)]
     pub total_queue_depth: usize,
     pub last_seen: chrono::DateTime<chrono::Utc>,
+    /// Handle path (e.g. "@hello/BEHEM") — present when server supports node identity.
+    /// New nodes prefer this over node_id for provenance and display.
+    #[serde(default)]
+    pub handle_path: Option<String>,
 }
 
 /// Fleet roster — all known same-operator peers.
@@ -67,12 +71,17 @@ impl FleetRoster {
                     queue_depths: HashMap::new(),
                     total_queue_depth: 0,
                     last_seen: now,
+                    handle_path: None,
                 });
             // Heartbeat provides tunnel_url and name. Models + serving_rules
             // come from direct announcement (preferred) or queue state mirror.
             peer.tunnel_url = entry.tunnel_url;
             peer.name = entry.name;
             peer.last_seen = now;
+            // Store handle_path when the server provides it.
+            if entry.handle_path.is_some() {
+                peer.handle_path = entry.handle_path;
+            }
         }
         if fleet_jwt.is_some() {
             self.fleet_jwt = fleet_jwt;
@@ -94,6 +103,7 @@ impl FleetRoster {
                 queue_depths: HashMap::new(),
                 total_queue_depth: 0,
                 last_seen: now,
+                handle_path: None,
             });
         peer.tunnel_url = announcement.tunnel_url;
         peer.models_loaded = announcement.models_loaded;
@@ -103,6 +113,10 @@ impl FleetRoster {
         peer.last_seen = now;
         if let Some(name) = announcement.name {
             peer.name = name;
+        }
+        // Construct handle_path from announcement's node_handle + operator_handle.
+        if let (Some(nh), Some(oh)) = (&announcement.node_handle, &announcement.operator_handle) {
+            peer.handle_path = Some(format!("@{}/{}", oh, nh));
         }
     }
 
@@ -133,6 +147,9 @@ pub struct HeartbeatFleetEntry {
     pub node_id: String,
     pub name: String,
     pub tunnel_url: String,
+    /// Handle path (e.g. "@hello/BEHEM") — present when server supports node identity.
+    #[serde(default)]
+    pub handle_path: Option<String>,
 }
 
 // ── Fleet announcement (peer-to-peer) ─────────────────────────────────────
@@ -143,6 +160,12 @@ pub struct HeartbeatFleetEntry {
 pub struct FleetAnnouncement {
     pub node_id: String,
     pub name: Option<String>,
+    /// Node handle local part (e.g. "BEHEM") — new field for node identity.
+    #[serde(default)]
+    pub node_handle: Option<String>,
+    /// Operator handle (e.g. "hello") — new field for node identity.
+    #[serde(default)]
+    pub operator_handle: Option<String>,
     pub tunnel_url: String,
     /// Model IDs this peer has loaded (kept for observability).
     pub models_loaded: Vec<String>,
