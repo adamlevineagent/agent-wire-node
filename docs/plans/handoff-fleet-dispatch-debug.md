@@ -42,6 +42,23 @@ Fleet Phase A: entry check has_fleet=true rule=ollama-catchall fleet_roster_pres
 
 The fleet_roster Arc is set on the config at startup. No code path resets it to None. The build clones from the same config. Yet the build's config has `fleet_roster: None`.
 
+## Update: with_runtime_overlays_from fix applied but not sufficient
+
+The debugger found and fixed the routes.rs profile-apply path (missing fleet_roster preservation). A canonical `with_runtime_overlays_from` helper now handles both profile-apply paths. **But fleet_roster is STILL None on the build's LlmConfig.**
+
+Confirmed:
+- The fix IS in the running binary (installed 11:45, launched 11:46)
+- Startup sets fleet_roster at line 11587 (log confirms "Dispatch policy loaded... compute queue wired")
+- Both profile-apply paths now use `with_runtime_overlays_from`
+- Only 2 full-config replacement sites found in main.rs and routes.rs — both fixed
+- Yet `fleet_roster_present=false` persists in Phase A logs
+
+**The config is losing fleet_roster through a path that is NOT a full replacement.** Something else is clearing it between startup wiring and the build's config clone. Candidates:
+- ConfigSynced listener at main.rs:11727 — sets dispatch_policy + provider_pools but doesn't touch fleet_roster (should be safe)
+- A field-level `cfg.fleet_roster = None` somewhere we haven't found
+- The config being cloned BEFORE the startup wiring (timing race)
+- The PyramidState.config Arc pointing to a different LlmConfig instance than the one startup wired
+
 ## Possible Remaining Explanations
 
 1. **The config is being replaced (not field-updated) somewhere we didn't find.** A `*cfg = new_config` that creates a fresh LlmConfig without fleet_roster.
@@ -51,6 +68,42 @@ The fleet_roster Arc is set on the config at startup. No code path resets it to 
 3. **The `to_llm_config_with_runtime()` path (line 5921) resets the config.** This constructs from `to_llm_config()` which has `fleet_roster: None`. If this runs at startup (initial model detection/profile), it creates a fresh config that overwrites fleet_roster before the build starts.
 
 4. **Timing: `to_llm_config_with_runtime()` runs DURING AppState construction** (before line 11604). The initial LlmConfig on PyramidState is created from `to_llm_config()` with None. Then line 11604 sets fleet_roster. But if something between construction and 11604 triggers a config read-clone-modify-write cycle, the fleet_roster might get lost.
+
+## How to Monitor
+
+**Logs:** The Wire Node log file is at:
+```
+/Users/adamlevine/Library/Application Support/wire-node/wire-node.log
+```
+
+**Watch fleet dispatch decisions in real time:**
+```bash
+tail -f "/Users/adamlevine/Library/Application Support/wire-node/wire-node.log" | grep --line-buffered "Fleet Phase A\|fleet_dispatched\|fleet_returned\|fleet dispatch\|no peer serves\|fleet_roster"
+```
+
+**Watch fleet announces:**
+```bash
+tail -f "/Users/adamlevine/Library/Application Support/wire-node/wire-node.log" | grep --line-buffered "Fleet announce\|announce.*succeeded\|announce.*failed"
+```
+
+**Check chronicle events for fleet activity:**
+```bash
+sqlite3 "/Users/adamlevine/Library/Application Support/wire-node/pyramid.db" "SELECT event_type, source, count(*) FROM pyramid_compute_events GROUP BY event_type, source;"
+```
+
+**Build the app:**
+```bash
+export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$PATH"
+cd "/Users/adamlevine/AI Project Files/agent-wire-node"
+cargo tauri build 2>&1 | tail -20
+```
+
+**Install:**
+```bash
+rm -rf "/Applications/Wire Node.app" && cp -R "src-tauri/target/release/bundle/macos/Wire Node.app" /Applications/
+```
+
+**BEHEM (5090 PC) also needs updates:** `git pull && cargo tauri build` then reinstall on Windows.
 
 ## Debug Strategy
 
