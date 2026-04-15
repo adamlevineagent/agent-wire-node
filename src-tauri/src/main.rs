@@ -12575,6 +12575,7 @@ fn main() {
             let heartbeat_state = state.clone();
             let heartbeat_config = config.clone();
             let heartbeat_app = app.handle().clone();
+            let heartbeat_jwt_pk = jwt_public_key.clone();
             tauri::async_runtime::spawn(async move {
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
@@ -12682,6 +12683,22 @@ fn main() {
                                 if let Some(oh) = response.get("operator_handle").and_then(|v| v.as_str()) {
                                     let mut auth = heartbeat_state.auth.write().await;
                                     auth.operator_handle = Some(oh.to_string());
+                                }
+
+                                // ── JWT public key from heartbeat (self-healing) ────
+                                // Ensures nodes pick up the key without re-registration.
+                                if let Some(pk) = response.get("jwt_public_key").and_then(|v| v.as_str()) {
+                                    if !pk.is_empty() {
+                                        let mut shared_pk = heartbeat_jwt_pk.write().await;
+                                        if shared_pk.is_empty() || *shared_pk != pk {
+                                            *shared_pk = pk.to_string();
+                                            // Also persist to AuthState → session.json
+                                            let mut auth = heartbeat_state.auth.write().await;
+                                            auth.jwt_public_key = Some(pk.to_string());
+                                            save_session(&heartbeat_config, &auth);
+                                            tracing::info!("JWT public key updated from heartbeat");
+                                        }
+                                    }
                                 }
 
                                 // ── Fleet roster from heartbeat ──────────────────

@@ -557,6 +557,8 @@ impl DadbearSupervisor {
             .clone()
             .unwrap_or_else(|| item.model_tier.clone());
 
+        // DADBEAR work_item_id is the semantic job_path.
+        let job_path = wi_id.clone();
         let entry = QueueEntry {
             result_tx,
             config: queue_config,
@@ -577,7 +579,7 @@ impl DadbearSupervisor {
             work_item_id: Some(wi_id.clone()),
             attempt_id: Some(attempt_id.clone()),
             source: "local".to_string(),
-            job_path: format!("dadbear/{}/{}", slug, item.primitive),
+            job_path,
             chronicle_job_path: None,
         };
 
@@ -1892,7 +1894,7 @@ fn reconstruct_step_context(
         resolved_model_id: item.resolved_model_id.clone(),
         resolved_provider_id: item.resolved_provider_id.clone(),
         prompt_hash: item.prompt_hash.clone().unwrap_or_default(),
-        // Chronicle integration fields (added by compute chronicle cascade)
+        // Chronicle integration fields
         chain_name: String::new(),
         content_type: String::new(),
         task_label: format!("dadbear:{}", item.primitive),
