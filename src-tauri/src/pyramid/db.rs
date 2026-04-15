@@ -6428,22 +6428,22 @@ pub fn get_build_live_nodes(
 }
 
 /// Delete audit records for all builds EXCEPT the latest for each slug.
+/// Clean up audit records for a slug, preserving the LATEST audit record
+/// per node. Only deletes older duplicates where a node has been re-processed
+/// in a newer build. Nodes that were not re-processed retain their original
+/// audit records from whichever build created them.
 pub fn cleanup_old_audit_records(conn: &Connection, slug: &str) -> Result<i64> {
-    let latest_build_id: Option<String> = conn
-        .query_row(
-            "SELECT build_id FROM pyramid_llm_audit WHERE slug = ?1
-             ORDER BY id DESC LIMIT 1",
-            rusqlite::params![slug],
-            |row| row.get(0),
-        )
-        .ok();
-    let deleted = match latest_build_id {
-        Some(bid) => conn.execute(
-            "DELETE FROM pyramid_llm_audit WHERE slug = ?1 AND build_id != ?2",
-            rusqlite::params![slug, bid],
-        )?,
-        None => 0,
-    };
+    // Delete audit records where a NEWER record exists for the same slug + node_id.
+    // This preserves the latest audit per node regardless of build_id.
+    let deleted = conn.execute(
+        "DELETE FROM pyramid_llm_audit WHERE id IN (
+            SELECT a.id FROM pyramid_llm_audit a
+            INNER JOIN pyramid_llm_audit b
+                ON a.slug = b.slug AND a.node_id = b.node_id AND a.id < b.id
+            WHERE a.slug = ?1
+        )",
+        rusqlite::params![slug],
+    )?;
     Ok(deleted as i64)
 }
 

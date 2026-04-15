@@ -57,7 +57,7 @@ steps:
       running_context: "$running_context"
     node_id_pattern: "FWD-{index:03}"
     depth: 0
-    save_as: step_only
+    save_as: node
     max_input_tokens: 80000
     split_strategy: "lines"
     split_overlap_tokens: 500
@@ -68,7 +68,7 @@ steps:
     heal_instruction: "$prompts/shared/heal_json.md"
     model_tier: extractor
 
-  # ── Phase 1B: REVERSE pass (intermediate, step_only) ───────────────
+  # ── Phase 1B: REVERSE pass (intermediate, saved as nodes) ──────────
   # Sequentially walks chunks latest -> earliest using for_each_reverse.
   # Each chunk sees a rolling running_context summarizing what happens
   # AFTER it. This is the hindsight reading.
@@ -77,7 +77,9 @@ steps:
   # zip_steps lookup in combine_l0 (with reverse: true) finds the
   # correct pair, and resume keys remain stable.
   #
-  # Reused from conversation-chronological without modification.
+  # Saved as nodes so users can inspect each pass's interpretation
+  # during the build. combine_l0 later produces the authoritative
+  # merged Q-L0-* nodes from both perspectives.
   - name: reverse_pass
     primitive: extract
     instruction: "$prompts/conversation-episodic/reverse.md"
@@ -95,7 +97,7 @@ steps:
       running_context: "$running_context"
     node_id_pattern: "REV-{index:03}"
     depth: 0
-    save_as: step_only
+    save_as: node
     max_input_tokens: 80000
     split_strategy: "lines"
     split_overlap_tokens: 500

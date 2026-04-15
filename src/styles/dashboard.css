@@ -17002,6 +17002,104 @@ body {
     color: var(--text-secondary, #ccc);
 }
 
+.response-source-note {
+    font-size: 11px;
+    color: var(--text-muted, #888);
+    padding: 8px 12px;
+    margin-bottom: 12px;
+    border-left: 2px solid var(--text-muted, #888);
+    font-style: italic;
+}
+
+.response-multiline {
+    white-space: pre-wrap;
+    line-height: 1.5;
+}
+
+.details-distilled {
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--text-primary, #eee);
+    white-space: pre-wrap;
+}
+
+.details-topics {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.details-topic {
+    padding: 8px 10px;
+    border-left: 2px solid var(--accent, #4ecdc4);
+    background: var(--bg-card, rgba(255,255,255,0.03));
+    border-radius: 0 4px 4px 0;
+}
+
+.details-topic-name {
+    font-weight: 600;
+    font-size: 12px;
+    color: var(--accent, #4ecdc4);
+    margin-bottom: 4px;
+}
+
+.details-topic-current,
+.details-topic-summary {
+    font-size: 12px;
+    color: var(--text-secondary, #ccc);
+    line-height: 1.5;
+}
+
+.details-topic-entities {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 6px;
+}
+
+.details-entity-tag {
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    background: var(--bg-hover, #333);
+    color: var(--text-muted, #888);
+}
+
+.details-corrections,
+.details-decisions {
+    margin: 0;
+    padding-left: 20px;
+}
+
+.details-corrections li,
+.details-decisions li {
+    color: var(--text-secondary, #ccc);
+    font-size: 12px;
+    margin: 4px 0;
+    line-height: 1.5;
+}
+
+.details-terms {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.details-term {
+    font-size: 12px;
+    padding: 4px 8px;
+}
+
+.details-term-name {
+    font-weight: 600;
+    color: var(--text-primary, #eee);
+    margin-right: 8px;
+}
+
+.details-term-def {
+    color: var(--text-secondary, #ccc);
+}
+
 .mono {
     font-family: 'SF Mono', 'Fira Code', monospace;
     font-size: 11px;

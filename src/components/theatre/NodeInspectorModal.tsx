@@ -16,7 +16,7 @@ interface NodeInspectorModalProps {
 type TabId = 'prompt' | 'response' | 'details';
 
 export function NodeInspectorModal({ slug, nodeId, allNodes, onClose, onNavigate }: NodeInspectorModalProps) {
-    const [activeTab, setActiveTab] = useState<TabId>('response');
+    const [activeTab, setActiveTab] = useState<TabId>('details');
     const [auditRecords, setAuditRecords] = useState<LlmAuditRecord[]>([]);
     const [loading, setLoading] = useState(true);
     const [drillData, setDrillData] = useState<any>(null);
@@ -121,8 +121,8 @@ export function NodeInspectorModal({ slug, nodeId, allNodes, onClose, onNavigate
                         <div className="inspector-loading">Loading...</div>
                     ) : (
                         <>
-                            {activeTab === 'prompt' && <PromptTab audit={latestAudit} />}
-                            {activeTab === 'response' && <ResponseTab audit={latestAudit} />}
+                            {activeTab === 'prompt' && <PromptTab audit={latestAudit} drillData={drillData} />}
+                            {activeTab === 'response' && <ResponseTab audit={latestAudit} drillData={drillData} />}
                             {activeTab === 'details' && (
                                 <DetailsTab
                                     drillData={drillData}

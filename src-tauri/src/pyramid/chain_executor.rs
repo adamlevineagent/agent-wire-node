@@ -2782,8 +2782,31 @@ fn split_by_sections(content: &str, max_tokens: usize, overlap_tokens: usize) ->
             chunks.push(current_chunk.clone());
             // Build overlap prefix from the end of the previous chunk
             let overlap_prefix = build_overlap_suffix(&current_chunk, overlap_tokens);
-            current_chunk = overlap_prefix;
-            current_tokens = estimate_tokens(&current_chunk);
+            let overlap_est = estimate_tokens(&overlap_prefix);
+            // Clamp: overlap must not exceed 25% of budget to guarantee forward progress.
+            // Truncate from the front (keep trailing context) instead of dropping entirely.
+            if overlap_est > max_tokens / 4 {
+                warn!(
+                    "[CHAIN] split_by_sections: overlap ({} tokens) exceeds 25% of budget ({}), truncating",
+                    overlap_est, max_tokens
+                );
+                let budget_bytes = (max_tokens / 4) * 4;
+                let trim_start = overlap_prefix.len().saturating_sub(budget_bytes);
+                // Snap to char boundary
+                let trim_start = if trim_start < overlap_prefix.len() {
+                    overlap_prefix.char_indices()
+                        .map(|(i, _)| i)
+                        .find(|&i| i >= trim_start)
+                        .unwrap_or(overlap_prefix.len())
+                } else {
+                    overlap_prefix.len()
+                };
+                current_chunk = overlap_prefix[trim_start..].to_string();
+                current_tokens = estimate_tokens(&current_chunk);
+            } else {
+                current_chunk = overlap_prefix;
+                current_tokens = overlap_est;
+            }
         }
 
         if !current_chunk.is_empty() {
@@ -2806,6 +2829,7 @@ fn split_by_sections(content: &str, max_tokens: usize, overlap_tokens: usize) ->
 
 /// Split content on line boundaries at max_tokens intervals.
 /// Includes overlap_tokens worth of trailing lines from the previous chunk.
+/// Falls back to byte-level splitting (split_by_tokens) for lines that exceed max_tokens.
 fn split_by_lines(content: &str, max_tokens: usize, overlap_tokens: usize) -> Vec<String> {
     let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() {
@@ -2829,6 +2853,18 @@ fn split_by_lines(content: &str, max_tokens: usize, overlap_tokens: usize) -> Ve
             end += 1;
         }
 
+        // If a single line exceeds max_tokens (end == start + 1 and that line
+        // is over budget), split it by bytes as terminal fallback.
+        // Use 60% of budget so sub-chunks leave headroom for system prompt
+        // overhead and don't push models to their context limit.
+        if end == start + 1 && estimate_tokens(lines[start]) > max_tokens {
+            let sub_budget = (max_tokens * 3) / 5;
+            let line_sub_chunks = split_by_tokens(lines[start], sub_budget.max(1000), overlap_tokens);
+            chunks.extend(line_sub_chunks);
+            start = end; // advance past the oversized line
+            continue;
+        }
+
         let chunk_text = lines[start..end].join("\n");
         chunks.push(chunk_text);
 
@@ -2849,7 +2885,9 @@ fn split_by_lines(content: &str, max_tokens: usize, overlap_tokens: usize) -> Ve
             overlap_line_count += 1;
         }
 
-        start = end.saturating_sub(overlap_line_count);
+        let new_start = end.saturating_sub(overlap_line_count);
+        // Progress guarantee — start MUST advance by at least 1 line
+        start = new_start.max(start + 1);
     }
 
     if chunks.is_empty() {
@@ -2859,37 +2897,58 @@ fn split_by_lines(content: &str, max_tokens: usize, overlap_tokens: usize) -> Ve
     }
 }
 
-/// Split content at character positions estimated from token counts.
-/// Simple: chunk the text at roughly max_tokens * 4 chars, with overlap.
+/// Split content at byte positions estimated from token counts, with overlap.
+/// Uses byte length (consistent with `estimate_tokens` which uses `str::len().div_ceil(4)`).
+/// Snaps to char boundaries so we never split mid-character.
+/// This is the terminal fallback — guaranteed to terminate on any input.
 fn split_by_tokens(content: &str, max_tokens: usize, overlap_tokens: usize) -> Vec<String> {
-    let chars_per_chunk = max_tokens * 4;
-    let overlap_chars = overlap_tokens * 4;
-    let content_chars: Vec<char> = content.chars().collect();
+    let bytes_per_chunk = max_tokens * 4;
+    let overlap_bytes = overlap_tokens * 4;
 
-    if content_chars.len() <= chars_per_chunk {
+    if content.len() <= bytes_per_chunk {
         return vec![content.to_string()];
     }
 
     let mut chunks: Vec<String> = Vec::new();
     let mut start = 0;
 
-    while start < content_chars.len() {
-        let end = (start + chars_per_chunk).min(content_chars.len());
-        let chunk: String = content_chars[start..end].iter().collect();
-        chunks.push(chunk);
+    while start < content.len() {
+        let mut end = (start + bytes_per_chunk).min(content.len());
+        // Snap forward to char boundary (don't split mid-character)
+        while end < content.len() && !content.is_char_boundary(end) {
+            end += 1;
+        }
 
-        if end >= content_chars.len() {
+        chunks.push(content[start..end].to_string());
+
+        if end >= content.len() {
             break;
         }
 
-        start = end.saturating_sub(overlap_chars);
+        let mut new_start = end.saturating_sub(overlap_bytes);
+        // Snap forward to char boundary
+        while new_start < content.len() && !content.is_char_boundary(new_start) {
+            new_start += 1;
+        }
+        // Progress guarantee — advance by at least 1 byte
+        start = new_start.max(start + 1);
+        // Re-snap after max (start+1 might not be a char boundary)
+        while start < content.len() && !content.is_char_boundary(start) {
+            start += 1;
+        }
     }
 
-    chunks
+    if chunks.is_empty() {
+        vec![content.to_string()]
+    } else {
+        chunks
+    }
 }
 
 /// Build an overlap suffix: extract the last `overlap_tokens` worth of text
 /// from the given content, respecting line boundaries.
+/// If the first line alone exceeds the overlap budget, include it but stop
+/// immediately — don't accumulate more lines on top.
 fn build_overlap_suffix(content: &str, overlap_tokens: usize) -> String {
     if overlap_tokens == 0 {
         return String::new();
@@ -2905,6 +2964,10 @@ fn build_overlap_suffix(content: &str, overlap_tokens: usize) -> String {
         }
         tokens += lt;
         selected.push(line);
+        // If a single line already exceeds the budget, stop — don't accumulate more
+        if tokens > overlap_tokens {
+            break;
+        }
     }
 
     selected.reverse();
@@ -2922,6 +2985,9 @@ fn split_chunk(
     strategy: &str,
     overlap_tokens: usize,
 ) -> Vec<Value> {
+    // Floor on max_tokens to prevent memory bombs from zero/tiny values
+    let max_tokens = max_tokens.max(1000);
+
     // Find the text content field
     let (field_name, text_content) = if let Some(s) = item.get("content").and_then(|v| v.as_str()) {
         ("content", s.to_string())
@@ -2939,6 +3005,19 @@ fn split_chunk(
         "tokens" => split_by_tokens(&text_content, max_tokens, overlap_tokens),
         _ => split_by_sections(&text_content, max_tokens, overlap_tokens), // "sections" is default
     };
+
+    // Output validation: any sub-text still grossly over budget gets re-split
+    // via byte-level splitting as the terminal guarantee.
+    let sub_texts: Vec<String> = sub_texts
+        .into_iter()
+        .flat_map(|chunk| {
+            if estimate_tokens(&chunk) > max_tokens.saturating_mul(2) {
+                split_by_tokens(&chunk, max_tokens, overlap_tokens)
+            } else {
+                vec![chunk]
+            }
+        })
+        .collect();
 
     if sub_texts.len() <= 1 {
         return vec![item.clone()];
@@ -4496,6 +4575,7 @@ pub async fn execute_chain_from(
                 }
                 total = estimate_total(chain, &ctx, num_chunks).max(done);
                 send_progress(&progress_tx, done, total).await;
+
                 let step_elapsed = step_start.elapsed().as_secs_f64();
                 step_activities.push(super::types::StepActivity {
                     name: step.name.clone(),
@@ -6487,6 +6567,15 @@ async fn execute_for_each(
             format!("L{depth}-{index:03}")
         };
 
+        // Propagate node_id into audit context so LLM audit records are queryable per node
+        let dispatch_ctx_with_node = {
+            let mut c = dispatch_ctx.clone();
+            if let Some(ref audit) = dispatch_ctx.audit {
+                c.audit = Some(audit.for_node(&node_id, "chain_dispatch", depth));
+            }
+            c
+        };
+
         // Check resume state
         let resume = get_resume_state(
             reader,
@@ -6602,7 +6691,7 @@ async fn execute_for_each(
                         sub_item,
                         &sub_system_prompt,
                         defaults,
-                        dispatch_ctx,
+                        &dispatch_ctx_with_node,
                         error_strategy,
                         &sub_fallback_key,
                     )
@@ -6675,7 +6764,7 @@ async fn execute_for_each(
                         &merge_input,
                         &merge_system_prompt,
                         defaults,
-                        dispatch_ctx,
+                        &dispatch_ctx_with_node,
                         error_strategy,
                         &merge_fallback_key,
                     )
@@ -6818,7 +6907,7 @@ async fn execute_for_each(
             &resolved_input,
             &system_prompt,
             defaults,
-            dispatch_ctx,
+            &dispatch_ctx_with_node,
             error_strategy,
             &fallback_key,
         )
@@ -7068,6 +7157,7 @@ async fn execute_for_each_concurrent(
                             node_id: node_id.clone(),
                             output: Err(e),
                             sub_failures: 0,
+
                         })
                         .await;
                     continue;
@@ -7105,6 +7195,7 @@ async fn execute_for_each_concurrent(
                                     node_id: node_id.clone(),
                                     output: Err(e),
                                     sub_failures: 0,
+        
                                 })
                                 .await;
                             continue;
@@ -7118,6 +7209,7 @@ async fn execute_for_each_concurrent(
                             node_id: node_id.clone(),
                             output: Ok(output_val),
                             sub_failures: 0,
+
                         })
                         .await
                         .is_err()
@@ -7174,6 +7266,7 @@ async fn execute_for_each_concurrent(
                             node_id: node_id.clone(),
                             output: Err(e),
                             sub_failures: 0,
+
                         })
                         .await;
                     return;
@@ -7193,6 +7286,7 @@ async fn execute_for_each_concurrent(
                                     node_id: node_id.clone(),
                                     output: Err(e),
                                     sub_failures: 0,
+        
                                 })
                                 .await;
                             return;
@@ -7219,6 +7313,7 @@ async fn execute_for_each_concurrent(
                                 node_id: node_id.clone(),
                                 output: Err(e),
                                 sub_failures: 0,
+    
                             })
                             .await;
                         return;
@@ -7260,6 +7355,7 @@ async fn execute_for_each_concurrent(
                                             node_id: node_id.clone(),
                                             output: Err(e),
                                             sub_failures: sub_fail_count,
+                
                                         })
                                         .await;
                                     return;
@@ -7282,6 +7378,7 @@ async fn execute_for_each_concurrent(
                                                 node_id: node_id.clone(),
                                                 output: Err(anyhow!("forEach abort at index {index} sub-chunk {sub_idx}: {e}")),
                                                 sub_failures: sub_fail_count,
+                    
                                             })
                                             .await;
                                         return;
@@ -7336,6 +7433,7 @@ async fn execute_for_each_concurrent(
                                             node_id: node_id.clone(),
                                             output: Err(anyhow::Error::from(e)),
                                             sub_failures: sub_fail_count,
+                
                                         })
                                         .await;
                                     return;
@@ -7437,6 +7535,7 @@ async fn execute_for_each_concurrent(
                                             node_id: node_id.clone(),
                                             output: Err(anyhow::Error::from(e)),
                                             sub_failures: sub_fail_count,
+                
                                         })
                                         .await;
                                     return;
@@ -7489,6 +7588,7 @@ async fn execute_for_each_concurrent(
                                 node_id: node_id.clone(),
                                 output: Err(e),
                                 sub_failures: 0,
+    
                             })
                             .await;
                         return;
@@ -7648,12 +7748,21 @@ async fn execute_for_each_work_item(
     let t0 = Instant::now();
     info!("[CHAIN] [{}] {} dispatching LLM call", step.name, work.node_id);
 
+    // Propagate node_id into audit context so LLM audit records are queryable
+    let dispatch_ctx_with_node = {
+        let mut ctx = dispatch_ctx.clone();
+        if let Some(ref audit) = dispatch_ctx.audit {
+            ctx.audit = Some(audit.for_node(&work.node_id, "chain_dispatch", work.depth));
+        }
+        ctx
+    };
+
     let analysis = dispatch_with_retry(
         step,
         &work.resolved_input,
         &work.system_prompt,
         defaults,
-        dispatch_ctx,
+        &dispatch_ctx_with_node,
         error_strategy,
         &fallback_key,
     )

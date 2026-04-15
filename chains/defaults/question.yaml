@@ -36,8 +36,7 @@ steps:
     max_input_tokens: 80000
     split_strategy: "sections"
     split_overlap_tokens: 500
-    split_merge: true
-    merge_instruction: "$prompts/shared/merge_sub_chunks.md"
+    split_merge: false
     on_error: "retry(3)"
     on_parse_error: "heal"
     heal_instruction: "$prompts/shared/heal_json.md"

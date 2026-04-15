@@ -56,8 +56,7 @@ steps:
     max_input_tokens: 80000
     split_strategy: "sections"
     split_overlap_tokens: 500
-    split_merge: true
-    merge_instruction: "$prompts/shared/merge_sub_chunks.md"
+    split_merge: false
     # No response_schema — structured output makes Mercury 2 30-60x slower
     # (67-90s per doc vs 1-3s). Free-form JSON + walker parse is faster.
     model_tier: mid
