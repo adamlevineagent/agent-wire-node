@@ -213,6 +213,48 @@ pub struct FleetDispatchResponse {
     pub peer_model: Option<String>,
 }
 
+// ── Fleet dispatch errors ────────────────────────────────────────────────
+
+/// Typed fleet dispatch error — callers can distinguish timeout from dead
+/// peer from auth failure, enabling correct retry/backoff policy instead
+/// of string-matching folklore.
+#[derive(Debug)]
+pub struct FleetDispatchError {
+    pub kind: FleetDispatchErrorKind,
+    pub peer_id: String,
+    pub status_code: Option<u16>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetDispatchErrorKind {
+    /// Our HTTP client timed out before getting a response
+    ClientTimeout,
+    /// Cloudflare 524 — origin (peer GPU) didn't respond in time
+    OriginTimeout,
+    /// Network/transport error (DNS, connection refused, tunnel down)
+    Transport,
+    /// Non-success HTTP status (403, 500, etc.)
+    HttpStatus,
+    /// Response body couldn't be parsed as FleetDispatchResponse
+    ResponseParse,
+}
+
+impl std::fmt::Display for FleetDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Fleet dispatch to {} failed ({:?}): {}", self.peer_id, self.kind, self.message)
+    }
+}
+
+impl FleetDispatchError {
+    /// Whether this error means the peer is likely dead/unreachable
+    /// (vs just slow or temporarily overloaded).
+    pub fn is_peer_dead(&self) -> bool {
+        matches!(self.kind, FleetDispatchErrorKind::Transport)
+    }
+}
+
 // ── Fleet dispatch client ─────────────────────────────────────────────────
 
 /// Dispatch an LLM call to a fleet peer by routing rule name.
@@ -230,8 +272,9 @@ pub async fn fleet_dispatch_by_rule(
     response_format: Option<&serde_json::Value>,
     fleet_jwt: &str,
     timeout_secs: u64,
-) -> Result<FleetDispatchResponse, String> {
+) -> Result<FleetDispatchResponse, FleetDispatchError> {
     let url = format!("{}/v1/compute/fleet-dispatch", peer.tunnel_url);
+    let peer_id = peer.node_id.clone();
 
     let request = FleetDispatchRequest {
         rule_name: rule_name.to_string(),
@@ -243,7 +286,7 @@ pub async fn fleet_dispatch_by_rule(
         fleet_jwt: fleet_jwt.to_string(),
     };
 
-    let resp = HTTP_CLIENT
+    let resp = match HTTP_CLIENT
         .post(&url)
         .header("Authorization", format!("Bearer {}", fleet_jwt))
         .header("Content-Type", "application/json")
@@ -251,20 +294,52 @@ pub async fn fleet_dispatch_by_rule(
         .json(&request)
         .send()
         .await
-        .map_err(|e| format!("Fleet dispatch to {} failed: {}", peer.node_id, e))?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let kind = if e.is_timeout() {
+                FleetDispatchErrorKind::ClientTimeout
+            } else if e.is_connect() {
+                FleetDispatchErrorKind::Transport
+            } else {
+                FleetDispatchErrorKind::Transport
+            };
+            return Err(FleetDispatchError {
+                kind,
+                peer_id,
+                status_code: None,
+                message: e.to_string(),
+            });
+        }
+    };
 
-    if !resp.status().is_success() {
-        let status = resp.status();
+    let status = resp.status();
+    if !status.is_success() {
+        let status_code = status.as_u16();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "Fleet dispatch to {} returned {}: {}",
-            peer.node_id, status, text
-        ));
+        let kind = if status_code == 524 {
+            FleetDispatchErrorKind::OriginTimeout
+        } else if status_code == 408 || status_code == 504 {
+            FleetDispatchErrorKind::OriginTimeout
+        } else {
+            FleetDispatchErrorKind::HttpStatus
+        };
+        return Err(FleetDispatchError {
+            kind,
+            peer_id,
+            status_code: Some(status_code),
+            message: format!("{}: {}", status, text),
+        });
     }
 
     resp.json::<FleetDispatchResponse>()
         .await
-        .map_err(|e| format!("Fleet dispatch response parse error: {}", e))
+        .map_err(|e| FleetDispatchError {
+            kind: FleetDispatchErrorKind::ResponseParse,
+            peer_id,
+            status_code: Some(status.as_u16()),
+            message: e.to_string(),
+        })
 }
 
 // ── Derive serving rules ─────────────────────────────────────────────────

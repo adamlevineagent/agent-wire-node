@@ -1045,6 +1045,13 @@ pub async fn start_server(
     // Cloudflare tunnel origins, not localhost.
 
     // POST /v1/compute/fleet-dispatch — receive fleet LLM job from peer
+    //
+    // ARCHITECTURE NOTE: This handler holds the HTTP response open until the
+    // GPU job completes. Over Cloudflare tunnels, long jobs (~120s+) hit
+    // Cloudflare's origin timeout (524). The 100-year fix is ACK + async
+    // result delivery: respond immediately with a job_id, process the job,
+    // then POST the result back to the requester's tunnel. This matches
+    // the Phase 3 compute market architecture (webhook-based delivery).
     let fleet_dispatch_route = {
         let state = state.clone();
         warp::path!("v1" / "compute" / "fleet-dispatch")

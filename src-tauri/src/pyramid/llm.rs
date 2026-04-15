@@ -958,7 +958,9 @@ pub async fn call_model_unified_with_audit_and_ctx(
                                         let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
                                             "peer_id": peer_clone.node_id,
                                             "peer_name": peer_clone.name,
-                                            "error": e.to_string(),
+                                            "error": e.message.clone(),
+                                            "error_kind": serde_json::to_value(&e.kind).unwrap_or_default(),
+                                            "status_code": e.status_code,
                                             "latency_ms": fleet_start.elapsed().as_millis() as u64,
                                         }));
                                         if let Some(ref db_path) = fleet_db_path {
@@ -971,10 +973,16 @@ pub async fn call_model_unified_with_audit_and_ctx(
                                         }
                                     }
 
-                                    // Remove dead peer, continue to pool providers
-                                    let mut roster_w = roster_handle.write().await;
-                                    roster_w.remove_peer(&peer_clone.node_id);
-                                    warn!("Fleet dispatch failed, trying pool providers: {}", e);
+                                    // Only remove peer from roster if it's actually dead (transport failure).
+                                    // Timeouts (524, client timeout) mean the peer is alive but slow —
+                                    // discovery membership belongs to heartbeat/announce, not dataplane RPC outcomes.
+                                    if e.is_peer_dead() {
+                                        let mut roster_w = roster_handle.write().await;
+                                        roster_w.remove_peer(&peer_clone.node_id);
+                                        warn!("Fleet dispatch: peer {} removed (transport failure): {}", peer_clone.node_id, e);
+                                    } else {
+                                        warn!("Fleet dispatch failed ({:?}), peer stays in roster: {}", e.kind, e);
+                                    }
                                 }
                             }
                         } else {
