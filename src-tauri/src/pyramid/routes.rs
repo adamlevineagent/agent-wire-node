@@ -4025,32 +4025,12 @@ async fn handle_config_profile(
         // so model fields are resolved from the active tier routing
         // (not hardcoded OpenRouter slugs). Preserve api_key + auth_token
         // from the live config — profiles only override model selection.
-        let preserved_api_key = config_lock.api_key.clone();
-        let preserved_auth_token = config_lock.auth_token.clone();
-        // Phase A: preserve dispatch_policy + provider_pools across profile apply.
-        let preserved_dispatch_policy = config_lock.dispatch_policy.clone();
-        let preserved_provider_pools = config_lock.provider_pools.clone();
-        // Phase 1 compute queue: preserve across profile apply.
-        let preserved_compute_queue = config_lock.compute_queue.clone();
+        let previous_live = config_lock.clone();
         *config_lock = pyramid_config.to_llm_config_with_runtime(
             state.provider_registry.clone(),
             state.credential_store.clone(),
-        );
-        if config_lock.api_key.is_empty() {
-            config_lock.api_key = preserved_api_key;
-        }
-        if config_lock.auth_token.is_empty() {
-            config_lock.auth_token = preserved_auth_token;
-        }
-        if config_lock.dispatch_policy.is_none() {
-            config_lock.dispatch_policy = preserved_dispatch_policy;
-        }
-        if config_lock.provider_pools.is_none() {
-            config_lock.provider_pools = preserved_provider_pools;
-        }
-        if config_lock.compute_queue.is_none() {
-            config_lock.compute_queue = preserved_compute_queue;
-        }
+        )
+        .with_runtime_overlays_from(&previous_live);
 
         Ok(json_ok(&serde_json::json!({
             "status": "profile_applied",

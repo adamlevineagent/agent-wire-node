@@ -5923,35 +5923,8 @@ async fn pyramid_apply_profile(
         state.pyramid.credential_store.clone(),
     );
     let mut live = state.pyramid.config.write().await;
-    let preserved_api_key = live.api_key.clone();
-    let preserved_auth_token = live.auth_token.clone();
-    // Phase A: preserve dispatch_policy + provider_pools across profile apply.
-    // Profiles only change model selection, not the dispatch topology.
-    let preserved_dispatch_policy = live.dispatch_policy.clone();
-    let preserved_provider_pools = live.provider_pools.clone();
-    // Phase 1 compute queue: preserve across profile apply (same reason).
-    let preserved_compute_queue = live.compute_queue.clone();
-    // Fleet roster: preserve across profile apply (same pattern).
-    let preserved_fleet_roster = live.fleet_roster.clone();
-    *live = new_llm;
-    if live.api_key.is_empty() {
-        live.api_key = preserved_api_key;
-    }
-    if live.auth_token.is_empty() {
-        live.auth_token = preserved_auth_token;
-    }
-    if live.dispatch_policy.is_none() {
-        live.dispatch_policy = preserved_dispatch_policy;
-    }
-    if live.provider_pools.is_none() {
-        live.provider_pools = preserved_provider_pools;
-    }
-    if live.compute_queue.is_none() {
-        live.compute_queue = preserved_compute_queue;
-    }
-    if live.fleet_roster.is_none() {
-        live.fleet_roster = preserved_fleet_roster;
-    }
+    let previous_live = live.clone();
+    *live = new_llm.with_runtime_overlays_from(&previous_live);
 
     tracing::info!(
         profile = %profile,

@@ -377,6 +377,49 @@ impl LlmConfig {
         cloned.fallback_model_2 = model.to_string();
         cloned
     }
+
+    /// Merge process-scoped runtime wiring from the currently-live config.
+    ///
+    /// Rebuilds from `PyramidConfig` intentionally start from durable
+    /// profile/config data, which means runtime-only attachments like
+    /// dispatch policy handles, queue wiring, and fleet roster pointers
+    /// must be carried forward from the live process state. Keeping that
+    /// contract here avoids multiple profile-apply entry points drifting
+    /// out of sync as new runtime fields are added.
+    ///
+    /// TODO(architecture): `LlmConfig` still mixes durable user config with
+    /// process-scoped runtime wiring. The 100-year fix is to split those into
+    /// separate types so profile/config rebuilds never need overlay logic at all.
+    ///
+    /// `cache_access` is intentionally excluded because it is build-scoped
+    /// ephemeral state, not global process wiring.
+    pub fn with_runtime_overlays_from(mut self, live: &Self) -> Self {
+        if self.api_key.is_empty() {
+            self.api_key = live.api_key.clone();
+        }
+        if self.auth_token.is_empty() {
+            self.auth_token = live.auth_token.clone();
+        }
+        if self.provider_registry.is_none() {
+            self.provider_registry = live.provider_registry.clone();
+        }
+        if self.credential_store.is_none() {
+            self.credential_store = live.credential_store.clone();
+        }
+        if self.dispatch_policy.is_none() {
+            self.dispatch_policy = live.dispatch_policy.clone();
+        }
+        if self.provider_pools.is_none() {
+            self.provider_pools = live.provider_pools.clone();
+        }
+        if self.compute_queue.is_none() {
+            self.compute_queue = live.compute_queue.clone();
+        }
+        if self.fleet_roster.is_none() {
+            self.fleet_roster = live.fleet_roster.clone();
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3196,6 +3239,107 @@ fn maybe_record_provider_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_runtime_overlays_preserve_fleet_and_other_runtime_wiring() {
+        let unique_suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let credentials_path = std::env::temp_dir()
+            .join(format!("wire-node-credentials-{}.yaml", unique_suffix));
+        let credential_store = std::sync::Arc::new(
+            crate::pyramid::credentials::CredentialStore::load_from_path(credentials_path)
+                .unwrap(),
+        );
+        let provider_registry = std::sync::Arc::new(
+            crate::pyramid::provider::ProviderRegistry::new(credential_store.clone()),
+        );
+
+        let policy_yaml: crate::pyramid::dispatch_policy::DispatchPolicyYaml =
+            serde_yaml::from_str(
+                r#"
+version: 1
+provider_pools:
+  fleet:
+    concurrency: 1
+routing_rules:
+  - name: ollama-catchall
+    route_to:
+      - provider_id: fleet
+      - provider_id: ollama
+        is_local: true
+"#,
+            )
+            .unwrap();
+        let dispatch_policy = std::sync::Arc::new(
+            crate::pyramid::dispatch_policy::DispatchPolicy::from_yaml(&policy_yaml),
+        );
+        let provider_pools = std::sync::Arc::new(
+            crate::pyramid::provider_pools::ProviderPools::new(dispatch_policy.as_ref()),
+        );
+        let compute_queue = crate::compute_queue::ComputeQueueHandle::new();
+        let fleet_roster =
+            std::sync::Arc::new(tokio::sync::RwLock::new(crate::fleet::FleetRoster::default()));
+
+        let live = LlmConfig {
+            api_key: "live-api-key".into(),
+            auth_token: "live-auth-token".into(),
+            provider_registry: Some(provider_registry.clone()),
+            credential_store: Some(credential_store.clone()),
+            cache_access: Some(CacheAccess {
+                slug: "live-slug".into(),
+                build_id: "live-build".into(),
+                db_path: std::sync::Arc::<str>::from("/tmp/live.db"),
+                bus: None,
+                chain_name: None,
+                content_type: None,
+            }),
+            dispatch_policy: Some(dispatch_policy.clone()),
+            provider_pools: Some(provider_pools.clone()),
+            compute_queue: Some(compute_queue.clone()),
+            fleet_roster: Some(fleet_roster.clone()),
+            ..Default::default()
+        };
+
+        let rebuilt = LlmConfig::default().with_runtime_overlays_from(&live);
+
+        assert_eq!(rebuilt.api_key, "live-api-key");
+        assert_eq!(rebuilt.auth_token, "live-auth-token");
+        assert!(std::sync::Arc::ptr_eq(
+            rebuilt.provider_registry.as_ref().unwrap(),
+            &provider_registry,
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            rebuilt.credential_store.as_ref().unwrap(),
+            &credential_store,
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            rebuilt.dispatch_policy.as_ref().unwrap(),
+            &dispatch_policy,
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            rebuilt.provider_pools.as_ref().unwrap(),
+            &provider_pools,
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &rebuilt.compute_queue.as_ref().unwrap().queue,
+            &compute_queue.queue,
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &rebuilt.compute_queue.as_ref().unwrap().notify,
+            &compute_queue.notify,
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            rebuilt.fleet_roster.as_ref().unwrap(),
+            &fleet_roster,
+        ));
+        assert!(rebuilt.cache_access.is_none());
+    }
 
     #[test]
     fn test_llm_response_from_openrouter_json() {
