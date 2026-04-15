@@ -833,6 +833,19 @@ pub fn commit_enable_local_mode(
     // provider_pools for ollama-local and build_coordination deferral.
     // This wires the per-provider semaphore so Ollama calls route through
     // ProviderPools instead of the global LOCAL_PROVIDER_SEMAPHORE fallback.
+    //
+    // TODO: This hardcoded dispatch policy YAML violates Law 3 (one contribution
+    // store) and Pillar 37 (no hardcoded operational parameters in code).
+    // It should be a proper contribution YAML in chains/defaults/ or
+    // assets/bundled_contributions.json, managed via the generative config system.
+    //
+    // Additionally, `provider_id: fleet` should NOT be unconditionally included.
+    // Whether a node dispatches outward (client mode) vs only serves incoming
+    // fleet requests (server mode) is an operator choice per node. GPU rigs
+    // should serve fleet but not dispatch — their stale engine / DADBEAR work
+    // should stay local. Laptops / orchestrators dispatch to fleet. This needs
+    // a fleet_dispatch_enabled toggle in the node config UI, not a hardcoded
+    // fleet entry in every dispatch policy.
     let dispatch_policy_yaml = "schema_type: dispatch_policy\n\
                                 version: 1\n\
                                 provider_pools:\n  ollama-local:\n    concurrency: 1\n\
