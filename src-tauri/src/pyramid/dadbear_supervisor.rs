@@ -569,6 +569,7 @@ impl DadbearSupervisor {
                 min_timeout_secs: None,
                 skip_concurrency_gate: true,
                 skip_fleet_dispatch: false,
+                chronicle_job_path: None,
             },
             step_ctx: Some(step_ctx),
             model_id: model_id.clone(),
@@ -1888,6 +1889,10 @@ fn reconstruct_step_context(
         resolved_model_id: item.resolved_model_id.clone(),
         resolved_provider_id: item.resolved_provider_id.clone(),
         prompt_hash: item.prompt_hash.clone().unwrap_or_default(),
+        // Chronicle integration fields (added by compute chronicle cascade)
+        chain_name: None,
+        content_type: None,
+        task_label: Some(format!("dadbear:{}", item.primitive)),
     }
 }
 
