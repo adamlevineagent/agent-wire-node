@@ -6415,7 +6415,7 @@ async fn pyramid_auto_update_config_set(
     auto_update: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let (result, should_resume_breaker) = {
-        let conn = state.pyramid.writer.lock().await;
+        let mut conn = state.pyramid.writer.lock().await;
         let mut should_resume_breaker = false;
 
         let mut sets: Vec<String> = Vec::new();
@@ -6476,23 +6476,24 @@ async fn pyramid_auto_update_config_set(
         if let Some(old_contrib) = existing {
             // Supersede with updated values
             wire_node_lib::pyramid::config_contributions::supersede_config_contribution(
-                &conn,
-                &state.pyramid.build_event_bus,
+                &mut conn,
                 &old_contrib.contribution_id,
                 &yaml_content,
-                Some("Updated via DADBEAR panel config save"),
+                "Updated via DADBEAR panel config save",
+                "local",
+                Some("operator"),
             ).map_err(|e: anyhow::Error| e.to_string())?;
         } else {
             // Create new per-slug norms contribution
             wire_node_lib::pyramid::config_contributions::create_config_contribution(
                 &conn,
-                &state.pyramid.build_event_bus,
                 "dadbear_norms",
                 Some(&slug),
                 &yaml_content,
+                Some("Created via DADBEAR panel config save"),
                 "local",
-                "operator",
-                None,
+                Some("operator"),
+                "active",
             ).map_err(|e: anyhow::Error| e.to_string())?;
         }
 
