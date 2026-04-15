@@ -2220,25 +2220,8 @@ pub fn pyramid_routes(
         .and(with_auth_state(state.clone()))
         .and_then(handle_dadbear_status));
 
-    // POST /pyramid/:slug/dadbear/enable — enable DADBEAR for a slug
-    let dadbear_enable = route!(prefix
-        .and(warp::path::param::<String>())
-        .and(warp::path("dadbear"))
-        .and(warp::path("enable"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(with_auth_state(state.clone()))
-        .and_then(handle_dadbear_enable));
-
-    // POST /pyramid/:slug/dadbear/disable — disable DADBEAR for a slug
-    let dadbear_disable = route!(prefix
-        .and(warp::path::param::<String>())
-        .and(warp::path("dadbear"))
-        .and(warp::path("disable"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(with_auth_state(state.clone()))
-        .and_then(handle_dadbear_disable));
+    // POST /pyramid/:slug/dadbear/enable — REMOVED in Phase 7 (holds projection is the authority)
+    // POST /pyramid/:slug/dadbear/disable — REMOVED in Phase 7 (holds projection is the authority)
 
     // POST /pyramid/:slug/dadbear/trigger — manually trigger a scan+dispatch cycle
     let dadbear_trigger = route!(prefix
@@ -2251,10 +2234,9 @@ pub fn pyramid_routes(
         .and_then(handle_dadbear_trigger));
 
     // Combine: more-specific paths first
+    // (dadbear_enable/dadbear_disable removed in Phase 7 — holds projection is the authority)
     let dbd_a = dadbear_watch.or(dadbear_status).unify().boxed();
-    let dbd_b = dadbear_enable.or(dadbear_disable).unify().boxed();
-    let dbd_c = dbd_b.or(dadbear_trigger).unify().boxed();
-    let dbd = dbd_a.or(dbd_c).unify().boxed();
+    let dbd = dbd_a.or(dadbear_trigger).unify().boxed();
     let top23 = top22.or(dbd).unify().boxed();
 
     // ── WS-VINE-UNIFY: Vine composition management ──
@@ -3754,7 +3736,7 @@ async fn handle_build(
                                         created_at: String::new(),
                                         updated_at: String::new(),
                                     };
-                                    match db::save_dadbear_config(&conn, &dadbear_cfg) {
+                                    match db::save_dadbear_config_with_contributions(&conn, &dadbear_cfg) {
                                         Ok(_) => tracing::info!("Post-build: DADBEAR config created for '{}' → '{}'", slug_name, watch_dir),
                                         Err(e) => tracing::warn!("Post-build: DADBEAR config failed for '{}': {}", slug_name, e),
                                     }
@@ -4935,6 +4917,22 @@ fn hash_rescan(conn: &Connection, slug: &str) -> i64 {
                      VALUES (?1, 0, 'deleted_file', ?2, 'Detected during unfreeze rescan', 0, ?3)",
                     rusqlite::params![slug, file_path, now],
                 );
+
+                // Dual-write: observation event
+                let _ = super::observation_events::write_observation_event(
+                    conn,
+                    slug,
+                    "rescan",
+                    "file_deleted",
+                    None,
+                    Some(file_path.as_str()),
+                    None,
+                    Some(stored_hash.as_str()),
+                    None,
+                    Some(0),
+                    Some("Detected during unfreeze rescan"),
+                );
+
                 count += 1;
                 continue;
             }
@@ -4947,6 +4945,22 @@ fn hash_rescan(conn: &Connection, slug: &str) -> i64 {
                  VALUES (?1, 0, 'file_change', ?2, 'Detected during unfreeze rescan', 0, ?3)",
                 rusqlite::params![slug, file_path, now],
             );
+
+            // Dual-write: observation event
+            let _ = super::observation_events::write_observation_event(
+                conn,
+                slug,
+                "rescan",
+                "file_modified",
+                None,
+                Some(file_path.as_str()),
+                Some(current_hash.as_str()),
+                Some(stored_hash.as_str()),
+                None,
+                Some(0),
+                Some("Detected during unfreeze rescan"),
+            );
+
             count += 1;
         }
     }
@@ -5009,6 +5023,27 @@ pub fn enqueue_full_l0_sweep(conn: &Connection, slug: &str) -> (i64, i64, i64) {
              VALUES (?1, 0, ?2, ?3, ?4, 0, ?5, 0)",
             rusqlite::params![slug, mutation_type, file_path, detail, now],
         );
+
+        // Dual-write: observation event (full L0 sweep)
+        let obs_type = match mutation_type {
+            "file_change" => "file_modified",
+            "deleted_file" => "file_deleted",
+            _ => "full_sweep",
+        };
+        let _ = super::observation_events::write_observation_event(
+            conn,
+            slug,
+            "rescan",
+            obs_type,
+            None,
+            Some(file_path.as_str()),
+            None,
+            None,
+            None,
+            Some(0),
+            Some(detail),
+        );
+
         enqueued += 1;
     }
 
@@ -5542,10 +5577,12 @@ async fn handle_auto_update_status(
         pending_by_layer.insert(layer, count);
     }
 
-    // Get last check time
+    // Get last check time from dadbear_work_attempts (canonical source)
     let last_check_at: Option<String> = conn
         .query_row(
-            "SELECT MAX(checked_at) FROM pyramid_stale_check_log WHERE slug = ?1",
+            "SELECT MAX(a.dispatched_at) FROM dadbear_work_attempts a
+             JOIN dadbear_work_items wi ON a.work_item_id = wi.id
+             WHERE wi.slug = ?1",
             rusqlite::params![slug_name],
             |row| row.get(0),
         )
@@ -8663,7 +8700,7 @@ async fn handle_dadbear_watch(
         .await;
     let conn = state.writer.lock().await;
 
-    match db::save_dadbear_config(&conn, &config) {
+    match db::save_dadbear_config_with_contributions(&conn, &config) {
         Ok(_id) => Ok(json_ok(&serde_json::json!({
             "slug": slug_name,
             "source_path": body.source_path,
@@ -8703,49 +8740,8 @@ async fn handle_dadbear_status(
     }
 }
 
-/// POST /pyramid/:slug/dadbear/enable — enable DADBEAR for a slug.
-async fn handle_dadbear_enable(
-    slug_name: String,
-    state: Arc<PyramidState>,
-) -> Result<warp::reply::Response, warp::Rejection> {
-    let _lock = super::lock_manager::LockManager::global()
-        .write(&slug_name)
-        .await;
-    let conn = state.writer.lock().await;
-
-    match db::enable_dadbear_for_slug(&conn, &slug_name) {
-        Ok(count) => Ok(json_ok(&serde_json::json!({
-            "slug": slug_name,
-            "enabled_configs": count,
-        }))),
-        Err(e) => Ok(json_error(
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            &e.to_string(),
-        )),
-    }
-}
-
-/// POST /pyramid/:slug/dadbear/disable — disable DADBEAR for a slug.
-async fn handle_dadbear_disable(
-    slug_name: String,
-    state: Arc<PyramidState>,
-) -> Result<warp::reply::Response, warp::Rejection> {
-    let _lock = super::lock_manager::LockManager::global()
-        .write(&slug_name)
-        .await;
-    let conn = state.writer.lock().await;
-
-    match db::disable_dadbear_for_slug(&conn, &slug_name) {
-        Ok(count) => Ok(json_ok(&serde_json::json!({
-            "slug": slug_name,
-            "disabled_configs": count,
-        }))),
-        Err(e) => Ok(json_error(
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            &e.to_string(),
-        )),
-    }
-}
+// handle_dadbear_enable / handle_dadbear_disable removed in Phase 7.
+// Enable/disable is now managed through the holds projection (freeze/unfreeze).
 
 /// POST /pyramid/:slug/dadbear/trigger — manually trigger a scan+dispatch cycle.
 async fn handle_dadbear_trigger(
@@ -10059,7 +10055,7 @@ async fn handle_preview_commit(
         .await;
     let conn = state.writer.lock().await;
 
-    match db::save_dadbear_config(&conn, &config) {
+    match db::save_dadbear_config_with_contributions(&conn, &config) {
         Ok(_id) => Ok(json_ok(&serde_json::json!({
             "slug": slug_name,
             "source_path": body.source_path,

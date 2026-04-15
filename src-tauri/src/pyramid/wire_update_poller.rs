@@ -578,6 +578,7 @@ mod phase14_tests {
             supabase_anon_key: None,
             csrf_secret: [0u8; 32],
             dadbear_handle: Arc::new(TokioMutex::new(None)),
+            dadbear_supervisor_handle: Arc::new(TokioMutex::new(None)),
             dadbear_in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
             provider_registry: Arc::new(
                 crate::pyramid::provider::ProviderRegistry::new(credential_store.clone()),

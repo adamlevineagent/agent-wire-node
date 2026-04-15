@@ -1,9 +1,9 @@
-// Phase 15 — Activity drawer for the DADBEAR Oversight Page.
+// Phase 6 (Canonical) — Activity drawer for the DADBEAR Oversight Page.
 //
 // Opens when the user clicks "View Activity" on a pyramid card.
-// Fetches `pyramid_dadbear_activity_log` for the selected slug and
-// renders the union of stale-check, pending-mutation, and change
-// manifest rows in a time-descending list.
+// Reads from `pyramid_dadbear_activity_v2` which merges observation events,
+// work item state transitions, dispatch attempts, and hold events into
+// a unified timeline sorted by timestamp.
 
 import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -31,6 +31,25 @@ function formatTime(iso: string): string {
 }
 
 function eventTypeLabel(t: string): string {
+    // Observation events
+    if (t.startsWith('observation_')) {
+        const sub = t.slice('observation_'.length);
+        return `Observation: ${sub.replace(/_/g, ' ')}`;
+    }
+    // Work item state transitions
+    if (t.startsWith('work_item_')) {
+        const state = t.slice('work_item_'.length);
+        return `Work item: ${state}`;
+    }
+    // Dispatch attempts
+    if (t.startsWith('attempt_')) {
+        const status = t.slice('attempt_'.length);
+        return `Attempt: ${status}`;
+    }
+    // Hold events
+    if (t === 'hold_placed') return 'Hold placed';
+    if (t === 'hold_cleared') return 'Hold cleared';
+    // Legacy fallbacks
     if (t === 'stale_check_stale') return 'Stale check: stale';
     if (t === 'stale_check_fresh') return 'Stale check: fresh';
     if (t === 'change_manifest_applied') return 'Change manifest applied';
@@ -44,6 +63,19 @@ function eventTypeLabel(t: string): string {
 }
 
 function eventTypeClass(t: string): string {
+    if (t.startsWith('observation_')) return 'activity-row-observation';
+    if (t === 'work_item_compiled') return 'activity-row-compiled';
+    if (t === 'work_item_dispatched') return 'activity-row-dispatched';
+    if (t === 'work_item_completed' || t === 'work_item_applied') return 'activity-row-applied';
+    if (t === 'work_item_failed') return 'activity-row-failed';
+    if (t === 'work_item_blocked') return 'activity-row-blocked';
+    if (t === 'work_item_stale') return 'activity-row-stale';
+    if (t.startsWith('attempt_completed')) return 'activity-row-applied';
+    if (t.startsWith('attempt_failed') || t.startsWith('attempt_timeout')) return 'activity-row-failed';
+    if (t.startsWith('attempt_')) return 'activity-row-pending';
+    if (t === 'hold_placed') return 'activity-row-hold-placed';
+    if (t === 'hold_cleared') return 'activity-row-hold-cleared';
+    // Legacy fallbacks
     if (t.startsWith('stale_check_stale')) return 'activity-row-stale';
     if (t.startsWith('mutation_applied_')) return 'activity-row-applied';
     if (t.startsWith('mutation_pending_')) return 'activity-row-pending';
@@ -64,7 +96,7 @@ export function DadbearActivityDrawer({
         setLoading(true);
         setError(null);
 
-        invoke<DadbearActivityEntry[]>('pyramid_dadbear_activity_log', {
+        invoke<DadbearActivityEntry[]>('pyramid_dadbear_activity_v2', {
             slug,
             limit: 200,
         })
@@ -105,7 +137,7 @@ export function DadbearActivityDrawer({
                 </div>
 
                 {loading && (
-                    <div className="dadbear-activity-loading">Loading…</div>
+                    <div className="dadbear-activity-loading">Loading...</div>
                 )}
                 {error && (
                     <div className="dadbear-activity-error">{error}</div>

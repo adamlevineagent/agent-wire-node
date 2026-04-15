@@ -34,7 +34,10 @@ pub mod converge_expand;
 pub mod cost_model;
 pub mod credentials;
 pub mod crystallization;
+pub mod dadbear_compiler;
 pub mod dadbear_extend;
+pub mod dadbear_preview;
+pub mod dadbear_supervisor;
 pub mod db;
 pub mod defaults_adapter;
 pub mod demand_gen;
@@ -65,6 +68,7 @@ pub mod meta;
 pub mod migration_config;
 pub mod multi_chain_overlay;
 pub mod naming;
+pub mod observation_events;
 pub mod parity;
 pub mod payment_redeemer;
 pub mod preview;
@@ -110,6 +114,7 @@ pub mod wire_pull;
 pub mod wire_update_poller;
 pub mod yaml_renderer;
 pub mod dispatch_policy;
+pub mod prompt_materializer;
 pub mod provider_pools;
 pub mod viz_config;
 
@@ -830,6 +835,10 @@ pub struct PyramidState {
     /// DADBEAR extend loop handle for conversation/vine lifecycle management.
     /// Started on first conversation build; dropped on app exit.
     pub dadbear_handle: Arc<Mutex<Option<crate::pyramid::dadbear_extend::DadbearExtendHandle>>>,
+    /// DADBEAR supervisor handle (Phase 5). The supervisor runs alongside
+    /// the extend loop during the transition period (Phases 5–7), handling
+    /// dispatch + result application for work items created by the compiler.
+    pub dadbear_supervisor_handle: Arc<Mutex<Option<crate::pyramid::dadbear_supervisor::DadbearSupervisorHandle>>>,
     /// Phase 1 fix: shared per-config DADBEAR dispatch in-flight flags, keyed by
     /// `pyramid_dadbear_config.id`.
     ///
@@ -1000,6 +1009,7 @@ impl PyramidState {
             supabase_anon_key: self.supabase_anon_key.clone(),
             csrf_secret: self.csrf_secret,
             dadbear_handle: self.dadbear_handle.clone(),
+            dadbear_supervisor_handle: self.dadbear_supervisor_handle.clone(),
             dadbear_in_flight: self.dadbear_in_flight.clone(),
             provider_registry: self.provider_registry.clone(),
             credential_store: self.credential_store.clone(),

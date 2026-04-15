@@ -1048,23 +1048,6 @@ pub async fn dispatch_connection_check(
                     )?;
                 }
 
-                // Log to pyramid_connection_check_log
-                conn.execute(
-                    "INSERT INTO pyramid_connection_check_log
-                     (slug, supersession_node_id, new_node_id, connection_type, connection_id,
-                      still_valid, reason, checked_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    rusqlite::params![
-                        s,
-                        old_nid,
-                        new_nid,
-                        conn_type,
-                        cr.connection_id,
-                        cr.still_valid as i32,
-                        cr.reason,
-                        Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-                    ],
-                )?;
             }
 
             Ok(())
@@ -1421,6 +1404,7 @@ pub async fn dispatch_edge_stale_check(
                     .ok();
 
                 if let Some(ref onid) = other_node_id {
+                    let cross_detail = format!("Cross-thread propagation from edge {} re-evaluation", eid);
                     conn.execute(
                         "INSERT INTO pyramid_pending_mutations
                          (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
@@ -1429,11 +1413,26 @@ pub async fn dispatch_edge_stale_check(
                             s,
                             layer,
                             onid,
-                            format!("Cross-thread propagation from edge {} re-evaluation", eid),
+                            cross_detail,
                             cascade_depth + 1,
                             now_str,
                         ],
                     )?;
+
+                    // Dual-write: observation event
+                    let _ = super::observation_events::write_observation_event(
+                        &conn,
+                        &s,
+                        "cascade",
+                        "cascade_stale",
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(onid.as_str()),
+                        Some(layer as i64),
+                        Some(&cross_detail),
+                    );
                 }
 
                 Ok(())
@@ -2823,6 +2822,7 @@ fn propagate_in_place_update(
         std::slice::from_ref(&node_id.to_string()),
     )?;
     for target in propagation_targets {
+        let inplace_detail = format!("Node {} updated in place", node_id);
         conn.execute(
             "INSERT INTO pyramid_pending_mutations
              (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
@@ -2831,10 +2831,25 @@ fn propagate_in_place_update(
                 slug,
                 next_layer,
                 target,
-                format!("Node {} updated in place", node_id),
+                inplace_detail,
                 now_str,
             ],
         )?;
+
+        // Dual-write: observation event
+        let _ = super::observation_events::write_observation_event(
+            &conn,
+            slug,
+            "cascade",
+            "cascade_stale",
+            None,
+            None,
+            None,
+            None,
+            Some(&target),
+            Some(next_layer as i64),
+            Some(&inplace_detail),
+        );
     }
 
     // edge_stale mutations for edges touching this thread
@@ -2861,6 +2876,21 @@ fn propagate_in_place_update(
                     now_str,
                 ],
             )?;
+
+            // Dual-write: observation event (edge_stale)
+            let _ = super::observation_events::write_observation_event(
+                &conn,
+                slug,
+                "cascade",
+                "edge_stale",
+                None,
+                None,
+                None,
+                None,
+                Some(&eid.to_string()),
+                Some(depth as i64),
+                Some(&node_id.to_string()),
+            );
         }
     }
 
@@ -3308,6 +3338,7 @@ async fn execute_supersession_identity_change(
         let propagation_targets =
             resolve_evidence_targets_for_node_ids(&conn, &s, std::slice::from_ref(&nid))?;
         for target in propagation_targets {
+            let supersession_detail = format!("Child node {} superseded by {}", nid, new_nid);
             conn.execute(
                 "INSERT INTO pyramid_pending_mutations
                  (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
@@ -3316,10 +3347,25 @@ async fn execute_supersession_identity_change(
                     s,
                     next_layer,
                     target,
-                    format!("Child node {} superseded by {}", nid, new_nid),
+                    supersession_detail,
                     now_str,
                 ],
             )?;
+
+            // Dual-write: observation event
+            let _ = super::observation_events::write_observation_event(
+                &conn,
+                &s,
+                "cascade",
+                "cascade_stale",
+                None,
+                None,
+                None,
+                None,
+                Some(&target),
+                Some(next_layer as i64),
+                Some(&supersession_detail),
+            );
         }
 
         if let Some(ref tid) = nd.self_thread_id {
@@ -3345,6 +3391,21 @@ async fn execute_supersession_identity_change(
                         now_str,
                     ],
                 )?;
+
+                // Dual-write: observation event (edge_stale)
+                let _ = super::observation_events::write_observation_event(
+                    &conn,
+                    &s,
+                    "cascade",
+                    "edge_stale",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&eid.to_string()),
+                    Some(nd.depth as i64),
+                    Some(&nid),
+                );
             }
         }
 

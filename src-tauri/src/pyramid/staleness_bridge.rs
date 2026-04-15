@@ -110,19 +110,120 @@ pub fn run_staleness_check(
     Ok((report, queued_items))
 }
 
-// ── Auto-detect from Pending Mutations ───────────────────────────────────────
+// ── Auto-detect from Observation Events (with WAL fallback) ─────────────────
 
-/// Read pending mutations from `pyramid_pending_mutations` (DADBEAR's table)
-/// and convert them to `ChangedFile` entries for the staleness pipeline.
+/// Ensure the `last_bridge_observation_id` column exists on `pyramid_build_metadata`.
+/// Uses ALTER TABLE IF NOT EXISTS pattern (idempotent).
+fn ensure_bridge_cursor_column(conn: &Connection) {
+    // SQLite doesn't have ALTER TABLE ... ADD COLUMN IF NOT EXISTS, so we
+    // check pragma table_info first.
+    let has_column: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('pyramid_build_metadata') WHERE name = 'last_bridge_observation_id'")
+        .and_then(|mut stmt| stmt.exists([]))
+        .unwrap_or(false);
+
+    if !has_column {
+        let _ = conn.execute_batch(
+            "ALTER TABLE pyramid_build_metadata ADD COLUMN last_bridge_observation_id INTEGER DEFAULT 0;"
+        );
+    }
+}
+
+/// Get the current bridge cursor for a slug.
+fn get_bridge_cursor(conn: &Connection, slug: &str) -> i64 {
+    conn.query_row(
+        "SELECT COALESCE(last_bridge_observation_id, 0) FROM pyramid_build_metadata WHERE slug = ?1",
+        rusqlite::params![slug],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// Advance the bridge cursor to the given observation event ID.
+fn advance_bridge_cursor(conn: &Connection, slug: &str, new_cursor: i64) {
+    let _ = conn.execute(
+        "INSERT INTO pyramid_build_metadata (slug, last_bridge_observation_id, updated_at)
+         VALUES (?1, ?2, datetime('now'))
+         ON CONFLICT(slug) DO UPDATE SET last_bridge_observation_id = ?2, updated_at = datetime('now')",
+        rusqlite::params![slug, new_cursor],
+    );
+}
+
+/// Read observation events from `dadbear_observation_events` using a cursor,
+/// converting file-level events to `ChangedFile` entries for the staleness pipeline.
 ///
-/// This bridges DADBEAR's mutation format into the crystallization format.
+/// Falls back to the old `pyramid_pending_mutations` CTE if no observation events
+/// are found (transition period where the backfill hasn't run or the new table is empty).
 pub fn auto_detect_changed_files(conn: &Connection, slug: &str) -> Result<Vec<ChangedFile>> {
-    // pyramid_pending_mutations columns: id, slug, layer, mutation_type, target_ref, detail,
-    // cascade_depth, detected_at, processed, batch_id.
-    // target_ref holds the file path for file-level mutations. Only process unprocessed entries.
-    //
-    // Atomic CTE: SELECT + UPDATE in a single statement so no concurrent caller can
-    // double-process or miss entries between the read and the flag flip.
+    // Ensure the cursor column exists (idempotent migration)
+    ensure_bridge_cursor_column(conn);
+
+    // Try the new observation events path first
+    let cursor = get_bridge_cursor(conn, slug);
+
+    let mut stmt = conn.prepare(
+        "SELECT id, event_type, file_path FROM dadbear_observation_events
+         WHERE slug = ?1 AND id > ?2
+           AND event_type IN ('file_modified', 'file_created', 'file_deleted', 'file_renamed')
+           AND file_path IS NOT NULL AND file_path != ''
+         ORDER BY id ASC",
+    )?;
+
+    let rows: Vec<(i64, String, String)> = stmt
+        .query_map(rusqlite::params![slug, cursor], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if !rows.is_empty() {
+        // New path: read from observation events and advance cursor
+        let max_id = rows.iter().map(|(id, _, _)| *id).max().unwrap_or(cursor);
+
+        let mut seen = std::collections::HashSet::new();
+        let mut changed_files = Vec::new();
+        for (_id, event_type, file_path) in &rows {
+            if !seen.insert((file_path.clone(), event_type.clone())) {
+                continue;
+            }
+            let change_type = match event_type.as_str() {
+                "file_created" => ChangeType::Addition,
+                "file_deleted" => ChangeType::Deletion,
+                "file_modified" => ChangeType::Modification,
+                "file_renamed" => ChangeType::Modification,
+                _ => ChangeType::Modification,
+            };
+            changed_files.push(ChangedFile {
+                path: file_path.clone(),
+                change_type,
+            });
+        }
+
+        advance_bridge_cursor(conn, slug, max_id);
+
+        info!(
+            slug,
+            count = changed_files.len(),
+            cursor_from = cursor,
+            cursor_to = max_id,
+            "Auto-detected changed files from observation events (cursor advanced)"
+        );
+
+        return Ok(changed_files);
+    }
+
+    // Fallback: old WAL path during transition
+    auto_detect_changed_files_from_wal(conn, slug)
+}
+
+/// Legacy fallback: read from `pyramid_pending_mutations` using the atomic CTE.
+/// Kept during the transition period while the new observation events table
+/// may not yet have all historical data.
+fn auto_detect_changed_files_from_wal(conn: &Connection, slug: &str) -> Result<Vec<ChangedFile>> {
     let mut stmt = conn.prepare(
         "WITH batch AS (
              SELECT id, target_ref, mutation_type
@@ -142,7 +243,6 @@ pub fn auto_detect_changed_files(conn: &Connection, slug: &str) -> Result<Vec<Ch
         Ok((file_path, mutation_type))
     })?;
 
-    // Deduplicate by (path, mutation_type) — the old query used SELECT DISTINCT.
     let mut seen = std::collections::HashSet::new();
     let mut changed_files = Vec::new();
     for row in rows {
@@ -151,12 +251,10 @@ pub fn auto_detect_changed_files(conn: &Connection, slug: &str) -> Result<Vec<Ch
             continue;
         }
         let change_type = match mutation_type.as_str() {
-            // New vocabulary (DADBEAR watcher)
             "new_file" => ChangeType::Addition,
             "deleted_file" => ChangeType::Deletion,
             "file_change" => ChangeType::Modification,
             "rename_candidate" => ChangeType::Modification,
-            // Backward compat (old vocabulary)
             "added" | "add" => ChangeType::Addition,
             "deleted" | "delete" | "removed" | "remove" => ChangeType::Deletion,
             _ => ChangeType::Modification,
@@ -170,7 +268,7 @@ pub fn auto_detect_changed_files(conn: &Connection, slug: &str) -> Result<Vec<Ch
     info!(
         slug,
         count = changed_files.len(),
-        "Auto-detected changed files from pending mutations (marked as processed)"
+        "Auto-detected changed files from pending mutations WAL fallback (marked as processed)"
     );
 
     Ok(changed_files)

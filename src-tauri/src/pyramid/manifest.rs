@@ -448,12 +448,14 @@ fn execute_investigation(
         }
     };
 
-    // Check the stale_check_log for this node's most recent staleness check
+    // Check dadbear_work_items for this node's most recent staleness check
     let stale_info: Option<(bool, String)> = conn
         .prepare(
-            "SELECT stale, reason FROM pyramid_stale_check_log
+            "SELECT CASE WHEN state = 'applied' THEN 1 ELSE 0 END,
+                    COALESCE(result_json, '')
+             FROM dadbear_work_items
              WHERE slug = ?1 AND target_id = ?2
-             ORDER BY checked_at DESC LIMIT 1",
+             ORDER BY completed_at DESC LIMIT 1",
         )
         .ok()
         .and_then(|mut stmt| {

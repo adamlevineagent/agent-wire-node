@@ -6,7 +6,7 @@
 // of all three LLM call paths in llm.rs.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 // ── Work classification ─────────────────────────────────────────────────────
 
@@ -164,6 +164,15 @@ pub struct DispatchPolicyYaml {
     pub escalation: Option<EscalationConfig>,
     #[serde(default)]
     pub build_coordination: Option<BuildCoordinationConfig>,
+    /// Auto-commit ceiling per batch (USD). Batches within this cost are
+    /// committed without operator confirmation. Batches exceeding it
+    /// require manual approval or place a cost_limit hold.
+    #[serde(default)]
+    pub max_batch_cost_usd: Option<f64>,
+    /// Daily cost cap per slug (USD). When cumulative daily spend plus
+    /// the preview cost exceeds this, a cost_limit hold is placed.
+    #[serde(default)]
+    pub max_daily_cost_usd: Option<f64>,
 }
 
 // ── Runtime dispatch policy ─────────────────────────────────────────────────
@@ -175,7 +184,11 @@ pub struct DispatchPolicy {
     pub rules: Vec<RoutingRule>,
     pub escalation: EscalationConfig,
     pub build_coordination: BuildCoordinationConfig,
-    pub pool_configs: HashMap<String, ProviderPoolConfig>,
+    pub pool_configs: BTreeMap<String, ProviderPoolConfig>,
+    /// Auto-commit ceiling per batch (USD). None = no limit (auto-commit all).
+    pub max_batch_cost_usd: Option<f64>,
+    /// Daily cost cap per slug (USD). None = no daily limit.
+    pub max_daily_cost_usd: Option<f64>,
 }
 
 // ── Resolved route ──────────────────────────────────────────────────────────
@@ -202,7 +215,9 @@ impl DispatchPolicy {
             rules: yaml.routing_rules.clone(),
             escalation: yaml.escalation.clone().unwrap_or_default(),
             build_coordination: yaml.build_coordination.clone().unwrap_or_default(),
-            pool_configs: yaml.provider_pools.clone(),
+            pool_configs: yaml.provider_pools.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            max_batch_cost_usd: yaml.max_batch_cost_usd,
+            max_daily_cost_usd: yaml.max_daily_cost_usd,
         }
     }
 
@@ -399,7 +414,9 @@ mod tests {
             ],
             escalation: EscalationConfig::default(),
             build_coordination: BuildCoordinationConfig::default(),
-            pool_configs: HashMap::new(),
+            pool_configs: BTreeMap::new(),
+            max_batch_cost_usd: None,
+            max_daily_cost_usd: None,
         };
 
         let route = policy.resolve_route(WorkType::Build, "primary", "summarize_l2", None);
@@ -433,7 +450,9 @@ mod tests {
             }],
             escalation: EscalationConfig::default(),
             build_coordination: BuildCoordinationConfig::default(),
-            pool_configs: HashMap::new(),
+            pool_configs: BTreeMap::new(),
+            max_batch_cost_usd: None,
+            max_daily_cost_usd: None,
         };
 
         let route = policy.resolve_route(WorkType::Interactive, "primary", "chat", None);

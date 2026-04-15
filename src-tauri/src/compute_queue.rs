@@ -70,6 +70,11 @@ pub struct QueueEntry {
     pub model_id: String,
     /// When the item was enqueued (for latency tracking).
     pub enqueued_at: std::time::Instant,
+    /// DADBEAR work item ID for correlating queue results back to durable
+    /// work items. None for non-DADBEAR callers (interactive, manual builds).
+    pub work_item_id: Option<String>,
+    /// DADBEAR attempt ID for this dispatch attempt. None for non-DADBEAR callers.
+    pub attempt_id: Option<String>,
 }
 
 impl ComputeQueueManager {

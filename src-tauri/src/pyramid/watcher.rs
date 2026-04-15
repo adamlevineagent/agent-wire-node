@@ -651,7 +651,31 @@ pub fn write_mutation(
             mutation_type, slug
         )
     })?;
-    Ok(conn.last_insert_rowid())
+    let wal_id = conn.last_insert_rowid();
+
+    // Dual-write: observation event (always written, even during pause)
+    let obs_event_type = match mutation_type {
+        "file_change" => "file_modified",
+        "new_file" => "file_created",
+        "deleted_file" => "file_deleted",
+        "rename_candidate" => "file_renamed",
+        other => other, // pass through unknown types
+    };
+    let _ = super::observation_events::write_observation_event(
+        conn,
+        slug,
+        "watcher",
+        obs_event_type,
+        None,            // source_path
+        Some(target_ref), // file_path = target_ref for watcher mutations
+        None,            // content_hash (not available at WAL write time)
+        None,            // previous_hash
+        None,            // target_node_id
+        Some(layer as i64),
+        detail,          // metadata_json = detail
+    );
+
+    Ok(wal_id)
 }
 
 /// Multi-pyramid fan-out: find all slugs that track the given file path.

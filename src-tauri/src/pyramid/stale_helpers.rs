@@ -115,6 +115,21 @@ fn enqueue_parent_confirmed_stales(
              VALUES (?1, 1, 'confirmed_stale', ?2, ?3, 0, ?4, 0)",
             rusqlite::params![slug, target, detail, now],
         )?;
+
+        // Dual-write: observation event
+        let _ = super::observation_events::write_observation_event(
+            conn,
+            slug,
+            "cascade",
+            "cascade_stale",
+            None,          // source_path
+            None,          // file_path
+            None,          // content_hash
+            None,          // previous_hash
+            Some(target),  // target_node_id
+            Some(1),       // layer
+            Some(detail),  // metadata_json
+        );
     }
 
     Ok(parent_targets.len())
@@ -516,20 +531,6 @@ pub async fn dispatch_new_file_ingest(batch: Vec<PendingMutation>, db_path: &str
                 info!(file = %file_path, node_id = %node_id, "New file ingested without an existing parent thread target");
             }
 
-            // Log to stale check log (stale=2 means "new")
-            let _ = conn.execute(
-                "INSERT INTO pyramid_stale_check_log
-                 (slug, batch_id, layer, target_id, stale, reason,
-                  checker_index, checker_batch_size, checked_at, cost_tokens, cost_usd)
-                 VALUES (?1, '', 0, ?2, 2, ?3, 0, 1, ?4, NULL, NULL)",
-                rusqlite::params![
-                    slug_c,
-                    file_path,
-                    format!("New file ingested as node {}", node_id),
-                    now,
-                ],
-            );
-
             info!(file = %file_path, node_id = %node_id, "New file ingested into pyramid");
         }
 
@@ -692,20 +693,6 @@ pub async fn dispatch_tombstone(batch: Vec<PendingMutation>, db_path: &str) -> R
             if parent_count == 0 {
                 info!(file = %file_path, tombstone = %tombstone_id, "Tombstone created without an existing parent thread target");
             }
-
-            // Log to stale check log (stale=3 means "deleted")
-            let _ = conn.execute(
-                "INSERT INTO pyramid_stale_check_log
-                 (slug, batch_id, layer, target_id, stale, reason,
-                  checker_index, checker_batch_size, checked_at, cost_tokens, cost_usd)
-                 VALUES (?1, '', 0, ?2, 3, ?3, 0, 1, ?4, NULL, NULL)",
-                rusqlite::params![
-                    slug_c,
-                    file_path,
-                    format!("File deleted, tombstoned as {}", tombstone_id),
-                    now,
-                ],
-            );
 
             info!(file = %file_path, tombstone = %tombstone_id, "File tombstoned");
         }
@@ -890,211 +877,236 @@ Output JSON only:
     tokio::task::spawn_blocking(move || -> Result<()> {
         let conn = super::db::open_pyramid_connection(Path::new(&db))
             .context("Failed to open DB for rename post-processing")?;
-        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-
-        if result_c.rename {
-            // Confirmed rename: update thread key, update file_hashes, supersede old
-            let old_node_ids = get_file_node_ids(&conn, &slug_c, &old_path_c)
-                .unwrap_or_default();
-
-            if let Some(old_node_id) = old_node_ids.first() {
-                // Create a rename note node (sequential ID, not UUID)
-                let new_node_id = super::db::next_sequential_node_id(&conn, &slug_c, 0, "");
-                let rename_note = format!(
-                    "File renamed: {} -> {}. Reason: {}",
-                    old_path_c, new_path_c, result_c.reason
-                );
-
-                // Read new file content for the updated node
-                let new_content = read_file_content(&new_path_c).unwrap_or_default();
-                let distilled_lines: Vec<&str> = new_content.lines().take(200).collect();
-                let distilled = format!(
-                    "File: {} (renamed from {})\n\n{}",
-                    new_path_c, old_path_c, distilled_lines.join("\n")
-                );
-
-                // Insert new L0 node
-                let headline = headline_from_path(&new_path_c).unwrap_or_else(|| "Renamed File".to_string());
-                conn.execute(
-                    "INSERT OR REPLACE INTO pyramid_nodes
-                     (id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions,
-                      terms, dead_ends, self_prompt, children, parent_id, build_version, created_at)
-                     VALUES (?1, ?2, 0, NULL, ?3, ?4, '[]', '[]', '[]', '[]', '[]', '', '[]', NULL, 1, ?5)",
-                    rusqlite::params![new_node_id, slug_c, headline, distilled, now],
-                )?;
-
-                // Supersede all old nodes
-                for oid in &old_node_ids {
-                    conn.execute(
-                        "UPDATE pyramid_nodes SET superseded_by = ?1
-                         WHERE slug = ?2 AND id = ?3 AND superseded_by IS NULL",
-                        rusqlite::params![new_node_id, slug_c, oid],
-                    )?;
-
-                    // Re-parent children
-                    conn.execute(
-                        "UPDATE pyramid_nodes SET parent_id = ?1
-                         WHERE slug = ?2 AND parent_id = ?3",
-                        rusqlite::params![new_node_id, slug_c, oid],
-                    )?;
-                }
-
-                // Update pyramid_file_hashes: remove old path, add new path
-                conn.execute(
-                    "DELETE FROM pyramid_file_hashes WHERE slug = ?1 AND file_path = ?2",
-                    rusqlite::params![slug_c, old_path_c],
-                )?;
-
-                let hash = compute_hash(new_content.as_bytes());
-                let node_ids_json = serde_json::to_string(&vec![&new_node_id])?;
-                conn.execute(
-                    "INSERT OR REPLACE INTO pyramid_file_hashes
-                     (slug, file_path, hash, chunk_count, node_ids, last_ingested_at)
-                     VALUES (?1, ?2, ?3, 1, ?4, ?5)",
-                    rusqlite::params![slug_c, new_path_c, hash, node_ids_json, now],
-                )?;
-
-                // Update thread key if a thread references the old path
-                conn.execute(
-                    "UPDATE pyramid_threads SET thread_name = ?1, current_canonical_id = ?2, updated_at = ?3
-                     WHERE slug = ?4 AND current_canonical_id = ?5",
-                    rusqlite::params![new_path_c, new_node_id, now, slug_c, old_node_id],
-                )?;
-
-                let parent_count = enqueue_parent_confirmed_stales(
-                    &conn,
-                    &slug_c,
-                    &old_node_ids,
-                    &rename_note,
-                    &now,
-                )?;
-
-                if parent_count == 0 {
-                    info!(old_path = %old_path_c, new_path = %new_path_c, "Rename completed without an existing parent thread target");
-                }
-
-                info!(
-                    old_path = %old_path_c,
-                    new_path = %new_path_c,
-                    old_node = %old_node_id,
-                    new_node = %new_node_id,
-                    "Rename processed: updated thread and file_hashes"
-                );
-            }
-        } else {
-            // Not a rename: tombstone old + fresh ingest for new
-            info!(
-                old_path = %old_path_c,
-                new_path = %new_path_c,
-                "Not a rename: will tombstone old and ingest new"
-            );
-
-            // Tombstone the old file
-            let old_node_ids = get_file_node_ids(&conn, &slug_c, &old_path_c)
-                .unwrap_or_default();
-
-            if !old_node_ids.is_empty() {
-                let old_distilled = old_node_ids
-                    .first()
-                    .and_then(|nid| get_node_content(&conn, &slug_c, nid).ok())
-                    .unwrap_or_default();
-                let first_line = old_distilled.lines().next().unwrap_or("(empty)");
-                let tombstone_content = format!(
-                    "File deleted: {}. Previously contained: {}",
-                    old_path_c, first_line
-                );
-                let tombstone_headline = tombstone_headline(&old_path_c);
-
-                let tombstone_id = super::db::next_sequential_node_id(&conn, &slug_c, 0, "TOMB");
-
-                conn.execute(
-                    "INSERT INTO pyramid_nodes
-                     (id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions,
-                      terms, dead_ends, self_prompt, children, parent_id, build_version, created_at)
-                     VALUES (?1, ?2, 0, NULL, ?3, ?4, '[]', '[]', '[]', '[]', '[]', '', '[]', NULL, 1, ?5)",
-                    rusqlite::params![tombstone_id, slug_c, tombstone_headline, tombstone_content, now],
-                )?;
-
-                for oid in &old_node_ids {
-                    conn.execute(
-                        "UPDATE pyramid_nodes SET superseded_by = ?1
-                         WHERE slug = ?2 AND id = ?3 AND superseded_by IS NULL",
-                        rusqlite::params![tombstone_id, slug_c, oid],
-                    )?;
-                    conn.execute(
-                        "UPDATE pyramid_nodes SET parent_id = ?1
-                         WHERE slug = ?2 AND parent_id = ?3",
-                        rusqlite::params![tombstone_id, slug_c, oid],
-                    )?;
-                }
-
-                conn.execute(
-                    "DELETE FROM pyramid_file_hashes WHERE slug = ?1 AND file_path = ?2",
-                    rusqlite::params![slug_c, old_path_c],
-                )?;
-
-                let parent_count = enqueue_parent_confirmed_stales(
-                    &conn,
-                    &slug_c,
-                    &old_node_ids,
-                    &tombstone_content,
-                    &now,
-                )?;
-
-                if parent_count == 0 {
-                    info!(old_path = %old_path_c, tombstone = %tombstone_id, "Rename-false tombstone created without an existing parent thread target");
-                }
-            }
-
-            // Ingest the new file
-            let new_content = read_file_content(&new_path_c).unwrap_or_default();
-            if !new_content.is_empty() {
-                let hash = compute_hash(new_content.as_bytes());
-                let new_node_id = super::db::next_sequential_node_id(&conn, &slug_c, 0, "");
-
-                let distilled_lines: Vec<&str> = new_content.lines().take(200).collect();
-                let distilled = format!(
-                    "File: {}\n\n{}",
-                    new_path_c,
-                    distilled_lines.join("\n")
-                );
-
-                let headline = headline_from_path(&new_path_c).unwrap_or_else(|| "New File".to_string());
-                conn.execute(
-                    "INSERT OR REPLACE INTO pyramid_nodes
-                     (id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions,
-                      terms, dead_ends, self_prompt, children, parent_id, build_version, created_at)
-                     VALUES (?1, ?2, 0, NULL, ?3, ?4, '[]', '[]', '[]', '[]', '[]', '', '[]', NULL, 1, ?5)",
-                    rusqlite::params![new_node_id, slug_c, headline, distilled, now],
-                )?;
-
-                let node_ids_json = serde_json::to_string(&vec![&new_node_id])?;
-                conn.execute(
-                    "INSERT OR REPLACE INTO pyramid_file_hashes
-                     (slug, file_path, hash, chunk_count, node_ids, last_ingested_at)
-                     VALUES (?1, ?2, ?3, 1, ?4, ?5)",
-                    rusqlite::params![slug_c, new_path_c, hash, node_ids_json, now],
-                )?;
-
-                let parent_count = enqueue_parent_confirmed_stales(
-                    &conn,
-                    &slug_c,
-                    std::slice::from_ref(&new_node_id),
-                    "New file ingested (from rename-false)",
-                    &now,
-                )?;
-
-                if parent_count == 0 {
-                    info!(new_path = %new_path_c, node_id = %new_node_id, "Rename-false new file ingested without an existing parent thread target");
-                }
-            }
-        }
-
+        apply_rename_result(&conn, &slug_c, &old_path_c, &new_path_c, result_c.rename, &result_c.reason)?;
         Ok(())
     })
     .await??;
 
     Ok(result)
+}
+
+/// Apply the result of a rename check to the pyramid.
+///
+/// When `is_rename` is true: creates a new L0 node for the new path,
+/// supersedes old nodes, re-parents children, updates file_hashes and
+/// thread keys, and enqueues parent stale mutations.
+///
+/// When `is_rename` is false: tombstones the old file, creates a fresh
+/// L0 node for the new file, and enqueues parent stale mutations.
+///
+/// This function is called both from `dispatch_rename_check` (where the
+/// LLM call happens inline) and from the DADBEAR supervisor's
+/// `apply_result` (where the LLM call already happened via the compute
+/// queue).
+pub(crate) fn apply_rename_result(
+    conn: &Connection,
+    slug: &str,
+    old_path: &str,
+    new_path: &str,
+    is_rename: bool,
+    reason: &str,
+) -> Result<()> {
+    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+    if is_rename {
+        // Confirmed rename: update thread key, update file_hashes, supersede old
+        let old_node_ids = get_file_node_ids(conn, slug, old_path)
+            .unwrap_or_default();
+
+        if let Some(old_node_id) = old_node_ids.first() {
+            // Create a rename note node (sequential ID, not UUID)
+            let new_node_id = super::db::next_sequential_node_id(conn, slug, 0, "");
+            let rename_note = format!(
+                "File renamed: {} -> {}. Reason: {}",
+                old_path, new_path, reason
+            );
+
+            // Read new file content for the updated node
+            let new_content = read_file_content(new_path).unwrap_or_default();
+            let distilled_lines: Vec<&str> = new_content.lines().take(200).collect();
+            let distilled = format!(
+                "File: {} (renamed from {})\n\n{}",
+                new_path, old_path, distilled_lines.join("\n")
+            );
+
+            // Insert new L0 node
+            let headline = headline_from_path(new_path).unwrap_or_else(|| "Renamed File".to_string());
+            conn.execute(
+                "INSERT OR REPLACE INTO pyramid_nodes
+                 (id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions,
+                  terms, dead_ends, self_prompt, children, parent_id, build_version, created_at)
+                 VALUES (?1, ?2, 0, NULL, ?3, ?4, '[]', '[]', '[]', '[]', '[]', '', '[]', NULL, 1, ?5)",
+                rusqlite::params![new_node_id, slug, headline, distilled, now],
+            )?;
+
+            // Supersede all old nodes
+            for oid in &old_node_ids {
+                conn.execute(
+                    "UPDATE pyramid_nodes SET superseded_by = ?1
+                     WHERE slug = ?2 AND id = ?3 AND superseded_by IS NULL",
+                    rusqlite::params![new_node_id, slug, oid],
+                )?;
+
+                // Re-parent children
+                conn.execute(
+                    "UPDATE pyramid_nodes SET parent_id = ?1
+                     WHERE slug = ?2 AND parent_id = ?3",
+                    rusqlite::params![new_node_id, slug, oid],
+                )?;
+            }
+
+            // Update pyramid_file_hashes: remove old path, add new path
+            conn.execute(
+                "DELETE FROM pyramid_file_hashes WHERE slug = ?1 AND file_path = ?2",
+                rusqlite::params![slug, old_path],
+            )?;
+
+            let hash = compute_hash(new_content.as_bytes());
+            let node_ids_json = serde_json::to_string(&vec![&new_node_id])?;
+            conn.execute(
+                "INSERT OR REPLACE INTO pyramid_file_hashes
+                 (slug, file_path, hash, chunk_count, node_ids, last_ingested_at)
+                 VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+                rusqlite::params![slug, new_path, hash, node_ids_json, now],
+            )?;
+
+            // Update thread key if a thread references the old path
+            conn.execute(
+                "UPDATE pyramid_threads SET thread_name = ?1, current_canonical_id = ?2, updated_at = ?3
+                 WHERE slug = ?4 AND current_canonical_id = ?5",
+                rusqlite::params![new_path, new_node_id, now, slug, old_node_id],
+            )?;
+
+            let parent_count = enqueue_parent_confirmed_stales(
+                conn,
+                slug,
+                &old_node_ids,
+                &rename_note,
+                &now,
+            )?;
+
+            if parent_count == 0 {
+                info!(old_path = %old_path, new_path = %new_path, "Rename completed without an existing parent thread target");
+            }
+
+            info!(
+                old_path = %old_path,
+                new_path = %new_path,
+                old_node = %old_node_id,
+                new_node = %new_node_id,
+                "Rename processed: updated thread and file_hashes"
+            );
+        }
+    } else {
+        // Not a rename: tombstone old + fresh ingest for new
+        info!(
+            old_path = %old_path,
+            new_path = %new_path,
+            "Not a rename: will tombstone old and ingest new"
+        );
+
+        // Tombstone the old file
+        let old_node_ids = get_file_node_ids(conn, slug, old_path)
+            .unwrap_or_default();
+
+        if !old_node_ids.is_empty() {
+            let old_distilled = old_node_ids
+                .first()
+                .and_then(|nid| get_node_content(conn, slug, nid).ok())
+                .unwrap_or_default();
+            let first_line = old_distilled.lines().next().unwrap_or("(empty)");
+            let tombstone_content = format!(
+                "File deleted: {}. Previously contained: {}",
+                old_path, first_line
+            );
+            let tombstone_hl = tombstone_headline(old_path);
+
+            let tombstone_id = super::db::next_sequential_node_id(conn, slug, 0, "TOMB");
+
+            conn.execute(
+                "INSERT INTO pyramid_nodes
+                 (id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions,
+                  terms, dead_ends, self_prompt, children, parent_id, build_version, created_at)
+                 VALUES (?1, ?2, 0, NULL, ?3, ?4, '[]', '[]', '[]', '[]', '[]', '', '[]', NULL, 1, ?5)",
+                rusqlite::params![tombstone_id, slug, tombstone_hl, tombstone_content, now],
+            )?;
+
+            for oid in &old_node_ids {
+                conn.execute(
+                    "UPDATE pyramid_nodes SET superseded_by = ?1
+                     WHERE slug = ?2 AND id = ?3 AND superseded_by IS NULL",
+                    rusqlite::params![tombstone_id, slug, oid],
+                )?;
+                conn.execute(
+                    "UPDATE pyramid_nodes SET parent_id = ?1
+                     WHERE slug = ?2 AND parent_id = ?3",
+                    rusqlite::params![tombstone_id, slug, oid],
+                )?;
+            }
+
+            conn.execute(
+                "DELETE FROM pyramid_file_hashes WHERE slug = ?1 AND file_path = ?2",
+                rusqlite::params![slug, old_path],
+            )?;
+
+            let parent_count = enqueue_parent_confirmed_stales(
+                conn,
+                slug,
+                &old_node_ids,
+                &tombstone_content,
+                &now,
+            )?;
+
+            if parent_count == 0 {
+                info!(old_path = %old_path, tombstone = %tombstone_id, "Rename-false tombstone created without an existing parent thread target");
+            }
+        }
+
+        // Ingest the new file
+        let new_content = read_file_content(new_path).unwrap_or_default();
+        if !new_content.is_empty() {
+            let hash = compute_hash(new_content.as_bytes());
+            let new_node_id = super::db::next_sequential_node_id(conn, slug, 0, "");
+
+            let distilled_lines: Vec<&str> = new_content.lines().take(200).collect();
+            let distilled = format!(
+                "File: {}\n\n{}",
+                new_path,
+                distilled_lines.join("\n")
+            );
+
+            let headline = headline_from_path(new_path).unwrap_or_else(|| "New File".to_string());
+            conn.execute(
+                "INSERT OR REPLACE INTO pyramid_nodes
+                 (id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions,
+                  terms, dead_ends, self_prompt, children, parent_id, build_version, created_at)
+                 VALUES (?1, ?2, 0, NULL, ?3, ?4, '[]', '[]', '[]', '[]', '[]', '', '[]', NULL, 1, ?5)",
+                rusqlite::params![new_node_id, slug, headline, distilled, now],
+            )?;
+
+            let node_ids_json = serde_json::to_string(&vec![&new_node_id])?;
+            conn.execute(
+                "INSERT OR REPLACE INTO pyramid_file_hashes
+                 (slug, file_path, hash, chunk_count, node_ids, last_ingested_at)
+                 VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+                rusqlite::params![slug, new_path, hash, node_ids_json, now],
+            )?;
+
+            let parent_count = enqueue_parent_confirmed_stales(
+                conn,
+                slug,
+                std::slice::from_ref(&new_node_id),
+                "New file ingested (from rename-false)",
+                &now,
+            )?;
+
+            if parent_count == 0 {
+                info!(new_path = %new_path, node_id = %new_node_id, "Rename-false new file ingested without an existing parent thread target");
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ── dispatch_evidence_set_apex_synthesis ─────────────────────────────────────

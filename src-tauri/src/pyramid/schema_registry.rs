@@ -462,6 +462,8 @@ fn display_name_for(schema_type: &str) -> String {
         "evidence_policy" => "Evidence Policy".to_string(),
         "build_strategy" => "Build Strategy".to_string(),
         "dadbear_policy" => "DADBEAR Policy".to_string(),
+        "watch_root" => "Watch Root".to_string(),
+        "dadbear_norms" => "DADBEAR Norms".to_string(),
         "tier_routing" => "Tier Routing".to_string(),
         "custom_prompts" => "Custom Prompts".to_string(),
         "folder_ingestion_heuristics" => "Folder Ingestion Heuristics".to_string(),
@@ -486,6 +488,12 @@ fn description_for(schema_type: &str) -> String {
         }
         "dadbear_policy" => {
             "DADBEAR background auto-update loop policy (scan intervals, staleness propagation)".to_string()
+        }
+        "watch_root" => {
+            "Per-source-path identity for DADBEAR file watching (contribution existence is the enable gate)".to_string()
+        }
+        "dadbear_norms" => {
+            "DADBEAR timing and threshold norms — scan interval, debounce, staleness thresholds (global or per-pyramid)".to_string()
         }
         "tier_routing" => {
             "Maps model tier names to (provider, model) targets".to_string()

@@ -228,6 +228,8 @@ mod tests {
             escalation: EscalationConfig::default(),
             build_coordination: BuildCoordinationConfig::default(),
             pool_configs,
+            max_batch_cost_usd: None,
+            max_daily_cost_usd: None,
         }
     }
 

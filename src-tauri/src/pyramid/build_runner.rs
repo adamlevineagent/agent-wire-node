@@ -423,6 +423,22 @@ async fn run_post_build_hooks(
                          VALUES (?1, 0, 'confirmed_stale', ?2, ?3, 0, ?4, 0)",
                         rusqlite::params![referrer, &slug_owned, &detail, &now],
                     )?;
+
+                    // Dual-write: observation event (vine bedrock stale)
+                    let _ = super::observation_events::write_observation_event(
+                        &conn,
+                        referrer,
+                        "vine",
+                        "vine_stale",
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(slug_owned.as_str()),
+                        Some(0),
+                        Some(&detail),
+                    );
+
                     notified += 1;
                 }
                 info!(

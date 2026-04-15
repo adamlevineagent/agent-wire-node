@@ -1618,7 +1618,7 @@ function CreatePanel({
     // ── Phase 15: Consume preset (schema-only pre-selection) ──────────────
     //
     // The DADBEAR Oversight "Set Default Norms" button dispatches a
-    // preset { schemaType: 'dadbear_policy', slug: null }. We jump
+    // preset { schemaType: 'dadbear_norms', slug: null }. We jump
     // straight to the intent step so the user can write a norm
     // adjustment directly without picking a schema from the list.
     useEffect(() => {

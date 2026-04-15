@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { PyramidSurface } from './pyramid-surface/PyramidSurface';
-import { NodeInspectorPanel } from './theatre/NodeInspectorPanel';
+import { NodeInspectorModal } from './theatre/NodeInspectorModal';
 import type { LiveNodeInfo } from './theatre/types';
 
 interface AutoUpdateConfig {
@@ -162,6 +162,10 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
     // DADBEAR watch configs (source paths)
     const [dadbearConfigs, setDadbearConfigs] = useState<DadbearWatchConfig[] | null>(null);
 
+    // Phase 6 (Canonical): active holds from holds_projection
+    interface HoldEntry { hold: string; held_since: string; reason: string | null }
+    const [activeHolds, setActiveHolds] = useState<HoldEntry[]>([]);
+
     // Evidence density (loaded once on mount, manual refresh)
     const [evidenceDensity, setEvidenceDensity] = useState<EvidenceDensity | null>(null);
     const [evidenceLoading, setEvidenceLoading] = useState(false);
@@ -277,12 +281,30 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
         }
     }, [slug]);
 
+    // Phase 6 (Canonical): load active holds from the holds projection.
+    // Uses the v2 overview IPC (single-slug filter) to get hold state.
+    const loadHolds = useCallback(async () => {
+        try {
+            const resp = await invoke<{
+                pyramids: Array<{
+                    slug: string;
+                    holds: HoldEntry[];
+                    derived_status: string;
+                }>;
+            }>('pyramid_dadbear_overview_v2');
+            const match = resp.pyramids.find((p) => p.slug === slug);
+            setActiveHolds(match?.holds ?? []);
+        } catch {
+            // v2 IPC may not be available yet — ignore
+        }
+    }, [slug]);
+
     useEffect(() => {
         setLoading(true);
-        Promise.all([loadConfig(), loadStatus(), loadStaleLog(), loadCost(), loadContributions(), loadDadbearConfigs()])
+        Promise.all([loadConfig(), loadStatus(), loadStaleLog(), loadCost(), loadContributions(), loadDadbearConfigs(), loadHolds()])
             .catch(() => setError('Failed to load DADBEAR data'))
             .finally(() => setLoading(false));
-    }, [loadConfig, loadStatus, loadStaleLog, loadCost, loadContributions, loadDadbearConfigs]);
+    }, [loadConfig, loadStatus, loadStaleLog, loadCost, loadContributions, loadDadbearConfigs, loadHolds]);
 
     // ── Node counts (works independently of DADBEAR config) ─────────
 
@@ -362,9 +384,10 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
             loadStaleLog();
             loadCost();
             loadContributions();
+            loadHolds();
         }, 10_000);
         return () => clearInterval(interval);
-    }, [loadStatus, loadStaleLog, loadCost, loadContributions]);
+    }, [loadStatus, loadStaleLog, loadCost, loadContributions, loadHolds]);
 
     // ── Countdown timer (1s interval) ──────────────────────────────
 
@@ -425,7 +448,7 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
         try {
             await invoke('pyramid_auto_update_freeze', { slug });
             await loadConfig();
-            await loadStatus();
+            await Promise.all([loadStatus(), loadHolds()]);
         } catch (err) {
             setError(String(err));
         }
@@ -435,7 +458,7 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
         try {
             await invoke('pyramid_auto_update_unfreeze', { slug });
             await loadConfig();
-            await loadStatus();
+            await Promise.all([loadStatus(), loadHolds()]);
         } catch (err) {
             setError(String(err));
         }
@@ -447,7 +470,7 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
         try {
             await invoke('pyramid_breaker_resume', { slug });
             await loadConfig();
-            await loadStatus();
+            await Promise.all([loadStatus(), loadHolds()]);
         } catch (err) {
             setError(String(err));
         }
@@ -470,7 +493,7 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
         setRunningNow(true);
         try {
             await invoke('pyramid_auto_update_run_now', { slug });
-            await loadStatus();
+            await Promise.all([loadStatus(), loadHolds()]);
             await loadStaleLog();
             await loadCost();
         } catch (err) {
@@ -484,7 +507,7 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
         setSweepingL0(true);
         try {
             await invoke<L0SweepResult>('pyramid_auto_update_l0_sweep', { slug });
-            await loadStatus();
+            await Promise.all([loadStatus(), loadHolds()]);
             await loadStaleLog();
             await loadCost();
             await loadContributions();
@@ -520,8 +543,12 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
     };
 
     const enginePhase = status?.phase ?? 'idle';
-    const isFrozen = status?.frozen ?? config?.frozen ?? false;
-    const isBreakerTripped = status?.breaker_tripped ?? config?.breaker_tripped ?? false;
+    // Phase 6 (Canonical): derive frozen/breaker from holds when available,
+    // falling back to legacy booleans for backward compat during transition.
+    const hasFrozenHold = activeHolds.some((h) => h.hold === 'frozen');
+    const hasBreakerHold = activeHolds.some((h) => h.hold === 'breaker');
+    const isFrozen = hasFrozenHold || status?.frozen || config?.frozen || false;
+    const isBreakerTripped = hasBreakerHold || status?.breaker_tripped || config?.breaker_tripped || false;
 
     // ── Accumulated-brightness DADBEAR model ─────────────────────────
     const stepCounts = useMemo(() => {
@@ -740,6 +767,20 @@ Last check: ${lastCheckStr}
                             {statusInfo.text}
                         </div>
 
+                        {/* Phase 6 (Canonical): active holds display */}
+                        {activeHolds.length > 0 && (
+                            <div className="dadbear-holds-list" style={{ margin: '8px 0', padding: '6px 8px', background: 'var(--surface-2, #1a1a2e)', borderRadius: 4, fontSize: 12 }}>
+                                <div style={{ fontWeight: 600, marginBottom: 4, color: 'var(--text-muted)' }}>Active Holds</div>
+                                {activeHolds.map((h) => (
+                                    <div key={h.hold} style={{ display: 'flex', gap: 8, padding: '2px 0' }}>
+                                        <span style={{ fontWeight: 500, color: h.hold === 'breaker' ? 'var(--danger, #f87171)' : 'var(--warning, #fbbf24)' }}>{h.hold}</span>
+                                        <span style={{ color: 'var(--text-muted)' }}>{formatTimeAgo(h.held_since)}</span>
+                                        {h.reason && <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>{h.reason}</span>}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+
                         {/* Node counts now shown in bar chart labels below */}
 
                         {statusError && !status && contentType !== 'question' && contentType !== 'conversation' && (
@@ -751,7 +792,7 @@ Last check: ${lastCheckStr}
                                         await invoke('pyramid_auto_update_config_init', { slug });
                                         setStatusError(null);
                                         await loadConfig();
-                                        await loadStatus();
+                                        await Promise.all([loadStatus(), loadHolds()]);
                                     } catch (err) {
                                         setStatusError(String(err));
                                     }
@@ -859,35 +900,35 @@ Last check: ${lastCheckStr}
                             <h3>Source Paths</h3>
                             <div className="dadbear-source-paths-list">
                                 {dadbearConfigs.map((dc) => (
-                                    <div key={dc.id} className={`dadbear-source-path-row ${dc.enabled ? 'active' : 'paused'}`}>
+                                    <div key={dc.id} className={`dadbear-source-path-row ${isFrozen ? 'paused' : 'active'}`}>
                                         <div className="dadbear-source-path-info">
                                             <span className="dadbear-source-path-name" title={dc.source_path}>
                                                 {dc.source_path.split('/').slice(-2).join('/')}
                                             </span>
                                             <span className="dadbear-source-path-type">{dc.content_type}</span>
-                                            <span className={`dadbear-source-path-status ${dc.enabled ? 'active' : 'paused'}`}>
-                                                {dc.enabled ? 'Active' : 'Paused'}
+                                            <span className={`dadbear-source-path-status ${isFrozen ? 'paused' : 'active'}`}>
+                                                {isFrozen ? 'Paused' : 'Active'}
                                             </span>
                                             <span className="dadbear-source-path-scan">
                                                 {dc.last_scan_at ? formatDate(dc.last_scan_at) : 'never scanned'}
                                             </span>
                                         </div>
                                         <button
-                                            className={`dadbear-action-btn ${dc.enabled ? '' : 'primary'}`}
+                                            className={`dadbear-action-btn ${isFrozen ? 'primary' : ''}`}
                                             onClick={async () => {
                                                 try {
-                                                    if (dc.enabled) {
+                                                    if (!isFrozen) {
                                                         await invoke('pyramid_dadbear_pause', { slug: dc.slug });
                                                     } else {
                                                         await invoke('pyramid_dadbear_resume', { slug: dc.slug });
                                                     }
-                                                    await loadDadbearConfigs();
+                                                    await Promise.all([loadStatus(), loadHolds()]);
                                                 } catch (err) {
                                                     setError(String(err));
                                                 }
                                             }}
                                         >
-                                            {dc.enabled ? 'Pause' : 'Resume'}
+                                            {isFrozen ? 'Resume' : 'Pause'}
                                         </button>
                                     </div>
                                 ))}
@@ -1215,7 +1256,7 @@ Last check: ${lastCheckStr}
 
             {/* Node Inspector Panel */}
             {inspectedNodeId && (
-                <NodeInspectorPanel
+                <NodeInspectorModal
                     slug={slug}
                     nodeId={inspectedNodeId}
                     allNodes={allNodes}

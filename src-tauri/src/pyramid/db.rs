@@ -329,7 +329,9 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
 
     conn.execute_batch(
         "
-        -- WAL for crash recovery of pending mutations
+        -- DEPRECATED (Phase 7): WAL for crash recovery of pending mutations.
+        -- Retained during transition; dadbear_observation_events is the
+        -- canonical authority for change observations.
         CREATE TABLE IF NOT EXISTS pyramid_pending_mutations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             slug TEXT NOT NULL REFERENCES pyramid_slugs(slug) ON DELETE CASCADE,
@@ -355,7 +357,11 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             PRIMARY KEY (slug, file_path)
         );
 
-        -- Per-pyramid auto-update settings
+        -- DEPRECATED (Phase 7): Per-pyramid auto-update settings.
+        -- Retained for backward compatibility; the holds projection
+        -- (dadbear_holds_projection) is the sole authority for frozen/breaker
+        -- state, and contribution existence in pyramid_dadbear_config is the
+        -- enable gate. The enabled column is no longer read by the master gate.
         CREATE TABLE IF NOT EXISTS pyramid_auto_update_config (
             slug TEXT PRIMARY KEY REFERENCES pyramid_slugs(slug) ON DELETE CASCADE,
             auto_update INTEGER NOT NULL DEFAULT 0,
@@ -368,37 +374,10 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             frozen_at TEXT
         );
 
-        -- Stale-check audit trail
-        CREATE TABLE IF NOT EXISTS pyramid_stale_check_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            slug TEXT NOT NULL REFERENCES pyramid_slugs(slug) ON DELETE CASCADE,
-            batch_id TEXT NOT NULL,
-            layer INTEGER NOT NULL,
-            target_id TEXT NOT NULL,
-            stale INTEGER NOT NULL DEFAULT 0,
-            reason TEXT NOT NULL DEFAULT '',
-            checker_index INTEGER NOT NULL DEFAULT 0,
-            checker_batch_size INTEGER NOT NULL DEFAULT 1,
-            checked_at TEXT NOT NULL DEFAULT (datetime('now')),
-            cost_tokens INTEGER,
-            cost_usd REAL
-        );
-        CREATE INDEX IF NOT EXISTS idx_stale_check_slug ON pyramid_stale_check_log(slug, batch_id);
-        CREATE INDEX IF NOT EXISTS idx_stale_check_target ON pyramid_stale_check_log(slug, target_id);
-
-        -- Connection carryforward decisions
-        CREATE TABLE IF NOT EXISTS pyramid_connection_check_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            slug TEXT NOT NULL REFERENCES pyramid_slugs(slug) ON DELETE CASCADE,
-            supersession_node_id TEXT NOT NULL,
-            new_node_id TEXT NOT NULL,
-            connection_type TEXT NOT NULL,
-            connection_id TEXT NOT NULL,
-            still_valid INTEGER NOT NULL DEFAULT 1,
-            reason TEXT NOT NULL DEFAULT '',
-            checked_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE INDEX IF NOT EXISTS idx_conn_check_slug ON pyramid_connection_check_log(slug, supersession_node_id);
+        -- Phase 7: Drop legacy tables. Any code still referencing these will crash
+        -- loudly, which is how we find consumers that need migration.
+        DROP TABLE IF EXISTS pyramid_stale_check_log;
+        DROP TABLE IF EXISTS pyramid_connection_check_log;
         ",
     )?;
 
@@ -723,6 +702,11 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // with the base schema at line ~91) is what this table indexes against.
     // Phase 2 does NOT introduce a new column — it ties into the existing
     // counter that `apply_supersession` already bumps.
+    //
+    // RETAINED (Phase 7): pyramid_change_manifests is used by the build
+    // pipeline (reroll, supersession), not just DADBEAR. It is NOT deprecated
+    // — it remains a live table for the build system. dadbear_result_applications
+    // is the DADBEAR-specific canonical table for applied results.
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS pyramid_change_manifests (
@@ -1960,10 +1944,10 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // `contribution_id` column is still NULL.
     migrate_legacy_dadbear_to_contributions(conn)?;
 
-    // Ghost-engine fix: backfill pyramid_auto_update_config for ALL existing
-    // slugs that don't have a row yet. Without this, the master gate query
-    // has no row to JOIN against, and pre-existing pyramids either get
-    // fail-open ghost engines or fail-closed invisible drops.
+    // DEPRECATED (Phase 7): ghost-engine backfill for pyramid_auto_update_config.
+    // The holds projection is now the dispatch gate, and contribution existence
+    // is the enable gate. This backfill is retained only for backward compatibility
+    // with any code that still reads from the old table.
     conn.execute(
         "INSERT OR IGNORE INTO pyramid_auto_update_config (slug)
          SELECT slug FROM pyramid_slugs WHERE slug NOT IN (
@@ -1972,9 +1956,17 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // Ghost-engine fix: convert legacy pyramid_auto_update_config rows
-    // to pyramid_config_contributions. Same pattern as DADBEAR migration.
+    // DEPRECATED (Phase 7): one-time migration from legacy auto_update_config rows
+    // to contributions. Already ran on all existing installations. Retained as
+    // idempotent no-op for safety — the sentinel check short-circuits immediately.
     migrate_legacy_auto_update_to_contributions(conn)?;
+
+    // Phase 0 (DADBEAR Canonical Architecture): split dadbear_policy into
+    // watch_root + dadbear_norms, and absorb auto_update_policy fields.
+    // Must run AFTER the legacy migrations above (they create the source
+    // contributions that these migrations split/merge).
+    crate::pyramid::config_contributions::migrate_dadbear_policy_to_split(conn)?;
+    crate::pyramid::config_contributions::migrate_auto_update_into_norms(conn)?;
 
     // Dispatch policy operational table (stores active YAML for hot-reload).
     conn.execute_batch(
@@ -1985,6 +1977,251 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             updated_at TEXT DEFAULT (datetime('now'))
         )"
     )?;
+
+    // ── DADBEAR Canonical State Model tables ────────────────────────────────
+    //
+    // Per `docs/plans/dadbear-canonical-state-model.md`. These are WALs,
+    // immutable audit logs, operational state, and read-through caches —
+    // NOT user-facing data tables. Law 3 exception: explicitly allowed
+    // outside the contribution store.
+    conn.execute_batch(
+        "
+        -- 1. Append-only observation stream
+        CREATE TABLE IF NOT EXISTS dadbear_observation_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            source TEXT NOT NULL,
+            source_path TEXT,
+            event_type TEXT NOT NULL,
+            file_path TEXT,
+            content_hash TEXT,
+            previous_hash TEXT,
+            target_node_id TEXT,
+            layer INTEGER,
+            detected_at TEXT NOT NULL,
+            metadata_json TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_obs_slug ON dadbear_observation_events(slug, detected_at);
+        CREATE INDEX IF NOT EXISTS idx_obs_cursor ON dadbear_observation_events(slug, id);
+
+        -- 2. Append-only hold stream
+        CREATE TABLE IF NOT EXISTS dadbear_hold_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            hold TEXT NOT NULL,
+            action TEXT NOT NULL,
+            reason TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_hold_slug ON dadbear_hold_events(slug, created_at);
+
+        -- 3. Materialized active holds (fast-path projection of hold_events)
+        CREATE TABLE IF NOT EXISTS dadbear_holds_projection (
+            slug TEXT NOT NULL,
+            hold TEXT NOT NULL,
+            held_since TEXT NOT NULL,
+            reason TEXT,
+            PRIMARY KEY (slug, hold)
+        );
+
+        -- 4. Durable work items (the compiler output)
+        -- IDs are semantic paths, not UUIDs. Parse with splitn(5, colon).
+        --   id:       slug:epoch_short:primitive:layer:target_id
+        --   batch_id: slug:epoch_short:batch-cursor_position
+        --   epoch_id: slug:recipe_short:norms_short:timestamp
+        -- target_id uses / for composites (edge/L2-003/L2-007)
+        -- _short = first 8 hex of contribution UUID. timestamp = uniqueness.
+        CREATE TABLE IF NOT EXISTS dadbear_work_items (
+            id TEXT PRIMARY KEY,
+            slug TEXT NOT NULL,
+            batch_id TEXT NOT NULL,
+            epoch_id TEXT NOT NULL,
+            recipe_contribution_id TEXT,
+            step_name TEXT NOT NULL,
+            primitive TEXT NOT NULL,
+            layer INTEGER NOT NULL,
+            target_id TEXT,
+            system_prompt TEXT NOT NULL,
+            user_prompt TEXT NOT NULL,
+            model_tier TEXT NOT NULL,
+            resolved_model_id TEXT,
+            resolved_provider_id TEXT,
+            temperature REAL,
+            max_tokens INTEGER,
+            response_format_json TEXT,
+            build_id TEXT,
+            chunk_index INTEGER,
+            prompt_hash TEXT,
+            force_fresh INTEGER DEFAULT 0,
+            observation_event_ids TEXT,
+            compiled_at TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'compiled',
+            state_changed_at TEXT NOT NULL,
+            blocked_from TEXT,
+            preview_id TEXT,
+            result_json TEXT,
+            result_cost_usd REAL,
+            result_tokens_in INTEGER,
+            result_tokens_out INTEGER,
+            result_latency_ms INTEGER,
+            completed_at TEXT,
+            applied_at TEXT,
+            application_contribution_id TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_wi_slug_state ON dadbear_work_items(slug, state);
+        CREATE INDEX IF NOT EXISTS idx_wi_batch ON dadbear_work_items(batch_id);
+        CREATE INDEX IF NOT EXISTS idx_wi_epoch ON dadbear_work_items(slug, epoch_id);
+
+        -- 5. Dependency DAG between work items
+        CREATE TABLE IF NOT EXISTS dadbear_work_item_deps (
+            work_item_id TEXT NOT NULL REFERENCES dadbear_work_items(id),
+            depends_on_id TEXT NOT NULL REFERENCES dadbear_work_items(id),
+            PRIMARY KEY (work_item_id, depends_on_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_deps_upstream ON dadbear_work_item_deps(depends_on_id);
+
+        -- 6. Batch-level commit contracts
+        -- ID is semantic path: {slug}:{batch_id}:{policy_hash_short}
+        CREATE TABLE IF NOT EXISTS dadbear_dispatch_previews (
+            id TEXT PRIMARY KEY,
+            slug TEXT NOT NULL,
+            batch_id TEXT NOT NULL,
+            policy_hash TEXT NOT NULL,
+            norms_hash TEXT NOT NULL,
+            item_count INTEGER NOT NULL,
+            total_cost_usd REAL NOT NULL,
+            total_wall_time_secs REAL,
+            enforcement_cost_usd REAL,
+            enforcement_level TEXT,
+            routing_summary_json TEXT,
+            expires_at TEXT NOT NULL,
+            committed_at TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_preview_batch ON dadbear_dispatch_previews(batch_id);
+
+        -- 7. Per-slug epoch-versioned compilation cursor
+        -- epoch_id is semantic path: {slug}:{recipe_id_short}:{norms_id_short}:{timestamp}
+        CREATE TABLE IF NOT EXISTS dadbear_compilation_state (
+            slug TEXT PRIMARY KEY,
+            epoch_id TEXT NOT NULL,
+            recipe_contribution_id TEXT,
+            norms_contribution_id TEXT,
+            last_compiled_observation_id INTEGER,
+            epoch_start_observation_id INTEGER,
+            epoch_started_at TEXT NOT NULL
+        );
+
+        -- 8. Per-dispatch attempt log
+        -- ID is semantic path: {work_item_id}:a{attempt_number}
+        CREATE TABLE IF NOT EXISTS dadbear_work_attempts (
+            id TEXT PRIMARY KEY,
+            work_item_id TEXT NOT NULL REFERENCES dadbear_work_items(id),
+            attempt_number INTEGER NOT NULL,
+            dispatched_at TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            routing TEXT NOT NULL,
+            result_json TEXT,
+            cost_usd REAL,
+            tokens_in INTEGER,
+            tokens_out INTEGER,
+            latency_ms INTEGER,
+            status TEXT NOT NULL DEFAULT 'pending',
+            review_status TEXT NOT NULL DEFAULT 'none',
+            cost_log_id TEXT,
+            completed_at TEXT,
+            error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_attempts_wi ON dadbear_work_attempts(work_item_id);
+
+        -- 9. Idempotent result application log
+        CREATE TABLE IF NOT EXISTS dadbear_result_applications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            work_item_id TEXT NOT NULL REFERENCES dadbear_work_items(id),
+            slug TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            old_contribution_id TEXT,
+            new_contribution_id TEXT,
+            applied_at TEXT NOT NULL,
+            UNIQUE(work_item_id, target_id)
+        );
+
+        -- 10. Per-slug build-derived facts
+        CREATE TABLE IF NOT EXISTS pyramid_build_metadata (
+            slug TEXT PRIMARY KEY,
+            ingested_extensions TEXT DEFAULT '[]',
+            ingested_config_files TEXT DEFAULT '[]',
+            updated_at TEXT
+        );
+        ",
+    )?;
+
+    // ── Seed holds from current frozen/breaker state (one-time migration) ──
+    //
+    // Populates hold events + projection from the old pyramid_auto_update_config
+    // columns. INSERT OR IGNORE makes this idempotent — only runs on first boot
+    // after the tables are created.
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO dadbear_hold_events (slug, hold, action, reason, created_at)
+         SELECT slug, 'frozen', 'placed', 'Migrated from pyramid_auto_update_config', datetime('now')
+         FROM pyramid_auto_update_config WHERE frozen = 1;
+
+         INSERT OR IGNORE INTO dadbear_hold_events (slug, hold, action, reason, created_at)
+         SELECT slug, 'breaker', 'placed', 'Migrated from pyramid_auto_update_config', datetime('now')
+         FROM pyramid_auto_update_config WHERE breaker_tripped = 1;
+
+         INSERT OR IGNORE INTO dadbear_holds_projection (slug, hold, held_since, reason)
+         SELECT slug, 'frozen', COALESCE(frozen_at, datetime('now')), 'Migrated'
+         FROM pyramid_auto_update_config WHERE frozen = 1;
+
+         INSERT OR IGNORE INTO dadbear_holds_projection (slug, hold, held_since, reason)
+         SELECT slug, 'breaker', COALESCE(breaker_tripped_at, datetime('now')), 'Migrated'
+         FROM pyramid_auto_update_config WHERE breaker_tripped = 1;"
+    )?;
+
+    // Populate pyramid_build_metadata from existing pyramid_auto_update_config data
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO pyramid_build_metadata (slug, ingested_extensions, ingested_config_files, updated_at)
+         SELECT slug, COALESCE(ingested_extensions, '[]'), COALESCE(ingested_config_files, '[]'), datetime('now')
+         FROM pyramid_auto_update_config;"
+    )?;
+
+    // Backfill observation events from existing WAL rows (one-time migration).
+    // Only runs if dadbear_observation_events is empty — idempotent.
+    // Translates old mutation_type names to new event_type names per the plan's
+    // backfill translation table, and maps columns correctly:
+    //   - file events: target_ref → file_path, target_node_id = NULL
+    //   - internal events: target_ref → target_node_id, file_path = NULL
+    //   - content_hash is always NULL (not available in old WAL)
+    //   - detail → metadata_json
+    conn.execute_batch(
+        "INSERT INTO dadbear_observation_events
+             (slug, source, event_type, file_path, content_hash, target_node_id, layer, detected_at, metadata_json)
+         SELECT
+             slug,
+             'migration',
+             CASE mutation_type
+                 WHEN 'file_change' THEN 'file_modified'
+                 WHEN 'new_file' THEN 'file_created'
+                 WHEN 'deleted_file' THEN 'file_deleted'
+                 WHEN 'rename_candidate' THEN 'file_renamed'
+                 WHEN 'confirmed_stale' THEN 'cascade_stale'
+                 ELSE mutation_type
+             END,
+             CASE WHEN mutation_type IN ('file_change', 'new_file', 'deleted_file', 'rename_candidate')
+                  THEN target_ref ELSE NULL END,
+             NULL,
+             CASE WHEN mutation_type NOT IN ('file_change', 'new_file', 'deleted_file', 'rename_candidate')
+                  THEN target_ref ELSE NULL END,
+             layer,
+             detected_at,
+             detail
+         FROM pyramid_pending_mutations
+         WHERE NOT EXISTS (SELECT 1 FROM dadbear_observation_events LIMIT 1);"
+    )?;
+
+    // ── end DADBEAR Canonical State Model tables ────────────────────────────
 
     Ok(())
 }
@@ -2897,10 +3134,10 @@ pub fn create_slug(
     )
     .with_context(|| format!("Failed to create slug '{slug}'"))?;
 
-    // Ghost-engine fix: ensure every pyramid has a master auto_update_config row
-    // from birth. Uses schema defaults (auto_update=0, frozen=0, breaker_tripped=0).
-    // The LEFT JOIN in get_enabled_dadbear_configs() is belt-and-suspenders for
-    // edge cases where this didn't run (e.g., pin_pyramid, archive-and-rebuild).
+    // DEPRECATED (Phase 7): pyramid_auto_update_config is no longer the authority.
+    // The holds projection is the sole dispatch gate, and contribution existence
+    // is the enable gate. This INSERT is kept only for backward compatibility with
+    // code that still reads from the old table. No runtime behavior depends on it.
     let _ = conn.execute(
         "INSERT OR IGNORE INTO pyramid_auto_update_config (slug) VALUES (?1)",
         rusqlite::params![slug],
@@ -3101,22 +3338,23 @@ pub fn archive_slug(
         "UPDATE pyramid_slugs SET archived_at = datetime('now') WHERE slug = ?1",
         rusqlite::params![slug],
     )?;
-    // Disable DADBEAR for archived slugs — prevents stale engine from monitoring them.
-    // Policy: disable auto_update (permanent intent).
-    conn.execute(
-        "UPDATE pyramid_auto_update_config SET auto_update = 0 WHERE slug = ?1",
-        rusqlite::params![slug],
-    )?;
-    // Freeze via auto_update_ops so the event bus is notified.
+    // Freeze via auto_update_ops so the event bus is notified and dispatch is blocked.
+    // Phase 7: holds projection is the sole authority — no dual-write to old table.
     if let Some(bus) = event_bus {
         if let Err(e) = crate::pyramid::auto_update_ops::freeze(conn, bus, slug) {
             tracing::warn!(slug = %slug, "archive_slug: auto_update_ops::freeze failed: {e}");
         }
     } else {
-        // Fallback when no event bus available (e.g. tests). Direct write is acceptable
-        // here because archive is a terminal operation and auto_update=0 is the primary gate.
+        // Fallback when no event bus available (e.g. tests). Write hold event + projection
+        // directly. No bus events emitted since there's no bus, but the DB is correct.
         conn.execute(
-            "UPDATE pyramid_auto_update_config SET frozen = 1, frozen_at = datetime('now') WHERE slug = ?1",
+            "INSERT INTO dadbear_hold_events (slug, hold, action, reason, created_at)
+             VALUES (?1, 'frozen', 'placed', 'archive_slug fallback (no bus)', datetime('now'))",
+            rusqlite::params![slug],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO dadbear_holds_projection (slug, hold, held_since, reason)
+             VALUES (?1, 'frozen', datetime('now'), 'archive_slug fallback (no bus)')",
             rusqlite::params![slug],
         )?;
     }
@@ -6057,7 +6295,9 @@ pub fn get_auto_update_status(conn: &Connection, slug: &str) -> Result<Option<se
 
     let last_check_at: Option<String> = conn
         .query_row(
-            "SELECT MAX(checked_at) FROM pyramid_stale_check_log WHERE slug = ?1",
+            "SELECT MAX(a.dispatched_at) FROM dadbear_work_attempts a
+             JOIN dadbear_work_items wi ON a.work_item_id = wi.id
+             WHERE wi.slug = ?1",
             rusqlite::params![slug],
             |row| row.get(0),
         )
@@ -6073,7 +6313,7 @@ pub fn get_auto_update_status(conn: &Connection, slug: &str) -> Result<Option<se
     })))
 }
 
-/// Query stale check log entries.
+/// Query stale check log entries from dadbear_work_items (canonical source).
 pub fn get_stale_log(
     conn: &Connection,
     slug: &str,
@@ -6082,35 +6322,37 @@ pub fn get_stale_log(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<serde_json::Value>> {
+    // Read from dadbear_work_items + dadbear_work_attempts (canonical).
+    // Map the old stale filter values to work_item states.
     let mut sql = String::from(
-        "SELECT id, slug, batch_id, layer, target_id, stale, reason,
-                checker_index, checker_batch_size, checked_at, cost_tokens, cost_usd
-         FROM pyramid_stale_check_log WHERE slug = ?1",
+        "SELECT wi.id, wi.slug, wi.batch_id, wi.layer, wi.target_id,
+                wi.state, COALESCE(wi.result_json, ''),
+                wi.chunk_index, 1,
+                COALESCE(wi.completed_at, wi.compiled_at),
+                wi.result_tokens_in, wi.result_cost_usd
+         FROM dadbear_work_items wi WHERE wi.slug = ?1",
     );
     let mut param_vals: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     param_vals.push(Box::new(slug.to_string()));
 
     if let Some(layer_val) = layer {
         param_vals.push(Box::new(layer_val));
-        sql.push_str(&format!(" AND layer = ?{}", param_vals.len()));
+        sql.push_str(&format!(" AND wi.layer = ?{}", param_vals.len()));
     }
     if let Some(stale_str) = stale {
-        let stale_val: i32 = match stale_str {
-            "yes" | "true" | "1" => 1,
-            "no" | "false" | "0" => 0,
-            "new" | "2" => 2,
-            "deleted" | "3" => 3,
-            "renamed" | "4" => 4,
-            "skipped" | "5" => 5,
-            _ => 0,
+        // Map old stale filter to work_item state filter
+        let state_filter: &str = match stale_str {
+            "yes" | "true" | "1" => "applied",
+            "no" | "false" | "0" => "completed",
+            _ => "applied",
         };
-        param_vals.push(Box::new(stale_val));
-        sql.push_str(&format!(" AND stale = ?{}", param_vals.len()));
+        param_vals.push(Box::new(state_filter.to_string()));
+        sql.push_str(&format!(" AND wi.state = ?{}", param_vals.len()));
     }
 
     param_vals.push(Box::new(limit));
     sql.push_str(&format!(
-        " ORDER BY checked_at DESC LIMIT ?{}",
+        " ORDER BY COALESCE(wi.completed_at, wi.compiled_at) DESC LIMIT ?{}",
         param_vals.len()
     ));
     param_vals.push(Box::new(offset));
@@ -6123,22 +6365,19 @@ pub fn get_stale_log(
     let rows: Vec<serde_json::Value> = stmt
         .query_map(param_refs.as_slice(), |row| {
             Ok(serde_json::json!({
-                "id": row.get::<_, i64>(0)?,
+                "id": row.get::<_, String>(0)?,
                 "slug": row.get::<_, String>(1)?,
                 "batch_id": row.get::<_, String>(2)?,
                 "layer": row.get::<_, i32>(3)?,
-                "target_id": row.get::<_, String>(4)?,
-                "stale": match row.get::<_, i32>(5)? {
-                    0 => "no",
-                    1 => "yes",
-                    2 => "new",
-                    3 => "deleted",
-                    4 => "renamed",
-                    5 => "skipped",
+                "target_id": row.get::<_, Option<String>>(4)?,
+                "stale": match row.get::<_, String>(5)?.as_str() {
+                    "applied" => "yes",
+                    "completed" => "no",
+                    "failed" => "skipped",
                     _ => "unknown",
                 },
                 "reason": row.get::<_, String>(6)?,
-                "checker_index": row.get::<_, i32>(7)?,
+                "checker_index": row.get::<_, Option<i32>>(7)?,
                 "checker_batch_size": row.get::<_, i32>(8)?,
                 "checked_at": row.get::<_, String>(9)?,
                 "cost_tokens": row.get::<_, Option<i64>>(10)?,
@@ -11415,6 +11654,111 @@ pub fn save_dadbear_config(conn: &Connection, config: &DadbearWatchConfig) -> Re
     Ok(conn.last_insert_rowid())
 }
 
+/// Insert or update the operational DADBEAR row *and* ensure backing
+/// `watch_root` + `dadbear_norms` contributions exist. Idempotent: if
+/// contributions already exist for this (slug, source_path) they are
+/// not duplicated.
+///
+/// Production callers that create new watch configs should use this
+/// instead of bare `save_dadbear_config` so the contribution store
+/// stays in sync with the operational table.
+pub fn save_dadbear_config_with_contributions(
+    conn: &Connection,
+    config: &DadbearWatchConfig,
+) -> Result<i64> {
+    use super::config_contributions::{create_config_contribution, load_active_config_contribution};
+
+    // 1. Operational write (upsert).
+    let rowid = save_dadbear_config(conn, config)?;
+
+    // 2. Ensure watch_root contribution exists for (slug, source_path).
+    //    Check if there's already an active watch_root whose yaml
+    //    contains this source_path. If not, create one.
+    let existing_wr = load_active_config_contribution(conn, "watch_root", Some(&config.slug))?;
+    let wr_id = if let Some(ref wr) = existing_wr {
+        // Check if the source_path matches. A slug can have multiple
+        // watch_roots for different source_paths, so we search by yaml.
+        let matches_source: bool = wr.yaml_content.contains(&config.source_path);
+        if matches_source {
+            wr.contribution_id.clone()
+        } else {
+            let watch_root = WatchRootYaml {
+                source_path: config.source_path.clone(),
+                content_type: config.content_type.clone(),
+            };
+            let yaml_str = serde_yaml::to_string(&watch_root)
+                .unwrap_or_else(|_| format!(
+                    "source_path: {:?}\ncontent_type: {:?}\n",
+                    watch_root.source_path, watch_root.content_type,
+                ));
+            create_config_contribution(
+                conn,
+                "watch_root",
+                Some(&config.slug),
+                &yaml_str,
+                Some("Auto-created from post-build seed"),
+                "local",
+                Some("post_build_seed"),
+                "active",
+            )?
+        }
+    } else {
+        let watch_root = WatchRootYaml {
+            source_path: config.source_path.clone(),
+            content_type: config.content_type.clone(),
+        };
+        let yaml_str = serde_yaml::to_string(&watch_root)
+            .unwrap_or_else(|_| format!(
+                "source_path: {:?}\ncontent_type: {:?}\n",
+                watch_root.source_path, watch_root.content_type,
+            ));
+        create_config_contribution(
+            conn,
+            "watch_root",
+            Some(&config.slug),
+            &yaml_str,
+            Some("Auto-created from post-build seed"),
+            "local",
+            Some("post_build_seed"),
+            "active",
+        )?
+    };
+
+    // 3. Ensure dadbear_norms contribution exists for this slug.
+    if load_active_config_contribution(conn, "dadbear_norms", Some(&config.slug))?.is_none() {
+        let norms = DadbearNormsYaml {
+            scan_interval_secs: config.scan_interval_secs as i64,
+            debounce_secs: config.debounce_secs as i64,
+            session_timeout_secs: config.session_timeout_secs as i64,
+            batch_size: config.batch_size as i64,
+            min_changed_files: 1,
+            runaway_threshold: 0.5,
+            retention_window_days: 30,
+        };
+        let norms_yaml = serde_yaml::to_string(&norms)
+            .unwrap_or_else(|_| "scan_interval_secs: 10\ndebounce_secs: 30\n".to_string());
+        create_config_contribution(
+            conn,
+            "dadbear_norms",
+            Some(&config.slug),
+            &norms_yaml,
+            Some("Auto-created from post-build seed"),
+            "local",
+            Some("post_build_seed"),
+            "active",
+        )?;
+    }
+
+    // 4. Sync contribution_id FK on the operational row.
+    conn.execute(
+        "UPDATE pyramid_dadbear_config SET contribution_id = ?1
+         WHERE slug = ?2 AND source_path = ?3",
+        rusqlite::params![wr_id, config.slug, config.source_path],
+    )?;
+
+    Ok(rowid)
+}
+
 /// Get all DADBEAR watch configs for a slug.
 pub fn get_dadbear_configs(conn: &Connection, slug: &str) -> Result<Vec<DadbearWatchConfig>> {
     let sql = format!(
@@ -11432,17 +11776,15 @@ pub fn get_dadbear_configs(conn: &Connection, slug: &str) -> Result<Vec<DadbearW
 
 /// Get all enabled DADBEAR watch configs (across all slugs).
 ///
-/// Ghost-engine fix: INNER JOINs `pyramid_auto_update_config` to enforce
-/// the master enable gate. DADBEAR configs are only returned when:
-///   - per-path: `enabled = 1`
-///   - master: `auto_update = 1 AND frozen = 0 AND breaker_tripped = 0`
+/// **Phase 7 (DADBEAR canonical architecture — legacy cleanup complete):**
 ///
-/// Fail-closed: if no master row exists, DADBEAR does NOT scan. The
-/// backfill in init_pyramid_db() ensures all existing slugs have a row,
-/// and create_slug() seeds one for new slugs.
+/// Enable gate: having a row in `pyramid_dadbear_config` is the enable gate.
+/// Contribution existence is what matters — no `d.enabled` column check,
+/// no `pyramid_auto_update_config.auto_update` subquery.
 ///
-/// This is the single query change that prevents ghost engines.
-/// All columns are d.-qualified to avoid ambiguous `slug`.
+/// Dispatch gate: holds projection anti-join. A slug with ANY active hold
+/// in `dadbear_holds_projection` is excluded from dispatch.
+///
 /// Column order matches `DADBEAR_CONFIG_COLUMNS` for `parse_dadbear_config()`.
 pub fn get_enabled_dadbear_configs(conn: &Connection) -> Result<Vec<DadbearWatchConfig>> {
     let sql =
@@ -11450,9 +11792,7 @@ pub fn get_enabled_dadbear_configs(conn: &Connection) -> Result<Vec<DadbearWatch
                 d.debounce_secs, d.session_timeout_secs, d.batch_size, d.enabled,
                 d.last_scan_at, d.created_at, d.updated_at
          FROM pyramid_dadbear_config d
-         JOIN pyramid_auto_update_config a ON d.slug = a.slug
-         WHERE d.enabled = 1
-           AND a.auto_update = 1 AND a.frozen = 0 AND a.breaker_tripped = 0
+         WHERE NOT EXISTS (SELECT 1 FROM dadbear_holds_projection h WHERE h.slug = d.slug)
          ORDER BY d.slug ASC, d.source_path ASC";
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([], parse_dadbear_config)?;
@@ -11463,50 +11803,6 @@ pub fn get_enabled_dadbear_configs(conn: &Connection) -> Result<Vec<DadbearWatch
     Ok(configs)
 }
 
-/// Enable DADBEAR for all watch configs of a slug.
-pub fn enable_dadbear_for_slug(conn: &Connection, slug: &str) -> Result<usize> {
-    let count = conn.execute(
-        "UPDATE pyramid_dadbear_config SET enabled = 1, updated_at = datetime('now') WHERE slug = ?1",
-        rusqlite::params![slug],
-    )?;
-    Ok(count)
-}
-
-/// Disable DADBEAR for all watch configs of a slug.
-pub fn disable_dadbear_for_slug(conn: &Connection, slug: &str) -> Result<usize> {
-    let count = conn.execute(
-        "UPDATE pyramid_dadbear_config SET enabled = 0, updated_at = datetime('now') WHERE slug = ?1",
-        rusqlite::params![slug],
-    )?;
-    Ok(count)
-}
-
-/// Phase 13: bulk-pause every DADBEAR watch config that is currently
-/// enabled. The `WHERE enabled = 1` clause makes the operation
-/// idempotent — a second invocation affects zero rows. Returns the
-/// number of rows that flipped from 1 to 0.
-pub fn disable_dadbear_all(conn: &Connection) -> Result<usize> {
-    let count = conn.execute(
-        "UPDATE pyramid_dadbear_config
-            SET enabled = 0, updated_at = datetime('now')
-          WHERE enabled = 1",
-        [],
-    )?;
-    Ok(count)
-}
-
-/// Phase 13: bulk-resume every DADBEAR watch config that is
-/// currently paused. Returns the number of rows that flipped from 0
-/// to 1.
-pub fn enable_dadbear_all(conn: &Connection) -> Result<usize> {
-    let count = conn.execute(
-        "UPDATE pyramid_dadbear_config
-            SET enabled = 1, updated_at = datetime('now')
-          WHERE enabled = 0",
-        [],
-    )?;
-    Ok(count)
-}
 
 // ── Phase 18c (L9): Scoped pause/resume for DADBEAR ──────────────────────────
 //
@@ -11538,38 +11834,6 @@ fn normalize_dadbear_folder(folder: &str) -> String {
     }
 }
 
-/// Phase 18c: bulk-pause DADBEAR for every config whose `source_path`
-/// is exactly the given folder or is a descendant of it. Idempotent —
-/// already-disabled rows do not contribute to the affected count.
-/// Returns the number of rows that flipped from `enabled = 1` to
-/// `enabled = 0`.
-pub fn disable_dadbear_by_folder(conn: &Connection, folder: &str) -> Result<usize> {
-    let normalized = normalize_dadbear_folder(folder);
-    let count = conn.execute(
-        "UPDATE pyramid_dadbear_config
-            SET enabled = 0, updated_at = datetime('now')
-          WHERE enabled = 1
-            AND (source_path = ?1 OR source_path LIKE ?1 || '/%')",
-        rusqlite::params![normalized],
-    )?;
-    Ok(count)
-}
-
-/// Phase 18c: mirror of `disable_dadbear_by_folder`. Resumes DADBEAR
-/// on every config whose `source_path` is the given folder or a
-/// descendant. Returns the number of rows that flipped from
-/// `enabled = 0` to `enabled = 1`.
-pub fn enable_dadbear_by_folder(conn: &Connection, folder: &str) -> Result<usize> {
-    let normalized = normalize_dadbear_folder(folder);
-    let count = conn.execute(
-        "UPDATE pyramid_dadbear_config
-            SET enabled = 1, updated_at = datetime('now')
-          WHERE enabled = 0
-            AND (source_path = ?1 OR source_path LIKE ?1 || '/%')",
-        rusqlite::params![normalized],
-    )?;
-    Ok(count)
-}
 
 /// Phase 18c: distinct list of `source_path` values across all
 /// DADBEAR configs. Used by the frontend scope picker to populate the
@@ -11588,50 +11852,76 @@ pub fn list_dadbear_source_paths(conn: &Connection) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Phase 18c: count rows that WOULD be flipped by a pause-all call
-/// with the given scope, without actually mutating any rows. Used by
-/// the frontend scope picker to show the live count as the user
-/// changes scope. The `target_state` parameter selects whether we
-/// count rows currently enabled (would-pause) or currently disabled
-/// (would-resume). Returns 0 for unknown scopes (the IPC layer
-/// validates the scope name and returns an error in that case).
+/// Phase 18c + Phase 7: count slugs that WOULD be flipped by a pause-all
+/// (freeze) or resume-all (unfreeze) call with the given scope. Used by
+/// the frontend scope picker to show the live count as the user changes scope.
 ///
-/// Folder canonicalization matches `disable_dadbear_by_folder` /
-/// `enable_dadbear_by_folder` exactly so the preview count and the
-/// real action agree on which rows match.
+/// `target_state = true` means "would-pause" (count currently unfrozen slugs).
+/// `target_state = false` means "would-resume" (count currently frozen slugs).
+///
+/// Phase 7: now reads from the holds projection instead of the `enabled` column.
 pub fn count_dadbear_scope(
     conn: &Connection,
     scope: &str,
     scope_value: Option<&str>,
     target_state: bool,
 ) -> Result<usize> {
-    // `target_state = true` means "would-pause" — we count rows that
-    // are currently `enabled = 1` (they will flip to disabled). The
-    // resume preview is the inverse: `enabled = 0` rows that will
-    // flip to enabled.
-    let current_enabled: i64 = if target_state { 1 } else { 0 };
     match scope {
         "all" => {
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM pyramid_dadbear_config WHERE enabled = ?1",
-                rusqlite::params![current_enabled],
-                |r| r.get(0),
-            )?;
-            Ok(count as usize)
+            if target_state {
+                // Would-pause: count distinct slugs that do NOT have a 'frozen' hold
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(DISTINCT d.slug) FROM pyramid_dadbear_config d
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM dadbear_holds_projection h
+                         WHERE h.slug = d.slug AND h.hold = 'frozen'
+                     )",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok(count as usize)
+            } else {
+                // Would-resume: count distinct slugs that HAVE a 'frozen' hold
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(DISTINCT slug) FROM dadbear_holds_projection WHERE hold = 'frozen'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok(count as usize)
+            }
         }
         "folder" => {
             let folder = match scope_value {
                 Some(f) if !f.is_empty() => normalize_dadbear_folder(f),
                 _ => return Ok(0),
             };
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM pyramid_dadbear_config
-                  WHERE enabled = ?1
-                    AND (source_path = ?2 OR source_path LIKE ?2 || '/%')",
-                rusqlite::params![current_enabled, folder],
-                |r| r.get(0),
-            )?;
-            Ok(count as usize)
+            if target_state {
+                // Would-pause: configs under folder without a 'frozen' hold
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(DISTINCT d.slug) FROM pyramid_dadbear_config d
+                     WHERE (d.source_path = ?1 OR d.source_path LIKE ?1 || '/%')
+                       AND NOT EXISTS (
+                           SELECT 1 FROM dadbear_holds_projection h
+                           WHERE h.slug = d.slug AND h.hold = 'frozen'
+                       )",
+                    rusqlite::params![folder],
+                    |r| r.get(0),
+                )?;
+                Ok(count as usize)
+            } else {
+                // Would-resume: configs under folder with a 'frozen' hold
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(DISTINCT d.slug) FROM pyramid_dadbear_config d
+                     WHERE (d.source_path = ?1 OR d.source_path LIKE ?1 || '/%')
+                       AND EXISTS (
+                           SELECT 1 FROM dadbear_holds_projection h
+                           WHERE h.slug = d.slug AND h.hold = 'frozen'
+                       )",
+                    rusqlite::params![folder],
+                    |r| r.get(0),
+                )?;
+                Ok(count as usize)
+            }
         }
         // "circle" is deferred — no schema to query. Return 0 so the
         // IPC layer can show "Circle scoping not yet available".
@@ -11689,20 +11979,14 @@ pub fn cost_rollup(
     Ok(out)
 }
 
-// ── Phase 15: DADBEAR Oversight Page helpers ────────────────────────────────
+// ── Phase 15: DADBEAR Oversight Page helpers (test-only) ─────────────────────
 //
-// The Oversight page needs per-slug aggregation of DADBEAR status,
-// pending mutations, deferred questions, demand signals, and cost
-// reconciliation state. The IPC handler in `main.rs` composes
-// `build_dadbear_overview_rows` with the runtime `dadbear_in_flight`
-// state map to produce the final response. Splitting the DB-level
-// aggregation out of the IPC handler keeps the pure logic testable
-// against an in-memory Connection.
+// `build_dadbear_overview_rows` has no production callers — the v2 overview
+// handler reads from canonical work-item tables. Retained under #[cfg(test)]
+// so existing coverage tests keep compiling.
 
-/// Phase 15: per-slug row for the DADBEAR Oversight page, minus the
-/// in-flight stale check count (which lives on runtime state). The
-/// IPC handler fills `in_flight_stale_checks` from the shared
-/// `dadbear_in_flight` map.
+/// Phase 15: per-slug row for the DADBEAR Oversight page (test-only).
+#[cfg(test)]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DadbearOverviewRowDb {
     pub slug: String,
@@ -11723,10 +12007,8 @@ pub struct DadbearOverviewRowDb {
     pub auto_update: bool,
 }
 
-/// Phase 15: build every per-slug overview row from a single
-/// connection. Iterates `pyramid_dadbear_config`, groups by slug,
-/// and folds in counts + cost rollups. Pure function — the IPC
-/// handler appends the in-flight count after the fact.
+/// Phase 15: build every per-slug overview row (test-only, no production callers).
+#[cfg(test)]
 pub fn build_dadbear_overview_rows(
     conn: &Connection,
 ) -> Result<Vec<DadbearOverviewRowDb>> {
@@ -14597,6 +14879,10 @@ pub struct DadbearPolicyYaml {
     pub session_timeout_secs: i64,
     #[serde(default = "dadbear_default_batch_size")]
     pub batch_size: i64,
+    /// DEPRECATED (Phase 7): `enabled` is no longer read by the master gate.
+    /// Contribution existence is the enable gate; holds projection is the
+    /// dispatch gate. Retained with `serde(default)` so old YAMLs with this
+    /// field still deserialize without error.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Phase 11: cost reconciliation thresholds. Persisted back
@@ -14668,6 +14954,133 @@ fn dadbear_default_session_timeout() -> i64 {
 }
 fn dadbear_default_batch_size() -> i64 {
     1
+}
+
+// ── DADBEAR Canonical Architecture: split contribution types ─────────────────
+//
+// Phase 0 of `docs/plans/dadbear-canonical-state-model.md` splits the
+// monolithic `dadbear_policy` into two focused contribution types:
+//
+//   - `watch_root`: per-source-path identity (slug, source_path, content_type)
+//   - `dadbear_norms`: per-slug or global timing/threshold norms
+//
+// Contribution existence IS the enable gate — no `enabled` bool needed.
+// If no `watch_root` contribution exists for a slug, DADBEAR doesn't watch it.
+
+fn default_scan_interval() -> i64 {
+    10
+}
+fn default_debounce() -> i64 {
+    30
+}
+fn default_session_timeout() -> i64 {
+    1800
+}
+fn default_batch_size() -> i64 {
+    1
+}
+fn default_min_changed() -> i64 {
+    1
+}
+fn default_runaway() -> f64 {
+    0.5
+}
+fn default_retention() -> i64 {
+    30
+}
+
+/// Identity contribution for a single watched source path. One per
+/// (slug, source_path) pair. Contribution existence IS the enable gate.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct WatchRootYaml {
+    pub source_path: String,
+    pub content_type: String,
+}
+
+/// Per-slug or global timing/threshold norms. One per slug (or slug=NULL
+/// for global defaults). The layered resolver merges global + per-slug
+/// at read time; the dispatcher writes resolved norms into the
+/// operational table on each sync.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DadbearNormsYaml {
+    #[serde(default = "default_scan_interval")]
+    pub scan_interval_secs: i64,
+    #[serde(default = "default_debounce")]
+    pub debounce_secs: i64,
+    #[serde(default = "default_session_timeout")]
+    pub session_timeout_secs: i64,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: i64,
+    #[serde(default = "default_min_changed")]
+    pub min_changed_files: i64,
+    #[serde(default = "default_runaway")]
+    pub runaway_threshold: f64,
+    #[serde(default = "default_retention")]
+    pub retention_window_days: i64,
+}
+
+impl Default for DadbearNormsYaml {
+    fn default() -> Self {
+        Self {
+            scan_interval_secs: default_scan_interval(),
+            debounce_secs: default_debounce(),
+            session_timeout_secs: default_session_timeout(),
+            batch_size: default_batch_size(),
+            min_changed_files: default_min_changed(),
+            runaway_threshold: default_runaway(),
+            retention_window_days: default_retention(),
+        }
+    }
+}
+
+/// UPSERT a `watch_root` contribution into the operational
+/// `pyramid_dadbear_config` table. Takes the resolved norms (from the
+/// layered resolver) as a parameter so the norms columns are populated
+/// alongside identity columns in a single atomic write.
+///
+/// When `slug` is `None`, this is invalid — `watch_root` is always
+/// per-slug (a watched path must belong to a pyramid). Returns Ok as a
+/// no-op for global watch_root contributions (shouldn't exist, but
+/// defensive).
+pub fn upsert_watch_root(
+    conn: &Connection,
+    slug: &Option<String>,
+    yaml: &WatchRootYaml,
+    resolved_norms: &DadbearNormsYaml,
+    contribution_id: &str,
+) -> Result<()> {
+    let Some(slug_str) = slug.as_deref() else {
+        // Global watch_root makes no sense — watch roots are per-slug.
+        // Defensive no-op rather than error (matches dadbear_policy pattern).
+        return Ok(());
+    };
+
+    conn.execute(
+        "INSERT INTO pyramid_dadbear_config (
+            slug, source_path, content_type, scan_interval_secs, debounce_secs,
+            session_timeout_secs, batch_size, enabled, contribution_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8)
+         ON CONFLICT(slug, source_path) DO UPDATE SET
+            content_type = excluded.content_type,
+            scan_interval_secs = excluded.scan_interval_secs,
+            debounce_secs = excluded.debounce_secs,
+            session_timeout_secs = excluded.session_timeout_secs,
+            batch_size = excluded.batch_size,
+            enabled = 1,
+            contribution_id = excluded.contribution_id,
+            updated_at = datetime('now')",
+        rusqlite::params![
+            slug_str,
+            yaml.source_path,
+            yaml.content_type,
+            resolved_norms.scan_interval_secs,
+            resolved_norms.debounce_secs,
+            resolved_norms.session_timeout_secs,
+            resolved_norms.batch_size,
+            contribution_id,
+        ],
+    )?;
+    Ok(())
 }
 
 /// UPSERT a DADBEAR policy contribution's payload into the existing
@@ -16684,66 +17097,10 @@ mod phase13_tests {
         assert_eq!(build_opt.call_count, 2);
     }
 
-    #[test]
-    fn test_pause_all_sets_enabled_zero_and_returns_affected_count() {
-        let conn = mem_conn();
-        // Seed two enabled configs + one already-disabled.
-        conn.execute(
-            "INSERT INTO pyramid_dadbear_config (slug, source_path, content_type, enabled)
-             VALUES ('p13-test', '/tmp/a', 'document', 1),
-                    ('p13-test', '/tmp/b', 'document', 1),
-                    ('p13-other', '/tmp/c', 'document', 0)",
-            [],
-        )
-        .unwrap();
-
-        let affected = disable_dadbear_all(&conn).unwrap();
-        assert_eq!(affected, 2, "only the two enabled rows should flip");
-
-        // Count enabled rows after pause — all should be 0.
-        let enabled_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pyramid_dadbear_config WHERE enabled = 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(enabled_count, 0);
-
-        // Idempotent: second call should return 0.
-        let affected2 = disable_dadbear_all(&conn).unwrap();
-        assert_eq!(affected2, 0);
-    }
-
-    #[test]
-    fn test_resume_all_mirrors_pause_all() {
-        let conn = mem_conn();
-        conn.execute(
-            "INSERT INTO pyramid_dadbear_config (slug, source_path, content_type, enabled)
-             VALUES ('p13-test', '/tmp/a', 'document', 0),
-                    ('p13-test', '/tmp/b', 'document', 0),
-                    ('p13-other', '/tmp/c', 'document', 1)",
-            [],
-        )
-        .unwrap();
-
-        let affected = enable_dadbear_all(&conn).unwrap();
-        assert_eq!(affected, 2);
-
-        let disabled_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pyramid_dadbear_config WHERE enabled = 0",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(disabled_count, 0);
-    }
-
-    // ── Phase 18c (L9) — Folder-scoped pause/resume + count ─────────────────
+    // ── Phase 18c (L9) — Folder-scoped count + source paths ───────────────────
 
     /// Helper for the Phase 18c folder-scope tests: seeds a path
-    /// hierarchy where /a, /a/b, and /a/b/c are all enabled descendants
+    /// hierarchy where /a, /a/b, and /a/b/c are all descendants
     /// of /a, plus /d as a sibling that should never be touched by
     /// /a-scoped operations.
     fn seed_dadbear_folder_hierarchy(conn: &Connection) {
@@ -16756,101 +17113,6 @@ mod phase13_tests {
             [],
         )
         .unwrap();
-    }
-
-    #[test]
-    fn test_disable_dadbear_by_folder_matches_subtree() {
-        let conn = mem_conn();
-        seed_dadbear_folder_hierarchy(&conn);
-
-        // /a should match /a, /a/b, /a/b/c — three rows. /d is a
-        // sibling and must NOT be touched.
-        let affected = disable_dadbear_by_folder(&conn, "/a").unwrap();
-        assert_eq!(affected, 3, "expected /a + /a/b + /a/b/c, sibling /d untouched");
-
-        let still_enabled: Vec<String> = conn
-            .prepare(
-                "SELECT source_path FROM pyramid_dadbear_config
-                  WHERE enabled = 1 ORDER BY source_path",
-            )
-            .unwrap()
-            .query_map([], |r| r.get::<_, String>(0))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        assert_eq!(still_enabled, vec!["/d".to_string()]);
-    }
-
-    #[test]
-    fn test_disable_dadbear_by_folder_handles_trailing_slash() {
-        let conn = mem_conn();
-        seed_dadbear_folder_hierarchy(&conn);
-
-        // Trailing-slash variant should match the same set as the
-        // no-slash variant. Canonicalization strips the trailing slash
-        // before matching.
-        let affected = disable_dadbear_by_folder(&conn, "/a/").unwrap();
-        assert_eq!(affected, 3);
-    }
-
-    #[test]
-    fn test_disable_dadbear_by_folder_idempotent() {
-        let conn = mem_conn();
-        seed_dadbear_folder_hierarchy(&conn);
-
-        let first = disable_dadbear_by_folder(&conn, "/a").unwrap();
-        assert_eq!(first, 3);
-        // Second call hits zero matching rows because they're all
-        // already disabled.
-        let second = disable_dadbear_by_folder(&conn, "/a").unwrap();
-        assert_eq!(second, 0);
-    }
-
-    #[test]
-    fn test_enable_dadbear_by_folder_mirrors_disable() {
-        let conn = mem_conn();
-        seed_dadbear_folder_hierarchy(&conn);
-        // Disable everything first.
-        disable_dadbear_all(&conn).unwrap();
-
-        let affected = enable_dadbear_by_folder(&conn, "/a").unwrap();
-        assert_eq!(affected, 3, "/a + /a/b + /a/b/c should re-enable");
-
-        // /d is still disabled.
-        let still_disabled: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pyramid_dadbear_config WHERE enabled = 0",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(still_disabled, 1);
-    }
-
-    #[test]
-    fn test_disable_dadbear_by_folder_does_not_match_partial_prefix() {
-        let conn = mem_conn();
-        // /alpha and /a are siblings — pausing /a must NOT match
-        // /alpha because the LIKE match uses '/%' as the suffix.
-        conn.execute(
-            "INSERT INTO pyramid_dadbear_config (slug, source_path, content_type, enabled)
-             VALUES ('p18c-a',     '/a',     'document', 1),
-                    ('p18c-alpha', '/alpha', 'document', 1)",
-            [],
-        )
-        .unwrap();
-
-        let affected = disable_dadbear_by_folder(&conn, "/a").unwrap();
-        assert_eq!(affected, 1, "only /a should match, not /alpha");
-
-        let alpha_enabled: i64 = conn
-            .query_row(
-                "SELECT enabled FROM pyramid_dadbear_config WHERE source_path = '/alpha'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(alpha_enabled, 1, "/alpha must still be enabled");
     }
 
     #[test]
@@ -16876,43 +17138,47 @@ mod phase13_tests {
     }
 
     #[test]
-    fn test_count_dadbear_scope_all_returns_currently_enabled() {
+    fn test_count_dadbear_scope_all_uses_holds_projection() {
         let conn = mem_conn();
         seed_dadbear_folder_hierarchy(&conn);
-        // Pause one row so the seeded hierarchy has 3 enabled / 1 disabled.
+        // Freeze one slug via holds projection.
         conn.execute(
-            "UPDATE pyramid_dadbear_config SET enabled = 0 WHERE source_path = '/d'",
+            "INSERT INTO dadbear_holds_projection (slug, hold, source, acquired_at)
+             VALUES ('p18c-d', 'frozen', 'test', datetime('now'))",
             [],
         )
         .unwrap();
 
-        // target_state=true means "would-pause" — count rows that are
-        // currently enabled (i.e. would flip to disabled).
+        // target_state=true means "would-pause" — count slugs without a frozen hold.
         let pause_count = count_dadbear_scope(&conn, "all", None, true).unwrap();
         assert_eq!(pause_count, 3);
 
-        // target_state=false means "would-resume" — count rows that are
-        // currently disabled.
+        // target_state=false means "would-resume" — count slugs with a frozen hold.
         let resume_count = count_dadbear_scope(&conn, "all", None, false).unwrap();
         assert_eq!(resume_count, 1);
     }
 
     #[test]
-    fn test_count_dadbear_scope_folder_matches_disable_helper() {
+    fn test_count_dadbear_scope_folder_uses_holds_projection() {
         let conn = mem_conn();
         seed_dadbear_folder_hierarchy(&conn);
 
-        // Preview should agree with the real action — both must say 3
-        // rows under /a.
+        // Preview should say 3 rows under /a (none frozen yet).
         let preview = count_dadbear_scope(&conn, "folder", Some("/a"), true).unwrap();
         assert_eq!(preview, 3);
 
-        // After actually disabling, the preview drops to 0.
-        disable_dadbear_by_folder(&conn, "/a").unwrap();
+        // Freeze the /a slugs via holds projection (canonical path).
+        for slug in &["p18c-a", "p18c-ab", "p18c-abc"] {
+            conn.execute(
+                "INSERT INTO dadbear_holds_projection (slug, hold, source, acquired_at)
+                 VALUES (?1, 'frozen', 'test', datetime('now'))",
+                rusqlite::params![slug],
+            ).unwrap();
+        }
         let after = count_dadbear_scope(&conn, "folder", Some("/a"), true).unwrap();
         assert_eq!(after, 0);
 
-        // And the resume preview now sees the 3 disabled rows.
+        // Resume preview now sees the 3 frozen slugs.
         let resume_preview = count_dadbear_scope(&conn, "folder", Some("/a"), false).unwrap();
         assert_eq!(resume_preview, 3);
     }
@@ -17565,31 +17831,6 @@ mod phase15_tests {
         assert!((gamma.cost_24h_estimated_usd - 0.50).abs() < 1e-9);
         assert!((gamma.cost_24h_actual_usd - 0.48).abs() < 1e-9);
         assert!(gamma.enabled);
-    }
-
-    #[test]
-    fn test_per_slug_pause_and_resume() {
-        let conn = mem_conn();
-        seed_dadbear_config(&conn, "p15-alpha", "/tmp/a", true, 10);
-        seed_dadbear_config(&conn, "p15-alpha", "/tmp/b", true, 10);
-        seed_dadbear_config(&conn, "p15-beta", "/tmp/c", true, 10);
-
-        let paused = disable_dadbear_for_slug(&conn, "p15-alpha").unwrap();
-        assert_eq!(paused, 2);
-
-        // alpha is now paused, beta is not.
-        let rows = build_dadbear_overview_rows(&conn).unwrap();
-        let alpha = rows.iter().find(|r| r.slug == "p15-alpha").unwrap();
-        let beta = rows.iter().find(|r| r.slug == "p15-beta").unwrap();
-        assert!(!alpha.enabled);
-        assert!(beta.enabled);
-
-        // Resume alpha — both configs should flip back.
-        let resumed = enable_dadbear_for_slug(&conn, "p15-alpha").unwrap();
-        assert_eq!(resumed, 2);
-        let rows = build_dadbear_overview_rows(&conn).unwrap();
-        let alpha = rows.iter().find(|r| r.slug == "p15-alpha").unwrap();
-        assert!(alpha.enabled);
     }
 
     #[test]

@@ -804,6 +804,24 @@ pub fn resolve_wire_type(schema_type: &str) -> Result<(WireContributionType, Vec
                 "dadbear_policy".to_string(),
             ],
         )),
+        "watch_root" => Ok((
+            WireContributionType::Template,
+            vec![
+                "config".to_string(),
+                "wire-node".to_string(),
+                "dadbear".to_string(),
+                "watch_root".to_string(),
+            ],
+        )),
+        "dadbear_norms" => Ok((
+            WireContributionType::Template,
+            vec![
+                "config".to_string(),
+                "wire-node".to_string(),
+                "dadbear".to_string(),
+                "dadbear_norms".to_string(),
+            ],
+        )),
         "tier_routing" => Ok((
             WireContributionType::Template,
             vec![
@@ -1423,6 +1441,8 @@ wire:
             ("evidence_policy", WireContributionType::Template),
             ("build_strategy", WireContributionType::Template),
             ("dadbear_policy", WireContributionType::Template),
+            ("watch_root", WireContributionType::Template),
+            ("dadbear_norms", WireContributionType::Template),
             ("tier_routing", WireContributionType::Template),
             ("step_overrides", WireContributionType::Template),
             ("custom_prompts", WireContributionType::Template),

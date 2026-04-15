@@ -24,6 +24,7 @@ use tracing::{debug, error, info, warn};
 
 use super::build::WriteOp;
 use super::build_runner;
+use super::dadbear_compiler;
 use super::db;
 use super::event_bus::{BuildEventBus, TaggedBuildEvent, TaggedKind};
 use super::ingest;
@@ -112,6 +113,16 @@ pub fn start_dadbear_extend_loop(
         // Track per-config tick intervals
         let mut tickers: HashMap<i64, ConfigTicker> = HashMap::new();
 
+        // Phase 0: subscribe to the event bus for DadbearConfigChanged
+        // events. When a dadbear_norms or dadbear_policy contribution
+        // is activated, the dispatcher emits this event and we force an
+        // immediate config reload on the next tick by resetting all
+        // ticker timestamps.
+        let mut config_rx = event_bus.subscribe();
+        // Flag: when set, all tickers are reset on the next iteration
+        // so every config fires immediately.
+        let mut force_reload = false;
+
         // Per-config in-flight flags now live on shared `PyramidState`
         // (see `PyramidState::dadbear_in_flight`). This lets `trigger_for_slug`
         // (HTTP/CLI manual trigger path) consult the same map and skip when an
@@ -125,14 +136,65 @@ pub fn start_dadbear_extend_loop(
         // all other paths unaffected.
 
         loop {
-            // Check cancellation
+            // Check cancellation + drain config change events
             tokio::select! {
                 _ = cancel_clone.cancelled() => {
                     info!("DADBEAR-EXTEND tick loop cancelled");
                     break;
                 }
+                // Phase 0: drain DadbearConfigChanged events from the bus.
+                // On receipt, set the force_reload flag so all tickers fire
+                // immediately on the next iteration. On Lagged (slow
+                // consumer), also force reload — we may have missed a
+                // config change.
+                result = config_rx.recv() => {
+                    match result {
+                        Ok(event) => {
+                            if matches!(event.kind, TaggedKind::DadbearConfigChanged { .. }) {
+                                info!(
+                                    slug = %event.slug,
+                                    "DADBEAR-EXTEND: config changed event received, forcing reload"
+                                );
+                                force_reload = true;
+                            }
+                            // Non-DadbearConfigChanged events are ignored;
+                            // continue to the sleep branch on the next select.
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(
+                                skipped = n,
+                                "DADBEAR-EXTEND: event bus lagged, forcing config reload"
+                            );
+                            force_reload = true;
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            info!("DADBEAR-EXTEND: event bus closed, exiting tick loop");
+                            break;
+                        }
+                    }
+                }
                 // Base tick: check every 1 second whether any config is due
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            }
+
+            // Phase 0: if a config change was received, reset all tickers
+            // so every config fires on this iteration rather than waiting
+            // for its next scan_interval window. We set last_tick far
+            // enough in the past that (now - last_tick) exceeds any
+            // reasonable scan_interval.
+            if force_reload {
+                let now_for_reset = std::time::Instant::now();
+                for ticker in tickers.values_mut() {
+                    // Push last_tick back by the ticker's own interval + 1s
+                    // so the duration_since check passes immediately.
+                    ticker.last_tick = now_for_reset
+                        .checked_sub(ticker.interval + std::time::Duration::from_secs(1))
+                        .unwrap_or(now_for_reset);
+                }
+                force_reload = false;
+                debug!("DADBEAR-EXTEND: tickers reset for forced config reload");
             }
 
             // Load all enabled configs
@@ -386,6 +448,67 @@ pub async fn run_tick_for_config(
 
     // ── 5. Dispatch pending ingest records ───────────────────────────────
     dispatch_pending_ingests(state, db_path, config, event_bus).await?;
+
+    // ── 6. Run DADBEAR compiler: observations → work items ──────────────
+    // The compiler reads new observation events and creates durable work items
+    // in 'compiled' state. It does NOT dispatch them — that's Phase 5 (supervisor).
+    // The compiler runs even when holds are active (holds block dispatch, not compilation).
+    {
+        let db_compile = db_path.to_string();
+        let slug_compile = slug.to_string();
+        let compile_result = tokio::task::spawn_blocking(move || {
+            let conn = db::open_pyramid_connection(Path::new(&db_compile))?;
+            // Look up the active dadbear_norms contribution ID for epoch tracking.
+            // Track the RESOLVED norms (global + per-slug merge) via a hash.
+            // This catches changes at either level — per-slug contribution
+            // supersession OR global norms change. The compiler compares
+            // the hash against the stored epoch's norms_contribution_id
+            // (repurposed as a norms_hash). Any change triggers epoch rotation.
+            // Recipe contributions are not yet implemented (chains are YAML
+            // files, not contributions), so recipe stays None.
+            let norms_hash = {
+                let resolved = crate::pyramid::config_contributions::resolve_dadbear_norms(
+                    &conn,
+                    Some(&slug_compile),
+                ).unwrap_or_default();
+                let yaml_str = serde_yaml::to_string(&resolved).unwrap_or_default();
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                yaml_str.hash(&mut hasher);
+                format!("{:016x}", hasher.finish())
+            };
+            dadbear_compiler::run_compilation_for_slug(
+                &conn,
+                &slug_compile,
+                None, // recipe_contribution_id (chains not yet contributions)
+                Some(&norms_hash),
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Compiler task join error: {e}"))?;
+
+        match compile_result {
+            Ok(result) => {
+                if result.items_compiled > 0 {
+                    debug!(
+                        slug = %slug,
+                        items = result.items_compiled,
+                        deps = result.deps_created,
+                        deduped = result.deduped,
+                        cursor = result.new_cursor,
+                        "DADBEAR compiler: new work items compiled"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    slug = %slug,
+                    error = %e,
+                    "DADBEAR compiler pass failed (non-fatal, will retry next tick)"
+                );
+            }
+        }
+    }
 
     Ok(())
 }
@@ -1101,15 +1224,6 @@ mod tests {
         assert_eq!(configs2[0].scan_interval_secs, 30);
         assert!(!configs2[0].enabled);
 
-        // Enable/disable
-        db::enable_dadbear_for_slug(&conn, "test-slug").unwrap();
-        let configs3 = db::get_dadbear_configs(&conn, "test-slug").unwrap();
-        assert!(configs3[0].enabled);
-
-        db::disable_dadbear_for_slug(&conn, "test-slug").unwrap();
-        let configs4 = db::get_dadbear_configs(&conn, "test-slug").unwrap();
-        assert!(!configs4[0].enabled);
-
         // Delete
         let deleted = db::delete_dadbear_config(&conn, "test-slug", "/tmp/src").unwrap();
         assert!(deleted);
@@ -1329,6 +1443,7 @@ mod tests {
             supabase_anon_key: None,
             csrf_secret: [0u8; 32],
             dadbear_handle: Arc::new(TokioMutex::new(None)),
+            dadbear_supervisor_handle: Arc::new(TokioMutex::new(None)),
             dadbear_in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
             provider_registry: {
                 // Phase 3: test state gets an empty provider registry.

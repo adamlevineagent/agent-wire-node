@@ -6154,6 +6154,12 @@ async fn execute_process_gaps(
                                 &node.id,
                             )?;
                             if !node.self_prompt.is_empty() {
+                                let evidence_detail = serde_json::json!({
+                                    "reason": "targeted_reexamination",
+                                    "build_id": bid,
+                                    "node_id": node.id,
+                                })
+                                .to_string();
                                 c.execute(
                                     "INSERT INTO pyramid_pending_mutations
                                      (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
@@ -6161,15 +6167,25 @@ async fn execute_process_gaps(
                                     rusqlite::params![
                                         base_slug_owned,
                                         node.self_prompt,
-                                        serde_json::json!({
-                                            "reason": "targeted_reexamination",
-                                            "build_id": bid,
-                                            "node_id": node.id,
-                                        })
-                                        .to_string(),
+                                        evidence_detail,
                                         now
                                     ],
                                 )?;
+
+                                // Dual-write: observation event
+                                let _ = super::observation_events::write_observation_event(
+                                    &c,
+                                    &base_slug_owned,
+                                    "evidence",
+                                    "evidence_growth",
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    Some(&node.self_prompt),
+                                    Some(0),
+                                    Some(&evidence_detail),
+                                );
                             }
                         }
                         Ok(())
@@ -15334,6 +15350,7 @@ mod tests {
             supabase_anon_key: None,
             csrf_secret: [0u8; 32],
             dadbear_handle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            dadbear_supervisor_handle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             dadbear_in_flight: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -15440,6 +15457,7 @@ mod tests {
             supabase_anon_key: None,
             csrf_secret: [0u8; 32],
             dadbear_handle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            dadbear_supervisor_handle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             dadbear_in_flight: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -15566,6 +15584,7 @@ mod tests {
             supabase_anon_key: None,
             csrf_secret: [0u8; 32],
             dadbear_handle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            dadbear_supervisor_handle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             dadbear_in_flight: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -15656,6 +15675,7 @@ mod tests {
             supabase_anon_key: None,
             csrf_secret: [0u8; 32],
             dadbear_handle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            dadbear_supervisor_handle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             dadbear_in_flight: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),

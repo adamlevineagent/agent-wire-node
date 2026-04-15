@@ -1,15 +1,15 @@
-// Phase 15 — Per-pyramid card for the DADBEAR Oversight Page.
+// Phase 6 (Canonical) — Per-pyramid card for the DADBEAR Oversight Page.
 //
-// Renders a single `DadbearOverviewRow` as a compact status card
-// with pause/resume, view-activity, and configure buttons. Wired to
-// `pyramid_dadbear_pause` / `pyramid_dadbear_resume`.
+// Renders a single `WorkItemOverviewRow` as a compact work-pipeline card
+// with hold list, pipeline counts, cost, and pause/resume buttons.
+// Now uses the canonical holds-based status instead of boolean flags.
 
 import { useCallback, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import type { DadbearOverviewRow } from '../hooks/useDadbearOverview';
+import type { WorkItemOverviewRow } from '../hooks/useDadbearOverviewV2';
 
 interface DadbearPyramidCardProps {
-    row: DadbearOverviewRow;
+    row: WorkItemOverviewRow;
     onViewActivity: (slug: string) => void;
     onConfigure: (slug: string) => void;
     onMutated: () => void;
@@ -17,7 +17,6 @@ interface DadbearPyramidCardProps {
 
 function timeAgo(iso: string | null): string {
     if (!iso) return 'never';
-    // ISO may arrive as `YYYY-MM-DD HH:MM:SS` (SQL) or full ISO.
     const normalized = iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z';
     const diff = Date.now() - new Date(normalized).getTime();
     if (Number.isNaN(diff)) return iso;
@@ -31,52 +30,8 @@ function timeAgo(iso: string | null): string {
     return `${d}d ago`;
 }
 
-function timeUntil(iso: string | null): string {
-    if (!iso) return 'due now';
-    const normalized = iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z';
-    const diff = new Date(normalized).getTime() - Date.now();
-    if (Number.isNaN(diff)) return iso;
-    if (diff <= 0) return 'due now';
-    const s = Math.floor(diff / 1000);
-    if (s < 60) return `in ${s}s`;
-    const m = Math.floor(s / 60);
-    if (m < 60) return `in ${m}m`;
-    const h = Math.floor(m / 60);
-    return `in ${h}h`;
-}
-
 function currency(v: number): string {
     return `$${v.toFixed(2)}`;
-}
-
-function statusLabel(status: string): string {
-    switch (status) {
-        case 'healthy':
-            return 'Healthy';
-        case 'pending':
-            return 'Pending confirmation';
-        case 'discrepancy':
-            return 'Discrepancy detected';
-        case 'broadcast_missing':
-            return 'Broadcast missing';
-        default:
-            return status;
-    }
-}
-
-function statusClass(status: string): string {
-    switch (status) {
-        case 'healthy':
-            return 'dadbear-card-recon-healthy';
-        case 'pending':
-            return 'dadbear-card-recon-pending';
-        case 'discrepancy':
-            return 'dadbear-card-recon-discrepancy';
-        case 'broadcast_missing':
-            return 'dadbear-card-recon-broadcast-missing';
-        default:
-            return 'dadbear-card-recon-pending';
-    }
 }
 
 export function DadbearPyramidCard({
@@ -88,11 +43,14 @@ export function DadbearPyramidCard({
     const [busy, setBusy] = useState(false);
     const [localError, setLocalError] = useState<string | null>(null);
 
+    // Derived from holds: any hold means paused from dispatch perspective
+    const isPaused = row.derived_status !== 'active';
+
     const handleToggle = useCallback(async () => {
         setBusy(true);
         setLocalError(null);
         try {
-            if (row.enabled) {
+            if (!isPaused) {
                 await invoke('pyramid_dadbear_pause', { slug: row.slug });
             } else {
                 await invoke('pyramid_dadbear_resume', { slug: row.slug });
@@ -103,105 +61,141 @@ export function DadbearPyramidCard({
         } finally {
             setBusy(false);
         }
-    }, [row.enabled, row.slug, onMutated]);
+    }, [isPaused, row.slug, onMutated]);
+
+    const statusText =
+        row.derived_status === 'breaker'
+            ? 'Breaker'
+            : row.derived_status === 'paused'
+                ? 'Paused'
+                : row.derived_status === 'held'
+                    ? 'Held'
+                    : 'Active';
+    const statusCls =
+        row.derived_status === 'breaker'
+            ? 'dadbear-card-status-breaker'
+            : row.derived_status === 'paused' || row.derived_status === 'held'
+                ? 'dadbear-card-status-paused'
+                : 'dadbear-card-status-active';
 
     const cardClass = [
         'dadbear-card',
-        row.enabled ? 'dadbear-card-active' : 'dadbear-card-paused',
-        row.cost_reconciliation_status === 'discrepancy' ||
-        row.cost_reconciliation_status === 'broadcast_missing'
-            ? 'dadbear-card-alert'
-            : '',
-        row.frozen ? 'dadbear-card-frozen' : '',
-        row.breaker_tripped ? 'dadbear-card-breaker' : '',
+        row.derived_status === 'breaker'
+            ? 'dadbear-card-breaker'
+            : row.derived_status === 'paused' || row.derived_status === 'held'
+                ? 'dadbear-card-paused'
+                : 'dadbear-card-active',
     ]
         .filter(Boolean)
         .join(' ');
 
     return (
         <div className={cardClass}>
-            {row.frozen && (
-                <div className="dadbear-card-frozen-banner">Master frozen — unfreeze from global controls</div>
-            )}
-            {row.breaker_tripped && !row.frozen && (
-                <div className="dadbear-card-breaker-banner">Breaker tripped — resume from pyramid page</div>
+            {row.derived_status === 'breaker' && (
+                <div className="dadbear-card-breaker-banner">Breaker tripped — resume to clear</div>
             )}
             <div className="dadbear-card-header">
                 <h3 className="dadbear-card-title">{row.display_name}</h3>
-                <span
-                    className={`dadbear-card-status ${
-                        row.enabled ? 'dadbear-card-status-active' : 'dadbear-card-status-paused'
-                    }`}
-                >
-                    {row.enabled ? 'Active' : 'Paused'}
+                <span className={`dadbear-card-status ${statusCls}`}>
+                    {statusText}
                 </span>
             </div>
 
+            {/* Hold list with reasons and timestamps */}
+            {row.holds.length > 0 && (
+                <div className="dadbear-card-holds">
+                    {row.holds.map((h) => (
+                        <div key={h.hold} className="dadbear-card-hold-row">
+                            <span className="dadbear-card-hold-type">{h.hold}</span>
+                            <span className="dadbear-card-hold-since">{timeAgo(h.held_since)}</span>
+                            {h.reason && (
+                                <span className="dadbear-card-hold-reason">{h.reason}</span>
+                            )}
+                        </div>
+                    ))}
+                </div>
+            )}
+
+            {/* Pipeline counts grid */}
             <div className="dadbear-card-grid">
                 <div className="dadbear-card-field">
-                    <span className="dadbear-card-field-label">Next scan</span>
+                    <span className="dadbear-card-field-label">Pending obs</span>
                     <span className="dadbear-card-field-value">
-                        {row.enabled
-                            ? timeUntil(row.next_scan_at)
-                            : '—'}
+                        {row.pending_observations}
                     </span>
                 </div>
                 <div className="dadbear-card-field">
-                    <span className="dadbear-card-field-label">Last scan</span>
+                    <span className="dadbear-card-field-label">Compiled</span>
                     <span className="dadbear-card-field-value">
-                        {timeAgo(row.last_scan_at)}
+                        {row.compiled_items}
                     </span>
                 </div>
                 <div className="dadbear-card-field">
-                    <span className="dadbear-card-field-label">Pending mutations</span>
+                    <span className="dadbear-card-field-label">Blocked</span>
                     <span className="dadbear-card-field-value">
-                        {row.pending_mutations_count}
+                        {row.blocked_items}
                     </span>
                 </div>
                 <div className="dadbear-card-field">
-                    <span className="dadbear-card-field-label">In-flight checks</span>
+                    <span className="dadbear-card-field-label">Previewed</span>
                     <span className="dadbear-card-field-value">
-                        {row.in_flight_stale_checks}
+                        {row.previewed_items}
                     </span>
                 </div>
                 <div className="dadbear-card-field">
-                    <span className="dadbear-card-field-label">Deferred questions</span>
+                    <span className="dadbear-card-field-label">Dispatched</span>
                     <span className="dadbear-card-field-value">
-                        {row.deferred_questions_count}
+                        {row.dispatched_items}
                     </span>
                 </div>
                 <div className="dadbear-card-field">
-                    <span className="dadbear-card-field-label">Demand (24h)</span>
+                    <span className="dadbear-card-field-label">Completed (24h)</span>
                     <span className="dadbear-card-field-value">
-                        {row.demand_signals_24h}
+                        {row.completed_items_24h}
                     </span>
                 </div>
                 <div className="dadbear-card-field">
-                    <span className="dadbear-card-field-label">Cost (24h)</span>
+                    <span className="dadbear-card-field-label">Applied (24h)</span>
                     <span className="dadbear-card-field-value">
-                        {currency(row.cost_24h_estimated_usd)} est
-                        {row.cost_24h_actual_usd > 0 && (
-                            <>
-                                {' '}
-                                / {currency(row.cost_24h_actual_usd)} actual
-                            </>
-                        )}
+                        {row.applied_items_24h}
                     </span>
                 </div>
                 <div className="dadbear-card-field">
-                    <span className="dadbear-card-field-label">Reconciliation</span>
-                    <span
-                        className={`dadbear-card-field-value ${statusClass(
-                            row.cost_reconciliation_status,
-                        )}`}
-                    >
-                        {statusLabel(row.cost_reconciliation_status)}
+                    <span className="dadbear-card-field-label">Failed (24h)</span>
+                    <span className="dadbear-card-field-value">
+                        {row.failed_items_24h}
                     </span>
                 </div>
                 <div className="dadbear-card-field">
-                    <span className="dadbear-card-field-label">Manifests (24h)</span>
+                    <span className="dadbear-card-field-label">Stale</span>
                     <span className="dadbear-card-field-value">
-                        {row.recent_manifest_count}
+                        {row.stale_items}
+                    </span>
+                </div>
+                {row.preview_total_cost_usd > 0 && (
+                    <div className="dadbear-card-field">
+                        <span className="dadbear-card-field-label">Preview cost</span>
+                        <span className="dadbear-card-field-value">
+                            {currency(row.preview_total_cost_usd)}
+                        </span>
+                    </div>
+                )}
+                <div className="dadbear-card-field">
+                    <span className="dadbear-card-field-label">Actual cost (24h)</span>
+                    <span className="dadbear-card-field-value">
+                        {currency(row.actual_cost_24h_usd)}
+                    </span>
+                </div>
+                <div className="dadbear-card-field">
+                    <span className="dadbear-card-field-label">Last compiled</span>
+                    <span className="dadbear-card-field-value">
+                        {timeAgo(row.last_compilation_at)}
+                    </span>
+                </div>
+                <div className="dadbear-card-field">
+                    <span className="dadbear-card-field-label">Last dispatch</span>
+                    <span className="dadbear-card-field-value">
+                        {timeAgo(row.last_dispatch_at)}
                     </span>
                 </div>
             </div>
@@ -212,18 +206,15 @@ export function DadbearPyramidCard({
 
             <div className="dadbear-card-actions">
                 <button
-                    className={`btn ${row.enabled ? 'btn-secondary' : 'btn-primary'}`}
+                    className={`btn ${isPaused ? 'btn-primary' : 'btn-secondary'}`}
                     disabled={busy}
                     onClick={handleToggle}
                 >
                     {busy
-                        ? '…'
-                        : row.enabled
-                            ? 'Pause'
-                            : 'Resume'}
-                    {row.frozen && (
-                        <span className="dadbear-card-frozen-indicator">takes effect on unfreeze</span>
-                    )}
+                        ? '...'
+                        : isPaused
+                            ? 'Resume'
+                            : 'Pause'}
                 </button>
                 <button
                     className="btn btn-secondary"

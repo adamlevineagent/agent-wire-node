@@ -10,7 +10,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppContext } from '../contexts/AppContext';
-import { useDadbearOverview } from '../hooks/useDadbearOverview';
+import { useDadbearOverviewV2 } from '../hooks/useDadbearOverviewV2';
+import type { WorkItemOverviewRow } from '../hooks/useDadbearOverviewV2';
 import { useProviderHealth } from '../hooks/useProviderHealth';
 import { useOrphanBroadcasts } from '../hooks/useOrphanBroadcasts';
 import { DadbearPyramidCard } from './DadbearPyramidCard';
@@ -25,7 +26,7 @@ import {
     type DadbearPauseScope,
 } from './DadbearPauseScopeModal';
 
-type PyramidFilter = 'all' | 'active' | 'paused' | 'frozen' | 'breaker';
+type PyramidFilter = 'all' | 'active' | 'paused' | 'breaker';
 
 function currency(v: number): string {
     return `$${v.toFixed(2)}`;
@@ -38,7 +39,7 @@ export function DadbearOversightPage() {
         loading: overviewLoading,
         error: overviewError,
         refetch: refetchOverview,
-    } = useDadbearOverview(10_000);
+    } = useDadbearOverviewV2(10_000);
 
     const {
         data: providerHealth,
@@ -147,10 +148,10 @@ export function DadbearOversightPage() {
     const handleSetDefaultNorms = useCallback(() => {
         // Queue the preset + switch to ToolsMode. The ToolsMode
         // bridge consumes the preset on mount / event and dispatches
-        // a pick-schema for dadbear_policy, skipping the schema
+        // a pick-schema for dadbear_norms, skipping the schema
         // picker and jumping straight to the intent step.
         requestToolsModePreset({
-            schemaType: 'dadbear_policy',
+            schemaType: 'dadbear_norms',
             slug: null,
         });
         setMode('tools');
@@ -160,9 +161,9 @@ export function DadbearOversightPage() {
         (slug: string) => {
             // Per-pyramid "Configure" opens the same flow but with
             // the pyramid slug bound. The user ends up editing a
-            // pyramid-scoped dadbear_policy contribution.
+            // pyramid-scoped dadbear_norms contribution.
             requestToolsModePreset({
-                schemaType: 'dadbear_policy',
+                schemaType: 'dadbear_norms',
                 slug,
             });
             setMode('tools');
@@ -170,17 +171,18 @@ export function DadbearOversightPage() {
         [setMode],
     );
 
+    // Work-item-centric filter: derived_status from holds projection.
     const filteredPyramids = useMemo(() => {
         if (!overview) return [];
         switch (filter) {
             case 'active':
-                return overview.pyramids.filter((p) => p.enabled && !p.frozen && !p.breaker_tripped && p.auto_update);
+                return overview.pyramids.filter((p) => p.derived_status === 'active');
             case 'paused':
-                return overview.pyramids.filter((p) => !p.enabled && !p.frozen && !p.breaker_tripped);
-            case 'frozen':
-                return overview.pyramids.filter((p) => p.frozen && !p.breaker_tripped);
+                return overview.pyramids.filter(
+                    (p) => p.derived_status === 'paused' || p.derived_status === 'held',
+                );
             case 'breaker':
-                return overview.pyramids.filter((p) => p.breaker_tripped);
+                return overview.pyramids.filter((p) => p.derived_status === 'breaker');
             default:
                 return overview.pyramids;
         }
@@ -256,38 +258,25 @@ export function DadbearOversightPage() {
                             Paused: <strong>{overview.totals.paused_count}</strong>
                         </span>
                         <span>
-                            Frozen: <strong>{overview.totals.frozen_count}</strong>
-                        </span>
-                        <span>
                             Breaker: <strong>{overview.totals.breaker_count}</strong>
                         </span>
                         <span>
-                            Pending mutations:{' '}
-                            <strong>{overview.totals.total_pending_mutations}</strong>
+                            Compiled:{' '}
+                            <strong>{overview.totals.total_compiled}</strong>
                         </span>
                         <span>
-                            In-flight:{' '}
-                            <strong>{overview.totals.total_in_flight_checks}</strong>
+                            Dispatched:{' '}
+                            <strong>{overview.totals.total_dispatched}</strong>
                         </span>
                         <span>
-                            Deferred questions:{' '}
-                            <strong>
-                                {overview.totals.total_deferred_questions}
-                            </strong>
+                            Blocked:{' '}
+                            <strong>{overview.totals.total_blocked}</strong>
                         </span>
                         <span>
                             24h cost:{' '}
                             <strong>
-                                {currency(overview.totals.total_estimated_24h_usd)} est
+                                {currency(overview.totals.total_cost_24h_usd)}
                             </strong>
-                            {overview.totals.total_actual_24h_usd > 0 && (
-                                <>
-                                    {' '}/{' '}
-                                    <strong>
-                                        {currency(overview.totals.total_actual_24h_usd)} actual
-                                    </strong>
-                                </>
-                            )}
                         </span>
                     </div>
                 )}
@@ -297,7 +286,7 @@ export function DadbearOversightPage() {
                 <div className="dadbear-oversight-pyramids-header">
                     <h3>Per-Pyramid Status</h3>
                     <div className="dadbear-oversight-filter">
-                        {(['all', 'active', 'paused', 'frozen', 'breaker'] as PyramidFilter[]).map(
+                        {(['all', 'active', 'paused', 'breaker'] as PyramidFilter[]).map(
                             (f) => (
                                 <button
                                     key={f}

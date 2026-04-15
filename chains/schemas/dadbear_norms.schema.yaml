@@ -1,0 +1,98 @@
+# DADBEAR norms — timing and threshold knobs for scan behavior.
+#
+# Describes how the YamlConfigRenderer presents DADBEAR's per-pyramid
+# (or global) norms. Field names mirror `DadbearNormsYaml` in
+# `src-tauri/src/pyramid/db.rs`:
+#
+#   scan_interval_secs: i64      (default 10)
+#   debounce_secs: i64           (default 30)
+#   session_timeout_secs: i64    (default 1800)
+#   batch_size: i64              (default 1)
+#   min_changed_files: i64       (default 1)
+#   runaway_threshold: f64       (default 0.5)
+#   retention_window_days: i64   (default 30)
+#
+# These were split out of `dadbear_policy` so that source_path,
+# content_type, and enabled live in `watch_root` while timing/thresholds
+# live here with layered (global + per-slug) override semantics.
+
+schema_type: dadbear_norms
+applies_to: dadbear_norms
+version: 1
+label: "DADBEAR Norms"
+description: "Timing and threshold norms for DADBEAR scan behavior (global or per-pyramid)."
+
+fields:
+  scan_interval_secs:
+    label: "Scan Interval"
+    help: "How often DADBEAR polls the source folder for new or changed files (seconds)."
+    widget: number
+    min: 1
+    max: 3600
+    step: 1
+    suffix: "sec"
+    visibility: basic
+    order: 1
+
+  debounce_secs:
+    label: "Debounce Window"
+    help: "Seconds a file must be stable before a provisional build fires."
+    widget: number
+    min: 1
+    max: 600
+    step: 1
+    suffix: "sec"
+    visibility: basic
+    order: 2
+
+  session_timeout_secs:
+    label: "Session Timeout"
+    help: "Seconds of inactivity on a conversation file before session promotion."
+    widget: number
+    min: 60
+    max: 7200
+    step: 30
+    suffix: "sec"
+    visibility: advanced
+    order: 3
+
+  batch_size:
+    label: "Batch Size"
+    help: "How many pending ingest records DADBEAR dispatches per tick."
+    widget: number
+    min: 1
+    max: 32
+    step: 1
+    visibility: basic
+    order: 4
+
+  min_changed_files:
+    label: "Min Changed Files"
+    help: "Minimum number of changed files before DADBEAR triggers a rebuild. Prevents churn from single-file saves."
+    widget: number
+    min: 1
+    max: 100
+    step: 1
+    visibility: advanced
+    order: 5
+
+  runaway_threshold:
+    label: "Runaway Threshold"
+    help: "Fraction of pyramid nodes that can be stale before DADBEAR considers the pyramid 'runaway' and throttles rebuilds (0.0-1.0)."
+    widget: number
+    min: 0.0
+    max: 1.0
+    step: 0.05
+    visibility: advanced
+    order: 6
+
+  retention_window_days:
+    label: "Retention Window"
+    help: "Days to keep superseded contribution versions before pruning."
+    widget: number
+    min: 1
+    max: 365
+    step: 1
+    suffix: "days"
+    visibility: advanced
+    order: 7

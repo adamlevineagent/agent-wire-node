@@ -379,6 +379,22 @@ fn enqueue_vine_manifest_mutations(
              VALUES (?1, ?2, 'confirmed_stale', ?3, ?4, 0, ?5, 0)",
             rusqlite::params![vine_slug, depth, vine_node_id, detail, now],
         )?;
+
+        // Dual-write: observation event (vine node stale)
+        let _ = super::observation_events::write_observation_event(
+            conn,
+            vine_slug,
+            "vine",
+            "vine_stale",
+            None,
+            None,
+            None,
+            None,
+            Some(&vine_node_id),
+            Some(depth),
+            Some(&detail),
+        );
+
         inserted += rows_changed;
     }
 
@@ -832,6 +848,7 @@ mod tests {
             supabase_anon_key: None,
             csrf_secret: [0u8; 32],
             dadbear_handle: Arc::new(TokioMutex::new(None)),
+            dadbear_supervisor_handle: Arc::new(TokioMutex::new(None)),
             dadbear_in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
             provider_registry: Arc::new(
                 crate::pyramid::provider::ProviderRegistry::new(credential_store.clone()),

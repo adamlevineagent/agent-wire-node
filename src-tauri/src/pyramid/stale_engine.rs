@@ -985,7 +985,7 @@ pub async fn drain_and_dispatch(
         let permit = semaphore.clone().acquire_owned().await?;
         let db = db_owned.clone();
         let s = slug_owned.clone();
-        let bid = batch_id.clone();
+
         let cfg = base_config_owned.clone();
         let mdl = model_owned.clone();
         handles.push(tokio::spawn(async move {
@@ -1037,7 +1037,7 @@ pub async fn drain_and_dispatch(
             }
             let _ = tokio::task::spawn_blocking(move || {
                 if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
-                    let _ = log_stale_results(&conn, &s, &bid, layer, &results);
+
                     let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
 
                     // Propagate to targeted L0 nodes from the same source files
@@ -1064,6 +1064,7 @@ pub async fn drain_and_dispatch(
                         match super::db::get_targeted_l0_for_canonical_nodes(&conn, &s, &canonical_ids) {
                             Ok(targeted_ids) => {
                                 for tid in &targeted_ids {
+                                    let targeted_detail = format!("Canonical L0 stale: {}", result.reason);
                                     if let Err(e) = conn.execute(
                                         "INSERT INTO pyramid_pending_mutations
                                          (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
@@ -1071,13 +1072,28 @@ pub async fn drain_and_dispatch(
                                         rusqlite::params![
                                             s,
                                             tid,
-                                            format!("Canonical L0 stale: {}", result.reason),
+                                            targeted_detail,
                                             result.cascade_depth + 1,
                                             now,
                                         ],
                                     ) {
                                         warn!(slug = %s, target = %tid, "Failed to insert targeted_l0_stale pending mutation: {e}");
                                     }
+
+                                    // Dual-write: observation event
+                                    let _ = super::observation_events::write_observation_event(
+                                        &conn,
+                                        &s,
+                                        "cascade",
+                                        "targeted_stale",
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        Some(tid.as_str()),
+                                        Some(0),
+                                        Some(&targeted_detail),
+                                    );
                                 }
                                 if !targeted_ids.is_empty() {
                                     info!(
@@ -1109,7 +1125,7 @@ pub async fn drain_and_dispatch(
         let permit = semaphore.clone().acquire_owned().await?;
         let db = db_owned.clone();
         let s = slug_owned.clone();
-        let bid = batch_id.clone();
+
         let cfg = base_config_owned.clone();
         let mdl = model_owned.clone();
         handles.push(tokio::spawn(async move {
@@ -1126,7 +1142,7 @@ pub async fn drain_and_dispatch(
             };
             let _ = tokio::task::spawn_blocking(move || {
                 if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
-                    let _ = log_stale_results(&conn, &s, &bid, layer, &results);
+
                     let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
                 }
             })
@@ -1140,7 +1156,7 @@ pub async fn drain_and_dispatch(
         let permit = semaphore.clone().acquire_owned().await?;
         let db = db_owned.clone();
         let s = slug_owned.clone();
-        let bid = batch_id.clone();
+
         let cfg = base_config_owned.clone();
         let mdl = model_owned.clone();
         handles.push(tokio::spawn(async move {
@@ -1168,7 +1184,7 @@ pub async fn drain_and_dispatch(
             }
             let _ = tokio::task::spawn_blocking(move || {
                 if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
-                    let _ = log_stale_results(&conn, &s, &bid, layer, &results);
+
                     let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
                 }
             }).await;
@@ -1181,7 +1197,7 @@ pub async fn drain_and_dispatch(
         let permit = semaphore.clone().acquire_owned().await?;
         let db = db_owned.clone();
         let s = slug_owned.clone();
-        let bid = batch_id.clone();
+
         let cfg = base_config_owned.clone();
         let mdl = model_owned.clone();
         handles.push(tokio::spawn(async move {
@@ -1198,7 +1214,7 @@ pub async fn drain_and_dispatch(
             };
             let _ = tokio::task::spawn_blocking(move || {
                 if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
-                    let _ = log_stale_results(&conn, &s, &bid, layer, &results);
+
                     let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
                 }
             })
@@ -1265,7 +1281,7 @@ pub async fn drain_and_dispatch(
         let permit = semaphore.clone().acquire_owned().await?;
         let db = db_owned.clone();
         let s = slug_owned.clone();
-        let bid = batch_id.clone();
+
         let cfg = base_config_owned.clone();
         let mdl = model_owned.clone();
         handles.push(tokio::spawn(async move {
@@ -1282,7 +1298,7 @@ pub async fn drain_and_dispatch(
             };
             let _ = tokio::task::spawn_blocking(move || {
                 if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
-                    let _ = log_stale_results(&conn, &s, &bid, layer, &results);
+
                     let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
                 }
             })
@@ -1296,7 +1312,7 @@ pub async fn drain_and_dispatch(
         let permit = semaphore.clone().acquire_owned().await?;
         let db = db_owned.clone();
         let s = slug_owned.clone();
-        let bid = batch_id.clone();
+
         let cfg = base_config_owned.clone();
         let mdl = model_owned.clone();
         handles.push(tokio::spawn(async move {
@@ -1313,7 +1329,7 @@ pub async fn drain_and_dispatch(
             };
             let _ = tokio::task::spawn_blocking(move || {
                 if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
-                    let _ = log_stale_results(&conn, &s, &bid, layer, &results);
+
                     let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
                 }
             })
@@ -1417,7 +1433,7 @@ pub async fn drain_and_dispatch(
         tokio::time::sleep(min_display - elapsed).await;
     }
 
-    // Determine outcome by checking stale log for this batch
+    // Determine outcome by checking dadbear_work_items for this batch
     let stale_count = {
         let db = db_owned.clone();
         let s = slug_owned.clone();
@@ -1425,8 +1441,8 @@ pub async fn drain_and_dispatch(
         tokio::task::spawn_blocking(move || -> i64 {
             if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
                 conn.query_row(
-                    "SELECT COUNT(*) FROM pyramid_stale_check_log
-                     WHERE slug = ?1 AND batch_id = ?2 AND stale = 1",
+                    "SELECT COUNT(*) FROM dadbear_work_items
+                     WHERE slug = ?1 AND batch_id = ?2 AND state = 'applied'",
                     rusqlite::params![s, bid],
                     |row| row.get(0),
                 )
@@ -1533,38 +1549,6 @@ pub fn batch_items<T>(items: Vec<T>, cap: usize) -> Vec<Vec<T>> {
 }
 
 // ── Result Processing Helpers ────────────────────────────────────────────────
-
-fn log_stale_results(
-    conn: &Connection,
-    slug: &str,
-    batch_id: &str,
-    layer: i32,
-    results: &[StaleCheckResult],
-) -> Result<()> {
-    for result in results {
-        conn.execute(
-            "INSERT INTO pyramid_stale_check_log
-             (slug, batch_id, layer, target_id, stale, reason,
-              checker_index, checker_batch_size, checked_at, cost_tokens, cost_usd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            rusqlite::params![
-                slug,
-                batch_id,
-                layer,
-                result.target_id,
-                result.stale,
-                result.reason,
-                result.checker_index,
-                result.checker_batch_size,
-                result.checked_at,
-                result.cost_tokens,
-                result.cost_usd,
-            ],
-        )
-        .context("Failed to insert stale check log")?;
-    }
-    Ok(())
-}
 
 fn propagate_confirmed_stales(
     conn: &Connection,
@@ -1689,6 +1673,21 @@ fn propagate_confirmed_stales(
                 ],
             )
             .context("Failed to propagate confirmed stale mutation")?;
+
+            // Dual-write: observation event
+            let _ = super::observation_events::write_observation_event(
+                conn,
+                slug,
+                "cascade",
+                "cascade_stale",
+                None,
+                None,
+                None,
+                None,
+                Some(&propagation_target),
+                Some(next_layer as i64),
+                Some(&result.reason),
+            );
         }
     }
 

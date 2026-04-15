@@ -514,6 +514,10 @@ fn write_reroll_manifest(
     // this (slug, node_id) tuple. If the node doesn't exist yet
     // (intermediate rerolls that reference a synthetic id), we
     // default to 1.
+    //
+    // NOTE (Phase 7): pyramid_change_manifests is retained for the build
+    // pipeline (reroll, supersession). It is NOT deprecated. The DADBEAR-
+    // specific canonical table is dadbear_result_applications.
     let next_version: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(build_version), 0) + 1

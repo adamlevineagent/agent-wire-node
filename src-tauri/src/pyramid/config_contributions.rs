@@ -910,6 +910,59 @@ pub fn sync_config_to_operational_with_registry(
             // contribution store directly.
             debug!("reconciliation_result synced; no operational table — queryable from contribution store");
         }
+        // ── DADBEAR Canonical Architecture: split contribution types ───��─
+        //
+        // Phase 0 of `docs/plans/dadbear-canonical-state-model.md` splits
+        // `dadbear_policy` into `watch_root` + `dadbear_norms`. These new
+        // dispatcher branches coexist with the old `dadbear_policy` branch
+        // (kept for rollback safety — removed in Phase 7).
+        "watch_root" => {
+            let yaml: db::WatchRootYaml =
+                serde_yaml::from_str(&contribution.yaml_content)?;
+            // Resolve norms for this slug via the layered resolver.
+            // resolve_dadbear_norms returns db::DadbearNormsYaml directly.
+            let resolved_norms = resolve_dadbear_norms(conn, contribution.slug.as_deref())
+                .unwrap_or_default();
+            db::upsert_watch_root(
+                conn,
+                &slug_opt,
+                &yaml,
+                &resolved_norms,
+                &contribution.contribution_id,
+            )?;
+            trigger_dadbear_config_changed(bus, contribution.slug.as_deref());
+        }
+        "dadbear_norms" => {
+            // When a norms contribution lands, rebuild the operational
+            // norms for all affected slugs. For a global norms (slug=None):
+            // rebuild all slugs. For a per-slug norms: just that slug.
+            if contribution.slug.is_none() {
+                // Global norms changed — all slugs affected.
+                rebuild_all_dadbear_norms_cache(conn, bus)?;
+            } else if let Some(slug_str) = contribution.slug.as_deref() {
+                // Per-slug norms changed — rebuild just this slug's rows.
+                let norms = resolve_dadbear_norms(conn, Some(slug_str))
+                    .unwrap_or_default();
+                // Update all dadbear_config rows for this slug with new norms.
+                conn.execute(
+                    "UPDATE pyramid_dadbear_config SET
+                        scan_interval_secs = ?1,
+                        debounce_secs = ?2,
+                        session_timeout_secs = ?3,
+                        batch_size = ?4,
+                        updated_at = datetime('now')
+                     WHERE slug = ?5",
+                    rusqlite::params![
+                        norms.scan_interval_secs,
+                        norms.debounce_secs,
+                        norms.session_timeout_secs,
+                        norms.batch_size,
+                        slug_str,
+                    ],
+                )?;
+            }
+            trigger_dadbear_config_changed(bus, contribution.slug.as_deref());
+        }
         other => {
             // Per the spec: unknown types are a bug — fail loudly
             // rather than silently skipping sync.
@@ -1045,14 +1098,44 @@ fn reconfigure_wire_update_scheduler(_conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Phase 1 / Phase 11: after a DADBEAR policy updates, trigger the
-/// DADBEAR tick loop to re-read its config on the next cycle. Today's
-/// DADBEAR tick already re-reads per tick, so this is a no-op for now.
-fn trigger_dadbear_reload(_bus: &Arc<BuildEventBus>, slug: Option<&str>) {
+/// Phase 0: after a DADBEAR config contribution updates, emit a
+/// `DadbearConfigChanged` event so the tick loop forces an immediate
+/// reload on the next cycle. Replaces the former no-op stub.
+fn trigger_dadbear_reload(bus: &Arc<BuildEventBus>, slug: Option<&str>) {
     debug!(
         slug = ?slug,
-        "trigger_dadbear_reload: Phase 4 no-op (DADBEAR already re-reads per tick)"
+        "trigger_dadbear_reload: emitting DadbearConfigChanged event"
     );
+    let envelope_slug = slug.unwrap_or("").to_string();
+    let _ = bus.tx.send(TaggedBuildEvent {
+        slug: envelope_slug,
+        kind: TaggedKind::DadbearConfigChanged {
+            slug: slug.map(|s| s.to_string()),
+            schema_type: "dadbear_policy".to_string(),
+            contribution_id: String::new(),
+        },
+    });
+}
+
+// ── DADBEAR Canonical Architecture: Phase 0 helpers ─────────────────────────
+
+/// Emit a `DadbearConfigChanged` event for the new split contribution
+/// types (`watch_root`, `dadbear_norms`). Same pattern as
+/// `trigger_dadbear_reload` but with the correct schema_type.
+fn trigger_dadbear_config_changed(bus: &Arc<BuildEventBus>, slug: Option<&str>) {
+    debug!(
+        slug = ?slug,
+        "trigger_dadbear_config_changed: emitting DadbearConfigChanged event"
+    );
+    let envelope_slug = slug.unwrap_or("").to_string();
+    let _ = bus.tx.send(TaggedBuildEvent {
+        slug: envelope_slug,
+        kind: TaggedKind::DadbearConfigChanged {
+            slug: slug.map(|s| s.to_string()),
+            schema_type: "dadbear_norms".to_string(),
+            contribution_id: String::new(),
+        },
+    });
 }
 
 /// Phase 12: re-evaluate deferred questions after an evidence_policy
@@ -1399,6 +1482,18 @@ fn validate_rollback_yaml(yaml_content: &str, schema_type: &str) -> Result<()> {
                     "Cannot roll back — configuration schema has changed since this version: {e}"
                 ))?;
         }
+        "watch_root" => {
+            serde_yaml::from_str::<db::WatchRootYaml>(yaml_content)
+                .map_err(|e| anyhow::anyhow!(
+                    "Cannot roll back — configuration schema has changed since this version: {e}"
+                ))?;
+        }
+        "dadbear_norms" => {
+            serde_yaml::from_str::<db::DadbearNormsYaml>(yaml_content)
+                .map_err(|e| anyhow::anyhow!(
+                    "Cannot roll back — configuration schema has changed since this version: {e}"
+                ))?;
+        }
         _ => {
             // For schema types without a dedicated struct (stubs,
             // future types), basic YAML validity check is sufficient.
@@ -1408,6 +1503,566 @@ fn validate_rollback_yaml(yaml_content: &str, schema_type: &str) -> Result<()> {
                 ))?;
         }
     }
+    Ok(())
+}
+
+// ── Phase 0: Layered DADBEAR norms resolver ──────────────────────────────────
+//
+// Per the canonical state model: `dadbear_norms` contributions support
+// global defaults (slug=NULL) with per-slug overrides. The resolver
+// merges per-slug fields over the global base — missing per-slug fields
+// fall through to the global defaults.
+//
+// Uses `db::DadbearNormsYaml` as the resolved type (defined by WS-C in
+// db.rs). This avoids a redundant struct — the YAML schema and the
+// resolved output share the same fields and serde defaults.
+
+/// Layered resolver: merges global (slug=NULL) `dadbear_norms` with a
+/// per-slug override. Per-slug fields override global; missing fields
+/// fall through to global defaults. If neither exists, returns the
+/// struct default.
+///
+/// Uses `serde_yaml::Value` merge so any new fields added to the schema
+/// automatically participate in the layered merge without code changes.
+///
+/// When `slug` is `None`, returns the global defaults contribution
+/// directly (or struct defaults if no global contribution exists).
+pub fn resolve_dadbear_norms(
+    conn: &Connection,
+    slug: Option<&str>,
+) -> Result<db::DadbearNormsYaml> {
+    // 1. Load global default (slug IS NULL, schema_type='dadbear_norms', status='active')
+    let global = load_active_config_contribution(conn, "dadbear_norms", None)?;
+
+    // 2. For global-only resolution (slug=None), return global or defaults
+    let Some(slug_str) = slug else {
+        return match global {
+            Some(g) => {
+                let norms: db::DadbearNormsYaml = serde_yaml::from_str(&g.yaml_content)
+                    .unwrap_or_default();
+                Ok(norms)
+            }
+            None => Ok(db::DadbearNormsYaml::default()),
+        };
+    };
+
+    // 3. Load per-slug override (slug = slug_str, schema_type='dadbear_norms', status='active')
+    let per_slug = load_active_config_contribution(conn, "dadbear_norms", Some(slug_str))?;
+
+    // 4. Merge: per-slug values override global, missing values fall through
+    let merged_value: serde_yaml::Value = match (&global, &per_slug) {
+        (None, None) => {
+            // No contributions at all — return struct defaults
+            return Ok(db::DadbearNormsYaml::default());
+        }
+        (Some(g), None) => {
+            // Global only — parse as-is
+            serde_yaml::from_str(&g.yaml_content)?
+        }
+        (None, Some(p)) => {
+            // Per-slug only — parse as-is
+            serde_yaml::from_str(&p.yaml_content)?
+        }
+        (Some(g), Some(p)) => {
+            // Both exist — merge per-slug over global
+            let mut base: serde_yaml::Value = serde_yaml::from_str(&g.yaml_content)?;
+            let overlay: serde_yaml::Value = serde_yaml::from_str(&p.yaml_content)?;
+            merge_yaml_values(&mut base, overlay);
+            base
+        }
+    };
+
+    // Deserialize the merged YAML into the typed struct.
+    // serde defaults fill any fields missing from both layers.
+    let resolved: db::DadbearNormsYaml = serde_yaml::from_value(merged_value)
+        .unwrap_or_else(|e| {
+            warn!(
+                slug = ?slug,
+                error = %e,
+                "resolve_dadbear_norms: failed to deserialize merged norms, using defaults"
+            );
+            db::DadbearNormsYaml::default()
+        });
+    Ok(resolved)
+}
+
+/// Recursive YAML value merge: overlay's keys overwrite base's keys.
+/// For Mapping values, merges recursively. For all other types
+/// (scalars, sequences), overlay replaces base entirely.
+fn merge_yaml_values(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {
+    match (base, overlay) {
+        (serde_yaml::Value::Mapping(base_map), serde_yaml::Value::Mapping(overlay_map)) => {
+            for (key, value) in overlay_map {
+                if let Some(base_entry) = base_map.get_mut(&key) {
+                    merge_yaml_values(base_entry, value);
+                } else {
+                    base_map.insert(key, value);
+                }
+            }
+        }
+        (base, overlay) => {
+            *base = overlay;
+        }
+    }
+}
+
+/// Rebuild the resolved dadbear_norms cache for all slugs that have
+/// active `watch_root` or `dadbear_policy` contributions. Iterates
+/// every distinct slug with an active DADBEAR-related contribution,
+/// resolves norms via the layered merge, and upserts the resolved
+/// values into `pyramid_dadbear_config` rows.
+///
+/// Called by the dispatcher when a global `dadbear_norms` contribution
+/// syncs — a global change potentially affects every slug's resolved
+/// norms.
+pub fn rebuild_all_dadbear_norms_cache(
+    conn: &Connection,
+    bus: &Arc<BuildEventBus>,
+) -> Result<()> {
+    // Collect all distinct slugs that have active DADBEAR-related
+    // contributions (dadbear_policy or dadbear_norms with a non-NULL slug).
+    let slugs: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT slug FROM pyramid_config_contributions
+             WHERE slug IS NOT NULL
+               AND schema_type IN ('dadbear_policy', 'dadbear_norms', 'watch_root')
+               AND status = 'active'"
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    debug!(
+        slug_count = slugs.len(),
+        "rebuild_all_dadbear_norms_cache: resolving norms for all active slugs"
+    );
+
+    for slug in &slugs {
+        match resolve_dadbear_norms(conn, Some(slug.as_str())) {
+            Ok(norms) => {
+                // Upsert the resolved norms into pyramid_dadbear_config.
+                // Only update the norms-related columns; leave source_path,
+                // content_type, and enabled untouched (those come from
+                // watch_root / dadbear_policy contributions).
+                let result = conn.execute(
+                    "UPDATE pyramid_dadbear_config SET
+                        scan_interval_secs = ?1,
+                        debounce_secs = ?2,
+                        session_timeout_secs = ?3,
+                        batch_size = ?4,
+                        updated_at = datetime('now')
+                     WHERE slug = ?5",
+                    rusqlite::params![
+                        norms.scan_interval_secs,
+                        norms.debounce_secs,
+                        norms.session_timeout_secs,
+                        norms.batch_size,
+                        slug,
+                    ],
+                );
+
+                match result {
+                    Ok(updated) => {
+                        debug!(
+                            slug = %slug,
+                            rows_updated = updated,
+                            scan_interval = norms.scan_interval_secs,
+                            debounce = norms.debounce_secs,
+                            "rebuild_all_dadbear_norms_cache: updated operational cache"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            slug = %slug,
+                            error = %e,
+                            "rebuild_all_dadbear_norms_cache: failed to update operational cache"
+                        );
+                    }
+                }
+
+                // Emit DadbearConfigChanged so the tick loop picks up
+                // the new norms immediately.
+                let _ = bus.tx.send(TaggedBuildEvent {
+                    slug: slug.clone(),
+                    kind: TaggedKind::DadbearConfigChanged {
+                        slug: Some(slug.clone()),
+                        schema_type: "dadbear_norms".to_string(),
+                        contribution_id: String::new(),
+                    },
+                });
+            }
+            Err(e) => {
+                warn!(
+                    slug = %slug,
+                    error = %e,
+                    "rebuild_all_dadbear_norms_cache: failed to resolve norms, skipping"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ── Phase 0: Data migrations — contribution split ────────────────────────────
+
+/// Migrate active `dadbear_policy` contributions into the split
+/// `watch_root` + `dadbear_norms` contribution types. Idempotent via
+/// `_migration_marker` with `created_by = 'dadbear_split_bootstrap'`.
+///
+/// See module-level doc and `docs/plans/dadbear-canonical-state-model.md`
+/// Phase 0 for full details.
+pub fn migrate_dadbear_policy_to_split(conn: &Connection) -> Result<()> {
+    let marker_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pyramid_config_contributions
+         WHERE schema_type = '_migration_marker'
+           AND source = 'migration'
+           AND created_by = 'dadbear_split_bootstrap'",
+        [],
+        |row| row.get(0),
+    )?;
+    if marker_exists > 0 {
+        return Ok(());
+    }
+
+    let policies: Vec<(String, Option<String>, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT contribution_id, slug, yaml_content
+             FROM pyramid_config_contributions
+             WHERE schema_type = 'dadbear_policy'
+               AND status = 'active'
+               AND superseded_by_id IS NULL
+             ORDER BY created_at ASC"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    let disabled_slugs: std::collections::HashSet<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT slug FROM pyramid_auto_update_config WHERE auto_update = 0"
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    let mut slug_policies: std::collections::HashMap<
+        String,
+        Vec<(String, db::DadbearPolicyYaml)>,
+    > = std::collections::HashMap::new();
+
+    for (contribution_id, slug_opt, yaml_content) in &policies {
+        let Some(slug) = slug_opt.as_deref() else {
+            continue;
+        };
+        let yaml: db::DadbearPolicyYaml = match serde_yaml::from_str(yaml_content) {
+            Ok(y) => y,
+            Err(e) => {
+                warn!(
+                    contribution_id,
+                    error = %e,
+                    "migrate_dadbear_policy_to_split: skipping unparseable dadbear_policy"
+                );
+                continue;
+            }
+        };
+        slug_policies
+            .entry(slug.to_string())
+            .or_default()
+            .push((contribution_id.clone(), yaml));
+    }
+
+    for (slug, entries) in &slug_policies {
+        let is_disabled = disabled_slugs.contains(slug);
+
+        if !is_disabled {
+            for (_, policy_yaml) in entries {
+                let watch_root = db::WatchRootYaml {
+                    source_path: policy_yaml.source_path.clone(),
+                    content_type: policy_yaml.content_type.clone(),
+                };
+                let yaml_str = serde_yaml::to_string(&watch_root)
+                    .unwrap_or_else(|_| format!(
+                        "source_path: {:?}\ncontent_type: {:?}\n",
+                        watch_root.source_path, watch_root.content_type,
+                    ));
+                let mut metadata = crate::pyramid::wire_native_metadata::default_wire_native_metadata(
+                    "watch_root",
+                    Some(slug),
+                );
+                metadata.maturity = crate::pyramid::wire_native_metadata::WireMaturity::Canon;
+                let metadata_json = metadata.to_json().unwrap_or_else(|_| "{}".to_string());
+
+                let wr_id = uuid::Uuid::new_v4().to_string();
+                conn.execute(
+                    "INSERT INTO pyramid_config_contributions (
+                        contribution_id, slug, schema_type, yaml_content,
+                        wire_native_metadata_json, wire_publication_state_json,
+                        supersedes_id, superseded_by_id, triggering_note,
+                        status, source, wire_contribution_id, created_by, accepted_at
+                     ) VALUES (
+                        ?1, ?2, 'watch_root', ?3,
+                        ?4, '{}',
+                        NULL, NULL, 'Split from dadbear_policy contribution',
+                        'active', 'migration', NULL, 'dadbear_split_bootstrap', datetime('now')
+                     )",
+                    rusqlite::params![wr_id, slug, yaml_str, metadata_json],
+                )?;
+                // Sync the operational table's FK to point at the new
+                // watch_root contribution instead of the now-superseded
+                // dadbear_policy.
+                conn.execute(
+                    "UPDATE pyramid_dadbear_config SET contribution_id = ?1
+                     WHERE slug = ?2 AND source_path = ?3",
+                    rusqlite::params![wr_id, slug, policy_yaml.source_path],
+                )?;
+            }
+        }
+
+        let mut min_scan = i64::MAX;
+        let mut max_debounce = i64::MIN;
+        let mut max_session_timeout = i64::MIN;
+        let mut max_batch_size = i64::MIN;
+        for (_, policy_yaml) in entries {
+            min_scan = min_scan.min(policy_yaml.scan_interval_secs);
+            max_debounce = max_debounce.max(policy_yaml.debounce_secs);
+            max_session_timeout = max_session_timeout.max(policy_yaml.session_timeout_secs);
+            max_batch_size = max_batch_size.max(policy_yaml.batch_size);
+        }
+        if min_scan == i64::MAX { min_scan = 10; }
+        if max_debounce == i64::MIN { max_debounce = 30; }
+        if max_session_timeout == i64::MIN { max_session_timeout = 1800; }
+        if max_batch_size == i64::MIN { max_batch_size = 1; }
+
+        let norms = db::DadbearNormsYaml {
+            scan_interval_secs: min_scan,
+            debounce_secs: max_debounce,
+            session_timeout_secs: max_session_timeout,
+            batch_size: max_batch_size,
+            min_changed_files: 1,
+            runaway_threshold: 0.5,
+            retention_window_days: 30,
+        };
+        let norms_yaml_str = serde_yaml::to_string(&norms)
+            .unwrap_or_else(|_| "scan_interval_secs: 10\ndebounce_secs: 30\n".to_string());
+        let mut metadata = crate::pyramid::wire_native_metadata::default_wire_native_metadata(
+            "dadbear_norms",
+            Some(slug),
+        );
+        metadata.maturity = crate::pyramid::wire_native_metadata::WireMaturity::Canon;
+        let metadata_json = metadata.to_json().unwrap_or_else(|_| "{}".to_string());
+
+        let norms_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions (
+                contribution_id, slug, schema_type, yaml_content,
+                wire_native_metadata_json, wire_publication_state_json,
+                supersedes_id, superseded_by_id, triggering_note,
+                status, source, wire_contribution_id, created_by, accepted_at
+             ) VALUES (
+                ?1, ?2, 'dadbear_norms', ?3,
+                ?4, '{}',
+                NULL, NULL, 'Split from dadbear_policy contribution',
+                'active', 'migration', NULL, 'dadbear_split_bootstrap', datetime('now')
+             )",
+            rusqlite::params![norms_id, slug, norms_yaml_str, metadata_json],
+        )?;
+
+        for (contribution_id, _) in entries {
+            conn.execute(
+                "UPDATE pyramid_config_contributions
+                 SET status = 'superseded',
+                     superseded_by_id = ?1
+                 WHERE contribution_id = ?2
+                   AND status = 'active'",
+                rusqlite::params![norms_id, contribution_id],
+            )?;
+        }
+    }
+
+    let marker_id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO pyramid_config_contributions (
+            contribution_id, slug, schema_type, yaml_content,
+            status, source, created_by, accepted_at
+         ) VALUES (
+            ?1, NULL, '_migration_marker', '',
+            'active', 'migration', 'dadbear_split_bootstrap', datetime('now')
+         )",
+        rusqlite::params![marker_id],
+    )?;
+
+    debug!("migrate_dadbear_policy_to_split: completed");
+    Ok(())
+}
+
+/// Migrate `auto_update_policy` fields into the slug's existing
+/// `dadbear_norms` contribution. Idempotent via `_migration_marker`
+/// with `created_by = 'auto_update_norms_merge'`.
+pub fn migrate_auto_update_into_norms(conn: &Connection) -> Result<()> {
+    let marker_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pyramid_config_contributions
+         WHERE schema_type = '_migration_marker'
+           AND source = 'migration'
+           AND created_by = 'auto_update_norms_merge'",
+        [],
+        |row| row.get(0),
+    )?;
+    if marker_exists > 0 {
+        return Ok(());
+    }
+
+    let policies: Vec<(String, Option<String>, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT contribution_id, slug, yaml_content
+             FROM pyramid_config_contributions
+             WHERE schema_type = 'auto_update_policy'
+               AND status = 'active'
+               AND superseded_by_id IS NULL
+             ORDER BY created_at ASC"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    for (contribution_id, slug_opt, yaml_content) in &policies {
+        let Some(slug) = slug_opt.as_deref() else {
+            continue;
+        };
+
+        let auto_yaml: db::AutoUpdatePolicyYaml = match serde_yaml::from_str(yaml_content) {
+            Ok(y) => y,
+            Err(e) => {
+                warn!(
+                    contribution_id,
+                    error = %e,
+                    "migrate_auto_update_into_norms: skipping unparseable auto_update_policy"
+                );
+                continue;
+            }
+        };
+
+        let existing_norms = load_active_config_contribution(conn, "dadbear_norms", Some(slug))?;
+
+        if let Some(norms_row) = existing_norms {
+            let mut norms: db::DadbearNormsYaml =
+                serde_yaml::from_str(&norms_row.yaml_content).unwrap_or_default();
+
+            norms.min_changed_files = auto_yaml.min_changed_files;
+            norms.runaway_threshold = auto_yaml.runaway_threshold;
+            let debounce_from_auto = auto_yaml.debounce_minutes * 60;
+            if debounce_from_auto > norms.debounce_secs {
+                norms.debounce_secs = debounce_from_auto;
+            }
+
+            let norms_yaml_str = serde_yaml::to_string(&norms)
+                .unwrap_or_else(|_| norms_row.yaml_content.clone());
+
+            let mut metadata = crate::pyramid::wire_native_metadata::default_wire_native_metadata(
+                "dadbear_norms",
+                Some(slug),
+            );
+            metadata.maturity = crate::pyramid::wire_native_metadata::WireMaturity::Canon;
+            let metadata_json = metadata.to_json().unwrap_or_else(|_| "{}".to_string());
+
+            let new_norms_id = uuid::Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO pyramid_config_contributions (
+                    contribution_id, slug, schema_type, yaml_content,
+                    wire_native_metadata_json, wire_publication_state_json,
+                    supersedes_id, superseded_by_id, triggering_note,
+                    status, source, wire_contribution_id, created_by, accepted_at
+                 ) VALUES (
+                    ?1, ?2, 'dadbear_norms', ?3,
+                    ?4, '{}',
+                    ?5, NULL, 'Merged auto_update_policy fields into dadbear_norms',
+                    'active', 'migration', NULL, 'auto_update_norms_merge', datetime('now')
+                 )",
+                rusqlite::params![
+                    new_norms_id,
+                    slug,
+                    norms_yaml_str,
+                    metadata_json,
+                    norms_row.contribution_id,
+                ],
+            )?;
+
+            conn.execute(
+                "UPDATE pyramid_config_contributions
+                 SET status = 'superseded',
+                     superseded_by_id = ?1
+                 WHERE contribution_id = ?2
+                   AND status = 'active'",
+                rusqlite::params![new_norms_id, norms_row.contribution_id],
+            )?;
+        } else {
+            let norms = db::DadbearNormsYaml {
+                min_changed_files: auto_yaml.min_changed_files,
+                runaway_threshold: auto_yaml.runaway_threshold,
+                debounce_secs: auto_yaml.debounce_minutes * 60,
+                ..db::DadbearNormsYaml::default()
+            };
+            let norms_yaml_str = serde_yaml::to_string(&norms)
+                .unwrap_or_else(|_| "min_changed_files: 1\nrunaway_threshold: 0.5\n".to_string());
+
+            let mut metadata = crate::pyramid::wire_native_metadata::default_wire_native_metadata(
+                "dadbear_norms",
+                Some(slug),
+            );
+            metadata.maturity = crate::pyramid::wire_native_metadata::WireMaturity::Canon;
+            let metadata_json = metadata.to_json().unwrap_or_else(|_| "{}".to_string());
+
+            let norms_id = uuid::Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO pyramid_config_contributions (
+                    contribution_id, slug, schema_type, yaml_content,
+                    wire_native_metadata_json, wire_publication_state_json,
+                    supersedes_id, superseded_by_id, triggering_note,
+                    status, source, wire_contribution_id, created_by, accepted_at
+                 ) VALUES (
+                    ?1, ?2, 'dadbear_norms', ?3,
+                    ?4, '{}',
+                    NULL, NULL, 'Created from auto_update_policy migration',
+                    'active', 'migration', NULL, 'auto_update_norms_merge', datetime('now')
+                 )",
+                rusqlite::params![norms_id, slug, norms_yaml_str, metadata_json],
+            )?;
+        }
+
+        conn.execute(
+            "UPDATE pyramid_config_contributions
+             SET status = 'superseded'
+             WHERE contribution_id = ?1
+               AND status = 'active'",
+            rusqlite::params![contribution_id],
+        )?;
+    }
+
+    let marker_id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO pyramid_config_contributions (
+            contribution_id, slug, schema_type, yaml_content,
+            status, source, created_by, accepted_at
+         ) VALUES (
+            ?1, NULL, '_migration_marker', '',
+            'active', 'migration', 'auto_update_norms_merge', datetime('now')
+         )",
+        rusqlite::params![marker_id],
+    )?;
+
+    debug!("migrate_auto_update_into_norms: completed");
     Ok(())
 }
 

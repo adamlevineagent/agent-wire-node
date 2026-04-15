@@ -1536,7 +1536,7 @@ pub async fn execute_plan(
                     created_at: String::new(),
                     updated_at: String::new(),
                 };
-                match db::save_dadbear_config(&conn, &config) {
+                match db::save_dadbear_config_with_contributions(&conn, &config) {
                     Ok(_) => result.dadbear_configs.push(slug),
                     Err(e) => result
                         .errors
@@ -3544,6 +3544,7 @@ mod phase18e_tests {
             supabase_anon_key: None,
             csrf_secret: [0u8; 32],
             dadbear_handle: StdArc::new(TokioMutex::new(None)),
+            dadbear_supervisor_handle: StdArc::new(TokioMutex::new(None)),
             dadbear_in_flight: StdArc::new(std::sync::Mutex::new(HashMap::new())),
             provider_registry: {
                 let store = StdArc::new(

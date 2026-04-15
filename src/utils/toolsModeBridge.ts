@@ -1,7 +1,7 @@
 // Phase 15 — cross-component bridge for opening ToolsMode's Create
 // tab with a pre-selected schema type. Used by the DADBEAR Oversight
 // Page's "Set Default Norms" button, which needs to switch the user
-// to the Phase 9/10 generative config flow with `dadbear_policy`
+// to the Phase 9/10 generative config flow with `dadbear_norms`
 // already picked.
 //
 // We use a module-level singleton + a custom DOM event instead of

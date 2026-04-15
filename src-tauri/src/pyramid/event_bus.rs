@@ -409,18 +409,6 @@ pub enum TaggedKind {
         chain_length_delta: i64,
     },
 
-    // ── Auto-Update Operational State ───────────────────────────────
-    //
-    // Emitted by `auto_update_ops` whenever frozen/breaker/auto_update
-    // state changes on `pyramid_auto_update_config`. Both the Oversight
-    // UI and DADBEARPanel poll for state, but this event enables
-    // real-time reactivity when wired to the Tauri event bridge.
-    AutoUpdateStateChanged {
-        frozen: bool,
-        breaker_tripped: bool,
-        auto_update: bool,
-    },
-
     // ── Phase 3a: Fine-grained build introspection ───────────────────
     //
     // Per-edge, per-verdict, per-skip, and reconciliation events that
@@ -531,6 +519,45 @@ pub enum TaggedKind {
     QueueJobCompleted {
         model_id: String,
         latency_ms: u64,
+    },
+
+    // ── DADBEAR Canonical State Model (Phase 0) ────────────────────────
+    //
+    // Events for the DADBEAR contribution-based configuration system.
+    // `DadbearConfigChanged` replaces the no-op `trigger_dadbear_reload`
+    // stub in config_contributions.rs with a real event that the tick
+    // loop subscribes to for hot-reload. `DadbearHoldsChanged` and
+    // `WorkItemStateChanged` are consumed by the future oversight UI
+    // and supervisor (Phases 2+).
+
+    /// Emitted by `sync_config_to_operational` when a `dadbear_norms`
+    /// or `watch_root` contribution activates. The tick loop subscribes
+    /// to this event and forces an immediate config reload on the next
+    /// cycle. `slug` is `None` for global-defaults contributions.
+    DadbearConfigChanged {
+        slug: Option<String>,
+        schema_type: String,
+        contribution_id: String,
+    },
+
+    /// Emitted when a hold is placed or cleared on a pyramid slug.
+    /// Phase 2 writes hold events + projection; this event enables
+    /// real-time UI updates and supervisor reactivity. `action` is
+    /// one of `"placed"` or `"cleared"`.
+    DadbearHoldsChanged {
+        slug: String,
+        hold: String,
+        action: String,
+    },
+
+    /// Emitted when a durable work item transitions state. Phase 3
+    /// creates work items; this event enables the oversight UI to
+    /// render live state changes without polling.
+    WorkItemStateChanged {
+        slug: String,
+        work_item_id: String,
+        old_state: String,
+        new_state: String,
     },
 }
 
