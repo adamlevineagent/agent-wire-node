@@ -10,8 +10,7 @@
 //
 // The Wire response shape is not strictly typed in this component —
 // we display whatever the Wire returns and gracefully degrade on
-// missing fields. Phase 3 will firm up the contract when the
-// requester side is built.
+// missing fields. Phase 3 will firm up the contract.
 
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -78,49 +77,74 @@ export function ComputeMarketSurface() {
     const sortedModels = sortModels(surface?.models ?? [], sortBy);
 
     return (
-        <div className="compute-market-surface">
-            <h2>Compute Market Surface</h2>
-            <p style={{ color: "#888", fontSize: 13 }}>
-                Browse compute providers across the network. Read-only — Phase 2 is
-                provider-side only; requester-side purchase arrives in Phase 3.
-            </p>
-
-            <div style={{ display: "flex", gap: 12, marginBottom: 16, alignItems: "center" }}>
-                <input
-                    type="text"
-                    value={modelFilter}
-                    onChange={(e) => setModelFilter(e.target.value)}
-                    placeholder="Filter by model id (optional)"
-                    style={{ flex: "1" }}
-                />
-                <label style={{ whiteSpace: "nowrap" }}>
-                    Sort:&nbsp;
-                    <select value={sortBy} onChange={(e) => setSortBy(e.target.value as SortField)}>
-                        <option value="price">Price</option>
-                        <option value="queue">Queue depth</option>
-                        <option value="speed">Speed</option>
-                    </select>
-                </label>
-                <button onClick={refresh} disabled={loading}>
-                    {loading ? "Refreshing..." : "Refresh"}
+        <div className="compute-surface-panel">
+            <div className="compute-surface-header">
+                <div className="compute-surface-header-text">
+                    <h3 className="compute-section-title">Market surface</h3>
+                    <p className="compute-section-sub">
+                        Browse compute providers across the network. Read-only — Phase 2 is
+                        provider-side only; requester-side purchase arrives in Phase 3.
+                    </p>
+                </div>
+                <button
+                    className="compute-ghost-btn compute-ghost-btn-sm"
+                    onClick={refresh}
+                    disabled={loading}
+                    title="Refetch market surface from the Wire"
+                >
+                    {loading ? "…" : "Refresh"}
                 </button>
             </div>
 
+            <div className="compute-surface-filters">
+                <div className="compute-surface-filter-field">
+                    <label className="compute-field-label" htmlFor="compute-surface-filter">
+                        Filter by model
+                    </label>
+                    <input
+                        id="compute-surface-filter"
+                        className="compute-input"
+                        type="text"
+                        value={modelFilter}
+                        onChange={(e) => setModelFilter(e.target.value)}
+                        placeholder="Optional — e.g. gemma3"
+                    />
+                </div>
+                <div className="compute-surface-filter-field">
+                    <label className="compute-field-label" htmlFor="compute-surface-sort">
+                        Sort
+                    </label>
+                    <select
+                        id="compute-surface-sort"
+                        className="compute-input"
+                        value={sortBy}
+                        onChange={(e) => setSortBy(e.target.value as SortField)}
+                    >
+                        <option value="price">Price (lowest first)</option>
+                        <option value="queue">Queue depth (shortest first)</option>
+                        <option value="speed">Speed (fastest first)</option>
+                    </select>
+                </div>
+            </div>
+
             {error && (
-                <div role="alert" style={{ color: "#c33", padding: "8px 0" }}>
+                <div className="compute-market-error" role="alert">
                     {error}
                 </div>
             )}
 
             {loading && !surface ? (
-                <p>Loading market surface...</p>
+                <div className="compute-empty">Loading market surface…</div>
             ) : sortedModels.length === 0 ? (
-                <p style={{ color: "#888" }}>
-                    No providers on the market for this filter. The network may be new or
-                    the Wire may not have cached any offers yet.
-                </p>
+                <div className="compute-empty">
+                    <div className="compute-empty-title">No providers on the market</div>
+                    <div className="compute-empty-desc">
+                        The network may be new, or the Wire hasn't cached any offers matching
+                        this filter. Providers surface on the Wire when they start serving.
+                    </div>
+                </div>
             ) : (
-                <div>
+                <div className="compute-surface-list">
                     {sortedModels.map((model) => (
                         <ModelCard key={model.model_id} model={model} />
                     ))}
@@ -128,9 +152,9 @@ export function ComputeMarketSurface() {
             )}
 
             {surface?.fetched_at && (
-                <p style={{ color: "#888", fontSize: 11, marginTop: 16 }}>
+                <div className="compute-surface-fetched">
                     Fetched at {surface.fetched_at}
-                </p>
+                </div>
             )}
         </div>
     );
@@ -140,10 +164,14 @@ function sortModels(models: MarketSurfaceModel[], field: SortField): MarketSurfa
     const copy = [...models];
     switch (field) {
         case "price":
-            copy.sort((a, b) => (a.min_rate_output ?? Infinity) - (b.min_rate_output ?? Infinity));
+            copy.sort(
+                (a, b) => (a.min_rate_output ?? Infinity) - (b.min_rate_output ?? Infinity),
+            );
             break;
         case "queue":
-            copy.sort((a, b) => (a.total_queue_depth ?? Infinity) - (b.total_queue_depth ?? Infinity));
+            copy.sort(
+                (a, b) => (a.total_queue_depth ?? Infinity) - (b.total_queue_depth ?? Infinity),
+            );
             break;
         case "speed":
             copy.sort((a, b) => (b.median_tps ?? 0) - (a.median_tps ?? 0));
@@ -154,21 +182,16 @@ function sortModels(models: MarketSurfaceModel[], field: SortField): MarketSurfa
 
 function ModelCard({ model }: { model: MarketSurfaceModel }) {
     const [expanded, setExpanded] = useState(false);
-    const providerCount = model.provider_count ?? (model.providers?.length ?? 0);
+    const providerCount = model.provider_count ?? model.providers?.length ?? 0;
 
     return (
-        <div
-            style={{
-                border: "1px solid #ddd",
-                borderRadius: 6,
-                padding: 12,
-                marginBottom: 12,
-            }}
-        >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-                <h3 style={{ margin: 0 }}>{model.model_id}</h3>
-                <div style={{ display: "flex", gap: 12, color: "#555", fontSize: 13 }}>
-                    <span>{providerCount} provider{providerCount === 1 ? "" : "s"}</span>
+        <div className="compute-surface-card">
+            <div className="compute-surface-card-header">
+                <h4 className="compute-surface-card-model">{model.model_id}</h4>
+                <div className="compute-surface-card-meta">
+                    <span>
+                        {providerCount} provider{providerCount === 1 ? "" : "s"}
+                    </span>
                     {model.median_tps != null && (
                         <span>{formatNumber(model.median_tps, 0)} tok/s median</span>
                     )}
@@ -178,75 +201,91 @@ function ModelCard({ model }: { model: MarketSurfaceModel }) {
                 </div>
             </div>
 
-            <div style={{ display: "flex", gap: 16, marginTop: 8, fontSize: 14 }}>
+            <dl className="compute-surface-card-stats">
                 {model.min_rate_input != null && model.max_rate_input != null && (
-                    <div>
-                        <strong>Input:</strong>{" "}
-                        {model.min_rate_input === model.max_rate_input
-                            ? `${model.min_rate_input}`
-                            : `${model.min_rate_input}–${model.max_rate_input}`}{" "}
-                        credits / M tokens
+                    <div className="compute-surface-card-stat">
+                        <dt>Input</dt>
+                        <dd className="compute-mono">
+                            {formatRange(model.min_rate_input, model.max_rate_input)}
+                        </dd>
                     </div>
                 )}
                 {model.min_rate_output != null && model.max_rate_output != null && (
-                    <div>
-                        <strong>Output:</strong>{" "}
-                        {model.min_rate_output === model.max_rate_output
-                            ? `${model.min_rate_output}`
-                            : `${model.min_rate_output}–${model.max_rate_output}`}{" "}
-                        credits / M tokens
+                    <div className="compute-surface-card-stat">
+                        <dt>Output</dt>
+                        <dd className="compute-mono">
+                            {formatRange(model.min_rate_output, model.max_rate_output)}
+                        </dd>
                     </div>
                 )}
                 {model.total_queue_depth != null && (
-                    <div>
-                        <strong>Total depth:</strong> {model.total_queue_depth}
+                    <div className="compute-surface-card-stat">
+                        <dt>Total queue</dt>
+                        <dd className="compute-mono">{model.total_queue_depth}</dd>
                     </div>
                 )}
-            </div>
+            </dl>
 
             {(model.providers?.length ?? 0) > 0 && (
-                <button
-                    onClick={() => setExpanded((x) => !x)}
-                    style={{ marginTop: 8, fontSize: 13 }}
-                >
-                    {expanded ? "Hide" : "Show"} per-provider pricing
-                </button>
-            )}
-
-            {expanded && model.providers && (
-                <table style={{ width: "100%", marginTop: 8, borderCollapse: "collapse" }}>
-                    <thead>
-                        <tr>
-                            <th style={cellStyle}>Node</th>
-                            <th style={cellStyle}>Type</th>
-                            <th style={cellStyle}>Input / M</th>
-                            <th style={cellStyle}>Output / M</th>
-                            <th style={cellStyle}>Queue</th>
-                            <th style={cellStyle}>Median TPS</th>
-                            <th style={cellStyle}>p95 Latency</th>
-                            <th style={cellStyle}>Obs</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {model.providers.map((p, idx) => (
-                            <tr key={`${p.node_id ?? ""}-${idx}`}>
-                                <td style={cellStyle}>{shortNode(p.node_id)}</td>
-                                <td style={cellStyle}>{p.provider_type ?? "?"}</td>
-                                <td style={cellStyle}>{p.rate_per_m_input ?? "—"}</td>
-                                <td style={cellStyle}>{p.rate_per_m_output ?? "—"}</td>
-                                <td style={cellStyle}>
-                                    {p.queue_depth ?? "—"}
-                                    {p.max_queue_depth != null && ` / ${p.max_queue_depth}`}
-                                </td>
-                                <td style={cellStyle}>{formatNumber(p.median_tps, 0)}</td>
-                                <td style={cellStyle}>{formatLatency(p.p95_latency_ms)}</td>
-                                <td style={cellStyle} title="observation count (confidence)">
-                                    {p.observation_count ?? 0}
-                                </td>
-                            </tr>
-                        ))}
-                    </tbody>
-                </table>
+                <>
+                    <button
+                        className="compute-ghost-btn compute-ghost-btn-sm compute-surface-card-toggle"
+                        onClick={() => setExpanded((x) => !x)}
+                    >
+                        {expanded ? "Hide" : "Show"} per-provider pricing
+                    </button>
+                    {expanded && model.providers && (
+                        <div className="compute-surface-provider-table">
+                            <div className="compute-surface-provider-row compute-surface-provider-head">
+                                <div>Node</div>
+                                <div>Type</div>
+                                <div className="compute-col-num">Input / M</div>
+                                <div className="compute-col-num">Output / M</div>
+                                <div className="compute-col-num">Queue</div>
+                                <div className="compute-col-num">TPS</div>
+                                <div className="compute-col-num">p95</div>
+                                <div className="compute-col-num">Obs</div>
+                            </div>
+                            {model.providers.map((p, idx) => (
+                                <div
+                                    className="compute-surface-provider-row"
+                                    key={`${p.node_id ?? ""}-${idx}`}
+                                >
+                                    <div className="compute-surface-provider-node" title={p.node_id}>
+                                        {shortNode(p.node_id)}
+                                    </div>
+                                    <div>{p.provider_type ?? "?"}</div>
+                                    <div className="compute-col-num compute-mono">
+                                        {p.rate_per_m_input ?? "—"}
+                                    </div>
+                                    <div className="compute-col-num compute-mono">
+                                        {p.rate_per_m_output ?? "—"}
+                                    </div>
+                                    <div className="compute-col-num compute-mono">
+                                        {p.queue_depth ?? "—"}
+                                        {p.max_queue_depth != null && (
+                                            <span className="compute-surface-provider-cap">
+                                                /{p.max_queue_depth}
+                                            </span>
+                                        )}
+                                    </div>
+                                    <div className="compute-col-num compute-mono">
+                                        {formatNumber(p.median_tps, 0)}
+                                    </div>
+                                    <div className="compute-col-num compute-mono">
+                                        {formatLatency(p.p95_latency_ms)}
+                                    </div>
+                                    <div
+                                        className="compute-col-num compute-mono"
+                                        title="observation count (confidence)"
+                                    >
+                                        {p.observation_count ?? 0}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </>
             )}
         </div>
     );
@@ -269,9 +308,6 @@ function formatLatency(ms: number | null | undefined): string {
     return `${(ms / 1000).toFixed(1)}s`;
 }
 
-const cellStyle: React.CSSProperties = {
-    padding: "4px 6px",
-    borderBottom: "1px solid #eee",
-    textAlign: "left",
-    fontSize: 13,
-};
+function formatRange(min: number, max: number): string {
+    return min === max ? `${min}` : `${min}–${max}`;
+}

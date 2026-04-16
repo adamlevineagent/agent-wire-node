@@ -74,111 +74,101 @@ export function ComputeMarketDashboard() {
         }
     };
 
-    const offerCount = snapshot ? Object.keys(snapshot.offers).length : 0;
-    const activeJobCount = snapshot ? Object.keys(snapshot.active_jobs).length : 0;
+    // Null-safe accessors — the initial render before the first IPC
+    // returns has `snapshot === null`, and the `Record<string, unknown>`
+    // fields can come back missing in degraded states. Falling back to
+    // 0 everywhere prevents the "undefined" render bug on cold start.
+    const isServing = snapshot?.is_serving ?? false;
+    const offerCount = snapshot ? Object.keys(snapshot.offers ?? {}).length : 0;
+    const activeJobCount = snapshot ? Object.keys(snapshot.active_jobs ?? {}).length : 0;
+    const sessionJobs = snapshot?.session_jobs_completed ?? 0;
+    const sessionCredits = snapshot?.session_credits_earned ?? 0;
+    const lifetimeJobs = snapshot?.total_jobs_completed ?? 0;
+    const lifetimeCredits = snapshot?.total_credits_earned ?? 0;
 
     return (
-        <div className="compute-market-dashboard" style={{ padding: 16 }}>
-            <h1>Compute Market</h1>
-            <p style={{ color: "#888", fontSize: 13 }}>
-                Publish your GPU as a compute offer on the Wire. Market dispatches land
-                in the same queue as local + fleet work; settlement is Wire-side.
-            </p>
+        <div className="compute-market-view">
+            <header className="compute-market-hero">
+                <div className="compute-market-hero-text">
+                    <h2 className="compute-market-hero-title">Compute Market</h2>
+                    <p className="compute-market-hero-sub">
+                        Publish your GPU as a compute offer on the Wire. Market dispatches land
+                        in the same queue as local + fleet work; settlement is Wire-side.
+                    </p>
+                </div>
+                <button
+                    className={`compute-market-toggle ${isServing ? "compute-market-toggle-on" : "compute-market-toggle-off"}`}
+                    onClick={handleToggle}
+                    disabled={toggling || loading}
+                    title={
+                        isServing
+                            ? "Pause serving — stops pushing queue state to the Wire. Does not remove offers."
+                            : "Start serving — resume pushing queue state. Requires allow_market_visibility on the participation policy."
+                    }
+                >
+                    <span className="compute-market-toggle-dot" />
+                    {toggling ? "…" : isServing ? "Pause serving" : "Start serving"}
+                </button>
+            </header>
 
             {error && (
-                <div role="alert" style={{ color: "#c33", padding: "8px 0" }}>
+                <div className="compute-market-error" role="alert">
                     {error}
                 </div>
             )}
 
-            {loading && !snapshot ? (
-                <p>Loading market state...</p>
-            ) : snapshot ? (
-                <section
-                    style={{
-                        border: "1px solid #ddd",
-                        borderRadius: 6,
-                        padding: 16,
-                        marginBottom: 16,
-                        display: "grid",
-                        gridTemplateColumns: "repeat(4, 1fr) auto",
-                        gap: 12,
-                        alignItems: "center",
-                    }}
-                >
-                    <Stat label="Serving" value={snapshot.is_serving ? "Yes" : "No"} emphasis={snapshot.is_serving} />
-                    <Stat label="Offers" value={String(offerCount)} />
-                    <Stat label="Active jobs" value={String(activeJobCount)} />
-                    <Stat
-                        label="Session credits"
-                        value={String(snapshot.session_credits_earned)}
-                        subtitle={`${snapshot.total_credits_earned} lifetime`}
-                    />
-                    <button
-                        onClick={handleToggle}
-                        disabled={toggling}
-                        style={{
-                            background: snapshot.is_serving ? "#c80" : "#3a3",
-                            color: "white",
-                            padding: "8px 16px",
-                            border: "none",
-                            borderRadius: 4,
-                            cursor: toggling ? "wait" : "pointer",
-                        }}
-                    >
-                        {toggling
-                            ? "..."
-                            : snapshot.is_serving
-                              ? "Pause serving"
-                              : "Start serving"}
-                    </button>
-                </section>
-            ) : null}
+            <section className="compute-market-stats">
+                <StatCard
+                    label="Serving"
+                    value={loading && !snapshot ? "…" : isServing ? "Yes" : "No"}
+                    tone={isServing ? "positive" : "muted"}
+                />
+                <StatCard label="Offers" value={String(offerCount)} />
+                <StatCard label="Active jobs" value={String(activeJobCount)} />
+                <StatCard
+                    label="Session credits"
+                    value={formatCredits(sessionCredits)}
+                    subtitle={`${sessionJobs} job${sessionJobs === 1 ? "" : "s"} · ${formatCredits(
+                        lifetimeCredits,
+                    )} lifetime (${lifetimeJobs})`}
+                />
+            </section>
 
-            <nav style={{ borderBottom: "1px solid #ddd", marginBottom: 16 }}>
-                <TabButton label="My offers" active={tab === "offers"} onClick={() => setTab("offers")} />
-                <TabButton
+            <nav className="compute-market-subtabs">
+                <SubTab label="My offers" active={tab === "offers"} onClick={() => setTab("offers")} />
+                <SubTab
                     label="Market surface"
                     active={tab === "surface"}
                     onClick={() => setTab("surface")}
                 />
             </nav>
 
-            {tab === "offers" && <ComputeOfferManager />}
-            {tab === "surface" && <ComputeMarketSurface />}
+            <div className="compute-market-subtab-content">
+                {tab === "offers" && <ComputeOfferManager />}
+                {tab === "surface" && <ComputeMarketSurface />}
+            </div>
         </div>
     );
 }
 
-function Stat({
-    label,
-    value,
-    subtitle,
-    emphasis,
-}: {
+interface StatCardProps {
     label: string;
     value: string;
     subtitle?: string;
-    emphasis?: boolean;
-}) {
+    tone?: "default" | "positive" | "muted";
+}
+
+function StatCard({ label, value, subtitle, tone = "default" }: StatCardProps) {
     return (
-        <div>
-            <div style={{ color: "#888", fontSize: 11, textTransform: "uppercase" }}>{label}</div>
-            <div
-                style={{
-                    fontSize: 20,
-                    fontWeight: 600,
-                    color: emphasis ? "#3a3" : "#222",
-                }}
-            >
-                {value}
-            </div>
-            {subtitle && <div style={{ color: "#888", fontSize: 11 }}>{subtitle}</div>}
+        <div className={`compute-stat compute-stat-tone-${tone}`}>
+            <div className="compute-stat-label">{label}</div>
+            <div className="compute-stat-value">{value}</div>
+            {subtitle && <div className="compute-stat-subtitle">{subtitle}</div>}
         </div>
     );
 }
 
-function TabButton({
+function SubTab({
     label,
     active,
     onClick,
@@ -189,18 +179,20 @@ function TabButton({
 }) {
     return (
         <button
+            className={`compute-market-subtab ${active ? "compute-market-subtab-active" : ""}`}
             onClick={onClick}
-            style={{
-                background: "transparent",
-                border: "none",
-                padding: "8px 16px",
-                borderBottom: active ? "2px solid #3a6ea5" : "2px solid transparent",
-                fontWeight: active ? 600 : 400,
-                cursor: "pointer",
-                color: active ? "#3a6ea5" : "#555",
-            }}
         >
             {label}
         </button>
     );
+}
+
+/**
+ * Format a credits i64 as a thousands-separated string.
+ * Keeps integers exact (Pillar 9 — no float rounding on the
+ * credit path).
+ */
+function formatCredits(n: number): string {
+    if (!Number.isFinite(n)) return "0";
+    return n.toLocaleString("en-US", { maximumFractionDigits: 0 });
 }

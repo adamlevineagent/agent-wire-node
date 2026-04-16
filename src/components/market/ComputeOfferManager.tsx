@@ -10,11 +10,6 @@
 //
 // IPCs consumed: compute_offer_create, compute_offer_update,
 // compute_offer_remove, compute_offers_list.
-//
-// The rate/fee inputs are per-million tokens in credits (integer i64).
-// Multipliers in the discount curve are basis points (integer i32,
-// 10000 = 1.0x). Input fields enforce this with parseInt + clamp to
-// reasonable ranges.
 
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -64,22 +59,17 @@ function parseIntOrZero(s: string): number {
     return Number.isFinite(n) ? n : 0;
 }
 
-/**
- * Format a multiplier_bps as a human-readable multiplier string.
- * 10000 → "1.00x", 9500 → "0.95x", 11000 → "1.10x"
- */
 function formatMultiplier(bps: number): string {
-    return `${(bps / 10000).toFixed(2)}x`;
+    return `${(bps / 10000).toFixed(2)}×`;
 }
 
 /**
- * Show the effective rate at a given queue depth, given a curve.
- * Looks up the highest-depth curve point <= the target depth.
- * Returns the base rate * multiplier_bps / 10000 as an integer
- * (floor division, same as the Rust math at settlement time).
+ * Effective rate at a given queue depth, given a curve.
+ * Highest-depth curve point <= N wins. Floor division to match
+ * the Rust settlement math (integer credits, Pillar 9).
  */
 function effectiveRate(rate: number, depth: number, curve: QueueDiscountPoint[]): number {
-    let multiplier = 10000; // default 1.0x
+    let multiplier = 10000;
     for (const point of [...curve].sort((a, b) => a.depth - b.depth)) {
         if (depth >= point.depth) multiplier = point.multiplier_bps;
     }
@@ -93,6 +83,7 @@ export function ComputeOfferManager() {
     const [saving, setSaving] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [editingModelId, setEditingModelId] = useState<string | null>(null);
+    const [formOpen, setFormOpen] = useState(false);
 
     const refresh = useCallback(async () => {
         try {
@@ -118,17 +109,20 @@ export function ComputeOfferManager() {
             rate_per_m_output: String(offer.rate_per_m_output),
             reservation_fee: String(offer.reservation_fee),
             max_queue_depth: String(offer.max_queue_depth),
-            curve: offer.queue_discount_curve.length > 0
-                ? offer.queue_discount_curve
-                : emptyForm.curve,
+            curve:
+                offer.queue_discount_curve.length > 0
+                    ? offer.queue_discount_curve
+                    : emptyForm.curve,
         });
         setEditingModelId(offer.model_id);
+        setFormOpen(true);
         setError(null);
     };
 
     const resetForm = () => {
         setForm(emptyForm);
         setEditingModelId(null);
+        setFormOpen(false);
         setError(null);
     };
 
@@ -160,7 +154,7 @@ export function ComputeOfferManager() {
     };
 
     const handleRemove = async (model_id: string) => {
-        if (!confirm(`Remove offer for ${model_id}?`)) return;
+        if (!confirm(`Remove offer for ${model_id}? Active jobs continue; only new matches are blocked.`)) return;
         setSaving(true);
         setError(null);
         try {
@@ -174,7 +168,11 @@ export function ComputeOfferManager() {
         }
     };
 
-    const updateCurvePoint = (idx: number, field: "depth" | "multiplier_bps", value: string) => {
+    const updateCurvePoint = (
+        idx: number,
+        field: "depth" | "multiplier_bps",
+        value: string,
+    ) => {
         setForm((prev) => {
             const curve = [...prev.curve];
             curve[idx] = { ...curve[idx], [field]: parseIntOrZero(value) };
@@ -190,230 +188,374 @@ export function ComputeOfferManager() {
     };
 
     const removeCurvePoint = (idx: number) => {
-        setForm((prev) => ({ ...prev, curve: prev.curve.filter((_, i) => i !== idx) }));
+        setForm((prev) => ({
+            ...prev,
+            curve: prev.curve.filter((_, i) => i !== idx),
+        }));
     };
 
     return (
-        <div className="compute-offer-manager">
-            <h2>Compute Offer Manager</h2>
-
+        <div className="compute-offers-panel">
             {error && (
-                <div className="error-banner" role="alert" style={{ color: "#c33", padding: "8px 0" }}>
+                <div className="compute-market-error" role="alert">
                     {error}
                 </div>
             )}
 
-            <section style={{ marginBottom: 24 }}>
-                <h3>Current offers</h3>
-                {loading ? (
-                    <p>Loading...</p>
-                ) : offers.length === 0 ? (
-                    <p style={{ color: "#888" }}>
-                        No offers published yet. Create one below to start accepting market jobs.
+            <div className="compute-offers-header">
+                <div className="compute-offers-header-text">
+                    <h3 className="compute-section-title">Your offers</h3>
+                    <p className="compute-section-sub">
+                        Models you're publishing to the Wire. Each offer defines the rate you
+                        charge, how the rate scales with queue depth, and the cap on concurrent
+                        market jobs.
                     </p>
-                ) : (
-                    <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                        <thead>
-                            <tr>
-                                <th style={cellStyle}>Model</th>
-                                <th style={cellStyle}>Type</th>
-                                <th style={cellStyle}>Input / M</th>
-                                <th style={cellStyle}>Output / M</th>
-                                <th style={cellStyle}>Reservation</th>
-                                <th style={cellStyle}>Max Depth</th>
-                                <th style={cellStyle}>Wire Status</th>
-                                <th style={cellStyle}></th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {offers.map((o) => (
-                                <tr key={o.model_id}>
-                                    <td style={cellStyle}>{o.model_id}</td>
-                                    <td style={cellStyle}>{o.provider_type}</td>
-                                    <td style={cellStyle}>{o.rate_per_m_input}</td>
-                                    <td style={cellStyle}>{o.rate_per_m_output}</td>
-                                    <td style={cellStyle}>{o.reservation_fee}</td>
-                                    <td style={cellStyle}>{o.max_queue_depth}</td>
-                                    <td style={cellStyle}>
-                                        {o.wire_offer_id ? (
-                                            <span style={{ color: "#3a3" }} title={o.wire_offer_id}>
-                                                Active
-                                            </span>
-                                        ) : (
-                                            <span style={{ color: "#c80" }}>Pending sync</span>
-                                        )}
-                                    </td>
-                                    <td style={cellStyle}>
-                                        <button onClick={() => beginEdit(o)} disabled={saving}>
-                                            Edit
-                                        </button>{" "}
-                                        <button onClick={() => handleRemove(o.model_id)} disabled={saving}>
-                                            Remove
-                                        </button>
-                                    </td>
-                                </tr>
-                            ))}
-                        </tbody>
-                    </table>
-                )}
-            </section>
-
-            <section>
-                <h3>{editingModelId ? `Edit ${editingModelId}` : "Create new offer"}</h3>
-                <div style={formGridStyle}>
-                    <label>
-                        Model ID
-                        <input
-                            type="text"
-                            value={form.model_id}
-                            onChange={(e) => setForm({ ...form, model_id: e.target.value })}
-                            disabled={editingModelId !== null}
-                            placeholder="e.g. gemma3:27b"
-                        />
-                    </label>
-
-                    <label>
-                        Provider
-                        <select
-                            value={form.provider_type}
-                            onChange={(e) =>
-                                setForm({ ...form, provider_type: e.target.value as "local" | "bridge" })
-                            }
-                        >
-                            <option value="local">local (Ollama)</option>
-                            <option value="bridge">bridge (OpenRouter)</option>
-                        </select>
-                    </label>
-
-                    <label>
-                        Input rate (credits / million tokens)
-                        <input
-                            type="number"
-                            step="1"
-                            min="0"
-                            value={form.rate_per_m_input}
-                            onChange={(e) => setForm({ ...form, rate_per_m_input: e.target.value })}
-                        />
-                    </label>
-
-                    <label>
-                        Output rate (credits / million tokens)
-                        <input
-                            type="number"
-                            step="1"
-                            min="0"
-                            value={form.rate_per_m_output}
-                            onChange={(e) => setForm({ ...form, rate_per_m_output: e.target.value })}
-                        />
-                    </label>
-
-                    <label>
-                        Reservation fee (credits)
-                        <input
-                            type="number"
-                            step="1"
-                            min="0"
-                            value={form.reservation_fee}
-                            onChange={(e) => setForm({ ...form, reservation_fee: e.target.value })}
-                        />
-                    </label>
-
-                    <label>
-                        Max market queue depth
-                        <input
-                            type="number"
-                            step="1"
-                            min="0"
-                            value={form.max_queue_depth}
-                            onChange={(e) => setForm({ ...form, max_queue_depth: e.target.value })}
-                        />
-                    </label>
                 </div>
+                {!formOpen && (
+                    <button
+                        className="compute-primary-btn"
+                        onClick={() => {
+                            setForm(emptyForm);
+                            setEditingModelId(null);
+                            setFormOpen(true);
+                            setError(null);
+                        }}
+                    >
+                        + New offer
+                    </button>
+                )}
+            </div>
 
-                <div style={{ marginTop: 16 }}>
-                    <h4>Queue discount curve</h4>
-                    <p style={{ color: "#888", fontSize: 12 }}>
-                        Multiplier in basis points (10000 = 1.00x). Points are sorted by depth;
-                        the multiplier at depth N is the one from the highest point whose depth
-                        ≤ N. Effective rate = base × multiplier / 10000 (integer math).
-                    </p>
-                    <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                        <thead>
-                            <tr>
-                                <th style={cellStyle}>Depth</th>
-                                <th style={cellStyle}>Multiplier (bps)</th>
-                                <th style={cellStyle}>As rate</th>
-                                <th style={cellStyle}>Eff. Output / M</th>
-                                <th style={cellStyle}></th>
-                            </tr>
-                        </thead>
-                        <tbody>
+            {loading ? (
+                <div className="compute-empty">Loading…</div>
+            ) : offers.length === 0 ? (
+                <div className="compute-empty">
+                    <div className="compute-empty-title">No offers published yet</div>
+                    <div className="compute-empty-desc">
+                        Create an offer to start accepting paid market jobs. You keep running
+                        local and fleet work regardless — market dispatches just land in the
+                        same queue with their own depth cap.
+                    </div>
+                </div>
+            ) : (
+                <div className="compute-offer-grid">
+                    {offers.map((o) => (
+                        <OfferCard
+                            key={o.model_id}
+                            offer={o}
+                            onEdit={() => beginEdit(o)}
+                            onRemove={() => handleRemove(o.model_id)}
+                            disabled={saving}
+                        />
+                    ))}
+                </div>
+            )}
+
+            {formOpen && (
+                <div className="compute-form-panel">
+                    <div className="compute-form-header">
+                        <h4 className="compute-section-title">
+                            {editingModelId ? `Edit offer — ${editingModelId}` : "New offer"}
+                        </h4>
+                        <button className="compute-ghost-btn" onClick={resetForm} disabled={saving}>
+                            Cancel
+                        </button>
+                    </div>
+
+                    <div className="compute-form-grid">
+                        <label className="compute-field">
+                            <span className="compute-field-label">Model ID</span>
+                            <input
+                                className="compute-input"
+                                type="text"
+                                value={form.model_id}
+                                onChange={(e) => setForm({ ...form, model_id: e.target.value })}
+                                disabled={editingModelId !== null}
+                                placeholder="e.g. gemma3:27b"
+                            />
+                            <span className="compute-field-hint">
+                                Must match a locally-loaded model (or an OpenRouter slug if
+                                provider is bridge).
+                            </span>
+                        </label>
+
+                        <label className="compute-field">
+                            <span className="compute-field-label">Provider</span>
+                            <select
+                                className="compute-input"
+                                value={form.provider_type}
+                                onChange={(e) =>
+                                    setForm({
+                                        ...form,
+                                        provider_type: e.target.value as "local" | "bridge",
+                                    })
+                                }
+                            >
+                                <option value="local">Local (Ollama)</option>
+                                <option value="bridge">Bridge (OpenRouter)</option>
+                            </select>
+                            <span className="compute-field-hint">
+                                Local serves from your GPU; bridge proxies to OpenRouter (Phase 4).
+                            </span>
+                        </label>
+
+                        <label className="compute-field">
+                            <span className="compute-field-label">Input rate</span>
+                            <div className="compute-input-with-suffix">
+                                <input
+                                    className="compute-input"
+                                    type="number"
+                                    step="1"
+                                    min="0"
+                                    value={form.rate_per_m_input}
+                                    onChange={(e) =>
+                                        setForm({ ...form, rate_per_m_input: e.target.value })
+                                    }
+                                />
+                                <span className="compute-input-suffix">credits / M tokens</span>
+                            </div>
+                        </label>
+
+                        <label className="compute-field">
+                            <span className="compute-field-label">Output rate</span>
+                            <div className="compute-input-with-suffix">
+                                <input
+                                    className="compute-input"
+                                    type="number"
+                                    step="1"
+                                    min="0"
+                                    value={form.rate_per_m_output}
+                                    onChange={(e) =>
+                                        setForm({ ...form, rate_per_m_output: e.target.value })
+                                    }
+                                />
+                                <span className="compute-input-suffix">credits / M tokens</span>
+                            </div>
+                        </label>
+
+                        <label className="compute-field">
+                            <span className="compute-field-label">Reservation fee</span>
+                            <div className="compute-input-with-suffix">
+                                <input
+                                    className="compute-input"
+                                    type="number"
+                                    step="1"
+                                    min="0"
+                                    value={form.reservation_fee}
+                                    onChange={(e) =>
+                                        setForm({ ...form, reservation_fee: e.target.value })
+                                    }
+                                />
+                                <span className="compute-input-suffix">credits</span>
+                            </div>
+                            <span className="compute-field-hint">
+                                Upfront deposit charged at match time, held until settle.
+                            </span>
+                        </label>
+
+                        <label className="compute-field">
+                            <span className="compute-field-label">Max market queue depth</span>
+                            <div className="compute-input-with-suffix">
+                                <input
+                                    className="compute-input"
+                                    type="number"
+                                    step="1"
+                                    min="0"
+                                    value={form.max_queue_depth}
+                                    onChange={(e) =>
+                                        setForm({ ...form, max_queue_depth: e.target.value })
+                                    }
+                                />
+                                <span className="compute-input-suffix">jobs</span>
+                            </div>
+                            <span className="compute-field-hint">
+                                Beyond this, new market dispatches get rejected with 503 +
+                                Retry-After so the Wire re-matches.
+                            </span>
+                        </label>
+                    </div>
+
+                    <div className="compute-curve-section">
+                        <div className="compute-curve-header">
+                            <h5 className="compute-curve-title">Queue discount curve</h5>
+                            <p className="compute-curve-desc">
+                                Multiplier in basis points (10000 = 1.00×). At depth N, the
+                                multiplier from the highest point whose depth ≤ N wins.
+                                Effective rate = base × multiplier / 10000.
+                            </p>
+                        </div>
+                        <div className="compute-curve-table">
+                            <div className="compute-curve-row compute-curve-head">
+                                <div>Depth</div>
+                                <div>Multiplier</div>
+                                <div className="compute-curve-col-eff">As rate</div>
+                                <div className="compute-curve-col-eff">Eff. output / M</div>
+                                <div />
+                            </div>
                             {form.curve.map((point, idx) => (
-                                <tr key={idx}>
-                                    <td style={cellStyle}>
+                                <div className="compute-curve-row" key={idx}>
+                                    <div>
                                         <input
+                                            className="compute-input compute-input-tight"
                                             type="number"
                                             step="1"
                                             min="0"
                                             value={point.depth}
-                                            onChange={(e) => updateCurvePoint(idx, "depth", e.target.value)}
+                                            onChange={(e) =>
+                                                updateCurvePoint(idx, "depth", e.target.value)
+                                            }
                                         />
-                                    </td>
-                                    <td style={cellStyle}>
+                                    </div>
+                                    <div>
                                         <input
+                                            className="compute-input compute-input-tight"
                                             type="number"
-                                            step="1"
+                                            step="100"
                                             min="0"
                                             value={point.multiplier_bps}
                                             onChange={(e) =>
-                                                updateCurvePoint(idx, "multiplier_bps", e.target.value)
+                                                updateCurvePoint(
+                                                    idx,
+                                                    "multiplier_bps",
+                                                    e.target.value,
+                                                )
                                             }
                                         />
-                                    </td>
-                                    <td style={cellStyle}>{formatMultiplier(point.multiplier_bps)}</td>
-                                    <td style={cellStyle}>
+                                    </div>
+                                    <div className="compute-curve-col-eff compute-mono">
+                                        {formatMultiplier(point.multiplier_bps)}
+                                    </div>
+                                    <div className="compute-curve-col-eff compute-mono">
                                         {effectiveRate(
                                             parseIntOrZero(form.rate_per_m_output),
                                             point.depth,
                                             form.curve,
                                         )}
-                                    </td>
-                                    <td style={cellStyle}>
-                                        <button onClick={() => removeCurvePoint(idx)} disabled={form.curve.length <= 1}>
-                                            Remove
+                                    </div>
+                                    <div>
+                                        <button
+                                            className="compute-ghost-btn compute-ghost-btn-sm"
+                                            onClick={() => removeCurvePoint(idx)}
+                                            disabled={form.curve.length <= 1}
+                                            title={
+                                                form.curve.length <= 1
+                                                    ? "At least one point required"
+                                                    : "Remove curve point"
+                                            }
+                                        >
+                                            ×
                                         </button>
-                                    </td>
-                                </tr>
+                                    </div>
+                                </div>
                             ))}
-                        </tbody>
-                    </table>
-                    <button onClick={addCurvePoint} style={{ marginTop: 8 }}>
-                        + Add curve point
-                    </button>
-                </div>
+                        </div>
+                        <button className="compute-ghost-btn compute-ghost-btn-sm" onClick={addCurvePoint}>
+                            + Add curve point
+                        </button>
+                    </div>
 
-                <div style={{ marginTop: 24, display: "flex", gap: 12 }}>
-                    <button onClick={handleSave} disabled={saving || !form.model_id.trim()}>
-                        {saving ? "Saving..." : editingModelId ? "Update offer" : "Create offer"}
-                    </button>
-                    <button onClick={resetForm} disabled={saving}>
-                        Reset
-                    </button>
+                    <div className="compute-form-actions">
+                        <button
+                            className="compute-primary-btn"
+                            onClick={handleSave}
+                            disabled={saving || !form.model_id.trim()}
+                        >
+                            {saving
+                                ? "Saving…"
+                                : editingModelId
+                                  ? "Update offer"
+                                  : "Create offer"}
+                        </button>
+                        <button
+                            className="compute-ghost-btn"
+                            onClick={resetForm}
+                            disabled={saving}
+                        >
+                            Discard
+                        </button>
+                    </div>
                 </div>
-            </section>
+            )}
         </div>
     );
 }
 
-const cellStyle: React.CSSProperties = {
-    padding: "6px 8px",
-    borderBottom: "1px solid #eee",
-    textAlign: "left",
-    verticalAlign: "middle",
-};
+interface OfferCardProps {
+    offer: ComputeOffer;
+    onEdit: () => void;
+    onRemove: () => void;
+    disabled: boolean;
+}
 
-const formGridStyle: React.CSSProperties = {
-    display: "grid",
-    gridTemplateColumns: "repeat(2, 1fr)",
-    gap: 12,
-};
+function OfferCard({ offer, onEdit, onRemove, disabled }: OfferCardProps) {
+    const wireStatus = offer.wire_offer_id ? "active" : "pending";
+    return (
+        <div className="compute-offer-card">
+            <div className="compute-offer-card-header">
+                <div className="compute-offer-card-model">
+                    <span className="compute-offer-card-name">{offer.model_id}</span>
+                    <span className="compute-offer-card-provider">{offer.provider_type}</span>
+                </div>
+                <span
+                    className={`compute-offer-badge compute-offer-badge-${wireStatus}`}
+                    title={
+                        wireStatus === "active"
+                            ? `Wire offer_id: ${offer.wire_offer_id}`
+                            : "Not yet synced to the Wire"
+                    }
+                >
+                    {wireStatus === "active" ? "Wire active" : "Pending sync"}
+                </span>
+            </div>
+
+            <dl className="compute-offer-card-stats">
+                <div className="compute-offer-stat">
+                    <dt>Input</dt>
+                    <dd className="compute-mono">{offer.rate_per_m_input}</dd>
+                </div>
+                <div className="compute-offer-stat">
+                    <dt>Output</dt>
+                    <dd className="compute-mono">{offer.rate_per_m_output}</dd>
+                </div>
+                <div className="compute-offer-stat">
+                    <dt>Reservation</dt>
+                    <dd className="compute-mono">{offer.reservation_fee}</dd>
+                </div>
+                <div className="compute-offer-stat">
+                    <dt>Max depth</dt>
+                    <dd className="compute-mono">{offer.max_queue_depth}</dd>
+                </div>
+            </dl>
+
+            {offer.queue_discount_curve.length > 0 && (
+                <div className="compute-offer-curve">
+                    <div className="compute-offer-curve-label">Curve</div>
+                    <div className="compute-offer-curve-points">
+                        {offer.queue_discount_curve.map((p, i) => (
+                            <span key={i} className="compute-offer-curve-point">
+                                <span className="compute-offer-curve-depth">{p.depth}</span>
+                                <span className="compute-offer-curve-sep">@</span>
+                                <span className="compute-offer-curve-mul">
+                                    {formatMultiplier(p.multiplier_bps)}
+                                </span>
+                            </span>
+                        ))}
+                    </div>
+                </div>
+            )}
+
+            <div className="compute-offer-card-actions">
+                <button className="compute-ghost-btn compute-ghost-btn-sm" onClick={onEdit} disabled={disabled}>
+                    Edit
+                </button>
+                <button
+                    className="compute-ghost-btn compute-ghost-btn-sm compute-ghost-btn-danger"
+                    onClick={onRemove}
+                    disabled={disabled}
+                >
+                    Remove
+                </button>
+            </div>
+        </div>
+    );
+}

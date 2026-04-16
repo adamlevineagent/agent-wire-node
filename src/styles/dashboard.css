@@ -23771,3 +23771,877 @@ body {
 .chronicle-fleet-latency-label {
     font-weight: 500;
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+   Compute Market (Phase 2 WS9)
+   ═══════════════════════════════════════════════════════════════════ */
+
+.compute-market-view {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    padding: 4px;
+}
+
+/* ─── Hero + serving toggle ───────────────────────────────────── */
+
+.compute-market-hero {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 24px;
+    padding: 4px 0;
+}
+
+.compute-market-hero-text {
+    flex: 1;
+    min-width: 0;
+}
+
+.compute-market-hero-title {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--text-primary);
+    letter-spacing: -0.01em;
+    margin: 0 0 6px 0;
+}
+
+.compute-market-hero-sub {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    max-width: 640px;
+    margin: 0;
+}
+
+.compute-market-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 18px;
+    font-size: 13px;
+    font-weight: 500;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--glass-border);
+    background: var(--bg-card);
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: background var(--transition), border-color var(--transition),
+        color var(--transition), box-shadow var(--transition);
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.compute-market-toggle:hover:not(:disabled) {
+    background: var(--bg-card-hover);
+    border-color: rgba(255, 255, 255, 0.14);
+}
+
+.compute-market-toggle:disabled {
+    opacity: 0.6;
+    cursor: wait;
+}
+
+.compute-market-toggle-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+    transition: background var(--transition);
+}
+
+.compute-market-toggle-on {
+    border-color: rgba(64, 208, 128, 0.4);
+    color: var(--accent-green);
+}
+
+.compute-market-toggle-on .compute-market-toggle-dot {
+    background: var(--accent-green);
+    box-shadow: 0 0 12px rgba(64, 208, 128, 0.45);
+    animation: compute-toggle-pulse 2s ease-in-out infinite;
+}
+
+.compute-market-toggle-off .compute-market-toggle-dot {
+    background: var(--text-muted);
+}
+
+@keyframes compute-toggle-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
+}
+
+/* ─── Stat cards ──────────────────────────────────────────────── */
+
+.compute-market-stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+}
+
+.compute-stat {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    padding: 16px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    transition: border-color var(--transition);
+}
+
+.compute-stat:hover {
+    border-color: rgba(255, 255, 255, 0.12);
+}
+
+.compute-stat-label {
+    font-size: 11px;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 500;
+}
+
+.compute-stat-value {
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--text-primary);
+    line-height: 1.1;
+    font-variant-numeric: tabular-nums;
+}
+
+.compute-stat-subtitle {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 2px;
+}
+
+.compute-stat-tone-positive .compute-stat-value {
+    color: var(--accent-green);
+}
+
+.compute-stat-tone-muted .compute-stat-value {
+    color: var(--text-secondary);
+}
+
+/* ─── Sub-tabs (My offers | Market surface) ───────────────────── */
+
+.compute-market-subtabs {
+    display: flex;
+    gap: 24px;
+    border-bottom: 1px solid var(--glass-border);
+    padding: 0 4px;
+}
+
+.compute-market-subtab {
+    background: transparent;
+    border: none;
+    padding: 10px 2px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: color var(--transition), border-color var(--transition);
+    margin-bottom: -1px;
+}
+
+.compute-market-subtab:hover {
+    color: var(--text-primary);
+}
+
+.compute-market-subtab-active {
+    color: var(--accent-cyan);
+    border-bottom-color: var(--accent-cyan);
+}
+
+.compute-market-subtab-content {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+/* ─── Shared section bits ─────────────────────────────────────── */
+
+.compute-section-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0;
+}
+
+.compute-section-sub {
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    margin: 4px 0 0 0;
+    max-width: 640px;
+}
+
+.compute-market-error {
+    background: rgba(240, 100, 100, 0.12);
+    border: 1px solid rgba(240, 100, 100, 0.3);
+    color: #f0a0a0;
+    padding: 10px 14px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+}
+
+.compute-empty {
+    background: var(--bg-card);
+    border: 1px dashed var(--glass-border);
+    border-radius: var(--radius-md);
+    padding: 32px 24px;
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 13px;
+}
+
+.compute-empty-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 6px;
+}
+
+.compute-empty-desc {
+    color: var(--text-secondary);
+    line-height: 1.5;
+    max-width: 480px;
+    margin: 0 auto;
+}
+
+/* ─── Buttons ─────────────────────────────────────────────────── */
+
+.compute-primary-btn {
+    background: linear-gradient(
+        135deg,
+        rgba(34, 211, 238, 0.18),
+        rgba(34, 211, 238, 0.08)
+    );
+    border: 1px solid rgba(34, 211, 238, 0.4);
+    color: var(--accent-cyan);
+    padding: 8px 16px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background var(--transition), border-color var(--transition),
+        box-shadow var(--transition);
+}
+
+.compute-primary-btn:hover:not(:disabled) {
+    background: linear-gradient(
+        135deg,
+        rgba(34, 211, 238, 0.26),
+        rgba(34, 211, 238, 0.12)
+    );
+    border-color: rgba(34, 211, 238, 0.55);
+    box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.1);
+}
+
+.compute-primary-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.compute-ghost-btn {
+    background: transparent;
+    border: 1px solid var(--glass-border);
+    color: var(--text-secondary);
+    padding: 7px 14px;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background var(--transition), color var(--transition),
+        border-color var(--transition);
+}
+
+.compute-ghost-btn:hover:not(:disabled) {
+    background: var(--glass);
+    color: var(--text-primary);
+    border-color: rgba(255, 255, 255, 0.18);
+}
+
+.compute-ghost-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.compute-ghost-btn-sm {
+    padding: 4px 10px;
+    font-size: 11px;
+}
+
+.compute-ghost-btn-danger:hover:not(:disabled) {
+    background: rgba(240, 100, 100, 0.12);
+    color: #f0a0a0;
+    border-color: rgba(240, 100, 100, 0.3);
+}
+
+/* ─── Form inputs ─────────────────────────────────────────────── */
+
+.compute-input {
+    background: var(--bg-surface);
+    border: 1px solid var(--glass-border);
+    color: var(--text-primary);
+    padding: 7px 10px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    font-family: inherit;
+    width: 100%;
+    transition: border-color var(--transition), box-shadow var(--transition);
+}
+
+.compute-input:focus {
+    outline: none;
+    border-color: rgba(34, 211, 238, 0.5);
+    box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.1);
+}
+
+.compute-input:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.compute-input-tight {
+    padding: 4px 8px;
+    font-size: 12px;
+}
+
+.compute-input-with-suffix {
+    display: flex;
+    align-items: stretch;
+    background: var(--bg-surface);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    transition: border-color var(--transition), box-shadow var(--transition);
+}
+
+.compute-input-with-suffix:focus-within {
+    border-color: rgba(34, 211, 238, 0.5);
+    box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.1);
+}
+
+.compute-input-with-suffix .compute-input {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+}
+
+.compute-input-with-suffix .compute-input:focus {
+    box-shadow: none;
+    border: none;
+}
+
+.compute-input-suffix {
+    padding: 7px 12px;
+    font-size: 11px;
+    color: var(--text-muted);
+    background: var(--glass);
+    border-left: 1px solid var(--glass-border);
+    display: flex;
+    align-items: center;
+    white-space: nowrap;
+}
+
+.compute-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.compute-field-label {
+    font-size: 11px;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    font-weight: 500;
+}
+
+.compute-field-hint {
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.4;
+}
+
+select.compute-input {
+    cursor: pointer;
+}
+
+.compute-mono {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: 'tnum';
+}
+
+/* ─── Offers panel ────────────────────────────────────────────── */
+
+.compute-offers-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.compute-offers-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+}
+
+.compute-offers-header-text {
+    flex: 1;
+    min-width: 0;
+}
+
+.compute-offer-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 12px;
+}
+
+.compute-offer-card {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    transition: border-color var(--transition), box-shadow var(--transition);
+}
+
+.compute-offer-card:hover {
+    background: var(--bg-card-hover);
+    border-color: rgba(255, 255, 255, 0.14);
+}
+
+.compute-offer-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.compute-offer-card-model {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.compute-offer-card-name {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.compute-offer-card-provider {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    font-weight: 500;
+}
+
+.compute-offer-badge {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    white-space: nowrap;
+}
+
+.compute-offer-badge-active {
+    background: rgba(64, 208, 128, 0.12);
+    color: var(--accent-green);
+    border: 1px solid rgba(64, 208, 128, 0.3);
+}
+
+.compute-offer-badge-pending {
+    background: rgba(240, 192, 64, 0.1);
+    color: var(--accent-warm);
+    border: 1px solid rgba(240, 192, 64, 0.3);
+}
+
+.compute-offer-card-stats {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px 14px;
+    margin: 0;
+}
+
+.compute-offer-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 0;
+}
+
+.compute-offer-stat dt {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    font-weight: 500;
+    margin: 0;
+}
+
+.compute-offer-stat dd {
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text-primary);
+    margin: 0;
+}
+
+.compute-offer-curve {
+    border-top: 1px solid var(--glass-border);
+    padding-top: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.compute-offer-curve-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    font-weight: 500;
+}
+
+.compute-offer-curve-points {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.compute-offer-curve-point {
+    font-size: 11px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-variant-numeric: tabular-nums;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+}
+
+.compute-offer-curve-depth {
+    color: var(--text-secondary);
+}
+
+.compute-offer-curve-sep {
+    color: var(--text-muted);
+}
+
+.compute-offer-curve-mul {
+    color: var(--accent-cyan);
+    font-weight: 500;
+}
+
+.compute-offer-card-actions {
+    display: flex;
+    gap: 8px;
+    border-top: 1px solid var(--glass-border);
+    padding-top: 10px;
+    margin-top: 2px;
+}
+
+/* ─── Offer form ──────────────────────────────────────────────── */
+
+.compute-form-panel {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    padding: 20px 22px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.compute-form-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--glass-border);
+}
+
+.compute-form-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 16px 24px;
+}
+
+.compute-form-actions {
+    display: flex;
+    gap: 10px;
+    justify-content: flex-start;
+    border-top: 1px solid var(--glass-border);
+    padding-top: 16px;
+}
+
+/* ─── Curve editor ────────────────────────────────────────────── */
+
+.compute-curve-section {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.compute-curve-header {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.compute-curve-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0;
+}
+
+.compute-curve-desc {
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.5;
+    margin: 0;
+    max-width: 720px;
+}
+
+.compute-curve-table {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    background: var(--bg-surface);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    padding: 8px;
+}
+
+.compute-curve-row {
+    display: grid;
+    grid-template-columns: 1fr 1.2fr 0.9fr 1.2fr 40px;
+    gap: 10px;
+    align-items: center;
+    padding: 2px 4px;
+}
+
+.compute-curve-head {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    font-weight: 500;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--glass-border);
+    margin-bottom: 2px;
+}
+
+.compute-curve-col-eff {
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+
+.compute-curve-row:not(.compute-curve-head) .compute-curve-col-eff {
+    color: var(--accent-cyan);
+    font-weight: 500;
+}
+
+/* ─── Market surface ──────────────────────────────────────────── */
+
+.compute-surface-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.compute-surface-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+}
+
+.compute-surface-header-text {
+    flex: 1;
+    min-width: 0;
+}
+
+.compute-surface-filters {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 12px;
+    align-items: flex-end;
+}
+
+.compute-surface-filter-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.compute-surface-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.compute-surface-card {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    padding: 14px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    transition: border-color var(--transition);
+}
+
+.compute-surface-card:hover {
+    border-color: rgba(255, 255, 255, 0.12);
+}
+
+.compute-surface-card-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.compute-surface-card-model {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0;
+}
+
+.compute-surface-card-meta {
+    display: flex;
+    gap: 16px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    flex-wrap: wrap;
+}
+
+.compute-surface-card-stats {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+    margin: 0;
+}
+
+.compute-surface-card-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 0;
+}
+
+.compute-surface-card-stat dt {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    font-weight: 500;
+    margin: 0;
+}
+
+.compute-surface-card-stat dd {
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text-primary);
+    margin: 0;
+}
+
+.compute-surface-card-toggle {
+    align-self: flex-start;
+}
+
+.compute-surface-provider-table {
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-surface);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+}
+
+.compute-surface-provider-row {
+    display: grid;
+    grid-template-columns: 1.4fr 0.8fr 0.8fr 0.8fr 0.9fr 0.7fr 0.7fr 0.6fr;
+    gap: 10px;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: var(--text-primary);
+    border-bottom: 1px solid var(--glass-border);
+    align-items: center;
+}
+
+.compute-surface-provider-row:last-child {
+    border-bottom: none;
+}
+
+.compute-surface-provider-head {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    font-weight: 500;
+    background: var(--glass);
+}
+
+.compute-surface-provider-node {
+    font-family: ui-monospace, SFMono-Regular, Monaco, Consolas, monospace;
+    font-size: 11px;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.compute-surface-provider-cap {
+    color: var(--text-muted);
+}
+
+.compute-col-num {
+    text-align: right;
+}
+
+.compute-surface-fetched {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-align: right;
+}
+
+/* ─── Responsive: narrower screens ────────────────────────────── */
+
+@media (max-width: 900px) {
+    .compute-market-stats {
+        grid-template-columns: repeat(2, 1fr);
+    }
+    .compute-form-grid {
+        grid-template-columns: 1fr;
+    }
+    .compute-offer-grid {
+        grid-template-columns: 1fr;
+    }
+    .compute-surface-filters {
+        grid-template-columns: 1fr;
+    }
+    .compute-surface-provider-row {
+        grid-template-columns: 1fr 0.6fr 0.6fr 0.6fr 0.6fr 0.5fr 0.5fr 0.4fr;
+        font-size: 11px;
+    }
+}
