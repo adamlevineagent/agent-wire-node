@@ -784,6 +784,25 @@ pub fn sync_config_to_operational_with_registry(
             // a ConfigSynced event listener in server.rs.
             db::upsert_dispatch_policy(conn, &slug_opt, &contribution.yaml_content, &contribution.contribution_id)?;
         }
+        "fleet_delivery_policy" => {
+            // Async fleet dispatch operational policy: ACK/callback timeouts,
+            // sweep cadences, retention windows, admission caps, peer
+            // staleness. Node-scoped (`slug_opt` ignored — matches
+            // `dispatch_policy`'s slug-ignoring pattern). The operational
+            // table stores the YAML verbatim so operators see the
+            // source-of-truth text round-trip through contribution sync;
+            // parsing happens at read time via
+            // `FleetDeliveryPolicy::from_yaml`, which applies
+            // `deny_unknown_fields` to catch operator typos. The runtime
+            // `Arc<RwLock<FleetDeliveryPolicy>>` inside
+            // `FleetDispatchContext` is refreshed via a ConfigSynced event
+            // listener wired in `main.rs` (Init Ordering step 7).
+            crate::pyramid::fleet_delivery_policy::upsert_fleet_delivery_policy_yaml(
+                conn,
+                &contribution.yaml_content,
+                Some(&contribution.contribution_id),
+            )?;
+        }
         "chain_assignment" => {
             // Per-pyramid chain override. Syncs to the
             // `pyramid_chain_assignments` operational table via
@@ -3351,4 +3370,148 @@ mod tests {
         let contribution = load_contribution_by_id(&conn, &id).unwrap().unwrap();
         sync_config_to_operational(&conn, &bus, &contribution).unwrap();
     }
+
+    // ── Async fleet dispatch: fleet_delivery_policy dispatcher branch ──
+    //
+    // Exercises the match arm added for the async fleet dispatch
+    // feature. The arm routes `schema_type = "fleet_delivery_policy"`
+    // contributions into the dedicated singleton operational table via
+    // `upsert_fleet_delivery_policy_yaml`, mirroring the `dispatch_policy`
+    // raw-YAML storage pattern exactly.
+
+    const FLEET_DELIVERY_POLICY_SEED_YAML: &str =
+        include_str!("../../../docs/seeds/fleet_delivery_policy.yaml");
+
+    #[test]
+    fn test_sync_fleet_delivery_policy_writes_operational_table() {
+        use crate::pyramid::fleet_delivery_policy::read_fleet_delivery_policy;
+
+        let conn = mem_conn();
+        let bus = mem_bus();
+        let metadata = default_wire_native_metadata("fleet_delivery_policy", None);
+        let id = create_config_contribution_with_metadata(
+            &conn,
+            "fleet_delivery_policy",
+            None,
+            FLEET_DELIVERY_POLICY_SEED_YAML,
+            Some("seed fleet delivery policy"),
+            "local",
+            Some("user"),
+            "active",
+            &metadata,
+        )
+        .unwrap();
+
+        let contribution = load_contribution_by_id(&conn, &id).unwrap().unwrap();
+        sync_config_to_operational(&conn, &bus, &contribution).unwrap();
+
+        // The operational read helper parses the stored YAML via
+        // `FleetDeliveryPolicy::from_yaml` and returns the populated
+        // struct. Field-level assertions confirm the seed values landed.
+        let policy = read_fleet_delivery_policy(&conn)
+            .unwrap()
+            .expect("policy row must exist after sync");
+
+        assert_eq!(policy.dispatch_ack_timeout_secs, 10);
+        assert_eq!(policy.outbox_sweep_interval_secs, 15);
+        assert_eq!(policy.max_inflight_jobs, 32);
+        assert_eq!(policy.peer_staleness_secs, 120);
+    }
+
+    #[test]
+    fn test_sync_fleet_delivery_policy_overwrites_on_resync() {
+        use crate::pyramid::fleet_delivery_policy::read_fleet_delivery_policy;
+
+        let conn = mem_conn();
+        let bus = mem_bus();
+        let metadata = default_wire_native_metadata("fleet_delivery_policy", None);
+
+        // First contribution: seed values.
+        let id1 = create_config_contribution_with_metadata(
+            &conn,
+            "fleet_delivery_policy",
+            None,
+            FLEET_DELIVERY_POLICY_SEED_YAML,
+            Some("initial"),
+            "local",
+            Some("user"),
+            "active",
+            &metadata,
+        )
+        .unwrap();
+        let c1 = load_contribution_by_id(&conn, &id1).unwrap().unwrap();
+        sync_config_to_operational(&conn, &bus, &c1).unwrap();
+
+        let initial = read_fleet_delivery_policy(&conn).unwrap().unwrap();
+        assert_eq!(initial.dispatch_ack_timeout_secs, 10);
+        assert_eq!(initial.max_inflight_jobs, 32);
+
+        // Second contribution: operator tuned a couple of knobs. Same
+        // schema_type, no slug (node-scoped). The singleton row (id=1)
+        // must be overwritten in place and the stored `contribution_id`
+        // must track the new contribution.
+        let tuned_yaml = "schema_type: fleet_delivery_policy\n\
+                          version: 1\n\
+                          dispatch_ack_timeout_secs: 20\n\
+                          timeout_grace_secs: 5\n\
+                          orphan_sweep_interval_secs: 60\n\
+                          orphan_sweep_multiplier: 3\n\
+                          callback_post_timeout_secs: 45\n\
+                          outbox_sweep_interval_secs: 30\n\
+                          worker_heartbeat_interval_secs: 15\n\
+                          worker_heartbeat_tolerance_secs: 45\n\
+                          backoff_base_secs: 2\n\
+                          backoff_cap_secs: 128\n\
+                          max_delivery_attempts: 40\n\
+                          ready_retention_secs: 3600\n\
+                          delivered_retention_secs: 7200\n\
+                          failed_retention_secs: 1209600\n\
+                          max_inflight_jobs: 64\n\
+                          admission_retry_after_secs: 60\n\
+                          peer_staleness_secs: 240\n";
+        let id2 = create_config_contribution_with_metadata(
+            &conn,
+            "fleet_delivery_policy",
+            None,
+            tuned_yaml,
+            Some("tune for slow rules"),
+            "local",
+            Some("user"),
+            "active",
+            &metadata,
+        )
+        .unwrap();
+        let c2 = load_contribution_by_id(&conn, &id2).unwrap().unwrap();
+        sync_config_to_operational(&conn, &bus, &c2).unwrap();
+
+        let tuned = read_fleet_delivery_policy(&conn).unwrap().unwrap();
+        assert_eq!(tuned.dispatch_ack_timeout_secs, 20);
+        assert_eq!(tuned.max_inflight_jobs, 64);
+        assert_eq!(tuned.peer_staleness_secs, 240);
+
+        // Verify the stored contribution_id was overwritten to the new
+        // contribution. Confirms the singleton upsert — not a second row
+        // — was exercised.
+        let stored_cid: String = conn
+            .query_row(
+                "SELECT contribution_id FROM pyramid_fleet_delivery_policy WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_cid, id2);
+    }
+
+    // NOTE: The spec's suggested "malformed YAML rejected at sync time"
+    // test is deliberately omitted. The match arm mirrors
+    // `dispatch_policy` exactly — raw YAML goes into the operational
+    // table verbatim, parsing happens at read time via
+    // `FleetDeliveryPolicy::from_yaml`. Malformed YAML is therefore
+    // accepted at sync time (matching `dispatch_policy` behavior) and
+    // surfaces as a parse error at read time; the fleet_delivery_policy
+    // module's own test suite (`from_yaml_rejects_malformed_yaml`,
+    // `from_yaml_rejects_unknown_fields`) already covers that read-time
+    // path. The directive explicitly pinned this to dispatch_policy's
+    // shape: "If it just stores raw YAML, fleet_delivery_policy does
+    // the same."
 }

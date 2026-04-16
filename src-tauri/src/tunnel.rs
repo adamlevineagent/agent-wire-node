@@ -13,13 +13,60 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
-/// Tunnel state stored locally
+use crate::pyramid::tunnel_url::TunnelUrl;
+
+/// Tunnel state stored locally.
+///
+/// `tunnel_url` is an `Option<TunnelUrl>` — the validated newtype enforces
+/// scheme/host invariants at every ingress site. But because a prior version
+/// of this app wrote `tunnel_url` as a raw string (no validation), an empty
+/// or malformed value MUST NOT fail the whole `TunnelState` deserialize.
+/// Losing the struct means losing `tunnel_id` / `tunnel_token`, which forces
+/// a full re-provision and invalidates every fleet roster entry that still
+/// points at this node. The tolerant deserializer below falls the field back
+/// to `None` (with a warn-level log) on malformed input so the rest of the
+/// state round-trips cleanly.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TunnelState {
     pub tunnel_id: Option<String>,
-    pub tunnel_url: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_tunnel_url_tolerant")]
+    pub tunnel_url: Option<TunnelUrl>,
     pub tunnel_token: Option<String>,
     pub status: TunnelConnectionStatus,
+}
+
+/// Tolerant deserializer for `TunnelState.tunnel_url`.
+///
+/// The default `TunnelUrl` Deserialize impl calls `TunnelUrl::parse`, which
+/// FAILS the whole outer deserialize if the saved value is malformed. That
+/// would discard `tunnel_id` / `tunnel_token` / `status` along with the bad
+/// URL and trigger a full tunnel re-provision on every launch after an
+/// upgrade — unacceptable.
+///
+/// Instead we read the raw field as `Option<String>` first, then `parse` it.
+/// On parse failure we log a warning and return `None`; the outer struct
+/// keeps its other fields. `save_tunnel_state` will write the current
+/// (now-None) url back on the next save, and the caller (lib.rs) will
+/// re-provision the tunnel URL via the normal startup path.
+fn deserialize_tunnel_url_tolerant<'de, D>(d: D) -> Result<Option<TunnelUrl>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let maybe_str: Option<String> = Option::deserialize(d)?;
+    match maybe_str {
+        None => Ok(None),
+        Some(s) => match TunnelUrl::parse(&s) {
+            Ok(u) => Ok(Some(u)),
+            Err(e) => {
+                tracing::warn!(
+                    raw = %s,
+                    err = %e,
+                    "load_tunnel_state: malformed tunnel_url; falling back to None (will re-provision)"
+                );
+                Ok(None)
+            }
+        },
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -224,9 +271,21 @@ pub async fn provision_tunnel(
         }
     );
 
+    // A malformed URL from the Wire at provision time is a hard error: we
+    // can't proceed without a usable tunnel URL, and silently dropping it
+    // (the tolerant path used on LOAD) would leave callers with a tunnel
+    // that provisions-and-forgets itself. Surface through the existing
+    // String error type.
+    let parsed_url = TunnelUrl::parse(&provision.tunnel_url).map_err(|e| {
+        format!(
+            "Wire returned malformed tunnel_url {:?}: {}",
+            provision.tunnel_url, e
+        )
+    })?;
+
     Ok(TunnelState {
         tunnel_id: Some(provision.tunnel_id),
-        tunnel_url: Some(provision.tunnel_url),
+        tunnel_url: Some(parsed_url),
         tunnel_token: Some(provision.tunnel_token),
         status: TunnelConnectionStatus::Provisioning,
     })
@@ -373,4 +432,134 @@ pub fn load_tunnel_state(data_dir: &Path) -> Option<TunnelState> {
     let path = data_dir.join("tunnel.json");
     let data = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&data).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A well-formed `TunnelState` round-trips through serde_json without
+    /// losing any field. This is the "happy path" — the same shape
+    /// `save_tunnel_state`/`load_tunnel_state` see in production.
+    #[test]
+    fn round_trips_well_formed_tunnel_state() {
+        let original = TunnelState {
+            tunnel_id: Some("tun-abc123".to_string()),
+            tunnel_url: Some(
+                TunnelUrl::parse("https://example.com").expect("valid url"),
+            ),
+            tunnel_token: Some("secret-token".to_string()),
+            status: TunnelConnectionStatus::Connected,
+        };
+
+        let json = serde_json::to_string(&original).expect("serialize");
+        let decoded: TunnelState = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(decoded.tunnel_id, original.tunnel_id);
+        assert_eq!(decoded.tunnel_url, original.tunnel_url);
+        assert_eq!(decoded.tunnel_token, original.tunnel_token);
+        assert_eq!(decoded.status, original.status);
+    }
+
+    /// Empty-string `tunnel_url` on disk (from a prior buggy save) falls
+    /// back to `None` while preserving every other field. This is the
+    /// "do not trigger a re-provision on upgrade" guarantee.
+    #[test]
+    fn tolerant_deserialize_handles_empty_tunnel_url() {
+        let json = r#"{
+            "tunnel_id": "tun-xyz",
+            "tunnel_url": "",
+            "tunnel_token": "tok",
+            "status": "Connected"
+        }"#;
+
+        let decoded: TunnelState =
+            serde_json::from_str(json).expect("outer deserialize must not fail");
+
+        assert_eq!(decoded.tunnel_id.as_deref(), Some("tun-xyz"));
+        assert!(decoded.tunnel_url.is_none(), "empty url must fall back to None");
+        assert_eq!(decoded.tunnel_token.as_deref(), Some("tok"));
+        assert_eq!(decoded.status, TunnelConnectionStatus::Connected);
+    }
+
+    /// Non-URL garbage in `tunnel_url` falls back to `None` rather than
+    /// failing the outer deserialize.
+    #[test]
+    fn tolerant_deserialize_handles_malformed_tunnel_url() {
+        let json = r#"{
+            "tunnel_id": "tun-xyz",
+            "tunnel_url": "not a url",
+            "tunnel_token": "tok",
+            "status": "Disconnected"
+        }"#;
+
+        let decoded: TunnelState =
+            serde_json::from_str(json).expect("outer deserialize must not fail");
+
+        assert_eq!(decoded.tunnel_id.as_deref(), Some("tun-xyz"));
+        assert!(decoded.tunnel_url.is_none(), "malformed url must fall back to None");
+        assert_eq!(decoded.tunnel_token.as_deref(), Some("tok"));
+        assert_eq!(decoded.status, TunnelConnectionStatus::Disconnected);
+    }
+
+    /// Well-formed URL strings populate `tunnel_url` with a parsed
+    /// `TunnelUrl`. This exercises the happy-path tolerant branch.
+    #[test]
+    fn tolerant_deserialize_parses_valid_tunnel_url() {
+        let json = r#"{
+            "tunnel_id": "tun-ok",
+            "tunnel_url": "https://example.com",
+            "tunnel_token": "tok",
+            "status": "Connected"
+        }"#;
+
+        let decoded: TunnelState =
+            serde_json::from_str(json).expect("outer deserialize must not fail");
+
+        let parsed = decoded.tunnel_url.expect("tunnel_url must be Some");
+        assert_eq!(parsed.as_str(), "https://example.com/");
+        assert_eq!(decoded.tunnel_id.as_deref(), Some("tun-ok"));
+        assert_eq!(decoded.tunnel_token.as_deref(), Some("tok"));
+        assert_eq!(decoded.status, TunnelConnectionStatus::Connected);
+    }
+
+    /// Entirely-missing `tunnel_url` field (older or manually-edited state
+    /// file) deserializes cleanly via `#[serde(default)]` and leaves
+    /// `tunnel_url = None`.
+    #[test]
+    fn tolerant_deserialize_handles_missing_tunnel_url_field() {
+        let json = r#"{
+            "tunnel_id": "tun-nofield",
+            "tunnel_token": "tok",
+            "status": "Disconnected"
+        }"#;
+
+        let decoded: TunnelState =
+            serde_json::from_str(json).expect("outer deserialize must not fail");
+
+        assert_eq!(decoded.tunnel_id.as_deref(), Some("tun-nofield"));
+        assert!(decoded.tunnel_url.is_none(), "missing field must be None");
+        assert_eq!(decoded.tunnel_token.as_deref(), Some("tok"));
+        assert_eq!(decoded.status, TunnelConnectionStatus::Disconnected);
+    }
+
+    /// Explicit JSON `null` for `tunnel_url` deserializes to `None` rather
+    /// than tripping the tolerant parse branch.
+    #[test]
+    fn tolerant_deserialize_handles_null_tunnel_url() {
+        let json = r#"{
+            "tunnel_id": "tun-null",
+            "tunnel_url": null,
+            "tunnel_token": "tok",
+            "status": "Disconnected"
+        }"#;
+
+        let decoded: TunnelState =
+            serde_json::from_str(json).expect("outer deserialize must not fail");
+
+        assert_eq!(decoded.tunnel_id.as_deref(), Some("tun-null"));
+        assert!(decoded.tunnel_url.is_none(), "null must deserialize to None");
+        assert_eq!(decoded.tunnel_token.as_deref(), Some("tok"));
+        assert_eq!(decoded.status, TunnelConnectionStatus::Disconnected);
+    }
 }

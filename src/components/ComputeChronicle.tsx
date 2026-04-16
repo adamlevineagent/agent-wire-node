@@ -59,15 +59,36 @@ const SOURCE_COLORS: Record<string, string> = {
 };
 
 const EVENT_TYPE_COLORS: Record<string, string> = {
+    // Local lifecycle
     enqueued: '#6B7280',
     started: '#3B82F6',
     completed: '#22C55E',
     failed: '#EF4444',
-    fleet_dispatched: '#A855F7',
-    fleet_returned: '#8B5CF6',
-    fleet_dispatch_failed: '#DC2626',
-    fleet_received: '#0891B2',
     cloud_returned: '#9CA3AF',
+
+    // Dispatcher-side (my node sent the job out) — purple/violet hues
+    fleet_dispatched_async: '#A855F7',
+    fleet_peer_overloaded: '#F59E0B',
+    fleet_dispatch_timeout: '#F97316',
+    fleet_dispatch_failed: '#DC2626',
+    fleet_result_received: '#8B5CF6',
+    fleet_result_failed: '#EF4444',
+    fleet_result_orphaned: '#D97706',
+    fleet_result_forgery_attempt: '#B91C1C',
+    fleet_pending_orphaned: '#B45309',
+
+    // Peer-side (my node is serving a job for someone else) — teal/cyan hues
+    fleet_job_accepted: '#0891B2',
+    fleet_admission_rejected: '#E11D48',
+    fleet_job_completed: '#14B8A6',
+    fleet_callback_delivered: '#0EA5E9',
+    fleet_callback_failed: '#EF4444',
+    fleet_callback_exhausted: '#991B1B',
+
+    // Worker / delivery health — amber for lost, red for hard failures
+    fleet_worker_heartbeat_lost: '#F59E0B',
+    fleet_worker_sweep_lost: '#EA580C',
+    fleet_delivery_cas_lost: '#DC2626',
 };
 
 function formatTimestamp(ts: string): string {
