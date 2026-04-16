@@ -90,7 +90,18 @@ export function PyramidsMode() {
                     maxDotsPerLayer={GRID_MAX_DOTS_PER_LAYER}
                 />
             )}
-            {tab === 'builds' && <CrossPyramidTimeline />}
+            {/*
+             * Builds tab stays mounted across tab switches — the hook
+             * behind CrossPyramidTimeline owns a live `cross-build-event`
+             * subscription and a 30s poll, both of which would be torn
+             * down and restarted on every mount. The component paints
+             * nothing when hidden, and the hook's work continues in the
+             * background so when the user comes back the list is
+             * already current rather than empty-then-idle.
+             */}
+            <div style={{ display: tab === 'builds' ? 'contents' : 'none' }}>
+                <CrossPyramidTimeline />
+            </div>
             {tab === 'oversight' && <DadbearOversightPage />}
         </div>
     );

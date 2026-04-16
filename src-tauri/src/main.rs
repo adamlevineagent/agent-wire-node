@@ -6862,6 +6862,21 @@ async fn pyramid_reroll_node(
 /// Phase 13: list every active build across every slug. Seeds the
 /// CrossPyramidTimeline frontend on mount; subsequent updates flow
 /// via the `cross-build-event` Tauri channel.
+///
+/// Progress counts (`completed_steps` / `total_steps`) are read directly
+/// from each `BuildHandle`'s live status — the same source that
+/// `pyramid_build_progress_v2` exposes to the pyramid surface drawer.
+/// This guarantees the Builds tab mirrors the per-pyramid "done/total"
+/// that the drawer shows (e.g. "source_extract 7/21") instead of
+/// re-deriving counts from downstream tables.
+///
+/// TODO(ui-debt/followup): this command only returns live builds. The
+/// product direction is to evolve this surface into a durable,
+/// topical history of ALL jobs (cross-pyramid chronicle mirror,
+/// reverse-chronological, paginated). Needs a storage decision
+/// (pyramid_builds? derive from cross-build-event log?), retention
+/// strategy, and shared renderer with the per-pyramid Chronicle.
+/// Out of scope for the UI-debt cleanup pass that added this comment.
 #[tauri::command]
 async fn pyramid_active_builds(
     state: tauri::State<'_, SharedState>,
@@ -6872,7 +6887,9 @@ async fn pyramid_active_builds(
     }
 
     let conn = state.pyramid.reader.lock().await;
-    let mut rows = Vec::with_capacity(active_map.len());
+    let mut rows: Vec<wire_node_lib::pyramid::db::ActiveBuildRow> =
+        Vec::with_capacity(active_map.len());
+
     for (slug, handle) in active_map.iter() {
         let status_guard = handle.status.read().await;
         let status = status_guard.status.clone();
@@ -6881,21 +6898,27 @@ async fn pyramid_active_builds(
             handle.started_at.elapsed().as_secs()
         );
         let build_id = status_guard.slug.clone();
+        let completed_steps = status_guard.progress.done;
+        let total_steps = status_guard.progress.total;
         drop(status_guard);
 
-        // We don't have a canonical "build_id" yet (see module doc
-        // on cross_pyramid_router) — the status.slug doubles as a
-        // provisional build identifier so the query at least
-        // returns something for the cost/cache columns. A future
-        // phase will add a proper pyramid_build_runs table.
-        let current_step = None;
+        // current_step lives on layer_state, not status. Read it
+        // separately so the Builds tab can show per-step context
+        // matching the drawer.
+        let current_step = {
+            let layer_state = handle.layer_state.read().await;
+            layer_state.current_step.clone()
+        };
+
         match pyramid_db::build_active_build_summary(
             &conn,
             slug,
             &build_id,
             &status,
             &started_at,
-            current_step,
+            current_step.as_deref(),
+            completed_steps,
+            total_steps,
         ) {
             Ok(row) => rows.push(row),
             Err(e) => {
@@ -6907,6 +6930,7 @@ async fn pyramid_active_builds(
             }
         }
     }
+
     Ok(rows)
 }
 
