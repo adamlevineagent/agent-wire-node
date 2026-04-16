@@ -12771,6 +12771,26 @@ pub struct ActiveBuildRow {
     pub cache_hit_rate: f64,
 }
 
+/// Build a single `ActiveBuildRow` for the given slug.
+///
+/// `completed_steps` / `total_steps` are the caller's responsibility — they
+/// come from the live `BuildHandle`'s progress channel (main.rs:3917-3922
+/// maintains `handle.status.progress` via `progress_rx.recv()`). The
+/// pyramid surface drawer reads the same source via
+/// `pyramid_build_progress_v2`, which is why it shows accurate per-step
+/// counts (e.g. "source_extract 7/21") while this function should just
+/// mirror the same numbers. An earlier revision tried to aggregate
+/// `dadbear_work_items` directly; that was wrong because DADBEAR work
+/// items are created per-stage and reset between stages, so total
+/// collapsed to the current stage's fan-out rather than the cumulative
+/// build progress.
+///
+/// Cost and cache hit rate still come from `pyramid_step_cache`, which
+/// the chain executor writes for every step regardless of whether the
+/// step was compiled through DADBEAR. We aggregate by slug only —
+/// `BuildHandle` has no durable build_id and the placeholder semantics
+/// in the legacy code were fragile. Slug-scoped aggregation is
+/// "cost so far on this pyramid," which is what the UI wants.
 pub fn build_active_build_summary(
     conn: &Connection,
     slug: &str,
@@ -12778,72 +12798,26 @@ pub fn build_active_build_summary(
     status: &str,
     started_at: &str,
     current_step: Option<&str>,
+    completed_steps: i64,
+    total_steps: i64,
 ) -> Result<ActiveBuildRow> {
-    // Phase 13 verifier fix: the caller doesn't know the real
-    // build_id at runtime (BuildHandle doesn't carry it). The
-    // initial implementation passed the slug as a placeholder,
-    // which meant every JOIN against `pyramid_step_cache.build_id`
-    // returned zero. Resolve the effective build_id here by
-    // preferring the caller-supplied value if it actually matches a
-    // row, otherwise walking the cache for the latest build seen.
-    let effective_build_id = if !build_id.is_empty() && build_id != slug {
-        let exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pyramid_step_cache
-                  WHERE slug = ?1 AND build_id = ?2",
-                rusqlite::params![slug, build_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        if exists > 0 {
-            build_id.to_string()
-        } else {
-            find_latest_build_id_for_slug(conn, slug)?.unwrap_or_else(|| build_id.to_string())
-        }
-    } else {
-        find_latest_build_id_for_slug(conn, slug)?.unwrap_or_else(|| slug.to_string())
-    };
-
-    // Count completed pipeline steps for the build. The
-    // `pyramid_pipeline_steps` table doesn't carry a status column
-    // — every persisted row represents a completed step (the
-    // schema is append-only on completion). So "completed" is the
-    // row count, and "total" is the same value. The UI derives
-    // progress from the pyramid layer state instead, but we
-    // include the raw step count here for completeness.
-    let completed_steps: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM pyramid_pipeline_steps
-              WHERE slug = ?1 AND build_id = ?2",
-            rusqlite::params![slug, effective_build_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let total_steps = completed_steps;
-
-    // Cost so far: sum of cost_usd from cache entries for this build.
     let cost_so_far_usd: f64 = conn
         .query_row(
             "SELECT COALESCE(SUM(cost_usd), 0.0) FROM pyramid_step_cache
-              WHERE slug = ?1 AND build_id = ?2",
-            rusqlite::params![slug, effective_build_id],
+              WHERE slug = ?1",
+            rusqlite::params![slug],
             |row| row.get(0),
         )
         .unwrap_or(0.0);
 
-    // Cache hit rate: fraction of entries whose force_fresh flag is
-    // off (meaning the entry was served without a fresh LLM call).
-    // This is an approximation — a proper hit rate would count actual
-    // cache_hit emissions vs total lookups, but those live only in
-    // the event stream. The approximation stays useful in the UI.
     let (hits, total): (i64, i64) = conn
         .query_row(
             "SELECT
                 COALESCE(SUM(CASE WHEN force_fresh = 0 THEN 1 ELSE 0 END), 0),
                 COUNT(*)
              FROM pyramid_step_cache
-             WHERE slug = ?1 AND build_id = ?2",
-            rusqlite::params![slug, effective_build_id],
+             WHERE slug = ?1",
+            rusqlite::params![slug],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap_or((0, 0));
@@ -12856,7 +12830,7 @@ pub fn build_active_build_summary(
 
     Ok(ActiveBuildRow {
         slug: slug.to_string(),
-        build_id: effective_build_id,
+        build_id: build_id.to_string(),
         status: status.to_string(),
         started_at: started_at.to_string(),
         completed_steps,
@@ -17894,12 +17868,11 @@ mod phase13_tests {
     }
 
     #[test]
-    fn test_build_active_build_summary_resolves_latest_when_build_id_is_slug() {
+    fn test_build_active_build_summary_passes_through_progress() {
         let conn = mem_conn();
-        // The production path uses the slug as a placeholder
-        // build_id (because BuildHandle has no build_id field).
-        // The summary query must detect that and fall back to the
-        // latest real build.
+        // completed_steps and total_steps are caller-supplied (from
+        // the live BuildHandle's progress channel). The function just
+        // assembles the row and adds cost/cache from pyramid_step_cache.
         conn.execute(
             "INSERT INTO pyramid_step_cache
                 (slug, build_id, step_name, chunk_index, depth, cache_key,
@@ -17921,21 +17894,25 @@ mod phase13_tests {
         )
         .unwrap();
 
-        // Pass the slug itself as the placeholder build_id — the
-        // fallback should kick in.
         let row = build_active_build_summary(
             &conn,
             "summary-slug",
-            "summary-slug",
+            "chain-42",
             "running",
             "3s ago",
-            None,
+            Some("source_extract"),
+            7,
+            21,
         )
         .unwrap();
-        assert_eq!(row.build_id, "chain-42", "fallback resolved latest build");
+
+        assert_eq!(row.build_id, "chain-42");
+        assert_eq!(row.completed_steps, 7, "caller-supplied done");
+        assert_eq!(row.total_steps, 21, "caller-supplied total");
+        assert_eq!(row.current_step.as_deref(), Some("source_extract"));
         assert!(
             (row.cost_so_far_usd - 0.0444).abs() < 0.0001,
-            "cost summed from both rows: {}",
+            "cost summed from pyramid_step_cache: {}",
             row.cost_so_far_usd
         );
         assert!(
@@ -17943,6 +17920,30 @@ mod phase13_tests {
             "mixed hit/miss expected: {}",
             row.cache_hit_rate
         );
+    }
+
+    #[test]
+    fn test_build_active_build_summary_zero_rows_for_slug() {
+        let conn = mem_conn();
+        // Corner case: a pyramid appears in the in-memory
+        // active_build map but the chain executor hasn't written any
+        // step_cache rows yet and progress is still zero.
+        let row = build_active_build_summary(
+            &conn,
+            "empty-slug",
+            "chain-1",
+            "running",
+            "0s ago",
+            None,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(row.total_steps, 0);
+        assert_eq!(row.completed_steps, 0);
+        assert!((row.cost_so_far_usd - 0.0).abs() < 1e-9);
+        assert_eq!(row.cache_hit_rate, 0.0);
+        assert_eq!(row.build_id, "chain-1");
     }
 
     // ── Phase 14: pyramid_wire_update_cache helper tests ──────────────

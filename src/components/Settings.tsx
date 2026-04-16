@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useLocalMode, type OllamaProbeResult, type OllamaModelInfo, type ConfigHistoryEntry, type ExperimentalTerritory } from "../hooks/useLocalMode";
 import { AccordionSection } from "./AccordionSection";
 import type { TaggedBuildEvent } from "../hooks/useBuildRowState";
+import { invokeOrNull } from "../utils/invokeSafe";
 
 // --- Types ------------------------------------------------------------------
 
@@ -96,6 +97,7 @@ export function Settings() {
     const [nodeName, setNodeName] = useState("Wire Node");
     const [computePolicy, setComputePolicy] = useState<ComputeParticipationPolicy>(defaultComputeParticipationPolicy);
     const [computePolicyLoaded, setComputePolicyLoaded] = useState(false);
+    const [computePolicyUnavailable, setComputePolicyUnavailable] = useState(false);
     const [computePolicySaving, setComputePolicySaving] = useState(false);
     const [computePolicySaved, setComputePolicySaved] = useState(false);
 
@@ -537,33 +539,42 @@ export function Settings() {
     const availableModels: string[] = availableModelDetails.map((m) => m.name);
 
     const fetchData = useCallback(async () => {
-        try {
-            const [cfg, healthStatus, name, policy] = await Promise.all([
-                invoke<WireNodeConfig>("get_config"),
-                invoke<HealthStatus>("get_health_status"),
-                invoke<string>("get_node_name"),
-                invoke<ComputeParticipationPolicy>("pyramid_get_compute_participation_policy"),
-            ]);
+        // Each invoke runs independently; a single failure must not hide the
+        // siblings. invokeOrNull resolves to null on failure so the Promise.all
+        // cannot reject. Each setter is guarded on a non-null value.
+        const [cfg, healthStatus, name, policy] = await Promise.all([
+            invokeOrNull<WireNodeConfig>("get_config"),
+            invokeOrNull<HealthStatus>("get_health_status"),
+            invokeOrNull<string>("get_node_name"),
+            invokeOrNull<ComputeParticipationPolicy>("pyramid_get_compute_participation_policy"),
+        ]);
+        if (cfg) {
             setConfig(cfg);
-            setHealth(healthStatus);
             setStorageCap(cfg.storage_cap_gb);
             setMeshHosting(cfg.mesh_hosting_enabled);
             setAutoUpdate(cfg.auto_update_enabled);
-            setNodeName(name || "Wire Node");
+        }
+        if (healthStatus) setHealth(healthStatus);
+        if (name) setNodeName(name || "Wire Node");
+        if (policy) {
             setComputePolicy(policy);
             setComputePolicyLoaded(true);
-        } catch (err) {
-            console.error("Settings fetch error:", err);
+            setComputePolicyUnavailable(false);
+        } else {
+            setComputePolicyUnavailable(true);
         }
     }, []);
 
     useEffect(() => { fetchData(); }, [fetchData]);
 
     const handleSave = async () => {
-        if (!config) return;
+        // Save is always valid even if the initial get_config fetch failed —
+        // save_onboarding takes only local state (nodeName, storageCap,
+        // meshHosting, autoUpdate), and the backend writes to disk AND
+        // updates its own in-memory config. No dependency on the frontend's
+        // `config` object.
         setSaving(true);
         try {
-            // Save via onboarding endpoint (which persists to disk)
             await invoke("save_onboarding", {
                 nodeName: nodeName,
                 storageCapGb: storageCap,
@@ -766,7 +777,9 @@ export function Settings() {
                             ? "Participation policy saved."
                             : computePolicyLoaded
                                 ? `Current mode: ${roleDescriptions[computePolicy.mode].label}.`
-                                : "Loading participation policy…"}
+                                : computePolicyUnavailable
+                                    ? "Participation policy unavailable — check backend."
+                                    : "Loading participation policy…"}
                 </div>
             </div>
 

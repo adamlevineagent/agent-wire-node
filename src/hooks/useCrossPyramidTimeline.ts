@@ -91,6 +91,7 @@ export function useCrossPyramidTimeline() {
                     // Filter out non-pyramid events (e.g. __ollama__ pull
                     // progress) so they don't create phantom timeline rows.
                     if (payload.slug === '__ollama__') return;
+                    let slugIsNew = false;
                     setState(prev => {
                         const nextMap = new Map(prev.byslug);
                         const slugState =
@@ -99,8 +100,19 @@ export function useCrossPyramidTimeline() {
                             payload.slug,
                             reduceBuildRowEvent(slugState, payload.kind),
                         );
+                        // If the event is for a slug not currently in the
+                        // activeBuilds list, trigger a refresh so the row
+                        // surfaces without waiting for the 30s poll. Applies
+                        // especially to DADBEAR-only builds whose first
+                        // visible event may arrive before refreshActive.
+                        if (!prev.activeBuilds.some(b => b.slug === payload.slug)) {
+                            slugIsNew = true;
+                        }
                         return { ...prev, byslug: nextMap };
                     });
+                    if (slugIsNew) {
+                        refreshActive();
+                    }
                 });
             } catch (e) {
                 console.warn('useCrossPyramidTimeline: listen failed', e);
@@ -111,7 +123,7 @@ export function useCrossPyramidTimeline() {
             active = false;
             if (unlisten) unlisten();
         };
-    }, []);
+    }, [refreshActive]);
 
     return { state, refreshActive };
 }

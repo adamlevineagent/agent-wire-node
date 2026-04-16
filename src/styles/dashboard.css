@@ -22014,7 +22014,12 @@ body {
     position: relative;
     display: flex;
     flex-direction: column;
-    min-height: 400px;
+    min-height: 0;
+    /* min-width: 0 is load-bearing: without it, a long unbreakable
+       string inside the Chronicle (e.g. a JSON error dump) forces
+       min-content of this flex item wider than the window, which drags
+       the toolbar/overlay buttons off the right edge. */
+    min-width: 0;
     flex: 1;
     border-radius: var(--radius-md);
     overflow: visible;
@@ -22098,8 +22103,8 @@ body {
 
 .ps-canvas-container {
     position: relative;
-    flex: 1;
-    min-height: 350px;
+    flex: 1 1 0;
+    min-height: 150px;
     background: var(--bg-card);
     border: 1px solid var(--glass-border);
     border-top: none;
@@ -22249,9 +22254,16 @@ body {
 .ps-chronicle {
     display: flex;
     flex-direction: column;
-    flex-shrink: 0;
-    max-height: min(40vh, 40%);
-    overflow-y: auto;
+    flex-shrink: 1;
+    min-height: 0;
+    /* min-width: 0 + overflow-x: hidden together prevent long error
+       payloads in chronicle entries from expanding the panel width
+       beyond its parent. Without these, a single long JSON error
+       dumped into .ps-chronicle-detail forces horizontal growth
+       through the flex chain and pushes the viz toolbar off-screen. */
+    min-width: 0;
+    overflow-x: hidden;
+    max-height: 40vh;
     background: rgba(10, 14, 18, 0.92);
     backdrop-filter: blur(8px);
     border: 1px solid var(--glass-border);
@@ -22267,8 +22279,6 @@ body {
     padding: 5px 10px;
     border-bottom: 1px solid rgba(255, 255, 255, 0.06);
     flex-shrink: 0;
-    position: sticky;
-    top: 0;
     background: rgba(10, 14, 18, 0.96);
     z-index: 1;
 }
@@ -22409,10 +22419,16 @@ body {
 
 .ps-chronicle-detail {
     width: 100%;
+    min-width: 0;
     padding: 4px 8px 4px 68px;
     font-size: 10px;
     color: var(--text-secondary);
     line-height: 1.5;
+    /* Force wrapping on long unbroken strings (JSON error dumps,
+       URLs, UUIDs). Without this the detail's min-content blows the
+       chronicle width out horizontally. */
+    overflow-wrap: break-word;
+    word-break: break-word;
     border-top: 1px solid rgba(255, 255, 255, 0.03);
     margin-top: 2px;
 }
