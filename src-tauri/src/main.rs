@@ -12746,6 +12746,20 @@ fn main() {
                     .await
                     .fleet_dispatch
                     .clone();
+                // Phase 2 WS5: compute_market_dispatch and compute_market_state
+                // will be populated by WS6/WS7 (mirror task + offer IPC wiring)
+                // when the compute market boot path lands. For now pass None —
+                // the dispatch handler short-circuits with 503 "compute market
+                // disabled" when either is absent, which is the correct
+                // behavior for a node that hasn't wired up market participation.
+                let compute_market_dispatch: Option<
+                    std::sync::Arc<wire_node_lib::pyramid::market_dispatch::MarketDispatchContext>,
+                > = None;
+                let compute_market_state: Option<
+                    std::sync::Arc<
+                        tokio::sync::RwLock<wire_node_lib::compute_market::ComputeMarketState>,
+                    >,
+                > = None;
                 server::start_server(
                     server_port,
                     cache_dir,
@@ -12760,6 +12774,8 @@ fn main() {
                     server_state.fleet_roster.clone(),
                     server_state.compute_queue.clone(),
                     fleet_dispatch,
+                    compute_market_dispatch,
+                    compute_market_state,
                 ).await;
             });
 

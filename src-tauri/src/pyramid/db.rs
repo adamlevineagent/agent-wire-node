@@ -2485,6 +2485,77 @@ pub fn fleet_outbox_count_inflight_excluding(
     Ok(n as u64)
 }
 
+/// Insert a MARKET dispatch row into the outbox with explicit
+/// `callback_kind` (`'MarketStandard'` or `'Relay'`). Mirrors
+/// `fleet_outbox_insert_or_ignore` but uses the
+/// `WIRE_PLATFORM_DISPATCHER` sentinel as `dispatcher_node_id` per
+/// architecture §VIII.6 DD-Q — the Wire is not a fleet peer and has
+/// no node_id in the fleet-roster sense; the sentinel + `callback_kind`
+/// discriminator make collisions with fleet rows structurally
+/// impossible.
+///
+/// Returns rowcount: `1` on fresh insert, `0` on PK conflict (a
+/// legitimate Wire retry — caller should re-ACK 202 with the
+/// existing `job_id` instead of spawning a second worker).
+///
+/// `callback_kind_str` must be one of `"MarketStandard"` / `"Relay"`
+/// — the caller produces it via `fleet::callback_kind_str(&kind)` so
+/// the source of truth is the `CallbackKind` enum rather than a raw
+/// literal. The function does NOT validate the string; a bad value
+/// would land the row in an unreachable sweep bucket.
+pub fn market_outbox_insert_or_ignore(
+    conn: &Connection,
+    job_id: &str,
+    callback_url: &str,
+    callback_kind_str: &str,
+    expires_at: &str,
+) -> Result<usize> {
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO fleet_result_outbox
+            (dispatcher_node_id, job_id, callback_url, callback_kind, status, expires_at)
+         VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+        rusqlite::params![
+            crate::fleet::WIRE_PLATFORM_DISPATCHER,
+            job_id,
+            callback_url,
+            callback_kind_str,
+            expires_at
+        ],
+    )?;
+    Ok(n)
+}
+
+/// Admission counter for MARKET dispatches: number of in-flight
+/// (`pending` or `ready`) market/relay rows, EXCLUDING the caller's
+/// just-inserted row identified by `(dispatcher_node_id, job_id)`.
+/// Used to honor `market_delivery_policy.max_inflight_jobs` as the
+/// actual limit (the freshly inserted row is already counted by
+/// SELECT; we subtract it here).
+///
+/// Scoped to `callback_kind != 'Fleet'` so all market + relay rows
+/// count toward the same budget — the spec (DD-E) treats
+/// `max_inflight_jobs` as a unified cap across market variants.
+/// Mirror of `fleet_outbox_count_inflight_excluding` with the
+/// inverse filter. `dispatcher_node_id` is always
+/// `WIRE_PLATFORM_DISPATCHER` in practice but the signature
+/// preserves the compound-PK shape for future relay chains where
+/// the dispatcher could be a relay hop.
+pub fn market_outbox_count_inflight_excluding(
+    conn: &Connection,
+    dispatcher_node_id: &str,
+    job_id: &str,
+) -> Result<u64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM fleet_result_outbox
+         WHERE status IN ('pending','ready')
+           AND callback_kind != 'Fleet'
+           AND NOT (dispatcher_node_id = ?1 AND job_id = ?2)",
+        rusqlite::params![dispatcher_node_id, job_id],
+        |r| r.get(0),
+    )?;
+    Ok(n as u64)
+}
+
 /// Unconditional delete by compound PK. Returns rowcount (0 if PK missing —
 /// not an error; the row is simply gone). Used by admission rollback
 /// (INSERT then DELETE on rejection) and by Predicate A's `delivered`/`failed`
@@ -19514,6 +19585,163 @@ mod phase17_tests {
         let n =
             fleet_outbox_count_inflight_excluding(&conn, "dispA", "nonexistent").unwrap();
         assert_eq!(n, 2);
+    }
+
+    // ── Market outbox helpers (Phase 2 WS5.1) ───────────────────────────
+
+    #[test]
+    fn test_market_outbox_insert_sets_wire_platform_dispatcher_and_kind() {
+        // Fresh insert: dispatcher_node_id must be the sentinel,
+        // callback_kind must match the caller-supplied string, status
+        // defaults to 'pending'.
+        let conn = outbox_conn();
+        let expires = future_expires();
+        let n = market_outbox_insert_or_ignore(
+            &conn,
+            "market-job-1",
+            "https://wire.example.com/v1/compute/result-relay",
+            "MarketStandard",
+            &expires,
+        )
+        .unwrap();
+        assert_eq!(n, 1, "fresh insert returns rowcount=1");
+
+        let (disp, kind, status): (String, String, String) = conn
+            .query_row(
+                "SELECT dispatcher_node_id, callback_kind, status
+                 FROM fleet_result_outbox WHERE job_id = 'market-job-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(disp, crate::fleet::WIRE_PLATFORM_DISPATCHER);
+        assert_eq!(kind, "MarketStandard");
+        assert_eq!(status, "pending");
+    }
+
+    #[test]
+    fn test_market_outbox_insert_returns_zero_on_duplicate_job_id() {
+        // INSERT OR IGNORE: a Wire retry with the same job_id returns
+        // rowcount=0 and does NOT overwrite the existing row. The
+        // caller's WS5 handler re-ACKs 202 with the existing job_id
+        // rather than spawning a second worker.
+        let conn = outbox_conn();
+        let expires = future_expires();
+        market_outbox_insert_or_ignore(
+            &conn,
+            "market-job-1",
+            "https://wire.example.com/v1/compute/result-relay",
+            "MarketStandard",
+            &expires,
+        )
+        .unwrap();
+        let n = market_outbox_insert_or_ignore(
+            &conn,
+            "market-job-1",
+            "https://wire.example.com/v1/compute/result-relay",
+            "MarketStandard",
+            &expires,
+        )
+        .unwrap();
+        assert_eq!(n, 0, "duplicate insert returns rowcount=0");
+    }
+
+    #[test]
+    fn test_market_outbox_insert_accepts_relay_kind() {
+        // Same helper handles Relay kind (for future relay-chain
+        // dispatches). Only the callback_kind string differs.
+        let conn = outbox_conn();
+        let expires = future_expires();
+        market_outbox_insert_or_ignore(
+            &conn,
+            "relay-job-1",
+            "https://relay-hop-7.example.com/r/inbound",
+            "Relay",
+            &expires,
+        )
+        .unwrap();
+        let kind: String = conn
+            .query_row(
+                "SELECT callback_kind FROM fleet_result_outbox WHERE job_id = 'relay-job-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "Relay");
+    }
+
+    #[test]
+    fn test_market_outbox_count_inflight_ignores_fleet_rows() {
+        // Load-bearing invariant mirror of the fleet test: market
+        // admission's `max_inflight_jobs` budget must not be consumed
+        // by fleet rows. The filter is `callback_kind != 'Fleet'` so
+        // MarketStandard + Relay both count.
+        let conn = outbox_conn();
+        let expires = future_expires();
+        // Fleet rows — must NOT count.
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "fleet-j1", "https://x/cb", &expires)
+            .unwrap();
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "fleet-j2", "https://x/cb", &expires)
+            .unwrap();
+        // Two MarketStandard + one Relay row.
+        market_outbox_insert_or_ignore(&conn, "mkt-j1", "https://w/cb", "MarketStandard", &expires)
+            .unwrap();
+        market_outbox_insert_or_ignore(&conn, "mkt-j2", "https://w/cb", "MarketStandard", &expires)
+            .unwrap();
+        market_outbox_insert_or_ignore(&conn, "rly-j1", "https://r/cb", "Relay", &expires)
+            .unwrap();
+        // Excluding mkt-j1 — count should see mkt-j2 + rly-j1 = 2.
+        let n = market_outbox_count_inflight_excluding(
+            &conn,
+            crate::fleet::WIRE_PLATFORM_DISPATCHER,
+            "mkt-j1",
+        )
+        .unwrap();
+        assert_eq!(n, 2,
+            "market count must include MarketStandard + Relay, exclude Fleet");
+        // Excluding a key that doesn't exist — same 3 rows counted.
+        let n = market_outbox_count_inflight_excluding(
+            &conn,
+            crate::fleet::WIRE_PLATFORM_DISPATCHER,
+            "nonexistent",
+        )
+        .unwrap();
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn test_market_outbox_count_only_counts_inflight_statuses() {
+        // Only pending + ready count as inflight. A row that's been
+        // transitioned to delivered or failed (terminal) does NOT
+        // consume the admission budget.
+        let conn = outbox_conn();
+        let expires = future_expires();
+        market_outbox_insert_or_ignore(&conn, "mkt-j1", "https://w/cb", "MarketStandard", &expires)
+            .unwrap();
+        market_outbox_insert_or_ignore(&conn, "mkt-j2", "https://w/cb", "MarketStandard", &expires)
+            .unwrap();
+        market_outbox_insert_or_ignore(&conn, "mkt-j3", "https://w/cb", "MarketStandard", &expires)
+            .unwrap();
+        // Promote one to delivered, one to failed.
+        conn.execute(
+            "UPDATE fleet_result_outbox SET status = 'delivered' WHERE job_id = 'mkt-j1'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE fleet_result_outbox SET status = 'failed' WHERE job_id = 'mkt-j2'",
+            [],
+        )
+        .unwrap();
+        // Only mkt-j3 remains in inflight (pending); count excluding a
+        // nonexistent key must see just that one row.
+        let n = market_outbox_count_inflight_excluding(
+            &conn,
+            crate::fleet::WIRE_PLATFORM_DISPATCHER,
+            "nonexistent",
+        )
+        .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]

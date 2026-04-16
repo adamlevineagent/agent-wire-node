@@ -35,6 +35,23 @@ pub struct ServerState {
     /// Carries the pending-job registry (for dispatcher-side callbacks),
     /// the tunnel state handle, and the operational policy.
     pub fleet_dispatch: Option<Arc<crate::fleet::FleetDispatchContext>>,
+    /// Compute market dispatch context — None when compute market is
+    /// disabled (fresh install, operator hasn't flipped
+    /// `allow_market_visibility = true`, or the Phase 2 init path
+    /// hasn't landed yet). Carries the pending-job registry (owned by
+    /// Phase 3 requester-side; empty in Phase 2 provider-only builds),
+    /// the tunnel state handle (borrowed), and the operational policy
+    /// (owned, hot-reloaded on ConfigSynced).
+    pub compute_market_dispatch:
+        Option<Arc<crate::pyramid::market_dispatch::MarketDispatchContext>>,
+    /// Live compute market state — offers, in-flight jobs, counters,
+    /// queue mirror seqs. Wrapped in RwLock so WS5's dispatch handler
+    /// can upsert/transition jobs, WS6's mirror task can read+bump
+    /// seqs, and WS7's offer IPC can mutate the offers map. `None`
+    /// only in test fixtures and the pre-init boot window; production
+    /// boot constructs this before spawning the HTTP server.
+    pub compute_market_state:
+        Option<Arc<RwLock<crate::compute_market::ComputeMarketState>>>,
 }
 
 #[derive(Serialize)]
@@ -410,6 +427,8 @@ pub async fn start_server(
     fleet_roster: Arc<RwLock<crate::fleet::FleetRoster>>,
     compute_queue: crate::compute_queue::ComputeQueueHandle,
     fleet_dispatch: Option<Arc<crate::fleet::FleetDispatchContext>>,
+    compute_market_dispatch: Option<Arc<crate::pyramid::market_dispatch::MarketDispatchContext>>,
+    compute_market_state: Option<Arc<RwLock<crate::compute_market::ComputeMarketState>>>,
 ) {
     let state = ServerState {
         cache_dir,
@@ -424,6 +443,8 @@ pub async fn start_server(
         fleet_roster,
         compute_queue,
         fleet_dispatch,
+        compute_market_dispatch,
+        compute_market_state,
     };
 
     // Phase 7: Initialize stale engines for auto-update pyramids (background)
