@@ -43,6 +43,89 @@ The system can be technically alive and still feel broken.
 - Pull fires on: peer discovery, app startup, peer state `unknown`, before skipping a peer, periodic stale refresh.
 - Result: privacy preserved, no longer fragile.
 
+## Deeper Canonical Shape (100-Year Refinement)
+
+The three-object framing is a strong corrective to the current fragility, but it is not quite the final shape.
+The deeper control plane is five first-class concepts:
+
+### 1. Compute Participation Policy — durable operator intent
+- Canonical contribution schema should become `compute_participation_policy`, not a fleet-specific toggle.
+- It governs:
+  - where this node may send work
+  - where this node may accept work from
+  - whether it is private fleet-only or market-visible
+  - whether serving is allowed during degraded or maintenance states
+- The 3-state UI (`Coordinator`, `Hybrid`, `Worker`) is a projection/preset layer over this policy, not the deepest truth.
+- This prevents a later rewrite when fleet and market participation unify.
+
+### 2. Local Service Descriptor — semi-stable derived identity
+- Split out the durable-ish facts from the volatile ones.
+- Fields:
+  - `declared_role`
+  - `servable_rules`
+  - `models_loaded`
+  - `visibility` (private fleet / market-visible / disabled)
+  - `protocol_version`
+  - `descriptor_version`
+  - `computed_at`
+- This answers: "what can this node serve in principle?"
+
+### 3. Local Availability Snapshot — volatile runtime state
+- Separate fast-changing eligibility from service identity.
+- Fields:
+  - `total_queue_depth`
+  - `queue_depths`
+  - `health_status`
+  - `tunnel_status`
+  - `degraded`
+  - `last_updated`
+  - `availability_version`
+- This answers: "should this node get work right now?"
+
+### 4. Peer Knowledge State — local belief about another node
+- Cached, reconciled, freshness-aware state for remote peers.
+- Holds:
+  - last known service descriptor
+  - last known availability snapshot
+  - freshness metadata
+  - source provenance (`announce`, `pull`, `cache`)
+  - sync failures / last error
+- Unknown, stale, failed, and fresh are explicit beliefs, not inferred from missing fields.
+
+### 5. Fleet Reconciliation Protocol — one anti-entropy system
+- Heartbeat remains discovery-only.
+- Announce becomes "I changed; here is my newest version."
+- Pull becomes "give me the latest descriptor/snapshot for this peer."
+- Cache provides warm-start bootstrap.
+- All sources feed one reducer/merge path.
+- The system guarantee is eventual convergence of peer knowledge without centralizing private capability data in the Wire.
+
+## Canonical Objects (Refined)
+
+### Compute Participation Policy
+- Durable contribution.
+- Generates dispatch policy.
+- Fleet UI is a preset surface over it.
+
+### Service Descriptor
+- Derived from participation policy + local mode + loaded model state.
+- Semi-stable and versioned.
+- Private to peers, not Wire-mediated.
+
+### Availability Snapshot
+- Derived from queue, health, tunnel, and maintenance state.
+- Volatile and versioned separately from the descriptor.
+
+### Peer Knowledge State
+- Local cache of descriptor + availability + freshness + provenance.
+- Hydrated from disk on startup, reconciled live afterward.
+
+### Reconciliation Protocol
+- Push (`announce`) + pull (`/v1/fleet/capabilities`) + cache hydration.
+- One reducer.
+- One freshness model.
+- One place to reason about "what do we believe about this peer right now?"
+
 ## Warm-Start Cache
 
 - Persist last-known peer capabilities locally.
@@ -51,9 +134,9 @@ The system can be technically alive and still feel broken.
 
 ## Dispatch Selection
 
-- Phase A uses explicit role + explicit capability state.
+- Phase A uses participation policy + service descriptor + availability snapshot + peer knowledge.
 - Worker peers = eligible serving targets. Coordinator peers = not.
-- Unknown capability → try pull before concluding "no peer."
+- Unknown peer knowledge → try pull before concluding "no peer."
 - Load balancing: compare local queue depth vs peer queue depth (use BOTH GPUs).
 
 ## UI
@@ -72,16 +155,18 @@ Chronicle events: `fleet_capability_announced`, `fleet_capability_pull_started/s
 
 - Split LlmConfig into durable config vs runtime bindings.
 - Remove hardcoded dispatch policy YAML from local_mode.rs → bundled contribution.
+- Replace `fleet_policy` naming in the long-term architecture with `compute_participation_policy`.
 
 ## Implementation Order
 
-1. `fleet_policy` contribution + 3-state UI
-2. `CapabilitySnapshot` + explicit peer capability state
-3. Peer-to-peer capability pull endpoint + reconciliation loop
-4. Local last-known capability cache
-5. Dispatch logic: role + capability state + load balancing
-6. Market UI + fleet health surfaces
-7. LlmConfig split + bundled policy contribution
+1. `compute_participation_policy` contribution + 3-state UI preset surface
+2. Split capability into `ServiceDescriptor` + `AvailabilitySnapshot`
+3. Explicit peer knowledge state + single reducer
+4. Peer-to-peer capability pull endpoint + reconciliation loop
+5. Local last-known peer knowledge cache
+6. Dispatch logic: policy + descriptor + availability + load balancing
+7. Market UI + fleet health surfaces
+8. LlmConfig split + bundled policy contribution
 
 ## Ship Criteria
 
@@ -91,3 +176,14 @@ Chronicle events: `fleet_capability_announced`, `fleet_capability_pull_started/s
 - Coordinator nodes never appear as serving targets
 - No peer card can be "online but blank"
 - Fleet stays peer-to-peer and privacy-preserving
+
+## Final Architectural Verdict
+
+The maximal shape is not just "three objects." It is a unified private compute control plane:
+- **Compute Participation Policy** for durable intent
+- **Service Descriptor** for what a node can serve
+- **Availability Snapshot** for whether it should serve now
+- **Peer Knowledge State** for what this node currently believes about peers
+- **Fleet Reconciliation Protocol** for how that belief converges
+
+The three-object plan remains useful as the bridge from current fragility to this deeper shape, but implementation should target the refined model directly where possible.
