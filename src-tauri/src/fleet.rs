@@ -802,10 +802,18 @@ pub struct PendingFleetJob {
 /// - `tunnel_state` is **borrowed** — mutated by the tunnel lifecycle
 ///   elsewhere. We only read from it (for the local tunnel URL used
 ///   to construct our own `callback_url`).
+/// - `fleet_roster` is **borrowed** — mutated by heartbeat and announce
+///   handlers. The peer-side outbox sweep reads it to resolve the
+///   dispatcher's live tunnel URL + fleet JWT for callback delivery.
+///   Bundling it here keeps the sweep loop signature
+///   `fn(db_path, Arc<FleetDispatchContext>)` as the spec prescribes.
 /// - `pending` and `policy` are **owned by this feature**.
 pub struct FleetDispatchContext {
     /// Borrowed handle to the node's tunnel state.
     pub tunnel_state: Arc<tokio::sync::RwLock<crate::tunnel::TunnelState>>,
+    /// Borrowed handle to the live fleet roster. Peer-side sweep reads
+    /// it to resolve the dispatcher's current tunnel URL + JWT.
+    pub fleet_roster: Arc<tokio::sync::RwLock<FleetRoster>>,
     /// Owned: the in-memory pending-job registry.
     pub pending: Arc<PendingFleetJobs>,
     /// Owned: the operational policy, re-readable under hot reload.
@@ -873,6 +881,42 @@ pub async fn deliver_fleet_result(
     }
 
     Ok(())
+}
+
+// ── Dispatcher-side orphan sweep loop ────────────────────────────────────
+
+/// Background task that evicts stale [`PendingFleetJob`] entries whose
+/// dispatcher never received a callback within
+/// `expected_timeout * orphan_sweep_multiplier`. Spawned once at startup
+/// with an `Arc<FleetDispatchContext>`.
+///
+/// Eviction drops the entry's `oneshot::Sender`; the Phase A await that
+/// registered the entry then wakes with `RecvError` and records
+/// `fleet_dispatch_failed` at the call site where `StepContext` is in
+/// scope. This loop itself writes only a `tracing::info!` breadcrumb —
+/// the dispatcher-side chronicle event comes from Phase A, not here.
+///
+/// Never exits under normal operation. Under Tauri async_runtime the
+/// task is cancelled when the app shuts down; there is no per-iteration
+/// shutdown channel because the sweep has no mid-flight state to flush.
+pub async fn pending_jobs_sweep_loop(ctx: Arc<FleetDispatchContext>) {
+    loop {
+        let (interval, multiplier) = {
+            let p = ctx.policy.read().await;
+            (
+                p.orphan_sweep_interval_secs.max(1),
+                p.orphan_sweep_multiplier,
+            )
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        let evicted = ctx.pending.sweep_expired(multiplier);
+        for job_id in evicted {
+            tracing::info!(
+                %job_id,
+                "fleet_pending_orphaned: dispatcher sweep evicted stale pending entry"
+            );
+        }
+    }
 }
 
 // ── Derive serving rules ─────────────────────────────────────────────────

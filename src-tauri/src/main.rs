@@ -11628,6 +11628,76 @@ fn main() {
     // alongside compute_queue. Same Arc<RwLock<>> pattern.
     let fleet_roster = Arc::new(RwLock::new(wire_node_lib::fleet::FleetRoster::default()));
 
+    // ── Async fleet dispatch: hydrate FleetDeliveryPolicy + construct ────
+    // FleetDispatchContext (Init Ordering steps 2-5 of async-fleet-dispatch).
+    //
+    // 1. Read the singleton `pyramid_fleet_delivery_policy` row. Fall back to
+    //    `FleetDeliveryPolicy::default()` (bootstrap sentinels) when the row
+    //    is missing, malformed, or the DB connection fails — defaults are
+    //    intentionally conservative and let the node accept dispatches while
+    //    the seed/contribution lands.
+    // 2. Run peer startup recovery BEFORE sweep loops start, converting any
+    //    `pending` outbox rows left behind by a prior crash into `ready` with
+    //    a synthesized worker error payload. Without this, a crashed worker
+    //    could strand rows in `pending` forever.
+    // 3. Construct `FleetDispatchContext` and wire it onto the live
+    //    `LlmConfig.fleet_dispatch` overlay (same Arc<RwLock<>> pattern as
+    //    fleet_roster + compute_queue above).
+    let initial_fleet_delivery_policy = {
+        match wire_node_lib::pyramid::db::open_pyramid_connection(&pyramid_db_path) {
+            Ok(conn) => {
+                // Read policy — fall through to defaults on any failure.
+                let policy = match wire_node_lib::pyramid::fleet_delivery_policy::read_fleet_delivery_policy(&conn) {
+                    Ok(Some(p)) => {
+                        tracing::info!("Fleet delivery policy loaded from DB");
+                        p
+                    }
+                    Ok(None) => {
+                        tracing::info!(
+                            "No fleet_delivery_policy row; using bootstrap defaults (seed will land once contribution is synced)"
+                        );
+                        wire_node_lib::pyramid::fleet_delivery_policy::FleetDeliveryPolicy::default()
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to read fleet_delivery_policy from DB: {e}; using bootstrap defaults"
+                        );
+                        wire_node_lib::pyramid::fleet_delivery_policy::FleetDeliveryPolicy::default()
+                    }
+                };
+                // Peer startup recovery: stuck pending → ready with synth error.
+                match wire_node_lib::pyramid::db::fleet_outbox_startup_recovery(
+                    &conn,
+                    policy.ready_retention_secs,
+                ) {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(
+                            "Fleet outbox startup recovery: promoted {n} stuck pending row(s) to ready"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("Fleet outbox startup recovery failed: {e}");
+                    }
+                }
+                policy
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to open pyramid connection for fleet_delivery_policy hydration: {e}; using bootstrap defaults"
+                );
+                wire_node_lib::pyramid::fleet_delivery_policy::FleetDeliveryPolicy::default()
+            }
+        }
+    };
+
+    let fleet_dispatch_ctx = Arc::new(wire_node_lib::fleet::FleetDispatchContext {
+        tunnel_state: shared_tunnel.clone(),
+        fleet_roster: fleet_roster.clone(),
+        pending: Arc::new(wire_node_lib::fleet::PendingFleetJobs::new()),
+        policy: Arc::new(tokio::sync::RwLock::new(initial_fleet_delivery_policy)),
+    });
+
     // Phase A: hydrate dispatch policy + provider pools from DB.
     // Uses a one-shot connection (same pattern as registry/schema hydration
     // above). When a policy exists, the per-provider pools replace the
@@ -11645,6 +11715,7 @@ fn main() {
                             cfg.provider_pools = Some(std::sync::Arc::new(pools));
                             cfg.compute_queue = Some(compute_queue_handle.clone());
                             cfg.fleet_roster = Some(fleet_roster.clone());
+                            cfg.fleet_dispatch = Some(Arc::clone(&fleet_dispatch_ctx));
                             tracing::info!("Dispatch policy loaded from DB — per-provider pools active, compute queue wired");
                         }
                         Err(e) => {
@@ -11668,6 +11739,9 @@ fn main() {
             if cfg.fleet_roster.is_none() {
                 cfg.fleet_roster = Some(fleet_roster.clone());
             }
+            if cfg.fleet_dispatch.is_none() {
+                cfg.fleet_dispatch = Some(Arc::clone(&fleet_dispatch_ctx));
+            }
         }
     }
 
@@ -11685,6 +11759,7 @@ fn main() {
         let config_auth = shared_auth.clone();
         let config_tunnel = shared_tunnel.clone();
         let config_node_identity = node_identity.clone();
+        let config_fleet_dispatch = Arc::clone(&fleet_dispatch_ctx);
         let mut rx = ps.build_event_bus.tx.subscribe();
         tauri::async_runtime::spawn(async move {
             loop {
@@ -11805,6 +11880,28 @@ fn main() {
                                         }
                                     }
                                 }
+                            } else if schema_type == "fleet_delivery_policy" {
+                                // Async fleet dispatch: reload the operational
+                                // policy into the live `FleetDispatchContext`.
+                                // Runs in parallel to the `dispatch_policy`
+                                // branch above; both arms are independent.
+                                let yaml_opt = {
+                                    let conn_result = wire_node_lib::pyramid::db::open_pyramid_connection(
+                                        std::path::Path::new(&db_path),
+                                    );
+                                    match conn_result {
+                                        Ok(conn) => wire_node_lib::pyramid::fleet_delivery_policy::read_fleet_delivery_policy(&conn)
+                                            .ok()
+                                            .flatten(),
+                                        Err(_) => None,
+                                    }
+                                };
+                                if let Some(new_policy) = yaml_opt {
+                                    *config_fleet_dispatch.policy.write().await = new_policy;
+                                    tracing::info!("ConfigSynced: fleet_delivery_policy reloaded");
+                                } else {
+                                    tracing::warn!("ConfigSynced: fleet_delivery_policy broadcast but no row readable");
+                                }
                             }
                         }
                     }
@@ -11817,6 +11914,133 @@ fn main() {
                     }
                 }
             }
+        });
+    }
+
+    // ── Async fleet dispatch: best-effort seed of fleet_delivery_policy ──
+    //
+    // If no `fleet_delivery_policy` contribution exists yet, insert one
+    // from the embedded seed YAML and sync it to the operational table.
+    // The listener above is already installed — the `ConfigSynced` it
+    // broadcasts will be received and will refresh the live
+    // `FleetDispatchContext.policy` value.
+    //
+    // Best-effort: any failure is logged and swallowed. The bootstrap
+    // sentinel defaults that the `FleetDispatchContext` was constructed
+    // with above are conservative and let the node keep functioning
+    // while this lands on a later boot.
+    {
+        const SEED_FLEET_DELIVERY_POLICY_YAML: &str =
+            include_str!("../../docs/seeds/fleet_delivery_policy.yaml");
+        match wire_node_lib::pyramid::db::open_pyramid_connection(&pyramid_db_path) {
+            Ok(conn) => {
+                match wire_node_lib::pyramid::config_contributions::load_active_config_contribution(
+                    &conn,
+                    "fleet_delivery_policy",
+                    None,
+                ) {
+                    Ok(Some(_)) => {
+                        tracing::debug!(
+                            "fleet_delivery_policy contribution already present — skipping seed"
+                        );
+                    }
+                    Ok(None) => {
+                        match wire_node_lib::pyramid::config_contributions::create_config_contribution(
+                            &conn,
+                            "fleet_delivery_policy",
+                            None,
+                            SEED_FLEET_DELIVERY_POLICY_YAML,
+                            Some("bundled seed at first boot"),
+                            "bundled",
+                            Some("system"),
+                            "active",
+                        ) {
+                            Ok(contribution_id) => {
+                                match wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+                                    &conn,
+                                    &contribution_id,
+                                ) {
+                                    Ok(Some(contribution)) => {
+                                        if let Err(e) = wire_node_lib::pyramid::config_contributions::sync_config_to_operational(
+                                            &conn,
+                                            &pyramid_state.build_event_bus,
+                                            &contribution,
+                                        ) {
+                                            tracing::warn!(
+                                                "fleet_delivery_policy seed: sync_config_to_operational failed: {e}"
+                                            );
+                                        } else {
+                                            tracing::info!(
+                                                "fleet_delivery_policy seeded from docs/seeds/fleet_delivery_policy.yaml (contribution_id={contribution_id})"
+                                            );
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        tracing::warn!(
+                                            "fleet_delivery_policy seed: contribution {contribution_id} not found after create"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "fleet_delivery_policy seed: load_contribution_by_id failed: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "fleet_delivery_policy seed: create_config_contribution failed: {e}"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "fleet_delivery_policy seed: load_active_config_contribution failed: {e}"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "fleet_delivery_policy seed: failed to open pyramid connection: {e}"
+                );
+            }
+        }
+    }
+
+    // ── Async fleet dispatch: spawn sweep loops (Init Ordering step 9) ──
+    //
+    // Two sweeps, one context. Both are fire-and-forget until app exit.
+    //
+    // 1. `pending_jobs_sweep_loop` — dispatcher-side orphan sweep. Evicts
+    //    stale `PendingFleetJob` entries whose callback never arrived.
+    //    Dropping the entry drops its `oneshot::Sender`, waking the
+    //    Phase A await with `RecvError` so it falls through to local.
+    //
+    // 2. `fleet_outbox_sweep_loop` — peer-side outbox transitions + retry.
+    //    Predicate A transitions rows by `expires_at`; Predicate B
+    //    retries `ready` rows whose backoff has elapsed. See
+    //    `pyramid::fleet_outbox_sweep` for the exact state machine.
+    //
+    // Spec ordering: these come up BEFORE warp `start_server` below so
+    // there's no window where dispatch routes accept work that has no
+    // retry machinery attached.
+    {
+        let ctx_clone = Arc::clone(&fleet_dispatch_ctx);
+        tauri::async_runtime::spawn(async move {
+            wire_node_lib::fleet::pending_jobs_sweep_loop(ctx_clone).await;
+        });
+    }
+    {
+        let ctx_clone = Arc::clone(&fleet_dispatch_ctx);
+        let db_path_clone = pyramid_db_path.to_path_buf();
+        tauri::async_runtime::spawn(async move {
+            wire_node_lib::pyramid::fleet_outbox_sweep::fleet_outbox_sweep_loop(
+                db_path_clone,
+                ctx_clone,
+            )
+            .await;
         });
     }
 
@@ -12411,6 +12635,16 @@ fn main() {
                 let server_port = srv_cfg.server_port;
                 let cache_dir = srv_cfg.cache_dir();
                 drop(srv_cfg);
+                // Async fleet dispatch: pull the live overlay off pyramid.config.
+                // Set at startup (Init Ordering step 5); `None` only if that wiring
+                // was bypassed. ServerState is a plain struct, no mutation needed.
+                let fleet_dispatch = server_state
+                    .pyramid
+                    .config
+                    .read()
+                    .await
+                    .fleet_dispatch
+                    .clone();
                 server::start_server(
                     server_port,
                     cache_dir,
@@ -12424,6 +12658,7 @@ fn main() {
                     server_state.partner.clone(),
                     server_state.fleet_roster.clone(),
                     server_state.compute_queue.clone(),
+                    fleet_dispatch,
                 ).await;
             });
 

@@ -3607,6 +3607,7 @@ provider_pools:
     concurrency: 1
 routing_rules:
   - name: ollama-catchall
+    match_config: {}
     route_to:
       - provider_id: fleet
       - provider_id: ollama
@@ -3627,6 +3628,7 @@ routing_rules:
             std::sync::Arc::new(tokio::sync::RwLock::new(crate::tunnel::TunnelState::default()));
         let fleet_dispatch = std::sync::Arc::new(crate::fleet::FleetDispatchContext {
             tunnel_state: tunnel_state_for_dispatch.clone(),
+            fleet_roster: fleet_roster.clone(),
             pending: std::sync::Arc::new(crate::fleet::PendingFleetJobs::new()),
             policy: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::pyramid::fleet_delivery_policy::FleetDeliveryPolicy::default(),

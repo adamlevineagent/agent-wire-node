@@ -118,6 +118,7 @@ pub mod wire_update_poller;
 pub mod yaml_renderer;
 pub mod dispatch_policy;
 pub mod fleet_delivery_policy;
+pub mod fleet_outbox_sweep;
 pub mod prompt_materializer;
 pub mod provider_pools;
 pub mod viz_config;
