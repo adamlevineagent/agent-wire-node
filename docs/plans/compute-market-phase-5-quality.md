@@ -186,19 +186,24 @@ BEGIN
     FOR UPDATE;
 
   IF v_provider_balance >= v_debit_amount THEN
-    -- Provider can cover full clawback
+    -- Provider can cover full clawback — use atomic RPC (balance >= amount precondition satisfied)
     PERFORM debit_operator_atomic(v_job.provider_operator_id, v_debit_amount::BIGINT,
       'compute_clawback', p_verdict_id::text, 'compute_market');
   ELSE
-    -- Provider cannot cover full clawback — debit what's available,
-    -- create negative balance claim for the remainder.
-    -- Provider must clear negative balance before accepting new market jobs.
-    IF v_provider_balance > 0 THEN
-      PERFORM debit_operator_atomic(v_job.provider_operator_id, v_provider_balance,
-        'compute_clawback_partial', p_verdict_id::text, 'compute_market');
-    END IF;
+    -- Provider cannot cover full clawback. The atomic RPC refuses debits that would go below zero.
+    -- P3 fix: use RAW SQL (direct UPDATE + INSERT to ledger) for the partial path, matching the
+    -- pattern used by `settle_compute_job` for Wire platform estimation subsidy. The partial path
+    -- intentionally allows the operator balance to go negative so clawback enforcement is not
+    -- gated by solvency; a `wire_compute_negative_claims` row records the remaining debt and
+    -- blocks re-matching until cleared.
+    UPDATE wire_operators
+      SET credit_balance = credit_balance - v_debit_amount
+      WHERE id = v_job.provider_operator_id;
+    INSERT INTO wire_credits_ledger (operator_id, agent_id, amount, reason, reference_id, balance_after, created_at)
+      VALUES (v_job.provider_operator_id, NULL, -v_debit_amount, 'compute_clawback_partial', p_verdict_id::text,
+              (SELECT credit_balance FROM wire_operators WHERE id = v_job.provider_operator_id), now());
 
-    -- Record the remaining debt
+    -- Record the remaining debt (amount below zero that needs to be recovered before new matches)
     INSERT INTO wire_compute_negative_claims (
       operator_id, job_id, verdict_id, claimed_amount, recovered_amount, created_at
     ) VALUES (
@@ -290,6 +295,18 @@ The existing `wire_challenge_bank` has `is_honeypot = true` for content work (mi
 ### Probe Construction
 
 **New source type for `wire_challenge_bank`:** `compute_probe`
+
+**P3 fix — CHECK constraint prerequisite migration:** `wire_challenge_bank.source_type` has a CHECK constraint from migration `20260311500000` that enumerates the allowed values. Phase 5 must prepend a migration that extends this constraint:
+
+```sql
+ALTER TABLE wire_challenge_bank DROP CONSTRAINT IF EXISTS wire_challenge_bank_source_type_check;
+ALTER TABLE wire_challenge_bank ADD CONSTRAINT wire_challenge_bank_source_type_check
+  CHECK (source_type IN ('content_review', 'factual_recall', ..., 'compute_probe'));
+-- Actual enumerated values must be verified against the deployed constraint at migration-write time;
+-- the set above is illustrative. Never guess — read the deployed CHECK first.
+```
+
+This must land BEFORE any probe INSERT attempts `source_type = 'compute_probe'`, or inserts will fail with `check_violation`.
 
 Each probe contains:
 - `task_payload`: the prompt (carefully constructed to have deterministic-enough outputs)
@@ -497,6 +514,20 @@ The heartbeat response already carries offer status. When a node's heartbeat res
 - New offer creation blocked (checked at offer submission API)
 - Local builds, fleet internal work, and pyramid operations are NOT affected (different slugs)
 
+**P3 fix — staleness sweep must preserve quality-hold statuses.** The Phase 1 `deactivate_stale_compute_offers` function (migration `20260414200000_compute_market_tables.sql`) flips any offer whose node's heartbeat has aged past the threshold to `status = 'offline'`. As-deployed, this would clobber Phase 5's `'quality_hold'`, `'timing_suspended'`, and `'reputation_suspended'` statuses if the held node's heartbeat happens to age out (e.g., provider disconnects mid-hold). Phase 5 must include a migration that redefines `deactivate_stale_compute_offers` with:
+
+```sql
+UPDATE wire_compute_offers SET status = 'offline', updated_at = now()
+WHERE status = 'active'  -- existing filter: only flip active offers
+  AND status NOT IN ('quality_hold', 'timing_suspended', 'reputation_suspended')  -- P3 fix: preserve hold statuses
+  AND node_id IN (
+    SELECT id FROM wire_nodes
+    WHERE last_seen_at < now() - (v_staleness_s || ' seconds')::interval
+  );
+```
+
+(The `status = 'active'` existing filter already excludes hold statuses semantically, since a held offer's status is not `'active'` — but adding the explicit NOT IN guard makes the intent load-bearing in the SQL and protects against any future path that re-activates a held offer without clearing the hold properly.)
+
 ### Hold Clearing
 
 Sequence:
@@ -684,14 +715,20 @@ ORDER BY
 
 ---
 
-## VIII. Observation Aggregation
+## VIII. Offer Observation Sweep
 
 **Audit finding 5c: `wire_compute_offers.observed_*` columns exist but nothing populates them.**
 
-### Aggregation Function
+Per DD-J/CR-4, this function is the **sweep-side** of the observation aggregation split — it writes `wire_compute_offers.observed_*` columns. Distinct from Phase 3's `aggregate_compute_observations_for(node, model, horizon)` read helper. Different names, different signatures, no migration collision.
+
+### Sweep Function
 
 ```sql
-CREATE OR REPLACE FUNCTION aggregate_compute_observations()
+-- P3 fix: observation aggregation AND reputation queries must exclude jobs whose status is
+-- `clawed_back`. A clawed-back job's observation row was from a failed-quality delivery and
+-- should NOT pull the provider's median TPS / p95 latency up. Filter via JOIN against
+-- wire_compute_jobs.status != 'clawed_back' in each subquery.
+CREATE OR REPLACE FUNCTION refresh_offer_observations_sweep()
 RETURNS INTEGER  -- number of offers updated
 LANGUAGE plpgsql SECURITY DEFINER AS $$
 DECLARE
@@ -703,24 +740,30 @@ BEGIN
   LOOP
     UPDATE wire_compute_offers SET
       observed_median_tps = (
-        SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY tokens_per_sec)
-        FROM wire_compute_observations
-        WHERE node_id = v_offer.node_id AND model_id = v_offer.model_id
-          AND created_at > now() - interval '24 hours'
-          AND NOT COALESCE(same_operator, false)
+        SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY obs.tokens_per_sec)
+        FROM wire_compute_observations obs
+        JOIN wire_compute_jobs j ON j.id = obs.job_id
+        WHERE obs.node_id = v_offer.node_id AND obs.model_id = v_offer.model_id
+          AND obs.created_at > now() - interval '24 hours'
+          AND NOT COALESCE(obs.same_operator, false)
+          AND j.status != 'clawed_back'
       ),
       observed_p95_latency_ms = (
-        SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)
-        FROM wire_compute_observations
-        WHERE node_id = v_offer.node_id AND model_id = v_offer.model_id
-          AND created_at > now() - interval '24 hours'
-          AND NOT COALESCE(same_operator, false)
+        SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY obs.latency_ms)
+        FROM wire_compute_observations obs
+        JOIN wire_compute_jobs j ON j.id = obs.job_id
+        WHERE obs.node_id = v_offer.node_id AND obs.model_id = v_offer.model_id
+          AND obs.created_at > now() - interval '24 hours'
+          AND NOT COALESCE(obs.same_operator, false)
+          AND j.status != 'clawed_back'
       ),
       observed_job_count = (
         SELECT COUNT(*)
-        FROM wire_compute_observations
-        WHERE node_id = v_offer.node_id AND model_id = v_offer.model_id
-          AND NOT COALESCE(same_operator, false)
+        FROM wire_compute_observations obs
+        JOIN wire_compute_jobs j ON j.id = obs.job_id
+        WHERE obs.node_id = v_offer.node_id AND obs.model_id = v_offer.model_id
+          AND NOT COALESCE(obs.same_operator, false)
+          AND j.status != 'clawed_back'
       ),
       updated_at = now()
     WHERE node_id = v_offer.node_id AND model_id = v_offer.model_id;
@@ -732,14 +775,16 @@ BEGIN
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION aggregate_compute_observations() TO service_role;
+GRANT EXECUTE ON FUNCTION refresh_offer_observations_sweep() TO service_role;
 ```
+
+**Also apply the `status != 'clawed_back'` filter to the reputation score computation** in §VII (`compute_provider_reputation` function). Clawed-back jobs must not contribute to challenge-rate or probe-pass aggregates used for reputation; the intent is that a clawback removes the job from the provider's quality signal entirely (the challenger's bounty already compensated for the bad delivery, and the provider's reputation hit from the upheld challenge itself is the appropriate cost).
 
 ### Scheduling
 
 Two trigger points:
-1. **pg_cron:** Run every 5 minutes (`SELECT cron.schedule('aggregate_observations', '*/5 * * * *', 'SELECT aggregate_compute_observations()')`)
-2. **Settlement-inline:** Every Nth settlement (N = `observation_aggregation_interval` economic_parameter), call `aggregate_compute_observations()` at the end of `settle_compute_job`. Keeps data fresh during active trading.
+1. **pg_cron:** Run every 5 minutes (`SELECT cron.schedule('refresh_offer_observations', '*/5 * * * *', 'SELECT refresh_offer_observations_sweep()')`)
+2. **Settlement-inline:** Every Nth settlement (N = `observation_aggregation_interval` economic_parameter), call `refresh_offer_observations_sweep()` at the end of `settle_compute_job`. Keeps data fresh during active trading.
 
 ### Column addition for self-dealing exclusion
 
@@ -909,6 +954,86 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION file_compute_challenge(UUID, UUID, TEXT, JSONB) TO service_role;
+```
+
+### Panel Selection RPC (closes open→paneling state transition per DD-N)
+
+`file_compute_challenge` inserts cases at `status='open'`. `resolve_compute_challenge` requires `status='paneling'`. The intermediate transition is owned by this RPC.
+
+```sql
+CREATE OR REPLACE FUNCTION select_adjudication_panel(
+  p_case_id UUID
+) RETURNS TABLE(panelists UUID[])
+LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE
+  v_case wire_compute_challenge_cases%ROWTYPE;
+  v_panelists UUID[];
+BEGIN
+  SELECT * INTO v_case FROM wire_compute_challenge_cases
+    WHERE id = p_case_id AND status = 'open'
+    FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Case not found or not in open status';
+  END IF;
+
+  -- Select v_case.panel_size panelists via a selection query (random, stake-weighted,
+  -- or reputation-filtered — full policy deferred to a Phase 5 economic_parameter;
+  -- initial implementation: random among operators with reputation >= min_reputation_score
+  -- AND credit_balance >= minimum_panelist_stake, excluding requester + provider).
+  SELECT ARRAY_AGG(o.id ORDER BY random())
+    INTO v_panelists
+    FROM wire_operators o
+    WHERE o.credit_balance >= (SELECT (c.structured_data->>'minimum_panelist_stake')::BIGINT
+                                 FROM wire_contributions c
+                                 WHERE c.type = 'economic_parameter'
+                                   AND c.structured_data->>'parameter_name' = 'minimum_panelist_stake'
+                                   AND c.released_at IS NULL
+                                 ORDER BY c.created_at DESC LIMIT 1)
+      AND o.id NOT IN (v_case.challenger_operator_id,
+                       (SELECT provider_operator_id FROM wire_compute_jobs WHERE id = v_case.job_id))
+      -- Reputation filter (when Phase 5 reputation scores available):
+      -- AND compute_provider_reputation(o.id) >= min_reputation_score
+    LIMIT v_case.panel_size;
+
+  IF COALESCE(array_length(v_panelists, 1), 0) < v_case.panel_size THEN
+    RAISE EXCEPTION 'Insufficient eligible panelists for case % (need %, found %)',
+      p_case_id, v_case.panel_size, COALESCE(array_length(v_panelists, 1), 0);
+  END IF;
+
+  -- Persist panelist assignments
+  INSERT INTO wire_compute_challenge_panelists (case_id, panelist_operator_id, assigned_at)
+  SELECT p_case_id, unnest(v_panelists), now();
+
+  -- CAS state transition
+  UPDATE wire_compute_challenge_cases
+    SET status = 'paneling', paneled_at = now()
+    WHERE id = p_case_id AND status = 'open';
+
+  RETURN QUERY SELECT v_panelists;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION select_adjudication_panel(UUID) TO service_role;
+```
+
+**Prerequisite table addition:**
+```sql
+CREATE TABLE wire_compute_challenge_panelists (
+  case_id                  UUID NOT NULL REFERENCES wire_compute_challenge_cases(id) ON DELETE CASCADE,
+  panelist_operator_id     UUID NOT NULL REFERENCES wire_operators(id),
+  assigned_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+  response_submitted_at    TIMESTAMPTZ,
+  PRIMARY KEY (case_id, panelist_operator_id)
+);
+ALTER TABLE wire_compute_challenge_cases ADD COLUMN paneled_at TIMESTAMPTZ;
+```
+
+**Who calls `select_adjudication_panel`?** A Phase 5 API route `POST /api/v1/compute/challenges/:case_id/select-panel`, callable by the Wire platform operator or by a scheduled worker that sweeps open cases. Operator UX flow: challenger files → case is `open` → operator or autoscheduler triggers panel selection (typically within minutes of filing) → case becomes `paneling` → panelists receive in-app notification + have a window to respond → after all responses (or timeout), `resolve_compute_challenge` runs.
+
+**`minimum_panelist_stake` economic_parameter** (seeded Phase 5):
+```yaml
+parameter_name: minimum_panelist_stake
+minimum_panelist_stake: 100      # credits
 ```
 
 ### Challenge Resolution RPC
@@ -1126,7 +1251,7 @@ Phase 6 adds: DADBEAR compiler mappings that use quality signals for autonomous 
 |---|---|---|
 | **5a: Challenge infrastructure incompatible** | New compute-specific challenge system (`wire_compute_challenge_cases`, `wire_compute_challenge_responses`). Existing `wire_challenge_bank` reused only for probe storage (extended with `compute_probe` source type). Adjudication via new RPCs. | II, IX |
 | **5b: No clawback RPC** | Full `clawback_compute_job` RPC with negative balance handling, quality hold trigger, and Graph Fund treatment. | III |
-| **5c: No observation aggregation** | `aggregate_compute_observations()` function with pg_cron scheduling and settlement-inline trigger. Self-dealing exclusion via `same_operator` column. | VIII |
+| **5c: No observation aggregation** | Split into two canonical functions per DD-J/CR-4: Phase 3 ships `aggregate_compute_observations_for(node, model, horizon)` read helper; Phase 5 ships `refresh_offer_observations_sweep()` no-arg sweeper (this phase). pg_cron scheduling + settlement-inline trigger on the sweeper. Self-dealing exclusion via `same_operator` column. | VIII |
 | **5d: Privacy vs evidence tension** | Resolved: timing challenges use metadata only (no privacy issue). Quality challenges require opt-in disclosure with encryption + post-resolution purge. Requester chooses. | II (Privacy vs Evidence) |
 | **5e: No proactive detection until Phase 8** | Compute honeypots extending existing `wire_challenge_bank` pattern. Wire dispatches known-answer test jobs. Failure triggers escalation. | IV |
 | **5f: No challenge staking** | Stake proportional to `actual_cost` with economic_parameter multiplier and floor. DD-9 pattern applied. Rejected challenges forfeit stake to provider. | II (Filing), IX |
@@ -1185,11 +1310,36 @@ Column additions (2 tables):
 
 New RPCs (6):
 - `file_compute_challenge(UUID, UUID, TEXT, JSONB)`
+- `select_adjudication_panel(UUID)` — NEW per DD-N, closes open→paneling gap
 - `resolve_compute_challenge(UUID)`
-- `clawback_compute_job(UUID, UUID)`
+- `clawback_compute_job(UUID, UUID)` — canonical per DD-J (architecture §IX deletes its stale parallel version)
 - `compute_provider_reputation(UUID, TEXT)`
-- `aggregate_compute_observations()`
+- `refresh_offer_observations_sweep()` — the no-arg sweeper that updates `wire_compute_offers.observed_*` columns. The per-node/per-model read helper is `aggregate_compute_observations_for(node_id, model_id, horizon)` owned by Phase 3. Two distinct functions per DD-J / CR-4.
 - Timing anomaly detection (inline in `settle_compute_job` — modification, not new RPC)
 
-Offer status additions:
-- `wire_compute_offers.status` CHECK expansion: add `'quality_hold'`, `'timing_suspended'`, `'reputation_suspended'`
+Status CHECK constraints (per DD-L — neither column currently has a CHECK; Phase 5 adds them covering all values):
+
+```sql
+ALTER TABLE wire_compute_jobs
+  ADD CONSTRAINT wire_compute_jobs_status_check
+  CHECK (status IN (
+    'reserved', 'filled', 'executing', 'completed',
+    'failed', 'cancelled', 'void', 'clawed_back'
+  ));
+
+ALTER TABLE wire_compute_offers
+  ADD CONSTRAINT wire_compute_offers_status_check
+  CHECK (status IN (
+    'active', 'inactive', 'offline',
+    'suspended',           -- Phase 6 steward pause
+    'quality_hold',        -- upheld-challenge hold
+    'timing_suspended',    -- timing-anomaly hold
+    'reputation_suspended' -- reputation-threshold hold
+  ));
+```
+
+Prerequisite: the cleanup migration `deactivate_stale_compute_offers` must be updated (Phase 5 has this listed elsewhere) to preserve the hold statuses when flipping stale offers to `'offline'`.
+
+Prerequisite table additions (from DD-N panel selection):
+- `wire_compute_challenge_panelists` — per-case panelist assignments
+- `wire_compute_challenge_cases` gains `paneled_at TIMESTAMPTZ`

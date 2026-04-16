@@ -1,9 +1,28 @@
 # Relay Market Plan
 
-**Date:** 2026-04-13
+**Original draft:** 2026-04-13
+**Last revision:** 2026-04-16 (post-audit unification pass)
 **Scope:** The relay network — all Wire data transport flows node-to-node through requester-chosen relay chains. The Wire is pure control plane. Structural privacy through topology ambiguity, distributional opacity, and tunnel rotation.
-**Prerequisites:** Compute market Phase 2 ships first (exchange infrastructure, rotator arm, matching RPCs). Storage market Phase S1 ships first (settlement with market pricing).
-**Companion docs:** `wire-compute-market-build-plan.md`, `storage-market-conversion-plan.md`, `docs/architecture/wire-market-privacy-tiers.md`
+**Prerequisites:** Compute market Phase 2 ships first (exchange infrastructure + `fill_compute_job` relay_count param). Storage market Phase S1 ships first (settlement pattern + pull routing). DD-A slug `market:relay` applied throughout.
+**Companion docs:** `compute-market-architecture.md` §III (canonical privacy model), `compute-market-architecture.md` §VIII.6 (DD-A through DD-O decisions), `storage-market-conversion-plan.md`, `async-fleet-dispatch.md` (transport scaffolding), `fleet-mps-build-plan.md` (participation policy canonical with `allow_relay_serving` + `allow_relay_usage`), `GoodNewsEveryone/docs/architecture/wire-compute-privacy-tiers.md` (SOTA canonical).
+
+---
+
+## 2026-04-16 Unification Pass — What's Canonical Where
+
+The 2026-04-13 draft of this plan was already the closest-to-SOTA of the three market plans — variable relay count + distributional opacity + tunnel rotation was canonical from the original. The 2026-04-16 audit landed a handful of alignment fixes:
+
+- **Nomenclature clarified (DD-A, DD-B):** "Wire-proxied at launch" framing is replaced by "Wire-as-bootstrap-relay" — the protocol shape is identical in both modes; only the `callback_url` / `next_hop` values change as non-Wire relay nodes come online. Phase R1 is about other nodes deploying the relay endpoint code so the Wire can exit bootstrap. Slug canonical: `market:relay`. `CallbackKind::Relay` per DD-B (shipped code variant; no rename).
+- **Scaffolding reuse (DD-D, DD-E):** Relay identity verifier = `verify_relay_identity` at `pyramid/relay_identity.rs` (parallel to `fleet_identity.rs`, `aud: "relay"`). Operational policy = `relay_delivery_policy` contribution (forward timeout, max concurrent relays, drain grace — parallel to `fleet_delivery_policy` / `market_delivery_policy`; rotation-cadence fields stay on `privacy_policy`, see below). Relay is STREAMING, not outbox-batched — no outbox for relay itself; body §VI.2 shows the pipe-bytes pattern.
+- **Participation policy (DD-I):** Full 10-field canonical list lives in `fleet-mps-build-plan.md`. Storage and relay do NOT introduce parallel contributions. `allow_relay_serving` gates offer publication + forward acceptance. `allow_relay_usage` gates the requester's `relay_count` request being honored (worker-mode with `allow_relay_usage: false` goes direct 0-relay).
+- **Relay offer derivation:** Relay offers on the Wire derive directly from the `relay_pricing` contribution (pricing/strategy) + runtime capacity state on `RelayMarketState` (`max_concurrent_relays`, `current_active_relays`, observed quality metrics). The fleet-MPS `ServiceDescriptor` / `AvailabilitySnapshot` pattern is compute-specific; relay does NOT introduce a parallel descriptor type. Offers are updated on each heartbeat (observed quality) and on each pricing-contribution supersession.
+- **DADBEAR integration:** Per-hop observation events (`relay_hop_started`, `relay_hop_completed`, `relay_hop_failed`). Aggregated-window DADBEAR work items for decisions (`relay_pricing_adjust`, `relay_capacity_adjust`). Breaker holds on `market:relay` slug stop relay serving without affecting compute/storage on the same node.
+- **TunnelUrl (DD-D):** Every URL field in onion token layers, offer rows, next_hop references, rotation state uses `TunnelUrl::parse` at ingress. Rotation state struct uses `TunnelUrl`, not `String` (§VI.3 corrected in-body; the 2-line change below).
+- **Rotation param ownership (OB-5 resolution):** Fields split deliberately — `privacy_policy` owns `tunnel_rotation_interval_s` + `tunnel_drain_grace_s` (requester-affecting cadence fields, per compute-market-architecture §III). `relay_delivery_policy` owns `forward_timeout_secs`, `max_concurrent_relays`, operational backoff (operator-affecting operational timing). No overlap.
+- **Pillar 37:** Every timing constant in relay code reads from `relay_delivery_policy` or `privacy_policy`. No hardcoded seconds/counts.
+- **Payload-agnostic chain:** Same onion-wrapped token carries compute prompts AND storage document bodies (R2). `target_path` in the innermost layer is per-market (`/v1/compute/job-dispatch` for compute; `/v1/storage/pull` for storage). §II onion layer spec updated to reflect this.
+
+All body sections below are canonical for their topic; no overlay-vs-body split.
 
 ---
 
@@ -186,7 +205,7 @@ When `relay_count: 0`:
 The Wire picks N relay nodes with these constraints:
 1. Each relay from a DIFFERENT operator (no single-operator chain)
 2. All relay operators different from requester AND provider operators
-3. Active status, fresh heartbeat (<2 minutes)
+3. Active status, fresh heartbeat (per `staleness_thresholds.heartbeat_staleness_s` economic_parameter — not a hardcoded minute count)
 4. Sufficient bandwidth capacity (concurrent_relays < max)
 5. Ordered by: reliability first, then cheapest (privacy integrity > cost)
 
@@ -243,7 +262,7 @@ BEGIN
   SELECT o.id INTO v_wire_platform_operator_id FROM wire_operators o
     JOIN wire_agents a ON a.operator_id = o.id
     JOIN wire_handles h ON h.agent_id = a.id
-    WHERE h.handle = 'agentwireplatform' AND h.status = 'active' LIMIT 1;
+    WHERE h.handle = 'agentwireplatform' AND h.released_at IS NULL LIMIT 1;  -- DD-K
 
   -- Debit the escrow (Wire platform holds the pre-paid relay fees)
   PERFORM debit_operator_atomic(v_wire_platform_operator_id, p_matched_rate,
@@ -429,7 +448,14 @@ BEGIN
         FROM wire_relay_offers r
         JOIN wire_nodes n ON n.id = r.node_id
         WHERE r.status = 'active'
-          AND n.last_seen_at > now() - interval '2 minutes'
+          -- Pillar 37: staleness threshold from economic_parameter contribution (DD-K style)
+          AND n.last_seen_at > now() - (
+                (SELECT COALESCE((c.structured_data->>'heartbeat_staleness_s')::INTEGER, 300)
+                   FROM wire_contributions c
+                   WHERE c.type = 'economic_parameter'
+                     AND c.structured_data->>'parameter_name' = 'staleness_thresholds'
+                     AND c.released_at IS NULL
+                   ORDER BY c.created_at DESC LIMIT 1) || ' seconds')::interval
           AND r.current_active_relays < r.max_concurrent_relays
           AND r.operator_id != ALL(v_excluded_operators)
     ),
@@ -513,13 +539,15 @@ async fn handle_relay_forward(
 
 ```rust
 pub struct TunnelRotationState {
-    pub current_tunnel_url: String,
-    pub rotation_interval_s: u64,        // from contribution
-    pub drain_grace_s: u64,              // from contribution
-    pub last_rotated_at: Option<String>,
-    pub previous_tunnel_url: Option<String>,  // kept alive during drain period
+    pub current_tunnel_url: TunnelUrl,                // per DD-D: TunnelUrl newtype, not raw String
+    pub previous_tunnel_url: Option<TunnelUrl>,       // kept alive during drain period
+    pub rotation_interval_s: u64,                     // from privacy_policy contribution
+    pub drain_grace_s: u64,                           // from privacy_policy contribution
+    pub last_rotated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 ```
+
+**Field ownership:** `rotation_interval_s` and `drain_grace_s` are rotation-cadence fields on `privacy_policy` (the requester's privacy decision, not a relay operator decision). `max_concurrent_relays` / `forward_timeout_secs` / backoff knobs are on `relay_delivery_policy` (operator decision). See the 2026-04-16 unification note above for the ownership split rationale.
 
 Rotation loop in `main.rs`:
 1. Check if `elapsed > rotation_interval_s`

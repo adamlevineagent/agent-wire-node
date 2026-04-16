@@ -73,9 +73,9 @@ Phase 1 (shipped) ──→ Phase 2 (Exchange) ──→ Phase 3 (Settlement) �
 |---|---|---|---|
 | ACK+async result delivery | Phase 2 or 3 (TODO in server.rs) | Phase 3 (all market jobs) | Cloudflare 524 on any job >120s. Market unusable for large models. |
 | `start_compute_job` RPC (filled->executing transition) | Phase 2 or 3 | Phase 3 settlement (checks `status='executing'`) | Settlement rejects ALL jobs. No completed jobs, no revenue. |
-| `cancel_compute_job` RPC | Phase 2 or 3 | Phase 3 (requester cancellation path) | Requester can't cancel. Paid reservation + deposit stuck forever. |
+| `cancel_compute_job` RPC | **Phase 3** (P1 fix from 2026-04-15 audit — refund logic builds on Phase 3's settlement patterns, not Phase 2) | Phase 3 (requester cancellation path) | Requester can't cancel. Paid reservation + deposit stuck forever. |
 | Observation aggregation function | Phase 3 | Phase 5 (reputation signals) | Phase 5 has no performance data to enforce quality. Blind. |
-| `select_relay_chain` stub | Phase 2 | Phase 3 fill RPC | fill_compute_job crashes on relay_count > 0. Must stub to reject >0 at launch. |
+| Inline `relay_count > 0` rejection in `fill_compute_job` | Phase 2 migration | Phase 3 fill path | Without the rejection, Phase 2 fill crashes trying to call a nonexistent `select_relay_chain`. Per DD-J: no separate `select_relay_chain` function at compute launch — rejection lives inline in the fill body. The function itself is owned by the relay market plan and ships when relay market ships. |
 | `requester_operator_id != provider_operator_id` check | Phase 2 matching | Phase 5 (reputation integrity) | Self-dealing inflates reputation. Phase 5 builds on poisoned data. |
 | `cloud_relay` privacy indicator on bridge offers | Phase 4 | Phase 5 (quality enforcement) | Quality probes can't distinguish bridge vs local. Wrong thresholds applied. |
 
@@ -108,7 +108,7 @@ Phase 1 (shipped) ──→ Phase 2 (Exchange) ──→ Phase 3 (Settlement) �
 | T3 | FILLED | EXECUTING | Provider node | **NOT YET DEFINED.** Needs `start_compute_job` RPC or node-side status update pushed to Wire. The GPU loop on the provider must signal "I started this job." | **Must be built in Phase 2 or 3.** This is the audit finding: settle checks for `status='executing'` but nothing produces it. | `dispatched_at` timestamp set. Chronicle event `market_started`. DADBEAR work item status updated. | If the provider never signals start, the job sits in FILLED until timeout sweep catches it. Sweep calls fail_compute_job, deposit refunded. |
 | T4 | EXECUTING | COMPLETED | Provider node | `settle_compute_job` RPC, called from `POST /api/v1/compute/settle` (provider reports completion) | Phase 1 migration (RPC exists). Phase 3 wires the provider-side settlement reporting. | Actual cost calculated from measured tokens. Rotator determines recipient (provider 76/80, Wire 2/80, GF 2/80). Provider paid. Requester refunded overage (or Wire absorbs underage). Observation recorded. Queue depth decremented. Chronicle event `market_settled`. | Settlement RPC failure: job stays EXECUTING. **Critical cascade:** Provider did the work but isn't paid. Must retry. Phase 3 must specify local settlement retry queue. |
 | T5 | RESERVED | VOID | Provider node (GPU loop) | `void_compute_job` RPC, called from `POST /api/v1/compute/void` | Phase 1 migration (RPC exists). Phase 2 wires the GPU loop void path. | No deposit to refund (none was charged). Reservation fee stays with provider. Queue depth decremented. Chronicle event `market_voided`. | If void report fails, the reservation stays in queue. Timeout sweep will eventually catch it via T7. |
-| T6 | RESERVED or FILLED | CANCELLED | Requester | `cancel_compute_job` RPC, called from `POST /api/v1/compute/cancel` | **Must be built in Phase 2 or 3.** Audit finding: RPC not defined. | Deposit refunded to requester (if filled). Reservation fee stays with provider. Queue depth decremented. Provider notified to discard job. Chronicle event `market_cancelled`. | If cancel fails, job continues to execute. Not a critical failure (job completes normally, requester just can't abort). |
+| T6 | RESERVED or FILLED | CANCELLED | Requester | `cancel_compute_job` RPC, called from `POST /api/v1/compute/cancel` | **Phase 3** (P1 from 2026-04-15 audit). Ownership clarified: cancel RPC ships in Phase 3 alongside settlement, because refund logic reuses Phase 3 settlement patterns. | Deposit refunded to requester (if filled). Reservation fee stays with provider. Queue depth decremented. Provider notified to discard job. Chronicle event `market_cancelled`. | If cancel fails, job continues to execute. Not a critical failure (job completes normally, requester just can't abort). |
 | T7 | EXECUTING or FILLED | FAILED | Wire (timeout sweep) OR provider (error report) | `fail_compute_job` RPC, called from `sweep_timed_out_compute_jobs` or `POST /api/v1/compute/fail` | Phase 1 migration (RPC exists). Phase 2/3 wires the timeout sweep scheduling + provider error reporting. | Deposit refunded to requester. Reservation fee stays with provider. Failure observation recorded (0 tokens, 0 latency — impacts provider metrics). Queue depth decremented. Chronicle event `market_failed`. | If fail RPC itself fails: job stays in limbo. Timeout sweep is idempotent and retries on next cycle (SKIP LOCKED prevents contention). |
 | T8 | COMPLETED | CHALLENGED | Requester (via challenge infrastructure) | Challenge panel submission (Pillar 24 existing infrastructure extended to compute) | Phase 5 | Challenge evidence submitted (timing anomaly, quality evidence per privacy-respecting protocol). Challenge stake locked (proportional to job actual_cost). DADBEAR breaker hold placed on provider's market participation. | Challenge submission failure: requester retries. No credits at risk until challenge is accepted. |
 | T9 | CHALLENGED | CLAWBACK | Challenge panel resolution | `clawback_compute_job` RPC (Phase 5 — new, not yet defined) | Phase 5 | Provider's earned credits debited. Graph Fund treatment determined. Challenger bounty paid from clawed-back amount. Provider reputation scored. DADBEAR breaker hold cleared or escalated. | Clawback from provider with insufficient balance: negative balance allowed? Or capped at available? Phase 5 must define. |
@@ -165,9 +165,11 @@ The tables and core RPCs already exist from Phase 1 migrations. Phase 2 Wire wor
 
 New migration(s) required:
 1. `start_compute_job()` RPC — transitions FILLED -> EXECUTING. Sets `dispatched_at = now()`. The settle RPC checks for this status.
-2. `cancel_compute_job()` RPC — transitions RESERVED|FILLED -> CANCELLED. Refunds deposit if filled. Decrements queue depth.
-3. Read `select_relay_chain` stub — returns empty result set, rejects relay_count > 0 with informative error.
-4. Self-dealing guard: ALTER `match_compute_job` to add `AND v_offer.operator_id != p_requester_operator_id` in the offer selection query.
+2. Inline `relay_count > 0` rejection in the extended `fill_compute_job` body (per DD-J — no separate `select_relay_chain` function at launch; function is owned by relay market plan).
+3. Self-dealing guard: ALTER `match_compute_job` to add `AND v_offer.operator_id != p_requester_operator_id` in the offer selection query.
+4. Audit fixes on Phase 1 RPCs: add `AND model_id = v_job.model_id` to the queue-decrement `UPDATE wire_compute_queue_state` in `settle_compute_job`, `fail_compute_job`, and `void_compute_job`. Remove the duplicate Wire-platform-operator resolution inside `settle_compute_job`'s `v_requester_adj < 0` branch (the top-of-function resolution is sufficient).
+
+**P1 correction:** `cancel_compute_job` is **not** a Phase 2 migration. It moves to Phase 3 (refund logic builds on Phase 3 settlement patterns). Removed from this list.
 
 **FK Dependency:** None new. Phase 2 migrations only add RPCs that reference Phase 1 tables (already exist).
 
@@ -176,8 +178,12 @@ New migration(s) required:
 No new tables. RPCs already exist (settle, fail, void from Phase 1).
 
 New migration(s) required:
-1. Observation aggregation function: `aggregate_compute_observations(p_node_id, p_model_id)` — computes median, p25, p75, p95 across time horizons. Updates `wire_compute_offers.observed_*` columns. Can be called from settlement or on schedule.
-2. Update `fill_compute_job` return type if relay chain routing info needs to be added (currently returns deposit_charged and estimated_output_tokens; plan spec returns relay_chain + provider_ephemeral_pubkey — but these are Wire-internal, not persisted, so handled in the API route, not the RPC).
+1. `cancel_compute_job()` RPC — transitions RESERVED|FILLED -> CANCELLED. Refunds deposit if filled. Decrements queue depth. Canonical location: Phase 3 §II (per DD-J).
+2. Observation aggregation — SPLIT into two functions per DD-J/CR-4:
+   - `aggregate_compute_observations_for(p_node_id UUID, p_model_id TEXT, p_horizon_hours INTEGER) RETURNS TABLE(...)` — per-node/per-model read helper. Called by heartbeat + market-surface. Phase 3-owned.
+   - `refresh_offer_observations_sweep() RETURNS INTEGER` — no-arg sweeper that writes `wire_compute_offers.observed_*` columns. Phase 5-owned (ships in Phase 5 migration, not Phase 3).
+   Distinct names, distinct signatures, no migration collision.
+3. `settle_compute_job` return type: **canonical `RETURNS TABLE(actual_cost INTEGER, provider_payout INTEGER, requester_adjustment INTEGER)`** — matches deployed Phase 1. Any description as returning void is stale.
 
 **FK Dependency:** `wire_compute_observations.job_id` references `wire_compute_jobs.id` (both Phase 1 — already exist). Phase 3 populates observations via the settlement path. No new FK constraints.
 
@@ -194,18 +200,27 @@ New migration(s) required:
 
 ### Phase 5 (Quality) — Wire-Side Migrations Needed
 
+**P1 canonical table names (from 2026-04-15 audit):** The Phase 5 doc is canonical. Earlier versions of this seams doc used `wire_compute_challenges` / `wire_compute_challenge_stakes`; those names are wrong. Canonical Phase 5 table set:
+
 New tables required:
-1. `wire_compute_challenges` — challenge records referencing `wire_compute_jobs.id`
-2. `wire_compute_challenge_stakes` — locked stakes for challengers and challenged providers
-3. `wire_compute_reputation` — aggregated reputation scores per (node_id, model_id)
+1. `wire_compute_challenge_cases` — challenge records referencing `wire_compute_jobs.id`
+2. `wire_compute_challenge_responses` — panelist responses per challenge case
+3. `wire_compute_probe_results` — proactive honeypot probe outcomes (references `wire_challenge_bank.id`)
+4. `wire_compute_negative_claims` — outstanding clawback debt when provider balance < clawback amount
 
-New RPCs required:
-1. `clawback_compute_job()` — debit provider, pay challenger bounty, handle negative balance
-2. `file_compute_challenge()` — create challenge, lock stake, place DADBEAR breaker hold
-3. `resolve_compute_challenge()` — adjudicate, distribute stakes, update reputation
-4. `aggregate_compute_reputation()` — recompute reputation from challenge outcomes + observations
+Prerequisite ALTER: `wire_challenge_bank` CHECK constraint on `source_type` must be extended to include `'compute_probe'` (P3 mechanism gap — see Phase 5 §IV).
 
-**FK Dependency:** `wire_compute_challenges.job_id` references `wire_compute_jobs.id` (Phase 1). `wire_compute_challenge_stakes.challenge_id` references `wire_compute_challenges.id` (same Phase 5 migration). `wire_compute_reputation.node_id` references `wire_nodes.id` (pre-existing).
+New RPCs required (canonical names per Phase 5 doc):
+1. `clawback_compute_job(p_job_id, p_verdict_id)` — debit provider (raw SQL in partial path, atomic RPC in full-balance path), pay challenger bounty, handle negative-balance claim
+2. `file_compute_challenge(p_job_id, p_challenger_operator_id, p_challenge_type, p_evidence)` — create challenge case, lock stake via `debit_operator_atomic`, place DADBEAR breaker hold. Then `select_adjudication_panel(p_case_id)` transitions `open → paneling` (per DD-N — closes the state-machine gap).
+3. `resolve_compute_challenge(p_case_id, p_verdict)` — adjudicate from panelist responses, distribute stakes, calls `clawback_compute_job` if upheld
+4. `compute_provider_reputation(p_node_id, p_model_id)` — reads challenge outcomes + probe results + observations; returns reputation score
+
+**P1 correction:** The `aggregate_compute_reputation()` RPC previously listed here does NOT exist in the Phase 5 doc and is not needed. Reputation is computed on-read via `compute_provider_reputation`, not aggregated into a dedicated table. Removed from this list.
+
+Migration must also UPDATE `deactivate_stale_compute_offers` to preserve `quality_hold` / `timing_suspended` / `reputation_suspended` statuses (P3 — see Phase 5 §VI).
+
+**FK Dependency:** `wire_compute_challenge_cases.job_id` references `wire_compute_jobs.id` (Phase 1). `wire_compute_challenge_responses.case_id` references `wire_compute_challenge_cases.id` (same Phase 5 migration). `wire_compute_probe_results.challenge_id` references `wire_challenge_bank.id` (pre-existing). `wire_compute_negative_claims.operator_id` references `wire_operators.id` (pre-existing).
 
 ### Phase 6 (Intelligence) — Wire-Side Migrations Needed
 
@@ -225,25 +240,39 @@ ALREADY APPLIED:
   20260415100000_node_identity.sql             ← node handles, operator_id
 
 PHASE 2 (must apply before Phase 2 node work):
-  2026MMDD_phase2_exchange_rpcs.sql            ← start_compute_job, cancel_compute_job,
-                                                  select_relay_chain stub,
-                                                  match_compute_job self-dealing guard
+  2026MMDD_phase2_exchange_rpcs.sql            ← start_compute_job,
+                                                  fill_compute_job signature extension
+                                                  (+ relay_count inline rejection, + requester_operator_id,
+                                                   return provider_node_id; per DD-J: no select_relay_chain),
+                                                  match_compute_job self-dealing guard,
+                                                  model_id filter fix on queue decrements
+                                                  (settle/fail/void), duplicate operator
+                                                  resolution removal in settle,
+                                                  fill_job_ttl_secs + max_completion_token_ratio seeds,
+                                                  market_delivery_policy seed YAML
 
 PHASE 3 (must apply before Phase 3 node work):
-  2026MMDD_phase3_observation_aggregation.sql  ← aggregate_compute_observations function
+  2026MMDD_phase3_settlement_extensions.sql    ← cancel_compute_job RPC (canonical per DD-J),
+                                                  aggregate_compute_observations_for(node, model, horizon)
+                                                  read helper (Phase 3-owned; distinct from the
+                                                  Phase 5-owned refresh_offer_observations_sweep())
 
 PHASE 4 (must apply before Phase 4 node work):
   2026MMDD_phase4_bridge_columns.sql           ← bridge_dollar_cost, bridge_openrouter_model,
                                                   privacy_capabilities update
 
 PHASE 5 (must apply before Phase 5 node work):
-  2026MMDD_phase5_quality_tables.sql           ← wire_compute_challenges,
-                                                  wire_compute_challenge_stakes,
-                                                  wire_compute_reputation
+  2026MMDD_phase5_challenge_bank_extend.sql    ← ALTER wire_challenge_bank CHECK: +'compute_probe'
+  2026MMDD_phase5_quality_tables.sql           ← wire_compute_challenge_cases,
+                                                  wire_compute_challenge_responses,
+                                                  wire_compute_probe_results,
+                                                  wire_compute_negative_claims
   2026MMDD_phase5_quality_rpcs.sql             ← clawback_compute_job,
                                                   file_compute_challenge,
                                                   resolve_compute_challenge,
-                                                  aggregate_compute_reputation
+                                                  compute_provider_reputation,
+                                                  deactivate_stale_compute_offers update
+                                                  (preserve hold statuses)
 
 PHASE 6 (must apply before Phase 6 node work):
   2026MMDD_phase6_intelligence.sql             ← steward_publication type,
@@ -290,9 +319,9 @@ Wire-side:
 1. API routes: `POST /api/v1/compute/offers`, `POST /api/v1/compute/match`, `POST /api/v1/compute/fill`, `POST /api/v1/compute/queue-state`, `GET /api/v1/compute/market-surface`
 2. Heartbeat extension: `compute_market` section in heartbeat response
 3. `start_compute_job` RPC (FILLED -> EXECUTING transition)
-4. `cancel_compute_job` RPC (RESERVED|FILLED -> CANCELLED)
-5. `select_relay_chain` stub (reject relay_count > 0)
-6. Self-dealing guard on match_compute_job
+4. `fill_compute_job` signature extension (+ relay_count inline rejection, + requester_operator_id, return provider_node_id) per DD-J/DD-G
+5. Self-dealing guard on match_compute_job
+6. `cancel_compute_job` moves to Phase 3 per DD-J (not in Phase 2 Wire scope)
 
 Frontend:
 1. `ComputeOfferManager.tsx` — create/edit offers
@@ -462,7 +491,7 @@ New result application paths:
 | `wire_compute_queue_state` row | Phase 1 (table), Phase 2 (mirror push writes) | Phase 2 (mirror push loop), continuously updated | Phase 2 (matching uses queue depth), Phase 6 (utilization analysis) | Node pushes to Wire via `POST /api/v1/compute/queue-state`. Wire stores latest per (node, model). Staleness checked at match time (2-min cutoff from `staleness_thresholds` contribution). |
 | DADBEAR work items | Phase 1 (DADBEAR architecture) | Phase 2 (provider side), Phase 3 (requester side), Phase 4 (bridge source) | All phases | Local SQLite on each node. Work items have `source` field distinguishing `local`, `market_received`, `fleet_received`, `bridge`. DADBEAR supervisor recovers in-flight items on restart. |
 | Chronicle events | Phase 1 (Chronicle architecture, 9 types) | Phase 2 (+market_received, market_offered), Phase 3 (+market_settled, market_failed, market_voided), Phase 4 (+bridge_*) | Phase 5 (timing evidence), Phase 6 (health monitoring) | Local SQLite `pyramid_compute_events` table. 17 columns, 6 indexes. Events carry `work_item_id` and `attempt_id` for DADBEAR correlation. |
-| Reputation scores | N/A | Phase 5 (computed from challenges + observations) | Phase 6 (steward provider selection) | Wire-side computed views or `wire_compute_reputation` table. Phase 6 reads via API. |
+| Reputation scores | N/A | Phase 5 (computed from challenges + observations) | Phase 6 (steward provider selection) | Computed on-read via `compute_provider_reputation(node_id, model_id)` function — no dedicated reputation table. Reads `wire_compute_challenge_cases`, `wire_compute_probe_results`, and aggregated observation columns. Phase 6 calls via API. |
 | Quality holds | N/A | Phase 5 (placed on challenge, cleared on resolution) | Phase 6 (blocks work item dispatch) | Two paths: (1) Wire-side offer status change (active -> held), propagated to node via heartbeat. (2) DADBEAR breaker hold placed locally, blocking dispatch. Both paths must agree. |
 | Steward publications | N/A | Phase 6 (published as Wire contributions) | Phase 6 (other nodes read via subscription) | Standard `wire_contributions` rows with `type: 'steward_publication'`. Cross-node via Wire query/subscription. |
 | Economic parameter contributions | Phase 1 (5 seeds) | Phase 6 (steward supersedes parameters) | All phases (rotator reads slot counts, match reads staleness, fill reads deposit config) | Wire-side `wire_contributions` with `type: 'economic_parameter'`. Supersedable. All RPCs read latest active contribution at call time. |
@@ -624,3 +653,128 @@ New result application paths:
 - [ ] Compiler mappings produce work items (model_portfolio_eval, pricing_adjustment, market_depth_adjustment)
 - [ ] Result application: Ollama load/unload works, pricing contribution supersession works, experiment publication works
 - [ ] Management LLM calls (sentinel 2b model) can access GPU without starving market jobs (queue bypass or dedicated slot resolved)
+
+---
+
+## VIII. Cross-Market Seams (Compute ↔ Storage ↔ Relay)
+
+**Added 2026-04-16 as part of the three-market expansion.** The compute market was planned first and much of the shared infrastructure lives in compute's Phase 1 migration, but it is designed to serve storage and relay equally. This section documents what crosses market boundaries and what must be coordinated across the three build plans.
+
+### Shared Wire-Side Infrastructure
+
+All three markets share one set of foundational primitives. These exist in the Phase 1 compute migration but they are NOT compute-exclusive:
+
+| Primitive | Source Migration | Used By | Per-Market Extension |
+|---|---|---|---|
+| `wire_market_rotator` table | Phase 1 compute | Compute + Storage + Relay | `market_type` column distinguishes. Each settlement writes its market type. |
+| `advance_market_rotator()` function | Phase 1 compute | All three | No extension — function is market-agnostic. |
+| `market_rotator_recipient()` function | Phase 1 compute | All three | No extension — reads from shared `market_rotator_config` contribution. |
+| `market_rotator_config` seed (80 slots, 76/2/2) | Phase 1 compute | All three | No extension — shared configuration. |
+| `wire_graph_fund.source_type` CHECK | Phase 1 compute prerequisites | All three | Already extended for five values: `compute_service`, `compute_reservation`, `storage_serve`, `hosting_grant`, `relay_hop`. NO additional migrations to extend this constraint — Phase 1 handled all three markets prospectively. |
+| `agentwireplatform` + `agentwiregraphfund` system entities | Phase 1 compute prerequisites | All three | No extension. |
+| `staleness_thresholds` seed (`heartbeat_staleness_s`, `queue_mirror_staleness_s`) | Phase 1 compute | Compute + Storage | Relay may add its own staleness (`relay_offer_staleness_s`) via supersession or new seed. |
+| `relay_performance_floor` seed | Phase 1 compute | Relay only | Already seeded for relay; no extension. |
+| `credit_operator_atomic` / `debit_operator_atomic` RPCs | Pre-existing (migration `20260315400000`) | All three | No extension. |
+
+**Implication:** Storage and relay migrations do NOT re-declare these. They reference them. The "prerequisites migration" that extended `wire_graph_fund` CHECK + created rotator infrastructure is a one-time setup that benefits all three markets.
+
+### Shared Node-Side Scaffolding (async-fleet-dispatch)
+
+The transport layer is shared:
+
+| Primitive | Source | Used By | Per-Market Specialization |
+|---|---|---|---|
+| `TunnelUrl` newtype | async-fleet-dispatch Phase 1 | All URL fields everywhere | None — one shared type. |
+| `FleetIdentity` verifier pattern | async-fleet-dispatch Phase 1 | Each market uses parallel | `MarketIdentity` (aud `compute`), `StorageIdentity` (aud `storage`), `RelayIdentity` (aud `relay`). Same struct shape, different aud claims. One verifier per market. |
+| Outbox table pattern (`expires_at` + `worker_heartbeat_at` + CAS) | async-fleet-dispatch Phase 2 | Compute + Storage (both reuse it). Relay does not use an outbox (streaming). | **Per DD-D: ONE shared `fleet_result_outbox` table.** The `callback_kind` column discriminates `'Fleet'` (fleet-internal), `'MarketStandard'` (compute Phase 2+3), `'Relay'` (compute Phase 3 relay-tier). Storage S1 also uses the same table for settlement retry (if it needs durability). No parallel `compute_result_outbox` or `storage_result_outbox` — naming those tables in any spec is a bug that contradicts DD-D. The 14 existing CAS helpers at `db.rs:2332-2655` handle all variants uniformly. |
+| Operational-policy contribution pattern | async-fleet-dispatch (`fleet_delivery_policy`) | All three | `fleet_delivery_policy` + `market_delivery_policy` + `storage_delivery_policy` + `relay_delivery_policy`. Parallel contributions, same loader machinery, same hot-reload behavior. |
+| `FleetDispatchContext` Arc bundle discipline | async-fleet-dispatch Phase 1 | Each market has its own `XDispatchContext` | One Arc bundle per market, each containing its own `pending` map + `policy` RwLock. The `tunnel_state` handle is shared (borrowed from `AppState`). |
+| `CallbackKind` enum | async-fleet-dispatch Phase 2 | All three | Shipped variants: `Fleet { dispatcher_nid }` (fleet-internal), `MarketStandard` (covers launch bootstrap + future 0-relay direct — same variant, different `callback_url` over time), `Relay` (N-relay chain). See DD-B in architecture §VIII.6 — no rename, docs match shipped code. |
+
+### Shared Participation Policy
+
+One `compute_participation_policy` contribution carries fields for all three markets (not three separate contributions):
+
+```yaml
+schema_type: compute_participation_policy
+mode: coordinator | hybrid | worker
+allow_fleet_dispatch: bool
+allow_fleet_serving: bool
+allow_market_dispatch: bool         # compute market — Phase 3
+allow_market_visibility: bool       # compute market — Phase 2
+allow_storage_hosting: bool         # storage market — S1
+allow_storage_pulling: bool         # storage market — S1
+allow_relay_serving: bool           # relay market — R1
+allow_relay_usage: bool             # relay market — R1
+allow_serving_while_degraded: bool
+```
+
+The three-state UI (Coordinator/Hybrid/Worker) is a projection over these booleans. Each phase doc specifies which field(s) it consumes — no ambiguity about who owns the gate.
+
+### Shared Privacy Model (compute-market-architecture §III, post-B1)
+
+All three markets share the same privacy model: three orthogonal mechanisms (variable relay count / distributional opacity / tunnel rotation). The relay chain itself is payload-agnostic — the same `POST /v1/relay/forward` endpoint, same onion-wrapped chain token, same `settle_relay_hop` RPC, carries compute prompts AND document bodies AND (later) any other market's data.
+
+**Launch reality:** Wire-as-bootstrap-relay serves as the only relay node until the relay market ships proper decentralized relay capacity. This applies to both compute dispatch callbacks and storage pull routing at launch. The relay market's R1 phase replaces the Wire's bootstrap role with operator-deployed relay nodes, not with new privacy primitives.
+
+### DADBEAR Slug Namespace
+
+Each market has its own DADBEAR slug for hold scoping:
+
+| Market | DADBEAR slug | Work item `source` values |
+|---|---|---|
+| Compute (provider side, local GPU) | `market:compute` | `market_received` |
+| Compute (provider side, bridge) | `market:compute` with `step_name: "bridge/{job_id}"` | `market_bridge_received` |
+| Compute (requester side) | `market:compute` | `market_dispatch` |
+| Storage | `market:storage` | `storage_host`, `storage_drop`, `storage_retention_response`, `storage_chunk_pin` |
+| Relay | `market:relay` | Observation-only at per-hop (too high-volume for work items); `relay_pricing_adjust`/`relay_capacity_adjust` as work items from aggregated observations |
+
+Canonical slug strings per DD-A (architecture §VIII.6). Breaker holds on each slug are independent — a `market:compute` quality hold does not affect storage hosting on the same node. Bridge jobs are NOT a separate slug — they share `market:compute` with a `bridge/` step_name prefix, which keeps quality-hold propagation unified while letting the webhook correlator distinguish bridge traffic by step_name.
+
+### Cross-Market Build Ordering
+
+The original plan had compute first, then storage, then relay — this is still correct, but the Phase 1 compute migration already laid foundation for all three. Updated ordering:
+
+```
+SHIPPED:
+  Compute Phase 1 — rotator, entities, seeds (serves all three markets)
+  Compute Chronicle, DADBEAR canonical, async-fleet-dispatch Phases 1-3
+  Fleet MPS partial — compute_participation_policy contribution at 5 fields (WS1+WS2 struct/projection extension + three-objects runtime NOT yet shipped; see Phase 2 prereqs)
+
+NEXT (with explicit dependencies; Storage S1 now parallel to Compute Phase 2, not downstream):
+
+  Compute Phase 1 ─┬─→ Compute Phase 2 (Exchange) ─→ Compute Phase 3 (Settlement) ─→ Phase 4 ─→ Phase 5 ─→ Phase 6
+                   │
+                   ├─→ Storage S1 (Settlement & Pricing) ─→ Storage S2 (Grants & Quality) ─→ Storage S3 (Market Surface)
+                   │
+                   └─(parallel to above; Relay R1 needs BOTH Compute Phase 2 + Storage S1)
+                                                                                            ↓
+                                                           Relay R1 (Infrastructure + Rotation) ─→ Relay R2
+```
+
+**Storage S1 depends on Compute Phase 1 only.** Its needs (rotator + `wire_graph_fund` CHECK extended for all 5 market values + atomic credit RPCs) are all Phase 1 infrastructure. Storage S1 does NOT require Phase 2's matching/queue-mirror work. The seams §VIII build graph was previously wrong on this; corrected per 2026-04-16 audit Cycle 2 B NC-2.
+
+**Parallelization opportunity:**
+- Storage S1 + Compute Phase 2 develop concurrently from day 1 (disjoint file sets, disjoint migrations).
+- Compute Phase 3 starts after Phase 2 ships.
+- Storage S2/S3 start after S1 ships; run concurrently with Compute Phase 4-6.
+- Relay R1 requires BOTH Compute Phase 2 (for the `fill_compute_job` `relay_count > 0` inline-rejection pattern it extends) AND Storage S1 (for the settlement pattern the relay hop settlement mirrors).
+- Relay R2 requires Relay R1 + Compute Phase 3 (result-delivery callback path) + Storage S1 (pull routing).
+
+### Cross-Market Failure Modes
+
+New failure cascades that cross market boundaries:
+
+| Trigger | Cascade | Mitigation |
+|---|---|---|
+| `compute_participation_policy` supersedes with all booleans `false` | All three markets deactivate for this node simultaneously. Existing in-flight jobs complete (no mid-flight cancellation). Offers/subscriptions marked inactive. | Expected operator action; not a cascade to prevent. Chronicle records the transition for audit. |
+| `wire_market_rotator` table corruption | All three markets' settlements fail atomically (RPCs error out). No per-market isolation possible — it's shared infrastructure. | Replicated with the rest of the Wire DB. Single-point-of-failure risk inherent to the shared primitive. |
+| Wire-as-bootstrap-relay endpoint saturated | Compute callbacks AND storage pulls both slow or fail at launch. As relay capacity comes online, the saturation eases. | Operational monitoring on the Wire bootstrap endpoint; contribution-driven concurrency cap; eventual relay market deployment is the real fix. |
+| `TunnelUrl::parse` regression | All three markets' ingress paths reject malformed URLs. Effectively fleet + compute + storage + relay all see "no peers" on startup. | Extensive unit tests on `TunnelUrl::parse`. Canary deployment pattern — one node before fleet-wide rollout. |
+| `compute_participation_policy` schema validation rejects a supersedes | If validation rejects a new contribution version, prior version stays active. No cascade. | Validation errors surfaced in operator UI; malformed supersession is a user error, not a cascade. |
+
+### Cross-Market Economic Parameter Contention
+
+All three markets read from the same rotator (76/2/2 slots). Over time, if any market's volume dwarfs the others, the rotator distribution on the low-volume markets becomes noisy (fewer settlements = higher variance on the 2.5%/2.5% take rates). This is not a correctness issue — the law of large numbers still applies within each (node, market, scope, rotator_type) tuple because the primary key scopes the rotator position per tuple. Compute settlements for model A and storage serves for corpus B advance independent rotators. No contention.
+
+**Supersession conflicts:** If `market_rotator_config` is superseded (e.g., 77/2/1), the change affects all three markets simultaneously. This is desirable — the 76/2/2 ratio is a platform-wide policy, not a per-market tunable. Any per-market customization would require a schema extension (e.g., `market_rotator_config_by_market_type`) that is explicitly out of scope at launch.

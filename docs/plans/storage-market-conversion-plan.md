@@ -1,9 +1,30 @@
 # Storage Market Conversion Plan
 
-**Date:** 2026-04-13
+**Original draft:** 2026-04-13
+**Last revision:** 2026-04-16 (post-audit unification pass)
 **Scope:** Convert the existing storage market from centrally-planned flat-rate hosting to a proper market with provider-set pricing, competitive auto-pricing, hosting grants, rotator arm platform levy, and network-observed quality signals.
-**Prerequisite:** Compute market Phase 1 ships first (rotator arm infrastructure, atomic credit RPCs pattern, contribution-driven config).
-**Companion docs:** `wire-compute-market-build-plan.md` (compute market, same economic primitives), `GoodNewsEveryone/docs/architecture/wire-compute-market.md` (vision)
+**Prerequisite:** Compute market Phase 1 ships first (rotator arm infrastructure, atomic credit RPCs pattern, contribution-driven config). Storage S1 does NOT require compute Phase 2 (audit fix — dependency graph in seams §VIII corrected).
+**Companion docs:** `compute-market-architecture.md` (canonical for slug namespace, CallbackKind, privacy model, shared primitives, DD-A through DD-O decisions in §VIII.6), `async-fleet-dispatch.md` (transport pattern), `fleet-mps-build-plan.md` (participation policy canonical).
+
+---
+
+## 2026-04-16 Unification Pass — What's Canonical Where
+
+The 2026-04-13 draft of this plan was reconciled against four foundations that landed between 2026-04-13 and 2026-04-16: DADBEAR canonical architecture (shipped), Fleet MPS (compute_participation_policy contribution shipped; three-objects still pending), async-fleet-dispatch (Phases 1-3 shipped), SOTA privacy model (post-B1 rewrite of compute §III). The 2026-04-16 audit (`audit-2026-04-16-three-market-refresh.md`) closed every TBD. Rather than carry a layered overlay, this revision inlines the shared decisions (canonical DDs in architecture §VIII.6) and fixes the specific body issues in place. All references to "overlay," "Foundation 1-4," and layered corrections have been removed; body sections are now canonical for their topic. Deltas from the original 2026-04-13 draft:
+
+- **Slug namespace:** `"market:storage"` per DD-A. Applied throughout.
+- **Participation policy:** storage consumes `allow_storage_hosting` (offer publication + DADBEAR supervisor dispatch gate for `storage_host` work items) and `allow_storage_pulling` (pull-routing outbound). Full 10-field canonical list lives in `fleet-mps-build-plan.md` per DD-I — no parallel `storage_participation_policy` contribution.
+- **DADBEAR integration:** `market.rs`'s host/drop/evaluate_opportunities loop becomes a DADBEAR observation source. Daemon writes `storage_host_candidate` events; compiler produces `storage_host` / `storage_drop` / `storage_retention_response` / `storage_chunk_pin` work items; supervisor dispatches them (pull body, verify hash, report pin). Crash recovery comes free. Breaker holds on `market:storage` slug stop all storage work items without touching compute.
+- **Outbox:** Reuse shipped `fleet_result_outbox` per DD-D. Storage settle-retry uses `CallbackKind::MarketStandard` (same variant as compute — per DD-B there is no `Storage` variant; the shipped variants `Fleet / MarketStandard / Relay` cover the intended cross-market reuse). Storage's immediate need is settle metadata delivery, which the `pyramid/messages.rs` helper pattern doesn't apply to (no ChatML conversion).
+- **Auth:** `wire_document_token` (JWT) verified via `verify_storage_identity` at `pyramid/storage_identity.rs` (parallel to `fleet_identity.rs`, `aud: "storage"`). Shipped Wire signing key (same as fleet).
+- **TunnelUrl:** Every URL field (node tunnels, provider lookups at routing time) goes through `TunnelUrl::parse` at ingress. No raw String URL fields in new tables or IPC shapes. Note: `wire_storage_offers` does NOT carry a tunnel URL column — tunnel URL is on `wire_nodes` (joined at routing time).
+- **SOTA privacy (compute-market-architecture §III):** Storage pulls inherit variable relay count + distributional opacity + tunnel rotation. Launch = Wire-as-bootstrap-relay for non-0-relay pulls. 0-relay = direct consumer→provider with plausible deniability. Document bodies are plaintext (public content) — no E2E encryption needed, unlike compute prompts.
+- **Pull streaming vs outbox:** Pulls ≤ `sync_stream_max_bytes` economic_parameter (seeded Phase S1 at 100 MB) use synchronous streaming through the relay chain or direct tunnel. Pulls > threshold use chunked-asset manifest (§VI "Chunked Storage for Large Files") — each chunk is a synchronous stream up to the threshold. No async outbox for pulls themselves; outbox (if added later) only covers settle retry, not body delivery.
+- **Settlement RPC:** `settle_document_serve_v2(p_token_id, p_hosting_node_id, p_serve_latency_ms)` — consumer / document / matched_rate all resolved from token row inside RPC (OB-2 fix; provider never sees consumer identity).
+- **`min_replicas`:** NO DEFAULT on `wire_hosting_grants.min_replicas` per DD-O. Caller supplies from policy.
+- **CallbackKind:** Fleet/MarketStandard/Relay per DD-B (no rename — docs now match shipped code).
+
+All other sections below stand as-is except where inline edits land specific decisions.
 
 ---
 
@@ -170,34 +191,35 @@ The bonus incentivizes fast replication. Providers who want to earn the bonus ma
 Replace `settle_document_serve` with a market-aware version:
 
 ```sql
+-- Per OB-2 fix: signature resolves consumer + document + matched_rate from the token row.
+-- The provider (who calls settle) doesn't know the consumer — and MUST NOT, per SOTA privacy.
+-- The RPC gets them from wire_document_tokens after verifying the token.
 CREATE OR REPLACE FUNCTION settle_document_serve_v2(
   p_token_id UUID,
-  p_consumer_operator_id UUID,
   p_hosting_node_id UUID,
-  p_document_id UUID,
-  p_matched_rate INTEGER            -- the rate matched at routing time
+  p_serve_latency_ms INTEGER
 ) RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER AS $$
 DECLARE
+  v_token wire_document_tokens%ROWTYPE;
   v_hosting_operator_id UUID;
   v_rotator_pos INTEGER;
   v_recipient TEXT;
   v_wire_platform_operator_id UUID;
 BEGIN
-  -- Verify token (same as current)
+  -- Verify token AND resolve consumer+document+matched_rate atomically
   UPDATE wire_document_tokens
     SET redeemed = true
     WHERE id = p_token_id
-      AND document_id = p_document_id
-      AND consumer_operator_id = p_consumer_operator_id
       AND routed_to_node_id = p_hosting_node_id
       AND redeemed = false
-      AND expires_at > now();
+      AND expires_at > now()
+    RETURNING * INTO v_token;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'Invalid, expired, or already-redeemed document token';
   END IF;
 
-  -- Resolve hosting operator
+  -- Resolve hosting operator (per DD-K: h.released_at IS NULL, not h.status = 'active')
   SELECT a.operator_id INTO v_hosting_operator_id
     FROM wire_nodes n
     JOIN wire_agents a ON a.id = n.agent_id
@@ -206,8 +228,8 @@ BEGIN
     RAISE EXCEPTION 'Hosting node % has no linked operator', p_hosting_node_id;
   END IF;
 
-  -- Debit consumer using atomic RPC
-  PERFORM debit_operator_atomic(p_consumer_operator_id, p_matched_rate,
+  -- Debit consumer using atomic RPC (consumer identity resolved from token, NOT from provider input)
+  PERFORM debit_operator_atomic(v_token.consumer_operator_id, v_token.matched_rate,
     'document_serve_consumer', p_token_id, 'storage_market');
 
   -- Rotator arm: 76 provider / 2 Wire / 2 Graph Fund (same as compute)
@@ -215,31 +237,30 @@ BEGIN
   v_recipient := market_rotator_recipient(v_rotator_pos);
 
   IF v_recipient = 'provider' THEN
-    PERFORM credit_operator_atomic(v_hosting_operator_id, p_matched_rate,
+    PERFORM credit_operator_atomic(v_hosting_operator_id, v_token.matched_rate,
       'document_serve_host', p_token_id, 'storage_market');
   ELSIF v_recipient = 'wire' THEN
-    SELECT id INTO v_wire_platform_operator_id FROM wire_operators
-      JOIN wire_agents a ON a.operator_id = wire_operators.id
+    SELECT o.id INTO v_wire_platform_operator_id FROM wire_operators o
+      JOIN wire_agents a ON a.operator_id = o.id
       JOIN wire_handles h ON h.agent_id = a.id
-      WHERE h.handle = 'agentwireplatform' AND h.status = 'active' LIMIT 1;
-    PERFORM credit_operator_atomic(v_wire_platform_operator_id, p_matched_rate,
+      WHERE h.handle = 'agentwireplatform' AND h.released_at IS NULL LIMIT 1;
+    PERFORM credit_operator_atomic(v_wire_platform_operator_id, v_token.matched_rate,
       'storage_wire_take', p_token_id, 'storage_market');
   ELSE  -- graph_fund
     INSERT INTO wire_graph_fund (amount, source_type, reference_id)
-      VALUES (p_matched_rate, 'storage_serve', p_token_id);
+      VALUES (v_token.matched_rate, 'storage_serve', p_token_id);
   END IF;
 
   -- Update stats
-  UPDATE wire_nodes SET credits_earned_total = credits_earned_total + p_matched_rate
+  UPDATE wire_nodes SET credits_earned_total = credits_earned_total + v_token.matched_rate
     WHERE id = p_hosting_node_id;
   UPDATE wire_document_availability
     SET pulls_served_total = pulls_served_total + 1, last_served = now()
-    WHERE document_id = p_document_id AND node_id = p_hosting_node_id;
+    WHERE document_id = v_token.document_id AND node_id = p_hosting_node_id;
 
-  -- Record observation for network quality tracking
+  -- Record observation for network quality tracking (latency comes from provider's settle POST)
   INSERT INTO wire_storage_observations (node_id, document_id, serve_latency_ms, success)
-    VALUES (p_hosting_node_id, p_document_id, NULL, true);
-    -- serve_latency_ms filled by the API route handler, not the RPC
+    VALUES (p_hosting_node_id, v_token.document_id, p_serve_latency_ms, true);
 END;
 $$;
 
@@ -267,7 +288,7 @@ BEGIN
   SELECT o.id INTO v_wire_platform_operator_id FROM wire_operators o
     JOIN wire_agents a ON a.operator_id = o.id
     JOIN wire_handles h ON h.agent_id = a.id
-    WHERE h.handle = 'agentwireplatform' AND h.status = 'active' LIMIT 1;
+    WHERE h.handle = 'agentwireplatform' AND h.released_at IS NULL LIMIT 1;  -- DD-K
 
   -- Find grants due for payout
   FOR v_grant IN
@@ -375,7 +396,7 @@ CREATE TABLE wire_hosting_grants (
   corpus_id             UUID NOT NULL,
   amount_remaining      INTEGER NOT NULL,       -- credits in pool, depletes by 1 per payout
   payout_interval_s     INTEGER NOT NULL,       -- seconds between payouts
-  min_replicas          INTEGER NOT NULL DEFAULT 2,
+  min_replicas          INTEGER NOT NULL,          -- Per DD-O: no DEFAULT. Caller always supplies from policy.
   first_host_bonus_multiplier INTEGER DEFAULT 1, -- bonus for first providers to host new docs
   status                TEXT NOT NULL DEFAULT 'active',  -- 'active' | 'exhausted' | 'cancelled'
   document_rotator_pos  INTEGER NOT NULL DEFAULT 0,      -- cycles through corpus documents
@@ -411,14 +432,21 @@ CREATE INDEX idx_storage_obs_node ON wire_storage_observations(node_id, created_
 -- Add matched_rate to document tokens (currently flat 1 credit, now market-set)
 ALTER TABLE wire_document_tokens ADD COLUMN matched_rate INTEGER NOT NULL DEFAULT 1;
 
+-- Add credits_earned_total to wire_nodes — written by settle_document_serve_v2 (§IV).
+-- This column is currently missing from the deployed wire_nodes schema; settle RPC
+-- would fail without it. Storage S1 migration MUST add it.
+ALTER TABLE wire_nodes ADD COLUMN IF NOT EXISTS credits_earned_total INTEGER NOT NULL DEFAULT 0;
+
 -- Strip consumer identity from token for privacy-lite
 -- The token still has consumer_operator_id for settlement, but the node
 -- never sees it — the settlement RPC uses it server-side only.
 -- No schema change needed, just API behavior: the node's serve endpoint
 -- receives the token_id but NOT the consumer_operator_id.
 
--- Extend wire_graph_fund CHECK constraint
--- Add: 'storage_serve', 'hosting_grant' to the source_type CHECK
+-- wire_graph_fund.source_type CHECK constraint — ALREADY extended in compute Phase 1
+-- migration 20260414100000_market_prerequisites.sql for all 5 market values
+-- (compute_service, compute_reservation, storage_serve, hosting_grant, relay_hop).
+-- Storage S1 does NOT need to re-extend; cite the Phase 1 migration.
 ```
 
 ---
@@ -462,9 +490,9 @@ pub struct MarketOpportunity {
     pub word_count: u64,
     pub body_hash: String,
     // NEW
-    pub grant_payout_rate_per_day: u64,   // hosting grant payouts/day for this corpus
-    pub best_provider_rate: u64,          // cheapest active provider's per-pull rate
-    pub corpus_doc_count: u64,            // total docs in corpus (for grant signal math)
+    pub grant_payout_rate_per_day: i64,   // Pillar 9 fix (OB-4): credit amount, i64 not u64
+    pub best_provider_rate: i64,          // Pillar 9 fix (OB-4): credit amount, i64 not u64
+    pub corpus_doc_count: u64,            // total docs in corpus (count, not a credit amount — u64 OK)
 }
 ```
 
@@ -490,8 +518,8 @@ pub async fn evaluate_opportunities(
         // for hosting this document? Grant cycles through corpus docs via document
         // rotator, so each doc gets ~(payouts_per_day * 30) / corpus_doc_count payouts.
         // At our per-pull rate, each payout is worth 1 credit = 1 pull equivalent.
-        let grant_payouts_30d = if o.corpus_doc_count > 0 {
-            (o.grant_payout_rate_per_day * 30) / o.corpus_doc_count.max(1)
+        let grant_payouts_30d: i64 = if o.corpus_doc_count > 0 {
+            (o.grant_payout_rate_per_day * 30) / (o.corpus_doc_count as i64).max(1)
         } else {
             0
         };
@@ -499,7 +527,7 @@ pub async fn evaluate_opportunities(
         // grant_payouts_30d = 720/1000 = 0 (integer truncation).
         // Use grant_payout_rate_per_day directly as a tiebreaker signal
         // when the per-doc share rounds to zero.
-        let effective_demand = o.pulls_30d
+        let effective_demand: i64 = (o.pulls_30d as i64)
             + grant_payouts_30d
             + if grant_payouts_30d == 0 && o.grant_payout_rate_per_day > 0 { 1 } else { 0 };
         let efficiency = if o.current_replicas > 0 {
@@ -584,6 +612,7 @@ POST /api/v1/storage/grants          — Create a hosting grant for a corpus
 GET  /api/v1/storage/grants/:corpus  — List active grants for a corpus
 DELETE /api/v1/storage/grants/:id    — Cancel a grant (remaining credits refund to funder)
 GET  /api/v1/storage/market-surface  — Per-corpus: providers, rates, grant levels, quality
+POST /api/v1/storage/settle          — Provider reports serve completion; calls settle_document_serve_v2
 ```
 
 ### Updated Pull Routing (Relay-First)
@@ -593,7 +622,7 @@ The existing pull flow gains matching + relay chain:
 ```
 Consumer → GET /api/v1/wire/documents/:id/route?relay_count=2&preference=cheapest
   Wire finds all providers hosting this document
-  Filters: status = 'active', heartbeat fresh
+  Filters: status = 'active', heartbeat fresh per `staleness_thresholds.heartbeat_staleness_s` economic_parameter (Pillar 37 — no hardcoded minute count)
   Sorts by consumer preference:
     - "cheapest": lowest effective_per_pull_rate
     - "fastest": lowest observed_avg_serve_latency_ms  
@@ -614,7 +643,8 @@ Consumer → Relay A → Relay B → Provider (pull request + token, through rel
   Provider redeems token server-side (control plane → Wire)
 
 Wire settlement:
-  settle_document_serve_v2(token_id, consumer_op, node_id, doc_id, matched_rate)
+  settle_document_serve_v2(token_id, hosting_node_id, serve_latency_ms)
+  -- consumer, document, matched_rate all resolved from the token row server-side per OB-2 fix
   Rotator arm applies (76/2/2) for pull fee
   settle_relay_hop() for each relay (76/2/2 each)
 
@@ -663,9 +693,13 @@ The heartbeat response gains storage market data for competitive pricing:
 **Wire workstream:**
 - Migration: `wire_storage_offers` table, `wire_storage_observations` table
 - Migration: `matched_rate` column on `wire_document_tokens`
-- Migration: Extend `wire_graph_fund` CHECK for `'storage_serve'`, `'hosting_grant'`
-- `settle_document_serve_v2` RPC (atomic RPCs, rotator arm, matched rate)
+- Migration: `credits_earned_total` column on `wire_nodes` (written by `settle_document_serve_v2`; must exist first)
+- Note: `wire_graph_fund` CHECK for `'storage_serve'`, `'hosting_grant'` is ALREADY extended by compute Phase 1 migration `20260414100000_market_prerequisites.sql` (prospective 5-value CHECK). No re-extend needed.
+- `settle_document_serve_v2` RPC (atomic RPCs, rotator arm, matched rate) — signature `(p_token_id, p_hosting_node_id, p_serve_latency_ms)` resolves consumer+document+matched_rate from token row (OB-2 fix)
+- `POST /api/v1/storage/settle` API route exposes the RPC to provider settlement reporting
 - Updated pull routing endpoint with provider selection + rate matching
+- Seeds: `economic_parameter` contributions for:
+  - `sync_stream_max_bytes` = 100_000_000 (100 MB) — above this, chunked-asset manifest is required (§VI "Chunked Storage for Large Files")
 
 **Node workstream:**
 - `market.rs`: `credits_earned: i64`, `effective_per_pull_rate: i64`

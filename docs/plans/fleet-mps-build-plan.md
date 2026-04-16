@@ -42,13 +42,24 @@ This plan preserves fleet privacy (no capability inventory in Wire heartbeat), r
 ### Durable contribution
 
 - `compute_participation_policy`
-- Canonical fields:
-  - `mode: coordinator | hybrid | worker`
-  - `allow_market_visibility: bool`
-  - `allow_serving_while_degraded: bool`
-  - `allow_fleet_dispatch: bool`
-  - `allow_fleet_serving: bool`
-- The booleans above may be derived defaults under the `mode`, but keeping them explicit leaves room for future fleet/market unification.
+- **Canonical field list (10 fields, per DD-I in `compute-market-architecture.md` §VIII.6).** This is the single source of truth for the contribution schema. Storage and relay plans must not introduce parallel participation contributions; all 10 fields live on this one.
+  - `mode: coordinator | hybrid | worker`          # preset projection over the booleans
+  - `allow_fleet_dispatch: bool`                    # send work to fleet peers
+  - `allow_fleet_serving: bool`                     # accept work from fleet peers
+  - `allow_market_dispatch: bool`                   # send work to compute market
+  - `allow_market_visibility: bool`                 # publish compute offers + accept compute market jobs
+  - `allow_storage_hosting: bool`                   # publish storage offers + host documents
+  - `allow_storage_pulling: bool`                   # initiate document pulls from the market
+  - `allow_relay_serving: bool`                     # accept relay forwards from the network
+  - `allow_relay_usage: bool`                       # request relay chains for own dispatch
+  - `allow_serving_while_degraded: bool`            # accept work when health_status=degraded
+- **`mode` → booleans projection** (computed at config-read time, not stored):
+  - `coordinator`: all `allow_*_dispatch` / `allow_*_usage` = true; all `allow_*_serving` / `allow_*_hosting` / `allow_market_visibility` / `allow_relay_serving` = false
+  - `hybrid`: all booleans = true (except `allow_serving_while_degraded` which remains operator-configurable)
+  - `worker`: all `allow_*_serving` / `allow_*_hosting` / `allow_market_visibility` / `allow_relay_serving` = true; all `allow_*_dispatch` / `allow_*_usage` = false
+- **Projection precedence:** when a contribution sets both explicit booleans AND `mode`, explicit booleans override. `mode` is a UX convenience preset, not a constraint.
+- **WS1 bundled schema_definition MUST include all 10 fields** — even those consumed by later phases (storage/relay land in S1/R1). Building WS1 against a 6-field list would reject storage/relay supersessions with schema_mismatch.
+- **Market phase integration:** Phase 2 (exchange) reads `allow_market_visibility` at offer publication + at `/v1/compute/job-dispatch` admission. Phase 3 (settlement) reads `allow_market_dispatch` in `llm.rs` Phase A before considering `wire-compute` as a provider. Storage S1 reads `allow_storage_hosting` / `allow_storage_pulling`. Relay R1 reads `allow_relay_serving` / `allow_relay_usage`. See each phase doc's §III for the exact gate sites.
 
 ### Derived local objects
 

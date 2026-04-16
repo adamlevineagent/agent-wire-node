@@ -10,7 +10,9 @@
 
 Phase 3 closes the economic loop. Phase 2 left providers able to publish offers and requesters able to match jobs on the exchange. Phase 3 makes the money work: settlement pays providers, refunds requesters, levies the Graph Fund, and records performance observations. On the node side, Phase 3 adds `WireComputeProvider` as a new provider type in the LLM dispatch path so pyramid builds can consume market compute. DADBEAR work items wrap every outbound market call with preview gates, cost estimation, and crash recovery. The provider side reports settlement metadata and records chronicle events for completed market jobs.
 
-The critical architectural constraint: **the Wire never sees prompts or results**. For launch (0-relay, standard privacy tier), the Wire proxies the requester's prompt to the provider's tunnel URL. This means the Wire does see the payload in transit for standard-tier jobs. This is explicitly acknowledged and matches the privacy model of existing cloud providers (OpenRouter). Higher privacy tiers (relay chains, Clean Room) are stubbed but not built in Phase 3.
+The critical architectural constraint: **the Wire never sees prompts or results at maturity.** During launch — before the relay market ships — the Wire acts as a transient bootstrap relay node for callback delivery, which means it DOES see payload content while forwarding. This is bootstrap mode, not a permanent tier. The `CallbackKind` variant stays `MarketStandard` the whole time; what changes is the `callback_url` value (Wire bootstrap endpoint → requester's tunnel directly, once the network's relay capacity makes Wire-as-relay unnecessary). When `relay_count > 0`, `CallbackKind::Relay` is used with the first relay hop's tunnel URL. Architecture doc §III is the canonical privacy model.
+
+**Result delivery path (resolves P0 from 2026-04-15 audit handoff):** Result delivery uses the ACK+callback pattern from `agent-wire-node/docs/plans/async-fleet-dispatch.md`. The provider ACKs the job-dispatch immediately (HTTP 202), processes async, and POSTs the result content to the `callback_url` included in the dispatch envelope. At launch the callback_url points to `{wire_base}/v1/compute/result-relay` (Wire bootstrap relay); post-relay-market it points to either the requester's tunnel (0-relay direct) or the first relay hop (N-relay chain). Separately, the provider POSTs settlement metadata (token counts + latency + finish_reason, NO content) to `POST /api/v1/compute/settle`. This two-endpoint separation preserves the privacy invariant that the Wire sees content ONLY when it is explicitly acting as a relay node during bootstrap — never via the settlement path.
 
 ---
 
@@ -22,13 +24,17 @@ All RPCs follow the atomic credit-engine pattern: call `credit_operator_atomic`/
 
 #### `settle_compute_job(p_job_id, p_prompt_tokens, p_completion_tokens, p_latency_ms, p_finish_reason)`
 
-Canonical SQL is in the monolithic plan (lines 532-712) with the following bug fixes applied:
+**Return type (P1 canonical):** `RETURNS TABLE(actual_cost INTEGER, provider_payout INTEGER, requester_adjustment INTEGER)`. The architecture doc §IX is the canonical source for the full SQL body. The monolithic plan's original description of this as returning void was incorrect — settlement must return the computed amounts so the API route handler can log them and forward to chronicle events.
+
+**Ownership note (DD-J/CR-4):** `cancel_compute_job` ships in Phase 3. The observation aggregation function is SPLIT into two distinct canonical-per-phase functions: Phase 3 owns `aggregate_compute_observations_for(node_id, model_id, horizon)` — a per-node/per-model read helper called by heartbeat + market-surface. Phase 5 owns `refresh_offer_observations_sweep()` — a no-arg sweeper that writes `wire_compute_offers.observed_*` columns. Distinct function names, distinct signatures, no migration collision.
+
+Canonical SQL is in the architecture doc §IX with the following bug fixes applied (these are already deployed-pending-migration; the audit identified them in the deployed Phase 1 version):
 
 1. **model_id filter on queue decrement.** The `UPDATE wire_compute_queue_state` must include `AND model_id = v_job.model_id`. Without it, a node with multiple model queues decrements the wrong queue row. Same fix applies to `wire_compute_offers` decrement (keyed by `offer_id`, already correct, but the queue state row needs the model filter).
 
 2. **Single operator resolution.** The plan resolves `v_wire_platform_operator_id` twice -- once at the top of the function and again inside the `v_requester_adj < 0` branch. The duplicate resolution is removed. The single resolution at the top of the function is sufficient.
 
-3. **Completion token guard.** Caps `p_completion_tokens` at 2x `v_job.max_tokens` to prevent absurd settlement reports from inflating provider payouts.
+3. **Completion token guard (per DD-M).** Caps `p_completion_tokens` at `max_completion_token_ratio` times `v_job.max_tokens` to prevent absurd settlement reports from inflating provider payouts. Ratio is read from the `max_completion_token_ratio` economic_parameter contribution (seeded in Phase 2 with `ratio: 2`; cold-start fallback 2 if contribution absent). Removes the hardcoded `* 2` guard in the deployed function.
 
 Settlement flow:
 - Lock job row (`status = 'executing'`, `FOR UPDATE`)
@@ -97,13 +103,16 @@ BEGIN
 
   -- Reservation fee stays with provider (non-refundable)
 
-  -- Refund relay fees if any (relays did no work on cancellation)
+  -- Relay fee refund — not reachable at compute Phase 3 ship (fill rejects relay_count > 0).
+  -- When the relay market plan ships, that plan MUST extend this RPC to implement the refund path.
+  -- Raise loudly if the branch is ever reached without that extension, so silent deferral is
+  -- structurally impossible (feedback_no_deferral_creep).
   IF v_job.relay_count > 0 THEN
-    -- Relay fees were escrowed to Wire platform operator.
-    -- Reverse: credit requester, debit Wire platform.
-    -- The relay settlement path (per-hop) never fires for cancelled jobs.
-    NULL; -- Implementation: sum relay fees from ledger entries with category='relay_market'
-          -- and reference_id=p_job_id, then credit_operator_atomic back to requester.
+    RAISE EXCEPTION 'cancel_compute_job: relay fee refund path not implemented. '
+                    'The relay market plan must extend this RPC before relay_count > 0 '
+                    'is accepted at fill time. Do not ship relay market until this branch '
+                    'credits requester from ledger entries where category=''relay_market'' '
+                    'AND reference_id=p_job_id.';
   END IF;
 
   UPDATE wire_compute_jobs SET
@@ -154,7 +163,7 @@ BEGIN
 
   UPDATE wire_compute_jobs SET
     status = 'executing',
-    started_at = now()
+    dispatched_at = now()
   WHERE id = p_job_id;
 END;
 $$;
@@ -162,7 +171,7 @@ $$;
 GRANT EXECUTE ON FUNCTION start_compute_job TO service_role;
 ```
 
-**Who triggers it, when:** The provider node calls `POST /compute/start` immediately before GPU execution begins. The GPU processing loop calls this after dequeuing a market job and before calling the LLM. This gives the Wire accurate timing data (started_at vs completed_at = actual GPU time, not queue wait time).
+**Who triggers it, when:** The provider node calls `POST /compute/start` immediately before GPU execution begins. The GPU processing loop calls this after dequeuing a market job and before calling the LLM. This gives the Wire accurate timing data (`dispatched_at` vs `completed_at` = actual GPU time, not queue wait time). The column name on `wire_compute_jobs` is `dispatched_at` (see schema in architecture doc §VIII) — not `started_at`.
 
 ### API Routes Built This Phase
 
@@ -194,10 +203,10 @@ VALUES
 
 Failure observations record zero values (marks the failure event in the performance profile).
 
-**Observation aggregation function** (needed before Phase 5 quality enforcement):
+**Observation aggregation read helper** (per DD-J/CR-4 — distinct from Phase 5's `refresh_offer_observations_sweep()` sweeper; two functions, one canonical per phase):
 
 ```sql
-CREATE OR REPLACE FUNCTION aggregate_compute_observations(
+CREATE OR REPLACE FUNCTION aggregate_compute_observations_for(
   p_node_id UUID,
   p_model_id TEXT,
   p_horizon_hours INTEGER DEFAULT 168  -- 7 days
@@ -226,48 +235,46 @@ BEGIN
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION aggregate_compute_observations TO service_role;
+GRANT EXECUTE ON FUNCTION aggregate_compute_observations_for TO service_role;
 ```
 
-This function is called by the heartbeat handler to populate the `performance_profile` in the heartbeat response, and by the market surface endpoint to provide speed rankings.
+This function is called by the heartbeat handler (populates `performance_profile` in heartbeat response) and by the market-surface endpoint for speed rankings. It does NOT mutate `wire_compute_offers.observed_*` columns — that's Phase 5's `refresh_offer_observations_sweep()` scheduled job.
 
 ---
 
 ## III. Node Workstream
 
-### WireComputeProvider -- CORRECTED
+### WireComputeProvider
 
-**The audit found a critical data flow contradiction (Theme 3a).** The original plan's `WireComputeProvider.fill_job()` code sketch sends `system_prompt, user_prompt` as parameters to the Wire. This is WRONG. The Wire never sees payloads.
+Per architecture §III (SOTA privacy model) + DD-C (prompt shape) + DD-F (MarketIdentity) + DD-D (outbox). The flow below is canonical; the pre-SOTA "submit-prompt" flow has been removed entirely.
 
-**Correct flow for 0-relay (launch, standard privacy tier):**
+**Flow for launch (bootstrap-mode `CallbackKind::MarketStandard`):**
 
-1. Dispatch policy resolves a route to `wire-compute`
-2. `WireComputeProvider.call()` is invoked from the LLM provider dispatch path in `llm.rs` (NOT from `chain_dispatch.rs`)
-3. **Match:** `POST /api/v1/compute/match` with `model_id`, `max_budget`, `input_tokens`, `latency_preference`. NO prompts sent. Returns `job_id`, matched rates, estimated deposit, queue position.
-4. **Fill:** `POST /api/v1/compute/fill` with `job_id`, `input_token_count` (computed locally via tiktoken), `relay_count=0`. NO PROMPTS SENT TO THE WIRE. Fill returns: `relay_chain` (empty for 0-relay), `provider_ephemeral_pubkey`, `total_relay_fee`, `deposit_charged`.
-5. **For 0-relay (launch):** The Wire proxies the prompt to the provider's tunnel URL. The Wire dispatches the filled job to the provider via `POST {provider_tunnel_url}/v1/compute/job-dispatch` with the prompt included. **The Wire sees the payload in transit for standard-tier jobs.** This is explicitly acknowledged. It matches the privacy level of OpenRouter (cloud provider sees prompts). The provider's tunnel URL is never returned to the requester -- the Wire uses it internally.
-6. **Provider ACKs immediately** (HTTP 202) to avoid Cloudflare 524 timeout. Provider queues the job, processes on GPU, reports settlement metadata to Wire.
-7. **Wire forwards result** to requester via `POST {requester_tunnel_url}/v1/compute/result-delivery`. Requester resolves the oneshot channel. Chain executor task completes.
+1. Dispatch policy resolves a route to `wire-compute`.
+2. `WireComputeProvider.call()` is invoked from the LLM provider dispatch path in `llm.rs` (NOT from `chain_dispatch.rs`). **Gate:** `compute_participation_policy.allow_market_dispatch` must be true; otherwise this branch is skipped entirely (per DD-I).
+3. **Match:** `POST /api/v1/compute/match` with `model_id`, `max_budget`, `input_tokens` (computed locally via tiktoken), `latency_preference`. NO prompts sent. Returns `job_id`, matched rates, estimated deposit, queue position.
+4. **Fill:** `POST /api/v1/compute/fill` with `{ job_id, input_token_count, temperature, max_tokens, messages, relay_count: 0 }`. Messages are in ChatML shape per DD-C — this is the one payload the Wire sees, because the Wire acts as bootstrap relay at launch. Fill returns `{ deposit_charged, relay_chain: [], provider_ephemeral_pubkey: null, total_relay_fee: 0 }`.
+5. **Register oneshot channel** keyed by `job_id` in `WireComputeProvider.result_channels` — delivery via the provider-node's `/v1/compute/result-delivery` endpoint resolves it.
+6. **Wire forwards to provider** via `POST {provider_tunnel}/v1/compute/job-dispatch` with the `MarketDispatchRequest` envelope + `Authorization: Bearer {wire_job_token}` header (per DD-G). The requester never sees `{provider_tunnel}`.
+7. **Provider ACKs 202** immediately (Cloudflare timeout avoided). Provider's GPU loop processes the job, POSTs result content to the `callback_url` in the envelope (= Wire's bootstrap relay endpoint at launch), POSTs settlement metadata to `/api/v1/compute/settle`.
+8. **Wire's `/v1/compute/result-relay` forwards the result** to the requester's tunnel via `POST {requester_tunnel}/v1/compute/result-delivery`. Requester resolves the oneshot channel. Chain executor task completes.
 
-**For N-relay (future, not Phase 3):** Requester encrypts prompt with provider's ephemeral public key, sends through relay chain. Wire never sees plaintext payload. Relays stream ciphertext without reading it. Provider decrypts, executes, encrypts result, sends back through relay chain.
+**Flow post-relay-market (`relay_count > 0` or direct):** Same protocol shape. Only the `callback_url` in the envelope changes: first relay hop's tunnel (if `relay_count > 0`) or requester's tunnel directly (if `relay_count == 0` post-bootstrap). The `CallbackKind` variant is `MarketStandard` for all non-relay-chain cases; the specific URL value is what shifts.
 
-**WireComputeProvider does NOT reimplement fleet dispatch.** Fleet routing already happens in `llm.rs` Phase A BEFORE `wire-compute` is reached in the provider preference chain. `WireComputeProvider` receives calls only when fleet capacity is exhausted and the dispatch policy escalates to the `wire-compute` entry in the route chain.
+**WireComputeProvider does NOT reimplement fleet dispatch.** Fleet routing happens in `llm.rs` Phase A BEFORE `wire-compute` is reached in the provider preference chain. `WireComputeProvider` receives calls only when fleet capacity is exhausted AND the dispatch policy escalates to the `wire-compute` entry.
 
 ```rust
 pub struct WireComputeProvider {
     api_url: String,
     api_token: String,
     node_id: String,
+    // pending market jobs keyed by job_id, resolved when /v1/compute/result-delivery fires
     result_channels: Arc<Mutex<HashMap<String, oneshot::Sender<ComputeResult>>>>,
 }
 
 impl WireComputeProvider {
-    /// Three-phase call via Wire exchange.
+    /// Two-phase call: match + fill-with-messages. Wire handles dispatch to provider internally.
     /// Called from llm.rs provider dispatch, NOT from chain_dispatch.rs.
-    ///
-    /// (1) match on Wire exchange
-    /// (2) fill on Wire (Wire charges deposit, dispatches prompt to provider)
-    /// (3) await result delivery via webhook on our tunnel
     pub async fn call(
         &self,
         system_prompt: &str,
@@ -278,43 +285,41 @@ impl WireComputeProvider {
         max_budget: i64,
         response_format: Option<&serde_json::Value>,
     ) -> Result<LlmResponse> {
-        // Phase 1: Match on exchange
-        // POST /api/v1/compute/match { model_id, max_budget, input_tokens, latency_preference }
-        // Input tokens computed locally via tiktoken BEFORE the Wire call.
+        // Reshape (system, user) → messages ChatML at the provider boundary
+        // (inverse of provider-side messages_to_prompt_pair in pyramid/messages.rs)
+        let messages = serde_json::json!([
+            { "role": "system", "content": system_prompt },
+            { "role": "user",   "content": user_prompt },
+        ]);
         let input_tokens = count_tokens(system_prompt, user_prompt, model);
+
+        // Phase 1: Match on exchange (no prompts)
         let match_result = self.match_job(model, max_budget, input_tokens).await?;
 
-        // Phase 2: Fill (financial only -- Wire charges deposit)
-        // POST /api/v1/compute/fill { job_id, input_token_count, relay_count: 0 }
-        // NO PROMPTS SENT TO THE WIRE IN THIS CALL.
-        let fill_result = self.fill_job(&match_result.job_id, input_tokens, 0).await?;
-
-        // Phase 2b: Submit prompt for Wire-proxied dispatch
-        // POST /api/v1/compute/submit-prompt { job_id, system_prompt, user_prompt,
-        //   temperature, max_tokens, response_format }
-        // For 0-relay: Wire proxies this to the provider's tunnel URL.
-        // Wire DOES see the payload for standard tier. Acknowledged.
-        self.submit_prompt(
-            &match_result.job_id,
-            system_prompt, user_prompt,
-            temperature, max_tokens,
-            response_format,
-        ).await?;
-
-        // Phase 3: Register oneshot channel and await result
+        // Register for result delivery BEFORE fill — the Wire may dispatch + deliver before we'd register
         let (tx, rx) = oneshot::channel();
         {
             let mut channels = self.result_channels.lock().await;
             channels.insert(match_result.job_id.clone(), tx);
         }
 
-        // Await with timeout from the match result
+        // Phase 2: Fill carries messages. Wire forwards to provider internally.
+        let _fill_result = self.fill_job(
+            &match_result.job_id, input_tokens, &messages, temperature, max_tokens,
+            response_format, 0 /* relay_count */,
+        ).await?;
+
+        // Phase 3: Await result via /v1/compute/result-delivery webhook
         let result = tokio::time::timeout(
             Duration::from_secs(match_result.timeout_s),
             rx,
         ).await
-            .map_err(|_| anyhow!("Wire compute job timed out after {}s", match_result.timeout_s))?
-            .map_err(|_| anyhow!("Result channel closed -- provider may have failed"))?;
+            .map_err(|_| {
+                // Timeout — cancel the Wire job to release deposit
+                self.cancel_job(&match_result.job_id);
+                anyhow!("Wire compute job timed out after {}s", match_result.timeout_s)
+            })?
+            .map_err(|_| anyhow!("Result channel closed — provider may have failed"))?;
 
         Ok(LlmResponse {
             content: result.content,
@@ -355,10 +360,11 @@ routing_rules:
 ```
 
 - **`llm.rs`:** New branch in the provider dispatch section (after fleet Phase A filtering, in the pool acquisition loop). When `effective_provider_id == "wire-compute"`:
-  1. Skip the normal HTTP provider path entirely
-  2. Construct `WireComputeProvider` from config (api_url, api_token, node_id from session state)
-  3. Call `wire_compute_provider.call()` with the prompt, model, and parameters
-  4. Return the `LlmResponse` with `provider_id: "wire-compute"`
+  1. **Check `compute_participation_policy.allow_market_dispatch`** (read from the snapshot taken at the top of llm.rs Phase A, alongside the fleet policy snapshot). If `false`, skip this branch and fall through to the next provider in the preference chain. A worker-mode node never dispatches outward even if its dispatch policy lists `wire-compute`.
+  2. Skip the normal HTTP provider path entirely
+  3. Construct `WireComputeProvider` from config (api_url, api_token, node_id from session state)
+  4. Call `wire_compute_provider.call()` with the prompt, model, and parameters
+  5. Return the `LlmResponse` with `provider_id: "wire-compute"`
 
 - **NOT in `chain_dispatch.rs`.** That module is a higher-level step dispatcher that routes chain steps to LLM vs mechanical functions. The LLM call path goes through `llm.rs` regardless of which provider serves it. `chain_dispatch.rs` calls `llm::call_model_unified_with_audit_and_ctx`, which internally resolves the dispatch policy and provider chain.
 
@@ -375,43 +381,75 @@ routing_rules:
 
 **Current state:** The fleet dispatch handler in `server.rs` (line 1460) processes jobs synchronously -- it enqueues the job, waits for the GPU loop to complete it, and returns the result in the HTTP response. This works for fast jobs but times out on long LLM calls through Cloudflare tunnels.
 
-**Phase 3 pattern:**
+**Phase 3 pattern** (matches async-fleet-dispatch `CallbackKind` shape — see architecture §III for the tier mapping).
 
-Provider receives job -> immediately ACKs (HTTP 202) -> processes on GPU -> POSTs result to Wire (settle endpoint) -> Wire forwards result to requester's `/v1/compute/result-delivery` webhook -> requester resolves oneshot channel -> chain executor task completes.
+**Scaffolding inherited from async-fleet-dispatch:** `TunnelUrl`, `MarketIdentity`/`verify_market_identity` (parallel to `FleetIdentity`, `aud: "compute"`), `MarketDispatchAck { job_id, peer_queue_depth }`, `MarketAsyncResult` tagged enum, compute outbox table with `expires_at` + `worker_heartbeat_at` + CAS updates, startup recovery synthesizing Error payloads into `ready`, admission control, `Arc` bundle discipline for the `MarketDispatchContext`. All of these are defined in Phase 2; Phase 3 consumes them.
+
+**Operational policy:** Timing constants (dispatch ACK timeout, callback POST timeout, outbox sweep cadence, worker heartbeat interval/tolerance, backoff base/cap, delivery attempts cap, retention intervals, admission concurrency cap) live on a new `market_delivery_policy` `schema_type` contribution, parallel to `fleet_delivery_policy`. Same loader machinery (`config_contributions::sync_config_to_operational_with_registry`), same hot-reload-on-`ConfigSynced` behavior. Rust `Default` impl holds only bootstrap sentinels; canonical values ship in `docs/seeds/market_delivery_policy.yaml`. No hardcoded timing constants anywhere in the market dispatch path (P4/Pillar 37).
+
+
+Provider receives job → immediately ACKs (HTTP 202) → processes on GPU → POSTs **result content** to Wire's result-relay endpoint → Wire forwards to requester's `/v1/compute/result-delivery` → requester resolves oneshot channel → chain executor task completes. SEPARATELY, provider POSTs **settlement metadata** (token counts + latency + finish_reason only) to `/api/v1/compute/settle`. The two POSTs are independent — result delivery can complete before settlement, vice versa, or concurrently.
 
 Implementation:
 
 1. **Provider side (`server.rs` `/v1/compute/job-dispatch`):**
-   - Receive job from Wire
+   - Receive job from Wire (body includes `callback_url` for result delivery — for standard tier this is `{wire_base}/v1/compute/result-relay`; for future relay tier it's the first relay hop)
    - Verify wire_job_token JWT
    - Enqueue into compute queue
    - Return HTTP 202 with `{ "accepted": true, "job_id": "...", "estimated_start_s": N }`
    - Do NOT await GPU completion in the HTTP handler
 
 2. **GPU processing loop (`main.rs`):**
-   - When a market job (`source: "market_received"`) completes:
-   - Call `POST /api/v1/compute/start` (filled -> executing transition) BEFORE GPU execution
-   - Execute the LLM call
-   - On success: call `POST /api/v1/compute/settle` with token counts and latency
-   - On failure: call `POST /api/v1/compute/fail` with reason
-   - On void (unfilled reservation at front): call `POST /api/v1/compute/void`
-   - Settlement metadata only -- NO prompt content, NO result content sent to Wire
+   - When the GPU loop dequeues a market job (`source: "market_received"`), FIRST call `POST /api/v1/compute/start` with the provider's `wire_job_token` Authorization header. This RPC CAS-transitions the job to `status='executing'` and stamps `dispatched_at`. Required before GPU execution so `settle_compute_job`'s `status='executing'` guard passes.
+   - Execute the LLM call.
+   - **On success:** CAS the `fleet_result_outbox` row from `'pending'` to `'ready'`, writing `result_json` (the `FleetAsyncResult::Success` payload: `{ content, prompt_tokens, completion_tokens, latency_ms, finish_reason }`). Bump `expires_at = now + ready_retention_secs`. The outbox delivery worker (see §Outbox Delivery Worker below) is what POSTs to `callback_url` — the GPU loop does NOT post directly. Also POST settlement metadata to `/api/v1/compute/settle` (`{ job_id, prompt_tokens, completion_tokens, latency_ms, finish_reason }` — NO content). The settle POST is immediate from the GPU loop; the callback POST is handled by the worker.
+   - **On failure:** CAS the outbox row to `'ready'` with `FleetAsyncResult::Error` payload (synthesized error), then POST `/api/v1/compute/fail` with reason. The worker delivers the error payload to the callback_url — the requester receives either Success or Error, never silence.
+   - **On void** (unfilled reservation at front): CAS the outbox row to `'delivered'` (no callback needed), POST `/api/v1/compute/void`.
 
-3. **Wire side (settle route handler):**
-   - After `settle_compute_job` RPC succeeds:
-   - Forward the result to the requester's tunnel URL: `POST {requester_tunnel_url}/v1/compute/result-delivery`
-   - Include: `job_id`, `result_content` (passed through from provider, not stored), `prompt_tokens`, `completion_tokens`, `finish_reason`
-   - On delivery failure: retry 3 times with exponential backoff (1s, 5s, 25s)
+3. **Wire side — result relay (`POST /v1/compute/result-relay`):**
+   - Receive result content from provider. Verify provider identity (wire_job_token JWT + provider_node_id on the job row).
+   - Look up the requester's tunnel URL from the job record.
+   - Forward to requester: `POST {requester_tunnel_url}/v1/compute/result-delivery` with `{ job_id, result_content, prompt_tokens, completion_tokens, finish_reason, wire_signature }`. (Token counts are denormalized into the result-delivery payload so the requester can display them without a second fetch.)
+   - Do NOT persist result content. The relay is transient forward-then-forget.
+   - On delivery failure: retry per `market_delivery_policy` (`backoff_base_secs`, `backoff_cap_secs`, `max_delivery_attempts`). Backoff math is the same as async-fleet-dispatch's dispatcher-side delivery loop; do not re-derive. Cold-start fallback if contribution absent: `backoff_base_secs=1, backoff_cap_secs=64, max_delivery_attempts=3` (deliberately conservative sentinels).
    - On all retries exhausted: result is lost. The build step times out on the requester side and the chain executor's error strategy handles retry (re-match, new job). Cost: requester pays twice for that call. Acceptable for launch.
 
-4. **Requester side (`server.rs` `/v1/compute/result-delivery`):**
+4. **Wire side — settle route (`POST /api/v1/compute/settle`):**
+   - Provider POSTs metadata-only. Call `settle_compute_job` RPC. Move credits. Record observation. DO NOT forward anything to the requester — this path carries no content.
+
+5. **Requester side (`server.rs` `/v1/compute/result-delivery`):**
    - Verify Wire signature on the delivery
    - Look up pending oneshot sender keyed by `job_id` in `WireComputeProvider.result_channels`
    - Send result through the oneshot channel
    - Return 200 OK
    - If no awaiting channel exists (stale result after timeout): log warning, return 200 OK (idempotent), discard result
 
-**This same pattern should also be retrofitted to fleet dispatch** (the existing `handle_fleet_dispatch` in `server.rs`). However, fleet retrofit is a separate change and fleet currently works for jobs under ~90s. Phase 3 builds the ACK+async pattern for market jobs; fleet retrofit can follow.
+**Endpoint summary introduced by this section:**
+- Provider→Wire: `POST {callback_url}` (for standard tier, `callback_url = {wire_base}/v1/compute/result-relay`) carries result content
+- Provider→Wire: `POST /api/v1/compute/settle` carries settlement metadata only
+- Wire→Requester: `POST {requester_tunnel}/v1/compute/result-delivery` carries result content + denormalized token counts
+
+This is the standard-tier resolution of the P0 audit design hole. Relay-tier and fleet-tier use the same `CallbackKind`-shaped envelope but with a different `callback_url` (relay chain first hop / fleet peer tunnel respectively).
+
+### Outbox Delivery Worker
+
+Per DD-D, market dispatches reuse the shipped `fleet_result_outbox` table + the shipped sweep/delivery loop infrastructure at `server.rs` + `db.rs:2332-2655`. Market-specific aspects:
+
+**Discrimination.** The sweep loop's current predicate (`WHERE expires_at <= now() AND status IN ('pending', 'ready', ...)`) is market-agnostic. The DELIVERY step branches on `callback_kind`:
+
+- `CallbackKind::Fleet { dispatcher_nid }` — existing path; looks up dispatcher tunnel in roster, POSTs to `{dispatcher_tunnel}/v1/fleet/result`.
+- `CallbackKind::MarketStandard` — NEW path; POSTs to the `callback_url` stored in the outbox row (no roster lookup; the URL was validated at insert time to be valid HTTPS per DD-D's `validate_callback_url` extension). The POST body is the `MarketAsyncResult` envelope (`Success | Error` tagged enum), Authorization header carries a provider-signed market callback JWT (claims: `aud: "market-callback"`, `sub: job_id`, `iss: provider_node_id`, signed with provider's key).
+- `CallbackKind::Relay` — post-relay-market; POSTs to the first relay hop's tunnel URL. Same envelope + JWT pattern.
+
+**Market callback JWT (separate from `wire_job_token`).** The provider signs a per-job callback JWT proving the result came from the provider that was dispatched. Wire (or relay) verifies with the provider's known public key (part of provider registration; stored on `wire_nodes`). This is a small addition to the provider's signing-key handling — one line in `auth.rs` — not a whole new key infrastructure.
+
+**On CAS loss (sweep/worker race).** The shared sweep loop already handles all the CAS races — per `reference_async_dispatch_pattern.md`, whoever CASes first wins. Market rows inherit this unchanged: worker writes `'ready'` with Success; sweep promoted `'ready'` with Error; whichever won determines what gets delivered. The async-fleet-dispatch principle ("nothing dropped, nothing double-delivered") applies identically.
+
+**Retention:** Market rows use `market_delivery_policy.ready_retention_secs / delivered_retention_secs / failed_retention_secs` (parallel to fleet). Same schema column (`expires_at`); the retention value differs per `callback_kind` when the row transitions state. The sweep loop reads the right policy contribution based on the row's callback_kind.
+
+**No new implementation.** Phase 3 adds ~20 lines of branching in the existing `deliver_fleet_result` (rename to `deliver_outbox_callback`) to dispatch on `callback_kind`. The outer sweep loop, admission logic, expiration handling are all reused unchanged.
+
+**This same pattern CAN be retrofitted to fleet in this phase too** (fold fleet result callback into the same `deliver_outbox_callback` function). Acceptable scope extension — the fleet-side code path is already there; this is consolidation, not new code. Alternatively keep `deliver_fleet_result` + `deliver_outbox_callback` separate if retrofit risk is deemed too high; the outbox table is shared either way.
 
 ### Result Delivery Endpoint
 
@@ -507,6 +545,7 @@ Requester-side DADBEAR flow for outbound market calls. This is the critical inte
    - Cost estimate = `(est_input_tokens * matched_rate_in + est_output_tokens * matched_rate_out) * queue_multiplier_bps / 10000 + reservation_fee`
    - `est_output_tokens` comes from network-observed median for this model (from heartbeat performance profile)
    - This uses **market pricing** (credits), not local inference cost (USD/electricity). The `BudgetDecision` enum already supports this: `AutoCommit` / `RequiresApproval` / `CostLimitHold`
+   - **P3 fix — `ItemCostEstimate` currency:** The existing `ItemCostEstimate` struct in `dadbear_preview.rs:50` has `estimated_cost_usd: f64` and a `routing: String`. That's a Pillar 9 violation (f64 in a financial path) AND it has no way to represent credit cost for market dispatch. Phase 3 reshapes the struct to carry typed currency: generalize to `estimated_cost: Cost` where `enum Cost { Usd(i64) /* cents */, Credits(i64) }`. The `market:compute` slug's preview path populates `Cost::Credits(...)`; the existing local-inference + cloud preview path is migrated to `Cost::Usd(...)` with cents-integer math (fixing Pillar 9 in the same pass). Budget gates dispatch on the variant: USD estimates check the existing local/cloud budget thresholds, credit estimates check `max_market_cost_credits` and `daily_market_cap_credits`. The preview UI displays the unit label per variant. The `routing: String` stays as-is — the currency enum change is the minimum-surface fix.
    - New budget fields on DADBEAR config: `max_market_cost_credits` (per-batch), `daily_market_cap_credits` (daily)
 
 4. **Budget decision:**
@@ -514,7 +553,7 @@ Requester-side DADBEAR flow for outbound market calls. This is the critical inte
    - If cost exceeds batch limit but within daily cap: `RequiresApproval`. Work item gets a `cost_limit` hold. Operator sees the estimate in the DADBEAR hold events UI and approves/rejects.
    - If cost exceeds daily cap: `CostLimitHold`. DADBEAR slug-level hold freezes all market dispatch for this slug until operator intervenes.
 
-5. **Dispatch:** `WireComputeProvider.call()` with match + fill + submit-prompt + await result. Work item transitions `committed -> dispatched`.
+5. **Dispatch:** `WireComputeProvider.call()` with match + fill-with-messages + await result via `/v1/compute/result-delivery` webhook. Work item transitions `committed -> dispatched`.
 
 6. **Result:** Webhook delivers result. Work item transitions `dispatched -> completed`. DADBEAR supervisor applies result to the calling chain step.
 
@@ -532,7 +571,7 @@ Provider-side `StepContext` for market jobs (Law 4 compliance):
 
 ```rust
 StepContext {
-    slug: "compute-market",
+    slug: "market:compute",
     build_id: job_id,       // the Wire job ID
     step_name: "compute-serve",
     depth: 0,
@@ -641,17 +680,17 @@ Full end-to-end verification:
 | Source | Finding | How Applied |
 |--------|---------|-------------|
 | Theme 1 (DADBEAR) | Market jobs bypass work items, holds, preview, crash recovery | Full DADBEAR integration in Section III: work items on both sides, preview gate for cost estimation, crash recovery with Wire job status checking |
-| Theme 3a (Data flow contradiction) | `WireComputeProvider.fill_job()` sends prompts to Wire | Rewritten: fill RPC sends only `input_token_count` + `relay_count`. Separate `submit-prompt` call for Wire-proxied dispatch. Wire sees payload for 0-relay standard tier (acknowledged). |
-| Theme 3c (0-relay unspecified) | No explicit spec for launch privacy model | Section III explicitly states: 0-relay uses Wire-proxied dispatch, Wire sees payload for standard tier, matches OpenRouter privacy level |
-| Theme 4 (SQL bugs) | model_id filter missing in queue decrements | Added `AND model_id = v_job.model_id` to all 5 RPCs (settle, fail, void, cancel, start) |
-| Theme 4 (SQL bugs) | Duplicate operator resolution in settle | Single resolution at top of function, removed duplicate in underage branch |
-| Theme 4 (SQL bugs) | No filled->executing transition | Added `start_compute_job` RPC with provider-side trigger before GPU execution |
-| Theme 4 (SQL bugs) | No cancel_compute_job | Added full cancel RPC with deposit refund, relay fee refund, queue decrement |
-| Audit S11 | Cancel RPC "must be added" but wasn't | Full cancel RPC defined (Section II) |
-| Audit S3 | fill RPC must NOT return provider tunnel URL | Confirmed: fill returns only `deposit_charged`, `relay_chain`, `provider_ephemeral_pubkey`, `total_relay_fee` |
-| Audit J4 | WireComputeProvider != LlmProvider | Dispatch integration in `llm.rs` (not `chain_dispatch.rs`), new provider branch, not trait shoehorning |
-| Audit S16 | Phase 3 dispatch path needs explicit spec | Full dispatch integration section with routing rule YAML, `llm.rs` branch location, timeout interaction |
-| Audit 5c | No observation aggregation function | `aggregate_compute_observations` function defined (Section II) |
+| Theme 3a (Data flow contradiction) | `WireComputeProvider.fill_job()` sends prompts to Wire | Resolved per architecture §III bootstrap mode (DD-A/DD-B/DD-D): fill RPC accepts `messages` for forwarding through the Wire acting as transient bootstrap relay. No separate `submit-prompt` call. Post-relay-market, the same flow with `CallbackKind::MarketStandard` or `Relay` variant routes through non-Wire relay capacity. |
+| Theme 3c (0-relay unspecified) | No explicit spec for launch privacy model | Resolved per architecture §III SOTA model: three orthogonal mechanisms (variable relay count + distributional opacity + tunnel rotation) active from launch. Wire-as-bootstrap-relay fills the gap until relay capacity deploys. |
+| Theme 4 (SQL bugs) | model_id filter missing in queue decrements | Added `AND model_id = v_job.model_id` to all 5 RPCs (settle, fail, void, cancel, start). |
+| Theme 4 (SQL bugs) | Duplicate operator resolution in settle | Single resolution at top of function, removed duplicate in underage branch. |
+| Theme 4 (SQL bugs) | No filled->executing transition | `start_compute_job` RPC owned by Phase 2 per DD-J. |
+| Theme 4 (SQL bugs) | No cancel_compute_job | Full cancel RPC defined (Phase 3 §II, canonical per DD-J). |
+| Audit S11 | Cancel RPC "must be added" but wasn't | Full cancel RPC defined (Section II). |
+| Audit S3 | fill RPC must NOT return provider tunnel URL | Confirmed: fill returns `{ deposit_charged, relay_chain, provider_ephemeral_pubkey, total_relay_fee }` — no `provider_tunnel_url`. |
+| Audit J4 | WireComputeProvider != LlmProvider | Dispatch integration in `llm.rs` (not `chain_dispatch.rs`), new provider branch, not trait shoehorning. |
+| Audit S16 | Phase 3 dispatch path needs explicit spec | Full dispatch integration section with routing rule YAML, `llm.rs` branch location, timeout interaction. |
+| Audit 5c | No observation aggregation function | Phase 3 ships `aggregate_compute_observations_for(node_id, model_id, horizon)` read helper (Section II). Phase 5 ships `refresh_offer_observations_sweep()` no-arg sweeper. Two distinct functions per DD-J/CR-4. |
 | Known Issue 6 | Requester restart loses in-flight results | DADBEAR crash recovery checks Wire for job status, re-registers webhooks or fetches completed results |
 | Handoff TODO | ACK+async result delivery | Full spec as PREREQUISITE (Section III), not optional |
 | Handoff Learning 6 | Cloudflare tunnel ~120s timeout | ACK+async pattern eliminates the timeout for market jobs |

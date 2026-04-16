@@ -152,7 +152,21 @@ Queries the Wire for configurations used by nodes with similar hardware profiles
 
 ## IV. New Compiler Mappings
 
-Extend `map_event_to_primitive` in `dadbear_compiler.rs` for market event types. The function's signature remains identical: `(event_type: &str) -> Option<(&str, &str, &str)>` returning `(primitive, step_name, model_tier)`.
+Extend `map_event_to_primitive` in `dadbear_compiler.rs` for market event types.
+
+**P3 signature change (from 2026-04-15 audit):** The existing signature `(event_type: &str) -> Option<(&str, &str, &str)>` cannot distinguish `demand_signal` variants (high-demand-no-offer vs low-demand-active-offer) without reading the observation event's `metadata_json`. Phase 6 changes the signature to accept the full event struct:
+
+```rust
+// Before (pre-Phase-6):
+fn map_event_to_primitive(event_type: &str) -> Option<(&str, &str, &str)>
+
+// After (Phase 6):
+fn map_event_to_primitive(event: &ObservationEvent) -> Option<(&'static str, &'static str, &'static str)>
+```
+
+The function reads `event.event_type` and — where needed — `event.metadata_json.signal_variant` to select the primitive. Existing callers of the `&str` variant must be migrated. Known call site: `dadbear_compiler.rs:362`. A grep pass (`rg 'map_event_to_primitive' src-tauri/src`) should turn up any others in the same pass so none are left on the old signature after migration.
+
+The return type continues to be `(primitive, step_name, model_tier)`.
 
 New mappings:
 
@@ -184,6 +198,8 @@ New mappings:
 ## V. New Result Application Paths
 
 Extend `DadbearSupervisor::apply_result` (currently in `dadbear_supervisor.rs:931`) with new primitive-type branches for market work items. The existing pattern dispatches on `primitive.as_str()` — market primitives add new match arms.
+
+**P3 acknowledgment (from 2026-04-15 audit):** `apply_result` currently has no market dispatch surface. Phase 6 adds this as **new construction**, not a modification of existing branches. The five new match arms below each call a distinct subsystem — they do not share a common "apply market change" code path, because the subsystems being called (Ollama control-plane IPC, local config contribution supersession, Wire contribution API publication, local offer-state RPC, cross-slug hold placement) have nothing structurally in common beyond the shape of the match arm itself. Implementers should resist the instinct to build a shared abstraction during Phase 6 — the concrete repetition is deliberately preserved so each primitive's behavior is locally readable.
 
 ### Model Loading/Unloading
 

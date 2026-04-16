@@ -64,60 +64,94 @@ Receives 2.5% via rotator arm (2/80 slots). Resolved by handle at settlement tim
 
 ## III. Privacy Model
 
-**IMPORTANT: The privacy model at launch is HONEST about what each party sees.**
+**Canonical reference:** `GoodNewsEveryone/docs/architecture/wire-compute-privacy-tiers.md`. This section is a projection of that doc onto the compute market build plan.
 
-### Standard Tier (Launch -- 0-relay market jobs)
+### Three Orthogonal Privacy Mechanisms (All Active From Launch)
 
-At launch, market jobs with `relay_count=0` use **Wire-proxied dispatch**. This means the Wire acts as intermediary for the data plane. This matches current OpenRouter privacy level.
+Privacy in the Wire compute market comes from three independent mechanisms that compound:
 
-| Party | What they see |
-|-------|---------------|
-| **Wire** | Prompt content, result content, requester identity, provider identity, all metadata |
-| **Provider** | Prompt content, model, parameters, job token. Does NOT see requester identity, build context, pyramid slug, layer, step name |
-| **Requester** | Result content. Does NOT see provider identity (tunnel URL rotates) |
+1. **Variable relay count.** The requester's dispatch policy specifies how many relay hops each call uses (0, 1, 2, 5, 12 — any number within `relay_count_range`). This is a `privacy_policy` contribution on the requester node. A provider receiving a request from a given tunnel URL cannot know if it's the requester directly (0 hops) or the last hop of an N-hop chain. The protocol format is identical regardless of chain length. **Result: topology ambiguity.**
 
-This is acceptable for standard tier. The Wire is trusted infrastructure the same way OpenRouter is today.
+2. **Distributional opacity.** The network NEVER publishes aggregate relay statistics. No dashboard exposes "what fraction of traffic uses N relays." The Wire knows aggregates internally for capacity planning but never surfaces them. **Result: even probabilistic inference is blocked — attackers cannot assign a prior to "this connection is probably direct."**
 
-### Relay Tier (Future -- relay_count > 0)
+3. **Tunnel URL rotation.** Nodes periodically request fresh tunnel URLs from Cloudflare (or their tunnel provider) and push the new URL to the Wire via heartbeat. Rotation interval + drain grace are `privacy_policy` fields. Old URLs decommission after in-flight connections drain. **Result: any correlation an observer builds against a URL expires on the next rotation. Cross-time linkage is broken.**
 
-When relay infrastructure ships, market jobs with `relay_count > 0` route through relay nodes:
+Each mechanism is independent. Each strengthens the others. Together they make traffic analysis practically impossible at scale without simultaneously compromising multiple nodes within a rotation window.
 
+### What Each Party Sees
+
+| Party | Prompt content | Result content | Requester identity | Provider identity |
+|-------|----------------|----------------|-------------------|-------------------|
+| **Wire** (matching + settlement) | Never (except transiently while acting as bootstrap relay — see below) | Never (same exception) | Yes (for settlement) | Yes (for settlement) |
+| **Provider** | Yes (must run inference) | Yes (produces it) | Sees last-hop tunnel URL. Cannot prove whether it's the requester directly or the Nth relay. | N/A (it's the provider) |
+| **Relays** (when `relay_count > 0`) | Ciphertext only | Ciphertext only | Sees only previous hop's tunnel URL | Sees only next hop's tunnel URL |
+| **Requester** | Yes (produces it) | Yes (receives it) | N/A | Never sees provider identity. Tunnel URL opaque + rotates. |
+
+The Wire's role is **pure control plane**: matching, settlement escrow, routing instructions, offer publication. Data flows node-to-node.
+
+### Dispatch Callback Pattern (all tiers share one shape)
+
+Every market job uses the async-fleet-dispatch ACK+callback pattern (`agent-wire-node/docs/plans/async-fleet-dispatch.md`). The provider ACKs receipt immediately (HTTP 202), runs inference for any duration, then POSTs the result to a `callback_url` supplied in the dispatch envelope. The `CallbackKind` enum discriminates destination:
+
+| CallbackKind (shipped variants at `fleet.rs:582`) | `callback_url` value | When used | Wire in data path? |
+|---|---|---|---|
+| `MarketStandard` | Requester's current tunnel URL (post-relay-market, 0-relay direct) OR Wire bootstrap endpoint (`{wire_base}/v1/compute/result-relay`) at launch | `relay_count = 0` direct mode in the mature network; bootstrap mode at launch — same variant, different URL value over time | No at maturity; yes transiently during bootstrap |
+| `Relay` | First relay hop's tunnel URL (requester's view of the chain) | `relay_count > 0` | No — relays forward ciphertext |
+| `Fleet { dispatcher_nid }` | Same-operator peer tunnel URL | Fleet-internal (never crosses the market) | No |
+
+Settlement metadata (`POST /api/v1/compute/settle` with token counts + latency + finish_reason) is a SEPARATE POST from result delivery and always goes to the Wire. It carries no payload content — only settlement metrics. This separation preserves the privacy property that the Wire never sees content in any tier EXCEPT during bootstrap.
+
+### Bootstrap Mode (Launch Reality)
+
+Before sufficient relay capacity exists on the network, the Wire can itself act as a relay node — forwarding payloads between nodes as just-another-relay. The bootstrap endpoint is `POST /v1/compute/result-relay` (on the Wire). This is a **temporary convenience**, not a permanent tier.
+
+At launch, relay market is not yet shipped. Any requester requesting `relay_count > 0` will be served with the Wire filling the gap (Wire = a relay node, from the requester's perspective). As operators deploy relay-capable nodes, the Wire's share of relay workload decreases. Eventually, when relay capacity is sufficient, the Wire stops acting as a relay entirely.
+
+**During bootstrap mode**, the Wire DOES see prompt and result content while it is in transit as a relay node. It does not persist either — the bootstrap endpoint is pure forward-then-forget. Bootstrap mode is a transient tradeoff, not the privacy target. Framing it this way (rather than as "standard tier" or "Wire-proxied") means the architecture shape matches the mature network even at launch, and the later transition to a proper relay market is a capacity shift, not a protocol change.
+
+**At Adam's launch scale** (small operator network, known operators, everyone over Cloudflare tunnels already), the practical privacy delta from bootstrap mode is small. The code-level commitment is to SOTA from day one, so the eventual relay market is not an architectural migration — it's capacity coming online.
+
+### Tier-by-Tier Summary
+
+| Tier | relay_count | Who sees prompt | Wire in data path | Status |
+|---|---|---|---|---|
+| Direct | 0 | Provider only. Provider sees requester tunnel URL but cannot prove it's direct (plausible deniability from variable relay count). | No | **Launch** |
+| Relay | 1+ | Provider only (final hop decrypts). Provider sees last-relay tunnel URL. | No | **Bootstrap via Wire at launch; proper relay market later.** |
+| Fleet | N/A | Same-operator peer. | No | **Shipped.** |
+| Bridge (`cloud_relay`) | 0 (bridge's onward call to OpenRouter) | Bridge node + OpenRouter + upstream model provider | No (on Wire side); bridge forwards to cloud | **Phase 4.** |
+| Clean Room (future) | varies | No party sees plaintext (Docker+encryption) | No | **Stub.** |
+| Vault / SCIF (future) | varies | Wire-owned or Wire-audited hardware only | No | **Stub.** |
+
+### Distributional Opacity Enforcement
+
+No aggregate relay statistics are ever published by the Wire. No dashboard shows "40% of traffic uses 2 relays." No heartbeat response carries relay distribution data. No market surface reveals usage patterns. This is an explicit non-feature — anyone adding a "privacy metrics dashboard" to the market surface is violating the privacy model.
+
+Individual nodes know their own relay usage. Relay nodes know their own hop traffic. The Wire internally knows aggregate numbers for capacity planning but never exposes them via public endpoints or even operator-visible internal tools.
+
+### Tunnel Rotation Settings
+
+Rotation parameters live on the `privacy_policy` contribution (see `market-seed-contributions.md` seed #8) on each requester/provider node:
+
+```yaml
+schema_type: privacy_policy
+default_relay_count: 2
+sensitive_relay_count: 5
+relay_count_range: [0, 20]
+tunnel_rotation_interval_s: 3600       # 1h default
+tunnel_drain_grace_s: 180              # old URL kept alive for 3min for in-flight connections
+auto_escalate_on_sensitive_content: true
 ```
-Requester --> Relay A --> ... --> Relay N --> Provider
-```
 
-| Party | What they see |
-|-------|---------------|
-| **Wire** | Matching metadata, settlement data. NEVER sees prompt content or inference results |
-| **Provider** | Prompt content (must -- they run inference), model, parameters, job token. Does NOT see requester identity (sees last relay's tunnel URL) |
-| **Relays** | Ciphertext only (E2E encrypted between requester and provider) |
-| **Requester** | Result content. Does NOT see provider identity |
+No separate `tunnel_rotation_policy` type — rotation fields live alongside relay count settings in one contribution.
 
-At launch, `select_relay_chain` is stubbed to reject `relay_count > 0`.
+### Requester Identity Leakage (0-relay edge case)
 
-### Bridge Tier (`cloud_relay`)
+When `relay_count = 0`, the provider's callback POST lands on the requester's tunnel URL. That tunnel URL is observable by the provider. The provider:
+- Cannot prove it's the requester directly (variable relay count + distributional opacity)
+- Cannot correlate it across time (tunnel rotation)
+- Cannot correlate it across jobs (fan-out: `max_jobs_per_provider: 1` option on dispatch policy ensures each provider sees at most one call per build)
 
-Bridge offers MUST carry `privacy_capabilities: '{cloud_relay}'` -- NOT `'{standard}'`. Prompts flow through: bridge node --> OpenRouter --> upstream provider. The requester dispatch policy must support filtering by privacy capability so requesters can opt out of bridge providers.
-
-| Party | What they see |
-|-------|---------------|
-| **Bridge node** | Prompt content (forwards to OpenRouter) |
-| **OpenRouter** | Prompt content (standard OpenRouter privacy applies) |
-| **Upstream LLM provider** | Prompt content |
-
-### Fleet Tier (Completely Private)
-
-Fleet routing bypasses the Wire entirely. Direct node-to-node over tunnel URLs.
-
-| Party | What they see |
-|-------|---------------|
-| **Wire** | Nothing. Fleet traffic is invisible to the network |
-| **Fleet peer** | Prompt content, requester identity (same operator) |
-
-### Future Privacy Tiers (Stubbed)
-
-- **Clean Room:** Ephemeral Docker container on provider, encrypted I/O, provider never sees plaintext.
-- **Vault / SCIF:** Wire-owned or Wire-audited hardware. Zero trust chain.
+A sophisticated adversary running multiple provider nodes could attempt triangulation, but the cost of maintaining a network of colluding provider nodes long enough to defeat both rotation and fan-out is designed to exceed the value of the data recovered. This is the threat model, and it holds at maturity. At launch scale it's weaker because few operators + few rotations = thinner mix. This is acknowledged; the launch-scale leak exists; the recommended mitigation for sensitive work is to set `sensitive_relay_count: 3+` and accept that bootstrap-mode Wire sees the content while relay capacity builds.
 
 ---
 
@@ -416,6 +450,12 @@ CREATE TABLE wire_market_rotator (
 ALTER TABLE wire_market_rotator ENABLE ROW LEVEL SECURITY;
 GRANT ALL ON wire_market_rotator TO service_role;
 
+-- NOTE: This doc version hardcodes `% 80` as the rotator wrap modulus. This is a
+-- Pillar 37 violation (P4 from 2026-04-15 audit). The DEPLOYED version at
+-- `GoodNewsEveryone/supabase/migrations/20260414100000_market_prerequisites.sql`
+-- reads `total_slots` from the `market_rotator_config` economic_parameter
+-- contribution and wraps on that value. Any future migration to this function
+-- must preserve that behavior — do not copy the `% 80` from this doc.
 CREATE OR REPLACE FUNCTION advance_market_rotator(
   p_node_id UUID, p_market_type TEXT, p_scope_id TEXT, p_rotator_type TEXT
 ) RETURNS INTEGER
@@ -425,7 +465,7 @@ BEGIN
   INSERT INTO wire_market_rotator (node_id, market_type, scope_id, rotator_type, position)
     VALUES (p_node_id, p_market_type, p_scope_id, p_rotator_type, 1)
     ON CONFLICT (node_id, market_type, scope_id, rotator_type)
-    DO UPDATE SET position = (wire_market_rotator.position % 80) + 1
+    DO UPDATE SET position = (wire_market_rotator.position % 80) + 1  -- P4: should read total_slots from market_rotator_config
     RETURNING position INTO v_pos;
   RETURN v_pos;
 END;
@@ -634,7 +674,379 @@ CREATE INDEX idx_incentive_pools_payout ON wire_incentive_pools(last_payout_at) 
 
 ---
 
-## IX. Wire-Side RPCs
+## VIII.5 Deployed vs Target State (P2 from 2026-04-15 audit)
+
+The RPCs and economic_parameter seeds described in this doc represent the **target/corrected state**. Phase 1 migrations already deployed an earlier (pre-audit) version of these RPCs. Phase 2+ migrations will supersede the deployed versions with audit fixes. This table tracks the delta so implementers don't assume "the doc is live" or "the deployed RPC matches the doc."
+
+### RPC Deployment Status
+
+| RPC | Deployed? | Source migration | Differences from this doc |
+|---|---|---|---|
+| `match_compute_job` | Yes | `20260414200000_compute_market_tables.sql` | Deployed missing self-dealing check (`operator_id != p_requester_operator_id`); missing reputation filter. Phase 2 migration adds both. Default output estimate read from `default_output_estimate` contribution (matches deployed field name). |
+| `fill_compute_job` | Yes | `20260414200000_compute_market_tables.sql` | Deployed signature: `(p_job_id UUID, p_input_token_estimate INTEGER, p_temperature REAL, p_max_tokens INTEGER)` returning `TABLE(deposit_charged INTEGER, estimated_output_tokens INTEGER)`. No `p_relay_count` param. No `p_requester_operator_id` param. No `relay_chain`/`provider_ephemeral_pubkey`/`total_relay_fee` in return. Phase 2 migration extends signature; until then, relay_count defaults to 0. |
+| `settle_compute_job` | Yes | `20260414200000_compute_market_tables.sql` | Deployed returns `TABLE(actual_cost, provider_payout, requester_adjustment)` — this IS canonical (Phase 3 doc incorrectly described as void; fix in Phase 3 doc). Deployed has duplicate Wire platform operator resolution (minor perf; next migration consolidates). Deployed missing `model_id` filter on queue decrement — Phase 3 migration adds `AND model_id = v_job.model_id`. |
+| `fail_compute_job` | Yes | `20260414200000_compute_market_tables.sql` | Deployed missing `model_id` filter on queue decrement. Phase 3 migration adds it. |
+| `void_compute_job` | Yes | `20260414200000_compute_market_tables.sql` | Deployed missing `model_id` filter on queue decrement. Phase 3 migration adds it. |
+| `sweep_timed_out_compute_jobs` | Yes | `20260414200000_compute_market_tables.sql` | Matches doc. |
+| `deactivate_stale_compute_offers` | Yes | `20260414200000_compute_market_tables.sql` | Deployed reads `staleness_thresholds.heartbeat_staleness_s` (seconds). Doc shows `stale_offer_threshold_minutes` — **doc is wrong, deployed name is canonical**. Fixed in §XIV below. |
+| `compute_queue_multiplier_bps` | Yes | `20260414200000_compute_market_tables.sql` | Matches doc. |
+| `advance_market_rotator` | Yes | `20260414100000_market_prerequisites.sql` | Deployed reads `total_slots` from `market_rotator_config` contribution. Doc version (above) hardcodes `% 80` — P4 violation, deployed is canonical. |
+| `market_rotator_recipient` | Yes | `20260414100000_market_prerequisites.sql` | Matches doc. |
+| `start_compute_job` | **No** | — | New in Phase 2 migration. Transitions FILLED → EXECUTING. Sets `dispatched_at`. Required because `settle_compute_job` gates on `status='executing'` and no deployed RPC produces that state. |
+| `cancel_compute_job` | **No** | — | New in Phase 3 migration. Handles RESERVED → CANCELLED (no deposit refund) and FILLED → CANCELLED (deposit refund, reservation fee stays). Ownership: **Phase 3** (not Phase 2 as the seams doc once suggested) — refund logic builds on Phase 3's settlement patterns. |
+| `clawback_compute_job` | **No** | — | New in Phase 5 migration. Debits provider (may go negative), refunds requester, pays challenger bounty. Partial-debit case uses raw SQL, not `debit_operator_atomic` (P3 item). |
+| `aggregate_compute_observations` | **No** | — | New in **Phase 3 migration** (not Phase 5 as original plan implied). Phase 3 populates observations via settlement; Phase 5 consumes aggregated reputation. Building it in Phase 3 ensures Phase 5 has data to read. |
+| `file_compute_challenge` / `resolve_compute_challenge` / `aggregate_compute_reputation` | **No** | — | New in Phase 5 migrations. |
+
+### Economic Parameter Naming (doc vs deployed)
+
+The Phase 1 seed migration (`20260414100000_market_prerequisites.sql`) is the canonical source of `parameter_name` values. Where this doc diverges, **deployed names win**:
+
+| Deployed `parameter_name` | Deployed fields | Doc originally called it | Doc field names |
+|---|---|---|---|
+| `market_rotator_config` | `total_slots`, `provider_slots`, `wire_slots`, `graph_fund_slots`, `distribution` | `market_rotator_config` ✓ | missing `provider_slots`, `distribution` — add them |
+| `compute_deposit_config` | `deposit_percentage_bps` | `deposit_percentage` ✗ | `percentage_bps` — rename to match deployed |
+| `default_output_estimate` | `default_output_tokens` | `default_output_estimate_tokens` ✗ | `default_tokens` — rename both |
+| `staleness_thresholds` | `queue_mirror_staleness_s`, `heartbeat_staleness_s` (seconds) | `stale_offer_threshold_minutes` ✗ | `threshold_minutes` — rename to match deployed, seconds not minutes |
+| `relay_performance_floor` | `min_reliability_bps`, `min_bandwidth_mbps`, `evaluation_window_days` | not listed in §XIV | add to §XIV |
+
+§XIV of this doc is being updated to reflect deployed names. RPC code examples in §IX that reference these contributions have been/will be updated through the same pass.
+
+---
+
+## VIII.6 Design Decisions Log (from 2026-04-16 audit)
+
+The 2026-04-16 audit (`audit-2026-04-16-three-market-refresh.md`) surfaced a handful of genuine design forks where the doc set had left "implementer's call" hand-waves or parallel projections of the same concept. This subsection resolves each one. Every other plan doc references these decisions; this is the canonical source.
+
+### DD-A. DADBEAR slug namespace: `market:compute` / `market:storage` / `market:relay`
+
+**Decision.** The canonical slug strings are `market:compute`, `market:storage`, `market:relay`. Bridge jobs use `market:compute` slug with `step_name: "bridge"` — bridge is NOT a separate slug. Holds scoped at the slug level block all work items on that slug; bridge-specific quality decisions use the `step_name` discriminator within the slug.
+
+**Rationale.** The `<namespace>:<market>` convention groups cleanly when Phase 6 needs to iterate all market slugs. Bridge-as-separate-slug would fragment hold propagation (an operator pausing bridge would need two holds on two slugs) and complicate reputation aggregation.
+
+**Consequences.** Every other plan doc (Phase 2/3/4/5/6, seams, storage, relay) must use these exact strings. Any variant (`compute-market`, `compute-market-bridge`, etc.) is a bug.
+
+### DD-B. `CallbackKind` enum variants match shipped code
+
+**Decision.** The canonical `CallbackKind` variants are the shipped names at `fleet.rs:582`:
+```rust
+pub enum CallbackKind<'a> {
+    Fleet { dispatcher_nid: &'a str },
+    MarketStandard,
+    Relay,
+}
+```
+
+`MarketStandard` is the launch bootstrap-mode callback (requester's tunnel, delivered through Wire relay endpoint). `Relay` is the relay-chain callback. `Fleet` is fleet-internal. No `WireBootstrap` / `RequesterTunnel` / `RelayChain` / `FleetPeer` renames — those were a 2026-04-16 B1 doc-side rename that the code didn't receive and we're reverting.
+
+**Rationale.** Shipped code wins by default. Renaming the code would ripple across `validate_callback_url`, the outbox CAS helpers, the delivery loop. Renaming the docs is a pure text sweep. Revert docs.
+
+**Consequences.** Architecture §III result-delivery table + seams §VIII callback table + phase docs that name CallbackKind variants must all use `Fleet / MarketStandard / Relay`. Semantic meaning stays as-is.
+
+### DD-C. `MarketDispatchRequest` prompt shape diverges from fleet with a documented helper
+
+**Decision.** `MarketDispatchRequest` keeps `messages: serde_json::Value` (ChatML array). Fleet keeps `system_prompt: String` + `user_prompt: String`. The divergence is explicit and documented. A canonical helper `messages_to_prompt_pair(messages: &Value) -> Result<(String, String), MessagesError>` handles the conversion at the provider-side job-dispatch handler.
+
+**Helper contract.**
+- Collapse rule: first `system` message → `system_prompt` (strip role field); all `user` messages concatenated with `\n\n` → `user_prompt`; `assistant` turns rejected (Phase 2 serves single-turn requests only).
+- Error cases: no user messages, malformed message object, unsupported role → `MessagesError::InvalidShape`. Handler returns 400.
+- Location: `pyramid/messages.rs` (new module, minimal — ~30 lines).
+
+**Rationale.** Retrofitting fleet to `messages: Value` is a breaking fleet change we don't need to take on in Phase 2 scope. Two-string-parallel on market loses the J16 audit fix. Explicit divergence + helper is minimal scope.
+
+### DD-D. Outbox: reuse `fleet_result_outbox` with `callback_kind` column added + dispatcher_id sentinel
+
+**Decision.** Market dispatches use the existing `fleet_result_outbox` table. No `compute_result_outbox`. The outbox row's `callback_kind` column discriminates `Fleet` / `MarketStandard` / `Relay`. Compound PK `(dispatcher_node_id, job_id)` stays.
+
+**Implementation prereqs — see DD-Q below.** When this decision was first written, it asserted "schema unchanged from async-fleet-dispatch" — that's wrong. The shipped outbox has no `callback_kind` column; `validate_callback_url` returns `KindNotImplemented` for MarketStandard/Relay; and `AuthState` has no `wire_node_id` field. DD-Q specifies the ALTER migration, the sweep-reader change, the validate extension, and the dispatcher_id sentinel (`"wire-platform"`) that together make DD-D buildable. DD-D is the architectural decision; DD-Q is the prereq pack.
+
+**CallbackKind::Fleet bypass.** The `Fleet` variant's `validate_callback_url` checks the roster. `MarketStandard` and `Relay` accept any HTTPS URL with non-empty host (DD-Q specifies the actual code) — the callback is JWT-gated, not roster-gated.
+
+**Rationale.** 14 CAS helpers already exist for the fleet path; reusing the table means those helpers handle market rows too (after the sweep-reader update DD-Q specs). Duplicating would be drift risk.
+
+**Storage outbox.** Storage S1 also reuses `fleet_result_outbox` (same `callback_kind` column, `MarketStandard` variant for settlement retry). The outbox is genuinely market-agnostic once the `validate_callback_url` semantic generalizes per DD-Q. If storage later needs storage-specific columns, THAT is when a parallel table would be justified — not now.
+
+### DD-E. `market_delivery_policy` contribution: shape-parallel to `fleet_delivery_policy` with market-specific field set
+
+**Decision.** `market_delivery_policy` is a separate `schema_type` contribution, **shape-parallel** to `fleet_delivery_policy` (same loader machinery, same hot-reload behavior, same DB singleton pattern) but with a market-specific field set. It does NOT inherit fleet-specific fields that don't apply to market dispatch (`dispatch_ack_timeout_secs` + `timeout_grace_secs` + `orphan_sweep_interval_secs` + `orphan_sweep_multiplier` + `peer_staleness_secs` are fleet-peer-specific — market dispatcher is always the Wire, not a peer, so these don't translate). It adds 4 market-specific economic fields (`match_search_fee`, `offer_creation_fee`, `queue_push_fee`, `queue_mirror_debounce_ms`) that DD-E absorbs from previously-separate `economic_parameter` contributions.
+
+Lives at `pyramid/market_delivery_policy.rs` (new), seed YAML at `docs/seeds/market_delivery_policy.yaml`. Registered in `config_contributions::sync_config_to_operational_with_registry`.
+
+**Field list (17 fields total including version, market-adjusted sentinels):**
+```yaml
+schema_type: market_delivery_policy
+version: 1
+
+# Dispatcher side (for provider when acting as callback sender)
+callback_post_timeout_secs: 30
+outbox_sweep_interval_secs: 15
+worker_heartbeat_interval_secs: 10
+worker_heartbeat_tolerance_secs: 30
+backoff_base_secs: 1
+backoff_cap_secs: 64
+max_delivery_attempts: 20
+ready_retention_secs: 1800
+delivered_retention_secs: 3600
+failed_retention_secs: 604800
+
+# Admission control
+max_inflight_jobs: 32
+admission_retry_after_secs: 30
+
+# Market-specific
+match_search_fee: 1        # credits per match attempt (economic gate)
+offer_creation_fee: 1      # credits per offer creation (anti-spam)
+queue_push_fee: 1          # credits per queue state push (batched)
+queue_mirror_debounce_ms: 500
+```
+
+Note: `match_search_fee`, `offer_creation_fee`, `queue_push_fee`, `queue_mirror_debounce_ms` were previously specced as separate `economic_parameter` contributions; folding them into `market_delivery_policy` reduces contribution-count and puts all market operational knobs in one supersedable unit. Architecture §XIV updates accordingly.
+
+**Rationale.** Policy unification. One contribution supersession flips all market operational behavior atomically. Matches the fleet pattern exactly.
+
+### DD-F. `MarketIdentity` JWT verifier — claims, checks, key source
+
+**Decision.** Market dispatch JWTs follow this shape:
+
+```rust
+pub struct MarketClaims {
+    pub aud: String,       // must be "compute"
+    pub iss: String,       // Wire's key identifier (same as fleet JWTs)
+    pub exp: i64,          // unix seconds
+    pub iat: i64,
+    pub sub: String,       // job_id (UUID string)
+    pub pid: String,       // provider node_id — provider checks == self.node_id
+}
+```
+
+**Verifier checks** (in order):
+1. Signature valid against `AuthState.jwt_public_key` (same key as fleet JWTs — Wire has one signing key)
+2. `aud == "compute"` (differentiates from fleet `aud == "fleet"`)
+3. `exp` not expired
+4. `pid == self.node_id` (provider identity match — equivalent of fleet's `op == self_operator_id`)
+5. `sub` non-empty (job_id bound)
+
+**Verifier location.** `pyramid/market_identity.rs` (new), shape parallel to `fleet_identity.rs`.
+
+**Claims field name choices.** `aud` / `iss` / `exp` / `iat` / `sub` are standard JWT claims. `pid` (provider_id) is novel and chosen because `nid` (node_id) in fleet context implies "dispatcher node" — market's equivalent check is "which provider was this JWT issued for," so `pid` reads correctly.
+
+**Rationale.** The fleet `op == self_operator_id` check doesn't apply to market (requester and provider are different operators by design). The equivalent provider-binding check is `pid == self.node_id`. Signature + aud + exp + sub are standard. Single public key shared with fleet simplifies deployment.
+
+**Storage + Relay parallel verifiers.** Storage dispatches use `verify_storage_identity` at `pyramid/storage_identity.rs` with `aud: "storage"` — same MarketClaims shape (`sub = token_id / job_id`, `pid = provider_node_id`), same Wire signing key. Relay forward JWTs use `verify_relay_identity` at `pyramid/relay_identity.rs` with `aud: "relay"` — same shape with `pid = relay_node_id`. Each module is a near-clone of `market_identity.rs` (likely factorable into a generic `verify_wire_identity(bearer, aud, self_node_id)` helper; the three aud-specific wrappers exist so handlers can't accidentally accept a JWT minted for a different service). Single signing key + aud discrimination is the shared pattern across all four (fleet + market + storage + relay).
+
+### DD-G. `wire_job_token` issuance by Wire's `/api/v1/compute/fill` handler
+
+**Decision.** The Wire's fill handler, after `fill_compute_job` RPC succeeds, constructs a `MarketClaims` JWT:
+
+```
+aud = "compute"
+iss = wire signing key identifier
+exp = now + fill_job_ttl_secs (from a new economic_parameter seeded Phase 2; default 300 = 5min)
+iat = now
+sub = job_id (from RPC return)
+pid = provider_node_id (from RPC return — `fill_compute_job` must return this)
+```
+
+Signs with the Wire's private key (same key used for fleet JWT signing, dashboard query tokens, etc.). Embeds in the `Authorization: Bearer` header when dispatching to `POST {provider_tunnel}/v1/compute/job-dispatch`.
+
+**Signature on `fill_compute_job`.** Must return `provider_node_id` in the result TABLE so the API route handler can populate `pid`. This is an addition beyond Phase 2's audit-fix list for `fill_compute_job` and gets included in the same Phase 2 migration.
+
+**Fill_job_ttl_secs seed.** New economic_parameter contribution:
+```yaml
+parameter_name: fill_job_ttl_secs
+ttl_secs: 300
+```
+Seeded in Phase 2 migration. Rationale: 5 minutes is generous — typical dispatch ACK completes in seconds; the TTL is a safety net for tunnel hiccups.
+
+### DD-H. Admission control hold filter — enumerated blocking list
+
+**Decision.** The job-dispatch handler's admission check rejects with 503 if any hold with the following names is active on the target slug:
+
+```
+blocking_holds = [
+    "frozen",                    // operator-level pause
+    "breaker",                   // quality system flagged the node
+    "cost_limit",                // credit balance too low (economic gate)
+    "quality_hold",              // Phase 5 upheld-challenge hold
+    "timing_suspended",          // Phase 5 timing-anomaly hold
+    "reputation_suspended",      // Phase 5 reputation-threshold hold
+    "suspended",                 // Phase 6 steward-placed pause
+    "escalation",                // Phase 6 escalation gate
+]
+```
+
+Non-blocking holds (e.g., Phase 6's `measurement` for experiment windows) are markers, not gates — they are informational and do not reject dispatch.
+
+**Rationale.** Enumeration prevents "any hold blocks" silent-over-reject semantics and prevents adding new holds from accidentally gating the market. Each new hold type ships with an explicit classification.
+
+### DD-I. `compute_participation_policy` canonical field list — 10 fields
+
+**Decision.** The canonical `compute_participation_policy` contribution has these 10 fields:
+
+```yaml
+schema_type: compute_participation_policy
+mode: coordinator | hybrid | worker
+allow_fleet_dispatch: bool
+allow_fleet_serving: bool
+allow_market_dispatch: bool       # send work to compute market
+allow_market_visibility: bool     # publish compute offers + accept compute market jobs
+allow_storage_hosting: bool       # publish storage offers + host documents
+allow_storage_pulling: bool       # initiate document pulls from market
+allow_relay_serving: bool         # accept relay forwards
+allow_relay_usage: bool           # request relay chains for own dispatch
+allow_serving_while_degraded: bool
+```
+
+**`mode`→booleans projection function** (computed at config-read time, not stored):
+- `coordinator`: all `allow_*_dispatch` / `allow_*_usage` true; all `allow_*_serving` / `allow_*_hosting` / `allow_market_visibility` / `allow_relay_serving` false
+- `hybrid`: all booleans true (except `allow_serving_while_degraded` which remains operator-configurable)
+- `worker`: all `allow_*_serving` / `allow_*_hosting` / `allow_market_visibility` / `allow_relay_serving` true; all `allow_*_dispatch` / `allow_*_usage` false
+
+If the contribution sets explicit booleans AND mode, explicit booleans override. Mode is a convenience preset.
+
+**Rationale.** One contribution, all three markets. Mode provides UX simplicity (three buttons); explicit booleans provide fine-grained control. No parallel `storage_participation_policy` / `relay_participation_policy` contributions.
+
+### DD-J. RPC canonical locations — one source per RPC
+
+**Decision.** Each RPC has exactly one canonical SQL body. Architecture §IX holds only the RPCs that are Phase 1-deployed (canonical reference of the shipped state). RPCs introduced in later phases live in their phase doc's §II:
+
+| RPC | Canonical location |
+|---|---|
+| `match_compute_job` | Deployed migration `20260414200000`. Architecture §IX shows deployed + Phase 2 audit-fix patches (self-dealing, reputation filter). |
+| `fill_compute_job` | Deployed migration. Architecture §IX + §VIII.5 Phase 2 extension delta (+relay_count, +requester_operator_id, +provider_node_id in return). |
+| `settle_compute_job` | Deployed migration. Architecture §IX + Phase 3 patches (model_id filter, duplicate resolution removal, max_completion_token_ratio read). |
+| `fail_compute_job` / `void_compute_job` | Deployed. Architecture §IX + Phase 2 patches. |
+| `sweep_timed_out_compute_jobs` | Deployed. No changes. |
+| `deactivate_stale_compute_offers` | Deployed. Architecture §IX + Phase 5 patch (preserve hold statuses). |
+| `compute_queue_multiplier_bps` | Deployed. No changes. |
+| `advance_market_rotator` / `market_rotator_recipient` | Deployed migration `20260414100000`. Architecture §IV references. |
+| `start_compute_job` | **Phase 2 §II.** Architecture §IX removed. |
+| `cancel_compute_job` | **Phase 3 §II.** Architecture §IX removed. |
+| `clawback_compute_job` | **Phase 5 §III.** Architecture §IX removed. Phase 5 signature is canonical: `(p_job_id, p_verdict_id) RETURNS TABLE(provider_debited, challenger_credited, negative_balance_claim)`. |
+| `file_compute_challenge` / `resolve_compute_challenge` / `select_adjudication_panel` / `compute_provider_reputation` | **Phase 5 §IX.** |
+| `aggregate_compute_observations_for(node_id, model_id, horizon)` | **Phase 3 §II.** Per-node read helper. |
+| `refresh_offer_observations_sweep()` | **Phase 5 §VIII.** No-arg sweep. |
+| `select_relay_chain` | **Relay plan §V.** Compute launch has no separate function — rejection is inline in `fill_compute_job`. |
+| `settle_document_serve_v2` | **Storage S1 §IV.** |
+| `process_hosting_grant_payouts` | **Storage S2 §IV.** |
+| `settle_relay_hop` | **Relay plan §III.** |
+
+Architecture §IX becomes a **table + pointer**, not parallel SQL bodies. RPCs in §IX show canonical deployed state + links to phase-doc canonical locations for new work.
+
+**Rationale.** Two copies drift. One source per RPC eliminates the CR-3 / CR-4 class of finding entirely.
+
+### DD-K. Handle predicate: `h.released_at IS NULL` canonical, not `h.status = 'active'`
+
+**Decision.** All RPCs that resolve an operator via `wire_handles` use `h.released_at IS NULL`. Matches deployed. Architecture §IX examples updated.
+
+**Rationale.** Deployed is canonical. `status = 'active'` was a doc-side drift with no code support. Reverting to match code.
+
+### DD-L. `wire_compute_jobs.status` and `wire_compute_offers.status` — CHECK constraint added in Phase 5
+
+**Decision.** Neither column has a CHECK constraint today (deployed status is plain TEXT). Phase 5's migration introduces CHECKs for both:
+
+```sql
+ALTER TABLE wire_compute_jobs
+  ADD CONSTRAINT wire_compute_jobs_status_check
+  CHECK (status IN ('reserved', 'filled', 'executing', 'completed', 'failed', 'cancelled', 'void', 'clawed_back'));
+
+ALTER TABLE wire_compute_offers
+  ADD CONSTRAINT wire_compute_offers_status_check
+  CHECK (status IN ('active', 'inactive', 'offline', 'suspended', 'quality_hold', 'timing_suspended', 'reputation_suspended'));
+```
+
+**Rationale.** Add CHECK now to prevent silent invalid statuses. Phase 5 is the right phase because it introduces the most new values.
+
+### DD-M. `max_completion_token_ratio` contribution read in settle
+
+**Decision.** Phase 3's `settle_compute_job` migration reads `max_completion_token_ratio` from economic_parameter contribution (seeded with `ratio: 2` in Phase 2 migration). Deleted hardcoded `* 2` in settle body. Fallback 2 only if contribution absent.
+
+### DD-N. Open→paneling state transition — `select_adjudication_panel` RPC
+
+**Decision.** Phase 5 ships a new `select_adjudication_panel(p_case_id)` RPC that transitions `wire_compute_challenge_cases.status` from `'open'` to `'paneling'` after panelists are chosen. Called by a Phase 5 API route that queries available panelists + writes panelist IDs to the case. Closes the state-machine gap.
+
+### DD-O. `min_replicas` default removed from DDL
+
+**Decision.** Storage S1 migration: `wire_hosting_grants.min_replicas INTEGER NOT NULL` (no DEFAULT). Grant creator always supplies (matches §III YAML example).
+
+### DD-Q. Outbox reuse prerequisites — ALTER + sweep-reader change + validate_callback_url extension + dispatcher_id canonicalization
+
+**Context.** Cycle 2 D (implementer wanderer) verified DD-D against shipped code and found three claims that depend on code not yet written:
+1. DD-D said "schema unchanged from async-fleet-dispatch." The shipped `fleet_result_outbox` at `db.rs:2271-2290` has 13 columns, NONE of them `callback_kind`. `grep -n "callback_kind" db.rs` returns empty.
+2. DD-D named `AuthState.self_node_id` as the source for "Wire's node_id" on market outbox rows. That field does not exist; `AuthState.node_id` is THIS node's Wire-assigned ID.
+3. DD-D said the `MarketStandard` / `Relay` path of `validate_callback_url` is a "single-site change." It's currently `Err(CallbackValidationError::KindNotImplemented)` at `fleet.rs:659-661` — actual accept-any-HTTPS logic must be written.
+
+None of these are design forks — they're mechanical prerequisites. Resolved below.
+
+**Decision, part 1 — `fleet_result_outbox` ALTER migration.** Phase 2 node-side migration adds:
+
+```sql
+ALTER TABLE fleet_result_outbox
+  ADD COLUMN callback_kind TEXT NOT NULL DEFAULT 'Fleet';
+-- All existing rows are Fleet dispatches (the only dispatcher_node_id values in the
+-- outbox today come from fleet peers). The DEFAULT 'Fleet' backfills them correctly.
+CREATE INDEX IF NOT EXISTS idx_fleet_outbox_callback_kind
+  ON fleet_result_outbox (callback_kind);
+```
+
+**Decision, part 2 — update sweep helpers to read `callback_kind`.** The fleet sweep helpers in `db.rs:2332-2655` are keyed by `(dispatcher_node_id, job_id)` — they don't need to change for the compound PK, but the helpers that RECONSTRUCT a `CallbackKind` for `validate_callback_url` revalidation on sweep-time orphan-promotion (`pending` → `ready` with synth Error) MUST read the new column. Specifically the sweep path that builds the synth `FleetAsyncResult::Error` needs to look up the row's `callback_kind` and pass the right variant to `validate_callback_url`. Phase 2 migration list (Phase 2 §II item 4) must include: "update `fleet_outbox_sweep_pending_to_ready` (or whichever helper name) to SELECT the `callback_kind` column and reconstruct the `CallbackKind` via a string-to-enum helper. Update `deliver_outbox_callback` (see DD-D rename) likewise."
+
+**Decision, part 3 — `validate_callback_url` extension at `fleet.rs:659`.** Replace `Err(CallbackValidationError::KindNotImplemented)` with:
+
+```rust
+CallbackKind::MarketStandard | CallbackKind::Relay => {
+    // JWT-gated variants: the wire_job_token / relay chain JWT on the callback POST
+    // is the actual auth. URL validation only enforces the structural invariants.
+    if got.0.scheme() != "https" {
+        return Err(CallbackValidationError::SchemeNotHttps);
+    }
+    if got.0.host_str().map(|h| h.is_empty()).unwrap_or(true) {
+        return Err(CallbackValidationError::MissingHost);
+    }
+    Ok(())
+}
+```
+
+Add two new error variants: `SchemeNotHttps`, `MissingHost`. Applies to both `MarketStandard` (Wire bootstrap endpoint) and `Relay` (first relay hop). Localhost is allowed (private-network test rigs + Adam's LAN deployments need it) — if we ever want to gate localhost specifically, do it via `relay_delivery_policy`, not hardcoded here.
+
+**Decision, part 4 — dispatcher_node_id canonicalization.** The dispatcher on market outbox rows is the Wire platform. The Wire is not a peer and does not have a `node_id` in the fleet-roster sense. Use the sentinel string `"wire-platform"` for market rows' `dispatcher_node_id`. This:
+- Works with the existing `(dispatcher_node_id, job_id)` compound PK — `job_id` is the Wire-generated UUID, unique per dispatch; cross-dispatcher collisions are structurally impossible.
+- Does NOT require a schema change beyond the `callback_kind` ALTER in part 1.
+- Does NOT require extending `AuthState` with a `wire_node_id` field (simpler + no registration-response plumbing).
+- Sweep helpers that dispatch on `dispatcher_node_id` for Fleet-path roster lookup check `callback_kind` first — if it's `MarketStandard` or `Relay`, the roster lookup is skipped entirely (the callback URL is JWT-gated, not roster-gated).
+
+**Decision, part 5 — `pyramid_market_delivery_policy` singleton DDL.** Add to `db::init_pyramid_db`, parallel to `pyramid_fleet_delivery_policy`:
+
+```sql
+CREATE TABLE IF NOT EXISTS pyramid_market_delivery_policy (
+    id INTEGER PRIMARY KEY CHECK (id = 1),  -- singleton
+    yaml TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
++ helpers `upsert_market_delivery_policy(conn, yaml)` and `read_market_delivery_policy(conn)` paralleling the fleet functions.
+
+**Implementation scope.** All five parts fit in a single Phase 2 pre-flight migration + small code delta (~80 lines total across `db.rs` ALTER, `fleet.rs` validate extension, `market_delivery_policy.rs` new module). Do it as Workstream 0 of Phase 2 before any handler work. The 2026-04-17 friction log captures this as "N1 pre-flight" for future-me.
+
+### DD-P. Bridge hold scoping via `step_name` prefix within `market:compute` slug
+
+**Decision.** Phase 5 quality holds placed on slug `market:compute` block BOTH local-GPU market work items AND bridge work items by default — because bridge shares the slug (DD-A, bridge is `step_name: "bridge/<job_id>"` inside `market:compute`). Hold filters that need to discriminate (e.g., a quality issue affecting only a specific bridge model, not the local-GPU provider) must opt in with a `step_name_prefix` filter column on the hold:
+
+```sql
+ALTER TABLE dadbear_holds ADD COLUMN step_name_prefix TEXT;  -- optional
+-- Hold matches a work item if:
+--   hold.slug = work_item.slug
+--   AND (hold.step_name_prefix IS NULL OR work_item.step_name LIKE hold.step_name_prefix || '%')
+```
+
+A default `quality_hold` with `step_name_prefix IS NULL` applies to both local-GPU and bridge. A targeted hold with `step_name_prefix = 'bridge/'` applies only to bridge. This lets Phase 5 + Phase 6 handle both the "this operator has quality issues on all compute" case (slug-level) and the "bridge specifically is degraded" case (step_name-prefix-level) without inventing a parallel slug namespace.
+
+**Rationale.** DD-A already decided bridge is a step_name discriminator inside `market:compute`. Hold-scoping needs to operate at the same granularity. Adding one optional column to `dadbear_holds` is less invasive than a slug-proliferation rewrite.
+
+**Phase 5 must spec this ALTER** and the hold-filter WHERE clause update. Default hold behavior (prefix NULL) stays the same; operator-UX-exposed hold placement can offer a "scope: all compute | local-GPU only | bridge only" dropdown that maps to the prefix column.
+
+---
 
 ### `match_compute_job` -- Match requester to provider
 
@@ -677,14 +1089,15 @@ BEGIN
   SELECT o.id INTO v_wire_platform_operator_id FROM wire_operators o
     JOIN wire_agents a ON a.operator_id = o.id
     JOIN wire_handles h ON h.agent_id = a.id
-    WHERE h.handle = 'agentwireplatform' AND h.status = 'active' LIMIT 1;
+    WHERE h.handle = 'agentwireplatform' AND h.released_at IS NULL LIMIT 1;
 
   -- Read default output estimate from economic_parameter (Pillar 37: no hardcoded 500)
-  SELECT COALESCE((c.structured_data->>'default_tokens')::INTEGER, 500)
+  -- Deployed parameter_name is `default_output_estimate`, field is `default_output_tokens`.
+  SELECT COALESCE((c.structured_data->>'default_output_tokens')::INTEGER, 500)
     INTO v_default_output_estimate
     FROM wire_contributions c
     WHERE c.type = 'economic_parameter'
-      AND c.structured_data->>'parameter_name' = 'default_output_estimate_tokens'
+      AND c.structured_data->>'parameter_name' = 'default_output_estimate'
       AND c.status = 'active'
     ORDER BY c.created_at DESC LIMIT 1;
   v_default_output_estimate := COALESCE(v_default_output_estimate, 500);
@@ -794,7 +1207,7 @@ GRANT EXECUTE ON FUNCTION match_compute_job TO service_role;
 
 ### `fill_compute_job` -- Fill reserved slot with token count
 
-**Audit fixes applied:** `v_wire_platform_operator_id` DECLARED and resolved. `select_relay_chain` called ONCE and stored. NO prompts accepted.
+**Audit fixes applied:** `v_wire_platform_operator_id` DECLARED and resolved (DD-K handle predicate). Per CR-10/DD-J: `relay_count > 0` rejected inline at launch; `select_relay_chain` deferred to relay market plan entirely (no stub in Phase 2). The fill RPC now accepts `p_messages JSONB` that the API route forwards through the Wire-as-bootstrap-relay dispatch (DD-C); post-relay-market, the same messages payload is encrypted + passed through the relay chain.
 
 ```sql
 CREATE OR REPLACE FUNCTION fill_compute_job(
@@ -823,7 +1236,7 @@ BEGIN
   SELECT o.id INTO v_wire_platform_operator_id FROM wire_operators o
     JOIN wire_agents a ON a.operator_id = o.id
     JOIN wire_handles h ON h.agent_id = a.id
-    WHERE h.handle = 'agentwireplatform' AND h.status = 'active' LIMIT 1;
+    WHERE h.handle = 'agentwireplatform' AND h.released_at IS NULL LIMIT 1;
 
   SELECT * INTO v_job FROM wire_compute_jobs
     WHERE id = p_job_id AND status = 'reserved'
@@ -834,11 +1247,12 @@ BEGIN
   END IF;
 
   -- Read default output estimate from economic_parameter (Pillar 37)
-  SELECT COALESCE((c.structured_data->>'default_tokens')::INTEGER, 500)
+  -- Deployed parameter_name is `default_output_estimate`, field is `default_output_tokens`.
+  SELECT COALESCE((c.structured_data->>'default_output_tokens')::INTEGER, 500)
     INTO v_default_output_estimate
     FROM wire_contributions c
     WHERE c.type = 'economic_parameter'
-      AND c.structured_data->>'parameter_name' = 'default_output_estimate_tokens'
+      AND c.structured_data->>'parameter_name' = 'default_output_estimate'
       AND c.status = 'active'
     ORDER BY c.created_at DESC LIMIT 1;
   v_default_output_estimate := COALESCE(v_default_output_estimate, 500);
@@ -854,7 +1268,8 @@ BEGIN
   v_deposit := CEIL(p_input_token_count::NUMERIC * v_job.matched_rate_in_per_m * v_job.matched_multiplier_bps / (1000000::NUMERIC * 10000))
              + CEIL(v_est_output::NUMERIC * v_job.matched_rate_out_per_m * v_job.matched_multiplier_bps / (1000000::NUMERIC * 10000));
 
-  -- AUDIT FIX: select_relay_chain called ONCE and stored
+  -- AUDIT FIX (CR-10 / DD-J): relay_count > 0 rejected inline at launch.
+  -- select_relay_chain does not exist in Phase 2 — deferred entirely to relay market plan.
   IF p_relay_count > 0 THEN
     -- Stub: reject relay_count > 0 until relay market ships
     RAISE EXCEPTION 'Relay routing not yet available (relay_count must be 0 at launch)';
@@ -883,30 +1298,7 @@ GRANT EXECUTE ON FUNCTION fill_compute_job TO service_role;
 
 ### `start_compute_job` -- Transition filled to executing
 
-**NEW RPC -- was missing from original plan (audit finding).**
-
-```sql
-CREATE OR REPLACE FUNCTION start_compute_job(
-  p_job_id UUID,
-  p_provider_node_id UUID
-) RETURNS void
-LANGUAGE plpgsql SECURITY DEFINER AS $$
-BEGIN
-  UPDATE wire_compute_jobs SET
-    status = 'executing',
-    dispatched_at = now()
-  WHERE id = p_job_id
-    AND status = 'filled'
-    AND provider_node_id = p_provider_node_id;
-
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'Job % not found or not in filled status for provider %', p_job_id, p_provider_node_id;
-  END IF;
-END;
-$$;
-
-GRANT EXECUTE ON FUNCTION start_compute_job TO service_role;
-```
+**Canonical location: `compute-market-phase-2-exchange.md` §II** (per DD-J). Ships in Phase 2's migration. Architecture doc no longer inlines the body — see phase doc for full SQL.
 
 ### `settle_compute_job` -- Provider reports completion
 
@@ -937,7 +1329,7 @@ BEGIN
   SELECT o.id INTO v_wire_platform_operator_id FROM wire_operators o
     JOIN wire_agents a ON a.operator_id = o.id
     JOIN wire_handles h ON h.agent_id = a.id
-    WHERE h.handle = 'agentwireplatform' AND h.status = 'active' LIMIT 1;
+    WHERE h.handle = 'agentwireplatform' AND h.released_at IS NULL LIMIT 1;
 
   SELECT * INTO v_job FROM wire_compute_jobs
     WHERE id = p_job_id AND status = 'executing'
@@ -946,9 +1338,23 @@ BEGIN
     RAISE EXCEPTION 'Job not found or not in executing status';
   END IF;
 
-  IF v_job.max_tokens IS NOT NULL AND p_completion_tokens > v_job.max_tokens * 2 THEN
-    RAISE EXCEPTION 'Reported completion_tokens (%) exceeds plausible limit', p_completion_tokens;
-  END IF;
+  -- Completion-token guard: read ratio from max_completion_token_ratio economic_parameter (DD-M).
+  -- Hardcoded `* 2` retired in favor of contribution-driven value.
+  DECLARE v_max_ratio INTEGER;
+  BEGIN
+    SELECT COALESCE((c.structured_data->>'ratio')::INTEGER, 2)
+      INTO v_max_ratio
+      FROM wire_contributions c
+      WHERE c.type = 'economic_parameter'
+        AND c.structured_data->>'parameter_name' = 'max_completion_token_ratio'
+        AND c.released_at IS NULL
+      ORDER BY c.created_at DESC LIMIT 1;
+    v_max_ratio := COALESCE(v_max_ratio, 2);
+    IF v_job.max_tokens IS NOT NULL AND p_completion_tokens > v_job.max_tokens * v_max_ratio THEN
+      RAISE EXCEPTION 'Reported completion_tokens (%) exceeds plausible limit (max_tokens=% ratio=%)',
+        p_completion_tokens, v_job.max_tokens, v_max_ratio;
+    END IF;
+  END;
 
   -- ALL integer arithmetic (Pillar 9: basis points, not f64)
   v_actual_cost := CEIL(p_prompt_tokens::NUMERIC * v_job.matched_rate_in_per_m * v_job.matched_multiplier_bps / (1000000::NUMERIC * 10000))
@@ -1126,109 +1532,13 @@ $$;
 GRANT EXECUTE ON FUNCTION void_compute_job TO service_role;
 ```
 
-### `cancel_compute_job` -- NEW (was missing from original plan)
+### `cancel_compute_job` -- canonical location: Phase 3
 
-```sql
-CREATE OR REPLACE FUNCTION cancel_compute_job(
-  p_job_id UUID,
-  p_requester_operator_id UUID
-) RETURNS void
-LANGUAGE plpgsql SECURITY DEFINER AS $$
-DECLARE
-  v_job wire_compute_jobs%ROWTYPE;
-BEGIN
-  SELECT * INTO v_job FROM wire_compute_jobs
-    WHERE id = p_job_id
-      AND status IN ('reserved', 'filled')
-      AND requester_operator_id = p_requester_operator_id
-    FOR UPDATE;
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'Job not found, not cancellable, or not owned by requester';
-  END IF;
+**Canonical location: `compute-market-phase-3-settlement.md` §II** (per DD-J). Ships in Phase 3's migration — the refund logic builds on Phase 3's settlement patterns, so ownership moved out of Phase 2. Architecture doc no longer inlines the body.
 
-  -- Refund deposit if filled (deposit was charged). Reservation fee is NOT refunded.
-  IF v_job.status = 'filled' AND COALESCE(v_job.deposit_amount, 0) > 0 THEN
-    PERFORM credit_operator_atomic(v_job.requester_operator_id, v_job.deposit_amount,
-      'compute_cancel_refund', p_job_id, 'compute_market');
-  END IF;
+### `clawback_compute_job` -- canonical location: Phase 5
 
-  UPDATE wire_compute_jobs SET
-    status = 'cancelled',
-    completed_at = now()
-  WHERE id = p_job_id;
-
-  UPDATE wire_compute_queue_state SET
-    market_depth = GREATEST(market_depth - 1, 0),
-    total_depth = GREATEST(total_depth - 1, 0),
-    updated_at = now()
-  WHERE node_id = v_job.provider_node_id AND model_id = v_job.model_id;
-
-  UPDATE wire_compute_offers SET
-    current_queue_depth = GREATEST(current_queue_depth - 1, 0),
-    updated_at = now()
-  WHERE id = v_job.offer_id;
-END;
-$$;
-
-GRANT EXECUTE ON FUNCTION cancel_compute_job TO service_role;
-```
-
-### `clawback_compute_job` -- NEW (needed for Phase 5 quality enforcement)
-
-```sql
-CREATE OR REPLACE FUNCTION clawback_compute_job(
-  p_job_id UUID,
-  p_challenger_operator_id UUID,
-  p_challenge_stake INTEGER
-) RETURNS void
-LANGUAGE plpgsql SECURITY DEFINER AS $$
-DECLARE
-  v_job wire_compute_jobs%ROWTYPE;
-  v_clawback_amount INTEGER;
-  v_bounty INTEGER;
-  v_wire_platform_operator_id UUID;
-BEGIN
-  SELECT o.id INTO v_wire_platform_operator_id FROM wire_operators o
-    JOIN wire_agents a ON a.operator_id = o.id
-    JOIN wire_handles h ON h.agent_id = a.id
-    WHERE h.handle = 'agentwireplatform' AND h.status = 'active' LIMIT 1;
-
-  SELECT * INTO v_job FROM wire_compute_jobs
-    WHERE id = p_job_id AND status = 'completed'
-    FOR UPDATE;
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'Job not found or not in completed status';
-  END IF;
-
-  -- Clawback provider_payout (may create negative balance for provider)
-  v_clawback_amount := COALESCE(v_job.provider_payout, 0);
-  IF v_clawback_amount > 0 THEN
-    -- Debit from provider (balance may go negative -- tracked, recovered over time)
-    UPDATE wire_operators SET credit_balance = credit_balance - v_clawback_amount
-      WHERE id = v_job.provider_operator_id;
-    INSERT INTO wire_credits_ledger (operator_id, amount, reason, reference_id, category, balance_after)
-      VALUES (v_job.provider_operator_id, -v_clawback_amount, 'compute_clawback', p_job_id, 'compute_market',
-              (SELECT credit_balance FROM wire_operators WHERE id = v_job.provider_operator_id));
-  END IF;
-
-  -- Refund requester (original deposit minus what they already got back)
-  PERFORM credit_operator_atomic(v_job.requester_operator_id,
-    COALESCE(v_job.actual_cost, 0),
-    'compute_clawback_refund', p_job_id, 'compute_market');
-
-  -- Challenger bounty: proportional to job cost (funded by clawback)
-  v_bounty := GREATEST(v_clawback_amount / 10, 1);
-  PERFORM credit_operator_atomic(p_challenger_operator_id, v_bounty,
-    'challenge_bounty', p_job_id, 'compute_market');
-
-  -- Return challenger's stake
-  PERFORM credit_operator_atomic(p_challenger_operator_id, p_challenge_stake,
-    'challenge_stake_return', p_job_id, 'compute_market');
-END;
-$$;
-
-GRANT EXECUTE ON FUNCTION clawback_compute_job TO service_role;
-```
+**Canonical location: `compute-market-phase-5-quality.md` §III** (per DD-J). Ships in Phase 5's migration. The Phase 5 signature is canonical: `(p_job_id UUID, p_verdict_id UUID) RETURNS TABLE(provider_debited INTEGER, challenger_credited INTEGER, negative_balance_claim BOOLEAN)` — reads challenger identity + stake from `wire_compute_challenge_cases` via `p_verdict_id`, inserts into `wire_compute_negative_claims` on partial debit, sets offer status to `'quality_hold'`. Architecture doc no longer inlines the body; the earlier 3-parameter-with-stake-as-input version is retired.
 
 ### `sweep_timed_out_compute_jobs`
 
@@ -1267,23 +1577,24 @@ RETURNS INTEGER
 LANGUAGE plpgsql SECURITY DEFINER AS $$
 DECLARE
   v_count INTEGER;
-  v_threshold_minutes INTEGER;
+  v_staleness_s INTEGER;
 BEGIN
-  -- Read stale threshold from economic_parameter contribution (Pillar 37)
-  SELECT COALESCE((c.structured_data->>'threshold_minutes')::INTEGER, 5)
-    INTO v_threshold_minutes
+  -- Read heartbeat staleness threshold from economic_parameter contribution (Pillar 37)
+  -- Deployed parameter_name is `staleness_thresholds`, field is `heartbeat_staleness_s` (seconds, not minutes).
+  SELECT COALESCE((c.structured_data->>'heartbeat_staleness_s')::INTEGER, 300)
+    INTO v_staleness_s
     FROM wire_contributions c
     WHERE c.type = 'economic_parameter'
-      AND c.structured_data->>'parameter_name' = 'stale_offer_threshold_minutes'
+      AND c.structured_data->>'parameter_name' = 'staleness_thresholds'
       AND c.status = 'active'
     ORDER BY c.created_at DESC LIMIT 1;
-  v_threshold_minutes := COALESCE(v_threshold_minutes, 5);
+  v_staleness_s := COALESCE(v_staleness_s, 300);
 
   UPDATE wire_compute_offers SET status = 'offline', updated_at = now()
   WHERE status = 'active'
     AND node_id IN (
       SELECT id FROM wire_nodes
-      WHERE last_seen_at < now() - (v_threshold_minutes || ' minutes')::interval
+      WHERE last_seen_at < now() - (v_staleness_s || ' seconds')::interval
     );
   GET DIAGNOSTICS v_count = ROW_COUNT;
   RETURN v_count;
@@ -1293,40 +1604,14 @@ $$;
 GRANT EXECUTE ON FUNCTION deactivate_stale_compute_offers TO service_role;
 ```
 
-### `aggregate_compute_observations` -- NEW (needed before Phase 5)
+### Observation aggregation functions -- canonical locations: Phase 3 + Phase 5
 
-```sql
-CREATE OR REPLACE FUNCTION aggregate_compute_observations(
-  p_node_id UUID,
-  p_model_id TEXT
-) RETURNS void
-LANGUAGE plpgsql SECURITY DEFINER AS $$
-DECLARE
-  v_median_tps REAL;
-  v_p95_latency INTEGER;
-  v_job_count INTEGER;
-BEGIN
-  SELECT
-    percentile_cont(0.5) WITHIN GROUP (ORDER BY tokens_per_sec),
-    percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)::INTEGER,
-    COUNT(*)
-  INTO v_median_tps, v_p95_latency, v_job_count
-  FROM wire_compute_observations
-  WHERE node_id = p_node_id
-    AND model_id = p_model_id
-    AND created_at > now() - interval '7 days';
+Two distinct functions (per CR-4 resolution + DD-J):
 
-  UPDATE wire_compute_offers SET
-    observed_median_tps = v_median_tps,
-    observed_p95_latency_ms = v_p95_latency,
-    observed_job_count = v_job_count,
-    updated_at = now()
-  WHERE node_id = p_node_id AND model_id = p_model_id AND status = 'active';
-END;
-$$;
+- **`aggregate_compute_observations_for(p_node_id, p_model_id, p_horizon_hours)`** — per-node/per-model read helper; returns a TABLE of median TPS, p95 latency, job count, etc. Called by the heartbeat handler to populate per-node performance data. Canonical location: `compute-market-phase-3-settlement.md` §II.
+- **`refresh_offer_observations_sweep()`** — no-arg sweeper that updates `wire_compute_offers.observed_*` columns across all active offers. Canonical location: `compute-market-phase-5-quality.md` §VIII.
 
-GRANT EXECUTE ON FUNCTION aggregate_compute_observations TO service_role;
-```
+The earlier architecture-doc stub that merged these two concerns into one function with inconsistent signature has been deleted. See phase docs for canonical SQL.
 
 ### Helper: `compute_queue_multiplier_bps`
 
@@ -1492,44 +1777,44 @@ status: active
 **`economic_parameter` (various):**
 
 ```yaml
-# Rotator arm slot configuration
+# Rotator arm slot configuration (deployed in Phase 1 seed)
 schema_type: economic_parameter
 parameter_name: market_rotator_config
 total_slots: 80
+provider_slots: 76
 wire_slots: 2
 graph_fund_slots: 2
+distribution: bjorklund
 
 ---
 
-# Default output token estimate for cold-start models
+# Default output token estimate for cold-start models (deployed in Phase 1 seed)
 schema_type: economic_parameter
-parameter_name: default_output_estimate_tokens
-default_tokens: 500
+parameter_name: default_output_estimate
+default_output_tokens: 500
 
 ---
 
-# Stale offer deactivation threshold
+# Staleness thresholds for queue mirror and heartbeat (deployed in Phase 1 seed)
 schema_type: economic_parameter
-parameter_name: stale_offer_threshold_minutes
-threshold_minutes: 5
+parameter_name: staleness_thresholds
+queue_mirror_staleness_s: 120
+heartbeat_staleness_s: 300
 
 ---
 
-# Deposit percentage (100% = full prepayment of estimate)
+# Deposit percentage (100% = full prepayment of estimate) (deployed in Phase 1 seed)
 schema_type: economic_parameter
-parameter_name: deposit_percentage
-percentage_bps: 10000            # basis points: 10000 = 100%
+parameter_name: compute_deposit_config
+deposit_percentage_bps: 10000    # basis points: 10000 = 100%
 
 ---
 
-# Queue mirror debounce window
-schema_type: economic_parameter
-parameter_name: queue_mirror_debounce_ms
-debounce_ms: 500
+# queue_mirror_debounce_ms / match_search_fee / offer_creation_fee / queue_push_fee
+# were absorbed into the market_delivery_policy contribution per DD-E.
+# See DD-E in §VIII.6 for the full market_delivery_policy schema.
 
----
-
-# Challenge stake multiplier (stake = multiplier * job actual_cost)
+# Challenge stake multiplier (stake = multiplier * job actual_cost) (seeded in Phase 5)
 schema_type: economic_parameter
 parameter_name: challenge_stake_multiplier
 multiplier_bps: 5000             # basis points: 5000 = 50% of job cost
@@ -1590,19 +1875,34 @@ multiplier_bps: 5000             # basis points: 5000 = 50% of job cost
 
 ## XIV. Economic Parameters
 
-Every `economic_parameter` contribution that must be seeded before the compute market can operate:
+Every `economic_parameter` contribution that must be seeded before the compute market can operate. **Names and field keys below match the deployed Phase 1 migration** (`20260414100000_market_prerequisites.sql`) — see §VIII.5 for the doc-vs-deployed reconciliation history.
 
-| Parameter Name | Purpose | Seed Value | Units |
+**Seeded by Phase 1 (already deployed):**
+
+| Parameter Name | Purpose | Deployed Seed Value | Units |
 |---|---|---|---|
-| `market_rotator_config` | Rotator arm slot distribution | `{total_slots: 80, wire_slots: 2, graph_fund_slots: 2}` | Integer slot counts |
-| `default_output_estimate_tokens` | Cold-start fallback for output token estimation | `{default_tokens: 500}` | Tokens |
-| `stale_offer_threshold_minutes` | How long since last heartbeat before offer marked offline | `{threshold_minutes: 5}` | Minutes |
-| `deposit_percentage` | Ratio of estimated cost locked as deposit | `{percentage_bps: 10000}` | Basis points (10000 = 100%) |
-| `queue_mirror_debounce_ms` | Minimum interval between queue state pushes to Wire | `{debounce_ms: 500}` | Milliseconds |
-| `challenge_stake_multiplier` | Stake required to file a challenge (as ratio of job cost) | `{multiplier_bps: 5000}` | Basis points (5000 = 50%) |
-| `match_search_fee` | Credit cost per match attempt (refunded on success) | `{fee: 1}` | Credits |
-| `offer_creation_fee` | Credit cost to create an offer (anti-spam) | `{fee: 1}` | Credits |
-| `queue_push_fee` | Credit cost per queue state push (batched) | `{fee: 1}` | Credits |
-| `relay_hop_fee` | Per-hop relay fee (for future relay market) | `{fee: 1}` | Credits |
-| `fleet_jwt_ttl_secs` | TTL for fleet identity JWTs | `{ttl_secs: 3600}` | Seconds |
-| `max_completion_token_ratio` | Guard: max reported completion_tokens as ratio of max_tokens | `{ratio: 2}` | Multiplier |
+| `market_rotator_config` | Rotator arm slot distribution (shared across compute/storage/relay) | `{total_slots: 80, provider_slots: 76, wire_slots: 2, graph_fund_slots: 2, distribution: 'bjorklund'}` | Integer slot counts |
+| `compute_deposit_config` | Ratio of estimated cost locked as token deposit | `{deposit_percentage_bps: 10000}` | Basis points (10000 = 100%) |
+| `default_output_estimate` | Cold-start fallback for output token estimation | `{default_output_tokens: 500}` | Tokens |
+| `staleness_thresholds` | How fresh queue/heartbeat state must be for matching | `{queue_mirror_staleness_s: 120, heartbeat_staleness_s: 300}` | Seconds |
+| `relay_performance_floor` | Minimum quality for relay participation | `{min_reliability_bps: 9000, min_bandwidth_mbps: 1, evaluation_window_days: 7}` | Basis points + Mbps + days |
+
+**To be seeded by Phase 2+ (referenced by RPCs below):**
+
+| Parameter Name | Purpose | Target Seed Value | Units | Introduced In |
+|---|---|---|---|---|
+| `challenge_stake_multiplier` | Stake required to file a challenge (as ratio of job `actual_cost`) | `{multiplier_bps: 5000}` | Basis points (5000 = 50%) | Phase 5 |
+| `minimum_panelist_stake` | Minimum operator balance required to be selected as a challenge panelist | `{minimum_panelist_stake: 100}` | Credits | Phase 5 |
+| `relay_hop_fee` | Per-hop relay fee | `{fee: 1}` | Credits | Relay market |
+| `fleet_jwt_ttl_secs` | TTL for fleet identity JWTs | `{ttl_secs: 3600}` | Seconds | Fleet MPS (shipped) |
+| `fill_job_ttl_secs` | TTL for `wire_job_token` JWT (market dispatch) | `{ttl_secs: 300}` | Seconds | Phase 2 |
+| `max_completion_token_ratio` | Guard: max reported completion_tokens as ratio of max_tokens | `{ratio: 2}` | Multiplier | Phase 3 |
+
+**Absorbed into other contributions (do NOT seed as standalone economic_parameter):**
+
+| Old parameter name | Absorbed into | Field in new contribution |
+|---|---|---|
+| `queue_mirror_debounce_ms` | `market_delivery_policy` (DD-E) | `queue_mirror_debounce_ms` |
+| `match_search_fee` | `market_delivery_policy` (DD-E) | `match_search_fee` |
+| `offer_creation_fee` | `market_delivery_policy` (DD-E) | `offer_creation_fee` |
+| `queue_push_fee` | `market_delivery_policy` (DD-E) | `queue_push_fee` |

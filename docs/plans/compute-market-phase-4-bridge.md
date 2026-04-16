@@ -122,7 +122,7 @@ Every OpenRouter HTTP response must map to a Wire job state transition and an of
 | 400 (context exceeded) | failed | unchanged | no | `context_exceeded` | Requester should retry with shorter prompt or different model. |
 | 401 (unauthorized) | failed | ALL bridge offers suspended | no | `upstream_auth_failure` | API key revoked or expired. Operator must re-provision. |
 | 402 (insufficient funds) | failed | ALL bridge offers suspended | no | `upstream_funds_exhausted` | OpenRouter credits depleted. Operator must add funds. |
-| 403 (forbidden) | failed | THIS model's offer suspended | no | `upstream_forbidden` | Model access restricted (gated model, ToS violation). |
+| 403 (forbidden) | failed | THIS model's offer suspended | no | `upstream_forbidden` | Model access restricted (gated model, ToS violation). **P3 fix:** The bridge dispatch handler must override the default `retryable_status_codes` list (`llm.rs:347`, which includes some 4xx codes under the generic LLM retry policy) to EXCLUDE 403. A 403 means access restricted — retrying will never succeed, wastes OpenRouter quota, and delays failing the Wire job. Pass `retryable_status_codes: &[408, 429, 500, 502]` (or whatever the non-403 transient set is) on every OpenRouter call made from the bridge dispatch handler. |
 | 404 (model not found) | failed | THIS model's offer suspended | no | `upstream_model_removed` | Model deprecated. Trigger model lifecycle refresh. |
 | 408 (request timeout) | failed | unchanged | no | `upstream_timeout` | Request took too long to start processing. |
 | 429 (rate limited) | retry internally (max 3 attempts, exponential backoff starting at 2s) → fail if exhausted | unchanged | yes, bounded | `upstream_rate_limited` | Transient. If rate limit is sustained (3 consecutive 429s in 60s), consider reducing offer queue depth. |
@@ -234,50 +234,56 @@ The matching RPC respects this: if `bridge_allowed = false`, offers with `provid
 
 ### A. Bridge Mode in compute_market.rs
 
-Bridge dispatch is a special case of the provider-side job handler. When a market job arrives at a bridge node:
+Bridge dispatch is a special case of the provider-side job handler. It reuses the Phase 2 ACK+callback+outbox scaffolding unchanged — the only difference from local-GPU market dispatch is that the "worker" is an outbound OpenRouter HTTP call rather than a local GPU loop.
 
-1. **Receive job** via `/v1/compute/job-dispatch` (same endpoint as local GPU market jobs)
-2. **Check provider_type** on the matched offer. If `'bridge'`: route to bridge dispatch handler instead of local compute queue.
-3. **Bridge dispatch handler:**
-   - Extract prompt from the job payload (received via relay chain or Wire-proxied path)
-   - Build OpenRouter API request with bridge-dedicated API key
-   - Set `trace.metadata` fields for webhook correlation:
+**Same scaffolding as Phase 2:**
+- Same `/v1/compute/job-dispatch` endpoint, same `MarketDispatchRequest` envelope, same `verify_market_identity` auth
+- Same `fleet_result_outbox` row lifecycle (`pending` → `ready` → `delivered`) — per DD-D, ONE outbox table for Fleet + MarketStandard + Relay variants discriminated by `callback_kind`. Bridge jobs use `callback_kind = 'MarketStandard'` (Wire-relayed result delivery at launch).
+- Same `MarketAsyncResult` callback POST to the requester-supplied `callback_url`
+- Same `market_delivery_policy` operational knobs (retention, backoff, worker heartbeat tolerance)
+
+**What changes for bridge:**
+
+1. **Provider type routing.** The job-dispatch handler inspects the matched offer's `provider_type`. If `'bridge'`: route to `bridge_worker` instead of `gpu_worker`.
+
+2. **Bridge worker.** Instead of enqueueing into the local compute queue, the bridge worker:
+   - Extracts prompt from the job payload (arrived via relay chain or bootstrap-mode Wire forward)
+   - Builds OpenRouter API request with the bridge-dedicated API key (P3: manual key only, see §B)
+   - Sets `trace.metadata` for webhook correlation (DD-A: bridge uses `market:compute` slug + `step_name: "bridge"` prefix):
      ```json
      {
        "metadata": {
          "wire_job_id": "<job_id>",
-         "wire_slug": "compute-market-bridge",
-         "wire_step_name": "<job_id>"
+         "wire_slug": "market:compute",
+         "wire_step_name": "bridge/<job_id>"
        }
      }
      ```
-   - Call OpenRouter `/api/v1/chat/completions`
-   - Extract `actual_cost_usd` from response body (`usage.cost` field)
-   - Map response to Wire settlement metadata (token counts, finish reason, latency)
-   - Call Wire `settle_compute_job` RPC with actual token counts
-   - Record dollar cost and credit revenue in local bridge economics ledger
-   - Handle all error codes per classification table (Section III)
+   - Calls OpenRouter `/api/v1/chat/completions`
+   - While the OpenRouter call is in flight: bumps `worker_heartbeat_at` on the outbox row every `worker_heartbeat_interval_secs` — same machinery as GPU worker, guarantees no spurious "worker dead" synthesized Error under slow OpenRouter responses
+   - Extracts `actual_cost_usd` from response body (`usage.cost` field)
+   - Handles error codes per the classification table (§III). Retryable codes (429, 500, 502) are bounded by `max_delivery_attempts` from market delivery policy — same backoff machinery, different retry surface (OpenRouter HTTP vs callback delivery).
+   - On success: CAS `status='ready'`, write result_json, bump `expires_at = now + ready_retention_secs`. The delivery loop then POSTs the result to `callback_url` like any other market job.
+   - On terminal failure: CAS `status='ready'` with synthesized Error payload — same "fleet async result Error variant" pattern. The delivery loop delivers the Error to the requester, who fails the build step.
+
+3. **Settlement metadata.** After the OpenRouter call returns, settlement goes via `POST /api/v1/compute/settle` with `{ job_id, prompt_tokens, completion_tokens, latency_ms, finish_reason, bridge_dollar_cost, bridge_openrouter_model }`. This is the same metadata-only POST as local GPU — the bridge columns are optional additions.
+
+4. **Error isolation.** Bridge worker code lives in a separate handler function from GPU worker. An OpenRouter failure can never corrupt local-GPU state. Shared outbox discipline + shared delivery loop — separate worker logic.
 
 ### B. Bridge-Dedicated API Key
 
 The audit found that sharing one OpenRouter API key between personal builds and bridge jobs causes rate limit exhaustion — bridge traffic blocks the operator's own builds.
 
-**Key provisioning options (ordered by preference):**
+**Key provisioning — manual only.**
 
-1. **Programmatic provisioning via Management API (preferred):**
-   - On bridge activation, the Wire server calls `POST /api/v1/keys` with:
-     - `name`: `"wire-bridge-{node_handle}"`
-     - `limit`: operator-configured spend cap (from `compute_bridge` contribution)
-     - `limit_reset`: `"monthly"` (default)
-   - The new key is returned to the node and stored in `credentials.rs` alongside the personal key
-   - Both keys charge the same OpenRouter account but have independent server-side rate limits
-   - Wire configures a separate broadcast webhook destination filtered to the bridge key
+The original plan included a "programmatic provisioning via Management API" option that would have called `POST /api/v1/keys` to mint a bridge-dedicated key from the operator's main account. **P3 fix (from 2026-04-15 audit):** OpenRouter does not expose a programmatic key-provisioning endpoint on the free public API surface. Option 1 is removed. Manual key entry is the only supported path.
 
-2. **Manual separate key (fallback if Management API unavailable):**
-   - BridgeConfigPanel includes a field for a bridge-dedicated OpenRouter API key
-   - Operator creates the key manually on OpenRouter dashboard
-   - Stored separately from the personal key in `credentials.rs`
-   - Validation: on save, test the key with a lightweight `/api/v1/models` call
+**Manual key path:**
+- BridgeConfigPanel **requires** a bridge-dedicated OpenRouter API key — it is not optional. Bridge mode cannot activate without it, and the UI blocks activation with a clear message if the field is empty.
+- Operator creates the key manually on the OpenRouter dashboard
+- Stored separately from the personal key in `credentials.rs`
+- Validation: on save, test the key with a lightweight `/api/v1/models` call; reject on auth failure
+- The UI explicitly tells the operator why two keys are needed (rate-limit isolation — bridge traffic must not exhaust the personal build key's quota)
 
 **Key isolation in code:**
 
@@ -339,43 +345,68 @@ cache → route resolution → fleet-local-GPU → fleet-bridge → wire-compute
 
 Implementation:
 
-1. **Add `provider_type` to FleetPeer:**
+1. **Add `provider_types` to FleetPeer:**
    ```rust
    pub struct FleetPeer {
        // ... existing fields ...
        /// Provider types available at this peer.
        /// "local" = local GPU, "bridge" = cloud relay.
        /// A peer can be both (has local GPU AND runs bridge mode).
-       #[serde(default)]
+       /// P3 fix: default to ["local"], NOT an empty Vec. Existing fleet peers (rolled
+       /// out before Phase 4) won't serialize this field; an empty default would cause
+       /// the dispatch filter `provider_types.contains("local")` to exclude them
+       /// entirely, taking the whole pre-Phase-4 fleet offline until operators upgrade.
+       #[serde(default = "default_provider_types_local")]
        pub provider_types: Vec<String>,  // ["local"], ["bridge"], ["local", "bridge"]
+   }
+
+   fn default_provider_types_local() -> Vec<String> { vec!["local".to_string()] }
+   ```
+
+2. **Extend `HeartbeatFleetEntry` with `provider_types`** — at `fleet.rs:83-106`. Without this, `FleetPeer.provider_types` can never be populated from the heartbeat response:
+
+   ```rust
+   pub struct HeartbeatFleetEntry {
+       // ... existing fields ...
+       #[serde(default = "default_provider_types_local")]
+       pub provider_types: Vec<String>,
    }
    ```
 
-2. **Fleet announce includes provider_types:** The fleet peer announcement payload (from heartbeat and direct announce) carries `provider_types` so dispatching nodes know which peers have local GPU vs bridge.
+3. **Extend `FleetAnnouncement` payload** — the direct peer-to-peer announce at `fleet.rs` (search `FleetAnnouncement`). Add same field with same serde default:
 
-3. **Dispatch logic in llm.rs:**
-   ```
-   // Current: fleet dispatch checks serving_rules only
-   // New: fleet dispatch splits into two passes:
-   //   Pass 1: fleet peers with provider_types containing "local"
-   //   Pass 2: fleet peers with provider_types containing "bridge" ONLY
-   //           (and only when local fleet is exhausted AND bridge is cheaper than market)
+   ```rust
+   pub struct FleetAnnouncement {
+       // ... existing fields ...
+       #[serde(default = "default_provider_types_local")]
+       pub provider_types: Vec<String>,
+   }
    ```
 
-4. **Same-operator bridge is last resort, not first choice:** If a fleet peer only has bridge capability (no local GPU), it's treated as more expensive than a same-operator local GPU peer. The operator pays nothing for local fleet dispatch but pays OpenRouter dollars for bridge fleet dispatch.
+4. **Extend `update_from_heartbeat` and `update_from_announcement` reducers** at `fleet.rs` to carry the new field through to `FleetPeer`. Existing reducer-merge pattern means this is one line per reducer.
+
+5. **Extend Wire-side heartbeat response** (GoodNewsEveryone) — the fleet_roster section of the heartbeat JSON gains `provider_types` per-peer. The Wire learns each peer's provider_types via the peer's own offer publication (`wire_compute_offers.provider_type` already exists at Phase 1 migration). Aggregate per-peer: `SELECT DISTINCT provider_type FROM wire_compute_offers WHERE node_id = ...`.
+
+6. **Dispatch logic in `llm.rs`** — name the function being modified: `find_peer_for_rule` in `fleet.rs:502+` (the signature that already takes `staleness_secs`). Add a second arg `required_provider_type: &str` (`"local"` or `"bridge"`). `llm.rs` Phase A becomes two passes:
+   - **Pass 1** — `find_peer_for_rule(rule, staleness, "local")` — fleet peers that advertise local GPU. Prefer these.
+   - **Pass 2** — only if Pass 1 returns None: `find_peer_for_rule(rule, staleness, "bridge")` — fleet peers that advertise bridge capability. Use only when local-fleet is exhausted AND a bridge peer is cheaper than going to `wire-compute` (an economic comparison the dispatcher is NOT responsible for at launch; ship Pass 2 unconditionally when local fleet is exhausted — the fleet peer's bridge publishes its market offer on the Wire separately, so cross-operator dispatchers already see the bridge via the normal market path).
+
+   **Interaction with `serving_rules`:** Both passes respect `serving_rules` — a peer must both (a) have a serving_rule matching the requested rule_name AND (b) have the required provider_type. The two filters are ANDed in the SQL/Rust filter.
+
+7. **Same-operator bridge is last resort, not first choice:** If a fleet peer only has bridge capability (no local GPU), it's treated as more expensive than a same-operator local GPU peer. The operator pays nothing for local fleet dispatch but pays OpenRouter dollars for bridge fleet dispatch.
 
 ### E. OpenRouter Webhook Correlation
 
 The existing `openrouter_webhook.rs` module correlates broadcast traces against `pyramid_cost_log` rows using `(slug, step_name, model)` as fallback when `generation_id` is missing.
 
-Bridge jobs need a distinct StepContext so the correlator can distinguish bridge-for-market traces from personal build traces:
+Bridge jobs need a distinct StepContext so the correlator can distinguish bridge-for-market traces from personal build traces. Per DD-A, bridge reuses the `market:compute` slug with `bridge/` prefix on `step_name` — not a separate `compute-market-bridge` slug. This keeps hold scoping unified (a quality_hold on market:compute blocks bridge jobs too) while preserving webhook-correlation uniqueness via the step_name discriminator.
 
 ```rust
 // Bridge job StepContext:
 StepContext {
-    slug: "compute-market-bridge".into(),
+    slug: "market:compute".into(),
     build_id: None,  // bridge jobs are not builds
-    step_name: job_id.clone(),  // unique per job
+    step_name: format!("bridge/{}", job_id),  // unique per job; "bridge/" prefix discriminates
     depth: None,
     chunk_index: None,
     chain_id: None,
@@ -386,9 +417,9 @@ StepContext {
 
 **Correlation flow for bridge jobs:**
 
-1. Bridge dispatch sets `trace.metadata.wire_slug = "compute-market-bridge"` and `trace.metadata.wire_step_name = <job_id>` in the OpenRouter request
-2. `pyramid_cost_log` row created at dispatch time with `slug = "compute-market-bridge"`, `step_name = <job_id>`
-3. Broadcast webhook arrives → correlator matches by `(slug="compute-market-bridge", step_name=<job_id>, model=<model_id>)`
+1. Bridge dispatch sets `trace.metadata.wire_slug = "market:compute"` and `trace.metadata.wire_step_name = "bridge/<job_id>"` in the OpenRouter request
+2. `pyramid_cost_log` row created at dispatch time with `slug = "market:compute"`, `step_name = "bridge/<job_id>"`
+3. Broadcast webhook arrives → correlator matches by `(slug="market:compute", step_name="bridge/<job_id>", model=<model_id>)`
 4. `actual_cost_usd` from the synchronous response body is the primary cost source (available immediately, per-call)
 5. Broadcast webhook serves as reconciliation/verification — if broadcast cost diverges from synchronous cost, the discrepancy detection in `openrouter_webhook.rs` fires
 
@@ -397,9 +428,9 @@ StepContext {
 ```rust
 // In pyramid_cost_log for a bridge job:
 CostLogEntry {
-    slug: "compute-market-bridge",
+    slug: "market:compute",
     build_id: None,
-    step_name: job_id,
+    step_name: format!("bridge/{}", job_id),
     model: model_id,
     actual_cost_usd: response.usage.cost,  // from OpenRouter response
     // ... standard fields ...
@@ -458,6 +489,18 @@ All events carry `work_item_id` and `attempt_id` for DADBEAR correlation (column
 
 ## VI. Contribution Schemas
 
+### Interaction with `compute_participation_policy`
+
+Bridge capability is a facet of the `ServiceDescriptor`, not a parallel enable/disable. The node's `ServiceDescriptor.visibility` still governs whether offers land on the Wire at all. The `compute_participation_policy.allow_market_visibility` field gates market publication (bridge offers included). A node can therefore be in any of:
+
+| `allow_market_visibility` | `compute_bridge.enabled` | Result |
+|---|---|---|
+| false | any | No market offers of any kind. Bridge config is inert. |
+| true | false | Only local-GPU market offers published (if `ServiceDescriptor.models_loaded` non-empty). |
+| true | true | Local-GPU + bridge offers both published (if each has source content). |
+
+Bridge mode does NOT have its own participation-policy gate beyond the bridge-config `enabled: bool`. The market-level gate is upstream.
+
 ### A. compute_bridge
 
 This contribution type was listed in the plan's contribution types table but never defined. Full schema:
@@ -466,7 +509,7 @@ This contribution type was listed in the plan's contribution types table but nev
 # Bridge configuration (schema_type: compute_bridge)
 # One per node. Supersedable — new contribution replaces prior.
 
-# Master enable gate
+# Master enable gate (bridge-specific; subordinate to compute_participation_policy.allow_market_visibility)
 enabled: true
 
 # API key reference (hash, not plaintext — actual key in local credentials store)
