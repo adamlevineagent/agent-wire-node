@@ -9324,7 +9324,12 @@ async fn compute_offer_remove(
             let config = state.config.read().await;
             (config.api_url.clone(), get_api_token(&state.auth).await?)
         };
-        let path = format!("/api/v1/compute/offers/{offer_id}");
+        // URL-encode offer_id for path safety — Wire offer IDs are
+        // typically UUIDs but the path is the Wire's call to make.
+        let path = format!(
+            "/api/v1/compute/offers/{}",
+            urlencoding::encode(&offer_id)
+        );
         let (status, resp) =
             send_api_request(&api_url, "DELETE", &path, &token, None, None).await?;
         if !status.is_success() && status.as_u16() != 404 {
@@ -9376,8 +9381,14 @@ async fn compute_market_surface(
         let config = state.config.read().await;
         (config.api_url.clone(), get_api_token(&state.auth).await?)
     };
+    // URL-encode model_id so bridge provider IDs with slashes (e.g.
+    // `anthropic/claude-3-opus`) or query-reserved chars don't break
+    // the Wire's query parsing.
     let path = match model_id {
-        Some(m) => format!("/api/v1/compute/market-surface?model_id={m}"),
+        Some(m) => format!(
+            "/api/v1/compute/market-surface?model_id={}",
+            urlencoding::encode(&m)
+        ),
         None => "/api/v1/compute/market-surface".to_string(),
     };
     let (status, resp) =

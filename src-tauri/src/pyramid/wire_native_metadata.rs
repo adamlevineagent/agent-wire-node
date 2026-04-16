@@ -913,6 +913,32 @@ pub fn resolve_wire_type(schema_type: &str) -> Result<(WireContributionType, Vec
                 "update_polling".to_string(),
             ],
         )),
+        // Async fleet dispatch delivery policy — operator-tunable ACK
+        // timeouts, sweep cadences, admission caps. Shipped by the
+        // async-fleet-dispatch workstream; Wire publish mapping was
+        // missed during that series.
+        "fleet_delivery_policy" => Ok((
+            WireContributionType::Template,
+            vec![
+                "config".to_string(),
+                "wire-node".to_string(),
+                "fleet".to_string(),
+                "delivery".to_string(),
+            ],
+        )),
+        // Compute market dispatch delivery policy — parallel shape to
+        // fleet_delivery_policy with market-specific economic gates
+        // (match_search_fee, offer_creation_fee, queue_push_fee,
+        // queue_mirror_debounce_ms). Shipped in Phase 2 WS0.
+        "market_delivery_policy" => Ok((
+            WireContributionType::Template,
+            vec![
+                "config".to_string(),
+                "wire-node".to_string(),
+                "compute_market".to_string(),
+                "delivery".to_string(),
+            ],
+        )),
         other => Err(format!(
             "unknown schema_type {other:?}; cannot resolve to Wire contribution type"
         )),
@@ -1464,6 +1490,8 @@ wire:
             ("auto_update_policy", WireContributionType::Template),
             ("dispatch_policy", WireContributionType::Template),
             ("wire_update_polling", WireContributionType::Template),
+            ("fleet_delivery_policy", WireContributionType::Template),
+            ("market_delivery_policy", WireContributionType::Template),
         ];
         for (schema_type, expected) in cases {
             let (actual, tags) = resolve_wire_type(schema_type).unwrap();
