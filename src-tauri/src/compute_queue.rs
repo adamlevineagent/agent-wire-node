@@ -514,4 +514,69 @@ mod tests {
         let e_clone = e.clone();
         assert_eq!(e, e_clone);
     }
+
+    // ── Edge cases ───────────────────────────────────────────────────
+
+    #[test]
+    fn enqueue_market_with_zero_cap_rejects_first_push() {
+        // A zero-cap offer is the operator saying "stop accepting market
+        // work on this model". The strict >= semantics mean the first
+        // push rejects with current=0, max=0.
+        let mut mgr = ComputeQueueManager::new();
+        let err = mgr
+            .enqueue_market("m", sample_entry("m", "market_received"), 0)
+            .unwrap_err();
+        match err {
+            QueueError::DepthExceeded { current, max, .. } => {
+                assert_eq!(current, 0);
+                assert_eq!(max, 0);
+            }
+            other => panic!("expected DepthExceeded, got {other:?}"),
+        }
+        assert_eq!(mgr.queue_depth("m"), 0);
+        assert_eq!(mgr.market_queue_depth("m"), 0);
+    }
+
+    #[test]
+    fn enqueue_market_does_not_double_register_existing_model() {
+        // If enqueue_local registered the model first, a subsequent
+        // enqueue_market to the same model must NOT push the key to
+        // round_robin_keys again. Duplicate keys cause that model to
+        // drain twice per round — a silent fairness bug for the other
+        // models in the rotation.
+        let mut mgr = ComputeQueueManager::new();
+        mgr.enqueue_local("m", sample_entry("m", "local"));
+        mgr.enqueue_market("m", sample_entry("m", "market_received"), 5)
+            .unwrap();
+        mgr.enqueue_market("m", sample_entry("m", "market_received"), 5)
+            .unwrap();
+        // Round-robin should cycle through exactly one model. After
+        // draining all entries, the next dequeue_next must return None.
+        let a = mgr.dequeue_next();
+        let b = mgr.dequeue_next();
+        let c = mgr.dequeue_next();
+        assert!(a.is_some());
+        assert!(b.is_some());
+        assert!(c.is_some());
+        assert!(mgr.dequeue_next().is_none(), "queue must be fully drained");
+
+        // Sibling scenario: enqueue_market before enqueue_local must
+        // also not double-register.
+        let mut mgr2 = ComputeQueueManager::new();
+        mgr2.enqueue_market("n", sample_entry("n", "market_received"), 5)
+            .unwrap();
+        mgr2.enqueue_local("n", sample_entry("n", "local"));
+        mgr2.enqueue_market("n", sample_entry("n", "market_received"), 5)
+            .unwrap();
+        let a = mgr2.dequeue_next();
+        let b = mgr2.dequeue_next();
+        let c = mgr2.dequeue_next();
+        assert!(a.is_some());
+        assert!(b.is_some());
+        assert!(c.is_some());
+        assert!(
+            mgr2.dequeue_next().is_none(),
+            "queue must be fully drained after 3 pushes + 3 pops"
+        );
+    }
 }
