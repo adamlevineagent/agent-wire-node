@@ -2299,7 +2299,6 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_fleet_outbox_expires ON fleet_result_outbox (expires_at);
         CREATE INDEX IF NOT EXISTS idx_fleet_outbox_status_attempts ON fleet_result_outbox (status, last_attempt_at);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_outbox_job_id ON fleet_result_outbox (job_id);
-        CREATE INDEX IF NOT EXISTS idx_fleet_outbox_callback_kind ON fleet_result_outbox (callback_kind);
         ",
     )?;
 
@@ -2309,6 +2308,10 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // is in-line). For DBs that predate Phase 2, the column doesn't exist;
     // we ALTER once. SQLite has no `ADD COLUMN IF NOT EXISTS`, so we check
     // via PRAGMA table_info first.
+    //
+    // The callback_kind index MUST be created AFTER this block — if we put
+    // it in the main CREATE batch above, a pre-WS0 DB (table exists, column
+    // does not) fails on the CREATE INDEX before the PRAGMA guard ever runs.
     {
         let mut stmt = conn.prepare("PRAGMA table_info(fleet_result_outbox)")?;
         let cols: Vec<String> = stmt
@@ -2317,11 +2320,17 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             .collect();
         if !cols.iter().any(|c| c == "callback_kind") {
             conn.execute_batch(
-                "ALTER TABLE fleet_result_outbox ADD COLUMN callback_kind TEXT NOT NULL DEFAULT 'Fleet';
-                 CREATE INDEX IF NOT EXISTS idx_fleet_outbox_callback_kind ON fleet_result_outbox (callback_kind);",
+                "ALTER TABLE fleet_result_outbox ADD COLUMN callback_kind TEXT NOT NULL DEFAULT 'Fleet';",
             )?;
         }
     }
+
+    // Now that callback_kind is guaranteed to exist (either from the fresh
+    // CREATE above or from the conditional ALTER), build the index over it.
+    // Idempotent via IF NOT EXISTS.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_fleet_outbox_callback_kind ON fleet_result_outbox (callback_kind);",
+    )?;
 
     // ── Market delivery policy singleton ───────────────────────────────────
     //
@@ -18948,6 +18957,122 @@ mod phase17_tests {
             .query_row("SELECT COUNT(*) FROM fleet_result_outbox", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_fleet_outbox_pre_ws0_alter_upgrade_path() {
+        // Simulate an operator DB that predates Phase 2 WS0: the table
+        // was created by async-fleet-dispatch Phase 1-5 WITHOUT the
+        // `callback_kind` column, and has one or more rows in it. The
+        // PRAGMA-guarded ALTER path at db.rs:2312-2324 must:
+        //   (a) detect the missing column and add it with DEFAULT 'Fleet',
+        //   (b) leave every pre-existing row tagged as Fleet (so the
+        //       fleet-scoped sweep helpers see them exactly as before),
+        //   (c) be idempotent — a second init_pyramid_db must not ALTER
+        //       again or error.
+        //
+        // This path is the upgrade mechanism for every existing node in
+        // the field; if it regresses, operators upgrading from WS0- to
+        // WS0+ get either a broken schema or lost outbox rows.
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Pre-WS0 shape: no callback_kind column, no Market policy table.
+        // Constants match async-fleet-dispatch Phase 1 schema exactly.
+        conn.execute_batch(
+            "CREATE TABLE fleet_result_outbox (
+                dispatcher_node_id TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                callback_url TEXT NOT NULL,
+                status TEXT NOT NULL,
+                result_json TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                ready_at TEXT,
+                delivered_at TEXT,
+                expires_at TEXT NOT NULL,
+                worker_heartbeat_at TEXT,
+                delivery_attempts INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at TEXT,
+                last_error TEXT,
+                PRIMARY KEY (dispatcher_node_id, job_id)
+            );
+             CREATE INDEX idx_fleet_outbox_expires ON fleet_result_outbox (expires_at);",
+        )
+        .unwrap();
+
+        // Insert a legacy fleet row. This row has NO callback_kind value
+        // at all; the ALTER must backfill DEFAULT 'Fleet'.
+        conn.execute(
+            "INSERT INTO fleet_result_outbox
+                (dispatcher_node_id, job_id, callback_url, status, expires_at)
+             VALUES ('pre-ws0-dispA', 'legacy-job-1', 'https://x/cb', 'pending', ?1)",
+            rusqlite::params!["9999-12-31 23:59:59"],
+        )
+        .unwrap();
+
+        // Confirm the pre-WS0 state lacks callback_kind.
+        let pre_cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(fleet_result_outbox)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert!(
+            !pre_cols.iter().any(|c| c == "callback_kind"),
+            "pre-WS0 DB must not have callback_kind column"
+        );
+
+        // Run init — triggers the conditional ALTER.
+        init_pyramid_db(&conn).unwrap();
+
+        // Column is now present.
+        let post_cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(fleet_result_outbox)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert!(
+            post_cols.iter().any(|c| c == "callback_kind"),
+            "init_pyramid_db must add callback_kind column"
+        );
+
+        // Legacy row inherited DEFAULT 'Fleet' — preserving pre-WS0 behavior.
+        let legacy_kind: String = conn
+            .query_row(
+                "SELECT callback_kind FROM fleet_result_outbox WHERE job_id = 'legacy-job-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy_kind, "Fleet",
+            "legacy row must be backfilled as Fleet so existing sweep paths see it"
+        );
+
+        // Second init is a no-op — the PRAGMA check passes, no re-ALTER.
+        init_pyramid_db(&conn).unwrap();
+        let legacy_kind_after: String = conn
+            .query_row(
+                "SELECT callback_kind FROM fleet_result_outbox WHERE job_id = 'legacy-job-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_kind_after, "Fleet");
+
+        // And the market policy singleton table exists (fresh-install
+        // CREATE path, but also belongs here — its absence on upgrade
+        // would break the policy sync path).
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_market_delivery_policy",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "pyramid_market_delivery_policy table must exist (empty)");
     }
 
     #[test]

@@ -12009,6 +12009,107 @@ fn main() {
         }
     }
 
+    // ── Compute market: best-effort seed of market_delivery_policy ──
+    //
+    // Shape-parallel to the fleet_delivery_policy seed block above. If no
+    // `market_delivery_policy` contribution exists yet, insert one from
+    // the embedded seed YAML and sync it to the singleton operational
+    // table `pyramid_market_delivery_policy`. Phase 2 WS1+ will construct
+    // a `MarketDispatchContext` that reads this table at boot and holds
+    // the runtime `Arc<RwLock<MarketDeliveryPolicy>>` — at which point a
+    // ConfigSynced reload branch parallel to the fleet one above will be
+    // added to this main.rs.
+    //
+    // Seeding now (ahead of the runtime context) is harmless: the
+    // operational row lands, the contribution is tracked, and the Phase
+    // 2+ code inherits a populated table on its first read. Without this
+    // seed, operators would hit "no contribution to supersede" when they
+    // first try to tune the market policy.
+    //
+    // Best-effort: any failure is logged and swallowed. Per-node nodes
+    // that fail to seed will fall through to `MarketDeliveryPolicy::
+    // default()` (which `default_matches_seed_yaml` enforces as
+    // byte-equivalent to the seed).
+    {
+        const SEED_MARKET_DELIVERY_POLICY_YAML: &str =
+            include_str!("../../docs/seeds/market_delivery_policy.yaml");
+        match wire_node_lib::pyramid::db::open_pyramid_connection(&pyramid_db_path) {
+            Ok(conn) => {
+                match wire_node_lib::pyramid::config_contributions::load_active_config_contribution(
+                    &conn,
+                    "market_delivery_policy",
+                    None,
+                ) {
+                    Ok(Some(_)) => {
+                        tracing::debug!(
+                            "market_delivery_policy contribution already present — skipping seed"
+                        );
+                    }
+                    Ok(None) => {
+                        match wire_node_lib::pyramid::config_contributions::create_config_contribution(
+                            &conn,
+                            "market_delivery_policy",
+                            None,
+                            SEED_MARKET_DELIVERY_POLICY_YAML,
+                            Some("bundled seed at first boot"),
+                            "bundled",
+                            Some("system"),
+                            "active",
+                        ) {
+                            Ok(contribution_id) => {
+                                match wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+                                    &conn,
+                                    &contribution_id,
+                                ) {
+                                    Ok(Some(contribution)) => {
+                                        if let Err(e) = wire_node_lib::pyramid::config_contributions::sync_config_to_operational(
+                                            &conn,
+                                            &pyramid_state.build_event_bus,
+                                            &contribution,
+                                        ) {
+                                            tracing::warn!(
+                                                "market_delivery_policy seed: sync_config_to_operational failed: {e}"
+                                            );
+                                        } else {
+                                            tracing::info!(
+                                                "market_delivery_policy seeded from docs/seeds/market_delivery_policy.yaml (contribution_id={contribution_id})"
+                                            );
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        tracing::warn!(
+                                            "market_delivery_policy seed: contribution {contribution_id} not found after create"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "market_delivery_policy seed: load_contribution_by_id failed: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "market_delivery_policy seed: create_config_contribution failed: {e}"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "market_delivery_policy seed: load_active_config_contribution failed: {e}"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "market_delivery_policy seed: failed to open pyramid connection: {e}"
+                );
+            }
+        }
+    }
+
     // ── Async fleet dispatch: spawn sweep loops (Init Ordering step 9) ──
     //
     // Two sweeps, one context. Both are fire-and-forget until app exit.

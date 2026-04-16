@@ -803,6 +803,24 @@ pub fn sync_config_to_operational_with_registry(
                 Some(&contribution.contribution_id),
             )?;
         }
+        "market_delivery_policy" => {
+            // Compute market dispatch operational policy per architecture
+            // §VIII.6 DD-E / DD-Q. Shape-parallel to `fleet_delivery_policy`
+            // but with market-specific economic-gate fees
+            // (match_search_fee, offer_creation_fee, queue_push_fee,
+            // queue_mirror_debounce_ms) absorbed from what were previously
+            // standalone economic_parameter contributions. Same slug-
+            // ignoring, raw-YAML-stored, parse-at-read pattern as the fleet
+            // sibling. The Phase 2 WS1+ `MarketDispatchContext` will hold
+            // the runtime `Arc<RwLock<MarketDeliveryPolicy>>` and refresh
+            // on a ConfigSynced event listener that will be wired into
+            // `main.rs` when that context is constructed.
+            crate::pyramid::market_delivery_policy::upsert_market_delivery_policy_yaml(
+                conn,
+                &contribution.yaml_content,
+                Some(&contribution.contribution_id),
+            )?;
+        }
         "chain_assignment" => {
             // Per-pyramid chain override. Syncs to the
             // `pyramid_chain_assignments` operational table via
@@ -3514,4 +3532,135 @@ mod tests {
     // path. The directive explicitly pinned this to dispatch_policy's
     // shape: "If it just stores raw YAML, fleet_delivery_policy does
     // the same."
+
+    // ── market_delivery_policy routing (shape-parallel to fleet) ──
+    //
+    // Same raw-YAML storage pattern; arm routes `schema_type =
+    // "market_delivery_policy"` contributions into
+    // `pyramid_market_delivery_policy` singleton via
+    // `upsert_market_delivery_policy_yaml`. Per architecture §VIII.6
+    // DD-E / DD-Q.
+
+    const MARKET_DELIVERY_POLICY_SEED_YAML: &str =
+        include_str!("../../../docs/seeds/market_delivery_policy.yaml");
+
+    #[test]
+    fn test_sync_market_delivery_policy_writes_operational_table() {
+        use crate::pyramid::market_delivery_policy::read_market_delivery_policy;
+
+        let conn = mem_conn();
+        let bus = mem_bus();
+        let metadata = default_wire_native_metadata("market_delivery_policy", None);
+        let id = create_config_contribution_with_metadata(
+            &conn,
+            "market_delivery_policy",
+            None,
+            MARKET_DELIVERY_POLICY_SEED_YAML,
+            Some("seed market delivery policy"),
+            "local",
+            Some("user"),
+            "active",
+            &metadata,
+        )
+        .unwrap();
+
+        let contribution = load_contribution_by_id(&conn, &id).unwrap().unwrap();
+        sync_config_to_operational(&conn, &bus, &contribution).unwrap();
+
+        let policy = read_market_delivery_policy(&conn)
+            .unwrap()
+            .expect("policy row must exist after sync");
+
+        // Spot-check the four economic-gate fees absorbed from standalone
+        // economic_parameters per DD-E, plus a few cross-section knobs.
+        assert_eq!(policy.callback_post_timeout_secs, 30);
+        assert_eq!(policy.max_inflight_jobs, 32);
+        assert_eq!(policy.match_search_fee, 1);
+        assert_eq!(policy.offer_creation_fee, 1);
+        assert_eq!(policy.queue_push_fee, 1);
+        assert_eq!(policy.queue_mirror_debounce_ms, 500);
+    }
+
+    #[test]
+    fn test_sync_market_delivery_policy_overwrites_on_resync() {
+        use crate::pyramid::market_delivery_policy::read_market_delivery_policy;
+
+        let conn = mem_conn();
+        let bus = mem_bus();
+        let metadata = default_wire_native_metadata("market_delivery_policy", None);
+
+        // First contribution: seed values.
+        let id1 = create_config_contribution_with_metadata(
+            &conn,
+            "market_delivery_policy",
+            None,
+            MARKET_DELIVERY_POLICY_SEED_YAML,
+            Some("initial"),
+            "local",
+            Some("user"),
+            "active",
+            &metadata,
+        )
+        .unwrap();
+        let c1 = load_contribution_by_id(&conn, &id1).unwrap().unwrap();
+        sync_config_to_operational(&conn, &bus, &c1).unwrap();
+
+        let initial = read_market_delivery_policy(&conn).unwrap().unwrap();
+        assert_eq!(initial.max_inflight_jobs, 32);
+        assert_eq!(initial.match_search_fee, 1);
+
+        // Operator tunes the economic-gate fees and the inflight cap.
+        // Singleton row (id=1) must be overwritten; contribution_id
+        // must track the new contribution.
+        let tuned_yaml = "schema_type: market_delivery_policy\n\
+                          version: 1\n\
+                          callback_post_timeout_secs: 45\n\
+                          outbox_sweep_interval_secs: 30\n\
+                          worker_heartbeat_interval_secs: 15\n\
+                          worker_heartbeat_tolerance_secs: 45\n\
+                          backoff_base_secs: 2\n\
+                          backoff_cap_secs: 128\n\
+                          max_delivery_attempts: 40\n\
+                          ready_retention_secs: 3600\n\
+                          delivered_retention_secs: 7200\n\
+                          failed_retention_secs: 1209600\n\
+                          max_inflight_jobs: 64\n\
+                          admission_retry_after_secs: 60\n\
+                          match_search_fee: 5\n\
+                          offer_creation_fee: 3\n\
+                          queue_push_fee: 2\n\
+                          queue_mirror_debounce_ms: 1000\n";
+        let id2 = create_config_contribution_with_metadata(
+            &conn,
+            "market_delivery_policy",
+            None,
+            tuned_yaml,
+            Some("tune economic gates"),
+            "local",
+            Some("user"),
+            "active",
+            &metadata,
+        )
+        .unwrap();
+        let c2 = load_contribution_by_id(&conn, &id2).unwrap().unwrap();
+        sync_config_to_operational(&conn, &bus, &c2).unwrap();
+
+        let tuned = read_market_delivery_policy(&conn).unwrap().unwrap();
+        assert_eq!(tuned.max_inflight_jobs, 64);
+        assert_eq!(tuned.match_search_fee, 5);
+        assert_eq!(tuned.offer_creation_fee, 3);
+        assert_eq!(tuned.queue_push_fee, 2);
+        assert_eq!(tuned.queue_mirror_debounce_ms, 1000);
+
+        // Confirm singleton (not a second row) — stored contribution_id
+        // must track id2.
+        let stored_cid: String = conn
+            .query_row(
+                "SELECT contribution_id FROM pyramid_market_delivery_policy WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_cid, id2);
+    }
 }

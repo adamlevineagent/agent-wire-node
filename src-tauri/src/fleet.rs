@@ -675,10 +675,12 @@ pub fn validate_callback_url(
             // knob on `market_delivery_policy` (per the "no hardcoded policy
             // decisions" pattern) — do not loosen this check inline.
             //
-            // Note: `TunnelUrl::parse` already rejects non-http(s) and
-            // empty-host URLs before we get here. The checks below are
-            // defense-in-depth against future paths into `TunnelUrl` that
-            // bypass `parse`.
+            // Note: `TunnelUrl::parse` is more permissive than this check
+            // (it accepts both http and https); the scheme check below is
+            // the only layer enforcing https for Market/Relay callbacks.
+            // The host check IS redundant with `TunnelUrl::parse`'s
+            // rejection of empty hosts; keeping it as defense-in-depth
+            // against a future path that bypasses `parse`.
             let (scheme, host, _port) = got.authority();
             if scheme != "https" {
                 return Err(CallbackValidationError::SchemeNotHttps);
