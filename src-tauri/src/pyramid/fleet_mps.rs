@@ -60,18 +60,35 @@ pub const FLEET_MPS_PROTOCOL_VERSION: u32 = 1;
 /// What audience is this node offering service to? Derived from the
 /// operator's `ComputeParticipationPolicy` effective booleans. Drives
 /// offer publication gating (market-visible → publish to market;
-/// private-fleet → fleet-only; disabled → no offers at all).
+/// private-fleet → fleet-only; disabled → no inbound offers at all).
+///
+/// Note: this enum reflects *serving* visibility only, not dispatch.
+/// A `Coordinator`-mode node (all dispatch on, all serving off)
+/// resolves to `Disabled` here — it accepts no inbound work — but may
+/// still actively dispatch outward via the separate
+/// `allow_*_dispatch` / `allow_*_usage` policy gates. Downstream
+/// consumers that care about dispatch intent must read the
+/// participation policy directly, not this field.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceVisibility {
     /// Publish offers to the compute market and accept inbound market
-    /// jobs. Implies fleet-serving too (market-visible is a superset).
+    /// jobs. In the canonical DD-I projection `market-visible` implies
+    /// `fleet-serving` (market-visible is a superset); explicit
+    /// operator overrides can violate that invariant — the derivation
+    /// here does NOT auto-correct, it trusts `allow_market_visibility`
+    /// when set and treats inconsistent-policy violations as the
+    /// operator's responsibility.
     MarketVisible,
     /// Fleet peers only (same-operator). No market offers, no market
     /// jobs accepted. Fleet serving still allowed.
     PrivateFleet,
-    /// Neither fleet nor market. Operator explicitly turned serving
-    /// off; this node dispatches outward only.
+    /// Not accepting inbound work (neither fleet nor market). Covers
+    /// two operator states: (1) `Coordinator`-mode (all serving off,
+    /// still dispatches outward) and (2) fully-disabled nodes (every
+    /// participation flag off). Consumers that need to distinguish
+    /// "actively dispatches out" from "totally off" must consult the
+    /// participation policy.
     Disabled,
 }
 
@@ -283,6 +300,14 @@ pub fn derive_visibility(policy: &ComputeParticipationPolicy) -> ServiceVisibili
 /// storage of "what was the last version?" and must pass it in on
 /// each call — this keeps the helper pure and avoids hidden
 /// module-level state.
+///
+/// Contract: the helper TRUSTS `prior_version`. Passing a value less
+/// than the real prior would cause the descriptor to appear to
+/// regress to anti-entropy peers and would be interpreted as
+/// malicious/buggy and rejected. The reducer (WS4) is responsible
+/// for sourcing `prior_version` from the single canonical cell
+/// (e.g. the persisted warm cache) — don't compute it ad hoc at
+/// call sites.
 pub fn derive_service_descriptor(
     policy: &ComputeParticipationPolicy,
     dispatch_policy: &DispatchPolicy,
@@ -306,6 +331,10 @@ pub fn derive_service_descriptor(
 /// Inputs by reference so tests can feed small fixtures without
 /// synthesizing the full runtime state. `prior_version` is the
 /// previous snapshot's `availability_version` (0 if first-ever).
+///
+/// Contract: same trust semantics as `derive_service_descriptor` —
+/// `prior_version` must come from the canonical cell, not
+/// recomputed ad hoc. A regressing version breaks anti-entropy.
 pub fn derive_availability_snapshot(
     queue_depths: &HashMap<String, usize>,
     tunnel_healthy: bool,
@@ -407,6 +436,53 @@ mod tests {
         }
     }
 
+    /// Dispatch policy where the rule has ONLY a fleet route (no local
+    /// entry). Used to verify fleet-only rules are NOT servable locally.
+    fn dispatch_policy_fleet_only() -> DispatchPolicy {
+        DispatchPolicy {
+            rules: vec![RoutingRule {
+                name: "remote_only".to_string(),
+                match_config: MatchConfig {
+                    work_type: None,
+                    min_depth: None,
+                    step_pattern: None,
+                },
+                route_to: vec![RouteEntry {
+                    provider_id: "fleet".to_string(),
+                    model_id: None,
+                    tier_name: None,
+                    is_local: false,
+                }],
+                bypass_pool: false,
+                sequential: false,
+            }],
+            escalation: EscalationConfig::default(),
+            build_coordination: BuildCoordinationConfig::default(),
+            pool_configs: BTreeMap::new(),
+            max_batch_cost_usd: None,
+            max_daily_cost_usd: None,
+        }
+    }
+
+    /// A coordinator-mode policy with every projectable boolean cleared
+    /// (None) so the DD-I projection wins. The default()'s explicit
+    /// Some(_) values would otherwise override the coordinator preset —
+    /// we want to test the pure coordinator projection here.
+    fn coordinator_policy_pure_projection() -> ComputeParticipationPolicy {
+        ComputeParticipationPolicy {
+            mode: ComputeParticipationMode::Coordinator,
+            allow_fleet_dispatch: None,
+            allow_fleet_serving: None,
+            allow_market_dispatch: None,
+            allow_market_visibility: None,
+            allow_storage_pulling: None,
+            allow_storage_hosting: None,
+            allow_relay_usage: None,
+            allow_relay_serving: None,
+            ..ComputeParticipationPolicy::default()
+        }
+    }
+
     // ── ServiceVisibility derivation ─────────────────────────────────
 
     #[test]
@@ -425,6 +501,19 @@ mod tests {
     #[test]
     fn derive_visibility_everything_off_returns_disabled() {
         let p = everything_off();
+        assert_eq!(derive_visibility(&p), ServiceVisibility::Disabled);
+    }
+
+    #[test]
+    fn derive_visibility_coordinator_mode_returns_disabled() {
+        // Coordinator mode per DD-I: all dispatch/usage on, all
+        // serving/hosting/visibility off. From the POV of
+        // ServiceVisibility (which is about INBOUND work acceptance),
+        // coordinator is Disabled — the node dispatches outward but
+        // accepts nothing inbound. The enum docstring explicitly
+        // documents this case so consumers don't mistake Disabled for
+        // "node fully off."
+        let p = coordinator_policy_pure_projection();
         assert_eq!(derive_visibility(&p), ServiceVisibility::Disabled);
     }
 
@@ -507,6 +596,45 @@ mod tests {
         // And the descriptor is still fully populated otherwise.
         assert_eq!(d.declared_role, ComputeParticipationMode::Hybrid);
         assert_eq!(d.protocol_version, FLEET_MPS_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn derive_service_descriptor_excludes_fleet_only_rules() {
+        // A rule whose only route_to entry is provider_id="fleet"
+        // (is_local=false) is NOT locally servable. Confirms the
+        // behavior of `fleet::derive_serving_rules` — fleet entries are
+        // skipped and a rule with no local entries produces no
+        // servable name. The fleet MPS spec depends on this: a peer's
+        // descriptor must only advertise rules it can actually execute
+        // locally.
+        let policy = hybrid_with_markets_off();
+        let dispatch_policy = dispatch_policy_fleet_only();
+        let models = vec!["gemma3:27b".to_string()];
+        let d = derive_service_descriptor(&policy, &dispatch_policy, &models, 0);
+        assert!(
+            d.servable_rules.is_empty(),
+            "fleet-only rules must not appear in servable_rules"
+        );
+    }
+
+    #[test]
+    fn derive_service_descriptor_coordinator_mode_disables_visibility() {
+        // Coordinator-mode node: servable_rules may still be populated
+        // (if loaded models match local routes — the descriptor
+        // doesn't gate itself on ServiceVisibility), but the
+        // `visibility` field is `Disabled`. Downstream consumers use
+        // visibility to gate offer publication; serving filtering is
+        // the admission gate's responsibility.
+        let policy = coordinator_policy_pure_projection();
+        let dispatch_policy = minimal_dispatch_policy();
+        let models = vec!["gemma3:27b".to_string()];
+        let d = derive_service_descriptor(&policy, &dispatch_policy, &models, 0);
+        assert_eq!(d.visibility, ServiceVisibility::Disabled);
+        assert_eq!(d.declared_role, ComputeParticipationMode::Coordinator);
+        // servable_rules is independent of visibility — the rule data
+        // itself supports local serving even though policy disables
+        // inbound acceptance.
+        assert_eq!(d.servable_rules, vec!["code_l0".to_string()]);
     }
 
     // ── AvailabilitySnapshot derivation ──────────────────────────────
