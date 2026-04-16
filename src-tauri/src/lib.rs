@@ -52,6 +52,17 @@ pub struct AppState {
     /// access. Arc<RwLock<>> for concurrent read from LLM path + write
     /// from heartbeat/announce handlers.
     pub fleet_roster: Arc<RwLock<fleet::FleetRoster>>,
+    /// Phase 2 WS3: Full compute market state (offers, in-flight jobs,
+    /// counters, queue mirror seqs). Persisted to
+    /// `${app_data_dir}/compute_market_state.json` on every mutation.
+    /// IPC handlers (WS7), the dispatch handler (WS5), and the mirror
+    /// task (WS6) all read/write through this RwLock.
+    pub compute_market_state: Arc<RwLock<compute_market::ComputeMarketState>>,
+    /// Phase 2 WS5: MarketDispatchContext Arc bundle — pending-jobs
+    /// registry (Phase 3 populates), tunnel state handle (borrowed),
+    /// operational policy (hot-reloaded on ConfigSynced). Cloned into
+    /// ServerState at boot and passed to the dispatch handler.
+    pub compute_market_dispatch: Arc<pyramid::market_dispatch::MarketDispatchContext>,
     /// Persistent node identity (handle + token). Loaded before first
     /// registration attempt. None only if data_dir is unavailable.
     pub node_identity: Option<auth::NodeIdentity>,
