@@ -1122,7 +1122,33 @@ pub async fn start_server(
             })
     };
 
+    // POST /v1/compute/job-dispatch — receive matched market job from the Wire.
+    //
+    // Parallel to /v1/compute/fleet-dispatch in shape (header + JSON body,
+    // returns 202 ACK after spawning a worker). The handler verifies the
+    // wire_job_token JWT (aud="compute"), converts ChatML messages to a
+    // prompt pair, runs the market admission gates, and spawns the worker
+    // that heartbeats the outbox row and CAS-promotes it to `ready` on
+    // inference completion. See handle_market_dispatch for the full flow.
+    let compute_dispatch_route = {
+        let state = state.clone();
+        warp::path!("v1" / "compute" / "job-dispatch")
+            .and(warp::post())
+            .and(warp::header::<String>("authorization"))
+            .and(warp::body::json())
+            .and_then(move |auth_header: String, body: serde_json::Value| {
+                let state = state.clone();
+                async move {
+                    handle_market_dispatch(auth_header, body, state).await
+                }
+            })
+    };
+
     // Fleet CORS: permissive (peer-to-peer via Cloudflare tunnels).
+    // The compute-market dispatch endpoint shares the same CORS profile as
+    // the fleet routes — both accept inbound traffic from Cloudflare tunnel
+    // origins (the Wire for market, peer nodes for fleet) and auth via
+    // Authorization: Bearer.
     let fleet_cors = warp::cors()
         .allow_any_origin()
         .allow_methods(vec!["POST", "OPTIONS"])
@@ -1130,6 +1156,7 @@ pub async fn start_server(
     let fleet_routes = fleet_dispatch_route
         .or(fleet_announce_route)
         .or(fleet_result_route)
+        .or(compute_dispatch_route)
         .with(fleet_cors);
 
     let routes = preflight
@@ -2352,6 +2379,967 @@ fn spawn_fleet_worker(
     });
 }
 
+// ── Compute market handlers ─────────────────────────────────────────────
+//
+// `handle_market_dispatch` + `spawn_market_worker` mirror the fleet
+// dispatch pair structurally. The compute market is the fleet async
+// dispatch protocol with a different JWT audience (`compute` vs `fleet`),
+// a ChatML `messages` payload instead of (system_prompt, user_prompt),
+// and a JWT-gated callback URL instead of a roster-matched one. All the
+// outbox / CAS / sweep / admission scaffolding is reused via
+// `fleet_result_outbox.callback_kind = 'MarketStandard' | 'Relay'` with
+// `dispatcher_node_id = fleet::WIRE_PLATFORM_DISPATCHER`.
+//
+// See `docs/plans/compute-market-phase-2-exchange.md` §III for the full
+// step-by-step. Order is load-bearing: verify → parse → convert →
+// validate → admission gates → outbox insert → enqueue → spawn worker
+// → 202.
+
+/// Handle POST /v1/compute/job-dispatch — receive matched market job from
+/// the Wire.
+///
+/// Async admission protocol: verify `wire_job_token` JWT, parse request,
+/// convert ChatML messages to prompt pair, validate callback URL
+/// structurally, check market admission gates (market enabled, policy
+/// allows serving, offer exists), transactionally insert into the outbox
+/// with the market sentinel dispatcher, enqueue onto the compute queue
+/// with `source: "market_received"`, upsert the in-memory job registry,
+/// spawn the worker, and return 202. The actual inference runs in the
+/// spawned worker which heartbeats the outbox row and CAS-promotes it to
+/// `ready` on completion; Phase 3's callback-delivery worker then posts
+/// the result to the callback URL.
+///
+/// See `docs/plans/compute-market-phase-2-exchange.md` §III for the
+/// full spec.
+async fn handle_market_dispatch(
+    auth_header: String,
+    body: serde_json::Value,
+    state: ServerState,
+) -> Result<Box<dyn warp::Reply>, warp::Rejection> {
+    // Step 1 (§III L544): Verify wire_job_token JWT.
+    //
+    // `verify_market_identity` checks: aud=compute, exp, signature, pid ==
+    // self.node_id, sub non-empty. Any failure is a 401 — the specific
+    // variant is logged but never surfaced to the caller (same discipline
+    // as fleet).
+    let jwt_pk = state.jwt_public_key.read().await.clone();
+    let self_node_id = state.node_id.read().await.clone();
+    let identity = match crate::pyramid::market_identity::verify_market_identity(
+        &auth_header,
+        &jwt_pk,
+        &self_node_id,
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!("Market dispatch JWT verify failed: {}", e);
+            return Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({})),
+                warp::http::StatusCode::UNAUTHORIZED,
+            )));
+        }
+    };
+
+    // Step 2 (§III L545, DD-C): Parse body as MarketDispatchRequest.
+    //
+    // `deny_unknown_fields` is on the struct — a typo'd field from the
+    // Wire side surfaces as a visible 400 instead of being silently
+    // dropped. Parse error is surfaced verbatim for operator diagnosis.
+    let req: crate::pyramid::market_dispatch::MarketDispatchRequest =
+        match serde_json::from_value(body.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("Market dispatch body parse failed: {}", e);
+                return Ok(Box::new(warp::reply::with_status(
+                    warp::reply::json(
+                        &serde_json::json!({"error": format!("invalid body: {}", e)}),
+                    ),
+                    warp::http::StatusCode::BAD_REQUEST,
+                )));
+            }
+        };
+
+    // Defense in depth: the JWT `sub` and the body `job_id` must agree.
+    // The JWT binds the provider to a specific job_id; a mismatched body
+    // is either a Wire bug or a replayed JWT being reused. Reject.
+    if identity.sub_job_id() != req.job_id {
+        tracing::warn!(
+            "Market dispatch job_id mismatch: jwt.sub={} body.job_id={}",
+            identity.sub_job_id(),
+            req.job_id
+        );
+        return Ok(Box::new(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"error": "job_id mismatch with JWT sub"})),
+            warp::http::StatusCode::BAD_REQUEST,
+        )));
+    }
+
+    // Step 3 (§III L546, DD-C): Convert ChatML messages to prompt pair.
+    //
+    // Any failure here is a 400 with the specific `MessagesError` variant
+    // so the Wire (or an operator running curl) sees exactly which shape
+    // the dispatch violated.
+    let (system_prompt, user_prompt) =
+        match crate::pyramid::messages::messages_to_prompt_pair(&req.messages) {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!("Market dispatch messages conversion failed: {}", e);
+                return Ok(Box::new(warp::reply::with_status(
+                    warp::reply::json(&serde_json::json!({
+                        "error": format!("{}", e),
+                        "kind": e,
+                    })),
+                    warp::http::StatusCode::BAD_REQUEST,
+                )));
+            }
+        };
+
+    // Step 4 (§III L547): Validate callback_url structurally.
+    //
+    // MarketStandard kind short-circuits the roster check (the Wire is
+    // not a fleet peer; the JWT is the auth). An empty roster is fine.
+    let callback_url_str = req.callback_url.to_string();
+    {
+        let roster = state.fleet_roster.read().await;
+        if let Err(e) = crate::fleet::validate_callback_url(
+            &callback_url_str,
+            &crate::fleet::CallbackKind::MarketStandard,
+            &*roster,
+        ) {
+            tracing::warn!(
+                "Market dispatch callback_url rejected: {} (job_id={})",
+                e,
+                req.job_id
+            );
+            return Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": format!("{}", e)})),
+                warp::http::StatusCode::BAD_REQUEST,
+            )));
+        }
+    } // roster read-lock drops here
+
+    // Step 5 (§III L547-551, DD-H): Admission gates.
+    //
+    // Several gates are NOT implemented in this workstream — see TODOs
+    // below. The gates that ARE enforced here are the ones that are
+    // necessary to avoid accepting jobs we have no way to serve: market
+    // must be wired up, state must exist, operator intent must allow
+    // market serving, and an offer must exist for the requested model.
+    //
+    // TODO (WS8): Add DADBEAR hold check on the `"market:compute"` slug.
+    //   Blocking holds (frozen / breaker / cost_limit / quality_hold /
+    //   timing_suspended / reputation_suspended / suspended / escalation)
+    //   should reject 503 with Retry-After. Marker holds (measurement,
+    //   etc.) are informational — do not block. See DD-H in
+    //   compute-market-architecture.md §VIII.6.
+    //
+    // TODO (Fleet MPS WS5): Read AvailabilitySnapshot for this node; if
+    //   `health_status = degraded` AND policy.allow_serving_while_degraded
+    //   is false, reject 503. If `tunnel_status != healthy`, reject (we
+    //   can't deliver results back).
+    //
+    // TODO (Phase 5): Negative-balance gate. If the operator's credit
+    //   balance would go negative after this job's worst-case settlement,
+    //   reject 503 with `X-Wire-Reason: negative_balance`.
+
+    // Gate: compute market dispatch context must be wired up.
+    let market_ctx = match state.compute_market_dispatch.as_ref() {
+        Some(ctx) => Arc::clone(ctx),
+        None => {
+            return Ok(Box::new(warp::reply::with_status(
+                warp::reply::with_header(
+                    warp::reply::json(
+                        &serde_json::json!({"error": "compute market disabled"}),
+                    ),
+                    "Retry-After",
+                    // No policy to read since the context itself is None.
+                    // 30s is the seed default for admission_retry_after_secs.
+                    "30",
+                ),
+                warp::http::StatusCode::SERVICE_UNAVAILABLE,
+            )));
+        }
+    };
+
+    // Gate: compute market state must be initialized (offers live here).
+    let market_state_handle = match state.compute_market_state.as_ref() {
+        Some(s) => Arc::clone(s),
+        None => {
+            return Ok(Box::new(warp::reply::with_status(
+                warp::reply::with_header(
+                    warp::reply::json(
+                        &serde_json::json!({"error": "compute market state not initialized"}),
+                    ),
+                    "Retry-After",
+                    "30",
+                ),
+                warp::http::StatusCode::SERVICE_UNAVAILABLE,
+            )));
+        }
+    };
+
+    // Snapshot market delivery policy for admission + worker. Held for
+    // the rest of the handler; worker gets a clone by value so it can
+    // outlive the handler call.
+    let policy = market_ctx.policy.read().await.clone();
+
+    // Gate: operator intent via `compute_participation_policy.
+    // allow_market_visibility`. The DB lookup happens off the async
+    // thread because `get_compute_participation_policy` opens a SQLite
+    // connection.
+    let db_path = match state.pyramid.data_dir.as_ref() {
+        Some(d) => d.join("pyramid.db"),
+        None => {
+            return Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": "node data dir unavailable"})),
+                warp::http::StatusCode::SERVICE_UNAVAILABLE,
+            )));
+        }
+    };
+
+    let allow_market_visibility = {
+        let db_path_read = db_path.clone();
+        let result: Result<bool, String> = tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open(&db_path_read)
+                .map_err(|e| e.to_string())?;
+            let p = crate::pyramid::local_mode::get_compute_participation_policy(&conn)
+                .map_err(|e| e.to_string())?;
+            Ok(p.effective_booleans().allow_market_visibility)
+        })
+        .await
+        .unwrap_or_else(|je| Err(je.to_string()));
+        match result {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("Market dispatch participation policy read failed: {}", e);
+                return Ok(Box::new(warp::reply::with_status(
+                    warp::reply::json(
+                        &serde_json::json!({"error": "policy read error"}),
+                    ),
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                )));
+            }
+        }
+    };
+    if !allow_market_visibility {
+        return Ok(Box::new(warp::reply::with_status(
+            warp::reply::with_header(
+                warp::reply::with_header(
+                    warp::reply::json(
+                        &serde_json::json!({"error": "market_serving_disabled"}),
+                    ),
+                    "Retry-After",
+                    policy.admission_retry_after_secs.to_string(),
+                ),
+                "X-Wire-Reason",
+                "market_serving_disabled",
+            ),
+            warp::http::StatusCode::SERVICE_UNAVAILABLE,
+        )));
+    }
+
+    // Step 6 (§III): Look up the offer for the requested model, clone out
+    // `max_queue_depth` for the enqueue cap and the matched-bps value for
+    // the ComputeJob record. Offer absence is 503 with a reason header —
+    // the Wire's stale-offer cleanup consumes this to deactivate the
+    // offer.
+    let (max_queue_depth, offer_matched_multiplier_bps) = {
+        let s = market_state_handle.read().await;
+        match s.offers.get(&req.model) {
+            Some(offer) => {
+                // Derive a base multiplier from the first curve point (or
+                // 10000 / 1.0x if the curve is empty). Deep-queue matching
+                // is Wire-side; we only need the value for the ComputeJob
+                // observability record.
+                let bps = offer
+                    .queue_discount_curve
+                    .first()
+                    .map(|p| p.multiplier_bps)
+                    .unwrap_or(10000);
+                (offer.max_queue_depth, bps)
+            }
+            None => {
+                return Ok(Box::new(warp::reply::with_status(
+                    warp::reply::with_header(
+                        warp::reply::with_header(
+                            warp::reply::json(&serde_json::json!({
+                                "error": "no offer for model",
+                                "model": req.model,
+                            })),
+                            "Retry-After",
+                            policy.admission_retry_after_secs.to_string(),
+                        ),
+                        "X-Wire-Reason",
+                        "no_offer_for_model",
+                    ),
+                    warp::http::StatusCode::SERVICE_UNAVAILABLE,
+                )));
+            }
+        }
+    };
+
+    // Step 7 (§III L553, DD-D, DD-Q): Idempotent outbox insert.
+    //
+    // All SQL inside spawn_blocking (rusqlite is sync). Branch on the
+    // outcome enum to build the HTTP response. Unlike fleet dispatch,
+    // there's no cross-dispatcher conflict case — the Wire is the sole
+    // dispatcher for market rows, identified by the WIRE_PLATFORM_DISPATCHER
+    // sentinel. A rowcount=0 outcome means a legitimate Wire retry
+    // (re-ACK) or a terminal state leaked back to the Wire (Gone).
+    #[derive(Debug)]
+    enum MarketAdmissionOutcome {
+        Admitted,
+        RetryExisting,
+        GoneDelivered,
+        GoneFailed(Option<String>),
+        Rejected503, // max_inflight_jobs budget exhausted
+        DbError(String),
+    }
+
+    let worker_heartbeat_tolerance_secs = policy.worker_heartbeat_tolerance_secs;
+    let admission_max_inflight = policy.max_inflight_jobs;
+    let db_path_tx = db_path.clone();
+    let job_id_tx = req.job_id.clone();
+    let callback_url_tx = callback_url_str.clone();
+
+    let outcome = tokio::task::spawn_blocking(move || -> MarketAdmissionOutcome {
+        let mut conn = match rusqlite::Connection::open(&db_path_tx) {
+            Ok(c) => c,
+            Err(e) => return MarketAdmissionOutcome::DbError(e.to_string()),
+        };
+        let tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+            Ok(t) => t,
+            Err(e) => return MarketAdmissionOutcome::DbError(e.to_string()),
+        };
+        // expires_at = now + worker_heartbeat_tolerance_secs
+        let modifier = format!("+{} seconds", worker_heartbeat_tolerance_secs);
+        let expires_at: String = match tx.query_row(
+            "SELECT datetime('now', ?1)",
+            rusqlite::params![modifier],
+            |r| r.get(0),
+        ) {
+            Ok(s) => s,
+            Err(e) => return MarketAdmissionOutcome::DbError(e.to_string()),
+        };
+        let changes = match crate::pyramid::db::market_outbox_insert_or_ignore(
+            &tx,
+            &job_id_tx,
+            &callback_url_tx,
+            crate::fleet::callback_kind_str(&crate::fleet::CallbackKind::MarketStandard),
+            &expires_at,
+        ) {
+            Ok(n) => n,
+            Err(e) => return MarketAdmissionOutcome::DbError(e.to_string()),
+        };
+        // Look up the (now-either-just-inserted-or-pre-existing) row. Keyed
+        // on job_id alone — cross-dispatcher conflicts are impossible for
+        // market rows (WIRE_PLATFORM_DISPATCHER is the sole dispatcher),
+        // so a non-None lookup + changes=0 unambiguously means "existing
+        // market row with this job_id".
+        let lookup = match crate::pyramid::db::fleet_outbox_lookup(&tx, &job_id_tx) {
+            Ok(Some(l)) => l,
+            Ok(None) => {
+                let _ = tx.rollback();
+                return MarketAdmissionOutcome::DbError("outbox lookup returned None".into());
+            }
+            Err(e) => {
+                let _ = tx.rollback();
+                return MarketAdmissionOutcome::DbError(e.to_string());
+            }
+        };
+
+        if changes == 0 {
+            // Pre-existing row — branch on status.
+            match lookup.status.as_str() {
+                "pending" | "ready" => {
+                    if let Err(e) = tx.commit() {
+                        return MarketAdmissionOutcome::DbError(e.to_string());
+                    }
+                    MarketAdmissionOutcome::RetryExisting
+                }
+                "delivered" => {
+                    let _ = tx.rollback();
+                    MarketAdmissionOutcome::GoneDelivered
+                }
+                "failed" => {
+                    let _ = tx.rollback();
+                    MarketAdmissionOutcome::GoneFailed(lookup.last_error)
+                }
+                _ => {
+                    let _ = tx.rollback();
+                    MarketAdmissionOutcome::DbError(format!(
+                        "unknown outbox status: {}",
+                        lookup.status
+                    ))
+                }
+            }
+        } else {
+            // Fresh insert. Admission count gates.
+            let inflight = match crate::pyramid::db::market_outbox_count_inflight_excluding(
+                &tx,
+                crate::fleet::WIRE_PLATFORM_DISPATCHER,
+                &job_id_tx,
+            ) {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = tx.rollback();
+                    return MarketAdmissionOutcome::DbError(e.to_string());
+                }
+            };
+            if admission_max_inflight != 0 && inflight >= admission_max_inflight {
+                // Over capacity — delete the row we just inserted so the
+                // Wire can re-match elsewhere and we don't leak a phantom
+                // pending row.
+                if let Err(e) = crate::pyramid::db::fleet_outbox_delete(
+                    &tx,
+                    crate::fleet::WIRE_PLATFORM_DISPATCHER,
+                    &job_id_tx,
+                ) {
+                    let _ = tx.rollback();
+                    return MarketAdmissionOutcome::DbError(e.to_string());
+                }
+                let _ = tx.rollback();
+                return MarketAdmissionOutcome::Rejected503;
+            }
+            if let Err(e) = tx.commit() {
+                return MarketAdmissionOutcome::DbError(e.to_string());
+            }
+            MarketAdmissionOutcome::Admitted
+        }
+    })
+    .await
+    .unwrap_or_else(|je| MarketAdmissionOutcome::DbError(je.to_string()));
+
+    // Handle outbox-admission outcomes that short-circuit before queue
+    // enqueue. Only the `Admitted` path falls through to enqueue + spawn.
+    match outcome {
+        MarketAdmissionOutcome::DbError(msg) => {
+            tracing::error!("Market dispatch admission DB error: {}", msg);
+            return Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": "admission db error"})),
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            )));
+        }
+        MarketAdmissionOutcome::GoneDelivered => {
+            return Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": "job already delivered"})),
+                warp::http::StatusCode::GONE,
+            )));
+        }
+        MarketAdmissionOutcome::GoneFailed(last_error) => {
+            return Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({
+                    "error": "job previously failed",
+                    "last_error": last_error,
+                })),
+                warp::http::StatusCode::GONE,
+            )));
+        }
+        MarketAdmissionOutcome::Rejected503 => {
+            return Ok(Box::new(warp::reply::with_status(
+                warp::reply::with_header(
+                    warp::reply::json(&serde_json::json!({"error": "peer at capacity"})),
+                    "Retry-After",
+                    policy.admission_retry_after_secs.to_string(),
+                ),
+                warp::http::StatusCode::SERVICE_UNAVAILABLE,
+            )));
+        }
+        MarketAdmissionOutcome::RetryExisting => {
+            // Same Wire dispatcher, same job_id, outbox already pending/ready.
+            // Legitimate retry — re-ACK without spawning a second worker.
+            // Use the current total queue depth as the peer_queue_depth for
+            // observability (may have changed since the first dispatch).
+            let depth = state
+                .compute_queue
+                .queue
+                .lock()
+                .await
+                .total_depth() as u64;
+            let ack = crate::pyramid::market_dispatch::MarketDispatchAck {
+                job_id: req.job_id.clone(),
+                peer_queue_depth: depth,
+            };
+            return Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&ack),
+                warp::http::StatusCode::ACCEPTED,
+            )));
+        }
+        MarketAdmissionOutcome::Admitted => {
+            // Fall through to enqueue + spawn.
+        }
+    }
+
+    // Step 8 (§III): Enqueue into the compute queue with `source =
+    // "market_received"`. enqueue_market forces the source field
+    // internally as a defense-in-depth invariant. If the per-model
+    // depth cap is exceeded, roll back the outbox row and reject 503.
+    //
+    // The queue entry carries a disconnected oneshot `result_tx` — the
+    // GPU loop will push the LlmResponse through it, but this handler
+    // does not await the receiver. The spawned worker runs the actual
+    // inference via `call_model_unified_with_options_and_ctx` outside
+    // the queue (mirror of spawn_fleet_worker — see rationale there);
+    // the oneshot is only a protocol-level placeholder. Dropping the
+    // receiver is fine — the GPU loop treats a closed channel as
+    // "caller gave up" and moves on.
+    let (result_tx, _result_rx) =
+        tokio::sync::oneshot::channel::<anyhow::Result<crate::pyramid::llm::LlmResponse>>();
+
+    // Clone a config for the queue entry. The queue entry's config field
+    // drives model lookup and per-call defaults; for the worker's actual
+    // inference call, spawn_market_worker builds its own config with
+    // fleet_dispatch/fleet_roster zeroed (see there).
+    let queue_config = state.pyramid.config.read().await.clone();
+    let chronicle_job_path = format!("market-recv:{}", req.job_id);
+    let queue_entry = crate::compute_queue::QueueEntry {
+        result_tx,
+        config: queue_config,
+        system_prompt: system_prompt.clone(),
+        user_prompt: user_prompt.clone(),
+        temperature: req.temperature.unwrap_or(0.0),
+        max_tokens: req.max_tokens.unwrap_or(4096),
+        response_format: req.response_format.clone(),
+        options: crate::pyramid::llm::LlmCallOptions {
+            skip_fleet_dispatch: true,
+            chronicle_job_path: Some(chronicle_job_path.clone()),
+            ..Default::default()
+        },
+        step_ctx: None,
+        model_id: req.model.clone(),
+        enqueued_at: std::time::Instant::now(),
+        work_item_id: None,  // TODO (WS8): populate from DADBEAR work item
+        attempt_id: None,    // TODO (WS8): populate from DADBEAR attempt
+        source: "market_received".to_string(), // enqueue_market forces this anyway
+        job_path: chronicle_job_path.clone(),
+        chronicle_job_path: Some(chronicle_job_path.clone()),
+    };
+
+    let enqueue_result = state
+        .compute_queue
+        .queue
+        .lock()
+        .await
+        .enqueue_market(&req.model, queue_entry, max_queue_depth);
+
+    if let Err(e) = enqueue_result {
+        // Queue depth cap hit. Roll back the outbox row we just committed.
+        let db_rb = db_path.clone();
+        let jid_rb = req.job_id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(conn) = rusqlite::Connection::open(&db_rb) {
+                let _ = crate::pyramid::db::fleet_outbox_delete(
+                    &conn,
+                    crate::fleet::WIRE_PLATFORM_DISPATCHER,
+                    &jid_rb,
+                );
+            }
+        })
+        .await;
+        tracing::warn!("Market dispatch enqueue failed: {}", e);
+        return Ok(Box::new(warp::reply::with_status(
+            warp::reply::with_header(
+                warp::reply::with_header(
+                    warp::reply::json(&serde_json::json!({"error": format!("{}", e)})),
+                    "Retry-After",
+                    policy.admission_retry_after_secs.to_string(),
+                ),
+                "X-Wire-Reason",
+                "queue_depth_exceeded",
+            ),
+            warp::http::StatusCode::SERVICE_UNAVAILABLE,
+        )));
+    }
+
+    // Notify the GPU loop that a new entry is waiting. Fleet dispatch
+    // relies on the same notify pattern via its queue path.
+    state.compute_queue.notify.notify_waiters();
+
+    // Step 9 (§III): Upsert the in-memory ComputeJob for runtime
+    // observability. The outbox is the durable source of truth; this
+    // struct is the runtime view consumed by the frontend's queue panel
+    // and by Phase 3's settlement correlation.
+    //
+    // We stash the stripped JWT (no "Bearer " prefix) on the job so a
+    // Phase 3 callback-delivery retry can re-present the same token.
+    {
+        let bearer_stripped = auth_header
+            .strip_prefix("Bearer ")
+            .unwrap_or(&auth_header)
+            .to_string();
+        let queued_at = chrono::Utc::now().to_rfc3339();
+        let job = crate::compute_market::ComputeJob {
+            job_id: req.job_id.clone(),
+            model_id: req.model.clone(),
+            status: crate::compute_market::ComputeJobStatus::Queued,
+            messages: Some(req.messages.clone()),
+            temperature: req.temperature,
+            max_tokens: req.max_tokens,
+            wire_job_token: bearer_stripped,
+            matched_rate_in: req.credit_rate_in_per_m,
+            matched_rate_out: req.credit_rate_out_per_m,
+            matched_multiplier_bps: offer_matched_multiplier_bps,
+            queued_at,
+            filled_at: None,
+            work_item_id: None, // TODO (WS8): semantic path market/{job_id}
+            attempt_id: None,   // TODO (WS8): DADBEAR attempt id
+        };
+        market_state_handle.write().await.upsert_active_job(job);
+    }
+
+    // TODO (WS8): Record chronicle event `market_received` with
+    //   model_id, job_id, credit_rate_in_per_m, credit_rate_out_per_m,
+    //   privacy_tier in metadata. Needs market event constants in
+    //   compute_chronicle.rs (EVENT_MARKET_RECEIVED, SOURCE_MARKET_RECEIVED)
+    //   which ship in the WS8 DADBEAR integration.
+    //
+    // TODO (WS6): Trigger queue mirror push (debounced per
+    //   market_delivery_policy.queue_mirror_debounce_ms). The mirror task
+    //   will bump queue_mirror_seq for this model and POST the snapshot
+    //   to the Wire's /api/v1/compute/queue-state endpoint.
+
+    // Step 10 (§III): Spawn the worker BEFORE returning 202. `tokio::spawn`
+    // is infallible so the 202 is truthful by construction.
+    spawn_market_worker(
+        state.clone(),
+        Arc::clone(&market_state_handle),
+        db_path.clone(),
+        policy.clone(),
+        req.job_id.clone(),
+        req.model.clone(),
+        system_prompt,
+        user_prompt,
+        req.temperature.unwrap_or(0.0),
+        req.max_tokens.unwrap_or(4096),
+        req.response_format.clone(),
+        req.credit_rate_in_per_m,
+        req.credit_rate_out_per_m,
+    );
+
+    // Step 11 (§III): Return 202 ACK with the provider's current total
+    // queue depth for observability.
+    let depth = state
+        .compute_queue
+        .queue
+        .lock()
+        .await
+        .total_depth() as u64;
+    let ack = crate::pyramid::market_dispatch::MarketDispatchAck {
+        job_id: req.job_id.clone(),
+        peer_queue_depth: depth,
+    };
+    Ok(Box::new(warp::reply::with_status(
+        warp::reply::json(&ack),
+        warp::http::StatusCode::ACCEPTED,
+    )))
+}
+
+/// Compute the credits earned for a completed market job from the matched
+/// rates and the actual token counts. Rates are per-million tokens (DD-C);
+/// input and output are billed independently. Saturating arithmetic on the
+/// full chain so a pathological billion-token job can't wrap into negative
+/// credits or panic on multiplication overflow.
+fn market_credits_earned(
+    rate_in_per_m: i64,
+    rate_out_per_m: i64,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+) -> i64 {
+    let in_credits = rate_in_per_m
+        .saturating_mul(prompt_tokens)
+        .saturating_div(1_000_000);
+    let out_credits = rate_out_per_m
+        .saturating_mul(completion_tokens)
+        .saturating_div(1_000_000);
+    in_credits.saturating_add(out_credits)
+}
+
+/// Spawns the worker that runs inference + heartbeat for a market job.
+/// All clones are owned by the spawned future; the caller returns 202 as
+/// soon as this function returns.
+///
+/// The worker:
+///   * snapshots `LlmConfig` with `fleet_dispatch=None` and `fleet_roster=None`
+///     (belt-and-suspenders — the queue entry already skipped fleet dispatch,
+///     but the worker's out-of-queue inference path must too) and with the
+///     market-requested model overriding primary / fallbacks so the unified
+///     call path routes to the right backend.
+///   * runs `call_model_unified_with_options_and_ctx` alongside a heartbeat
+///     that bumps `expires_at` every `worker_heartbeat_interval_secs`.
+///   * CAS-promotes `pending → ready` on success, transitions the ComputeJob
+///     status, records completion credits.
+///   * Bumps `delivery_attempts` on inference failure for Phase 3's callback-
+///     delivery worker to surface as a failed job.
+///
+/// Phase 3's callback-delivery loop (NOT in this workstream) handles the
+/// actual HTTP POST of the result to the callback_url, the retry schedule,
+/// and the `ready → delivered` / `ready → failed` terminal CAS.
+#[allow(clippy::too_many_arguments)]
+fn spawn_market_worker(
+    state: ServerState,
+    market_state_handle: Arc<RwLock<crate::compute_market::ComputeMarketState>>,
+    db_path: std::path::PathBuf,
+    policy: crate::pyramid::market_delivery_policy::MarketDeliveryPolicy,
+    job_id: String,
+    model_id: String,
+    system_prompt: String,
+    user_prompt: String,
+    temperature: f32,
+    max_tokens: usize,
+    response_format: Option<serde_json::Value>,
+    credit_rate_in_per_m: i64,
+    credit_rate_out_per_m: i64,
+) {
+    tokio::spawn(async move {
+        // Build worker config. Override model to the market-requested
+        // model; zero fleet_dispatch + fleet_roster so the unified call
+        // path cannot recursively re-dispatch this job.
+        let worker_config = {
+            let cfg = state.pyramid.config.read().await;
+            let mut wc = cfg.clone();
+            wc.primary_model = model_id.clone();
+            wc.fallback_model_1 = model_id.clone();
+            wc.fallback_model_2 = model_id.clone();
+            wc.fleet_dispatch = None;
+            wc.fleet_roster = None;
+            wc
+        };
+
+        let chronicle_job_path = format!("market-recv:{}", job_id);
+        let options = crate::pyramid::llm::LlmCallOptions {
+            skip_fleet_dispatch: true,
+            chronicle_job_path: Some(chronicle_job_path.clone()),
+            ..Default::default()
+        };
+
+        // Transition the ComputeJob to Executing (the GPU loop would
+        // normally do this, but since the worker runs the inference
+        // directly, we transition here). Matches Queued → Executing in
+        // the spec state machine.
+        {
+            let mut s = market_state_handle.write().await;
+            let _ = s.transition_job_status(
+                &job_id,
+                crate::compute_market::ComputeJobStatus::Executing,
+            );
+            if let Some(job) = s.active_jobs.get_mut(&job_id) {
+                job.filled_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+        }
+
+        // Heartbeat future: tick every worker_heartbeat_interval_secs,
+        // bump expires_at, exit if the sweep CAS'd us out (rowcount 0).
+        let hb_db_path = db_path.clone();
+        let hb_job_id = job_id.clone();
+        let hb_interval = policy.worker_heartbeat_interval_secs.max(1);
+        let hb_tolerance = policy.worker_heartbeat_tolerance_secs;
+
+        let heartbeat = async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(hb_interval));
+            ticker.tick().await; // skip the immediate tick at t=0
+            loop {
+                ticker.tick().await;
+                let hb_db = hb_db_path.clone();
+                let hb_jid = hb_job_id.clone();
+                let hb_tol = hb_tolerance;
+                let result: anyhow::Result<usize> =
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+                        let conn = rusqlite::Connection::open(&hb_db)?;
+                        let modifier = format!("+{} seconds", hb_tol);
+                        let new_expires: String = conn.query_row(
+                            "SELECT datetime('now', ?1)",
+                            rusqlite::params![modifier],
+                            |r| r.get(0),
+                        )?;
+                        crate::pyramid::db::fleet_outbox_update_heartbeat_if_pending(
+                            &conn,
+                            crate::fleet::WIRE_PLATFORM_DISPATCHER,
+                            &hb_jid,
+                            &new_expires,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|je| Err(anyhow::anyhow!(je.to_string())));
+                match result {
+                    Ok(1) => continue,
+                    Ok(0) => return false, // sweep won the race
+                    Ok(_) => return false, // compound PK guarantees 0/1
+                    Err(e) => {
+                        let msg = e.to_string().to_lowercase();
+                        if msg.contains("busy") || msg.contains("locked") {
+                            tracing::debug!(?e, "market heartbeat DB-locked; retrying");
+                            continue;
+                        }
+                        tracing::error!(?e, "market heartbeat DB error; giving up");
+                        return false;
+                    }
+                }
+            }
+        };
+
+        let inference = crate::pyramid::llm::call_model_unified_with_options_and_ctx(
+            &worker_config,
+            None,
+            &system_prompt,
+            &user_prompt,
+            temperature,
+            max_tokens,
+            response_format.as_ref(),
+            options,
+        );
+
+        // Race inference against heartbeat exit. If the heartbeat exits
+        // first, the sweep claimed the row — drop the inference result.
+        let select_outcome = tokio::select! {
+            inf = inference => Some(inf),
+            _ = heartbeat => None,
+        };
+
+        match select_outcome {
+            None => {
+                // Sweep won. Transition the job to Failed so the
+                // observability panel reflects the terminal state.
+                let mut s = market_state_handle.write().await;
+                let _ = s.transition_job_status(
+                    &job_id,
+                    crate::compute_market::ComputeJobStatus::Failed,
+                );
+                tracing::warn!(
+                    "Market worker lost heartbeat sweep for job_id={}",
+                    job_id
+                );
+            }
+            Some(Ok(llm_response)) => {
+                // Build MarketAsyncResult::Success and CAS pending → ready.
+                let prompt_tokens = llm_response.usage.prompt_tokens;
+                let completion_tokens = llm_response.usage.completion_tokens;
+                let outcome = crate::pyramid::market_dispatch::MarketAsyncResult::Success(
+                    crate::pyramid::market_dispatch::MarketDispatchResponse {
+                        content: llm_response.content,
+                        prompt_tokens: Some(prompt_tokens),
+                        completion_tokens: Some(completion_tokens),
+                        model: model_id.clone(),
+                        finish_reason: None,
+                        provider_model: Some(model_id.clone()),
+                    },
+                );
+                let result_json = match serde_json::to_string(&outcome) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(?e, "failed to serialize MarketAsyncResult");
+                        crate::pyramid::db::synthesize_worker_error_json(&format!(
+                            "result serialize failed: {}",
+                            e
+                        ))
+                    }
+                };
+
+                let db_promote = db_path.clone();
+                let jid_promote = job_id.clone();
+                let rj_promote = result_json.clone();
+                let ready_retention_secs = policy.ready_retention_secs;
+                let promote_res: Result<usize, String> =
+                    tokio::task::spawn_blocking(move || {
+                        let conn = rusqlite::Connection::open(&db_promote)
+                            .map_err(|e| e.to_string())?;
+                        crate::pyramid::db::fleet_outbox_promote_ready_if_pending(
+                            &conn,
+                            crate::fleet::WIRE_PLATFORM_DISPATCHER,
+                            &jid_promote,
+                            &rj_promote,
+                            ready_retention_secs,
+                        )
+                        .map_err(|e| e.to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|je| Err(je.to_string()));
+
+                match promote_res {
+                    Ok(1) => {
+                        // Worker won. Transition ComputeJob Executing → Ready
+                        // and record completion credits. Phase 3's callback-
+                        // delivery worker will transition the outbox row
+                        // ready → delivered once the callback POST succeeds.
+                        let credits_earned = market_credits_earned(
+                            credit_rate_in_per_m,
+                            credit_rate_out_per_m,
+                            prompt_tokens,
+                            completion_tokens,
+                        );
+                        let mut s = market_state_handle.write().await;
+                        let _ = s.transition_job_status(
+                            &job_id,
+                            crate::compute_market::ComputeJobStatus::Ready,
+                        );
+                        s.record_completion(credits_earned);
+                        // TODO (WS8): chronicle event market_completed with
+                        //   model_id, job_id, prompt_tokens, completion_tokens,
+                        //   credits_earned.
+                    }
+                    Ok(_) => {
+                        // Sweep already promoted us with a synthesized Error —
+                        // drop our result. Reflect the terminal state locally.
+                        let mut s = market_state_handle.write().await;
+                        let _ = s.transition_job_status(
+                            &job_id,
+                            crate::compute_market::ComputeJobStatus::Failed,
+                        );
+                        tracing::warn!(
+                            "Market worker sweep-lost at promote for job_id={}",
+                            job_id
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "market outbox promote_ready failed: {} (job_id={})",
+                            e,
+                            job_id
+                        );
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                // Inference failed. Bump delivery_attempts so Phase 3's
+                // callback-delivery worker surfaces this as a failed job
+                // (and Predicate B's retries-exhausted path eventually
+                // marks the row failed). Transition the ComputeJob to
+                // Failed immediately for observability — the outbox row
+                // is the durable source of truth; this is the runtime view.
+                //
+                // Phase 3 owns the retry loop: the attempt counter here
+                // feeds into `max_delivery_attempts`, and the sweep will
+                // push the row to failed status once the budget is spent.
+                let err_msg = format!("{}", e);
+                let db_fail = db_path.clone();
+                let jid_fail = job_id.clone();
+                let err_clone = err_msg.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let conn = rusqlite::Connection::open(&db_fail).ok()?;
+                    crate::pyramid::db::fleet_outbox_bump_delivery_attempt(
+                        &conn,
+                        crate::fleet::WIRE_PLATFORM_DISPATCHER,
+                        &jid_fail,
+                        &err_clone,
+                    )
+                    .ok()
+                })
+                .await;
+
+                let mut s = market_state_handle.write().await;
+                let _ = s.transition_job_status(
+                    &job_id,
+                    crate::compute_market::ComputeJobStatus::Failed,
+                );
+                tracing::warn!(
+                    "Market inference failed for job_id={}: {}",
+                    job_id,
+                    err_msg
+                );
+                // TODO (WS8): chronicle event market_failed with error.
+            }
+        }
+    });
+}
+
 /// Handle POST /v1/fleet/result — dispatcher-side async result callback.
 ///
 /// Peek → verify → pop-and-send. Snapshot identity match while holding the
@@ -2560,4 +3548,71 @@ async fn handle_fleet_announce(
         warp::reply::json(&serde_json::json!({"status": "ok"})),
         warp::http::StatusCode::OK,
     ))
+}
+
+#[cfg(test)]
+mod market_dispatch_tests {
+    //! Unit tests for the market-dispatch helpers that can be tested
+    //! without the full warp / tauri test harness.
+    //!
+    //! The end-to-end flow (JWT verify → body parse → outbox insert →
+    //! queue enqueue → worker spawn) is covered by a later integration
+    //! workstream. These tests pin the isolated math and invariants that
+    //! this workstream introduces — primarily the credits-earned formula
+    //! which is the only piece of new numeric logic in the worker path.
+    //!
+    //! Primitives consumed by the handler (messages_to_prompt_pair,
+    //! market_outbox_insert_or_ignore, verify_market_identity,
+    //! enqueue_market) already have exhaustive unit tests in their
+    //! respective modules — see WS2, WS3, WS4, and WS5.1 commits.
+    use super::*;
+
+    #[test]
+    fn market_credits_earned_base_case() {
+        // 100 credits/Mtok input, 500 credits/Mtok output.
+        // 1M prompt tokens × 100 + 1M completion × 500 = 100 + 500 = 600.
+        let credits = market_credits_earned(100, 500, 1_000_000, 1_000_000);
+        assert_eq!(credits, 600);
+    }
+
+    #[test]
+    fn market_credits_earned_fractional_tokens_floor_via_integer_div() {
+        // 100 credits/Mtok × 500_000 tokens = 50_000_000 / 1_000_000 = 50.
+        // 500 credits/Mtok × 250_000 tokens = 125_000_000 / 1_000_000 = 125.
+        // Total = 175. Integer division floors — 500k tokens at 100/M is
+        // exactly 50 credits, not 50.0 or 49.something.
+        let credits = market_credits_earned(100, 500, 500_000, 250_000);
+        assert_eq!(credits, 175);
+    }
+
+    #[test]
+    fn market_credits_earned_zero_tokens_yields_zero() {
+        // A zero-token completion (pathological but legal) still yields
+        // zero credits, not a negative or NaN-adjacent value.
+        assert_eq!(market_credits_earned(100, 500, 0, 0), 0);
+        assert_eq!(market_credits_earned(100, 500, 0, 100), 0);
+        assert_eq!(market_credits_earned(100, 500, 100, 0), 0);
+    }
+
+    #[test]
+    fn market_credits_earned_saturates_on_overflow() {
+        // Pathological: i64::MAX rate × billion tokens would overflow
+        // a non-saturating multiply and either panic or wrap to negative.
+        // saturating_mul clamps at i64::MAX, saturating_div preserves it,
+        // saturating_add must not wrap the final sum. The output token
+        // side is zero to isolate the input-side saturation.
+        let credits = market_credits_earned(i64::MAX, 0, 1_000_000_000, 0);
+        assert!(credits >= 0, "saturating chain must not wrap negative");
+        assert_eq!(credits, i64::MAX / 1_000_000);
+    }
+
+    #[test]
+    fn market_credits_earned_negative_rate_propagates() {
+        // A negative matched rate shouldn't happen in production (Wire-side
+        // quoting is guarded at match time), but if it does we want the
+        // arithmetic to flow through cleanly rather than panic. Pins that
+        // saturating_div handles negatives the same way i64 division does.
+        let credits = market_credits_earned(-100, 500, 1_000_000, 1_000_000);
+        assert_eq!(credits, 400); // -100 + 500 = 400 per million pair.
+    }
 }
