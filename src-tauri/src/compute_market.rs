@@ -17,12 +17,25 @@
 // save. The file format includes a `schema_version: u32` field; on
 // load, a version mismatch returns `None` + logs a warning and the
 // app boots with `ComputeMarketState::default()` (cold-start
-// rebuild). This matches the pattern of other wire-node state files
-// (dadbear_state.json, fleet_roster.json).
+// rebuild).
 //
 // **Pillar 9 compliance:** all credit fields are `i64` (never `f64`,
 // never `u64`). Queue discount multipliers are `i32` basis points
 // (10000 = 1.0x). Per-offer rates are per-million tokens in credits.
+//
+// **Schema-migration policy.** Spec language (L272-273) talks about
+// the on-disk JSON "silently dropping" removed fields on next save
+// via `ignore_unknown_fields`. This implementation takes the stricter
+// path: `#[serde(deny_unknown_fields)]` on every persisted struct,
+// combined with the `schema_version` gate, so a stale file from a
+// future or past code version fails to parse and triggers cold-start
+// rebuild loudly instead of silently mutating. Phase 1 was never
+// persisted (the stub was unreferenced), so no Phase-1→Phase-2
+// migration case actually exists on disk — this policy concerns
+// Phase 2→Phase 3+ only. When the struct changes in a way that
+// should preserve existing state, bump `schema_version` AND write a
+// migration step; when the change can tolerate a cold start, bump
+// the version and let load() return None.
 //
 // **Phase 2 scope:** the struct + persistence + default constructor.
 // No handler logic, no offer-publication IPC (WS7), no mirror push
@@ -314,11 +327,24 @@ impl ComputeMarketState {
         Ok(())
     }
 
-    /// Record a newly-queued job. Idempotent by `job_id` — duplicate
-    /// inserts (retry of the same dispatch) overwrite the existing
-    /// entry, which is the desired behavior since the outbox insert
-    /// is also ON CONFLICT DO NOTHING and we want the two views to
-    /// agree.
+    /// Register a newly-queued job in the runtime view, keyed by
+    /// `job_id`. Semantics are **last-write-wins**: a second call with
+    /// the same `job_id` clobbers the first entry in full.
+    ///
+    /// The actual idempotency gate lives upstream in the
+    /// `fleet_result_outbox` INSERT (see
+    /// `compute-market-phase-2-exchange.md` §III step 3 — `ON CONFLICT
+    /// DO NOTHING`). The WS5 dispatch handler checks the outbox first;
+    /// on conflict it returns 202 with the existing `job_id` and does
+    /// NOT call this method a second time. So in practice this is
+    /// exercised once per unique `job_id`.
+    ///
+    /// The `upsert_` prefix exists because calling this twice with
+    /// different-content payloads for the same `job_id` IS legal (it
+    /// won't panic or return an error), but it will silently overwrite
+    /// in-flight status (e.g. revert an `Executing` job back to
+    /// `Queued`). WS5 callers must check `active_jobs.contains_key`
+    /// before calling if they need conflict-aware behavior.
     pub fn upsert_active_job(&mut self, job: ComputeJob) {
         self.active_jobs.insert(job.job_id.clone(), job);
     }
@@ -507,6 +533,22 @@ mod tests {
         state.session_credits_earned = 300;
 
         state.save(tmp.path()).unwrap();
+
+        // Strong form: the on-disk JSON must NOT mention the session
+        // fields at all. A grep-check pins the skip_serializing
+        // contract against a future refactor that accidentally flips
+        // skip_serializing off (which would make our "reset on
+        // restart" guarantee quietly dependent on
+        // `#[serde(default)]` — but default only fires when the field
+        // is MISSING; if save emits it, load reads it, and session
+        // state bleeds across restarts).
+        let raw = std::fs::read_to_string(
+            tmp.path().join(COMPUTE_MARKET_STATE_FILENAME)).unwrap();
+        assert!(!raw.contains("session_jobs_completed"),
+            "session_jobs_completed must be omitted from on-disk JSON, got: {raw}");
+        assert!(!raw.contains("session_credits_earned"),
+            "session_credits_earned must be omitted from on-disk JSON, got: {raw}");
+
         let loaded = ComputeMarketState::load(tmp.path()).unwrap();
         assert_eq!(loaded.total_jobs_completed, 10);
         assert_eq!(loaded.total_credits_earned, 1_000);
@@ -543,6 +585,36 @@ mod tests {
         state.upsert_active_job(sample_job());
         assert_eq!(state.active_jobs.len(), 1,
             "duplicate upsert must not create two entries");
+    }
+
+    #[test]
+    fn upsert_active_job_is_last_write_wins() {
+        // Pins the documented semantics: a second upsert with the SAME
+        // `job_id` but different content clobbers the first. Callers
+        // that need conflict-aware behavior must check
+        // `active_jobs.contains_key` before calling (see WS5 dispatch
+        // handler's outbox-first idempotency gate).
+        let mut state = ComputeMarketState::default();
+        let mut j1 = sample_job();
+        j1.status = ComputeJobStatus::Executing;
+        j1.filled_at = Some("2026-04-17T12:00:01Z".into());
+        state.upsert_active_job(j1);
+
+        let mut j2 = sample_job(); // status = Queued, filled_at = None
+        state.upsert_active_job(j2.clone());
+
+        let stored = state.active_jobs.get(&j2.job_id).unwrap();
+        assert_eq!(stored.status, ComputeJobStatus::Queued,
+            "second upsert must clobber the first's Executing status");
+        assert!(stored.filled_at.is_none(),
+            "second upsert must clobber the first's filled_at");
+        // Nudge the model_id on the second and confirm it lands too.
+        j2.model_id = "other-model".into();
+        state.upsert_active_job(j2);
+        assert_eq!(
+            state.active_jobs.get("job-xyz").unwrap().model_id,
+            "other-model"
+        );
     }
 
     #[test]
@@ -618,6 +690,28 @@ mod tests {
         state.record_completion(1_000);
         assert_eq!(state.total_credits_earned, i64::MAX,
             "saturating_add must not wrap to negative");
+    }
+
+    #[test]
+    fn record_completion_does_not_touch_unrelated_state() {
+        // Defensive regression: record_completion should only bump the
+        // four counter fields. If a future refactor wires it into any
+        // other state mutation (offers, active_jobs, queue_mirror_seq,
+        // is_serving), this test pins the boundary.
+        let mut state = ComputeMarketState::default();
+        state.offers.insert("m".into(), sample_offer());
+        state.active_jobs.insert("j".into(), sample_job());
+        state.queue_mirror_seq.insert("m".into(), 42);
+        state.is_serving = true;
+        state.last_evaluation_at = Some("t".into());
+
+        state.record_completion(100);
+
+        assert_eq!(state.offers.len(), 1);
+        assert_eq!(state.active_jobs.len(), 1);
+        assert_eq!(state.queue_mirror_seq.get("m"), Some(&42));
+        assert!(state.is_serving);
+        assert_eq!(state.last_evaluation_at.as_deref(), Some("t"));
     }
 
     // ── Serde unknown-field rejection ────────────────────────────────
