@@ -19,9 +19,12 @@
 //     completions; assistant turns would require chat-history
 //     semantics we don't implement yet.
 //   - Multiple user messages are concatenated with `\n\n`.
-//   - The first `system` message becomes `system_prompt` (subsequent
-//     system messages are also concatenated in order, same separator
-//     — rare but not a reason to reject).
+//   - The FIRST `system` message becomes `system_prompt`. Subsequent
+//     system messages are rejected with `InvalidShape` — DD-C line 751
+//     ("first `system` message → `system_prompt`") is explicit and the
+//     Wire's fill handler is expected to emit at most one system turn.
+//     A dispatch with multiple system turns is a bug upstream; surface
+//     it loudly rather than silently concatenating.
 //   - At least one user message is required. No user messages = reject.
 //   - Missing `role` / `content` fields or non-string `content` →
 //     `InvalidShape`.
@@ -82,7 +85,7 @@ pub fn messages_to_prompt_pair(
 ) -> Result<(String, String), MessagesError> {
     let arr = messages.as_array().ok_or(MessagesError::InvalidShape)?;
 
-    let mut system_parts: Vec<String> = Vec::new();
+    let mut system_prompt: Option<String> = None;
     let mut user_parts: Vec<String> = Vec::new();
 
     for entry in arr {
@@ -103,7 +106,15 @@ pub fn messages_to_prompt_pair(
             .ok_or(MessagesError::InvalidShape)?;
 
         match role {
-            "system" => system_parts.push(content.to_string()),
+            "system" => {
+                // DD-C: "first `system` message → `system_prompt`". A
+                // second system turn is a spec violation — fail loud
+                // instead of silently concatenating.
+                if system_prompt.is_some() {
+                    return Err(MessagesError::InvalidShape);
+                }
+                system_prompt = Some(content.to_string());
+            }
             "user" => user_parts.push(content.to_string()),
             "assistant" => return Err(MessagesError::AssistantTurns),
             other => return Err(MessagesError::UnknownRole(other.to_string())),
@@ -116,10 +127,8 @@ pub fn messages_to_prompt_pair(
 
     // No system messages is fine — empty string for `system_prompt` is
     // a valid downstream input (Ollama / OpenRouter treat it as "no
-    // system preamble"). Multiple system messages are concatenated in
-    // order so operator-side debugging can see everything the model
-    // was primed with.
-    let system_prompt = system_parts.join("\n\n");
+    // system preamble").
+    let system_prompt = system_prompt.unwrap_or_default();
     let user_prompt = user_parts.join("\n\n");
     Ok((system_prompt, user_prompt))
 }
@@ -159,34 +168,51 @@ mod tests {
     }
 
     #[test]
-    fn multiple_system_messages_concatenate_in_order() {
-        // Rare but not invalid — operators sometimes stack system
-        // messages for layered priming. Policy: concatenate them in
-        // order with the same separator.
+    fn multiple_system_messages_rejected_as_invalid_shape() {
+        // DD-C: "first `system` message → `system_prompt`". A second
+        // system turn is a spec violation — the Wire's fill handler is
+        // expected to emit at most one system turn. Reject loudly so
+        // operators catch Wire-side regressions rather than silently
+        // concatenating.
         let messages = json!([
             { "role": "system", "content": "Preamble A." },
             { "role": "system", "content": "Preamble B." },
             { "role": "user", "content": "go" },
         ]);
-        let (sys, usr) = messages_to_prompt_pair(&messages).unwrap();
-        assert_eq!(sys, "Preamble A.\n\nPreamble B.");
-        assert_eq!(usr, "go");
+        assert_eq!(
+            messages_to_prompt_pair(&messages).unwrap_err(),
+            MessagesError::InvalidShape
+        );
     }
 
     #[test]
-    fn interleaved_system_and_user_still_groups_by_role() {
-        // The order within each group is preserved; the grouping is
-        // system-first then user. This keeps the downstream
-        // (system_prompt, user_prompt) contract simple.
+    fn interleaved_system_and_user_preserves_user_order() {
+        // One system message (first, per spec) + multiple user
+        // messages interleaved. User messages are concatenated in
+        // source order; the single system becomes system_prompt.
         let messages = json!([
             { "role": "system", "content": "A" },
             { "role": "user", "content": "1" },
-            { "role": "system", "content": "B" },
             { "role": "user", "content": "2" },
         ]);
         let (sys, usr) = messages_to_prompt_pair(&messages).unwrap();
-        assert_eq!(sys, "A\n\nB");
+        assert_eq!(sys, "A");
         assert_eq!(usr, "1\n\n2");
+    }
+
+    #[test]
+    fn system_after_user_is_accepted_if_only_one_system() {
+        // DD-C doesn't require the single system turn to come first —
+        // it just says "first system message → system_prompt". One
+        // system turn in any position is fine; the rejection rule is
+        // specifically about a SECOND system turn.
+        let messages = json!([
+            { "role": "user", "content": "hi" },
+            { "role": "system", "content": "be concise" },
+        ]);
+        let (sys, usr) = messages_to_prompt_pair(&messages).unwrap();
+        assert_eq!(sys, "be concise");
+        assert_eq!(usr, "hi");
     }
 
     #[test]
