@@ -30,6 +30,48 @@ use crate::pyramid::event_bus::BuildEventBus;
 /// Preview TTL in seconds (5 minutes).
 const PREVIEW_TTL_SECS: i64 = 300;
 
+/// Virtual slug for provider-side compute market work.
+///
+/// Market jobs bypass the preview gate entirely — see the module-level
+/// doc on `skip_preview_for_slug` for the full rationale. This constant
+/// is the single source of truth; matching against it (rather than a
+/// bare string literal at each call site) keeps the behavior grep-able
+/// and lets DD-A renames flow through one edit.
+///
+/// Per `docs/plans/compute-market-architecture.md` DD-A: the canonical
+/// slug string is `market:compute`. Bridge jobs share this slug with
+/// `step_name: "bridge"` discriminating (DD-P).
+pub const MARKET_COMPUTE_SLUG: &str = "market:compute";
+
+/// Returns true if the preview gate should short-circuit for this slug.
+///
+/// Per `docs/plans/compute-market-phase-2-exchange.md` §V P3:
+///
+/// > The DADBEAR preview gate exists to enforce operator cost budgets
+/// > before committing to paid work. For provider-side market jobs
+/// > this is redundant: the Wire's matched price + deposit IS the cost
+/// > gate, and the provider already accepted the offer by publishing
+/// > it. If the preview gate ran normally, it would try to price the
+/// > job in USD against the operator's local-inference budget — the
+/// > wrong currency, against the wrong budget, for a job the provider
+/// > is being PAID to run.
+///
+/// The canonical handler (`handle_market_dispatch`) inserts market work
+/// items directly at `state = 'previewed'` and never calls
+/// `create_dispatch_preview` / `enforce_budget_and_commit`. This guard
+/// is a belt-and-suspenders: if a future caller (bridge cost-model
+/// integration, reprocessing path, etc.) accidentally routes a
+/// market-slug batch through the gate, the gate passes through without
+/// creating a phantom USD cost record or placing a wrong-currency
+/// cost_limit hold.
+///
+/// Requester-side market dispatch is a separate code path (Phase 3
+/// scope) and uses its own credit-denominated preview — it does NOT
+/// share this skip.
+pub fn skip_preview_for_slug(slug: &str) -> bool {
+    slug == MARKET_COMPUTE_SLUG
+}
+
 // ── Budget decision ────────────────────────────────────────────────────────
 
 /// Result of checking a preview's cost against policy budget limits.
@@ -73,6 +115,29 @@ pub fn create_dispatch_preview(
     policy: &DispatchPolicy,
     norms_hash: &str,
 ) -> Result<String> {
+    // §V P3 skip: market:compute batches never get a USD-denominated
+    // preview. Return a sentinel preview_id so the caller pattern
+    // matches (some paths then call `commit_preview` with the id);
+    // downstream CAS checks via `is_preview_valid` will see the
+    // sentinel format and can early-pass. See `skip_preview_for_slug`
+    // for the full rationale.
+    //
+    // The canonical `handle_market_dispatch` path does NOT go through
+    // this function — it inserts work items directly at 'previewed'.
+    // This branch exists so a future accidental caller on a
+    // market:compute batch doesn't create a phantom USD cost record
+    // and doesn't place a wrong-currency cost_limit hold on the slug.
+    if skip_preview_for_slug(slug) {
+        let preview_id = format!("{slug}:{batch_id}:market-skip");
+        debug!(
+            slug = %slug,
+            batch_id = %batch_id,
+            item_count = work_item_ids.len(),
+            "dadbear_preview::create_dispatch_preview: slug is market:compute; short-circuiting (no USD cost gate for Wire-priced paid market work)"
+        );
+        return Ok(preview_id);
+    }
+
     let now = Utc::now();
     let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
     let expires_at = (now + chrono::Duration::seconds(PREVIEW_TTL_SECS))
@@ -288,6 +353,20 @@ pub fn enforce_budget_and_commit(
     preview_cost: f64,
     policy: &DispatchPolicy,
 ) -> Result<BudgetDecision> {
+    // §V P3 skip: market:compute is Wire-priced and paid-for; the
+    // operator USD budget does not apply. Short-circuit as AutoCommit
+    // so any (unexpected) caller gets the "pass" decision without us
+    // placing a wrong-currency cost_limit hold on the slug. See
+    // `skip_preview_for_slug` for the full rationale.
+    if skip_preview_for_slug(slug) {
+        debug!(
+            slug = %slug,
+            preview_id = %preview_id,
+            "dadbear_preview::enforce_budget_and_commit: slug is market:compute; short-circuiting AutoCommit (no USD budget applies to paid market work)"
+        );
+        return Ok(BudgetDecision::AutoCommit);
+    }
+
     let decision = check_budget(conn, slug, preview_cost, policy)?;
 
     match &decision {
@@ -596,5 +675,106 @@ mod tests {
         assert_eq!(summary["local"]["count"], 1);
         assert_eq!(summary["cloud"]["count"], 2);
         assert_eq!(summary["fleet"]["count"], 1);
+    }
+
+    // ── WS8: market:compute skip behaviour ─────────────────────────────
+
+    #[test]
+    fn market_compute_slug_constant_matches_dd_a() {
+        // DD-A (`compute-market-architecture.md`) canonicalizes the
+        // string `"market:compute"`. Pinning it here so a rename flags
+        // here and at the handler call site on the same PR.
+        assert_eq!(MARKET_COMPUTE_SLUG, "market:compute");
+    }
+
+    #[test]
+    fn skip_preview_for_slug_matches_market_compute_only() {
+        assert!(skip_preview_for_slug("market:compute"));
+        // Pyramid slugs with colons but not the market namespace —
+        // MUST NOT skip. Regression guard against a prefix-match
+        // implementation that would misfire on similar strings.
+        assert!(!skip_preview_for_slug("opt-025"));
+        assert!(!skip_preview_for_slug("goodnewseveryone"));
+        assert!(!skip_preview_for_slug("market:storage"));
+        assert!(!skip_preview_for_slug("market:relay"));
+        assert!(!skip_preview_for_slug("market:compute:extra"));
+        assert!(!skip_preview_for_slug(""));
+    }
+
+    #[test]
+    fn create_dispatch_preview_short_circuits_for_market_compute() {
+        // Construct a minimal in-memory DB with the schema bits the
+        // function touches. We don't expect the function to read from
+        // the DB on the skip branch — that's the whole point — so an
+        // empty :memory: connection suffices.
+        use crate::pyramid::dispatch_policy::*;
+        use std::collections::BTreeMap;
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let policy = DispatchPolicy {
+            rules: vec![],
+            escalation: EscalationConfig::default(),
+            build_coordination: BuildCoordinationConfig::default(),
+            pool_configs: BTreeMap::new(),
+            max_batch_cost_usd: Some(0.0), // would force CostLimitHold if evaluated
+            max_daily_cost_usd: Some(0.0),
+        };
+
+        // On the non-market path this call would fail (no schema, no
+        // work items). On the market:compute skip path it returns
+        // Ok(sentinel_id) without touching the DB.
+        let result = create_dispatch_preview(
+            &conn,
+            MARKET_COMPUTE_SLUG,
+            "batch-1",
+            &["market/abc".to_string()],
+            &policy,
+            "deadbeef",
+        );
+        assert!(
+            result.is_ok(),
+            "market:compute preview must short-circuit without DB access; got {:?}",
+            result.err(),
+        );
+        let id = result.unwrap();
+        assert!(id.contains("market-skip"), "sentinel preview_id must mark the skip: {id}");
+    }
+
+    #[test]
+    fn enforce_budget_and_commit_short_circuits_for_market_compute() {
+        // Same contract: the skip branch returns AutoCommit without
+        // consulting the DB or placing a cost_limit hold. The
+        // non-market path with max_batch_cost_usd = 0.0 and a positive
+        // preview_cost would otherwise CostLimitHold (exceeds daily
+        // cap that's also 0.0).
+        use crate::pyramid::dispatch_policy::*;
+        use crate::pyramid::event_bus::BuildEventBus;
+        use std::collections::BTreeMap;
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let bus = Arc::new(BuildEventBus::new());
+        let policy = DispatchPolicy {
+            rules: vec![],
+            escalation: EscalationConfig::default(),
+            build_coordination: BuildCoordinationConfig::default(),
+            pool_configs: BTreeMap::new(),
+            max_batch_cost_usd: Some(0.0),
+            max_daily_cost_usd: Some(0.0),
+        };
+
+        let decision = enforce_budget_and_commit(
+            &conn,
+            &bus,
+            MARKET_COMPUTE_SLUG,
+            "market:compute:batch-1:market-skip",
+            1234.56, // "cost" that would otherwise trip CostLimitHold
+            &policy,
+        );
+        assert!(
+            decision.is_ok(),
+            "market:compute enforce_budget_and_commit must short-circuit: {:?}",
+            decision.err(),
+        );
+        assert_eq!(decision.unwrap(), BudgetDecision::AutoCommit);
     }
 }

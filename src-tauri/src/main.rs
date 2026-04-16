@@ -9231,7 +9231,61 @@ async fn compute_offer_create(
         persist_compute_market_state(&market_state, &data_dir);
     }
 
-    // TODO (WS8): chronicle `market_offered` event here.
+    // WS8 (§III L607-612): Emit `market_offered` chronicle event.
+    //
+    // job_path: `market/offer/{model_id}` — keeps offer-lifecycle events
+    //           grouped under a stable per-model path so an operator
+    //           filtering by job_path can see create → update → deactivate
+    //           for a single offer as a single stream.
+    // source:   SOURCE_MARKET (not SOURCE_MARKET_RECEIVED — the provider
+    //           is the ACTOR here, not the receiver).
+    // work_item_id: None (offer management is not DADBEAR-tracked; the
+    //                DADBEAR work item lifecycle is for matched jobs).
+    // metadata: model_id, rate_per_m_input, rate_per_m_output,
+    //           reservation_fee, wire_offer_id — the four fields the
+    //           spec names plus the Wire's assigned offer id for
+    //           correlation against the Wire-side observation.
+    //
+    // Chronicle write happens off the async thread because
+    // `record_event` is sync (rusqlite). Fire-and-forget — if the DB
+    // write fails, the offer has already been published successfully
+    // and the operator sees it in the Wire response. Chronicle is an
+    // observability side-channel, not the source of truth.
+    {
+        let data_dir_opt = state.pyramid.data_dir.as_ref().cloned();
+        if let Some(data_dir) = data_dir_opt {
+            let model_id = offer.model_id.clone();
+            let rate_in = offer.rate_per_m_input;
+            let rate_out = offer.rate_per_m_output;
+            let reservation_fee = offer.reservation_fee;
+            let wire_offer_id_clone = offer_id.clone();
+            let db_path = data_dir.join("pyramid.db");
+            let job_path = format!("market/offer/{}", model_id);
+            let ctx = wire_node_lib::pyramid::compute_chronicle::ChronicleEventContext::minimal(
+                &job_path,
+                wire_node_lib::pyramid::compute_chronicle::EVENT_MARKET_OFFERED,
+                wire_node_lib::pyramid::compute_chronicle::SOURCE_MARKET,
+            )
+            .with_model_id(model_id)
+            .with_metadata(serde_json::json!({
+                "rate_per_m_input": rate_in,
+                "rate_per_m_output": rate_out,
+                "reservation_fee": reservation_fee,
+                "wire_offer_id": wire_offer_id_clone,
+            }));
+            tokio::task::spawn_blocking(move || {
+                if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                    let _ = wire_node_lib::pyramid::compute_chronicle::record_event(&conn, &ctx);
+                }
+            });
+        }
+    }
+
+    // Phase 2 WS6: nudge the queue mirror task — a new offer expands
+    // the set of models the Wire should know we can serve. The mirror
+    // task's snapshot includes an entry for every offer in
+    // `ComputeMarketState.offers`.
+    let _ = state.compute_market_dispatch.mirror_nudge.send(());
 
     Ok(offer_id)
 }
@@ -9293,6 +9347,10 @@ async fn compute_offer_remove(
         persist_compute_market_state(&market_state, &data_dir);
     }
 
+    // Phase 2 WS6: nudge the queue mirror task — removing the offer
+    // should retract us from that model's market surface at the Wire.
+    let _ = state.compute_market_dispatch.mirror_nudge.send(());
+
     Ok(())
 }
 
@@ -9341,18 +9399,23 @@ async fn compute_market_surface(
 async fn compute_market_enable(
     state: tauri::State<'_, SharedState>,
 ) -> Result<(), String> {
-    let mut market_state = state.compute_market_state.write().await;
-    market_state.is_serving = true;
-    market_state.last_evaluation_at = Some(chrono::Utc::now().to_rfc3339());
-    let data_dir = state
-        .pyramid
-        .data_dir
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    persist_compute_market_state(&market_state, &data_dir);
-    // TODO (WS6): signal the mirror task to start. For now the task
-    // itself reads is_serving on each tick and gates its own work.
+    {
+        let mut market_state = state.compute_market_state.write().await;
+        market_state.is_serving = true;
+        market_state.last_evaluation_at = Some(chrono::Utc::now().to_rfc3339());
+        let data_dir = state
+            .pyramid
+            .data_dir
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        persist_compute_market_state(&market_state, &data_dir);
+    }
+    // Phase 2 WS6: nudge the queue mirror task — turning serving on
+    // should push the first snapshot immediately (subject to policy
+    // gating). The task itself also reads is_serving each tick, so
+    // a nudge that races with the boot debounce is harmless.
+    let _ = state.compute_market_dispatch.mirror_nudge.send(());
     Ok(())
 }
 
@@ -9365,16 +9428,24 @@ async fn compute_market_enable(
 async fn compute_market_disable(
     state: tauri::State<'_, SharedState>,
 ) -> Result<(), String> {
-    let mut market_state = state.compute_market_state.write().await;
-    market_state.is_serving = false;
-    market_state.last_evaluation_at = Some(chrono::Utc::now().to_rfc3339());
-    let data_dir = state
-        .pyramid
-        .data_dir
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    persist_compute_market_state(&market_state, &data_dir);
+    {
+        let mut market_state = state.compute_market_state.write().await;
+        market_state.is_serving = false;
+        market_state.last_evaluation_at = Some(chrono::Utc::now().to_rfc3339());
+        let data_dir = state
+            .pyramid
+            .data_dir
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        persist_compute_market_state(&market_state, &data_dir);
+    }
+    // Phase 2 WS6: nudge the queue mirror task — the next tick will
+    // read `is_serving = false` inside `should_push` and skip the
+    // HTTP POST. Wire-side staleness deactivation via
+    // `compute_offer_staleness_secs` completes the disable within a
+    // bounded window; explicit batch inactive is a future TODO.
+    let _ = state.compute_market_dispatch.mirror_nudge.send(());
     // TODO: POST to Wire to mark all offers inactive in a batch. For
     // now just locally stop serving; the Wire will see staleness via
     // the heartbeat path within `compute_offer_staleness_secs` and
@@ -12886,6 +12957,14 @@ fn main() {
     };
     let compute_market_state_shared =
         Arc::new(RwLock::new(compute_market_state_init));
+    // Phase 2 WS6: construct the queue-mirror nudge channel BEFORE the
+    // dispatch context so every mutation site has a live sender from
+    // boot. The receiver is handed to `spawn_market_mirror_task` below
+    // once all the state it needs (compute_queue, auth, tunnel, db_path)
+    // is resolvable. Unbounded — mutation sites use `.send(()).ok()` so
+    // a shutdown race never panics.
+    let (market_mirror_nudge_tx, market_mirror_nudge_rx) =
+        tokio::sync::mpsc::unbounded_channel::<()>();
     let compute_market_dispatch_shared = Arc::new(
         wire_node_lib::pyramid::market_dispatch::MarketDispatchContext {
             tunnel_state: shared_tunnel.clone(),
@@ -12893,6 +12972,7 @@ fn main() {
                 wire_node_lib::pyramid::market_dispatch::PendingMarketJobs::new(),
             ),
             policy: Arc::new(RwLock::new(market_delivery_policy_init)),
+            mirror_nudge: market_mirror_nudge_tx,
         },
     );
 
@@ -12917,6 +12997,46 @@ fn main() {
         compute_market_dispatch: compute_market_dispatch_shared.clone(),
         node_identity: Some(node_identity.clone()),
     });
+
+    // ── Phase 2 WS6: queue mirror push task + market outbox sweep ──
+    //
+    // Both are fire-and-forget until app exit, mirroring the fleet
+    // sweep spawn pattern above. The mirror task consumes the nudge
+    // channel receiver constructed earlier (every mutation site has
+    // the sender bundled in `MarketDispatchContext.mirror_nudge`).
+    // The market sweep is shape-parallel to `fleet_outbox_sweep_loop`
+    // but scoped to `callback_kind != 'Fleet'` rows.
+    //
+    // Ordering: these come up BEFORE warp `start_server` below so the
+    // dispatch-handler nudges at that point have a live receiver and
+    // the outbox sweep catches any rows recovered from startup.
+    {
+        let ctx = wire_node_lib::pyramid::market_mirror::MirrorTaskContext {
+            market_state: compute_market_state_shared.clone(),
+            dispatch: compute_market_dispatch_shared.clone(),
+            compute_queue: compute_queue_handle.clone(),
+            auth: shared_auth.clone(),
+            tunnel: shared_tunnel.clone(),
+            api_url: config.api_url.clone(),
+            db_path: pyramid_db_path.to_path_buf(),
+            node_id_override: None,
+        };
+        wire_node_lib::pyramid::market_mirror::spawn_market_mirror_task(
+            ctx,
+            market_mirror_nudge_rx,
+        );
+    }
+    {
+        let policy_handle = compute_market_dispatch_shared.policy.clone();
+        let db_path_clone = pyramid_db_path.to_path_buf();
+        tauri::async_runtime::spawn(async move {
+            wire_node_lib::pyramid::fleet_outbox_sweep::market_outbox_sweep_loop(
+                db_path_clone,
+                policy_handle,
+            )
+            .await;
+        });
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())

@@ -332,7 +332,7 @@ pub struct PendingMarketJob {
 /// - `tunnel_state` is **borrowed** — the dispatch handler reads it
 ///   to construct the outbox row's `callback_url` for the Wire's
 ///   view of where to reach us.
-/// - `pending` and `policy` are **owned by this feature**.
+/// - `pending`, `policy`, and `mirror_nudge` are **owned by this feature**.
 pub struct MarketDispatchContext {
     /// Borrowed handle to the node's tunnel state. Read-only from
     /// the market path.
@@ -346,6 +346,20 @@ pub struct MarketDispatchContext {
     /// when `MarketDispatchContext` is wired into main.rs) writes
     /// into this RwLock when an operator supersedes the contribution.
     pub policy: Arc<tokio::sync::RwLock<MarketDeliveryPolicy>>,
+    /// Phase 2 WS6: queue-mirror nudge channel. Every call site that
+    /// mutates market queue state (dispatch handler, worker status
+    /// transitions, offer IPCs, enable/disable toggles) calls
+    /// `mirror_nudge.send(()).ok()` — fire-and-forget. The mirror task
+    /// (`pyramid::market_mirror::spawn_market_mirror_task`) receives
+    /// on the paired receiver, debounces by
+    /// `market_delivery_policy.queue_mirror_debounce_ms`, and pushes
+    /// the current snapshot to the Wire's
+    /// `POST /api/v1/compute/queue-state` endpoint.
+    ///
+    /// `unbounded_send` is non-blocking and returns `Err` only when
+    /// the receiver has been dropped (mirror task gone). Call sites
+    /// use `.ok()` so a shutdown race can't panic on a dispatch path.
+    pub mirror_nudge: tokio::sync::mpsc::UnboundedSender<()>,
 }
 
 #[cfg(test)]

@@ -2677,6 +2677,98 @@ async fn handle_market_dispatch(
         }
     };
 
+    // Step 6b (§V DADBEAR Integration, DD-H): Admission hold check.
+    //
+    // Per `compute-market-architecture.md` DD-H (§VIII.6), any of the
+    // following BLOCKING hold names on the `"market:compute"` slug
+    // must reject the dispatch with 503 + Retry-After:
+    //   frozen                — operator-level pause
+    //   breaker               — quality system flagged the node
+    //   cost_limit            — credit balance too low
+    //   quality_hold          — Phase 5 upheld-challenge hold
+    //   timing_suspended      — Phase 5 timing-anomaly hold
+    //   reputation_suspended  — Phase 5 reputation-threshold hold
+    //   suspended             — Phase 6 steward-placed pause
+    //   escalation            — Phase 6 escalation gate
+    //
+    // Non-blocking holds (e.g. Phase 6's `measurement` marker) are
+    // informational and MUST NOT reject. DD-H explicitly chose an
+    // enumerated blocking list (over "any hold blocks") so new hold
+    // types don't accidentally gate the market.
+    //
+    // The projection read happens off the async thread because
+    // `get_holds` opens a SQLite connection via rusqlite.
+    const MARKET_COMPUTE_BLOCKING_HOLDS: &[&str] = &[
+        "frozen",
+        "breaker",
+        "cost_limit",
+        "quality_hold",
+        "timing_suspended",
+        "reputation_suspended",
+        "suspended",
+        "escalation",
+    ];
+    const MARKET_COMPUTE_SLUG: &str =
+        crate::pyramid::dadbear_preview::MARKET_COMPUTE_SLUG;
+
+    let blocking_hold: Option<String> = {
+        let db_path_read = db_path.clone();
+        let result: Result<Option<String>, String> = tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open(&db_path_read)
+                .map_err(|e| e.to_string())?;
+            let holds = crate::pyramid::auto_update_ops::get_holds(
+                &conn,
+                MARKET_COMPUTE_SLUG,
+            );
+            // Return the FIRST matching blocking hold name so the
+            // X-Wire-Reason header can surface it. Iterating in the
+            // declared order keeps the surface deterministic.
+            for name in MARKET_COMPUTE_BLOCKING_HOLDS {
+                if holds.iter().any(|h| h.hold == *name) {
+                    return Ok(Some((*name).to_string()));
+                }
+            }
+            Ok(None)
+        })
+        .await
+        .unwrap_or_else(|je| Err(je.to_string()));
+        match result {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!("Market dispatch hold-projection read failed: {}", e);
+                return Ok(Box::new(warp::reply::with_status(
+                    warp::reply::json(
+                        &serde_json::json!({"error": "hold projection read error"}),
+                    ),
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                )));
+            }
+        }
+    };
+    if let Some(hold_name) = blocking_hold {
+        tracing::warn!(
+            "Market dispatch blocked by DADBEAR hold: slug={} hold={} job_id={}",
+            MARKET_COMPUTE_SLUG,
+            hold_name,
+            req.job_id,
+        );
+        return Ok(Box::new(warp::reply::with_status(
+            warp::reply::with_header(
+                warp::reply::with_header(
+                    warp::reply::json(&serde_json::json!({
+                        "error": "market compute held",
+                        "hold": hold_name,
+                    })),
+                    "Retry-After",
+                    policy.admission_retry_after_secs.to_string(),
+                ),
+                "X-Wire-Reason",
+                "market_compute_held",
+            ),
+            warp::http::StatusCode::SERVICE_UNAVAILABLE,
+        )));
+    }
+
     // Step 7 (§III L553, DD-D, DD-Q): Idempotent outbox insert.
     //
     // All SQL inside spawn_blocking (rusqlite is sync). Branch on the
@@ -2991,6 +3083,141 @@ async fn handle_market_dispatch(
         )));
     }
 
+    // Step 8b (§V DADBEAR Integration): Create DADBEAR work item + attempt.
+    //
+    // Every market job gets a durable DADBEAR work item. Per §V P3,
+    // market jobs SKIP the preview gate — the Wire's matched price +
+    // deposit IS the cost gate, so a local operator-USD preview is
+    // the wrong currency for the wrong budget. We therefore insert
+    // the row directly at state `previewed`. The supervisor's crash-
+    // recovery sweep uses `state = 'dispatched'` as the "in-flight"
+    // marker; `previewed` is the correct pre-dispatch resting state
+    // even though we never go through `create_dispatch_preview`.
+    //
+    // Semantic path (NO UUIDs per handoff rule 7):
+    //   work item id : "market/{job_id}"
+    //   batch_id     : job_id (single-job batch — each market dispatch
+    //                  is its own batch; the outbox is the batch-
+    //                  equivalent durable handle)
+    //   epoch_id     : "market:{timestamp}" — market work has no
+    //                  recipe/norms epoch like pyramid builds; the
+    //                  timestamp gives unique-per-dispatch identity
+    //                  while matching the schema's (slug, epoch_id)
+    //                  index shape.
+    //   target_id    : job_id (the work targets that specific Wire job)
+    //   step_name    : "compute-serve"
+    //   primitive    : "llm_call"
+    //   layer        : 0 (market work is L0 — it serves pre-computed
+    //                  work on behalf of the requester; the
+    //                  pyramid layer concept doesn't apply)
+    //
+    // Per DD-A, the virtual slug is `market:compute`. Bridge jobs
+    // share this slug with `step_name: "bridge"` — DD-P. Phase 2
+    // only ships local-GPU provider work, so step_name stays at
+    // "compute-serve" in this handler.
+    //
+    // Failure policy: if the DADBEAR write fails, the job still
+    // proceeds (the outbox row is the durable source of truth for
+    // the market protocol). The work item adds observability +
+    // crash recovery; missing it degrades the audit trail but does
+    // not orphan the Wire-side job.
+    let dadbear_work_item_id = format!("market/{}", req.job_id);
+    let dadbear_epoch_id = format!("market:{}", chrono::Utc::now().timestamp());
+    let dadbear_attempt_id: Option<String> = {
+        let db_path_wi = db_path.clone();
+        let work_item_id = dadbear_work_item_id.clone();
+        let epoch_id = dadbear_epoch_id.clone();
+        let batch_id = req.job_id.clone();
+        let target_id = req.job_id.clone();
+        let system_prompt_wi = system_prompt.clone();
+        let user_prompt_wi = user_prompt.clone();
+        let model_tier_wi = req.model.clone();
+        let wi_call_result: Result<String, String> =
+            tokio::task::spawn_blocking(move || -> Result<String, String> {
+                let conn = rusqlite::Connection::open(&db_path_wi)
+                    .map_err(|e| e.to_string())?;
+                let now = chrono::Utc::now()
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string();
+                // Insert work item at state='previewed'. INSERT OR IGNORE
+                // so a Wire retry with the same job_id (crash-recovery
+                // run hitting a pre-existing row) doesn't crash on PK.
+                conn.execute(
+                    "INSERT OR IGNORE INTO dadbear_work_items
+                     (id, slug, batch_id, epoch_id, step_name, primitive,
+                      layer, target_id, system_prompt, user_prompt, model_tier,
+                      compiled_at, state, state_changed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                             ?12, 'previewed', ?12)",
+                    rusqlite::params![
+                        work_item_id,
+                        MARKET_COMPUTE_SLUG,
+                        batch_id,
+                        epoch_id,
+                        "compute-serve",
+                        "llm_call",
+                        0i64,
+                        target_id,
+                        system_prompt_wi,
+                        user_prompt_wi,
+                        model_tier_wi,
+                        now,
+                    ],
+                )
+                .map_err(|e| format!("work item insert: {}", e))?;
+
+                // Create attempt (attempt_number = existing + 1). The
+                // attempt id format is pinned by
+                // `dadbear_compiler::attempt_id`.
+                let attempt_number: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM dadbear_work_attempts WHERE work_item_id = ?1",
+                        rusqlite::params![work_item_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0)
+                    + 1;
+                let attempt_id_val =
+                    crate::pyramid::dadbear_compiler::attempt_id(
+                        &work_item_id,
+                        attempt_number,
+                    );
+                // routing = 'local' — Phase 2 market work runs on the
+                // provider's local GPU (bridge is Phase 4). When
+                // bridge lands, the routing column distinguishes.
+                conn.execute(
+                    "INSERT INTO dadbear_work_attempts
+                     (id, work_item_id, attempt_number, dispatched_at, model_id, routing, status)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'local', 'pending')",
+                    rusqlite::params![
+                        attempt_id_val,
+                        work_item_id,
+                        attempt_number,
+                        now,
+                        model_tier_wi,
+                    ],
+                )
+                .map_err(|e| format!("work attempt insert: {}", e))?;
+                Ok(attempt_id_val)
+            })
+            .await
+            .unwrap_or_else(|je| Err(je.to_string()));
+
+        match wi_call_result {
+            Ok(aid) => Some(aid),
+            Err(e) => {
+                // Log but don't reject: the outbox row is durable and
+                // the Wire's view of the job is intact. Missing
+                // DADBEAR rows degrade audit but don't orphan work.
+                tracing::warn!(
+                    "Market dispatch DADBEAR work item/attempt write failed: {}",
+                    e
+                );
+                None
+            }
+        }
+    };
+
     // Step 9 (§III): Upsert the in-memory ComputeJob for runtime
     // observability. The outbox is the durable source of truth; this
     // struct is the runtime view consumed by the frontend's queue panel
@@ -2998,6 +3225,10 @@ async fn handle_market_dispatch(
     //
     // We stash the stripped JWT (no "Bearer " prefix) on the job so a
     // Phase 3 callback-delivery retry can re-present the same token.
+    // work_item_id + attempt_id come from Step 8b. If the DADBEAR
+    // writes failed, attempt_id is None — ComputeJob still carries
+    // work_item_id (deterministic from job_id), matching the
+    // conservative "outbox is truth; DADBEAR is audit" split.
     {
         let bearer_stripped = auth_header
             .strip_prefix("Bearer ")
@@ -3017,28 +3248,72 @@ async fn handle_market_dispatch(
             matched_multiplier_bps: offer_matched_multiplier_bps,
             queued_at,
             filled_at: None,
-            work_item_id: None, // TODO (WS8): semantic path market/{job_id}
-            attempt_id: None,   // TODO (WS8): DADBEAR attempt id
+            work_item_id: Some(dadbear_work_item_id.clone()),
+            attempt_id: dadbear_attempt_id.clone(),
         };
         market_state_handle.write().await.upsert_active_job(job);
     }
 
-    // TODO (WS8): Record chronicle event `market_received` with
-    //   model_id, job_id, credit_rate_in_per_m, credit_rate_out_per_m,
-    //   privacy_tier in metadata. Needs market event constants in
-    //   compute_chronicle.rs (EVENT_MARKET_RECEIVED, SOURCE_MARKET_RECEIVED)
-    //   which ship in the WS8 DADBEAR integration.
+    // Step 9b (§III L603-632 + §V): Record `market_received` chronicle event.
     //
-    // TODO (WS6): Trigger queue mirror push (debounced per
-    //   market_delivery_policy.queue_mirror_debounce_ms). The mirror task
-    //   will bump queue_mirror_seq for this model and POST the snapshot
-    //   to the Wire's /api/v1/compute/queue-state endpoint.
+    // job_path  : `market/{job_id}` — identical to the DADBEAR work
+    //             item id so filtering by job_path reconstructs the
+    //             full event stream for this job.
+    // source    : SOURCE_MARKET_RECEIVED (the provider received the
+    //             dispatch; parallels SOURCE_FLEET_RECEIVED).
+    // metadata  : model_id (via with_model_id), job_id,
+    //             credit_rate_in_per_m, credit_rate_out_per_m,
+    //             privacy_tier — the five fields the spec names.
+    // work_item : dadbear_work_item_id + dadbear_attempt_id from Step
+    //             8b. If the DADBEAR write failed, attempt_id is None
+    //             but work_item_id is still the deterministic semantic
+    //             path (same value as if the write had succeeded).
+    //
+    // Fire-and-forget via spawn_blocking — chronicle write is an
+    // observability side-channel; a failed write does not block
+    // returning 202 to the Wire.
+    {
+        let db_path_chr = db_path.clone();
+        let job_path = dadbear_work_item_id.clone();
+        let model_id_chr = req.model.clone();
+        let job_id_chr = req.job_id.clone();
+        let rate_in = req.credit_rate_in_per_m;
+        let rate_out = req.credit_rate_out_per_m;
+        let privacy_tier = req.privacy_tier.clone();
+        let wi_id_chr = Some(dadbear_work_item_id.clone());
+        let attempt_id_chr = dadbear_attempt_id.clone();
+        let ctx = crate::pyramid::compute_chronicle::ChronicleEventContext::minimal(
+            &job_path,
+            crate::pyramid::compute_chronicle::EVENT_MARKET_RECEIVED,
+            crate::pyramid::compute_chronicle::SOURCE_MARKET_RECEIVED,
+        )
+        .with_model_id(model_id_chr)
+        .with_metadata(serde_json::json!({
+            "job_id": job_id_chr,
+            "credit_rate_in_per_m": rate_in,
+            "credit_rate_out_per_m": rate_out,
+            "privacy_tier": privacy_tier,
+        }))
+        .with_work_item(wi_id_chr, attempt_id_chr);
+        tokio::task::spawn_blocking(move || {
+            if let Ok(conn) = rusqlite::Connection::open(&db_path_chr) {
+                let _ = crate::pyramid::compute_chronicle::record_event(&conn, &ctx);
+            }
+        });
+    }
+
+    // Phase 2 WS6: trigger queue mirror push. The mirror task debounces
+    // and coalesces bursts, so sending a token here is idempotent vs
+    // the later status transitions emitted by the worker. Fire-and-
+    // forget — a shutdown race cannot panic the handler.
+    let _ = market_ctx.mirror_nudge.send(());
 
     // Step 10 (§III): Spawn the worker BEFORE returning 202. `tokio::spawn`
     // is infallible so the 202 is truthful by construction.
     spawn_market_worker(
         state.clone(),
         Arc::clone(&market_state_handle),
+        Arc::clone(&market_ctx),
         db_path.clone(),
         policy.clone(),
         req.job_id.clone(),
@@ -3125,6 +3400,7 @@ fn market_credits_earned(
 fn spawn_market_worker(
     state: ServerState,
     market_state_handle: Arc<RwLock<crate::compute_market::ComputeMarketState>>,
+    market_ctx: Arc<crate::pyramid::market_dispatch::MarketDispatchContext>,
     db_path: std::path::PathBuf,
     policy: crate::pyramid::market_delivery_policy::MarketDeliveryPolicy,
     job_id: String,
@@ -3173,6 +3449,9 @@ fn spawn_market_worker(
                 job.filled_at = Some(chrono::Utc::now().to_rfc3339());
             }
         }
+        // Phase 2 WS6: nudge the mirror task — Queued → Executing
+        // changes the per-model `is_executing` flag the Wire sees.
+        let _ = market_ctx.mirror_nudge.send(());
 
         // Heartbeat future: tick every worker_heartbeat_interval_secs,
         // bump expires_at, exit if the sweep CAS'd us out (rowcount 0).
@@ -3246,11 +3525,16 @@ fn spawn_market_worker(
             None => {
                 // Sweep won. Transition the job to Failed so the
                 // observability panel reflects the terminal state.
-                let mut s = market_state_handle.write().await;
-                let _ = s.transition_job_status(
-                    &job_id,
-                    crate::compute_market::ComputeJobStatus::Failed,
-                );
+                {
+                    let mut s = market_state_handle.write().await;
+                    let _ = s.transition_job_status(
+                        &job_id,
+                        crate::compute_market::ComputeJobStatus::Failed,
+                    );
+                }
+                // Phase 2 WS6: nudge mirror — model's `is_executing`
+                // and `market_depth` changed.
+                let _ = market_ctx.mirror_nudge.send(());
                 tracing::warn!(
                     "Market worker lost heartbeat sweep for job_id={}",
                     job_id
@@ -3313,12 +3597,17 @@ fn spawn_market_worker(
                             prompt_tokens,
                             completion_tokens,
                         );
-                        let mut s = market_state_handle.write().await;
-                        let _ = s.transition_job_status(
-                            &job_id,
-                            crate::compute_market::ComputeJobStatus::Ready,
-                        );
-                        s.record_completion(credits_earned);
+                        {
+                            let mut s = market_state_handle.write().await;
+                            let _ = s.transition_job_status(
+                                &job_id,
+                                crate::compute_market::ComputeJobStatus::Ready,
+                            );
+                            s.record_completion(credits_earned);
+                        }
+                        // Phase 2 WS6: nudge mirror — Executing → Ready
+                        // means a slot just opened for the model.
+                        let _ = market_ctx.mirror_nudge.send(());
                         // TODO (WS8): chronicle event market_completed with
                         //   model_id, job_id, prompt_tokens, completion_tokens,
                         //   credits_earned.
@@ -3326,11 +3615,16 @@ fn spawn_market_worker(
                     Ok(_) => {
                         // Sweep already promoted us with a synthesized Error —
                         // drop our result. Reflect the terminal state locally.
-                        let mut s = market_state_handle.write().await;
-                        let _ = s.transition_job_status(
-                            &job_id,
-                            crate::compute_market::ComputeJobStatus::Failed,
-                        );
+                        {
+                            let mut s = market_state_handle.write().await;
+                            let _ = s.transition_job_status(
+                                &job_id,
+                                crate::compute_market::ComputeJobStatus::Failed,
+                            );
+                        }
+                        // Phase 2 WS6: nudge mirror — terminal transition
+                        // opens a slot for the model.
+                        let _ = market_ctx.mirror_nudge.send(());
                         tracing::warn!(
                             "Market worker sweep-lost at promote for job_id={}",
                             job_id
@@ -3372,11 +3666,16 @@ fn spawn_market_worker(
                 })
                 .await;
 
-                let mut s = market_state_handle.write().await;
-                let _ = s.transition_job_status(
-                    &job_id,
-                    crate::compute_market::ComputeJobStatus::Failed,
-                );
+                {
+                    let mut s = market_state_handle.write().await;
+                    let _ = s.transition_job_status(
+                        &job_id,
+                        crate::compute_market::ComputeJobStatus::Failed,
+                    );
+                }
+                // Phase 2 WS6: nudge mirror — Executing → Failed opens
+                // a slot for the model.
+                let _ = market_ctx.mirror_nudge.send(());
                 tracing::warn!(
                     "Market inference failed for job_id={}: {}",
                     job_id,

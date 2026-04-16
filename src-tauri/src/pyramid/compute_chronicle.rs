@@ -29,6 +29,18 @@ use crate::compute_queue::QueueEntry;
 pub const SOURCE_FLEET: &str = "fleet";
 pub const SOURCE_FLEET_RECEIVED: &str = "fleet_received";
 
+// Market-side source constants (Phase 2 WS8).
+// `SOURCE_MARKET`       — requester side + provider-side offer publication
+//                         (offer publication is not tied to a job, but the
+//                         event is attributed to the provider's market
+//                         activity so SOURCE_MARKET keeps it grouped with
+//                         other market-dispatcher events).
+// `SOURCE_MARKET_RECEIVED` — provider side: job arrived at the provider
+//                         from the Wire. Parallels SOURCE_FLEET_RECEIVED.
+// See `docs/plans/compute-market-phase-2-exchange.md` §III L603-632.
+pub const SOURCE_MARKET: &str = "market";
+pub const SOURCE_MARKET_RECEIVED: &str = "market_received";
+
 // ── Canonical event_type constants ────────────────────────────────────────
 // These are the canonical event_type string values emitted by the async
 // fleet dispatch path. Later workstreams migrate their emission sites to
@@ -55,6 +67,43 @@ pub const EVENT_FLEET_CALLBACK_EXHAUSTED: &str = "fleet_callback_exhausted";
 pub const EVENT_FLEET_WORKER_HEARTBEAT_LOST: &str = "fleet_worker_heartbeat_lost";
 pub const EVENT_FLEET_WORKER_SWEEP_LOST: &str = "fleet_worker_sweep_lost";
 pub const EVENT_FLEET_DELIVERY_CAS_LOST: &str = "fleet_delivery_cas_lost";
+
+// Market events (Phase 2 WS8).
+//
+// Per `docs/plans/compute-market-phase-2-exchange.md` §III L603-632.
+//
+//   EVENT_MARKET_OFFERED  — provider published an offer. Fires from
+//                           `compute_offer_create` (main.rs) on successful
+//                           Wire publication. Source: SOURCE_MARKET.
+//                           job_path: `market/offer/{model_id}`.
+//                           work_item_id: None (offer management is not
+//                           DADBEAR-tracked).
+//   EVENT_MARKET_RECEIVED — provider received a matched job dispatch.
+//                           Fires from `handle_market_dispatch` (server.rs)
+//                           after the outbox admission commits.
+//                           Source: SOURCE_MARKET_RECEIVED.
+//                           job_path: `market/{job_id}`.
+//                           work_item_id + attempt_id: populated from the
+//                           DADBEAR work item created in WS8 Part A.
+//   EVENT_MARKET_MATCHED  — requester matched a job. Phase 3 scope; the
+//                           constant is defined in Phase 2 so the chronicle
+//                           schema is stable across phases. NO emission
+//                           site in Phase 2.
+//   EVENT_QUEUE_MIRROR_PUSH_FAILED — queue-mirror push to the Wire failed.
+//                           Emitted by WS6's mirror task (not this WS).
+//                           Constant lives here so WS6 can import it.
+pub const EVENT_MARKET_OFFERED: &str = "market_offered";
+pub const EVENT_MARKET_RECEIVED: &str = "market_received";
+pub const EVENT_MARKET_MATCHED: &str = "market_matched";
+pub const EVENT_QUEUE_MIRROR_PUSH_FAILED: &str = "queue_mirror_push_failed";
+
+// Market sweep companions to the fleet sweep events (Phase 2 WS6).
+// Emitted by the market outbox sweep loop in
+// `pyramid::fleet_outbox_sweep::market_outbox_sweep_loop` when a market
+// row transitions due to expiry. Kept distinct from the Fleet versions
+// so operator dashboards can slice by lane — same event shape.
+pub const EVENT_MARKET_WORKER_HEARTBEAT_LOST: &str = "market_worker_heartbeat_lost";
+pub const EVENT_MARKET_CALLBACK_EXHAUSTED: &str = "market_callback_exhausted";
 
 // ── Event context ─────────────────────────────────────────────────────────
 
@@ -188,6 +237,26 @@ pub fn generate_job_path(ctx: Option<&StepContext>, work_item_id: Option<&str>, 
     if source == "fleet_received" {
         let ts = chrono::Utc::now().timestamp();
         return format!("fleet-recv:{}:{}", model_id, ts);
+    }
+    // Market received (no ctx, no work_item_id — handler path fell back
+    // to anon because the DADBEAR work item wasn't created upstream).
+    // Parallel to fleet-recv branch. The canonical handler path (WS8
+    // `handle_market_dispatch`) passes work_item_id `market/{job_id}`
+    // and returns at the top of this function, so this branch is a
+    // defensive fallback for call sites that emit market_received
+    // without creating a DADBEAR work item first.
+    if source == "market_received" {
+        let ts = chrono::Utc::now().timestamp();
+        return format!("market-recv:{}:{}", model_id, ts);
+    }
+    // Market source (SOURCE_MARKET) — offer publication, requester-side
+    // events, and the Phase 3 `market_matched` event. Offer publication
+    // uses job_path `market/offer/{model_id}` (WS8 wires this at the
+    // call site via ChronicleEventContext::minimal, so this branch
+    // also only runs as a defensive fallback).
+    if source == "market" {
+        let ts = chrono::Utc::now().timestamp();
+        return format!("market:{}:{}", model_id, ts);
     }
     // Fallback: model + timestamp (always readable)
     let ts = chrono::Utc::now().timestamp();
@@ -587,4 +656,83 @@ pub fn record_market_settled(conn: &Connection, ctx: &ChronicleEventContext) -> 
 /// Stub: record market_received event. Called from market job handler (Phase 5).
 pub fn record_market_received(conn: &Connection, ctx: &ChronicleEventContext) -> Result<i64> {
     record_event(conn, ctx)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    //! Phase 2 WS8 additions: market source/event constants + the
+    //! `generate_job_path` branches that route `market_received` /
+    //! `market` sources to semantic paths instead of the `anon:`
+    //! fallback.
+    //!
+    //! The canonical handler path (`handle_market_dispatch`) ALWAYS
+    //! populates `work_item_id` before emitting the chronicle event,
+    //! so the fallback branches exercised below are defensive. They
+    //! exist so a future emission site that forgets to thread the
+    //! DADBEAR work item id gets a readable path instead of `anon:...`.
+    use super::*;
+
+    #[test]
+    fn market_source_constants_match_spec() {
+        // Pinned to the strings in compute-market-phase-2-exchange.md
+        // §III "Chronicle Events This Phase" L603-632. A rename in
+        // either direction requires a spec update.
+        assert_eq!(SOURCE_MARKET, "market");
+        assert_eq!(SOURCE_MARKET_RECEIVED, "market_received");
+        assert_eq!(EVENT_MARKET_OFFERED, "market_offered");
+        assert_eq!(EVENT_MARKET_RECEIVED, "market_received");
+        assert_eq!(EVENT_MARKET_MATCHED, "market_matched");
+        assert_eq!(EVENT_QUEUE_MIRROR_PUSH_FAILED, "queue_mirror_push_failed");
+    }
+
+    #[test]
+    fn generate_job_path_market_received_fallback() {
+        // No ctx, no work_item_id, source=market_received → semantic
+        // path using model + timestamp. Parallel to fleet-recv.
+        let path = generate_job_path(None, None, "llama-3", "market_received");
+        assert!(path.starts_with("market-recv:llama-3:"));
+        assert!(!path.starts_with("anon:"));
+    }
+
+    #[test]
+    fn generate_job_path_market_source_fallback() {
+        // No ctx, no work_item_id, source=market → semantic path using
+        // model + timestamp.
+        let path = generate_job_path(None, None, "llama-3", "market");
+        assert!(path.starts_with("market:llama-3:"));
+        assert!(!path.starts_with("anon:"));
+    }
+
+    #[test]
+    fn generate_job_path_prefers_work_item_id_over_source_fallback() {
+        // The canonical path: the caller passes the DADBEAR work item
+        // id and `generate_job_path` returns it verbatim regardless
+        // of source. This is the branch `handle_market_dispatch` hits
+        // after it creates the `market/{job_id}` work item.
+        let path = generate_job_path(
+            None,
+            Some("market/abc-123"),
+            "llama-3",
+            "market_received",
+        );
+        assert_eq!(path, "market/abc-123");
+    }
+
+    #[test]
+    fn generate_job_path_fleet_received_still_works() {
+        // Regression: adding market branches must not break the
+        // fleet-received fallback.
+        let path = generate_job_path(None, None, "llama-3", "fleet_received");
+        assert!(path.starts_with("fleet-recv:llama-3:"));
+    }
+
+    #[test]
+    fn generate_job_path_unknown_source_uses_anon_fallback() {
+        // Unrecognized source still hits the anon: fallback so the
+        // chronicle never has an empty job_path.
+        let path = generate_job_path(None, None, "llama-3", "some-unknown-source");
+        assert!(path.starts_with("anon:llama-3:"));
+    }
 }

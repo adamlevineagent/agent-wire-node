@@ -123,6 +123,7 @@ pub mod fleet_outbox_sweep;
 pub mod market_delivery_policy;
 pub mod market_dispatch;
 pub mod market_identity;
+pub mod market_mirror;
 pub mod messages;
 pub mod prompt_materializer;
 pub mod provider_pools;

@@ -49,9 +49,11 @@ use crate::pyramid::db::{
     fleet_outbox_bump_delivery_attempt, fleet_outbox_delete, fleet_outbox_expire_exhausted,
     fleet_outbox_mark_delivered_if_ready, fleet_outbox_mark_failed_if_ready,
     fleet_outbox_promote_ready_if_pending, fleet_outbox_retry_candidates,
-    fleet_outbox_sweep_expired, synthesize_worker_error_json, OutboxRow,
+    fleet_outbox_sweep_expired, market_outbox_expire_exhausted, market_outbox_sweep_expired,
+    synthesize_worker_error_json, OutboxRow,
 };
 use crate::pyramid::fleet_delivery_policy::FleetDeliveryPolicy;
+use crate::pyramid::market_delivery_policy::MarketDeliveryPolicy;
 
 /// Number of delivery attempts processed per yield point. Prevents reactor
 /// starvation on deep outboxes without forcing an await between every row.
@@ -460,6 +462,218 @@ fn describe_delivery_outcome(r: &Result<(), FleetDeliveryError>) -> &'static str
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// Market outbox sweep (Phase 2 WS6)
+// ══════════════════════════════════════════════════════════════════════
+//
+// Shape-parallel to the Fleet sweep above, but only ships Predicate A
+// (expiry-driven state transitions) + `market_outbox_expire_exhausted`
+// (push exhausted rows into the past so Predicate A's next tick
+// transitions them to `failed` via the centralized CAS path).
+//
+// Predicate B (delivery retries) is Phase 3 territory. Exists as a db
+// helper (`market_outbox_retry_candidates`) so the later workstream
+// can drop in without adding more SELECT helpers.
+//
+// Partition guarantee: every market sweep SELECT filters on
+// `callback_kind != 'Fleet'`; every Fleet sweep SELECT filters on
+// `callback_kind = 'Fleet'`. The two loops MUST NOT race on the same
+// rows. A market row slipping into the fleet sweep would synthesize a
+// Fleet-shaped error payload into a market callback URL and likely
+// 4xx at the Wire; a fleet row slipping into the market sweep would
+// be held to market's admission budget, orphaning it.
+
+/// job_path prefix for market sweep events. Each row stamps a unique
+/// path from `job_id` alone — market's `dispatcher_node_id` is always
+/// the WIRE_PLATFORM_DISPATCHER sentinel, so including it doesn't
+/// disambiguate.
+fn market_job_path_for(row: &OutboxRow) -> String {
+    format!("market-recv:{}", row.job_id)
+}
+
+/// Spawn the market outbox sweep loop. Mirror of
+/// `fleet_outbox_sweep_loop` for market/relay rows. Runs forever until
+/// the async runtime shuts down.
+///
+/// WHY a dedicated spawn wrapper (vs the caller doing `tauri::async_runtime::spawn`
+/// directly like the Fleet init path does): the market loop needs its
+/// OWN `MarketDeliveryPolicy` read cadence — the two policies tune
+/// differently (fleet is peer-to-peer, market is node ↔ Wire), so
+/// sharing the fleet policy would let a fleet-tuning change silently
+/// alter market sweep behavior. Making the market loop a public `fn`
+/// keeps its signature pinned.
+pub async fn market_outbox_sweep_loop(
+    db_path: PathBuf,
+    policy_handle: Arc<tokio::sync::RwLock<MarketDeliveryPolicy>>,
+) {
+    tracing::info!(
+        db_path = %db_path.display(),
+        "Market outbox sweep loop started"
+    );
+    loop {
+        // Read policy fresh each tick so hot-reload takes effect.
+        let policy = policy_handle.read().await.clone();
+        let interval = policy.outbox_sweep_interval_secs.max(1);
+        tokio::time::sleep(Duration::from_secs(interval)).await;
+
+        // Predicate B companion: push exhausted rows into the past
+        // BEFORE Predicate A runs so they get transitioned by the
+        // same tick instead of having to wait a full interval.
+        if let Err(e) = expire_exhausted_market_once(db_path.clone(), policy.clone()).await {
+            tracing::warn!(
+                err = %e,
+                "Market outbox sweep (expire_exhausted) errored"
+            );
+        }
+
+        // Predicate A: expiry-driven transitions. Sync sqlite +
+        // chronicle writes inside spawn_blocking.
+        if let Err(e) = sweep_expired_market_once(db_path.clone(), policy.clone()).await {
+            tracing::warn!(err = %e, "Market outbox sweep (Predicate A) errored");
+        }
+    }
+}
+
+/// Predicate A for the market sweep: walk every expired market/relay
+/// row, branch on `status`, and transition. Parallel to
+/// `sweep_expired_once` with the market-filtered SELECT and market
+/// chronicle event names.
+async fn sweep_expired_market_once(
+    db_path: PathBuf,
+    policy: MarketDeliveryPolicy,
+) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        let rows = market_outbox_sweep_expired(&conn)?;
+        for row in rows {
+            match row.status.as_str() {
+                "pending" => {
+                    // Worker heartbeat stopped before inference finished.
+                    // Synth an Error payload and promote to ready — the
+                    // callback-delivery worker (Phase 3) owns the POST.
+                    let synth = synthesize_worker_error_json(
+                        "worker heartbeat lost — market sweep promoted",
+                    );
+                    match fleet_outbox_promote_ready_if_pending(
+                        &conn,
+                        &row.dispatcher_node_id,
+                        &row.job_id,
+                        &synth,
+                        policy.ready_retention_secs,
+                    ) {
+                        Ok(1) => {
+                            let ev = ChronicleEventContext::minimal(
+                                &market_job_path_for(&row),
+                                crate::pyramid::compute_chronicle::EVENT_MARKET_WORKER_HEARTBEAT_LOST,
+                                crate::pyramid::compute_chronicle::SOURCE_MARKET_RECEIVED,
+                            )
+                            .with_metadata(serde_json::json!({
+                                "job_id": row.job_id,
+                            }));
+                            let _ = record_event(&conn, &ev);
+                        }
+                        Ok(_) => {
+                            // Worker raced in and wrote ready/delivered
+                            // between our SELECT and this CAS — fine.
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                err = %e,
+                                job_id = %row.job_id,
+                                "market promote_ready_if_pending failed in sweep"
+                            );
+                        }
+                    }
+                }
+                "ready" => {
+                    // Wall-clock retention on ready exhausted — terminal
+                    // failure for the market row. Writes `failed` with
+                    // `expires_at = now + failed_retention_secs` so the
+                    // row stays visible for post-mortem before final
+                    // cleanup.
+                    match fleet_outbox_mark_failed_if_ready(
+                        &conn,
+                        &row.dispatcher_node_id,
+                        &row.job_id,
+                        policy.failed_retention_secs,
+                    ) {
+                        Ok(1) => {
+                            let ev = ChronicleEventContext::minimal(
+                                &market_job_path_for(&row),
+                                crate::pyramid::compute_chronicle::EVENT_MARKET_CALLBACK_EXHAUSTED,
+                                crate::pyramid::compute_chronicle::SOURCE_MARKET_RECEIVED,
+                            )
+                            .with_metadata(serde_json::json!({
+                                "job_id": row.job_id,
+                                "delivery_attempts": row.delivery_attempts,
+                            }));
+                            let _ = record_event(&conn, &ev);
+                        }
+                        Ok(_) => { /* raced — fine */ }
+                        Err(e) => {
+                            tracing::warn!(
+                                err = %e,
+                                job_id = %row.job_id,
+                                "market mark_failed_if_ready failed in sweep"
+                            );
+                        }
+                    }
+                }
+                "delivered" | "failed" => {
+                    // Final retention elapsed — clean up.
+                    if let Err(e) = fleet_outbox_delete(
+                        &conn,
+                        &row.dispatcher_node_id,
+                        &row.job_id,
+                    ) {
+                        tracing::warn!(
+                            err = %e,
+                            job_id = %row.job_id,
+                            status = %row.status,
+                            "market outbox_delete failed in sweep"
+                        );
+                    }
+                }
+                other => {
+                    tracing::warn!(
+                        status = %other,
+                        job_id = %row.job_id,
+                        "market_outbox_sweep_expired returned unknown status — skipping"
+                    );
+                }
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))??;
+    Ok(())
+}
+
+/// Push market rows at/above their attempt budget into the past so
+/// Predicate A transitions them on the next tick. Mirror of the fleet
+/// path's step-1 inside `sweep_retries_once`, but scoped to market rows.
+async fn expire_exhausted_market_once(
+    db_path: PathBuf,
+    policy: MarketDeliveryPolicy,
+) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        let max_attempts = policy.max_delivery_attempts;
+        let n = market_outbox_expire_exhausted(&conn, max_attempts)?;
+        if n > 0 {
+            tracing::debug!(
+                count = n,
+                "Market outbox sweep: {n} rows pushed to expired (retries exhausted)"
+            );
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))??;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,5 +740,196 @@ mod tests {
             &policy,
             now
         ));
+    }
+
+    // ── Market sweep helpers (Phase 2 WS6) ────────────────────────────
+
+    #[test]
+    fn market_job_path_for_uses_job_id_only() {
+        // The dispatcher_node_id is always the WIRE_PLATFORM_DISPATCHER
+        // sentinel for market rows. Including it in the path adds a
+        // constant prefix to every row without disambiguation — the
+        // job_id is UUID-unique on its own (job_id carries UNIQUE).
+        let row = OutboxRow {
+            dispatcher_node_id: crate::fleet::WIRE_PLATFORM_DISPATCHER.into(),
+            job_id: "abc-123".into(),
+            status: "pending".into(),
+            callback_url: "https://wire.example.com/v1/compute/result-relay".into(),
+            result_json: None,
+            delivery_attempts: 0,
+            last_attempt_at: None,
+            expires_at: "1970-01-01 00:00:00".into(),
+        };
+        assert_eq!(market_job_path_for(&row), "market-recv:abc-123");
+        // Note: parallel `job_path_for` (fleet) uses the pattern
+        // "fleet-recv:{dispatcher}:{job}"; we DON'T use the same pattern
+        // here because the dispatcher string is redundant for market.
+    }
+
+    #[tokio::test]
+    async fn market_sweep_promotes_expired_pending_to_ready() {
+        // End-to-end smoke: an expired market pending row gets promoted
+        // to ready with a synth Error payload after one sweep tick.
+        use crate::pyramid::db::{fleet_outbox_lookup, market_outbox_insert_or_ignore};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pyramid.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+
+        // Insert an already-expired MarketStandard row.
+        market_outbox_insert_or_ignore(
+            &conn,
+            "mkt-expired",
+            "https://wire.example.com/v1/compute/result-relay",
+            "MarketStandard",
+            "1970-01-01 00:00:00",
+        )
+        .unwrap();
+        drop(conn);
+
+        let policy = MarketDeliveryPolicy::default();
+        sweep_expired_market_once(db_path.clone(), policy).await.unwrap();
+
+        // Row should now be ready with a synth Error payload.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let lookup = fleet_outbox_lookup(&conn, "mkt-expired").unwrap().unwrap();
+        assert_eq!(lookup.status, "ready");
+        let result_json: Option<String> = conn
+            .query_row(
+                "SELECT result_json FROM fleet_result_outbox WHERE job_id = 'mkt-expired'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let body = result_json.unwrap();
+        assert!(body.contains("\"kind\":\"Error\""),
+            "sweep must synth Error payload, got: {body}");
+        assert!(body.contains("worker heartbeat lost"),
+            "payload must include the heartbeat-lost reason");
+    }
+
+    #[tokio::test]
+    async fn market_sweep_does_not_touch_fleet_rows() {
+        // Regression: market sweep partition. A fleet row and a market
+        // row both expired — only the market row must be transitioned.
+        use crate::pyramid::db::{
+            fleet_outbox_insert_or_ignore, fleet_outbox_lookup,
+            market_outbox_insert_or_ignore,
+        };
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pyramid.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+
+        fleet_outbox_insert_or_ignore(
+            &conn,
+            "peer-A",
+            "fleet-expired",
+            "https://peer.example/v1/fleet/result",
+            "1970-01-01 00:00:00",
+        )
+        .unwrap();
+        market_outbox_insert_or_ignore(
+            &conn,
+            "mkt-expired",
+            "https://wire.example.com/v1/compute/result-relay",
+            "MarketStandard",
+            "1970-01-01 00:00:00",
+        )
+        .unwrap();
+        drop(conn);
+
+        let policy = MarketDeliveryPolicy::default();
+        sweep_expired_market_once(db_path.clone(), policy).await.unwrap();
+
+        // Market row: ready. Fleet row: still pending (owned by fleet sweep).
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let mkt = fleet_outbox_lookup(&conn, "mkt-expired").unwrap().unwrap();
+        let flt = fleet_outbox_lookup(&conn, "fleet-expired").unwrap().unwrap();
+        assert_eq!(mkt.status, "ready");
+        assert_eq!(flt.status, "pending",
+            "market sweep must NOT transition fleet rows");
+    }
+
+    #[tokio::test]
+    async fn market_sweep_expire_exhausted_pushes_only_market_rows() {
+        // Regression: `market_outbox_expire_exhausted` must not push
+        // Fleet rows past their expires_at. A Fleet row at the same
+        // attempts count is owned by `fleet_outbox_expire_exhausted`
+        // with its own policy budget.
+        use crate::pyramid::db::market_outbox_insert_or_ignore;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pyramid.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+
+        let far_future = "9999-12-31 23:59:59";
+        // Insert a Fleet row directly at `status=ready, attempts=5,
+        // expires_at=far_future` to pin the exact starting state —
+        // using the helpers would overwrite expires_at during
+        // promote_ready_if_pending.
+        conn.execute(
+            "INSERT INTO fleet_result_outbox
+                (dispatcher_node_id, job_id, callback_url, callback_kind,
+                 status, expires_at, delivery_attempts, ready_at)
+             VALUES ('peer-A', 'fleet-busy', 'https://peer/x', 'Fleet',
+                 'ready', ?1, 5, datetime('now'))",
+            rusqlite::params![far_future],
+        )
+        .unwrap();
+        market_outbox_insert_or_ignore(
+            &conn,
+            "mkt-busy",
+            "https://wire/x",
+            "MarketStandard",
+            far_future,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE fleet_result_outbox
+                SET status = 'ready',
+                    delivery_attempts = 5,
+                    ready_at = datetime('now')
+              WHERE job_id = 'mkt-busy'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut policy = MarketDeliveryPolicy::default();
+        policy.max_delivery_attempts = 5;
+        expire_exhausted_market_once(db_path.clone(), policy).await.unwrap();
+
+        // Market row expires_at pushed into the past; fleet row unchanged.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let mkt_exp: String = conn
+            .query_row(
+                "SELECT expires_at FROM fleet_result_outbox WHERE job_id = 'mkt-busy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let flt_exp: String = conn
+            .query_row(
+                "SELECT expires_at FROM fleet_result_outbox WHERE job_id = 'fleet-busy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            flt_exp, far_future,
+            "fleet row's expires_at must be untouched by market helper"
+        );
+        // Market row was pushed to `now - 1s`; lexicographic compare
+        // is fine here because the far-future fixture starts with
+        // `9999-` which sorts after any realistic `now`.
+        assert_ne!(mkt_exp, far_future,
+            "market row's expires_at should have been pushed into the past");
     }
 }

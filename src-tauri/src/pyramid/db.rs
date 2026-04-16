@@ -2791,6 +2791,121 @@ pub fn fleet_outbox_retry_candidates(conn: &Connection) -> Result<Vec<OutboxRow>
     Ok(rows)
 }
 
+// ── Market outbox sweep helpers (Phase 2 WS6) ──────────────────────────────
+//
+// Shape-parallel to the Fleet sweep helpers above — same SQL with the
+// `callback_kind != 'Fleet'` filter so market + relay rows are walked by
+// the market sweep loop (`fleet_outbox_sweep::spawn_market_sweep_loop`)
+// while Fleet rows stay owned by the Fleet sweep. The two halves MUST
+// stay partitioned: a shared helper that iterated all callback_kinds
+// would let Fleet's `max_delivery_attempts` budget starve market rows
+// and vice versa.
+//
+// The `fleet_result_outbox` table is shared (per DD-D / DD-Q) — only the
+// SELECT filter differs. Admission budgets, backoff tuning, and attempt
+// caps live in `market_delivery_policy` separately from
+// `fleet_delivery_policy`.
+
+/// Predicate A candidate select for the MARKET sweep: every market/relay
+/// row whose `expires_at` is at or before `now`. The caller (market
+/// sweep loop) branches on `status` for each returned row — `pending` →
+/// synthesize Error and promote to `ready`, `ready` → terminal `failed`,
+/// `delivered`/`failed` → DELETE.
+///
+/// Scoped to `callback_kind != 'Fleet'` — fleet rows are owned by
+/// `fleet_outbox_sweep_expired`. Without the partition, the two sweeps
+/// would race on the same rows and bounce transitions back and forth.
+pub fn market_outbox_sweep_expired(conn: &Connection) -> Result<Vec<OutboxRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT dispatcher_node_id, job_id, status, callback_url, result_json,
+                delivery_attempts, last_attempt_at, expires_at
+           FROM fleet_result_outbox
+          WHERE expires_at <= datetime('now')
+            AND callback_kind != 'Fleet'",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(OutboxRow {
+                dispatcher_node_id: r.get(0)?,
+                job_id: r.get(1)?,
+                status: r.get(2)?,
+                callback_url: r.get(3)?,
+                result_json: r.get(4)?,
+                delivery_attempts: r.get(5)?,
+                last_attempt_at: r.get(6)?,
+                expires_at: r.get(7)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Two-step `ready → failed` promotion for MARKET rows whose delivery
+/// retries are exhausted. Shape-parallel to `fleet_outbox_expire_exhausted`
+/// but filters `callback_kind != 'Fleet'` so Fleet's
+/// `max_delivery_attempts` budget cannot push market rows into the past
+/// (and vice versa). Bumps `expires_at` one second into the past;
+/// Predicate A on the next market-sweep tick transitions the rows
+/// `ready → failed` via the standard CAS path, keeping terminal-state
+/// writes centralized in Predicate A.
+///
+/// Returns the number of rows pushed into the past.
+pub fn market_outbox_expire_exhausted(
+    conn: &Connection,
+    max_attempts: u64,
+) -> Result<usize> {
+    // SQLite integers are signed 64-bit; `MarketDeliveryPolicy.max_delivery_attempts`
+    // is `u64`. Saturate at `i64::MAX` before the cast — saturation is a
+    // belt-and-suspenders guard, not a real operating condition (default
+    // budget is 20).
+    let max_as_i64: i64 = max_attempts.min(i64::MAX as u64) as i64;
+    let n = conn.execute(
+        "UPDATE fleet_result_outbox
+            SET expires_at = datetime('now', '-1 second')
+          WHERE status = 'ready'
+            AND callback_kind != 'Fleet'
+            AND delivery_attempts >= ?1",
+        rusqlite::params![max_as_i64],
+    )?;
+    Ok(n)
+}
+
+/// Predicate B candidate select for the MARKET sweep: all `ready`
+/// market/relay rows. The caller computes per-row backoff in Rust
+/// against `delivery_attempts` and `last_attempt_at` (market has its own
+/// `backoff_base_secs` / `backoff_cap_secs` tuning in
+/// `market_delivery_policy`, distinct from Fleet's).
+///
+/// Phase 2 WS6 ships only Predicate A (expiry transitions) for the
+/// market sweep loop. Predicate B (retry delivery POSTs) ships in
+/// Phase 3 once the callback-delivery worker lands. This helper is
+/// included now so Phase 3's sweep can reuse the same partition
+/// mechanism without the module adding two more functions later.
+pub fn market_outbox_retry_candidates(conn: &Connection) -> Result<Vec<OutboxRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT dispatcher_node_id, job_id, status, callback_url, result_json,
+                delivery_attempts, last_attempt_at, expires_at
+           FROM fleet_result_outbox
+          WHERE status = 'ready'
+            AND callback_kind != 'Fleet'",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(OutboxRow {
+                dispatcher_node_id: r.get(0)?,
+                job_id: r.get(1)?,
+                status: r.get(2)?,
+                callback_url: r.get(3)?,
+                result_json: r.get(4)?,
+                delivery_attempts: r.get(5)?,
+                last_attempt_at: r.get(6)?,
+                expires_at: r.get(7)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Synthesizes a `FleetAsyncResult::Error(msg)` payload as JSON, matching the
 /// `#[serde(tag = "kind", content = "data")]` contract on the Phase 2
 /// `FleetAsyncResult` enum. Single source of truth so startup recovery and
@@ -19790,6 +19905,187 @@ mod phase17_tests {
             crate::fleet::WIRE_PLATFORM_DISPATCHER,
             "cross-protocol collision must be visible to the market handler's dispatcher_id check"
         );
+    }
+
+    // ── Market outbox sweep helpers (Phase 2 WS6) ───────────────────────
+
+    #[test]
+    fn test_market_outbox_sweep_expired_returns_only_market_rows() {
+        // Partition invariant: `market_outbox_sweep_expired` MUST only
+        // return rows whose `callback_kind != 'Fleet'`. If this filter
+        // breaks, the market and fleet sweeps race on the same rows and
+        // state transitions ping-pong between the two loops.
+        let conn = outbox_conn();
+        // Expired fleet row — must NOT be returned by the market sweep.
+        fleet_outbox_insert_or_ignore(
+            &conn,
+            "dispA",
+            "fleet-expired",
+            "https://x/cb",
+            "1970-01-01 00:00:00",
+        )
+        .unwrap();
+        // Expired MarketStandard + Relay — BOTH must be returned.
+        market_outbox_insert_or_ignore(
+            &conn,
+            "mkt-expired",
+            "https://w/cb",
+            "MarketStandard",
+            "1970-01-01 00:00:00",
+        )
+        .unwrap();
+        market_outbox_insert_or_ignore(
+            &conn,
+            "rly-expired",
+            "https://r/cb",
+            "Relay",
+            "1970-01-01 00:00:00",
+        )
+        .unwrap();
+        // Unexpired market row — must NOT be returned.
+        market_outbox_insert_or_ignore(
+            &conn,
+            "mkt-alive",
+            "https://w/cb",
+            "MarketStandard",
+            "9999-12-31 23:59:59",
+        )
+        .unwrap();
+
+        let rows = market_outbox_sweep_expired(&conn).unwrap();
+        let job_ids: Vec<&str> = rows.iter().map(|r| r.job_id.as_str()).collect();
+        assert_eq!(rows.len(), 2, "exactly the two expired market rows; got {:?}", job_ids);
+        assert!(job_ids.contains(&"mkt-expired"));
+        assert!(job_ids.contains(&"rly-expired"));
+        assert!(!job_ids.contains(&"fleet-expired"),
+            "fleet rows are owned by the fleet sweep");
+        assert!(!job_ids.contains(&"mkt-alive"),
+            "unexpired rows must be left alone");
+    }
+
+    #[test]
+    fn test_market_outbox_expire_exhausted_only_market_ready_rows() {
+        // Mirror of `test_fleet_outbox_expire_exhausted_ignores_market_rows`
+        // with roles swapped: market's `max_delivery_attempts` policy must
+        // not apply to Fleet rows.
+        let conn = outbox_conn();
+        let expires = future_expires();
+        // Insert both rows directly at `status=ready, attempts=5,
+        // expires_at=far_future` so the test's pre-condition is pinned.
+        // Using the helpers would overwrite expires_at during
+        // promote_ready_if_pending.
+        conn.execute(
+            "INSERT INTO fleet_result_outbox
+                (dispatcher_node_id, job_id, callback_url, callback_kind,
+                 status, expires_at, delivery_attempts, ready_at)
+             VALUES ('dispA', 'fleet-row', 'https://x/cb', 'Fleet',
+                 'ready', ?1, 5, datetime('now'))",
+            rusqlite::params![&expires],
+        )
+        .unwrap();
+        market_outbox_insert_or_ignore(&conn, "mkt-row", "https://w/cb", "MarketStandard", &expires)
+            .unwrap();
+        conn.execute(
+            "UPDATE fleet_result_outbox
+                SET status = 'ready',
+                    delivery_attempts = 5,
+                    ready_at = datetime('now')
+              WHERE job_id = 'mkt-row'",
+            [],
+        )
+        .unwrap();
+
+        let n = market_outbox_expire_exhausted(&conn, 5).unwrap();
+        assert_eq!(n, 1, "only the market row should be pushed into the past");
+
+        // Market row's expires_at is now in the past; fleet row's is not.
+        let market_expires: String = conn
+            .query_row(
+                "SELECT expires_at FROM fleet_result_outbox WHERE job_id = 'mkt-row'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let fleet_expires: String = conn
+            .query_row(
+                "SELECT expires_at FROM fleet_result_outbox WHERE job_id = 'fleet-row'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Market row: pushed into the past — <= datetime('now').
+        let still_future: i64 = conn
+            .query_row(
+                "SELECT CASE WHEN ?1 > datetime('now') THEN 1 ELSE 0 END",
+                rusqlite::params![&market_expires],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_future, 0, "market row should be in the past");
+        // Fleet row untouched — the helper filters `callback_kind != 'Fleet'`.
+        assert_eq!(fleet_expires, expires);
+    }
+
+    #[test]
+    fn test_market_outbox_expire_exhausted_ignores_below_budget() {
+        // Only `delivery_attempts >= max_attempts` gets pushed into the
+        // past. A row at 4 with max=5 remains untouched.
+        let conn = outbox_conn();
+        let expires = future_expires();
+        market_outbox_insert_or_ignore(&conn, "mkt-below", "https://w/cb", "MarketStandard", &expires)
+            .unwrap();
+        conn.execute(
+            "UPDATE fleet_result_outbox
+                SET status = 'ready',
+                    delivery_attempts = 4,
+                    ready_at = datetime('now')
+              WHERE job_id = 'mkt-below'",
+            [],
+        )
+        .unwrap();
+        let n = market_outbox_expire_exhausted(&conn, 5).unwrap();
+        assert_eq!(n, 0, "rows below the budget must not be pushed");
+        let unchanged: String = conn
+            .query_row(
+                "SELECT expires_at FROM fleet_result_outbox WHERE job_id = 'mkt-below'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unchanged, expires);
+    }
+
+    #[test]
+    fn test_market_outbox_retry_candidates_ready_market_only() {
+        // Phase 3 will use this helper for delivery retries. Even though
+        // WS6 does not ship Predicate B, the SELECT must already filter
+        // correctly so that when the delivery worker lands it doesn't
+        // surface Fleet rows to the market callback endpoint.
+        let conn = outbox_conn();
+        let expires = future_expires();
+        // Ready Fleet row — must NOT be returned.
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "fleet-ready", "https://x/cb", &expires).unwrap();
+        fleet_outbox_promote_ready_if_pending(&conn, "dispA", "fleet-ready", "{}", 60).unwrap();
+        // Ready Market row — MUST be returned.
+        market_outbox_insert_or_ignore(&conn, "mkt-ready", "https://w/cb", "MarketStandard", &expires)
+            .unwrap();
+        conn.execute(
+            "UPDATE fleet_result_outbox
+                SET status = 'ready',
+                    result_json = '{\"kind\":\"Success\",\"data\":{}}',
+                    ready_at = datetime('now')
+              WHERE job_id = 'mkt-ready'",
+            [],
+        )
+        .unwrap();
+        // Pending market row — must NOT be returned (only ready).
+        market_outbox_insert_or_ignore(&conn, "mkt-pending", "https://w/cb", "MarketStandard", &expires)
+            .unwrap();
+
+        let rows = market_outbox_retry_candidates(&conn).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.job_id.as_str()).collect();
+        assert_eq!(rows.len(), 1, "exactly one ready market row: {:?}", ids);
+        assert_eq!(rows[0].job_id, "mkt-ready");
     }
 
     #[test]
