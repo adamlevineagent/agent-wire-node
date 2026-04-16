@@ -1107,6 +1107,33 @@ fn consolidate_bundled_versions(conn: &Connection) -> Result<()> {
         let winner = user_winner.unwrap_or_else(|| rows[0].clone());
         let winner_id = winner.0;
 
+        // Pick the loser whose supersession chain link gets attached
+        // to the winner's `supersedes_id` — by convention, the most
+        // recent predecessor. With only 2 rows (the common case), the
+        // one loser is both "the loser" and "the most recent
+        // predecessor," so either ordering picks it. With 3+ rows,
+        // we link the NEWEST loser (rows are DESC-ordered) because
+        // that's the most recent thing the winner is superseding.
+        let newest_loser_id: Option<String> = rows
+            .iter()
+            .find(|(id, _, _, _)| id != &winner_id)
+            .map(|(id, _, _, _)| id.clone());
+
+        // Only update winner.supersedes_id if it's currently NULL —
+        // a user refinement that the operator wrote via
+        // `supersede_config_contribution` already has a valid
+        // supersedes_id pointing at the row it superseded. Don't
+        // overwrite that.
+        if let Some(ref newest_loser) = newest_loser_id {
+            conn.execute(
+                "UPDATE pyramid_config_contributions
+                 SET supersedes_id = ?1
+                 WHERE contribution_id = ?2
+                   AND supersedes_id IS NULL",
+                rusqlite::params![newest_loser, winner_id],
+            )?;
+        }
+
         for (loser_id, _, _, _) in rows.iter().filter(|(id, _, _, _)| id != &winner_id) {
             conn.execute(
                 "UPDATE pyramid_config_contributions
@@ -1121,6 +1148,130 @@ fn consolidate_bundled_versions(conn: &Connection) -> Result<()> {
                 "consolidate_bundled_versions: marked duplicate-active row superseded"
             );
         }
+    }
+
+    Ok(())
+}
+
+/// Rewrite any pre-WS1a `compute_participation_policy` contribution
+/// (user refinement — source != 'bundled') from its legacy 5/6-field
+/// shape to the canonical 10-field shape, preserving the operator's
+/// effective intent.
+///
+/// The shipped bundled v2 default already has all 10 fields explicit.
+/// This function targets USER refinements that were written against
+/// the pre-WS1a struct and therefore have the 5 new fields absent. On
+/// read, absent fields deserialize as `None` and project from mode —
+/// which for `mode: hybrid` (the common pre-WS1a setting) projects
+/// every new market to `true`. That's the silent-flip we want to
+/// prevent.
+///
+/// Resolution: parse the legacy YAML via the 10-field struct (missing
+/// fields → None), call `effective_booleans()` to resolve the
+/// operator's intent, then emit a 10-field YAML with every boolean
+/// explicit. The resulting YAML round-trips to the same
+/// `EffectiveParticipationPolicy` as before — so nothing about the
+/// operator's node behavior changes at the moment the rewrite runs.
+/// But the EXPLICIT 10-field storage means any future WS1a-aware code
+/// that happens to add new booleans won't silently flip this
+/// operator's markets on.
+///
+/// Idempotent: a YAML that already has all 10 booleans explicit
+/// produces the same YAML output, so the UPDATE is a no-op.
+/// Contributions with source='bundled' are skipped entirely — they're
+/// already canonical via `bundled_contributions.json`.
+fn canonicalize_legacy_participation_policy(conn: &Connection) -> Result<()> {
+    use crate::pyramid::local_mode::ComputeParticipationPolicy;
+
+    let mut stmt = conn.prepare(
+        "SELECT contribution_id, yaml_content
+         FROM pyramid_config_contributions
+         WHERE schema_type = 'compute_participation_policy'
+           AND status = 'active'
+           AND source != 'bundled'",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    for (contribution_id, yaml_content) in rows {
+        let parsed: ComputeParticipationPolicy = match serde_yaml::from_str(&yaml_content) {
+            Ok(p) => p,
+            Err(e) => {
+                // Malformed YAML shouldn't block boot — log and skip.
+                warn!(
+                    contribution_id = %contribution_id,
+                    error = %e,
+                    "canonicalize_legacy_participation_policy: parse failed, skipping row"
+                );
+                continue;
+            }
+        };
+
+        // Short-circuit the no-op case: if every projectable boolean
+        // is already Some(_), the YAML is canonical. No rewrite, no
+        // UPDATE, no DB write.
+        let already_canonical = parsed.allow_fleet_dispatch.is_some()
+            && parsed.allow_fleet_serving.is_some()
+            && parsed.allow_market_dispatch.is_some()
+            && parsed.allow_market_visibility.is_some()
+            && parsed.allow_storage_pulling.is_some()
+            && parsed.allow_storage_hosting.is_some()
+            && parsed.allow_relay_usage.is_some()
+            && parsed.allow_relay_serving.is_some();
+        if already_canonical {
+            continue;
+        }
+
+        // Resolve the operator's intent via the same projection the
+        // read path uses. Then emit a 10-field policy with every
+        // boolean explicit. The effective meaning is unchanged.
+        let eff = parsed.effective_booleans();
+        let canonical = ComputeParticipationPolicy {
+            schema_type: "compute_participation_policy".to_string(),
+            mode: parsed.mode,
+            allow_fleet_dispatch: Some(eff.allow_fleet_dispatch),
+            allow_fleet_serving: Some(eff.allow_fleet_serving),
+            allow_market_dispatch: Some(eff.allow_market_dispatch),
+            allow_market_visibility: Some(eff.allow_market_visibility),
+            allow_storage_pulling: Some(eff.allow_storage_pulling),
+            allow_storage_hosting: Some(eff.allow_storage_hosting),
+            allow_relay_usage: Some(eff.allow_relay_usage),
+            allow_relay_serving: Some(eff.allow_relay_serving),
+            allow_serving_while_degraded: eff.allow_serving_while_degraded,
+        };
+        let new_yaml = match serde_yaml::to_string(&canonical) {
+            Ok(y) => y,
+            Err(e) => {
+                warn!(
+                    contribution_id = %contribution_id,
+                    error = %e,
+                    "canonicalize_legacy_participation_policy: serialize failed, skipping row"
+                );
+                continue;
+            }
+        };
+
+        conn.execute(
+            "UPDATE pyramid_config_contributions
+             SET yaml_content = ?1,
+                 triggering_note = COALESCE(triggering_note, '') ||
+                   CASE
+                     WHEN triggering_note IS NULL OR triggering_note = ''
+                     THEN 'canonicalized to 10-field DD-I shape at upgrade'
+                     ELSE ' | canonicalized to 10-field DD-I shape at upgrade'
+                   END
+             WHERE contribution_id = ?2",
+            rusqlite::params![new_yaml, contribution_id],
+        )?;
+
+        debug!(
+            contribution_id = %contribution_id,
+            "canonicalize_legacy_participation_policy: rewrote legacy YAML to 10-field DD-I canonical"
+        );
     }
 
     Ok(())
@@ -1224,6 +1375,36 @@ pub fn walk_bundled_contributions_manifest(
         warn!(
             error = %e,
             "bundled version consolidation failed; duplicate-active rows may exist"
+        );
+    }
+
+    // ── Legacy 6-field participation policy canonicalization ─────────
+    //
+    // Pre-WS1a nodes had `ComputeParticipationPolicy` with 5 boolean
+    // fields + schema_type + mode. Post-WS1a the canonical shape has 8
+    // Option<bool> booleans + allow_serving_while_degraded + mode.
+    //
+    // A pre-WS1a operator who SUPERSEDED the bundled default with their
+    // own refinement has a user row whose YAML stores only the 5 old
+    // booleans. On read, the 5 new fields (allow_market_dispatch,
+    // allow_storage_*, allow_relay_*) deserialize as None → project
+    // from mode. For an operator on `mode: hybrid`, that means every
+    // market silently switches ON at upgrade time — surprising behavior
+    // the operator never opted into.
+    //
+    // Fix: detect legacy-shape user refinements and rewrite them in
+    // place with explicit 10-field values. The effective meaning is
+    // preserved by calling `effective_booleans()` on the parsed struct
+    // and storing each resolved value as an explicit Some(v). Fresh
+    // installs and already-10-field contributions are no-ops.
+    //
+    // This runs only AFTER consolidation so we rewrite the canonical
+    // active row, never a phantom.
+    if let Err(e) = canonicalize_legacy_participation_policy(conn) {
+        warn!(
+            error = %e,
+            "legacy participation policy canonicalization failed; \
+             pre-WS1a user refinements may silently project new markets ON"
         );
     }
 
@@ -2146,6 +2327,275 @@ applies_to: 'chain_step_config'
             )
             .unwrap();
         assert_eq!(b_v1_status, "active");
+    }
+
+    #[test]
+    fn consolidate_sets_winner_supersedes_id_when_null() {
+        // WS1a wanderer MAJOR-3: when consolidate picks a winner that
+        // has no supersedes_id (common: freshly-inserted bundled row),
+        // the winner's supersedes_id must get updated to point at the
+        // most-recent loser so chain-walk APIs (load_config_version_
+        // history) can traverse back through demoted rows.
+        let conn = mem_conn();
+        insert_active_row(
+            &conn,
+            "bundled-test-v1",
+            "test_schema",
+            None,
+            "bundled",
+            "schema_type: test_schema\n",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        insert_active_row(
+            &conn,
+            "bundled-test-v2",
+            "test_schema",
+            None,
+            "bundled",
+            "schema_type: test_schema\n",
+        );
+
+        consolidate_bundled_versions(&conn).unwrap();
+
+        // Winner's supersedes_id now points at the loser.
+        let v2_supersedes: Option<String> = conn
+            .query_row(
+                "SELECT supersedes_id FROM pyramid_config_contributions
+                 WHERE contribution_id = ?1",
+                rusqlite::params!["bundled-test-v2"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v2_supersedes.as_deref(), Some("bundled-test-v1"));
+    }
+
+    #[test]
+    fn consolidate_does_not_overwrite_winner_existing_supersedes_id() {
+        // WS1a wanderer MAJOR-3 corollary: when the winner is a user
+        // refinement (source != 'bundled') that already has a valid
+        // supersedes_id — because it was written via the real
+        // `supersede_config_contribution` path pointing at the
+        // pre-existing bundled row — consolidate must NOT overwrite
+        // that link. The user's historical chain is load-bearing.
+        let conn = mem_conn();
+        insert_active_row(
+            &conn,
+            "bundled-test-v1",
+            "test_schema",
+            None,
+            "bundled",
+            "schema_type: test_schema\n",
+        );
+        // Simulate user refinement that properly supersedes v1 — they
+        // wrote via `supersede_config_contribution` so supersedes_id is
+        // set to v1 already.
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions (
+                contribution_id, slug, schema_type, yaml_content,
+                wire_native_metadata_json, wire_publication_state_json,
+                supersedes_id, superseded_by_id, triggering_note,
+                status, source, wire_contribution_id, created_by, accepted_at
+             ) VALUES (
+                'user-test-refinement', NULL, 'test_schema',
+                'schema_type: test_schema\ntuned: true\n',
+                '{}', '{}',
+                'bundled-test-v1', NULL, 'user tuned',
+                'active', 'local', NULL, 'user', datetime('now')
+             )",
+            [],
+        )
+        .unwrap();
+        // Mark v1 superseded by the user refinement as real
+        // supersede_config_contribution would do.
+        conn.execute(
+            "UPDATE pyramid_config_contributions
+             SET status = 'superseded', superseded_by_id = 'user-test-refinement'
+             WHERE contribution_id = 'bundled-test-v1'",
+            [],
+        )
+        .unwrap();
+        // App upgrade drops v2 in.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        insert_active_row(
+            &conn,
+            "bundled-test-v2",
+            "test_schema",
+            None,
+            "bundled",
+            "schema_type: test_schema\n",
+        );
+
+        consolidate_bundled_versions(&conn).unwrap();
+
+        // User refinement stays active; its supersedes_id is still v1
+        // (NOT overwritten to point at v2). v2 is marked superseded.
+        let user_state: (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, supersedes_id, superseded_by_id FROM pyramid_config_contributions
+                 WHERE contribution_id = 'user-test-refinement'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(user_state.0, "active");
+        assert_eq!(user_state.1.as_deref(), Some("bundled-test-v1"));
+        assert!(user_state.2.is_none());
+
+        let v2_status: String = conn
+            .query_row(
+                "SELECT status FROM pyramid_config_contributions
+                 WHERE contribution_id = 'bundled-test-v2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v2_status, "superseded");
+    }
+
+    #[test]
+    fn canonicalize_rewrites_legacy_6_field_user_refinement() {
+        // WS1a wanderer MAJOR-1: a user-refined pre-WS1a policy with
+        // only the 5 old booleans must be rewritten to explicit 10-field
+        // at upgrade time. Otherwise the 5 new fields deserialize as
+        // None and project from mode, silently turning on markets the
+        // operator never opted into.
+        let conn = mem_conn();
+        let legacy_yaml = "schema_type: compute_participation_policy\n\
+                           mode: hybrid\n\
+                           allow_market_visibility: false\n\
+                           allow_serving_while_degraded: false\n\
+                           allow_fleet_dispatch: true\n\
+                           allow_fleet_serving: true\n";
+        // User refinement — source='local' (not bundled).
+        insert_active_row(
+            &conn,
+            "user-ppolicy-pre-ws1a",
+            "compute_participation_policy",
+            None,
+            "local",
+            legacy_yaml,
+        );
+
+        canonicalize_legacy_participation_policy(&conn).unwrap();
+
+        // Read back the rewritten YAML — must now have all 10 booleans
+        // explicit and the original explicit overrides preserved.
+        let new_yaml: String = conn
+            .query_row(
+                "SELECT yaml_content FROM pyramid_config_contributions
+                 WHERE contribution_id = 'user-ppolicy-pre-ws1a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // The original explicit override (market_visibility=false) must survive.
+        assert!(new_yaml.contains("allow_market_visibility: false"),
+            "original explicit override must be preserved:\n{new_yaml}");
+        // Fleet fields still true.
+        assert!(new_yaml.contains("allow_fleet_dispatch: true"));
+        assert!(new_yaml.contains("allow_fleet_serving: true"));
+        // Previously-absent fields: now explicit at their projected
+        // values for hybrid mode (true — the DD-I hybrid projection).
+        assert!(new_yaml.contains("allow_market_dispatch: true"),
+            "hybrid projection for market_dispatch must be explicit:\n{new_yaml}");
+        assert!(new_yaml.contains("allow_storage_pulling: true"));
+        assert!(new_yaml.contains("allow_storage_hosting: true"));
+        assert!(new_yaml.contains("allow_relay_usage: true"));
+        assert!(new_yaml.contains("allow_relay_serving: true"));
+
+        // Idempotency: running a second time on the now-canonical YAML
+        // must be a no-op (same YAML, no UPDATE).
+        let yaml_before: String = new_yaml.clone();
+        canonicalize_legacy_participation_policy(&conn).unwrap();
+        let yaml_after: String = conn
+            .query_row(
+                "SELECT yaml_content FROM pyramid_config_contributions
+                 WHERE contribution_id = 'user-ppolicy-pre-ws1a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(yaml_after, yaml_before,
+            "canonicalization must be idempotent on already-canonical YAML");
+    }
+
+    #[test]
+    fn canonicalize_skips_bundled_source_rows() {
+        // Only user refinements get rewritten. Bundled rows are already
+        // canonical via bundled_contributions.json and must be left
+        // untouched (rewriting them would change their content-hash
+        // and defeat the INSERT OR IGNORE dedup on next boot).
+        let conn = mem_conn();
+        let bundled_yaml = "schema_type: compute_participation_policy\nmode: hybrid\n";
+        insert_active_row(
+            &conn,
+            "bundled-ppolicy-test-v1",
+            "compute_participation_policy",
+            None,
+            "bundled",
+            bundled_yaml,
+        );
+
+        canonicalize_legacy_participation_policy(&conn).unwrap();
+
+        let after: String = conn
+            .query_row(
+                "SELECT yaml_content FROM pyramid_config_contributions
+                 WHERE contribution_id = 'bundled-ppolicy-test-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, bundled_yaml, "bundled rows must be untouched");
+    }
+
+    #[test]
+    fn canonicalize_handles_malformed_yaml_gracefully() {
+        // A corrupt YAML must not block the migration — log and skip.
+        // Other rows in the same batch must still be processed.
+        let conn = mem_conn();
+        insert_active_row(
+            &conn,
+            "user-ppolicy-corrupt",
+            "compute_participation_policy",
+            None,
+            "local",
+            "this is not: valid\n  yaml:: at all [[[\n",
+        );
+        insert_active_row(
+            &conn,
+            "user-ppolicy-valid-legacy",
+            "compute_participation_policy",
+            None,
+            "local",
+            "schema_type: compute_participation_policy\nmode: worker\nallow_fleet_dispatch: false\n",
+        );
+
+        // Must not panic or error.
+        canonicalize_legacy_participation_policy(&conn).unwrap();
+
+        // Corrupt row: left untouched.
+        let corrupt: String = conn
+            .query_row(
+                "SELECT yaml_content FROM pyramid_config_contributions
+                 WHERE contribution_id = 'user-ppolicy-corrupt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(corrupt.contains("not: valid"));
+
+        // Valid row: canonicalized to 10 fields.
+        let valid: String = conn
+            .query_row(
+                "SELECT yaml_content FROM pyramid_config_contributions
+                 WHERE contribution_id = 'user-ppolicy-valid-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(valid.contains("allow_relay_serving:"),
+            "valid row must have the 5 new fields explicit");
     }
 
     #[test]

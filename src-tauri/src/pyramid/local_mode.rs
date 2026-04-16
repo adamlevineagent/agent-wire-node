@@ -1728,13 +1728,34 @@ pub enum ComputeParticipationMode {
 ///
 /// `allow_serving_while_degraded` is NEVER projected. It's an operational
 /// safety knob the operator sets independently of market participation.
+///
+/// ## CONSUMER WARNING
+///
+/// **Do NOT read the `Option<bool>` fields directly to make gating
+/// decisions.** A bare `.unwrap_or(false)` is the exact wrong thing — it
+/// treats "project from mode" as "forbidden," the INVERSE of the DD-I
+/// semantic. Every consumer (compute admission gates, offer publication,
+/// LLM dispatch selection, storage hosting gate, relay forwarding gate)
+/// MUST call [`ComputeParticipationPolicy::effective_booleans`] and read
+/// the resolved concrete booleans off the returned
+/// [`EffectiveParticipationPolicy`].
+///
+/// The raw Option fields exist so the contribution can honestly store
+/// "operator picked mode=X and left the rest default" distinctly from
+/// "operator explicitly overrode this field." That distinction matters
+/// for `set_compute_participation_policy` roundtrips and for legacy YAML
+/// canonicalization — it should NOT leak into gating code.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ComputeParticipationPolicy {
     pub schema_type: String,
     pub mode: ComputeParticipationMode,
 
     // The 8 projectable booleans. Absent means "project from mode"; present
-    // means "explicit override, ignore mode preset." See `effective_booleans`.
+    // means "explicit override, ignore mode preset."
+    //
+    // DO NOT READ DIRECTLY FOR GATING — call `effective_booleans()` instead.
+    // See the CONSUMER WARNING in the struct-level doc above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_fleet_dispatch: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2468,28 +2489,79 @@ mod tests {
     }
 
     #[test]
-    fn policy_yaml_from_minimal_mode_only_deserializes_with_all_none() {
-        // Operator-facing ergonomic: the YAML `{ schema_type: ..., mode: hybrid }`
-        // alone must parse — every projectable boolean defaults to None,
-        // allow_serving_while_degraded defaults to false.
-        let yaml = "schema_type: compute_participation_policy\nmode: worker\n";
-        let p: ComputeParticipationPolicy = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(p.mode, ComputeParticipationMode::Worker);
-        assert_eq!(p.allow_fleet_dispatch, None);
-        assert_eq!(p.allow_fleet_serving, None);
-        assert_eq!(p.allow_market_dispatch, None);
-        assert_eq!(p.allow_market_visibility, None);
-        assert_eq!(p.allow_storage_pulling, None);
-        assert_eq!(p.allow_storage_hosting, None);
-        assert_eq!(p.allow_relay_usage, None);
-        assert_eq!(p.allow_relay_serving, None);
-        assert!(!p.allow_serving_while_degraded);
-        // Effective values must come from the worker projection.
-        let eff = p.effective_booleans();
-        assert!(!eff.allow_fleet_dispatch);
-        assert!(eff.allow_fleet_serving);
-        assert!(eff.allow_market_visibility);
-        assert!(eff.allow_storage_hosting);
+    fn policy_yaml_with_only_schema_type_and_mode_deserializes_with_all_none() {
+        // Operator-facing ergonomic: a YAML with just the two required
+        // fields (`schema_type` + `mode`) must parse — every projectable
+        // boolean defaults to None, `allow_serving_while_degraded`
+        // defaults to false. Exercises the full 3-mode matrix to make
+        // sure projection hits every branch.
+        for (mode_str, mode_enum) in [
+            ("coordinator", ComputeParticipationMode::Coordinator),
+            ("hybrid", ComputeParticipationMode::Hybrid),
+            ("worker", ComputeParticipationMode::Worker),
+        ] {
+            let yaml = format!(
+                "schema_type: compute_participation_policy\nmode: {mode_str}\n"
+            );
+            let p: ComputeParticipationPolicy = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(p.mode, mode_enum);
+            assert_eq!(p.allow_fleet_dispatch, None);
+            assert_eq!(p.allow_fleet_serving, None);
+            assert_eq!(p.allow_market_dispatch, None);
+            assert_eq!(p.allow_market_visibility, None);
+            assert_eq!(p.allow_storage_pulling, None);
+            assert_eq!(p.allow_storage_hosting, None);
+            assert_eq!(p.allow_relay_usage, None);
+            assert_eq!(p.allow_relay_serving, None);
+            assert!(!p.allow_serving_while_degraded);
+            // Effective values must come from the projection for this mode.
+            let eff = p.effective_booleans();
+            let (fd, fs, md, mv, sp, sh, ru, rs) = project_mode(mode_enum);
+            assert_eq!(eff.allow_fleet_dispatch, fd);
+            assert_eq!(eff.allow_fleet_serving, fs);
+            assert_eq!(eff.allow_market_dispatch, md);
+            assert_eq!(eff.allow_market_visibility, mv);
+            assert_eq!(eff.allow_storage_pulling, sp);
+            assert_eq!(eff.allow_storage_hosting, sh);
+            assert_eq!(eff.allow_relay_usage, ru);
+            assert_eq!(eff.allow_relay_serving, rs);
+        }
+    }
+
+    #[test]
+    fn policy_yaml_rejects_unknown_fields() {
+        // With `#[serde(deny_unknown_fields)]`, a typo like
+        // `allow_market_visiblity` (missing an 'i') that serde-default
+        // would have silently dropped must now fail loudly at parse
+        // time. This catches frontend/IPC payload typos at the boundary
+        // instead of letting them silently revert to the projection.
+        let typo_yaml = "schema_type: compute_participation_policy\n\
+                         mode: hybrid\n\
+                         allow_market_visiblity: false\n";
+        assert!(
+            serde_yaml::from_str::<ComputeParticipationPolicy>(typo_yaml).is_err(),
+            "typo'd field must be rejected by deny_unknown_fields"
+        );
+
+        let unknown_yaml = "schema_type: compute_participation_policy\n\
+                            mode: hybrid\n\
+                            allow_bitcoin_mining: true\n";
+        assert!(
+            serde_yaml::from_str::<ComputeParticipationPolicy>(unknown_yaml).is_err(),
+            "completely-unknown field must be rejected by deny_unknown_fields"
+        );
+    }
+
+    #[test]
+    fn effective_booleans_copies_allow_serving_while_degraded_unchanged() {
+        // Per DD-I: `allow_serving_while_degraded` is NEVER projected.
+        // It's an operator-configurable safety knob that must pass
+        // through `effective_booleans()` byte-for-byte.
+        let mut p = ComputeParticipationPolicy::default();
+        p.allow_serving_while_degraded = true;
+        assert!(p.effective_booleans().allow_serving_while_degraded);
+        p.allow_serving_while_degraded = false;
+        assert!(!p.effective_booleans().allow_serving_while_degraded);
     }
 
     #[test]

@@ -37,21 +37,24 @@ interface UpdateInfo {
 type ComputeParticipationMode = "coordinator" | "hybrid" | "worker";
 
 // Mirrors the Rust `ComputeParticipationPolicy` at src-tauri/src/pyramid/
-// local_mode.rs. The 8 projectable booleans may be null/absent on the
-// wire — the Rust side projects them from `mode` at read time per DD-I.
-// The UI always sends explicit booleans so there's no ambiguity when
-// the operator has tuned a mode button; see `policyForMode` below.
+// local_mode.rs. The 8 projectable booleans may be absent/undefined on
+// the wire — the Rust side uses `#[serde(skip_serializing_if = "Option::is_none")]`
+// so None serializes as "key omitted," which deserializes to `undefined`
+// in JS (NOT `null`). The Rust side projects absent fields from `mode`
+// at read time per DD-I. The UI always sends explicit booleans so
+// there's no ambiguity when the operator has tuned a mode button; see
+// `policyForMode` below.
 interface ComputeParticipationPolicy {
     schema_type: "compute_participation_policy";
     mode: ComputeParticipationMode;
-    allow_fleet_dispatch: boolean | null;
-    allow_fleet_serving: boolean | null;
-    allow_market_dispatch: boolean | null;
-    allow_market_visibility: boolean | null;
-    allow_storage_pulling: boolean | null;
-    allow_storage_hosting: boolean | null;
-    allow_relay_usage: boolean | null;
-    allow_relay_serving: boolean | null;
+    allow_fleet_dispatch?: boolean;
+    allow_fleet_serving?: boolean;
+    allow_market_dispatch?: boolean;
+    allow_market_visibility?: boolean;
+    allow_storage_pulling?: boolean;
+    allow_storage_hosting?: boolean;
+    allow_relay_usage?: boolean;
+    allow_relay_serving?: boolean;
     allow_serving_while_degraded: boolean;
 }
 
