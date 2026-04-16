@@ -499,13 +499,13 @@ mod tests {
     #[test]
     fn test_compute_policy_hash_deterministic() {
         use crate::pyramid::dispatch_policy::*;
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
 
         let policy = DispatchPolicy {
             rules: vec![],
             escalation: EscalationConfig::default(),
             build_coordination: BuildCoordinationConfig::default(),
-            pool_configs: HashMap::new(),
+            pool_configs: BTreeMap::new(),
             max_batch_cost_usd: Some(1.0),
             max_daily_cost_usd: Some(10.0),
         };
@@ -519,13 +519,13 @@ mod tests {
     #[test]
     fn test_compute_policy_hash_changes_with_budget() {
         use crate::pyramid::dispatch_policy::*;
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
 
         let policy1 = DispatchPolicy {
             rules: vec![],
             escalation: EscalationConfig::default(),
             build_coordination: BuildCoordinationConfig::default(),
-            pool_configs: HashMap::new(),
+            pool_configs: BTreeMap::new(),
             max_batch_cost_usd: Some(1.0),
             max_daily_cost_usd: None,
         };
@@ -534,7 +534,7 @@ mod tests {
             rules: vec![],
             escalation: EscalationConfig::default(),
             build_coordination: BuildCoordinationConfig::default(),
-            pool_configs: HashMap::new(),
+            pool_configs: BTreeMap::new(),
             max_batch_cost_usd: Some(5.0),
             max_daily_cost_usd: None,
         };
@@ -550,13 +550,13 @@ mod tests {
     fn test_budget_decision_no_limits() {
         // With no limits set, everything auto-commits
         use crate::pyramid::dispatch_policy::*;
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
 
         let policy = DispatchPolicy {
             rules: vec![],
             escalation: EscalationConfig::default(),
             build_coordination: BuildCoordinationConfig::default(),
-            pool_configs: HashMap::new(),
+            pool_configs: BTreeMap::new(),
             max_batch_cost_usd: None,
             max_daily_cost_usd: None,
         };

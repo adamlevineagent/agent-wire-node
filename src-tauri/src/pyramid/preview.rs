@@ -569,6 +569,7 @@ mod tests {
             enabled: true,
             created_at: String::new(),
             updated_at: String::new(),
+            last_scan_at: None,
         };
 
         let id = super::super::db::save_dadbear_config(&conn, &config).unwrap();

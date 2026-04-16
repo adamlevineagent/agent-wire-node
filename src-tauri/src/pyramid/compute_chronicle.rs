@@ -22,6 +22,40 @@ use std::collections::HashMap;
 use super::step_context::StepContext;
 use crate::compute_queue::QueueEntry;
 
+// ── Canonical source constants ────────────────────────────────────────────
+// The `source` column records which compute lane produced the event.
+// Dispatcher-side fleet events use SOURCE_FLEET.
+// Peer-side (received-from-peer) events and queue entries use SOURCE_FLEET_RECEIVED.
+pub const SOURCE_FLEET: &str = "fleet";
+pub const SOURCE_FLEET_RECEIVED: &str = "fleet_received";
+
+// ── Canonical event_type constants ────────────────────────────────────────
+// These are the canonical event_type string values emitted by the async
+// fleet dispatch path. Later workstreams migrate their emission sites to
+// use these constants instead of raw string literals.
+
+// Dispatcher-side events (source='fleet') — the node that sent the job.
+pub const EVENT_FLEET_DISPATCHED_ASYNC: &str = "fleet_dispatched_async";
+pub const EVENT_FLEET_DISPATCH_FAILED: &str = "fleet_dispatch_failed";
+pub const EVENT_FLEET_PEER_OVERLOADED: &str = "fleet_peer_overloaded";
+pub const EVENT_FLEET_DISPATCH_TIMEOUT: &str = "fleet_dispatch_timeout";
+pub const EVENT_FLEET_RESULT_RECEIVED: &str = "fleet_result_received";
+pub const EVENT_FLEET_RESULT_FAILED: &str = "fleet_result_failed";
+pub const EVENT_FLEET_RESULT_ORPHANED: &str = "fleet_result_orphaned";
+pub const EVENT_FLEET_RESULT_FORGERY_ATTEMPT: &str = "fleet_result_forgery_attempt";
+pub const EVENT_FLEET_PENDING_ORPHANED: &str = "fleet_pending_orphaned";
+
+// Peer-side events (source='fleet_received') — the node that received the job.
+pub const EVENT_FLEET_JOB_ACCEPTED: &str = "fleet_job_accepted";
+pub const EVENT_FLEET_ADMISSION_REJECTED: &str = "fleet_admission_rejected";
+pub const EVENT_FLEET_JOB_COMPLETED: &str = "fleet_job_completed";
+pub const EVENT_FLEET_CALLBACK_DELIVERED: &str = "fleet_callback_delivered";
+pub const EVENT_FLEET_CALLBACK_FAILED: &str = "fleet_callback_failed";
+pub const EVENT_FLEET_CALLBACK_EXHAUSTED: &str = "fleet_callback_exhausted";
+pub const EVENT_FLEET_WORKER_HEARTBEAT_LOST: &str = "fleet_worker_heartbeat_lost";
+pub const EVENT_FLEET_WORKER_SWEEP_LOST: &str = "fleet_worker_sweep_lost";
+pub const EVENT_FLEET_DELIVERY_CAS_LOST: &str = "fleet_delivery_cas_lost";
+
 // ── Event context ─────────────────────────────────────────────────────────
 
 /// All context needed to record a chronicle event.

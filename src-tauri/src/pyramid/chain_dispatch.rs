@@ -1616,6 +1616,7 @@ mod tests {
             ops: OperationalConfig::default(),
             audit: None,
             cache_base: None,
+            concurrency_cap: None,
         };
         let result = dispatch_mechanical("nonexistent", &serde_json::json!({}), &ctx);
         assert!(result.is_err());
@@ -1636,6 +1637,7 @@ mod tests {
             ops: OperationalConfig::default(),
             audit: None,
             cache_base: None,
+            concurrency_cap: None,
         };
         let input = serde_json::json!({"files": ["main.rs"]});
         let result = dispatch_mechanical("extract_import_graph", &input, &ctx).unwrap();
@@ -1880,6 +1882,7 @@ mod tests {
             ops: OperationalConfig::default(),
             audit: None,
             cache_base: None,
+            concurrency_cap: None,
         };
         let mut step = ir_step("mech_step", StepOperation::Mechanical);
         step.rust_function = Some("extract_import_graph".into());
@@ -1901,6 +1904,7 @@ mod tests {
             ops: OperationalConfig::default(),
             audit: None,
             cache_base: None,
+            concurrency_cap: None,
         };
         let step = ir_step("no_fn", StepOperation::Mechanical);
         // rust_function is None
@@ -1923,6 +1927,7 @@ mod tests {
             ops: OperationalConfig::default(),
             audit: None,
             cache_base: None,
+            concurrency_cap: None,
         };
         let mut step = ir_step("bad_fn", StepOperation::Mechanical);
         step.rust_function = Some("nonexistent_fn".into());
@@ -1945,6 +1950,7 @@ mod tests {
             ops: OperationalConfig::default(),
             audit: None,
             cache_base: None,
+            concurrency_cap: None,
         };
         let mut step = ir_step("count_step", StepOperation::Transform);
         step.transform = Some(TransformSpec {
@@ -1969,6 +1975,7 @@ mod tests {
             ops: OperationalConfig::default(),
             audit: None,
             cache_base: None,
+            concurrency_cap: None,
         };
         let mut step = ir_step("coalesce_step", StepOperation::Transform);
         step.transform = Some(TransformSpec {
@@ -1997,6 +2004,7 @@ mod tests {
             ops: OperationalConfig::default(),
             audit: None,
             cache_base: None,
+            concurrency_cap: None,
         };
         let step = ir_step("bad_transform", StepOperation::Transform);
         // transform is None
@@ -2019,6 +2027,7 @@ mod tests {
             ops: OperationalConfig::default(),
             audit: None,
             cache_base: None,
+            concurrency_cap: None,
         };
         let step = ir_step("wire_step", StepOperation::Wire);
         let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
@@ -2037,6 +2046,7 @@ mod tests {
             ops: OperationalConfig::default(),
             audit: None,
             cache_base: None,
+            concurrency_cap: None,
         };
         let step = ir_step("task_step", StepOperation::Task);
         let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
@@ -2055,6 +2065,7 @@ mod tests {
             ops: OperationalConfig::default(),
             audit: None,
             cache_base: None,
+            concurrency_cap: None,
         };
         let step = ir_step("game_step", StepOperation::Game);
         let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
@@ -2073,6 +2084,7 @@ mod tests {
             ops: OperationalConfig::default(),
             audit: None,
             cache_base: None,
+            concurrency_cap: None,
         };
         let mut step = ir_step("mech", StepOperation::Mechanical);
         step.rust_function = Some("extract_mechanical_metadata".into());

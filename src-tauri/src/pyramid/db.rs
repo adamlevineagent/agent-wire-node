@@ -1928,6 +1928,20 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         )"
     )?;
 
+    // Fleet delivery policy operational table — async fleet dispatch.
+    // Singleton (id=1). Mirrors `pyramid_dispatch_policy` exactly; see
+    // `pyramid::fleet_delivery_policy` for read/upsert helpers and
+    // `docs/plans/async-fleet-dispatch.md` § "Operational Policy" for
+    // field semantics.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pyramid_fleet_delivery_policy (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            yaml_content TEXT NOT NULL DEFAULT '',
+            contribution_id TEXT,
+            updated_at TEXT DEFAULT (datetime('now'))
+        )"
+    )?;
+
     // ── DADBEAR Canonical State Model tables ────────────────────────────────
     //
     // Per `docs/plans/dadbear-canonical-state-model.md`. These are WALs,
@@ -2210,37 +2224,452 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         WHERE slug IS NOT NULL AND depth IS NOT NULL
         GROUP BY slug, build_id, depth, primitive;
 
+        DROP VIEW IF EXISTS v_compute_fleet_peers;
         CREATE VIEW IF NOT EXISTS v_compute_fleet_peers AS
         SELECT
             json_extract(metadata, '$.peer_id') AS peer_id,
-            COUNT(CASE WHEN event_type = 'fleet_dispatched' THEN 1 END) AS dispatch_count,
-            COUNT(CASE WHEN event_type = 'fleet_returned' THEN 1 END) AS success_count,
-            COUNT(CASE WHEN event_type = 'fleet_dispatch_failed' THEN 1 END) AS failed_count,
+            COUNT(CASE WHEN event_type = 'fleet_dispatched_async' THEN 1 END) AS dispatch_count,
+            COUNT(CASE WHEN event_type = 'fleet_result_received' THEN 1 END) AS success_count,
+            COUNT(CASE WHEN event_type IN ('fleet_dispatch_failed', 'fleet_dispatch_timeout', 'fleet_peer_overloaded') THEN 1 END) AS failed_count,
             ROUND(
-                CAST(COUNT(CASE WHEN event_type = 'fleet_returned' THEN 1 END) AS REAL) /
-                NULLIF(COUNT(CASE WHEN event_type = 'fleet_dispatched' THEN 1 END), 0) * 100,
+                CAST(COUNT(CASE WHEN event_type = 'fleet_result_received' THEN 1 END) AS REAL) /
+                NULLIF(COUNT(CASE WHEN event_type = 'fleet_dispatched_async' THEN 1 END), 0) * 100,
                 1
             ) AS success_rate_pct,
-            AVG(CASE WHEN event_type = 'fleet_returned' THEN CAST(json_extract(metadata, '$.latency_ms') AS REAL) END) AS avg_round_trip_ms,
+            AVG(CASE WHEN event_type = 'fleet_result_received' THEN CAST(json_extract(metadata, '$.latency_ms') AS REAL) END) AS avg_round_trip_ms,
             GROUP_CONCAT(DISTINCT model_id) AS models_served
         FROM pyramid_compute_events
         WHERE source = 'fleet'
         GROUP BY peer_id;
 
+        DROP VIEW IF EXISTS v_compute_by_source;
         CREATE VIEW IF NOT EXISTS v_compute_by_source AS
         SELECT
             source,
-            COUNT(CASE WHEN event_type IN ('completed', 'fleet_returned', 'cloud_returned') THEN 1 END) AS total_completed,
+            COUNT(CASE WHEN event_type IN ('completed', 'fleet_result_received', 'cloud_returned') THEN 1 END) AS total_completed,
             SUM(CASE WHEN event_type IN ('completed', 'cloud_returned') THEN CAST(json_extract(metadata, '$.cost_usd') AS REAL) ELSE 0.0 END) AS total_cost_usd,
-            AVG(CASE WHEN event_type IN ('completed', 'fleet_returned', 'cloud_returned') THEN CAST(json_extract(metadata, '$.latency_ms') AS REAL) END) AS avg_latency_ms,
-            SUM(CASE WHEN event_type IN ('completed', 'fleet_returned', 'cloud_returned') THEN CAST(json_extract(metadata, '$.tokens_prompt') AS INTEGER) ELSE 0 END) AS total_tokens_in,
-            SUM(CASE WHEN event_type IN ('completed', 'fleet_returned', 'cloud_returned') THEN CAST(json_extract(metadata, '$.tokens_completion') AS INTEGER) ELSE 0 END) AS total_tokens_out
+            AVG(CASE WHEN event_type IN ('completed', 'fleet_result_received', 'cloud_returned') THEN CAST(json_extract(metadata, '$.latency_ms') AS REAL) END) AS avg_latency_ms,
+            SUM(CASE WHEN event_type IN ('completed', 'fleet_result_received', 'cloud_returned') THEN CAST(json_extract(metadata, '$.tokens_prompt') AS INTEGER) ELSE 0 END) AS total_tokens_in,
+            SUM(CASE WHEN event_type IN ('completed', 'fleet_result_received', 'cloud_returned') THEN CAST(json_extract(metadata, '$.tokens_completion') AS INTEGER) ELSE 0 END) AS total_tokens_out
         FROM pyramid_compute_events
         GROUP BY source;
         ",
     )?;
 
+    // ── Fleet async dispatch: result outbox ────────────────────────────────
+    //
+    // Peer-side durable outbox for async fleet dispatch. Compound PK prevents
+    // cross-dispatcher hijacking; unique index on job_id alone detects any
+    // cross-dispatcher UUID reuse. `expires_at` drives all sweep-time state
+    // transitions (pending/ready/delivered/failed). `worker_heartbeat_at` is
+    // distinct from `expires_at` only for observability.
+    //
+    // See docs/plans/async-fleet-dispatch.md "Outbox Schema" for the full
+    // state-machine spec and CAS invariants.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS fleet_result_outbox (
+            dispatcher_node_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            callback_url TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result_json TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            ready_at TEXT,
+            delivered_at TEXT,
+            expires_at TEXT NOT NULL,
+            worker_heartbeat_at TEXT,
+            delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at TEXT,
+            last_error TEXT,
+            PRIMARY KEY (dispatcher_node_id, job_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_fleet_outbox_expires ON fleet_result_outbox (expires_at);
+        CREATE INDEX IF NOT EXISTS idx_fleet_outbox_status_attempts ON fleet_result_outbox (status, last_attempt_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_outbox_job_id ON fleet_result_outbox (job_id);
+        ",
+    )?;
+
     Ok(())
+}
+
+// ── Fleet Result Outbox: CAS helpers ────────────────────────────────────────
+//
+// Peer-side durable result storage for async fleet dispatch. All UPDATEs are
+// compare-and-swap on `status`; callers MUST check the returned rowcount to
+// know whether the CAS won or lost (rowcount=1 => won, rowcount=0 => lost).
+//
+// These helpers are synchronous rusqlite calls, designed to be invoked from
+// `tokio::task::spawn_blocking` contexts in the delivery sweep and worker
+// paths. See docs/plans/async-fleet-dispatch.md for the full state machine.
+
+/// Status constants — canonical spellings persisted in the `status` column.
+pub const FLEET_STATUS_PENDING: &str = "pending";
+pub const FLEET_STATUS_READY: &str = "ready";
+pub const FLEET_STATUS_DELIVERED: &str = "delivered";
+pub const FLEET_STATUS_FAILED: &str = "failed";
+
+/// Row shape returned by sweep helpers (`fleet_outbox_sweep_expired`,
+/// `fleet_outbox_retry_candidates`, etc.). Carries enough fields for both
+/// Predicate A's state-transition branching and Predicate B's retry filtering.
+#[derive(Debug, Clone)]
+pub struct OutboxRow {
+    pub dispatcher_node_id: String,
+    pub job_id: String,
+    pub status: String,
+    pub callback_url: String,
+    pub result_json: Option<String>,
+    pub delivery_attempts: i64,
+    pub last_attempt_at: Option<String>,
+    pub expires_at: String,
+}
+
+/// Insert a new outbox row in `pending` state. Uses INSERT OR IGNORE so repeat
+/// calls with the same PK are a no-op. Returns `conn.changes()` rowcount —
+/// `1` means the row was freshly inserted, `0` means a row with that PK
+/// already existed. Callers use this to disambiguate fresh insert from
+/// legitimate retry (see `handle_fleet_dispatch` step 6).
+pub fn fleet_outbox_insert_or_ignore(
+    conn: &Connection,
+    dispatcher_node_id: &str,
+    job_id: &str,
+    callback_url: &str,
+    expires_at: &str,
+) -> Result<usize> {
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO fleet_result_outbox
+            (dispatcher_node_id, job_id, callback_url, status, expires_at)
+         VALUES (?1, ?2, ?3, 'pending', ?4)",
+        rusqlite::params![dispatcher_node_id, job_id, callback_url, expires_at],
+    )?;
+    Ok(n)
+}
+
+/// Row shape returned by [`fleet_outbox_lookup`]. Carries the fields the
+/// `handle_fleet_dispatch` step-6 branch table needs:
+///
+/// - `dispatcher_node_id` — stored dispatcher identity for 409 collision checks.
+/// - `status` — terminal-state branching (`pending`/`ready`/`delivered`/`failed`).
+/// - `delivery_attempts` — retry counter exposed to observability and metrics.
+/// - `last_error` — populated into the 410 Gone body when a row is already
+///   `failed` so the dispatcher sees the terminal failure reason.
+#[derive(Debug, Clone)]
+pub struct OutboxLookup {
+    pub dispatcher_node_id: String,
+    pub status: String,
+    pub delivery_attempts: u32,
+    pub last_error: Option<String>,
+}
+
+/// Look up an outbox row by `job_id` alone (NOT by compound PK). Keys on
+/// `job_id` so cross-dispatcher UUID collisions are detectable — the caller
+/// compares the returned `dispatcher_node_id` against its own identity and
+/// rejects with 409 Conflict on mismatch.
+///
+/// Returns an [`OutboxLookup`] or `None`. The `last_error` field is populated
+/// when the row's `last_error` column is non-NULL so the Phase 3 handler can
+/// include it in the 410 Gone body for already-failed rows.
+pub fn fleet_outbox_lookup(
+    conn: &Connection,
+    job_id: &str,
+) -> Result<Option<OutboxLookup>> {
+    let row = conn
+        .query_row(
+            "SELECT dispatcher_node_id, status, delivery_attempts, last_error
+             FROM fleet_result_outbox
+             WHERE job_id = ?1",
+            rusqlite::params![job_id],
+            |r| {
+                let did: String = r.get(0)?;
+                let status: String = r.get(1)?;
+                let attempts: i64 = r.get(2)?;
+                let last_error: Option<String> = r.get(3)?;
+                Ok(OutboxLookup {
+                    dispatcher_node_id: did,
+                    status,
+                    delivery_attempts: attempts as u32,
+                    last_error,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Admission counter: number of in-flight (`pending` or `ready`) rows in the
+/// outbox, EXCLUDING the caller's just-inserted row identified by
+/// `(dispatcher_node_id, job_id)`. Used to honor `max_inflight_jobs` as the
+/// actual limit rather than `max − 1` — the freshly inserted row is already
+/// counted by SELECT, so we subtract it here.
+pub fn fleet_outbox_count_inflight_excluding(
+    conn: &Connection,
+    dispatcher_node_id: &str,
+    job_id: &str,
+) -> Result<u64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM fleet_result_outbox
+         WHERE status IN ('pending','ready')
+           AND NOT (dispatcher_node_id = ?1 AND job_id = ?2)",
+        rusqlite::params![dispatcher_node_id, job_id],
+        |r| r.get(0),
+    )?;
+    Ok(n as u64)
+}
+
+/// Unconditional delete by compound PK. Returns rowcount (0 if PK missing —
+/// not an error; the row is simply gone). Used by admission rollback
+/// (INSERT then DELETE on rejection) and by Predicate A's `delivered`/`failed`
+/// transitions.
+pub fn fleet_outbox_delete(
+    conn: &Connection,
+    dispatcher_node_id: &str,
+    job_id: &str,
+) -> Result<usize> {
+    let n = conn.execute(
+        "DELETE FROM fleet_result_outbox
+         WHERE dispatcher_node_id = ?1 AND job_id = ?2",
+        rusqlite::params![dispatcher_node_id, job_id],
+    )?;
+    Ok(n)
+}
+
+/// Alias for `fleet_outbox_delete` — kept under the spec-named symbol for
+/// call sites written against Predicate A's DELETE transitions.
+pub fn fleet_outbox_delete_row(
+    conn: &Connection,
+    dispatcher_node_id: &str,
+    job_id: &str,
+) -> Result<usize> {
+    fleet_outbox_delete(conn, dispatcher_node_id, job_id)
+}
+
+/// Worker heartbeat tick: CAS update `expires_at` (and observability
+/// `worker_heartbeat_at`) only if the row is still `pending`. Returns
+/// rowcount — `1` means the heartbeat bumped the row, `0` means the sweep
+/// already promoted us to `ready` (or the row was deleted) and the worker
+/// should exit the heartbeat loop.
+pub fn fleet_outbox_update_heartbeat_if_pending(
+    conn: &Connection,
+    dispatcher_node_id: &str,
+    job_id: &str,
+    new_expires_at: &str,
+) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE fleet_result_outbox
+            SET expires_at = ?3,
+                worker_heartbeat_at = datetime('now')
+          WHERE dispatcher_node_id = ?1 AND job_id = ?2 AND status = 'pending'",
+        rusqlite::params![dispatcher_node_id, job_id, new_expires_at],
+    )?;
+    Ok(n)
+}
+
+/// Worker completion CAS: promote `pending → ready` and stamp the serialized
+/// result. Writes `ready_at = now` and `expires_at = now + ready_retention_secs`.
+/// Returns rowcount — `1` means the worker won the race; `0` means the sweep
+/// already promoted the row to `ready` with a synthesized Error payload and
+/// the worker's result should be dropped.
+pub fn fleet_outbox_promote_ready_if_pending(
+    conn: &Connection,
+    dispatcher_node_id: &str,
+    job_id: &str,
+    result_json: &str,
+    ready_retention_secs: u64,
+) -> Result<usize> {
+    // `'+' || ? || ' seconds'` composes a SQLite datetime modifier at bind time.
+    let modifier = format!("+{} seconds", ready_retention_secs);
+    let n = conn.execute(
+        "UPDATE fleet_result_outbox
+            SET status = 'ready',
+                result_json = ?3,
+                ready_at = datetime('now'),
+                expires_at = datetime('now', ?4)
+          WHERE dispatcher_node_id = ?1 AND job_id = ?2 AND status = 'pending'",
+        rusqlite::params![dispatcher_node_id, job_id, result_json, modifier],
+    )?;
+    Ok(n)
+}
+
+/// Delivery success CAS: promote `ready → delivered`. Stamps `delivered_at`
+/// and resets `expires_at` to `now + delivered_retention_secs`. Returns
+/// rowcount — `0` means Predicate A concurrently promoted the row
+/// `ready → failed` (retries exhausted). The callback already succeeded
+/// (dispatcher received 2xx); discard the CAS failure.
+pub fn fleet_outbox_mark_delivered_if_ready(
+    conn: &Connection,
+    dispatcher_node_id: &str,
+    job_id: &str,
+    delivered_retention_secs: u64,
+) -> Result<usize> {
+    let modifier = format!("+{} seconds", delivered_retention_secs);
+    let n = conn.execute(
+        "UPDATE fleet_result_outbox
+            SET status = 'delivered',
+                delivered_at = datetime('now'),
+                expires_at = datetime('now', ?3)
+          WHERE dispatcher_node_id = ?1 AND job_id = ?2 AND status = 'ready'",
+        rusqlite::params![dispatcher_node_id, job_id, modifier],
+    )?;
+    Ok(n)
+}
+
+/// Terminal failure CAS: promote `ready → failed`. Stamps `expires_at =
+/// now + failed_retention_secs` so the row is kept for post-mortem visibility
+/// before final cleanup. Returns rowcount — `0` means the row was already
+/// delivered, deleted, or in another state.
+pub fn fleet_outbox_mark_failed_if_ready(
+    conn: &Connection,
+    dispatcher_node_id: &str,
+    job_id: &str,
+    failed_retention_secs: u64,
+) -> Result<usize> {
+    let modifier = format!("+{} seconds", failed_retention_secs);
+    let n = conn.execute(
+        "UPDATE fleet_result_outbox
+            SET status = 'failed',
+                expires_at = datetime('now', ?3)
+          WHERE dispatcher_node_id = ?1 AND job_id = ?2 AND status = 'ready'",
+        rusqlite::params![dispatcher_node_id, job_id, modifier],
+    )?;
+    Ok(n)
+}
+
+/// Record a failed delivery attempt: bump `delivery_attempts`, stamp
+/// `last_attempt_at`, and capture `last_error`. Gated on `status = 'ready'`
+/// so a concurrent `ready → delivered` or `ready → failed` doesn't get
+/// the attempt counter polluted.
+pub fn fleet_outbox_bump_delivery_attempt(
+    conn: &Connection,
+    dispatcher_node_id: &str,
+    job_id: &str,
+    last_error: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE fleet_result_outbox
+            SET last_attempt_at = datetime('now'),
+                last_error = ?3,
+                delivery_attempts = delivery_attempts + 1
+          WHERE dispatcher_node_id = ?1 AND job_id = ?2 AND status = 'ready'",
+        rusqlite::params![dispatcher_node_id, job_id, last_error],
+    )?;
+    Ok(())
+}
+
+/// Two-step `ready → failed` promotion used by Predicate B for the
+/// retries-exhausted path. Rather than writing `failed` directly (which
+/// would duplicate the terminal-state-write machinery), this helper bumps
+/// `expires_at` to one second in the past; Predicate A on its next tick
+/// picks up the row and transitions it via the standard CAS path.
+/// Returns number of rows pushed into the past.
+pub fn fleet_outbox_expire_exhausted(conn: &Connection, max_attempts: u64) -> Result<usize> {
+    // SQLite integers are signed 64-bit; `FleetDeliveryPolicy.max_delivery_attempts`
+    // is `u64`. Cap at `i64::MAX` before the cast — a policy value above that
+    // would saturate rather than wrap. In practice `max_delivery_attempts` is
+    // a small retry budget (default 20), so saturation here is a belt-and-
+    // suspenders guard, not a real operating condition.
+    let max_as_i64: i64 = max_attempts.min(i64::MAX as u64) as i64;
+    let n = conn.execute(
+        "UPDATE fleet_result_outbox
+            SET expires_at = datetime('now', '-1 second')
+          WHERE status = 'ready' AND delivery_attempts >= ?1",
+        rusqlite::params![max_as_i64],
+    )?;
+    Ok(n)
+}
+
+/// Predicate A candidate select: all rows whose `expires_at` is at or before
+/// `now`. Caller branches on `status` for each returned row — `pending` →
+/// synthesize Error and promote to `ready`, `ready` → terminal `failed`,
+/// `delivered`/`failed` → DELETE.
+pub fn fleet_outbox_sweep_expired(conn: &Connection) -> Result<Vec<OutboxRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT dispatcher_node_id, job_id, status, callback_url, result_json,
+                delivery_attempts, last_attempt_at, expires_at
+           FROM fleet_result_outbox
+          WHERE expires_at <= datetime('now')",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(OutboxRow {
+                dispatcher_node_id: r.get(0)?,
+                job_id: r.get(1)?,
+                status: r.get(2)?,
+                callback_url: r.get(3)?,
+                result_json: r.get(4)?,
+                delivery_attempts: r.get(5)?,
+                last_attempt_at: r.get(6)?,
+                expires_at: r.get(7)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Predicate B candidate select: all `ready` rows. The caller computes the
+/// per-row backoff in Rust against `delivery_attempts` and
+/// `last_attempt_at` (exponential backoff formula lives in the sweep loop,
+/// not in SQL).
+pub fn fleet_outbox_retry_candidates(conn: &Connection) -> Result<Vec<OutboxRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT dispatcher_node_id, job_id, status, callback_url, result_json,
+                delivery_attempts, last_attempt_at, expires_at
+           FROM fleet_result_outbox
+          WHERE status = 'ready'",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(OutboxRow {
+                dispatcher_node_id: r.get(0)?,
+                job_id: r.get(1)?,
+                status: r.get(2)?,
+                callback_url: r.get(3)?,
+                result_json: r.get(4)?,
+                delivery_attempts: r.get(5)?,
+                last_attempt_at: r.get(6)?,
+                expires_at: r.get(7)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Synthesizes a `FleetAsyncResult::Error(msg)` payload as JSON, matching the
+/// `#[serde(tag = "kind", content = "data")]` contract on the Phase 2
+/// `FleetAsyncResult` enum. Single source of truth so startup recovery and
+/// the Phase 3 heartbeat-lost sweep stay byte-aligned with the enum's
+/// serialization shape. The message itself is JSON-encoded via `serde_json`
+/// so quotes, backslashes, and other control characters are escaped
+/// correctly.
+pub fn synthesize_worker_error_json(msg: &str) -> String {
+    // `serde_json::to_string` on a `&str` yields the properly-escaped,
+    // quoted JSON string literal — we splice that directly into the object
+    // body to avoid paying for a full `json!` macro round-trip.
+    let escaped = serde_json::to_string(msg).expect("string is always JSON-serializable");
+    format!(r#"{{"kind":"Error","data":{}}}"#, escaped)
+}
+
+/// Startup recovery: convert every `pending` row to `ready` with a synthesized
+/// `FleetAsyncResult::Error` payload so the dispatcher hears about the
+/// worker crash via the normal callback path. `ready` rows are left alone.
+/// Returns number of rows recovered.
+pub fn fleet_outbox_startup_recovery(
+    conn: &Connection,
+    ready_retention_secs: u64,
+) -> Result<usize> {
+    let modifier = format!("+{} seconds", ready_retention_secs);
+    let synth_payload =
+        synthesize_worker_error_json("worker crashed before completion (node restarted)");
+    let n = conn.execute(
+        "UPDATE fleet_result_outbox
+            SET status = 'ready',
+                result_json = ?2,
+                ready_at = datetime('now'),
+                expires_at = datetime('now', ?1),
+                last_error = 'startup recovery'
+          WHERE status = 'pending'",
+        rusqlite::params![modifier, synth_payload],
+    )?;
+    Ok(n)
 }
 
 /// Phase 4 bootstrap: convert every legacy `pyramid_dadbear_config` row
@@ -18408,6 +18837,431 @@ mod phase17_tests {
         assert_eq!(
             config.claude_code_conversation_path,
             "~/.claude/projects".to_string()
+        );
+    }
+
+    // ── Fleet Result Outbox tests ────────────────────────────────────────
+
+    /// Build a fresh in-memory DB with the outbox table present.
+    fn outbox_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        conn
+    }
+
+    /// Far-future ISO-8601 timestamp for rows that MUST NOT be swept in tests.
+    fn future_expires() -> String {
+        "9999-12-31 23:59:59".to_string()
+    }
+
+    #[test]
+    fn test_fleet_outbox_table_creation_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Running init twice must not error — CREATE TABLE IF NOT EXISTS +
+        // CREATE INDEX IF NOT EXISTS are idempotent.
+        init_pyramid_db(&conn).unwrap();
+        init_pyramid_db(&conn).unwrap();
+        // And the table is queryable.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM fleet_result_outbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_fleet_outbox_insert_or_ignore_fresh_vs_duplicate() {
+        let conn = outbox_conn();
+        let expires = future_expires();
+        // Fresh insert returns 1.
+        let n1 =
+            fleet_outbox_insert_or_ignore(&conn, "dispA", "job-1", "https://x/cb", &expires)
+                .unwrap();
+        assert_eq!(n1, 1, "fresh insert should report rowcount=1");
+        // Duplicate PK returns 0.
+        let n2 =
+            fleet_outbox_insert_or_ignore(&conn, "dispA", "job-1", "https://x/cb", &expires)
+                .unwrap();
+        assert_eq!(n2, 0, "duplicate PK should report rowcount=0");
+    }
+
+    #[test]
+    fn test_fleet_outbox_lookup_present_and_missing() {
+        let conn = outbox_conn();
+        let expires = future_expires();
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "job-1", "https://x/cb", &expires).unwrap();
+
+        let found = fleet_outbox_lookup(&conn, "job-1").unwrap();
+        assert!(found.is_some());
+        let lookup = found.unwrap();
+        assert_eq!(lookup.dispatcher_node_id, "dispA");
+        assert_eq!(lookup.status, FLEET_STATUS_PENDING);
+        assert_eq!(lookup.delivery_attempts, 0);
+        assert!(lookup.last_error.is_none());
+
+        let missing = fleet_outbox_lookup(&conn, "nope").unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_fleet_outbox_count_inflight_excluding() {
+        let conn = outbox_conn();
+        let expires = future_expires();
+        // Three in-flight rows, one delivered (should not count).
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "j1", "https://x/cb", &expires).unwrap();
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "j2", "https://x/cb", &expires).unwrap();
+        fleet_outbox_insert_or_ignore(&conn, "dispB", "j3", "https://x/cb", &expires).unwrap();
+        // Move j3 to delivered to confirm it's excluded from the count.
+        fleet_outbox_promote_ready_if_pending(&conn, "dispB", "j3", "{}", 60).unwrap();
+        fleet_outbox_mark_delivered_if_ready(&conn, "dispB", "j3", 3600).unwrap();
+
+        // Count excluding j1 should be 1 (j2 pending; j3 delivered excluded by status).
+        let n = fleet_outbox_count_inflight_excluding(&conn, "dispA", "j1").unwrap();
+        assert_eq!(n, 1);
+
+        // Count excluding j2 should be 1 (j1 pending; j3 delivered).
+        let n = fleet_outbox_count_inflight_excluding(&conn, "dispA", "j2").unwrap();
+        assert_eq!(n, 1);
+
+        // Count excluding a nonexistent key returns all in-flight.
+        let n =
+            fleet_outbox_count_inflight_excluding(&conn, "dispA", "nonexistent").unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn test_fleet_outbox_promote_ready_if_pending_cas() {
+        let conn = outbox_conn();
+        let expires = future_expires();
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "job-1", "https://x/cb", &expires).unwrap();
+
+        // First promotion: row is pending, CAS wins.
+        let n =
+            fleet_outbox_promote_ready_if_pending(&conn, "dispA", "job-1", "{\"kind\":\"Success\"}", 60)
+                .unwrap();
+        assert_eq!(n, 1);
+
+        // Second promotion: row is now ready, CAS loses.
+        let n =
+            fleet_outbox_promote_ready_if_pending(&conn, "dispA", "job-1", "{\"kind\":\"Success\"}", 60)
+                .unwrap();
+        assert_eq!(n, 0);
+
+        // Row missing entirely: CAS returns 0 (not an error).
+        let n =
+            fleet_outbox_promote_ready_if_pending(&conn, "dispA", "missing", "{}", 60).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_fleet_outbox_mark_delivered_if_ready_cas_loses_on_failed() {
+        let conn = outbox_conn();
+        let expires = future_expires();
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "job-1", "https://x/cb", &expires).unwrap();
+        fleet_outbox_promote_ready_if_pending(&conn, "dispA", "job-1", "{}", 60).unwrap();
+        // Force into failed state.
+        fleet_outbox_mark_failed_if_ready(&conn, "dispA", "job-1", 3600).unwrap();
+
+        // Delivery CAS must lose against failed status.
+        let n =
+            fleet_outbox_mark_delivered_if_ready(&conn, "dispA", "job-1", 3600).unwrap();
+        assert_eq!(n, 0, "ready→delivered CAS must lose when row is failed");
+
+        let lookup = fleet_outbox_lookup(&conn, "job-1").unwrap().unwrap();
+        assert_eq!(lookup.status, FLEET_STATUS_FAILED);
+    }
+
+    #[test]
+    fn test_fleet_outbox_heartbeat_cas_non_pending() {
+        let conn = outbox_conn();
+        let expires = future_expires();
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "job-1", "https://x/cb", &expires).unwrap();
+
+        // Heartbeat on pending row: returns 1.
+        let n = fleet_outbox_update_heartbeat_if_pending(
+            &conn,
+            "dispA",
+            "job-1",
+            "2099-01-01 00:00:00",
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+
+        // Transition to ready; heartbeat must now CAS-lose.
+        fleet_outbox_promote_ready_if_pending(&conn, "dispA", "job-1", "{}", 60).unwrap();
+        let n = fleet_outbox_update_heartbeat_if_pending(
+            &conn,
+            "dispA",
+            "job-1",
+            "2099-01-01 00:00:00",
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+
+        // Heartbeat on a missing row: 0, not an error.
+        let n = fleet_outbox_update_heartbeat_if_pending(
+            &conn,
+            "dispA",
+            "missing",
+            "2099-01-01 00:00:00",
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_fleet_outbox_startup_recovery_pending_only() {
+        let conn = outbox_conn();
+        let expires = future_expires();
+        // Two pending rows, one ready row.
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "p1", "https://x/cb", &expires).unwrap();
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "p2", "https://x/cb", &expires).unwrap();
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "r1", "https://x/cb", &expires).unwrap();
+        // Promote r1 to ready with a real result.
+        fleet_outbox_promote_ready_if_pending(
+            &conn,
+            "dispA",
+            "r1",
+            "{\"kind\":\"Success\",\"data\":{\"content\":\"ok\"}}",
+            60,
+        )
+        .unwrap();
+
+        let recovered = fleet_outbox_startup_recovery(&conn, 1800).unwrap();
+        assert_eq!(recovered, 2, "only the 2 pending rows should be recovered");
+
+        // p1 and p2 should now be ready with synth Error JSON.
+        for jid in &["p1", "p2"] {
+            let row: (String, String, Option<String>) = conn
+                .query_row(
+                    "SELECT status, last_error, result_json FROM fleet_result_outbox WHERE job_id = ?1",
+                    rusqlite::params![jid],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(row.0, FLEET_STATUS_READY);
+            assert_eq!(row.1, "startup recovery");
+            let body = row.2.unwrap();
+            assert!(body.contains("\"kind\":\"Error\""));
+            assert!(body.contains("worker crashed before completion"));
+        }
+
+        // r1's result_json must still be the original Success payload.
+        let r1_body: String = conn
+            .query_row(
+                "SELECT result_json FROM fleet_result_outbox WHERE job_id = 'r1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            r1_body.contains("\"kind\":\"Success\""),
+            "ready rows must survive recovery unchanged"
+        );
+    }
+
+    #[test]
+    fn test_fleet_outbox_sweep_expired_returns_matching_rows() {
+        let conn = outbox_conn();
+        // One row already expired (past), one very much not expired (future).
+        fleet_outbox_insert_or_ignore(
+            &conn,
+            "dispA",
+            "expired",
+            "https://x/cb",
+            "1970-01-01 00:00:00",
+        )
+        .unwrap();
+        fleet_outbox_insert_or_ignore(
+            &conn,
+            "dispA",
+            "alive",
+            "https://x/cb",
+            "9999-12-31 23:59:59",
+        )
+        .unwrap();
+
+        let rows = fleet_outbox_sweep_expired(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].job_id, "expired");
+        assert_eq!(rows[0].status, FLEET_STATUS_PENDING);
+    }
+
+    #[test]
+    fn test_fleet_outbox_unique_job_id_rejects_cross_dispatcher_reuse() {
+        let conn = outbox_conn();
+        let expires = future_expires();
+        let n1 =
+            fleet_outbox_insert_or_ignore(&conn, "dispA", "shared-uuid", "https://a/cb", &expires)
+                .unwrap();
+        assert_eq!(n1, 1);
+
+        // Different dispatcher, same job_id. INSERT OR IGNORE turns the
+        // unique-index conflict into a silent no-op, so the rowcount is 0
+        // — the row is NOT created under dispB. The detection mechanism is
+        // the subsequent lookup: callers compare the stored dispatcher_node_id
+        // against their identity and reject with 409 Conflict on mismatch.
+        let n2 = fleet_outbox_insert_or_ignore(
+            &conn,
+            "dispB",
+            "shared-uuid",
+            "https://b/cb",
+            &expires,
+        )
+        .unwrap();
+        assert_eq!(
+            n2, 0,
+            "unique index on job_id must prevent a second insert under a different dispatcher"
+        );
+
+        // Verify the stored row still belongs to dispA — the cross-dispatcher
+        // reuse did NOT overwrite it.
+        let stored = fleet_outbox_lookup(&conn, "shared-uuid").unwrap().unwrap();
+        assert_eq!(stored.dispatcher_node_id, "dispA");
+
+        // And there's exactly one row for this job_id.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fleet_result_outbox WHERE job_id = 'shared-uuid'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_fleet_outbox_bump_delivery_attempt_increments_counter() {
+        let conn = outbox_conn();
+        let expires = future_expires();
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "job-1", "https://x/cb", &expires).unwrap();
+        fleet_outbox_promote_ready_if_pending(&conn, "dispA", "job-1", "{}", 60).unwrap();
+
+        fleet_outbox_bump_delivery_attempt(&conn, "dispA", "job-1", "timeout").unwrap();
+        fleet_outbox_bump_delivery_attempt(&conn, "dispA", "job-1", "5xx").unwrap();
+
+        let lookup = fleet_outbox_lookup(&conn, "job-1").unwrap().unwrap();
+        assert_eq!(lookup.delivery_attempts, 2);
+
+        // And the gating on status=ready is live: a non-ready row doesn't
+        // have its counter bumped.
+        fleet_outbox_mark_delivered_if_ready(&conn, "dispA", "job-1", 3600).unwrap();
+        fleet_outbox_bump_delivery_attempt(&conn, "dispA", "job-1", "nope").unwrap();
+        let lookup_after_delivered =
+            fleet_outbox_lookup(&conn, "job-1").unwrap().unwrap();
+        assert_eq!(
+            lookup_after_delivered.delivery_attempts, 2,
+            "bump must not fire after ready transitions to delivered"
+        );
+    }
+
+    #[test]
+    fn test_synthesize_worker_error_json_escapes_quotes_and_backslashes() {
+        // Plain message — round-trips cleanly.
+        let plain = synthesize_worker_error_json("worker crashed");
+        assert_eq!(plain, r#"{"kind":"Error","data":"worker crashed"}"#);
+
+        // Message with embedded double quotes: serde_json escapes them
+        // with backslash-quote. The final string must parse back as valid
+        // JSON matching the kind/data contract.
+        let with_quotes = synthesize_worker_error_json("hello \"world\"");
+        assert_eq!(
+            with_quotes,
+            r#"{"kind":"Error","data":"hello \"world\""}"#,
+            "quotes must be escaped, not copied raw"
+        );
+
+        // Round-trip through serde_json to prove the output is always
+        // well-formed JSON that preserves the original message verbatim.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&with_quotes).expect("synth output must be valid JSON");
+        assert_eq!(parsed["kind"], "Error");
+        assert_eq!(parsed["data"], "hello \"world\"");
+
+        // Backslash, newline, tab — all common escape vectors.
+        let tricky = synthesize_worker_error_json("a\\b\nc\td");
+        let parsed_tricky: serde_json::Value =
+            serde_json::from_str(&tricky).expect("synth output with escapes must be valid JSON");
+        assert_eq!(parsed_tricky["data"], "a\\b\nc\td");
+    }
+
+    #[test]
+    fn test_fleet_outbox_expire_exhausted_only_ready_rows() {
+        let conn = outbox_conn();
+        let expires = future_expires();
+        // One ready row at max attempts, one ready row below, one pending
+        // row (irrelevant; below is the key invariant).
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "exhausted", "https://x/cb", &expires)
+            .unwrap();
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "below", "https://x/cb", &expires).unwrap();
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "pending", "https://x/cb", &expires).unwrap();
+
+        fleet_outbox_promote_ready_if_pending(&conn, "dispA", "exhausted", "{}", 600).unwrap();
+        fleet_outbox_promote_ready_if_pending(&conn, "dispA", "below", "{}", 600).unwrap();
+
+        // Bump exhausted row to 5 attempts.
+        for _ in 0..5 {
+            fleet_outbox_bump_delivery_attempt(&conn, "dispA", "exhausted", "err").unwrap();
+        }
+
+        // max_attempts=5 should push only 'exhausted' into the past.
+        let n = fleet_outbox_expire_exhausted(&conn, 5).unwrap();
+        assert_eq!(n, 1);
+
+        // Sweep now catches only the exhausted row.
+        let rows = fleet_outbox_sweep_expired(&conn).unwrap();
+        let job_ids: Vec<_> = rows.iter().map(|r| r.job_id.as_str()).collect();
+        assert!(job_ids.contains(&"exhausted"));
+        assert!(!job_ids.contains(&"below"));
+        assert!(!job_ids.contains(&"pending"));
+    }
+
+    #[test]
+    fn test_fleet_views_migration_uses_new_event_types() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Running init twice verifies DROP VIEW IF EXISTS + CREATE runs cleanly
+        // on upgrade: the first init installs the view, the second init drops
+        // and recreates it without error.
+        init_pyramid_db(&conn).unwrap();
+        init_pyramid_db(&conn).unwrap();
+
+        let peers_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='view' AND name='v_compute_fleet_peers'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            peers_sql.contains("fleet_dispatched_async"),
+            "v_compute_fleet_peers must reference the new event_type name"
+        );
+        assert!(
+            peers_sql.contains("fleet_result_received"),
+            "v_compute_fleet_peers must reference the new success event_type"
+        );
+        assert!(
+            !peers_sql.contains("'fleet_dispatched'"),
+            "v_compute_fleet_peers must not reference the old event_type 'fleet_dispatched'"
+        );
+        assert!(
+            !peers_sql.contains("'fleet_returned'"),
+            "v_compute_fleet_peers must not reference the old event_type 'fleet_returned'"
+        );
+
+        let by_source_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='view' AND name='v_compute_by_source'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            by_source_sql.contains("fleet_result_received"),
+            "v_compute_by_source must reference the new event_type name"
+        );
+        assert!(
+            !by_source_sql.contains("'fleet_returned'"),
+            "v_compute_by_source must not reference the old event_type 'fleet_returned'"
         );
     }
 }

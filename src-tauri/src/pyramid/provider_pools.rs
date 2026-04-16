@@ -171,7 +171,7 @@ mod tests {
     };
 
     fn test_policy() -> DispatchPolicy {
-        let mut pool_configs = HashMap::new();
+        let mut pool_configs = std::collections::BTreeMap::new();
         pool_configs.insert(
             "ollama".into(),
             ProviderPoolConfig {

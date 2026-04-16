@@ -1,0 +1,31 @@
+# Fleet Delivery Policy — seed values for async fleet dispatch.
+# Loaded at first boot by main.rs (Init Ordering step 8).
+# Operators tune at runtime via contribution supersession.
+# See docs/plans/async-fleet-dispatch.md § "Operational Policy" for field semantics.
+schema_type: fleet_delivery_policy
+version: 1
+
+# Dispatcher side
+dispatch_ack_timeout_secs: 10
+timeout_grace_secs: 2
+orphan_sweep_interval_secs: 30
+orphan_sweep_multiplier: 2
+
+# Peer side
+callback_post_timeout_secs: 30
+outbox_sweep_interval_secs: 15
+worker_heartbeat_interval_secs: 10
+worker_heartbeat_tolerance_secs: 30
+backoff_base_secs: 1
+backoff_cap_secs: 64
+max_delivery_attempts: 20
+ready_retention_secs: 1800
+delivered_retention_secs: 3600
+failed_retention_secs: 604800
+
+# Admission control
+max_inflight_jobs: 32
+admission_retry_after_secs: 30
+
+# Peer discovery
+peer_staleness_secs: 120

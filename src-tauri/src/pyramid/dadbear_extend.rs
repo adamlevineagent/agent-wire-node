@@ -1185,6 +1185,7 @@ mod tests {
             enabled: true,
             created_at: String::new(),
             updated_at: String::new(),
+            last_scan_at: None,
         }
     }
 
@@ -2042,6 +2043,7 @@ mod tests {
                 enabled: true,
                 created_at: String::new(),
                 updated_at: String::new(),
+                last_scan_at: None,
             };
             db::save_dadbear_config(&conn, &cfg).unwrap()
         };
@@ -2155,6 +2157,7 @@ mod tests {
                 enabled: true,
                 created_at: String::new(),
                 updated_at: String::new(),
+                last_scan_at: None,
             };
             db::save_dadbear_config(&conn, &cfg).unwrap();
         }
