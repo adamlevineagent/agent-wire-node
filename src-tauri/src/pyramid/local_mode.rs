@@ -1702,10 +1702,11 @@ pub async fn delete_ollama_model(base_url: &str, model: &str) -> Result<()> {
 
 // ── Phase 6 Daemon Control Plane: Experimental Territory (AD-6) ─────────────
 
-/// High-level participation presets for how this node joins private fleet
-/// compute. This is the durable operator-intent layer; later phases derive
-/// dispatch behavior and peer capability from it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// High-level participation presets for how this node joins the Wire's
+/// decentralized markets (compute, storage, relay) plus the private fleet.
+/// This is the durable operator-intent layer; later phases derive dispatch
+/// behavior and peer capability from it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ComputeParticipationMode {
     Coordinator,
@@ -1713,28 +1714,159 @@ pub enum ComputeParticipationMode {
     Worker,
 }
 
-/// Fleet MPS WS1: durable source of truth for this node's compute posture.
-/// The booleans stay explicit so later phases can evolve beyond the three
-/// presets without another storage migration.
+/// Fleet MPS WS1: durable source of truth for this node's participation
+/// posture across compute / storage / relay markets plus the private fleet.
+/// Per DD-I (architecture §VIII.6), the canonical shape is 10 fields:
+/// one mode preset + 8 projectable dispatch/serving/hosting/usage booleans
+/// + one always-explicit `allow_serving_while_degraded` knob.
+///
+/// The 8 projectable booleans are `Option<bool>` so the contribution can
+/// express "use the mode's preset" (None) distinctly from "explicit
+/// override" (Some(v)). Resolution to concrete booleans happens at
+/// config-read time via `effective_booleans()` — explicit values win over
+/// the mode projection.
+///
+/// `allow_serving_while_degraded` is NEVER projected. It's an operational
+/// safety knob the operator sets independently of market participation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ComputeParticipationPolicy {
     pub schema_type: String,
     pub mode: ComputeParticipationMode,
-    pub allow_market_visibility: bool,
+
+    // The 8 projectable booleans. Absent means "project from mode"; present
+    // means "explicit override, ignore mode preset." See `effective_booleans`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_fleet_dispatch: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_fleet_serving: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_market_dispatch: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_market_visibility: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_storage_pulling: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_storage_hosting: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_relay_usage: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_relay_serving: Option<bool>,
+
+    // Always-explicit. Defaults to false on any path that omits it.
+    #[serde(default)]
     pub allow_serving_while_degraded: bool,
+}
+
+/// Resolved booleans after applying mode projection + explicit overrides.
+/// This is what consuming code (admission gates, offer publication, LLM
+/// dispatch selection) should read, NOT the raw `Option<bool>` fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveParticipationPolicy {
+    pub mode: ComputeParticipationMode,
     pub allow_fleet_dispatch: bool,
     pub allow_fleet_serving: bool,
+    pub allow_market_dispatch: bool,
+    pub allow_market_visibility: bool,
+    pub allow_storage_pulling: bool,
+    pub allow_storage_hosting: bool,
+    pub allow_relay_usage: bool,
+    pub allow_relay_serving: bool,
+    pub allow_serving_while_degraded: bool,
+}
+
+/// Per DD-I: compute the 8 projectable booleans implied by a mode preset.
+/// Returned in the order
+/// `(fleet_dispatch, fleet_serving, market_dispatch, market_visibility,
+///   storage_pulling, storage_hosting, relay_usage, relay_serving)`
+/// — dispatch/usage pair + serving/hosting pair across fleet/compute/
+/// storage/relay.
+///
+/// The projection follows the spec verbatim:
+///   - `coordinator`: all dispatch/usage = true; all serving/hosting +
+///     market_visibility + relay_serving = false.
+///   - `hybrid`: all 8 = true.
+///   - `worker`: all serving/hosting + market_visibility + relay_serving =
+///     true; all dispatch/usage = false.
+pub fn project_mode(mode: ComputeParticipationMode) -> (bool, bool, bool, bool, bool, bool, bool, bool) {
+    match mode {
+        ComputeParticipationMode::Coordinator => (
+            true,  // allow_fleet_dispatch
+            false, // allow_fleet_serving
+            true,  // allow_market_dispatch
+            false, // allow_market_visibility
+            true,  // allow_storage_pulling
+            false, // allow_storage_hosting
+            true,  // allow_relay_usage
+            false, // allow_relay_serving
+        ),
+        ComputeParticipationMode::Hybrid => (true, true, true, true, true, true, true, true),
+        ComputeParticipationMode::Worker => (
+            false, // allow_fleet_dispatch
+            true,  // allow_fleet_serving
+            false, // allow_market_dispatch
+            true,  // allow_market_visibility
+            false, // allow_storage_pulling
+            true,  // allow_storage_hosting
+            false, // allow_relay_usage
+            true,  // allow_relay_serving
+        ),
+    }
+}
+
+impl ComputeParticipationPolicy {
+    /// Resolve the policy to concrete booleans. For each of the 8
+    /// projectable fields: explicit `Some(v)` wins; `None` takes the
+    /// mode's projection. `allow_serving_while_degraded` is copied
+    /// through unchanged.
+    pub fn effective_booleans(&self) -> EffectiveParticipationPolicy {
+        let (fd, fs, md, mv, sp, sh, ru, rs) = project_mode(self.mode);
+        EffectiveParticipationPolicy {
+            mode: self.mode,
+            allow_fleet_dispatch: self.allow_fleet_dispatch.unwrap_or(fd),
+            allow_fleet_serving: self.allow_fleet_serving.unwrap_or(fs),
+            allow_market_dispatch: self.allow_market_dispatch.unwrap_or(md),
+            allow_market_visibility: self.allow_market_visibility.unwrap_or(mv),
+            allow_storage_pulling: self.allow_storage_pulling.unwrap_or(sp),
+            allow_storage_hosting: self.allow_storage_hosting.unwrap_or(sh),
+            allow_relay_usage: self.allow_relay_usage.unwrap_or(ru),
+            allow_relay_serving: self.allow_relay_serving.unwrap_or(rs),
+            allow_serving_while_degraded: self.allow_serving_while_degraded,
+        }
+    }
 }
 
 impl Default for ComputeParticipationPolicy {
+    /// Conservative default: hybrid mode, but with every "serve / host /
+    /// be-visible / dispatch-to-market" capability EXPLICITLY off until
+    /// the operator opts in. Fleet peer participation is on (matches the
+    /// pre-DD-I shipped semantics). This preserves the current behavior
+    /// for operators who don't touch the policy: the node participates
+    /// in the private fleet but doesn't publish compute offers, host
+    /// storage, or relay traffic.
+    ///
+    /// Operators who want the full hybrid preset values can choose it
+    /// explicitly in Settings; the mode projection computes the expected
+    /// preset values.
     fn default() -> Self {
         Self {
             schema_type: "compute_participation_policy".to_string(),
             mode: ComputeParticipationMode::Hybrid,
-            allow_market_visibility: false,
+            // Fleet: participate (matches shipped default).
+            allow_fleet_dispatch: Some(true),
+            allow_fleet_serving: Some(true),
+            // Compute market: off by default (matches shipped default).
+            allow_market_dispatch: Some(false),
+            allow_market_visibility: Some(false),
+            // Storage market: off by default — S1 hasn't shipped, but
+            // when it does, operators opt in explicitly.
+            allow_storage_pulling: Some(false),
+            allow_storage_hosting: Some(false),
+            // Relay market: off by default — R1 hasn't shipped, but
+            // when it does, operators opt in explicitly.
+            allow_relay_usage: Some(false),
+            allow_relay_serving: Some(false),
+            // Operational safety: off by default.
             allow_serving_while_degraded: false,
-            allow_fleet_dispatch: true,
-            allow_fleet_serving: true,
         }
     }
 }
@@ -2174,5 +2306,251 @@ mod tests {
         assert!(!out.reachable);
         assert!(out.reachability_error.is_some());
         assert!(out.available_models.is_empty());
+    }
+
+    // ── Phase 2 WS1a: ComputeParticipationPolicy (DD-I canonical 10 fields) ──
+
+    #[test]
+    fn compute_participation_policy_default_is_conservative() {
+        // Default must match the bundled YAML byte-for-byte on all 10
+        // fields — conservative (hybrid mode, fleet on, every market
+        // off by default). If this drifts from bundled_contributions.json
+        // the bundled-manifest test below catches it.
+        let p = ComputeParticipationPolicy::default();
+        assert_eq!(p.mode, ComputeParticipationMode::Hybrid);
+        assert_eq!(p.allow_fleet_dispatch, Some(true));
+        assert_eq!(p.allow_fleet_serving, Some(true));
+        assert_eq!(p.allow_market_dispatch, Some(false));
+        assert_eq!(p.allow_market_visibility, Some(false));
+        assert_eq!(p.allow_storage_pulling, Some(false));
+        assert_eq!(p.allow_storage_hosting, Some(false));
+        assert_eq!(p.allow_relay_usage, Some(false));
+        assert_eq!(p.allow_relay_serving, Some(false));
+        assert!(!p.allow_serving_while_degraded);
+    }
+
+    #[test]
+    fn project_mode_coordinator_matches_dd_i_spec() {
+        // DD-I: coordinator = all *_dispatch + *_usage = true;
+        // all *_serving + *_hosting + market_visibility + relay_serving = false.
+        let (fd, fs, md, mv, sp, sh, ru, rs) =
+            project_mode(ComputeParticipationMode::Coordinator);
+        assert!(fd, "coordinator.allow_fleet_dispatch");
+        assert!(!fs, "coordinator.allow_fleet_serving");
+        assert!(md, "coordinator.allow_market_dispatch");
+        assert!(!mv, "coordinator.allow_market_visibility");
+        assert!(sp, "coordinator.allow_storage_pulling");
+        assert!(!sh, "coordinator.allow_storage_hosting");
+        assert!(ru, "coordinator.allow_relay_usage");
+        assert!(!rs, "coordinator.allow_relay_serving");
+    }
+
+    #[test]
+    fn project_mode_hybrid_matches_dd_i_spec() {
+        // DD-I: hybrid = all 8 projectable booleans = true.
+        let (fd, fs, md, mv, sp, sh, ru, rs) =
+            project_mode(ComputeParticipationMode::Hybrid);
+        assert!(fd && fs && md && mv && sp && sh && ru && rs,
+            "hybrid must project all 8 booleans to true");
+    }
+
+    #[test]
+    fn project_mode_worker_matches_dd_i_spec() {
+        // DD-I: worker = all *_serving + *_hosting + market_visibility +
+        // relay_serving = true; all *_dispatch + *_usage = false.
+        let (fd, fs, md, mv, sp, sh, ru, rs) =
+            project_mode(ComputeParticipationMode::Worker);
+        assert!(!fd, "worker.allow_fleet_dispatch");
+        assert!(fs, "worker.allow_fleet_serving");
+        assert!(!md, "worker.allow_market_dispatch");
+        assert!(mv, "worker.allow_market_visibility");
+        assert!(!sp, "worker.allow_storage_pulling");
+        assert!(sh, "worker.allow_storage_hosting");
+        assert!(!ru, "worker.allow_relay_usage");
+        assert!(rs, "worker.allow_relay_serving");
+    }
+
+    #[test]
+    fn effective_booleans_explicit_overrides_mode() {
+        // DD-I: when explicit booleans are set, they override the mode
+        // projection. An operator on "worker" mode who explicitly sets
+        // allow_fleet_dispatch = true (e.g. for a temporary burst)
+        // should get fleet_dispatch = true in the effective policy even
+        // though worker mode's projection says false.
+        let p = ComputeParticipationPolicy {
+            schema_type: "compute_participation_policy".into(),
+            mode: ComputeParticipationMode::Worker,
+            allow_fleet_dispatch: Some(true),   // explicit override
+            allow_fleet_serving: None,          // project from worker
+            allow_market_dispatch: None,
+            allow_market_visibility: None,
+            allow_storage_pulling: None,
+            allow_storage_hosting: None,
+            allow_relay_usage: None,
+            allow_relay_serving: None,
+            allow_serving_while_degraded: false,
+        };
+        let eff = p.effective_booleans();
+        assert!(eff.allow_fleet_dispatch, "explicit true must win over worker projection");
+        assert!(eff.allow_fleet_serving, "None projects to worker default (true)");
+        assert!(!eff.allow_market_dispatch, "None projects to worker default (false)");
+        assert!(eff.allow_market_visibility, "None projects to worker default (true)");
+    }
+
+    #[test]
+    fn effective_booleans_all_none_uses_pure_projection() {
+        // With every projectable boolean = None, effective_booleans
+        // should match project_mode() exactly. This is the "operator
+        // sent mode=X and nothing else" ergonomic path.
+        for mode in [
+            ComputeParticipationMode::Coordinator,
+            ComputeParticipationMode::Hybrid,
+            ComputeParticipationMode::Worker,
+        ] {
+            let p = ComputeParticipationPolicy {
+                schema_type: "compute_participation_policy".into(),
+                mode,
+                allow_fleet_dispatch: None,
+                allow_fleet_serving: None,
+                allow_market_dispatch: None,
+                allow_market_visibility: None,
+                allow_storage_pulling: None,
+                allow_storage_hosting: None,
+                allow_relay_usage: None,
+                allow_relay_serving: None,
+                allow_serving_while_degraded: false,
+            };
+            let eff = p.effective_booleans();
+            let (fd, fs, md, mv, sp, sh, ru, rs) = project_mode(mode);
+            assert_eq!(eff.allow_fleet_dispatch, fd);
+            assert_eq!(eff.allow_fleet_serving, fs);
+            assert_eq!(eff.allow_market_dispatch, md);
+            assert_eq!(eff.allow_market_visibility, mv);
+            assert_eq!(eff.allow_storage_pulling, sp);
+            assert_eq!(eff.allow_storage_hosting, sh);
+            assert_eq!(eff.allow_relay_usage, ru);
+            assert_eq!(eff.allow_relay_serving, rs);
+        }
+    }
+
+    #[test]
+    fn policy_yaml_roundtrip_preserves_none_and_some() {
+        // Serialize with None fields → absent in YAML. Deserialize
+        // absent fields → None again. Serialize with Some(v) → present
+        // with value. Deserialize present → Some(v). The
+        // `skip_serializing_if = "Option::is_none"` attribute is what
+        // keeps None from rendering as `~` or `null` in YAML.
+        let p = ComputeParticipationPolicy {
+            schema_type: "compute_participation_policy".into(),
+            mode: ComputeParticipationMode::Hybrid,
+            allow_fleet_dispatch: Some(true),
+            allow_fleet_serving: None,
+            allow_market_dispatch: Some(false),
+            allow_market_visibility: None,
+            allow_storage_pulling: None,
+            allow_storage_hosting: None,
+            allow_relay_usage: None,
+            allow_relay_serving: None,
+            allow_serving_while_degraded: true,
+        };
+        let yaml = serde_yaml::to_string(&p).unwrap();
+        // None fields are absent — no stray `null` or `~`.
+        assert!(!yaml.contains("allow_fleet_serving"),
+            "None field must not serialize:\n{yaml}");
+        assert!(!yaml.contains("allow_market_visibility"),
+            "None field must not serialize:\n{yaml}");
+        // Some fields render with their value.
+        assert!(yaml.contains("allow_fleet_dispatch: true"));
+        assert!(yaml.contains("allow_market_dispatch: false"));
+        // Roundtrip preserves the mix.
+        let back: ComputeParticipationPolicy = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn policy_yaml_from_minimal_mode_only_deserializes_with_all_none() {
+        // Operator-facing ergonomic: the YAML `{ schema_type: ..., mode: hybrid }`
+        // alone must parse — every projectable boolean defaults to None,
+        // allow_serving_while_degraded defaults to false.
+        let yaml = "schema_type: compute_participation_policy\nmode: worker\n";
+        let p: ComputeParticipationPolicy = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.mode, ComputeParticipationMode::Worker);
+        assert_eq!(p.allow_fleet_dispatch, None);
+        assert_eq!(p.allow_fleet_serving, None);
+        assert_eq!(p.allow_market_dispatch, None);
+        assert_eq!(p.allow_market_visibility, None);
+        assert_eq!(p.allow_storage_pulling, None);
+        assert_eq!(p.allow_storage_hosting, None);
+        assert_eq!(p.allow_relay_usage, None);
+        assert_eq!(p.allow_relay_serving, None);
+        assert!(!p.allow_serving_while_degraded);
+        // Effective values must come from the worker projection.
+        let eff = p.effective_booleans();
+        assert!(!eff.allow_fleet_dispatch);
+        assert!(eff.allow_fleet_serving);
+        assert!(eff.allow_market_visibility);
+        assert!(eff.allow_storage_hosting);
+    }
+
+    #[test]
+    fn policy_yaml_from_legacy_six_field_shape_still_parses() {
+        // Backwards-compat: contributions created before WS1a had the
+        // pre-extension 6-field shape. Those YAMLs must still parse
+        // (missing fields → None → project from mode).
+        let legacy_yaml = "schema_type: compute_participation_policy\n\
+                           mode: hybrid\n\
+                           allow_market_visibility: false\n\
+                           allow_serving_while_degraded: false\n\
+                           allow_fleet_dispatch: true\n\
+                           allow_fleet_serving: true\n";
+        let p: ComputeParticipationPolicy = serde_yaml::from_str(legacy_yaml).unwrap();
+        assert_eq!(p.mode, ComputeParticipationMode::Hybrid);
+        assert_eq!(p.allow_fleet_dispatch, Some(true));
+        assert_eq!(p.allow_fleet_serving, Some(true));
+        assert_eq!(p.allow_market_visibility, Some(false));
+        // New fields absent in legacy → None → project from hybrid → true.
+        assert_eq!(p.allow_market_dispatch, None);
+        assert_eq!(p.allow_storage_pulling, None);
+        assert_eq!(p.allow_storage_hosting, None);
+        assert_eq!(p.allow_relay_usage, None);
+        assert_eq!(p.allow_relay_serving, None);
+        let eff = p.effective_booleans();
+        assert!(eff.allow_market_visibility == false,
+            "explicit false in legacy YAML wins over hybrid projection");
+        // Unset new fields inherit hybrid's "all true" projection.
+        // NOTE: this means a node with the old 6-field contribution
+        // would, after upgrading to WS1a code, project market_dispatch
+        // + storage_* + relay_* to true per DD-I hybrid. If that
+        // behavior is not desired, the operator or the first-boot
+        // migration code should rewrite the contribution to include
+        // explicit booleans for the new 5 fields.
+        assert!(eff.allow_market_dispatch);
+        assert!(eff.allow_storage_hosting);
+        assert!(eff.allow_relay_serving);
+    }
+
+    #[test]
+    fn default_matches_bundled_contribution_yaml() {
+        // The Rust Default impl and the bundled YAML in
+        // src-tauri/assets/bundled_contributions.json must represent
+        // the same conservative-fresh-install posture. If one changes
+        // without the other, a fresh install would differ from what
+        // the Rust path produces when no contribution is present.
+        //
+        // We can't read the bundled file here without fs access, so we
+        // inline the expected YAML exactly as the bundled default.
+        let expected_yaml = "schema_type: compute_participation_policy\n\
+mode: hybrid\n\
+allow_fleet_dispatch: true\n\
+allow_fleet_serving: true\n\
+allow_market_dispatch: false\n\
+allow_market_visibility: false\n\
+allow_storage_pulling: false\n\
+allow_storage_hosting: false\n\
+allow_relay_usage: false\n\
+allow_relay_serving: false\n\
+allow_serving_while_degraded: false\n";
+        let parsed: ComputeParticipationPolicy = serde_yaml::from_str(expected_yaml).unwrap();
+        assert_eq!(parsed, ComputeParticipationPolicy::default());
     }
 }

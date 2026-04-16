@@ -36,49 +36,108 @@ interface UpdateInfo {
 
 type ComputeParticipationMode = "coordinator" | "hybrid" | "worker";
 
+// Mirrors the Rust `ComputeParticipationPolicy` at src-tauri/src/pyramid/
+// local_mode.rs. The 8 projectable booleans may be null/absent on the
+// wire — the Rust side projects them from `mode` at read time per DD-I.
+// The UI always sends explicit booleans so there's no ambiguity when
+// the operator has tuned a mode button; see `policyForMode` below.
 interface ComputeParticipationPolicy {
     schema_type: "compute_participation_policy";
     mode: ComputeParticipationMode;
-    allow_market_visibility: boolean;
+    allow_fleet_dispatch: boolean | null;
+    allow_fleet_serving: boolean | null;
+    allow_market_dispatch: boolean | null;
+    allow_market_visibility: boolean | null;
+    allow_storage_pulling: boolean | null;
+    allow_storage_hosting: boolean | null;
+    allow_relay_usage: boolean | null;
+    allow_relay_serving: boolean | null;
     allow_serving_while_degraded: boolean;
-    allow_fleet_dispatch: boolean;
-    allow_fleet_serving: boolean;
 }
 
+// Conservative default matching the Rust `Default` impl + bundled
+// default YAML: hybrid mode, fleet on, every market off until the
+// operator opts in.
 const defaultComputeParticipationPolicy: ComputeParticipationPolicy = {
     schema_type: "compute_participation_policy",
     mode: "hybrid",
-    allow_market_visibility: false,
-    allow_serving_while_degraded: false,
     allow_fleet_dispatch: true,
     allow_fleet_serving: true,
+    allow_market_dispatch: false,
+    allow_market_visibility: false,
+    allow_storage_pulling: false,
+    allow_storage_hosting: false,
+    allow_relay_usage: false,
+    allow_relay_serving: false,
+    allow_serving_while_degraded: false,
 };
 
 const roleDescriptions: Record<ComputeParticipationMode, { label: string; description: string }> = {
     coordinator: {
         label: "Coordinator",
-        description: "Can dispatch work to fleet peers, but does not advertise itself as a serving worker.",
+        description: "Dispatches work out (to fleet peers, market, storage, relay) but does not serve any inbound requests.",
     },
     hybrid: {
         label: "Hybrid",
-        description: "Can both dispatch work and serve private fleet compute.",
+        description: "Full participation — dispatches out AND serves across fleet, compute, storage, and relay markets.",
     },
     worker: {
         label: "Worker",
-        description: "Serves private fleet compute, but should not dispatch stale or local work outward.",
+        description: "Serves inbound requests (fleet, compute, storage hosting, relay forwarding) but does not dispatch outward.",
     },
 };
 
+// Apply the DD-I mode projection across all 8 projectable booleans.
+// Operator clicking a mode button wants "the canonical preset" — this
+// sets all 8 explicitly, so the saved contribution has no projected
+// fields and the Rust read path has no ambiguity. The operator can
+// then un-tune any specific field from Settings detail if we add that
+// UI later.
 function policyForMode(
     mode: ComputeParticipationMode,
     prior: ComputeParticipationPolicy,
 ): ComputeParticipationPolicy {
-    return {
-        ...prior,
-        mode,
-        allow_fleet_dispatch: mode !== "worker",
-        allow_fleet_serving: mode !== "coordinator",
-    };
+    switch (mode) {
+        case "coordinator":
+            return {
+                ...prior,
+                mode,
+                allow_fleet_dispatch: true,
+                allow_fleet_serving: false,
+                allow_market_dispatch: true,
+                allow_market_visibility: false,
+                allow_storage_pulling: true,
+                allow_storage_hosting: false,
+                allow_relay_usage: true,
+                allow_relay_serving: false,
+            };
+        case "hybrid":
+            return {
+                ...prior,
+                mode,
+                allow_fleet_dispatch: true,
+                allow_fleet_serving: true,
+                allow_market_dispatch: true,
+                allow_market_visibility: true,
+                allow_storage_pulling: true,
+                allow_storage_hosting: true,
+                allow_relay_usage: true,
+                allow_relay_serving: true,
+            };
+        case "worker":
+            return {
+                ...prior,
+                mode,
+                allow_fleet_dispatch: false,
+                allow_fleet_serving: true,
+                allow_market_dispatch: false,
+                allow_market_visibility: true,
+                allow_storage_pulling: false,
+                allow_storage_hosting: true,
+                allow_relay_usage: false,
+                allow_relay_serving: true,
+            };
+    }
 }
 
 // --- Component --------------------------------------------------------------

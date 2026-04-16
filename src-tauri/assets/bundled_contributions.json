@@ -204,19 +204,19 @@
       "triggering_note": "Bundled default wire_update_polling (wire-node v0.2.0)"
     },
     {
-      "contribution_id": "bundled-schema_definition-compute_participation_policy-v1",
+      "contribution_id": "bundled-schema_definition-compute_participation_policy-v2",
       "schema_type": "schema_definition",
       "slug": "compute_participation_policy",
-      "yaml_content": "{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"title\":\"Compute Participation Policy\",\"type\":\"object\",\"required\":[\"schema_type\",\"mode\"],\"properties\":{\"schema_type\":{\"type\":\"string\",\"const\":\"compute_participation_policy\"},\"mode\":{\"type\":\"string\",\"enum\":[\"coordinator\",\"hybrid\",\"worker\"]},\"allow_market_visibility\":{\"type\":\"boolean\"},\"allow_serving_while_degraded\":{\"type\":\"boolean\"},\"allow_fleet_dispatch\":{\"type\":\"boolean\"},\"allow_fleet_serving\":{\"type\":\"boolean\"}}}",
-      "triggering_note": "Bundled JSON schema for compute_participation_policy (wire-node v0.3.0)",
+      "yaml_content": "{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"title\":\"Compute Participation Policy\",\"type\":\"object\",\"required\":[\"schema_type\",\"mode\"],\"properties\":{\"schema_type\":{\"type\":\"string\",\"const\":\"compute_participation_policy\"},\"mode\":{\"type\":\"string\",\"enum\":[\"coordinator\",\"hybrid\",\"worker\"]},\"allow_fleet_dispatch\":{\"type\":\"boolean\",\"description\":\"Send work to fleet peers. Null means project from mode.\"},\"allow_fleet_serving\":{\"type\":\"boolean\",\"description\":\"Accept work from fleet peers. Null means project from mode.\"},\"allow_market_dispatch\":{\"type\":\"boolean\",\"description\":\"Send work to the compute market. Null means project from mode.\"},\"allow_market_visibility\":{\"type\":\"boolean\",\"description\":\"Publish compute offers + accept compute market jobs. Null means project from mode.\"},\"allow_storage_pulling\":{\"type\":\"boolean\",\"description\":\"Initiate document pulls from the storage market. Null means project from mode.\"},\"allow_storage_hosting\":{\"type\":\"boolean\",\"description\":\"Publish storage offers + host documents. Null means project from mode.\"},\"allow_relay_usage\":{\"type\":\"boolean\",\"description\":\"Request relay chains for own dispatch. Null means project from mode.\"},\"allow_relay_serving\":{\"type\":\"boolean\",\"description\":\"Accept relay forwards from the network. Null means project from mode.\"},\"allow_serving_while_degraded\":{\"type\":\"boolean\",\"description\":\"Accept work when health_status=degraded. Operator-configurable, never projected from mode.\"}}}",
+      "triggering_note": "Bundled JSON schema for compute_participation_policy v2 (10-field DD-I canonical — wire-node Phase 2 WS1a)",
       "applies_to": "compute_participation_policy"
     },
     {
-      "contribution_id": "bundled-compute_participation_policy-default-v1",
+      "contribution_id": "bundled-compute_participation_policy-default-v2",
       "schema_type": "compute_participation_policy",
       "slug": null,
-      "yaml_content": "schema_type: compute_participation_policy\n# Default to current fleet semantics: nodes can both dispatch to\n# fleet peers and serve fleet work until the operator chooses a more\n# specialized role.\nmode: hybrid\nallow_market_visibility: false\nallow_serving_while_degraded: false\nallow_fleet_dispatch: true\nallow_fleet_serving: true\n",
-      "triggering_note": "Bundled default compute_participation_policy (wire-node v0.3.0)"
+      "yaml_content": "schema_type: compute_participation_policy\n# Conservative default per DD-I (architecture §VIII.6): hybrid mode with\n# every market-facing capability EXPLICITLY off until the operator opts in.\n# Fleet participation is on (matches pre-DD-I shipped semantics).\n#\n# Operators who want the full hybrid preset (all capabilities on) can\n# choose that in Settings; the mode projection will fill in true values\n# wherever these explicit overrides are removed.\nmode: hybrid\n# Fleet: participate.\nallow_fleet_dispatch: true\nallow_fleet_serving: true\n# Compute market: off until operator opts in (Phase 2).\nallow_market_dispatch: false\nallow_market_visibility: false\n# Storage market: off until operator opts in (S1, not yet shipped).\nallow_storage_pulling: false\nallow_storage_hosting: false\n# Relay market: off until operator opts in (R1, not yet shipped).\nallow_relay_usage: false\nallow_relay_serving: false\n# Operational safety: off by default.\nallow_serving_while_degraded: false\n",
+      "triggering_note": "Bundled default compute_participation_policy v2 (10-field DD-I canonical — wire-node Phase 2 WS1a)"
     },
 
     {
