@@ -598,8 +598,10 @@ pub enum CallbackValidationError {
     PathMismatch,
     /// URL failed to parse as a valid tunnel URL.
     UnparseableUrl,
-    /// `CallbackKind` variant is reserved for a future workstream.
-    KindNotImplemented,
+    /// URL scheme is not HTTPS (MarketStandard/Relay variants).
+    SchemeNotHttps,
+    /// URL host is missing or empty (MarketStandard/Relay variants).
+    MissingHost,
 }
 
 impl std::fmt::Display for CallbackValidationError {
@@ -617,8 +619,11 @@ impl std::fmt::Display for CallbackValidationError {
             CallbackValidationError::UnparseableUrl => {
                 write!(f, "callback_url: failed to parse as tunnel URL")
             }
-            CallbackValidationError::KindNotImplemented => {
-                write!(f, "callback_url: kind not implemented yet")
+            CallbackValidationError::SchemeNotHttps => {
+                write!(f, "callback_url: scheme must be https")
+            }
+            CallbackValidationError::MissingHost => {
+                write!(f, "callback_url: host is missing or empty")
             }
         }
     }
@@ -657,8 +662,63 @@ pub fn validate_callback_url(
             Ok(())
         }
         CallbackKind::MarketStandard | CallbackKind::Relay => {
-            Err(CallbackValidationError::KindNotImplemented)
+            // JWT-gated variants (per architecture §VIII.6 DD-D / DD-Q):
+            // no roster check because the Wire is not a peer and relay hops
+            // may be operated by any third party. URL validation enforces
+            // structural invariants only; the wire_job_token / relay JWT on
+            // the callback POST is the actual auth.
+            //
+            // Localhost is allowed (private-network test rigs + single-host
+            // dev deployments). If we want to gate localhost specifically,
+            // do it via relay_delivery_policy, not hardcoded here. Accept
+            // both http and https schemes — production Cloudflare tunnels
+            // are https; dev rigs may be plain http.
+            let (scheme, host, _port) = got.authority();
+            if scheme != "https" && scheme != "http" {
+                return Err(CallbackValidationError::SchemeNotHttps);
+            }
+            match host {
+                Some(h) if !h.is_empty() => Ok(()),
+                _ => Err(CallbackValidationError::MissingHost),
+            }
         }
+    }
+}
+
+/// Sentinel `dispatcher_node_id` for market dispatches in `fleet_result_outbox`.
+/// The Wire is not a fleet peer and has no node_id in the roster sense; this
+/// constant marks market rows so sweep helpers can skip the Fleet-roster path
+/// (which would fail with `UnknownDispatcher`). Per architecture §VIII.6 DD-Q.
+pub const WIRE_PLATFORM_DISPATCHER: &str = "wire-platform";
+
+/// String serialization of a `CallbackKind` for the `fleet_result_outbox.callback_kind`
+/// column. Sweep helpers read the column and call `callback_kind_from_str` to
+/// reconstruct the variant for `validate_callback_url` revalidation.
+pub fn callback_kind_str(kind: &CallbackKind) -> &'static str {
+    match kind {
+        CallbackKind::Fleet { .. } => "Fleet",
+        CallbackKind::MarketStandard => "MarketStandard",
+        CallbackKind::Relay => "Relay",
+    }
+}
+
+/// Reconstruct a unit-shaped `CallbackKind` from its column string. The
+/// `Fleet` case requires a `dispatcher_nid` which we retrieve from the outbox
+/// row's `dispatcher_node_id` column at the sweep call site — so this helper
+/// returns an enum that the sweep wraps with the right borrowed nid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallbackKindColumn {
+    Fleet,
+    MarketStandard,
+    Relay,
+}
+
+pub fn callback_kind_from_str(s: &str) -> Option<CallbackKindColumn> {
+    match s {
+        "Fleet" => Some(CallbackKindColumn::Fleet),
+        "MarketStandard" => Some(CallbackKindColumn::MarketStandard),
+        "Relay" => Some(CallbackKindColumn::Relay),
+        _ => None,
     }
 }
 
@@ -1210,20 +1270,53 @@ mod tests {
     }
 
     #[test]
-    fn validate_callback_url_reserved_kinds() {
+    fn validate_callback_url_market_standard_accepts_https_any_host() {
+        // Per DD-Q: MarketStandard callbacks are JWT-gated (wire_job_token),
+        // not roster-gated. validate_callback_url enforces structural
+        // invariants (scheme + non-empty host) and leaves auth to the token
+        // check on the POST. An empty roster is fine — the Wire is not a peer.
         let roster = FleetRoster::default();
-        let r_ms = validate_callback_url(
-            "https://example.com/v1/fleet/result",
+        let r = validate_callback_url(
+            "https://wire.example.com/v1/market/result",
             &CallbackKind::MarketStandard,
             &roster,
         );
-        assert_eq!(r_ms.unwrap_err(), CallbackValidationError::KindNotImplemented);
-        let r_r = validate_callback_url(
-            "https://example.com/v1/fleet/result",
+        assert!(r.is_ok(), "valid https URL must pass for MarketStandard: {:?}", r);
+    }
+
+    #[test]
+    fn validate_callback_url_relay_accepts_https_any_host() {
+        // Per DD-Q: Relay callbacks are JWT-gated (relay JWT), not roster-
+        // gated. Relay hops may be operated by any third party, so no peer
+        // lookup makes sense. Structural validation only.
+        let roster = FleetRoster::default();
+        let r = validate_callback_url(
+            "https://relay-hop-7.example.com/v1/relay/result",
             &CallbackKind::Relay,
             &roster,
         );
-        assert_eq!(r_r.unwrap_err(), CallbackValidationError::KindNotImplemented);
+        assert!(r.is_ok(), "valid https URL must pass for Relay: {:?}", r);
+    }
+
+    #[test]
+    fn validate_callback_url_reserved_kinds_accept_http_for_dev_rigs() {
+        // The MarketStandard/Relay branch accepts both http and https so
+        // single-host dev rigs without TLS can exercise the callback path.
+        // Production gating (if any) lives in relay_delivery_policy, not
+        // hardcoded here.
+        let roster = FleetRoster::default();
+        let r_ms = validate_callback_url(
+            "http://localhost:8080/v1/market/result",
+            &CallbackKind::MarketStandard,
+            &roster,
+        );
+        assert!(r_ms.is_ok(), "http must pass for MarketStandard in dev: {:?}", r_ms);
+        let r_r = validate_callback_url(
+            "http://localhost:8080/v1/relay/result",
+            &CallbackKind::Relay,
+            &roster,
+        );
+        assert!(r_r.is_ok(), "http must pass for Relay in dev: {:?}", r_r);
     }
 
     // ── PendingFleetJobs register/peek/remove ───────────────────────────

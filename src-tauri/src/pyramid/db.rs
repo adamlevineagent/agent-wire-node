@@ -2258,20 +2258,32 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
 
     // ── Fleet async dispatch: result outbox ────────────────────────────────
     //
-    // Peer-side durable outbox for async fleet dispatch. Compound PK prevents
-    // cross-dispatcher hijacking; unique index on job_id alone detects any
-    // cross-dispatcher UUID reuse. `expires_at` drives all sweep-time state
-    // transitions (pending/ready/delivered/failed). `worker_heartbeat_at` is
-    // distinct from `expires_at` only for observability.
+    // Peer-side durable outbox for async fleet dispatch AND compute/storage
+    // market dispatch (per architecture §VIII.6 DD-D / DD-Q). Compound PK
+    // prevents cross-dispatcher hijacking; unique index on job_id alone
+    // detects any cross-dispatcher UUID reuse. `expires_at` drives all
+    // sweep-time state transitions (pending/ready/delivered/failed).
+    // `worker_heartbeat_at` is distinct from `expires_at` only for
+    // observability.
+    //
+    // `callback_kind` discriminates Fleet (roster-validated dispatcher) vs
+    // MarketStandard / Relay (JWT-gated, any-HTTPS). Sweep helpers read this
+    // column to reconstruct CallbackKind for revalidation.
+    //
+    // For market dispatches, dispatcher_node_id = `fleet::WIRE_PLATFORM_DISPATCHER`
+    // (the sentinel "wire-platform"). The Wire is not a peer; the sentinel
+    // lets the compound PK work uniformly across markets.
     //
     // See docs/plans/async-fleet-dispatch.md "Outbox Schema" for the full
-    // state-machine spec and CAS invariants.
+    // state-machine spec, and compute-market-architecture.md §VIII.6
+    // DD-D/DD-Q for the market reuse decision.
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS fleet_result_outbox (
             dispatcher_node_id TEXT NOT NULL,
             job_id TEXT NOT NULL,
             callback_url TEXT NOT NULL,
+            callback_kind TEXT NOT NULL DEFAULT 'Fleet',
             status TEXT NOT NULL,
             result_json TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -2287,7 +2299,47 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_fleet_outbox_expires ON fleet_result_outbox (expires_at);
         CREATE INDEX IF NOT EXISTS idx_fleet_outbox_status_attempts ON fleet_result_outbox (status, last_attempt_at);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_outbox_job_id ON fleet_result_outbox (job_id);
+        CREATE INDEX IF NOT EXISTS idx_fleet_outbox_callback_kind ON fleet_result_outbox (callback_kind);
         ",
+    )?;
+
+    // ── Phase 2 Workstream 0 (DD-Q): add callback_kind to existing DBs ─────
+    //
+    // The CREATE TABLE above handles fresh DBs (callback_kind DEFAULT 'Fleet'
+    // is in-line). For DBs that predate Phase 2, the column doesn't exist;
+    // we ALTER once. SQLite has no `ADD COLUMN IF NOT EXISTS`, so we check
+    // via PRAGMA table_info first.
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(fleet_result_outbox)")?;
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        if !cols.iter().any(|c| c == "callback_kind") {
+            conn.execute_batch(
+                "ALTER TABLE fleet_result_outbox ADD COLUMN callback_kind TEXT NOT NULL DEFAULT 'Fleet';
+                 CREATE INDEX IF NOT EXISTS idx_fleet_outbox_callback_kind ON fleet_result_outbox (callback_kind);",
+            )?;
+        }
+    }
+
+    // ── Market delivery policy singleton ───────────────────────────────────
+    //
+    // Per architecture §VIII.6 DD-E + DD-Q: shape-parallel to
+    // pyramid_fleet_delivery_policy. Holds the current YAML of the
+    // market_delivery_policy contribution. Loaded at boot; hot-reloaded on
+    // ConfigSynced via config_contributions::sync_config_to_operational_with_registry.
+    //
+    // Columns match pyramid_fleet_delivery_policy exactly (yaml_content +
+    // contribution_id + updated_at) so the DB helpers in
+    // pyramid/market_delivery_policy.rs mirror the fleet helpers shape-for-shape.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pyramid_market_delivery_policy (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            yaml_content TEXT NOT NULL DEFAULT '',
+            contribution_id TEXT,
+            updated_at TEXT DEFAULT (datetime('now'))
+        )",
     )?;
 
     Ok(())
@@ -2582,11 +2634,15 @@ pub fn fleet_outbox_expire_exhausted(conn: &Connection, max_attempts: u64) -> Re
 /// synthesize Error and promote to `ready`, `ready` → terminal `failed`,
 /// `delivered`/`failed` → DELETE.
 pub fn fleet_outbox_sweep_expired(conn: &Connection) -> Result<Vec<OutboxRow>> {
+    // Filter to `callback_kind = 'Fleet'`: market/relay rows are owned by
+    // compute market Phase 2+ delivery paths (not this sweeper).
+    // See architecture §VIII.6 DD-D / DD-Q for the outbox reuse decision.
     let mut stmt = conn.prepare(
         "SELECT dispatcher_node_id, job_id, status, callback_url, result_json,
                 delivery_attempts, last_attempt_at, expires_at
            FROM fleet_result_outbox
-          WHERE expires_at <= datetime('now')",
+          WHERE expires_at <= datetime('now')
+            AND callback_kind = 'Fleet'",
     )?;
     let rows = stmt
         .query_map([], |r| {
@@ -2610,11 +2666,14 @@ pub fn fleet_outbox_sweep_expired(conn: &Connection) -> Result<Vec<OutboxRow>> {
 /// `last_attempt_at` (exponential backoff formula lives in the sweep loop,
 /// not in SQL).
 pub fn fleet_outbox_retry_candidates(conn: &Connection) -> Result<Vec<OutboxRow>> {
+    // Filter to `callback_kind = 'Fleet'`: market/relay rows are owned by
+    // compute market Phase 2+ delivery paths (not this sweeper).
     let mut stmt = conn.prepare(
         "SELECT dispatcher_node_id, job_id, status, callback_url, result_json,
                 delivery_attempts, last_attempt_at, expires_at
            FROM fleet_result_outbox
-          WHERE status = 'ready'",
+          WHERE status = 'ready'
+            AND callback_kind = 'Fleet'",
     )?;
     let rows = stmt
         .query_map([], |r| {
@@ -2659,6 +2718,8 @@ pub fn fleet_outbox_startup_recovery(
     let modifier = format!("+{} seconds", ready_retention_secs);
     let synth_payload =
         synthesize_worker_error_json("worker crashed before completion (node restarted)");
+    // Fleet rows only: market/relay rows are recovered by their own path
+    // (compute market Phase 2+). See architecture §VIII.6 DD-D / DD-Q.
     let n = conn.execute(
         "UPDATE fleet_result_outbox
             SET status = 'ready',
@@ -2666,7 +2727,8 @@ pub fn fleet_outbox_startup_recovery(
                 ready_at = datetime('now'),
                 expires_at = datetime('now', ?1),
                 last_error = 'startup recovery'
-          WHERE status = 'pending'",
+          WHERE status = 'pending'
+            AND callback_kind = 'Fleet'",
         rusqlite::params![modifier, synth_payload],
     )?;
     Ok(n)

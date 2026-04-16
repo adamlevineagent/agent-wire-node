@@ -1,0 +1,79 @@
+# market_delivery_policy — operational policy for compute market dispatch.
+#
+# Shape-parallel to fleet_delivery_policy.yaml per architecture §VIII.6 DD-E / DD-Q.
+# Defines the contribution-controlled bundle of timings + caps + economic-gate
+# fees that govern the compute market dispatch path on the provider node.
+#
+# Differences from fleet_delivery_policy:
+#   - Drops dispatcher-side fields (dispatch_ack_timeout_secs,
+#     timeout_grace_secs, orphan_sweep_interval_secs, orphan_sweep_multiplier)
+#     because the dispatcher in market context is always the Wire.
+#   - Drops peer_staleness_secs (peer-roster-specific).
+#   - Adds four market-specific economic-gate fees absorbed from standalone
+#     economic_parameter contributions per DD-E.
+#
+# Canonical operational values live HERE. The Rust Default impl at
+# src-tauri/src/pyramid/market_delivery_policy.rs carries the same numbers
+# as bootstrap sentinels (for nodes booting with no DB row yet) — the
+# `default_matches_seed_yaml` unit test asserts they coincide.
+
+schema_type: market_delivery_policy
+version: 1
+
+# ── Provider callback delivery (when a provider POSTs a result) ────────
+# POST to the callback_url supplied in the dispatch envelope.
+callback_post_timeout_secs: 30
+
+# How often the sweep task scans for expired outbox rows.
+outbox_sweep_interval_secs: 15
+
+# How often a live worker bumps expires_at on its outbox row so the sweep
+# doesn't synthesize a heartbeat-lost Error while the GPU is still running.
+worker_heartbeat_interval_secs: 10
+
+# Worker is considered dead if expires_at is past by this much.
+# Must comfortably exceed worker_heartbeat_interval_secs (typically ~3x).
+worker_heartbeat_tolerance_secs: 30
+
+# Exponential backoff on delivery retry: first retry at backoff_base_secs,
+# capped at backoff_cap_secs. Doubles each attempt.
+backoff_base_secs: 1
+backoff_cap_secs: 64
+
+# After this many failed delivery attempts, mark the row status='failed'.
+# At backoff_cap=64 with doubling, 20 attempts is ~15 minutes of cumulative
+# backoff — typically enough to ride out a tunnel reconnect.
+max_delivery_attempts: 20
+
+# How long to keep a 'ready' row before giving up and transitioning to 'failed'.
+# Operators running very slow rules should raise this so retries don't get clipped.
+ready_retention_secs: 1800
+
+# How long to keep a 'delivered' row before DELETE. Observability window only.
+delivered_retention_secs: 3600
+
+# How long to keep a 'failed' row before DELETE. 7 days for audit/debug.
+failed_retention_secs: 604800
+
+# ── Admission control ──────────────────────────────────────────────────
+# 0 = unlimited; else the provider returns 503 with Retry-After beyond this
+# many pending+ready rows.
+max_inflight_jobs: 32
+
+# Value returned in Retry-After when admission is refused.
+admission_retry_after_secs: 30
+
+# ── Economic gates (per DD-E — absorbed from standalone economic_parameters) ─
+# Credit cost per match attempt. Refunded on success at the RPC level.
+match_search_fee: 1
+
+# Credit cost per offer creation. Anti-spam; does not refund.
+offer_creation_fee: 1
+
+# Credit cost per queue state push (batched — multiple queue mutations
+# within the debounce window coalesce into a single push).
+queue_push_fee: 1
+
+# Milliseconds debounce on queue mirror pushes. Matches DD-9 economic-gate
+# intent — avoid charging per individual queue mutation.
+queue_mirror_debounce_ms: 500
