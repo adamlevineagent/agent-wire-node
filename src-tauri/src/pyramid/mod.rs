@@ -689,6 +689,7 @@ impl PyramidConfig {
             provider_pools: None,
             compute_queue: None,
             fleet_roster: None,
+            fleet_dispatch: None,
         }
     }
 

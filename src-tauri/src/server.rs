@@ -1,4 +1,3 @@
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -32,6 +31,10 @@ pub struct ServerState {
     /// Compute queue handle for enqueuing fleet-dispatched jobs into the
     /// same per-model FIFO queue as local builds (Law 1).
     pub compute_queue: crate::compute_queue::ComputeQueueHandle,
+    /// Async fleet dispatch context — None when fleet dispatch is disabled.
+    /// Carries the pending-job registry (for dispatcher-side callbacks),
+    /// the tunnel state handle, and the operational policy.
+    pub fleet_dispatch: Option<Arc<crate::fleet::FleetDispatchContext>>,
 }
 
 #[derive(Serialize)]
@@ -406,6 +409,7 @@ pub async fn start_server(
     partner: Arc<partner::PartnerState>,
     fleet_roster: Arc<RwLock<crate::fleet::FleetRoster>>,
     compute_queue: crate::compute_queue::ComputeQueueHandle,
+    fleet_dispatch: Option<Arc<crate::fleet::FleetDispatchContext>>,
 ) {
     let state = ServerState {
         cache_dir,
@@ -419,6 +423,7 @@ pub async fn start_server(
         partner,
         fleet_roster,
         compute_queue,
+        fleet_dispatch,
     };
 
     // Phase 7: Initialize stale engines for auto-update pyramids (background)
@@ -1081,12 +1086,30 @@ pub async fn start_server(
             })
     };
 
+    // POST /v1/fleet/result — dispatcher-side async result callback
+    let fleet_result_route = {
+        let state = state.clone();
+        warp::path!("v1" / "fleet" / "result")
+            .and(warp::post())
+            .and(warp::header::<String>("authorization"))
+            .and(warp::body::json())
+            .and_then(move |auth_header: String, body: serde_json::Value| {
+                let state = state.clone();
+                async move {
+                    handle_fleet_result(auth_header, body, state).await
+                }
+            })
+    };
+
     // Fleet CORS: permissive (peer-to-peer via Cloudflare tunnels).
     let fleet_cors = warp::cors()
         .allow_any_origin()
         .allow_methods(vec!["POST", "OPTIONS"])
         .allow_headers(vec!["Content-Type", "Authorization"]);
-    let fleet_routes = fleet_dispatch_route.or(fleet_announce_route).with(fleet_cors);
+    let fleet_routes = fleet_dispatch_route
+        .or(fleet_announce_route)
+        .or(fleet_result_route)
+        .with(fleet_cors);
 
     let routes = preflight
         .or(public_html_with_cors)
@@ -1410,265 +1433,1084 @@ pub fn verify_pyramid_query_jwt(
     Ok(token_data.claims)
 }
 
-// ── Fleet JWT verification and handlers ─────────────────────────────────
-
-/// JWT claims for fleet-internal authentication.
-/// aud: "fleet", op: operator_id, nid: source node_id, nh: node handle
-#[derive(Debug, Deserialize)]
-pub struct FleetJwtClaims {
-    #[allow(dead_code)]
-    pub aud: Option<String>,
-    #[serde(alias = "op")]
-    pub op: Option<String>,
-    #[allow(dead_code)]
-    pub nid: Option<String>,
-    /// Node handle (e.g. "BEHEM") — present when server supports node identity.
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub nh: Option<String>,
-    #[allow(dead_code)]
-    pub exp: Option<u64>,
-}
-
-/// Verify a fleet JWT using Ed25519 public key.
-/// Validates audience is "fleet". Returns claims for operator matching.
-pub fn verify_fleet_jwt(
-    token: &str,
-    public_key_pem: &str,
-) -> Result<FleetJwtClaims, String> {
-    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-
-    let decoding_key = DecodingKey::from_ed_pem(public_key_pem.as_bytes())
-        .map_err(|e| format!("Invalid public key: {}", e))?;
-
-    let mut validation = Validation::new(Algorithm::EdDSA);
-    validation.validate_exp = true;
-    validation.set_required_spec_claims(&["exp"]);
-    validation.set_audience(&["fleet"]);
-
-    let token_data = decode::<FleetJwtClaims>(token, &decoding_key, &validation)
-        .map_err(|e| format!("Fleet JWT decode failed: {}", e))?;
-
-    Ok(token_data.claims)
-}
+// ── Fleet handlers ──────────────────────────────────────────────────────
 
 /// Handle POST /v1/compute/fleet-dispatch — receive fleet LLM job from peer.
 ///
-/// Verifies fleet JWT, checks same-operator, parses request, enqueues into
-/// the SAME compute queue as local builds (Law 1), awaits result, returns
-/// FleetDispatchResponse.
+/// Async admission protocol: verify identity, validate callback URL against
+/// roster, resolve model, transactionally insert into outbox, then return
+/// 202 Accepted. The actual inference runs in a spawned worker task that
+/// delivers the result via POST to the dispatcher's callback URL.
+///
+/// See `docs/plans/async-fleet-dispatch.md` § "Peer Side: handle_fleet_dispatch"
+/// for the full 13-step protocol. Order is load-bearing.
 async fn handle_fleet_dispatch(
     auth_header: String,
     body: serde_json::Value,
     state: ServerState,
-) -> Result<impl warp::Reply, warp::Rejection> {
-    // 1. Extract and verify fleet JWT
-    let token = auth_header.strip_prefix("Bearer ").unwrap_or("");
-    let jwt_pk = state.jwt_public_key.read().await;
-    if jwt_pk.is_empty() {
-        return Ok(warp::reply::with_status(
-            warp::reply::json(&serde_json::json!({"error": "No JWT public key configured"})),
-            warp::http::StatusCode::SERVICE_UNAVAILABLE,
-        ));
-    }
-
-    let claims = match verify_fleet_jwt(token, &jwt_pk) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("Fleet dispatch JWT verification failed: {}", e);
-            return Ok(warp::reply::with_status(
-                warp::reply::json(&serde_json::json!({"error": format!("JWT verification failed: {}", e)})),
+) -> Result<Box<dyn warp::Reply>, warp::Rejection> {
+    // Step 1: Verify fleet identity — single call returns typed FleetIdentity.
+    let jwt_pk = state.jwt_public_key.read().await.clone();
+    let self_operator_id = state
+        .auth
+        .read()
+        .await
+        .operator_id
+        .clone()
+        .unwrap_or_default();
+    let identity = match crate::pyramid::fleet_identity::verify_fleet_identity(
+        &auth_header,
+        &jwt_pk,
+        &self_operator_id,
+    ) {
+        Ok(i) => i,
+        Err(_) => {
+            return Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({})),
                 warp::http::StatusCode::FORBIDDEN,
-            ));
+            )));
         }
     };
-    // Drop the read lock on jwt_public_key.
-    drop(jwt_pk);
+    let dispatcher_nid = identity.nid().to_string();
 
-    // 2. Verify same operator
-    let self_operator_id = state.auth.read().await.operator_id.clone().unwrap_or_default();
-    let jwt_operator_id = claims.op.unwrap_or_default();
-    if self_operator_id.is_empty()
-        || jwt_operator_id.is_empty()
-        || self_operator_id != jwt_operator_id
-    {
-        return Ok(warp::reply::with_status(
-            warp::reply::json(&serde_json::json!({"error": "Operator mismatch — not same fleet"})),
-            warp::http::StatusCode::FORBIDDEN,
-        ));
-    }
-
-    // 3. Parse request — rule_name only, no model field
+    // Step 2: Parse body.
+    let job_id_str = body["job_id"].as_str().unwrap_or("").to_string();
     let rule_name = body["rule_name"].as_str().unwrap_or("").to_string();
-    let system_prompt = body["system_prompt"].as_str().unwrap_or("").to_string();
     let user_prompt = body["user_prompt"].as_str().unwrap_or("").to_string();
+    let callback_url = body["callback_url"].as_str().unwrap_or("").to_string();
+    let system_prompt = body["system_prompt"].as_str().unwrap_or("").to_string();
     let temperature = body["temperature"].as_f64().unwrap_or(0.0) as f32;
     let max_tokens = body["max_tokens"].as_u64().unwrap_or(4096) as usize;
     let response_format = body.get("response_format").cloned();
 
-    if rule_name.is_empty() || user_prompt.is_empty() {
-        return Ok(warp::reply::with_status(
-            warp::reply::json(&serde_json::json!({"error": "Missing rule_name or user_prompt"})),
+    if job_id_str.is_empty()
+        || rule_name.is_empty()
+        || user_prompt.is_empty()
+        || callback_url.is_empty()
+    {
+        return Ok(Box::new(warp::reply::with_status(
+            warp::reply::json(
+                &serde_json::json!({"error": "Missing required field (job_id/rule_name/user_prompt/callback_url)"}),
+            ),
             warp::http::StatusCode::BAD_REQUEST,
-        ));
+        )));
     }
 
-    // 4. Resolve model from dispatch policy by rule name — LOCAL providers only.
-    // If no local provider resolves, return error (never fall through to cloud).
-    // When the route entry has model_id: None (wildcard catchall like
-    // "ollama-catchall"), fall back to the config's primary_model — which
-    // commit_enable_local_mode already set to the chosen Ollama model.
+    // Validate job_id is a parseable UUID (keep string form for DB PK).
+    if uuid::Uuid::parse_str(&job_id_str).is_err() {
+        return Ok(Box::new(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"error": "job_id is not a valid UUID"})),
+            warp::http::StatusCode::BAD_REQUEST,
+        )));
+    }
+
+    // Step 3: Parse callback_url as TunnelUrl, then validate against roster.
+    if crate::pyramid::tunnel_url::TunnelUrl::parse(&callback_url).is_err() {
+        return Ok(Box::new(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"error": "unparseable callback_url"})),
+            warp::http::StatusCode::BAD_REQUEST,
+        )));
+    }
+    {
+        let roster = state.fleet_roster.read().await;
+        if let Err(e) = crate::fleet::validate_callback_url(
+            &callback_url,
+            &crate::fleet::CallbackKind::Fleet {
+                dispatcher_nid: &dispatcher_nid,
+            },
+            &*roster,
+        ) {
+            tracing::warn!(
+                "Fleet dispatch callback_url rejected: {} (dispatcher={})",
+                e,
+                dispatcher_nid
+            );
+            return Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": format!("{}", e)})),
+                warp::http::StatusCode::FORBIDDEN,
+            )));
+        }
+    } // roster read-lock drops here
+
+    // Step 4: Resolve model from dispatch policy by rule name — LOCAL only.
     let resolved_model = {
         let cfg = state.pyramid.config.read().await;
         if let Some(ref policy) = cfg.dispatch_policy {
             match policy.resolve_local_for_rule(&rule_name) {
                 Some((_provider_id, model_id)) => {
-                    // model_id is None when the route entry is a wildcard
-                    // (e.g. ollama-catchall with no explicit model_id).
-                    // Fall back to the config's primary_model.
                     model_id.unwrap_or_else(|| cfg.primary_model.clone())
                 }
                 None => {
-                    return Ok(warp::reply::with_status(
-                        warp::reply::json(&serde_json::json!({"error": "No local provider for rule"})),
+                    return Ok(Box::new(warp::reply::with_status(
+                        warp::reply::json(
+                            &serde_json::json!({"error": "No local provider for rule"}),
+                        ),
                         warp::http::StatusCode::BAD_REQUEST,
-                    ));
+                    )));
                 }
             }
         } else {
-            return Ok(warp::reply::with_status(
+            return Ok(Box::new(warp::reply::with_status(
                 warp::reply::json(&serde_json::json!({"error": "No dispatch policy configured"})),
+                warp::http::StatusCode::SERVICE_UNAVAILABLE,
+            )));
+        }
+    };
+
+    if resolved_model.is_empty() {
+        return Ok(Box::new(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"error": "Cannot resolve model for rule"})),
+            warp::http::StatusCode::BAD_REQUEST,
+        )));
+    }
+
+    // Snapshot fleet delivery policy for admission + worker.
+    let policy = match state.fleet_dispatch.as_ref() {
+        Some(ctx) => ctx.policy.read().await.clone(),
+        None => {
+            return Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": "fleet dispatch disabled"})),
+                warp::http::StatusCode::SERVICE_UNAVAILABLE,
+            )));
+        }
+    };
+
+    // DB path for outbox + chronicle writes.
+    let db_path = match state.pyramid.data_dir.as_ref() {
+        Some(d) => d.join("pyramid.db"),
+        None => {
+            return Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": "node data dir unavailable"})),
+                warp::http::StatusCode::SERVICE_UNAVAILABLE,
+            )));
+        }
+    };
+
+    // Helper for fire-and-forget chronicle writes from async context.
+    let chronicle_write =
+        |event_type: &'static str, source: &'static str, metadata: serde_json::Value| {
+            let job_path = format!("fleet-recv:{}:{}", dispatcher_nid, job_id_str);
+            let ctx = crate::pyramid::compute_chronicle::ChronicleEventContext::minimal(
+                &job_path, event_type, source,
+            )
+            .with_model_id(resolved_model.clone())
+            .with_metadata(metadata);
+            let db_path_clone = db_path.to_string_lossy().to_string();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(conn) = rusqlite::Connection::open(&db_path_clone) {
+                    let _ = crate::pyramid::compute_chronicle::record_event(&conn, &ctx);
+                }
+            });
+        };
+
+    // Step 5: Reverse-channel precondition — roster MUST have a fleet_jwt.
+    {
+        let roster = state.fleet_roster.read().await;
+        if roster.fleet_jwt.is_none() {
+            drop(roster);
+            chronicle_write(
+                crate::pyramid::compute_chronicle::EVENT_FLEET_ADMISSION_REJECTED,
+                crate::pyramid::compute_chronicle::SOURCE_FLEET_RECEIVED,
+                serde_json::json!({
+                    "peer_id": dispatcher_nid,
+                    "reason": "no fleet_jwt",
+                }),
+            );
+            return Ok(Box::new(warp::reply::with_status(
+                warp::reply::with_header(
+                    warp::reply::json(&serde_json::json!({"error": "no fleet_jwt; retry later"})),
+                    "Retry-After",
+                    policy.admission_retry_after_secs.to_string(),
+                ),
+                warp::http::StatusCode::SERVICE_UNAVAILABLE,
+            )));
+        }
+    }
+
+    // Step 6: Transactional admission + idempotent insert.
+    // All SQL inside spawn_blocking (rusqlite is sync). We return a branch
+    // outcome back to the async handler to construct the HTTP response.
+    #[derive(Debug)]
+    enum AdmissionOutcome {
+        Admitted,         // fresh insert, passed admission → spawn worker
+        RetryExisting,    // same dispatcher, pre-existing pending/ready row
+        ConflictDifferentDispatcher,
+        GoneDelivered,
+        GoneFailed(Option<String>), // last_error for body
+        Rejected503,      // admission cap hit (freshly inserted path)
+        DbError(String),
+    }
+
+    let worker_heartbeat_tolerance_secs = policy.worker_heartbeat_tolerance_secs;
+    let admission_max_inflight = policy.max_inflight_jobs;
+    let db_path_tx = db_path.clone();
+    let dispatcher_nid_tx = dispatcher_nid.clone();
+    let job_id_tx = job_id_str.clone();
+    let callback_url_tx = callback_url.clone();
+
+    let outcome = tokio::task::spawn_blocking(move || -> AdmissionOutcome {
+        let mut conn = match rusqlite::Connection::open(&db_path_tx) {
+            Ok(c) => c,
+            Err(e) => return AdmissionOutcome::DbError(e.to_string()),
+        };
+        let tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+            Ok(t) => t,
+            Err(e) => return AdmissionOutcome::DbError(e.to_string()),
+        };
+        // expires_at = now + worker_heartbeat_tolerance_secs
+        let modifier = format!("+{} seconds", worker_heartbeat_tolerance_secs);
+        let expires_at: String = match tx.query_row(
+            "SELECT datetime('now', ?1)",
+            rusqlite::params![modifier],
+            |r| r.get(0),
+        ) {
+            Ok(s) => s,
+            Err(e) => return AdmissionOutcome::DbError(e.to_string()),
+        };
+        let changes = match crate::pyramid::db::fleet_outbox_insert_or_ignore(
+            &tx,
+            &dispatcher_nid_tx,
+            &job_id_tx,
+            &callback_url_tx,
+            &expires_at,
+        ) {
+            Ok(n) => n,
+            Err(e) => return AdmissionOutcome::DbError(e.to_string()),
+        };
+        let lookup = match crate::pyramid::db::fleet_outbox_lookup(&tx, &job_id_tx) {
+            Ok(Some(l)) => l,
+            Ok(None) => {
+                // INSERT OR IGNORE was just done with this job_id; lookup must find it.
+                let _ = tx.rollback();
+                return AdmissionOutcome::DbError("outbox lookup returned None".into());
+            }
+            Err(e) => {
+                let _ = tx.rollback();
+                return AdmissionOutcome::DbError(e.to_string());
+            }
+        };
+
+        if lookup.dispatcher_node_id != dispatcher_nid_tx {
+            // Different dispatcher already owns this job_id. Cross-dispatcher UUID
+            // reuse — rollback the INSERT OR IGNORE (no-op since row wasn't ours)
+            // and reject.
+            let _ = tx.rollback();
+            return AdmissionOutcome::ConflictDifferentDispatcher;
+        }
+
+        // Same dispatcher owns it.
+        if changes == 0 {
+            // Pre-existing row — branch on status.
+            match lookup.status.as_str() {
+                "pending" | "ready" => {
+                    // Legitimate retry — no new worker, just re-ACK.
+                    if let Err(e) = tx.commit() {
+                        return AdmissionOutcome::DbError(e.to_string());
+                    }
+                    AdmissionOutcome::RetryExisting
+                }
+                "delivered" => {
+                    let _ = tx.rollback();
+                    AdmissionOutcome::GoneDelivered
+                }
+                "failed" => {
+                    let _ = tx.rollback();
+                    AdmissionOutcome::GoneFailed(lookup.last_error)
+                }
+                _ => {
+                    let _ = tx.rollback();
+                    AdmissionOutcome::DbError(format!("unknown outbox status: {}", lookup.status))
+                }
+            }
+        } else {
+            // Freshly inserted (changes == 1). Admission count.
+            let inflight = match crate::pyramid::db::fleet_outbox_count_inflight_excluding(
+                &tx,
+                &dispatcher_nid_tx,
+                &job_id_tx,
+            ) {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = tx.rollback();
+                    return AdmissionOutcome::DbError(e.to_string());
+                }
+            };
+            if admission_max_inflight != 0 && inflight >= admission_max_inflight {
+                // Over capacity — delete the row we just inserted and reject.
+                if let Err(e) = crate::pyramid::db::fleet_outbox_delete(
+                    &tx,
+                    &dispatcher_nid_tx,
+                    &job_id_tx,
+                ) {
+                    let _ = tx.rollback();
+                    return AdmissionOutcome::DbError(e.to_string());
+                }
+                let _ = tx.rollback();
+                return AdmissionOutcome::Rejected503;
+            }
+            if let Err(e) = tx.commit() {
+                return AdmissionOutcome::DbError(e.to_string());
+            }
+            AdmissionOutcome::Admitted
+        }
+    })
+    .await
+    .unwrap_or_else(|join_err| AdmissionOutcome::DbError(join_err.to_string()));
+
+    // Construct HTTP response + side-effects based on the outcome.
+    match outcome {
+        AdmissionOutcome::DbError(msg) => {
+            tracing::error!("Fleet dispatch admission DB error: {}", msg);
+            Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": "admission db error"})),
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            )))
+        }
+        AdmissionOutcome::ConflictDifferentDispatcher => {
+            Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(
+                    &serde_json::json!({"error": "job_id conflict with different dispatcher"}),
+                ),
+                warp::http::StatusCode::CONFLICT,
+            )))
+        }
+        AdmissionOutcome::GoneDelivered => {
+            Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(
+                    &serde_json::json!({"error": "job already delivered; dispatcher lost state"}),
+                ),
+                warp::http::StatusCode::GONE,
+            )))
+        }
+        AdmissionOutcome::GoneFailed(last_error) => {
+            let body = serde_json::json!({
+                "error": "job previously failed",
+                "last_error": last_error,
+            });
+            Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&body),
+                warp::http::StatusCode::GONE,
+            )))
+        }
+        AdmissionOutcome::Rejected503 => {
+            chronicle_write(
+                crate::pyramid::compute_chronicle::EVENT_FLEET_ADMISSION_REJECTED,
+                crate::pyramid::compute_chronicle::SOURCE_FLEET_RECEIVED,
+                serde_json::json!({
+                    "peer_id": dispatcher_nid,
+                    "reason": "max_inflight_jobs",
+                }),
+            );
+            Ok(Box::new(warp::reply::with_status(
+                warp::reply::with_header(
+                    warp::reply::json(&serde_json::json!({"error": "peer at capacity"})),
+                    "Retry-After",
+                    policy.admission_retry_after_secs.to_string(),
+                ),
+                warp::http::StatusCode::SERVICE_UNAVAILABLE,
+            )))
+        }
+        AdmissionOutcome::RetryExisting => {
+            // Pre-existing row; re-ACK without spawning a new worker.
+            let ack = crate::fleet::FleetDispatchAck {
+                job_id: job_id_str.clone(),
+                peer_queue_depth: 0,
+            };
+            Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&ack),
+                warp::http::StatusCode::ACCEPTED,
+            )))
+        }
+        AdmissionOutcome::Admitted => {
+            // Step 7: Record fleet_job_accepted and return 202.
+            // Step 8: Spawn the worker task BEFORE returning 202.
+            chronicle_write(
+                crate::pyramid::compute_chronicle::EVENT_FLEET_JOB_ACCEPTED,
+                crate::pyramid::compute_chronicle::SOURCE_FLEET_RECEIVED,
+                serde_json::json!({
+                    "peer_id": dispatcher_nid,
+                    "rule_name": rule_name,
+                    "resolved_model": resolved_model,
+                    "job_id": job_id_str,
+                }),
+            );
+
+            spawn_fleet_worker(
+                state.clone(),
+                db_path.clone(),
+                policy.clone(),
+                dispatcher_nid.clone(),
+                job_id_str.clone(),
+                callback_url.clone(),
+                resolved_model.clone(),
+                system_prompt,
+                user_prompt,
+                temperature,
+                max_tokens,
+                response_format,
+            );
+
+            let ack = crate::fleet::FleetDispatchAck {
+                job_id: job_id_str.clone(),
+                peer_queue_depth: 0,
+            };
+            Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&ack),
+                warp::http::StatusCode::ACCEPTED,
+            )))
+        }
+    }
+}
+
+/// Spawns the worker that runs inference + heartbeat and delivers the
+/// result back to the dispatcher. All clones are owned by the spawned
+/// future; the caller returns 202 as soon as this function returns.
+///
+/// The worker:
+///   * snapshots `LlmConfig` with `fleet_dispatch=None` and `fleet_roster=None`
+///     so a recursive call into Phase A cannot re-dispatch the job.
+///   * runs `call_model_unified_with_options_and_ctx` alongside a heartbeat
+///     that bumps `expires_at` every `worker_heartbeat_interval_secs`.
+///   * CAS-promotes `pending → ready` on success (step 9), delivers (step 10),
+///     and CAS-promotes `ready → delivered` on 2xx (step 11) or bumps attempts
+///     on failure (step 12).
+#[allow(clippy::too_many_arguments)]
+fn spawn_fleet_worker(
+    state: ServerState,
+    db_path: std::path::PathBuf,
+    policy: crate::pyramid::fleet_delivery_policy::FleetDeliveryPolicy,
+    dispatcher_nid: String,
+    job_id: String,
+    callback_url: String,
+    resolved_model: String,
+    system_prompt: String,
+    user_prompt: String,
+    temperature: f32,
+    max_tokens: usize,
+    response_format: Option<serde_json::Value>,
+) {
+    tokio::spawn(async move {
+        // Build worker config with fleet recursion bypass fields zeroed.
+        let fleet_config = {
+            let cfg = state.pyramid.config.read().await;
+            let mut fc = cfg.clone();
+            fc.primary_model = resolved_model.clone();
+            fc.fallback_model_1 = resolved_model.clone();
+            fc.fallback_model_2 = resolved_model.clone();
+            fc.fleet_dispatch = None; // prevent Phase A re-entry
+            fc.fleet_roster = None;   // belt-and-suspenders — no peer candidates
+            fc
+        };
+
+        let chronicle_job_path = format!("fleet-recv:{}:{}", dispatcher_nid, job_id);
+        let options = crate::pyramid::llm::LlmCallOptions {
+            skip_fleet_dispatch: true,
+            chronicle_job_path: Some(chronicle_job_path.clone()),
+            ..Default::default()
+        };
+
+        // Helper to write a chronicle event from the worker path.
+        let chronicle_write =
+            |event_type: &'static str, source: &'static str, metadata: serde_json::Value| {
+                let ctx = crate::pyramid::compute_chronicle::ChronicleEventContext::minimal(
+                    &chronicle_job_path,
+                    event_type,
+                    source,
+                )
+                .with_model_id(resolved_model.clone())
+                .with_metadata(metadata);
+                let db_path_clone = db_path.to_string_lossy().to_string();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(conn) = rusqlite::Connection::open(&db_path_clone) {
+                        let _ = crate::pyramid::compute_chronicle::record_event(&conn, &ctx);
+                    }
+                });
+            };
+
+        // Heartbeat future: tick every worker_heartbeat_interval_secs, bump
+        // expires_at, exit if CAS lost (sweep won) or fatal DB error.
+        let hb_db_path = db_path.clone();
+        let hb_dispatcher = dispatcher_nid.clone();
+        let hb_job_id = job_id.clone();
+        let hb_interval = policy.worker_heartbeat_interval_secs.max(1);
+        let hb_tolerance = policy.worker_heartbeat_tolerance_secs;
+
+        let heartbeat = async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(hb_interval));
+            // Skip the immediate tick at t=0 — we already inserted with the
+            // expiry; next tick should fire after the interval.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let hb_db = hb_db_path.clone();
+                let hb_disp = hb_dispatcher.clone();
+                let hb_jid = hb_job_id.clone();
+                let hb_tol = hb_tolerance;
+                let result: anyhow::Result<usize> =
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+                        let conn = rusqlite::Connection::open(&hb_db)?;
+                        let modifier = format!("+{} seconds", hb_tol);
+                        let new_expires: String = conn.query_row(
+                            "SELECT datetime('now', ?1)",
+                            rusqlite::params![modifier],
+                            |r| r.get(0),
+                        )?;
+                        crate::pyramid::db::fleet_outbox_update_heartbeat_if_pending(
+                            &conn,
+                            &hb_disp,
+                            &hb_jid,
+                            &new_expires,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|je| Err(anyhow::anyhow!(je.to_string())));
+                match result {
+                    Ok(1) => continue,
+                    Ok(0) => {
+                        // Sweep won the race; exit and let select! cancel inference.
+                        return false;
+                    }
+                    Ok(_) => return false, // compound PK, should be unreachable
+                    Err(e) => {
+                        // SQLITE_BUSY → retry next tick; other DB errors → fatal.
+                        let msg = e.to_string().to_lowercase();
+                        if msg.contains("busy") || msg.contains("locked") {
+                            tracing::debug!(?e, "heartbeat tick DB-locked; retrying");
+                            continue;
+                        }
+                        tracing::error!(?e, "heartbeat DB error; giving up");
+                        return false;
+                    }
+                }
+            }
+        };
+
+        let inference = crate::pyramid::llm::call_model_unified_with_options_and_ctx(
+            &fleet_config,
+            None,
+            &system_prompt,
+            &user_prompt,
+            temperature,
+            max_tokens,
+            response_format.as_ref(),
+            options,
+        );
+
+        // Race inference against heartbeat exit. If heartbeat exits first, the
+        // sweep already claimed the row — we drop the inference result.
+        let select_outcome = tokio::select! {
+            inf = inference => Some(inf),
+            _ = heartbeat => None,
+        };
+
+        match select_outcome {
+            None => {
+                // Heartbeat exited — sweep won.
+                chronicle_write(
+                    crate::pyramid::compute_chronicle::EVENT_FLEET_WORKER_SWEEP_LOST,
+                    crate::pyramid::compute_chronicle::SOURCE_FLEET_RECEIVED,
+                    serde_json::json!({
+                        "peer_id": dispatcher_nid,
+                        "job_id": job_id,
+                    }),
+                );
+                return;
+            }
+            Some(Ok(llm_response)) => {
+                // Build FleetAsyncResult::Success from LlmResponse.
+                let outcome = crate::fleet::FleetAsyncResult::Success(
+                    crate::fleet::FleetDispatchResponse {
+                        content: llm_response.content,
+                        prompt_tokens: Some(llm_response.usage.prompt_tokens),
+                        completion_tokens: Some(llm_response.usage.completion_tokens),
+                        model: resolved_model.clone(),
+                        finish_reason: None,
+                        peer_model: Some(resolved_model.clone()),
+                    },
+                );
+                let result_json = match serde_json::to_string(&outcome) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // Fall back to synthesized error so the dispatcher gets *some*
+                        // terminal outcome rather than a silent hang.
+                        tracing::error!(?e, "failed to serialize FleetAsyncResult");
+                        crate::pyramid::db::synthesize_worker_error_json(&format!(
+                            "result serialize failed: {}",
+                            e
+                        ))
+                    }
+                };
+
+                // Step 9: CAS promote pending → ready.
+                let db_promote = db_path.clone();
+                let disp_promote = dispatcher_nid.clone();
+                let jid_promote = job_id.clone();
+                let rj_promote = result_json.clone();
+                let ready_retention_secs = policy.ready_retention_secs;
+                let promote_res: Result<usize, String> =
+                    tokio::task::spawn_blocking(move || {
+                        let conn = rusqlite::Connection::open(&db_promote)
+                            .map_err(|e| e.to_string())?;
+                        crate::pyramid::db::fleet_outbox_promote_ready_if_pending(
+                            &conn,
+                            &disp_promote,
+                            &jid_promote,
+                            &rj_promote,
+                            ready_retention_secs,
+                        )
+                        .map_err(|e| e.to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|je| Err(je.to_string()));
+
+                match promote_res {
+                    Ok(1) => {
+                        // Worker won. Record completion.
+                        chronicle_write(
+                            crate::pyramid::compute_chronicle::EVENT_FLEET_JOB_COMPLETED,
+                            crate::pyramid::compute_chronicle::SOURCE_FLEET_RECEIVED,
+                            serde_json::json!({
+                                "peer_id": dispatcher_nid,
+                                "job_id": job_id,
+                                "model": resolved_model,
+                            }),
+                        );
+                    }
+                    Ok(_) => {
+                        // rowcount == 0: sweep already promoted us. Drop result.
+                        chronicle_write(
+                            crate::pyramid::compute_chronicle::EVENT_FLEET_WORKER_SWEEP_LOST,
+                            crate::pyramid::compute_chronicle::SOURCE_FLEET_RECEIVED,
+                            serde_json::json!({
+                                "peer_id": dispatcher_nid,
+                                "job_id": job_id,
+                            }),
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!("fleet outbox promote_ready failed: {}", e);
+                        return;
+                    }
+                }
+
+                // Step 10–12: Attempt callback delivery.
+                let envelope = crate::fleet::FleetAsyncResultEnvelope {
+                    job_id: job_id.clone(),
+                    outcome,
+                };
+                // Snapshot the roster state needed for delivery, then DROP the
+                // lock before the HTTP POST. Holding the roster read lock across
+                // a 30s-bounded network call would starve roster writers
+                // (heartbeat updates, announcements, dead-peer removal).
+                let roster_snapshot_for_delivery = {
+                    let roster = state.fleet_roster.read().await;
+                    crate::fleet::FleetRoster {
+                        peers: roster
+                            .peers
+                            .get(&dispatcher_nid)
+                            .cloned()
+                            .map(|p| {
+                                let mut m = std::collections::HashMap::new();
+                                m.insert(p.node_id.clone(), p);
+                                m
+                            })
+                            .unwrap_or_default(),
+                        fleet_jwt: roster.fleet_jwt.clone(),
+                        self_operator_id: roster.self_operator_id.clone(),
+                    }
+                };
+                let delivery = crate::fleet::deliver_fleet_result(
+                    &dispatcher_nid,
+                    &callback_url,
+                    &envelope,
+                    &roster_snapshot_for_delivery,
+                    &policy,
+                )
+                .await;
+
+                match delivery {
+                    Ok(()) => {
+                        // Step 11: CAS ready → delivered.
+                        let db_del = db_path.clone();
+                        let disp_del = dispatcher_nid.clone();
+                        let jid_del = job_id.clone();
+                        let delivered_retention_secs = policy.delivered_retention_secs;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let conn = rusqlite::Connection::open(&db_del).ok()?;
+                            crate::pyramid::db::fleet_outbox_mark_delivered_if_ready(
+                                &conn,
+                                &disp_del,
+                                &jid_del,
+                                delivered_retention_secs,
+                            )
+                            .ok()
+                        })
+                        .await;
+                        chronicle_write(
+                            crate::pyramid::compute_chronicle::EVENT_FLEET_CALLBACK_DELIVERED,
+                            crate::pyramid::compute_chronicle::SOURCE_FLEET_RECEIVED,
+                            serde_json::json!({
+                                "peer_id": dispatcher_nid,
+                                "job_id": job_id,
+                                "attempts": 1,
+                            }),
+                        );
+                    }
+                    Err(e) => {
+                        // Step 12: bump attempt counter, record failure event.
+                        let err_msg = format!("{}", e);
+                        let db_fail = db_path.clone();
+                        let disp_fail = dispatcher_nid.clone();
+                        let jid_fail = job_id.clone();
+                        let err_clone = err_msg.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let conn = rusqlite::Connection::open(&db_fail).ok()?;
+                            crate::pyramid::db::fleet_outbox_bump_delivery_attempt(
+                                &conn,
+                                &disp_fail,
+                                &jid_fail,
+                                &err_clone,
+                            )
+                            .ok()
+                        })
+                        .await;
+                        chronicle_write(
+                            crate::pyramid::compute_chronicle::EVENT_FLEET_CALLBACK_FAILED,
+                            crate::pyramid::compute_chronicle::SOURCE_FLEET_RECEIVED,
+                            serde_json::json!({
+                                "peer_id": dispatcher_nid,
+                                "job_id": job_id,
+                                "error": err_msg,
+                                "attempts": 1,
+                            }),
+                        );
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                // Inference failed — synthesize Error result and let it flow through
+                // the same ready → deliver path so the dispatcher always hears back.
+                let err_msg = format!("{}", e);
+                let result_json = crate::pyramid::db::synthesize_worker_error_json(&err_msg);
+                let outcome = crate::fleet::FleetAsyncResult::Error(err_msg.clone());
+
+                let db_promote = db_path.clone();
+                let disp_promote = dispatcher_nid.clone();
+                let jid_promote = job_id.clone();
+                let ready_retention_secs = policy.ready_retention_secs;
+                let promote_res: Result<usize, String> =
+                    tokio::task::spawn_blocking(move || {
+                        let conn = rusqlite::Connection::open(&db_promote)
+                            .map_err(|e| e.to_string())?;
+                        crate::pyramid::db::fleet_outbox_promote_ready_if_pending(
+                            &conn,
+                            &disp_promote,
+                            &jid_promote,
+                            &result_json,
+                            ready_retention_secs,
+                        )
+                        .map_err(|e| e.to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|je| Err(je.to_string()));
+
+                if !matches!(promote_res, Ok(1)) {
+                    chronicle_write(
+                        crate::pyramid::compute_chronicle::EVENT_FLEET_WORKER_SWEEP_LOST,
+                        crate::pyramid::compute_chronicle::SOURCE_FLEET_RECEIVED,
+                        serde_json::json!({
+                            "peer_id": dispatcher_nid,
+                            "job_id": job_id,
+                        }),
+                    );
+                    return;
+                }
+
+                chronicle_write(
+                    crate::pyramid::compute_chronicle::EVENT_FLEET_JOB_COMPLETED,
+                    crate::pyramid::compute_chronicle::SOURCE_FLEET_RECEIVED,
+                    serde_json::json!({
+                        "peer_id": dispatcher_nid,
+                        "job_id": job_id,
+                        "model": resolved_model,
+                        "error": err_msg,
+                    }),
+                );
+
+                let envelope = crate::fleet::FleetAsyncResultEnvelope {
+                    job_id: job_id.clone(),
+                    outcome,
+                };
+                // Snapshot roster state and drop the lock before the HTTP
+                // POST — see matching comment in the Success branch above.
+                let roster_snapshot_for_delivery = {
+                    let roster = state.fleet_roster.read().await;
+                    crate::fleet::FleetRoster {
+                        peers: roster
+                            .peers
+                            .get(&dispatcher_nid)
+                            .cloned()
+                            .map(|p| {
+                                let mut m = std::collections::HashMap::new();
+                                m.insert(p.node_id.clone(), p);
+                                m
+                            })
+                            .unwrap_or_default(),
+                        fleet_jwt: roster.fleet_jwt.clone(),
+                        self_operator_id: roster.self_operator_id.clone(),
+                    }
+                };
+                let delivery = crate::fleet::deliver_fleet_result(
+                    &dispatcher_nid,
+                    &callback_url,
+                    &envelope,
+                    &roster_snapshot_for_delivery,
+                    &policy,
+                )
+                .await;
+
+                match delivery {
+                    Ok(()) => {
+                        let db_del = db_path.clone();
+                        let disp_del = dispatcher_nid.clone();
+                        let jid_del = job_id.clone();
+                        let delivered_retention_secs = policy.delivered_retention_secs;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let conn = rusqlite::Connection::open(&db_del).ok()?;
+                            crate::pyramid::db::fleet_outbox_mark_delivered_if_ready(
+                                &conn,
+                                &disp_del,
+                                &jid_del,
+                                delivered_retention_secs,
+                            )
+                            .ok()
+                        })
+                        .await;
+                        chronicle_write(
+                            crate::pyramid::compute_chronicle::EVENT_FLEET_CALLBACK_DELIVERED,
+                            crate::pyramid::compute_chronicle::SOURCE_FLEET_RECEIVED,
+                            serde_json::json!({
+                                "peer_id": dispatcher_nid,
+                                "job_id": job_id,
+                                "attempts": 1,
+                            }),
+                        );
+                    }
+                    Err(e2) => {
+                        let err2_msg = format!("{}", e2);
+                        let db_fail = db_path.clone();
+                        let disp_fail = dispatcher_nid.clone();
+                        let jid_fail = job_id.clone();
+                        let err_clone = err2_msg.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let conn = rusqlite::Connection::open(&db_fail).ok()?;
+                            crate::pyramid::db::fleet_outbox_bump_delivery_attempt(
+                                &conn,
+                                &disp_fail,
+                                &jid_fail,
+                                &err_clone,
+                            )
+                            .ok()
+                        })
+                        .await;
+                        chronicle_write(
+                            crate::pyramid::compute_chronicle::EVENT_FLEET_CALLBACK_FAILED,
+                            crate::pyramid::compute_chronicle::SOURCE_FLEET_RECEIVED,
+                            serde_json::json!({
+                                "peer_id": dispatcher_nid,
+                                "job_id": job_id,
+                                "error": err2_msg,
+                                "attempts": 1,
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Handle POST /v1/fleet/result — dispatcher-side async result callback.
+///
+/// Peek → verify → pop-and-send. Snapshot identity match while holding the
+/// sync mutex briefly, drop the lock, then fire the oneshot sender to wake
+/// the awaiting Phase A dispatch future. Never hold the mutex across .await.
+async fn handle_fleet_result(
+    auth_header: String,
+    body: serde_json::Value,
+    state: ServerState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    // 503 if fleet dispatch disabled on this node.
+    let ctx = match state.fleet_dispatch.as_ref() {
+        Some(c) => Arc::clone(c),
+        None => {
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": "fleet dispatch disabled"})),
                 warp::http::StatusCode::SERVICE_UNAVAILABLE,
             ));
         }
     };
 
-    if resolved_model.is_empty() {
-        return Ok(warp::reply::with_status(
-            warp::reply::json(&serde_json::json!({"error": "Cannot resolve model for rule"})),
-            warp::http::StatusCode::BAD_REQUEST,
-        ));
-    }
+    // Snapshot auth inputs once, drop locks before verify_fleet_identity.
+    let pk = state.jwt_public_key.read().await.clone();
+    let self_op = state
+        .auth
+        .read()
+        .await
+        .operator_id
+        .clone()
+        .unwrap_or_default();
 
-    // 5. CRITICAL: Fleet jobs go THROUGH the queue, not around it.
-    // The queue serializes fleet jobs with local builds — same GPU.
-    // Clone base LlmConfig, set model to resolved model, keep
-    // compute_queue as Some, set fleet_roster to None, set
-    // skip_fleet_dispatch: true. Call through the normal LLM path.
-    let fleet_config = {
-        let cfg = state.pyramid.config.read().await;
-        let mut fc = cfg.clone();
-        fc.primary_model = resolved_model.clone();
-        fc.fallback_model_1 = resolved_model.clone();
-        fc.fallback_model_2 = resolved_model.clone();
-        // compute_queue stays Some — job enters the queue (Law 1)
-        fc.fleet_roster = None; // prevent re-dispatch to fleet
-        fc
+    let identity = match crate::pyramid::fleet_identity::verify_fleet_identity(
+        &auth_header,
+        &pk,
+        &self_op,
+    ) {
+        Ok(i) => i,
+        Err(_) => {
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({})),
+                warp::http::StatusCode::FORBIDDEN,
+            ));
+        }
     };
 
-    // WP-7: Chronicle fleet_received event.
-    // Generate the job_path ONCE here. This same job_path flows through the QueueEntry
-    // (via chronicle_job_path) to WP-1/2/3/4, so one logical fleet job has one job_path.
-    let fleet_received_job_path = {
-        let ts = Utc::now().timestamp();
-        format!("fleet-recv:{}:{}", resolved_model, ts)
+    let envelope: crate::fleet::FleetAsyncResultEnvelope = match serde_json::from_value(body) {
+        Ok(e) => e,
+        Err(_) => {
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": "invalid body"})),
+                warp::http::StatusCode::BAD_REQUEST,
+            ));
+        }
     };
-    let fleet_db_path = state.pyramid.data_dir.as_ref().map(|d| d.join("pyramid.db"));
-    if let Some(ref db_path) = fleet_db_path {
-        let requester_node_id = claims.nid.clone().unwrap_or_default();
-        let chronicle_ctx = crate::pyramid::compute_chronicle::ChronicleEventContext::minimal(
-            &fleet_received_job_path, "fleet_received", "fleet_received",
+
+    // Peek-verify-pop atomically under the sync mutex. Snapshot the identity
+    // match while holding the lock briefly — the mutex MUST NOT be held across
+    // any .await.
+    let peek = ctx
+        .pending
+        .peek_matches(&envelope.job_id, identity.nid());
+    let action: crate::fleet::PeekResult = peek;
+
+    // DB path for chronicle side-effects.
+    let db_path = state
+        .pyramid
+        .data_dir
+        .as_ref()
+        .map(|d| d.join("pyramid.db"));
+    let chronicle_write = |event_type: &'static str, metadata: serde_json::Value| {
+        let source = crate::pyramid::compute_chronicle::SOURCE_FLEET;
+        let ctx_ev = crate::pyramid::compute_chronicle::ChronicleEventContext::minimal(
+            &format!("fleet-dispatch:{}", envelope.job_id),
+            event_type,
+            source,
         )
-        .with_model_id(resolved_model.clone())
-        .with_metadata(serde_json::json!({
-            "requester_node_id": requester_node_id,
-            "rule_name": rule_name,
-            "resolved_model": resolved_model,
-        }));
-        let db_path_clone = db_path.to_string_lossy().to_string();
-        tokio::task::spawn_blocking(move || {
-            if let Ok(conn) = rusqlite::Connection::open(&db_path_clone) {
-                let _ = crate::pyramid::compute_chronicle::record_event(&conn, &chronicle_ctx);
-            }
-        });
-    }
-
-    let options = crate::pyramid::llm::LlmCallOptions {
-        skip_fleet_dispatch: true, // prevent re-dispatch loop
-        chronicle_job_path: Some(fleet_received_job_path.clone()),
-        ..Default::default()
+        .with_metadata(metadata);
+        if let Some(ref dbp) = db_path {
+            let db_path_clone = dbp.to_string_lossy().to_string();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(conn) = rusqlite::Connection::open(&db_path_clone) {
+                    let _ = crate::pyramid::compute_chronicle::record_event(&conn, &ctx_ev);
+                }
+            });
+        }
     };
 
-    // 6. Call through normal LLM path — transparent queue routing
-    // enqueues the job, GPU loop executes it, result flows back.
-    match crate::pyramid::llm::call_model_unified_with_options_and_ctx(
-        &fleet_config,
-        None, // Fleet jobs have no StepContext (Law 4)
-        &system_prompt,
-        &user_prompt,
-        temperature,
-        max_tokens,
-        response_format.as_ref(),
-        options,
-    )
-    .await
-    {
-        Ok(llm_response) => {
-            let response = serde_json::json!({
-                "content": llm_response.content,
-                "prompt_tokens": llm_response.usage.prompt_tokens,
-                "completion_tokens": llm_response.usage.completion_tokens,
-                "model": resolved_model,
-                "finish_reason": null,
-                "peer_model": resolved_model,
-            });
+    match action {
+        crate::fleet::PeekResult::NotFound => {
+            chronicle_write(
+                crate::pyramid::compute_chronicle::EVENT_FLEET_RESULT_ORPHANED,
+                serde_json::json!({
+                    "job_id": envelope.job_id,
+                    "claimed_peer": identity.nid(),
+                }),
+            );
             Ok(warp::reply::with_status(
-                warp::reply::json(&response),
+                warp::reply::json(&serde_json::json!({})),
                 warp::http::StatusCode::OK,
             ))
         }
-        Err(e) => Ok(warp::reply::with_status(
-            warp::reply::json(&serde_json::json!({"error": format!("LLM call failed: {}", e)})),
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-        )),
+        crate::fleet::PeekResult::Mismatch => {
+            chronicle_write(
+                crate::pyramid::compute_chronicle::EVENT_FLEET_RESULT_FORGERY_ATTEMPT,
+                serde_json::json!({
+                    "job_id": envelope.job_id,
+                    "claimed_peer": identity.nid(),
+                }),
+            );
+            Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({})),
+                warp::http::StatusCode::FORBIDDEN,
+            ))
+        }
+        crate::fleet::PeekResult::Match => {
+            // Remove the pending entry and fire the oneshot sender.
+            if let Some(pj) = ctx.pending.remove(&envelope.job_id) {
+                let latency_ms = pj.dispatched_at.elapsed().as_millis() as u64;
+                let peer_id = pj.peer_id.clone();
+                // send() returns Err if the receiver dropped — acceptable, nothing to do.
+                let _ = pj.sender.send(envelope.outcome);
+                chronicle_write(
+                    crate::pyramid::compute_chronicle::EVENT_FLEET_RESULT_RECEIVED,
+                    serde_json::json!({
+                        "peer_id": peer_id,
+                        "latency_ms": latency_ms,
+                        "job_id": envelope.job_id,
+                    }),
+                );
+            } else {
+                // Raced with sweep between peek_matches and remove — treat as orphan.
+                chronicle_write(
+                    crate::pyramid::compute_chronicle::EVENT_FLEET_RESULT_ORPHANED,
+                    serde_json::json!({
+                        "job_id": envelope.job_id,
+                        "claimed_peer": identity.nid(),
+                    }),
+                );
+            }
+            Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({})),
+                warp::http::StatusCode::OK,
+            ))
+        }
     }
 }
 
 /// Handle POST /v1/fleet/announce — receive fleet peer announcement.
 ///
-/// Verifies fleet JWT, checks same-operator, parses announcement,
-/// updates the fleet roster.
+/// Verifies fleet identity (single call: signature + audience + operator +
+/// nid non-empty), parses announcement, updates the fleet roster.
 async fn handle_fleet_announce(
     auth_header: String,
     body: serde_json::Value,
     state: ServerState,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    // 1. Verify fleet JWT
-    let token = auth_header.strip_prefix("Bearer ").unwrap_or("");
-    let jwt_pk = state.jwt_public_key.read().await;
-
-    let claims = match verify_fleet_jwt(token, &jwt_pk) {
-        Ok(c) => c,
-        Err(e) => {
+    // 1. Verify fleet identity — single call returns typed FleetIdentity.
+    let jwt_pk = state.jwt_public_key.read().await.clone();
+    let self_operator_id = state
+        .auth
+        .read()
+        .await
+        .operator_id
+        .clone()
+        .unwrap_or_default();
+    let _identity = match crate::pyramid::fleet_identity::verify_fleet_identity(
+        &auth_header,
+        &jwt_pk,
+        &self_operator_id,
+    ) {
+        Ok(i) => i,
+        Err(_) => {
             return Ok(warp::reply::with_status(
-                warp::reply::json(&serde_json::json!({"error": format!("JWT verification failed: {}", e)})),
+                warp::reply::json(&serde_json::json!({})),
                 warp::http::StatusCode::FORBIDDEN,
             ));
         }
     };
-    drop(jwt_pk);
 
-    // 2. Verify same operator
-    let self_operator_id = state.auth.read().await.operator_id.clone().unwrap_or_default();
-    let jwt_operator_id = claims.op.unwrap_or_default();
-    if self_operator_id.is_empty() || self_operator_id != jwt_operator_id {
-        return Ok(warp::reply::with_status(
-            warp::reply::json(&serde_json::json!({"error": "Operator mismatch"})),
-            warp::http::StatusCode::FORBIDDEN,
-        ));
-    }
-
-    // 3. Parse announcement and update roster
+    // 2. Parse announcement and update roster
     let announcement: crate::fleet::FleetAnnouncement = match serde_json::from_value(body.clone()) {
         Ok(a) => a,
         Err(e) => {

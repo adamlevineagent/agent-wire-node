@@ -237,6 +237,13 @@ pub struct LlmConfig {
     /// through to the local queue. When None (tests, pre-init), fleet
     /// routing is skipped.
     pub fleet_roster: Option<Arc<tokio::sync::RwLock<crate::fleet::FleetRoster>>>,
+    /// Fleet dispatch context (Phase 4 async fleet dispatch). Carries the
+    /// pending-job registry, a handle to the node's tunnel state (for
+    /// callback URL construction), and the operational delivery policy.
+    /// When Some, fleet dispatch uses the async callback protocol. When
+    /// None (tests, pre-init), fleet dispatch is skipped and the call
+    /// falls through to local execution.
+    pub fleet_dispatch: Option<std::sync::Arc<crate::fleet::FleetDispatchContext>>,
 }
 
 /// Phase 12: cache plumbing that lives on an LlmConfig so every call
@@ -327,6 +334,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("provider_pools", &self.provider_pools.as_ref().map(|_| "<pools>"))
             .field("compute_queue", &self.compute_queue.as_ref().map(|_| "<queue>"))
             .field("fleet_roster", &self.fleet_roster.as_ref().map(|_| "<fleet>"))
+            .field("fleet_dispatch", &self.fleet_dispatch.as_ref().map(|_| "<fleet_dispatch>"))
             .finish()
     }
 }
@@ -359,6 +367,7 @@ impl Default for LlmConfig {
             provider_pools: None,
             compute_queue: None,
             fleet_roster: None,
+            fleet_dispatch: None,
         }
     }
 }
@@ -450,6 +459,9 @@ impl LlmConfig {
         }
         if self.fleet_roster.is_none() {
             self.fleet_roster = live.fleet_roster.clone();
+        }
+        if self.fleet_dispatch.is_none() {
+            self.fleet_dispatch = live.fleet_dispatch.clone();
         }
         self
     }
@@ -819,159 +831,427 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 has_fleet,
                 rule = %route.matched_rule_name,
                 fleet_roster_present = config.fleet_roster.is_some(),
+                fleet_dispatch_present = config.fleet_dispatch.is_some(),
                 provider_count = route.providers.len(),
                 providers = ?route.providers.iter().map(|p| &p.provider_id).collect::<Vec<_>>(),
                 "Fleet Phase A: entry check"
             );
+            // Phase 4 async: the dispatch pathway requires a FleetDispatchContext
+            // (pending-job registry, tunnel handle, policy). When absent (tests,
+            // pre-init), fleet is skipped and we fall through to local.
+            // We ALSO snapshot the policy and tunnel URL exactly once here so
+            // the peer-staleness diagnostic, find_peer_for_rule, and the timeout
+            // computations all see consistent values. This eliminates a TOCTOU
+            // race where tunnel_state could transition Connected → Disconnected
+            // between the check and callback URL construction.
             if has_fleet {
-                if let Some(ref roster_handle) = config.fleet_roster {
-                    let roster = roster_handle.read().await;
-                    // Diagnostic: log fleet routing decision
-                    tracing::info!(
-                        rule = %route.matched_rule_name,
-                        peer_count = roster.peers.len(),
-                        has_jwt = roster.fleet_jwt.is_some(),
-                        peers_with_rules = roster.peers.values()
-                            .filter(|p| !p.serving_rules.is_empty())
-                            .count(),
-                        "Fleet Phase A: checking roster for rule match"
-                    );
-                    for (pid, peer) in &roster.peers {
-                        tracing::info!(
-                            peer_id = %pid,
-                            serving_rules = ?peer.serving_rules,
-                            models = ?peer.models_loaded,
-                            handle = ?peer.handle_path,
-                            stale = %(chrono::Utc::now() - peer.last_seen).num_seconds() > 120,
-                            "Fleet peer state"
-                        );
-                    }
-                    if let Some(peer) = roster.find_peer_for_rule(&route.matched_rule_name) {
-                        let jwt = roster.fleet_jwt.clone().unwrap_or_default();
-                        if !jwt.is_empty() {
-                            // (fleet dispatch proceeds below)
-                            let peer_clone = peer.clone();
-                            let rule_name = route.matched_rule_name.clone();
-                            // Fleet timeout reads from the matched rule's escalation config
-                            let fleet_timeout_secs = route.max_wait_secs;
-                            drop(roster); // release lock before async
-
-                            // WP-5: Chronicle fleet_dispatched event
-                            let fleet_job_path = super::compute_chronicle::generate_job_path(
-                                ctx, None, &config.primary_model, "fleet",
+                // Step 0: snapshot fleet_ctx + policy + callback_url.
+                let phase_a_ready = async {
+                    let fleet_ctx = match config.fleet_dispatch.as_ref() {
+                        Some(c) => c.clone(),
+                        None => {
+                            tracing::warn!(
+                                rule = %route.matched_rule_name,
+                                "Fleet Phase A skipped: FleetDispatchContext not attached"
                             );
-                            let fleet_start = std::time::Instant::now();
-                            let fleet_db_path = ctx
-                                .map(|c| c.db_path.clone())
-                                .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
-                            {
-                                let chronicle_ctx = if let Some(sc) = ctx {
-                                    super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-                                        sc, &fleet_job_path, "fleet_dispatched", "fleet",
-                                    )
-                                } else {
-                                    super::compute_chronicle::ChronicleEventContext::minimal(
-                                        &fleet_job_path, "fleet_dispatched", "fleet",
-                                    )
-                                    .with_model_id(config.primary_model.clone())
-                                };
-                                let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
-                                    "peer_id": peer_clone.node_id,
-                                    "peer_name": peer_clone.name,
-                                    "rule_name": rule_name,
-                                    "timeout_secs": fleet_timeout_secs,
-                                }));
-                                if let Some(ref db_path) = fleet_db_path {
-                                    let db_path = db_path.clone();
-                                    let chronicle_ctx = chronicle_ctx.clone();
-                                    tokio::task::spawn_blocking(move || {
-                                        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                                            let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
-                                        }
-                                    });
-                                }
+                            return None;
+                        }
+                    };
+                    let policy_snap = fleet_ctx.policy.read().await.clone();
+                    let callback_url = {
+                        let ts = fleet_ctx.tunnel_state.read().await;
+                        match (&ts.status, ts.tunnel_url.as_ref()) {
+                            // Only Connected is dispatch-valid. Connecting means
+                            // cloudflared hasn't finished announcing the tunnel
+                            // at Cloudflare's edge — callbacks would 404 there.
+                            (crate::tunnel::TunnelConnectionStatus::Connected, Some(u)) => {
+                                u.endpoint("/v1/fleet/result")
                             }
+                            _ => {
+                                tracing::warn!(
+                                    rule = %route.matched_rule_name,
+                                    status = ?ts.status,
+                                    has_url = ts.tunnel_url.is_some(),
+                                    "Fleet Phase A skipped: tunnel not Connected or URL missing"
+                                );
+                                return None;
+                            }
+                        }
+                    };
+                    Some((fleet_ctx, policy_snap, callback_url))
+                }
+                .await;
 
-                            match crate::fleet::fleet_dispatch_by_rule(
-                                &peer_clone,
-                                &rule_name,
-                                system_prompt,
-                                user_prompt,
-                                temperature,
-                                _max_tokens,
-                                response_format,
-                                &jwt,
-                                fleet_timeout_secs,
-                            )
-                            .await
-                            {
-                                Ok(fleet_resp) => {
-                                    // WP-6: Chronicle fleet_returned event
-                                    {
-                                        let chronicle_ctx = if let Some(sc) = ctx {
-                                            super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-                                                sc, &fleet_job_path, "fleet_returned", "fleet",
-                                            )
-                                        } else {
-                                            super::compute_chronicle::ChronicleEventContext::minimal(
-                                                &fleet_job_path, "fleet_returned", "fleet",
-                                            )
-                                            .with_model_id(config.primary_model.clone())
-                                        };
-                                        let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
-                                            "peer_id": peer_clone.node_id,
-                                            "peer_name": peer_clone.name,
-                                            "peer_model": fleet_resp.peer_model,
-                                            "latency_ms": fleet_start.elapsed().as_millis() as u64,
-                                            "tokens_prompt": fleet_resp.prompt_tokens.unwrap_or(0),
-                                            "tokens_completion": fleet_resp.completion_tokens.unwrap_or(0),
-                                        }));
-                                        if let Some(ref db_path) = fleet_db_path {
-                                            let db_path = db_path.clone();
-                                            tokio::task::spawn_blocking(move || {
-                                                if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                                                    let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
-                                                }
-                                            });
-                                        }
-                                    }
+                if let Some((fleet_ctx, policy_snap, callback_url)) = phase_a_ready {
+                    if let Some(ref roster_handle) = config.fleet_roster {
+                        let roster = roster_handle.read().await;
+                        // Diagnostic: log fleet routing decision
+                        tracing::info!(
+                            rule = %route.matched_rule_name,
+                            peer_count = roster.peers.len(),
+                            has_jwt = roster.fleet_jwt.is_some(),
+                            peers_with_rules = roster.peers.values()
+                                .filter(|p| !p.serving_rules.is_empty())
+                                .count(),
+                            peer_staleness_secs = policy_snap.peer_staleness_secs,
+                            "Fleet Phase A: checking roster for rule match"
+                        );
+                        for (pid, peer) in &roster.peers {
+                            let age_secs = (chrono::Utc::now() - peer.last_seen).num_seconds();
+                            tracing::info!(
+                                peer_id = %pid,
+                                serving_rules = ?peer.serving_rules,
+                                models = ?peer.models_loaded,
+                                handle = ?peer.handle_path,
+                                stale = age_secs > policy_snap.peer_staleness_secs as i64,
+                                "Fleet peer state"
+                            );
+                        }
+                        if let Some(peer) = roster.find_peer_for_rule(
+                            &route.matched_rule_name,
+                            policy_snap.peer_staleness_secs,
+                        ) {
+                            let jwt = roster.fleet_jwt.clone().unwrap_or_default();
+                            if !jwt.is_empty() {
+                                let peer_clone = peer.clone();
+                                let rule_name = route.matched_rule_name.clone();
+                                // NB: route.max_wait_secs is the JOB wall-clock
+                                // bound on how long we await the callback.
+                                // policy_snap.dispatch_ack_timeout_secs is a
+                                // distinct ACK-phase timeout (how long we wait
+                                // for the 202 HTTP response).
+                                let job_wait_secs = route.max_wait_secs;
+                                // Clamp to at least 1s — a zero would cause the
+                                // orphan sweep to evict the entry on its first
+                                // tick, before the callback can arrive.
+                                let expected_timeout =
+                                    std::time::Duration::from_secs(job_wait_secs.max(1));
+                                drop(roster); // release lock before async
 
-                                    // Return with fleet provenance on the LlmResponse
-                                    return Ok(LlmResponse {
-                                        content: fleet_resp.content,
-                                        usage: super::types::TokenUsage {
-                                            prompt_tokens: fleet_resp.prompt_tokens.unwrap_or(0),
-                                            completion_tokens: fleet_resp.completion_tokens.unwrap_or(0),
-                                        },
-                                        generation_id: None,
-                                        actual_cost_usd: None, // fleet is free (same operator)
-                                        provider_id: Some("fleet".to_string()),
-                                        fleet_peer_id: Some(peer_clone.handle_path.clone()
-                                            .unwrap_or_else(|| peer_clone.node_id.clone())),
-                                        fleet_peer_model: fleet_resp.peer_model.clone(),
+                                let fleet_job_path = super::compute_chronicle::generate_job_path(
+                                    ctx, None, &config.primary_model, "fleet",
+                                );
+                                let fleet_start = std::time::Instant::now();
+                                let fleet_db_path = ctx
+                                    .map(|c| c.db_path.clone())
+                                    .or_else(|| {
+                                        config
+                                            .cache_access
+                                            .as_ref()
+                                            .map(|ca| ca.db_path.to_string())
                                     });
-                                }
-                                Err(e) => {
-                                    // Chronicle fleet_dispatch_failed event
-                                    {
+
+                                // Step 2: generate UUID for this dispatch.
+                                let job_id = uuid::Uuid::new_v4().to_string();
+
+                                // Step 4: oneshot channel — filled by the
+                                // server.rs /v1/fleet/result handler when the
+                                // peer's callback arrives, or dropped by the
+                                // orphan sweep (producing RecvError here).
+                                let (sender, receiver) =
+                                    tokio::sync::oneshot::channel::<crate::fleet::FleetAsyncResult>();
+
+                                // Step 5: register pending entry BEFORE dispatch
+                                // POST, so a very-fast peer callback cannot beat
+                                // our registration and produce a spurious orphan.
+                                //
+                                // peer_id MUST be peer.node_id (raw) — the
+                                // callback authenticates via fleet JWT whose
+                                // `nid` claim carries the raw node_id.
+                                fleet_ctx.pending.register(
+                                    job_id.clone(),
+                                    crate::fleet::PendingFleetJob {
+                                        sender,
+                                        dispatched_at: std::time::Instant::now(),
+                                        peer_id: peer_clone.node_id.clone(),
+                                        expected_timeout,
+                                    },
+                                );
+
+                                // Step 6: POST dispatch (202 ACK phase).
+                                let dispatch_result = crate::fleet::fleet_dispatch_by_rule(
+                                    &peer_clone,
+                                    &job_id,
+                                    &callback_url,
+                                    &rule_name,
+                                    system_prompt,
+                                    user_prompt,
+                                    temperature,
+                                    _max_tokens,
+                                    response_format,
+                                    &jwt,
+                                    policy_snap.dispatch_ack_timeout_secs,
+                                )
+                                .await;
+
+                                match dispatch_result {
+                                    Ok(ack) => {
+                                        // Step 9: chronicle fleet_dispatched_async
+                                        {
+                                            let chronicle_ctx = if let Some(sc) = ctx {
+                                                super::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                                                    sc, &fleet_job_path, "fleet_dispatched_async", "fleet",
+                                                )
+                                            } else {
+                                                super::compute_chronicle::ChronicleEventContext::minimal(
+                                                    &fleet_job_path, "fleet_dispatched_async", "fleet",
+                                                )
+                                                .with_model_id(config.primary_model.clone())
+                                            };
+                                            let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
+                                                "peer_id": peer_clone.node_id,
+                                                "peer_name": peer_clone.name,
+                                                "rule_name": rule_name,
+                                                "timeout_secs": job_wait_secs,
+                                                "peer_queue_depth": ack.peer_queue_depth,
+                                            }));
+                                            if let Some(ref db_path) = fleet_db_path {
+                                                let db_path = db_path.clone();
+                                                tokio::task::spawn_blocking(move || {
+                                                    if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                                                        let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                                                    }
+                                                });
+                                            }
+                                        }
+
+                                        // Step 10: two-phase await with pinned
+                                        // receiver. `timeout` consumes its
+                                        // future by value; pin once, then pass
+                                        // `receiver.as_mut()` on each call —
+                                        // `&mut receiver` would yield
+                                        // `&mut Pin<&mut Receiver>`, not a Future.
+                                        tokio::pin!(receiver);
+                                        let wait_outcome = match tokio::time::timeout(
+                                            std::time::Duration::from_secs(job_wait_secs),
+                                            receiver.as_mut(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(r)) => Ok(r),
+                                            Ok(Err(_recv_err)) => {
+                                                // Sender dropped — sweep evicted
+                                                // the pending entry. Fall through.
+                                                Err("orphaned")
+                                            }
+                                            Err(_elapsed) => {
+                                                // Primary timeout — grace window
+                                                // for in-flight callbacks.
+                                                match tokio::time::timeout(
+                                                    std::time::Duration::from_secs(
+                                                        policy_snap.timeout_grace_secs,
+                                                    ),
+                                                    receiver.as_mut(),
+                                                )
+                                                .await
+                                                {
+                                                    Ok(Ok(r)) => Ok(r),
+                                                    _ => Err("timeout"),
+                                                }
+                                            }
+                                        };
+
+                                        // Idempotent cleanup — the callback or
+                                        // sweep may have already removed us.
+                                        let _ = fleet_ctx.pending.remove(&job_id);
+
+                                        match wait_outcome {
+                                            Ok(crate::fleet::FleetAsyncResult::Success(fleet_resp)) => {
+                                                // Chronicle fleet_result_received
+                                                {
+                                                    let chronicle_ctx = if let Some(sc) = ctx {
+                                                        super::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                                                            sc, &fleet_job_path, "fleet_result_received", "fleet",
+                                                        )
+                                                    } else {
+                                                        super::compute_chronicle::ChronicleEventContext::minimal(
+                                                            &fleet_job_path, "fleet_result_received", "fleet",
+                                                        )
+                                                        .with_model_id(config.primary_model.clone())
+                                                    };
+                                                    let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
+                                                        "peer_id": peer_clone.node_id,
+                                                        "peer_name": peer_clone.name,
+                                                        "peer_model": fleet_resp.peer_model,
+                                                        "latency_ms": fleet_start.elapsed().as_millis() as u64,
+                                                        "tokens_prompt": fleet_resp.prompt_tokens.unwrap_or(0),
+                                                        "tokens_completion": fleet_resp.completion_tokens.unwrap_or(0),
+                                                    }));
+                                                    if let Some(ref db_path) = fleet_db_path {
+                                                        let db_path = db_path.clone();
+                                                        tokio::task::spawn_blocking(move || {
+                                                            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                                                                let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                                                            }
+                                                        });
+                                                    }
+                                                }
+
+                                                return Ok(LlmResponse {
+                                                    content: fleet_resp.content,
+                                                    usage: super::types::TokenUsage {
+                                                        prompt_tokens: fleet_resp.prompt_tokens.unwrap_or(0),
+                                                        completion_tokens: fleet_resp.completion_tokens.unwrap_or(0),
+                                                    },
+                                                    generation_id: None,
+                                                    actual_cost_usd: None, // fleet is free (same operator)
+                                                    provider_id: Some("fleet".to_string()),
+                                                    fleet_peer_id: Some(
+                                                        peer_clone
+                                                            .handle_path
+                                                            .clone()
+                                                            .unwrap_or_else(|| peer_clone.node_id.clone()),
+                                                    ),
+                                                    fleet_peer_model: fleet_resp.peer_model.clone(),
+                                                });
+                                            }
+                                            Ok(crate::fleet::FleetAsyncResult::Error(err_msg)) => {
+                                                // Peer RAN inference and it failed
+                                                // (GPU OOM, model mismatch, etc.).
+                                                // Chronicle and fall through to local.
+                                                let chronicle_ctx = if let Some(sc) = ctx {
+                                                    super::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                                                        sc, &fleet_job_path, "fleet_result_failed", "fleet",
+                                                    )
+                                                } else {
+                                                    super::compute_chronicle::ChronicleEventContext::minimal(
+                                                        &fleet_job_path, "fleet_result_failed", "fleet",
+                                                    )
+                                                    .with_model_id(config.primary_model.clone())
+                                                };
+                                                let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
+                                                    "peer_id": peer_clone.node_id,
+                                                    "peer_name": peer_clone.name,
+                                                    "error": err_msg,
+                                                }));
+                                                if let Some(ref db_path) = fleet_db_path {
+                                                    let db_path = db_path.clone();
+                                                    tokio::task::spawn_blocking(move || {
+                                                        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                                                            let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                                                        }
+                                                    });
+                                                }
+                                                warn!(
+                                                    "Fleet peer {} inference failed, falling through to local",
+                                                    peer_clone.node_id
+                                                );
+                                            }
+                                            Err("timeout") => {
+                                                let chronicle_ctx = if let Some(sc) = ctx {
+                                                    super::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                                                        sc, &fleet_job_path, "fleet_dispatch_timeout", "fleet",
+                                                    )
+                                                } else {
+                                                    super::compute_chronicle::ChronicleEventContext::minimal(
+                                                        &fleet_job_path, "fleet_dispatch_timeout", "fleet",
+                                                    )
+                                                    .with_model_id(config.primary_model.clone())
+                                                };
+                                                let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
+                                                    "peer_id": peer_clone.node_id,
+                                                    "peer_name": peer_clone.name,
+                                                    "timeout_secs": job_wait_secs,
+                                                    "grace_secs": policy_snap.timeout_grace_secs,
+                                                }));
+                                                if let Some(ref db_path) = fleet_db_path {
+                                                    let db_path = db_path.clone();
+                                                    tokio::task::spawn_blocking(move || {
+                                                        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                                                            let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                                                        }
+                                                    });
+                                                }
+                                                warn!(
+                                                    "Fleet dispatch timeout awaiting callback from peer {}, falling through to local",
+                                                    peer_clone.node_id
+                                                );
+                                            }
+                                            Err(_orphaned) => {
+                                                // Sweep removed the entry before
+                                                // the callback arrived. Chronicle
+                                                // as dispatch_failed (reason=orphaned)
+                                                // so the observability trail does not
+                                                // silently drop this case.
+                                                let chronicle_ctx = if let Some(sc) = ctx {
+                                                    super::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                                                        sc, &fleet_job_path, "fleet_dispatch_failed", "fleet",
+                                                    )
+                                                } else {
+                                                    super::compute_chronicle::ChronicleEventContext::minimal(
+                                                        &fleet_job_path, "fleet_dispatch_failed", "fleet",
+                                                    )
+                                                    .with_model_id(config.primary_model.clone())
+                                                };
+                                                let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
+                                                    "peer_id": peer_clone.node_id,
+                                                    "peer_name": peer_clone.name,
+                                                    "error": "pending entry orphaned by sweep",
+                                                    "error_kind": "orphaned",
+                                                    "status_code": serde_json::Value::Null,
+                                                    "latency_ms": fleet_start.elapsed().as_millis() as u64,
+                                                }));
+                                                if let Some(ref db_path) = fleet_db_path {
+                                                    let db_path = db_path.clone();
+                                                    tokio::task::spawn_blocking(move || {
+                                                        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                                                            let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                                                        }
+                                                    });
+                                                }
+                                                warn!(
+                                                    "Fleet pending entry orphaned for peer {}, falling through to local",
+                                                    peer_clone.node_id
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        // Dispatch POST failed — remove entry
+                                        // (idempotent) and chronicle by status_code.
+                                        let _ = fleet_ctx.pending.remove(&job_id);
+
+                                        // 503 = peer overloaded; treat distinctly
+                                        // so analytics can show capacity pressure
+                                        // separately from hard failures.
+                                        let is_overloaded = e.status_code == Some(503);
+                                        let event_type = if is_overloaded {
+                                            "fleet_peer_overloaded"
+                                        } else {
+                                            "fleet_dispatch_failed"
+                                        };
                                         let chronicle_ctx = if let Some(sc) = ctx {
                                             super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-                                                sc, &fleet_job_path, "fleet_dispatch_failed", "fleet",
+                                                sc, &fleet_job_path, event_type, "fleet",
                                             )
                                         } else {
                                             super::compute_chronicle::ChronicleEventContext::minimal(
-                                                &fleet_job_path, "fleet_dispatch_failed", "fleet",
+                                                &fleet_job_path, event_type, "fleet",
                                             )
                                             .with_model_id(config.primary_model.clone())
                                         };
-                                        let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
-                                            "peer_id": peer_clone.node_id,
-                                            "peer_name": peer_clone.name,
-                                            "error": e.message.clone(),
-                                            "error_kind": serde_json::to_value(&e.kind).unwrap_or_default(),
-                                            "status_code": e.status_code,
-                                            "latency_ms": fleet_start.elapsed().as_millis() as u64,
-                                        }));
+                                        let chronicle_ctx = if is_overloaded {
+                                            // Policy-derived retry-after — the
+                                            // peer's own Retry-After header is
+                                            // not parsed here (Phase 4 scope);
+                                            // the policy value is the fleet-wide
+                                            // backoff guidance.
+                                            chronicle_ctx.with_metadata(serde_json::json!({
+                                                "peer_id": peer_clone.node_id,
+                                                "peer_name": peer_clone.name,
+                                                "status_code": e.status_code,
+                                                "retry_after": policy_snap.admission_retry_after_secs,
+                                            }))
+                                        } else {
+                                            chronicle_ctx.with_metadata(serde_json::json!({
+                                                "peer_id": peer_clone.node_id,
+                                                "peer_name": peer_clone.name,
+                                                "error": e.message.clone(),
+                                                "error_kind": serde_json::to_value(&e.kind).unwrap_or_default(),
+                                                "status_code": e.status_code,
+                                                "latency_ms": fleet_start.elapsed().as_millis() as u64,
+                                            }))
+                                        };
                                         if let Some(ref db_path) = fleet_db_path {
                                             let db_path = db_path.clone();
                                             tokio::task::spawn_blocking(move || {
@@ -980,33 +1260,43 @@ pub async fn call_model_unified_with_audit_and_ctx(
                                                 }
                                             });
                                         }
-                                    }
 
-                                    // Only remove peer from roster if it's actually dead (transport failure).
-                                    // Timeouts (524, client timeout) mean the peer is alive but slow —
-                                    // discovery membership belongs to heartbeat/announce, not dataplane RPC outcomes.
-                                    if e.is_peer_dead() {
-                                        let mut roster_w = roster_handle.write().await;
-                                        roster_w.remove_peer(&peer_clone.node_id);
-                                        warn!("Fleet dispatch: peer {} removed (transport failure): {}", peer_clone.node_id, e);
-                                    } else {
-                                        warn!("Fleet dispatch failed ({:?}), peer stays in roster: {}", e.kind, e);
+                                        // Only remove peer from roster if it's
+                                        // actually dead (transport failure).
+                                        // Timeouts (524, client timeout) mean
+                                        // the peer is alive but slow —
+                                        // discovery membership belongs to
+                                        // heartbeat/announce, not dataplane
+                                        // RPC outcomes.
+                                        if e.is_peer_dead() {
+                                            let mut roster_w = roster_handle.write().await;
+                                            roster_w.remove_peer(&peer_clone.node_id);
+                                            warn!(
+                                                "Fleet dispatch: peer {} removed (transport failure): {}",
+                                                peer_clone.node_id, e
+                                            );
+                                        } else {
+                                            warn!(
+                                                "Fleet dispatch failed ({:?}), peer stays in roster: {}",
+                                                e.kind, e
+                                            );
+                                        }
                                     }
                                 }
+                            } else {
+                                tracing::warn!(
+                                    rule = %route.matched_rule_name,
+                                    "Fleet dispatch skipped: fleet JWT is empty"
+                                );
                             }
                         } else {
                             tracing::warn!(
                                 rule = %route.matched_rule_name,
-                                "Fleet dispatch skipped: fleet JWT is empty"
+                                peer_count = roster.peers.len(),
+                                "Fleet dispatch skipped: no peer serves rule '{}'",
+                                route.matched_rule_name
                             );
                         }
-                    } else {
-                        tracing::warn!(
-                            rule = %route.matched_rule_name,
-                            peer_count = roster.peers.len(),
-                            "Fleet dispatch skipped: no peer serves rule '{}'",
-                            route.matched_rule_name
-                        );
                     }
                 }
             }
@@ -1030,12 +1320,18 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 queue_model_id_for_local_execution(config, ctx, resolved_route.as_ref());
             let (tx, rx) = tokio::sync::oneshot::channel();
 
-            // Clone config WITHOUT queue handle (prevents re-enqueue loop)
-            // and WITHOUT fleet roster. Queue replay is a pure local
-            // execution path: fleet dispatch already had its chance.
+            // Clone config WITHOUT queue handle (prevents re-enqueue loop),
+            // WITHOUT fleet roster, and WITHOUT fleet_dispatch context.
+            // Queue replay is a pure local execution path: fleet dispatch
+            // already had its chance. Stripping fleet_dispatch is
+            // belt-and-suspenders — `skip_fleet_dispatch = true` below is
+            // the authoritative guard against Phase A re-entry, but zeroing
+            // the context removes the possibility entirely and matches the
+            // spawn_fleet_worker pattern in server.rs::spawn_fleet_worker.
             let mut gpu_config = config.clone();
             gpu_config.compute_queue = None;
             gpu_config.fleet_roster = None;
+            gpu_config.fleet_dispatch = None;
 
             // Set skip flags on the forwarded options so the GPU loop
             // performs the local execution directly rather than treating
@@ -3327,6 +3623,15 @@ routing_rules:
         let compute_queue = crate::compute_queue::ComputeQueueHandle::new();
         let fleet_roster =
             std::sync::Arc::new(tokio::sync::RwLock::new(crate::fleet::FleetRoster::default()));
+        let tunnel_state_for_dispatch =
+            std::sync::Arc::new(tokio::sync::RwLock::new(crate::tunnel::TunnelState::default()));
+        let fleet_dispatch = std::sync::Arc::new(crate::fleet::FleetDispatchContext {
+            tunnel_state: tunnel_state_for_dispatch.clone(),
+            pending: std::sync::Arc::new(crate::fleet::PendingFleetJobs::new()),
+            policy: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::pyramid::fleet_delivery_policy::FleetDeliveryPolicy::default(),
+            )),
+        });
 
         let live = LlmConfig {
             api_key: "live-api-key".into(),
@@ -3345,6 +3650,7 @@ routing_rules:
             provider_pools: Some(provider_pools.clone()),
             compute_queue: Some(compute_queue.clone()),
             fleet_roster: Some(fleet_roster.clone()),
+            fleet_dispatch: Some(fleet_dispatch.clone()),
             ..Default::default()
         };
 
@@ -3379,6 +3685,10 @@ routing_rules:
         assert!(std::sync::Arc::ptr_eq(
             rebuilt.fleet_roster.as_ref().unwrap(),
             &fleet_roster,
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            rebuilt.fleet_dispatch.as_ref().unwrap(),
+            &fleet_dispatch,
         ));
         assert!(rebuilt.cache_access.is_none());
     }
