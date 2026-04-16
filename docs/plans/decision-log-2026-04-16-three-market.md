@@ -240,4 +240,113 @@ All critical findings (Cycle 1 + Cycle 2) addressed. All soft gaps addressed or 
 
 Cycle 2 A (compute internals) and B (cross-market + storage + relay) both fully addressed. Two more auditors still running (fresh read C, implementer wanderer D). Will integrate on landing and run Cycle 3 if any new findings surface.
 
+---
+
+## Session 2: Phase 2 Workstream 0 Implementation
+
+### 2026-04-17 · BUILD · WS0 pre-flight shipped (commit 6e414bf)
+
+Landed the DD-Q pre-flight migrations on feature branch
+`feat/compute-market-phase-2`. Infrastructure-only, no market behavior:
+
+1. **`validate_callback_url` MarketStandard/Relay branch** — was
+   `KindNotImplemented` placeholder; now validates https + non-empty host.
+2. **`fleet_result_outbox.callback_kind` column** — added with DEFAULT
+   `'Fleet'` in CREATE, conditional PRAGMA-guarded ALTER for existing DBs.
+3. **Sweep helpers filtered by `callback_kind = 'Fleet'`** — sweep_expired,
+   retry_candidates, startup_recovery gated so market rows land in Phase 2
+   WS1+'s own worker.
+4. **`pyramid_market_delivery_policy` singleton table** + Rust struct +
+   seed YAML, 17 fields shape-parallel to FleetDeliveryPolicy with the 4
+   economic-gate fees absorbed per DD-E. `default_matches_seed_yaml` test
+   enforces the coincidence.
+5. **Helpers**: `WIRE_PLATFORM_DISPATCHER` sentinel, `callback_kind_str` /
+   `callback_kind_from_str` / `CallbackKindColumn` for outbox round-trip.
+6. **Dead variant removed**: `KindNotImplemented` and its 3 sites deleted.
+
+Test delta: +9 passing (7 market_delivery_policy + 2 replaced callback
+tests), 0 regressions. 15 pre-existing DADBEAR/staleness failures unchanged.
+
+### 2026-04-17 · VERIFY · WS0 serial verifier pass (commit 7b303c0)
+
+Ran serial verifier (one focused agent, full WS0 spec context, told to fix
+in place). Caught THREE issues:
+
+- **MAJOR** — `fleet_outbox_count_inflight_excluding` missed the
+  `callback_kind = 'Fleet'` filter. Fleet's `max_inflight_jobs` budget
+  would have been consumed by market rows and vice versa (cross-market
+  starvation). Fixed + regression test
+  `test_fleet_outbox_count_inflight_ignores_market_rows`.
+- **MAJOR** — `fleet_outbox_expire_exhausted` missed the same filter. A
+  market row that hit Fleet's `max_delivery_attempts` would have its
+  `expires_at` pushed into the past but never be collected by the Fleet-
+  scoped sweep (orphaned row). Fixed + regression test
+  `test_fleet_outbox_expire_exhausted_ignores_market_rows`.
+- **MINOR** — no roundtrip test for `callback_kind_str` /
+  `callback_kind_from_str`. The strings MUST stay byte-aligned with the
+  SQL filter literals or sweeps silently stop picking up rows. Added
+  `callback_kind_str_roundtrips_all_variants`.
+
+Plus **spec alignment**: tightened `validate_callback_url` to https-only
+(my commit accepted http for dev rigs with a comment; canonical DD-Q part 3
+and architecture §VIII.6 say `!= "https"`). Updated the test fixture to
+assert http is now rejected with `SchemeNotHttps`. If dev rigs need
+non-TLS later, that's a new `allow_http_callbacks` field on
+`market_delivery_policy`, not an inline loosening.
+
+### 2026-04-17 · VERIFY · WS0 wanderer pass (commit fba3723)
+
+Ran wanderer — no punch list, just "does this actually work when WS1+
+builds on it." Caught THREE integration gaps (plus one wrong comment):
+
+- **GAP 1** — `config_contributions.rs` had no `"market_delivery_policy"`
+  arm. Supersession would hard-fail with `UnknownSchemaType`. Added the
+  arm shape-parallel to the fleet sibling.
+- **GAP 2** — `main.rs` had no first-boot seed path for the contribution.
+  Operators tuning the policy for the first time would find nothing to
+  supersede; no `contribution_id` tracked for the Wire-sync overlay.
+  Added parallel to the fleet block at `main.rs:11920`.
+- **GAP 3** — ConfigSynced reload branch (deferred). Would require the
+  yet-unconstructed Phase 2 WS1+ `MarketDispatchContext` to hold the
+  `Arc<RwLock<MarketDeliveryPolicy>>`. Documented inline so WS1+ knows
+  where to wire it; not added here.
+- **COMMENT** — `fleet.rs:678-681` was half-wrong: claimed both scheme +
+  host checks were defense-in-depth because `TunnelUrl::parse` blocks
+  both. Truth: `TunnelUrl` accepts http, so `SchemeNotHttps` is in fact
+  the only layer enforcing https; only the host check is defense-in-
+  depth. Comment corrected.
+
+Added `test_fleet_outbox_pre_ws0_alter_upgrade_path` — simulates the
+upgrade path for every existing node (build pre-WS0 schema without
+`callback_kind`, insert legacy row, run `init_pyramid_db`, verify column
+added, legacy row backfilled as 'Fleet', idempotent on re-run).
+
+**This test surfaced a real ordering bug**: the
+`CREATE INDEX idx_fleet_outbox_callback_kind` was in the same execute_
+batch as the CREATE TABLE. On a pre-WS0 DB (table exists without
+callback_kind), SQLite executed the CREATE INDEX first and errored with
+"no such column: callback_kind" before the PRAGMA-guarded ALTER could
+run. Moved the CREATE INDEX to a separate execute_batch AFTER the ALTER
+guard. Without this test the regression would have silently broken every
+operator upgrade in the field.
+
+Added parallel config_contributions tests:
+`test_sync_market_delivery_policy_writes_operational_table` +
+`test_sync_market_delivery_policy_overwrites_on_resync`.
+
+### 2026-04-17 · STATUS · WS0 complete, ready for WS1+
+
+Three commits on `feat/compute-market-phase-2`:
+- `6e414bf` — infrastructure
+- `7b303c0` — verifier pass (2 major filter bugs + scheme tighten + roundtrip)
+- `fba3723` — wanderer pass (contribution supersession + ALTER ordering)
+
+Net test delta: +14 passing (7 market_delivery_policy + 2 market
+config_contributions + 1 pre-WS0 upgrade + 1 roundtrip + 1 inflight
+isolation + 1 expire isolation + 1 test replaced 2 tests). 0 regressions.
+cargo check clean with default target (catches main.rs Send errors per
+`feedback_cargo_check_lib_insufficient_for_binary`).
+
+Next up: WS1 planning.
+
 

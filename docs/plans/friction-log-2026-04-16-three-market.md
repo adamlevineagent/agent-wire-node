@@ -137,4 +137,41 @@ Cycle 2 A launched, found issues, I started fixing. Cycle 2 B/C launched in para
 
 **Generalization worth keeping:** When running parallel audit agents on a state I'm actively editing, either (a) freeze edits until all agents return, or (b) label each agent's output with the file-state timestamp it read (if the agent framework supports that). Current framework doesn't expose file-state-at-read-time. Workaround: sequential audits during active edit phases, parallel audits only during stable/committed phases.
 
+---
+
+## Session 2 Frictions (WS0 implementation)
+
+### 2026-04-17 · WINS · Verifier + wanderer pattern validated on WS0
+
+Ran the verifier-then-wanderer pattern per `feedback_wanderer_after_verifier`. Both caught real bugs the implementer (me) missed:
+
+- Verifier: 2 MAJOR outbox filter gaps that would have cross-starved fleet/market admission budgets in production.
+- Wanderer: 1 ordering bug (`CREATE INDEX` before `ALTER`) that would have broken every operator's upgrade.
+
+Neither bug would have been caught by the pre-existing test suite. Neither was in the canonical spec — they were implementation drift that only surfaces when you try to build the thing. `feedback_wanderers_on_built_systems.md` says "wanderers on built systems catch more than wanderers on plans" — validated again.
+
+### 2026-04-17 · FRICTION · I shipped an HTTP-scheme acceptance deviation from canonical spec
+
+When implementing `validate_callback_url` for MarketStandard/Relay, canonical DD-Q part 3 says `!= "https"`. My commit accepted both http and https with a comment justifying "single-host dev rigs." Verifier caught it; tightened to spec.
+
+**Root cause:** I was thinking about dev ergonomics while writing code, and the local "I want this to work without TLS" thought overrode the global "canonical spec says https" constraint. Classic local-optimization-vs-global-constraint friction.
+
+**Generalization:** When implementing a specific spec'd decision, re-read the exact spec text for that decision immediately before writing the code. Don't rely on memory of the spec — memory drifts toward local context at write time.
+
+### 2026-04-17 · WIN · Small, incremental commits kept verifier scope clean
+
+WS0 landed as three commits (`6e414bf` infra, `7b303c0` verifier, `fba3723` wanderer). Each has a clear intent and a testable scope. Verifier was able to reason about WS0's delta cleanly because the infrastructure commit was isolated from the fix-pass commits. If I had bundled everything into one mega-commit, the verifier's report would have been harder to interpret (is this finding about the infra or the verifier's own additions?).
+
+### 2026-04-17 · OBSERVATION · DD-Q's code-level specificity paid off
+
+DD-Q wrote out the specific ALTER migration + code deltas needed to make DD-D buildable. Implementing WS0 from DD-Q was straightforward — every item in the spec mapped to a concrete code change.
+
+Compare to earlier DDs (A-O) which were more architectural and required translation. DD-Q's "here is the exact ALTER statement" / "here is the exact match arm" shape is the right level of specificity for implementer-facing canonical decisions. For decisions that close an implementability gap (not a design fork), include the exact code or SQL. Don't leave the implementer to re-derive.
+
+### 2026-04-17 · FRICTION · Adding the new ALTER upgrade-path test found a real bug — tests FOR tests matter
+
+I wrote `test_fleet_outbox_pre_ws0_alter_upgrade_path` specifically because the wanderer flagged that the PRAGMA-guarded ALTER was never exercised (`test_fleet_outbox_table_creation_idempotent` only tested fresh-DB init). Writing the test surfaced an ordering bug I would otherwise have shipped (CREATE INDEX before ALTER → "no such column" on upgrade).
+
+This is a case where adding a test that a wanderer recommended paid off immediately — the test is load-bearing in a way the original test suite wasn't. Write upgrade-path tests FIRST when shipping schema changes, not as an afterthought.
+
 
