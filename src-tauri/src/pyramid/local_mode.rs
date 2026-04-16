@@ -1702,6 +1702,88 @@ pub async fn delete_ollama_model(base_url: &str, model: &str) -> Result<()> {
 
 // ── Phase 6 Daemon Control Plane: Experimental Territory (AD-6) ─────────────
 
+/// High-level participation presets for how this node joins private fleet
+/// compute. This is the durable operator-intent layer; later phases derive
+/// dispatch behavior and peer capability from it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ComputeParticipationMode {
+    Coordinator,
+    Hybrid,
+    Worker,
+}
+
+/// Fleet MPS WS1: durable source of truth for this node's compute posture.
+/// The booleans stay explicit so later phases can evolve beyond the three
+/// presets without another storage migration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComputeParticipationPolicy {
+    pub schema_type: String,
+    pub mode: ComputeParticipationMode,
+    pub allow_market_visibility: bool,
+    pub allow_serving_while_degraded: bool,
+    pub allow_fleet_dispatch: bool,
+    pub allow_fleet_serving: bool,
+}
+
+impl Default for ComputeParticipationPolicy {
+    fn default() -> Self {
+        Self {
+            schema_type: "compute_participation_policy".to_string(),
+            mode: ComputeParticipationMode::Hybrid,
+            allow_market_visibility: false,
+            allow_serving_while_degraded: false,
+            allow_fleet_dispatch: true,
+            allow_fleet_serving: true,
+        }
+    }
+}
+
+/// Read the current compute participation policy contribution, or return a
+/// default that preserves today's fleet semantics.
+pub fn get_compute_participation_policy(conn: &Connection) -> Result<ComputeParticipationPolicy> {
+    match load_active_config_contribution(conn, "compute_participation_policy", None)? {
+        Some(contrib) => Ok(serde_yaml::from_str(&contrib.yaml_content)?),
+        None => Ok(ComputeParticipationPolicy::default()),
+    }
+}
+
+/// Create or supersede the compute participation policy contribution.
+pub fn set_compute_participation_policy(
+    conn: &mut Connection,
+    bus: &Arc<BuildEventBus>,
+    policy: &ComputeParticipationPolicy,
+) -> Result<()> {
+    let yaml_str = serde_yaml::to_string(policy)?;
+    let prior = load_active_config_contribution(conn, "compute_participation_policy", None)?;
+    if let Some(prior_contrib) = prior {
+        supersede_config_contribution(
+            conn,
+            &prior_contrib.contribution_id,
+            &yaml_str,
+            "compute participation policy updated",
+            "user",
+            Some("user"),
+        )?;
+    } else {
+        create_config_contribution(
+            conn,
+            "compute_participation_policy",
+            None,
+            &yaml_str,
+            Some("compute participation policy created"),
+            "user",
+            Some("user"),
+            "active",
+        )?;
+    }
+    if let Some(contrib) = load_active_config_contribution(conn, "compute_participation_policy", None)?
+    {
+        sync_config_to_operational(conn, bus, &contrib)?;
+    }
+    Ok(())
+}
+
 /// Read the current experimental territory contribution.
 /// Returns the YAML content as a JSON value, or a default if none exists.
 pub fn get_experimental_territory(conn: &Connection) -> Result<serde_json::Value> {

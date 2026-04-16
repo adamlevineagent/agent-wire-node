@@ -33,6 +33,53 @@ interface UpdateInfo {
     body?: string;
 }
 
+type ComputeParticipationMode = "coordinator" | "hybrid" | "worker";
+
+interface ComputeParticipationPolicy {
+    schema_type: "compute_participation_policy";
+    mode: ComputeParticipationMode;
+    allow_market_visibility: boolean;
+    allow_serving_while_degraded: boolean;
+    allow_fleet_dispatch: boolean;
+    allow_fleet_serving: boolean;
+}
+
+const defaultComputeParticipationPolicy: ComputeParticipationPolicy = {
+    schema_type: "compute_participation_policy",
+    mode: "hybrid",
+    allow_market_visibility: false,
+    allow_serving_while_degraded: false,
+    allow_fleet_dispatch: true,
+    allow_fleet_serving: true,
+};
+
+const roleDescriptions: Record<ComputeParticipationMode, { label: string; description: string }> = {
+    coordinator: {
+        label: "Coordinator",
+        description: "Can dispatch work to fleet peers, but does not advertise itself as a serving worker.",
+    },
+    hybrid: {
+        label: "Hybrid",
+        description: "Can both dispatch work and serve private fleet compute.",
+    },
+    worker: {
+        label: "Worker",
+        description: "Serves private fleet compute, but should not dispatch stale or local work outward.",
+    },
+};
+
+function policyForMode(
+    mode: ComputeParticipationMode,
+    prior: ComputeParticipationPolicy,
+): ComputeParticipationPolicy {
+    return {
+        ...prior,
+        mode,
+        allow_fleet_dispatch: mode !== "worker",
+        allow_fleet_serving: mode !== "coordinator",
+    };
+}
+
 // --- Component --------------------------------------------------------------
 
 export function Settings() {
@@ -47,6 +94,10 @@ export function Settings() {
     const [checking, setChecking] = useState(false);
     const [installing, setInstalling] = useState(false);
     const [nodeName, setNodeName] = useState("Wire Node");
+    const [computePolicy, setComputePolicy] = useState<ComputeParticipationPolicy>(defaultComputeParticipationPolicy);
+    const [computePolicyLoaded, setComputePolicyLoaded] = useState(false);
+    const [computePolicySaving, setComputePolicySaving] = useState(false);
+    const [computePolicySaved, setComputePolicySaved] = useState(false);
 
     // --- Phase 18a (L1): Local Mode toggle state -------------------------
     //
@@ -487,10 +538,11 @@ export function Settings() {
 
     const fetchData = useCallback(async () => {
         try {
-            const [cfg, healthStatus, name] = await Promise.all([
+            const [cfg, healthStatus, name, policy] = await Promise.all([
                 invoke<WireNodeConfig>("get_config"),
                 invoke<HealthStatus>("get_health_status"),
                 invoke<string>("get_node_name"),
+                invoke<ComputeParticipationPolicy>("pyramid_get_compute_participation_policy"),
             ]);
             setConfig(cfg);
             setHealth(healthStatus);
@@ -498,6 +550,8 @@ export function Settings() {
             setMeshHosting(cfg.mesh_hosting_enabled);
             setAutoUpdate(cfg.auto_update_enabled);
             setNodeName(name || "Wire Node");
+            setComputePolicy(policy);
+            setComputePolicyLoaded(true);
         } catch (err) {
             console.error("Settings fetch error:", err);
         }
@@ -546,6 +600,21 @@ export function Settings() {
             setInstalling(false);
         }
     };
+
+    const handleSelectComputeMode = useCallback(async (mode: ComputeParticipationMode) => {
+        const next = policyForMode(mode, computePolicy);
+        setComputePolicySaving(true);
+        try {
+            await invoke("pyramid_set_compute_participation_policy", { policy: next });
+            setComputePolicy(next);
+            setComputePolicySaved(true);
+            setTimeout(() => setComputePolicySaved(false), 2000);
+        } catch (err) {
+            console.error("Compute participation policy save failed:", err);
+        } finally {
+            setComputePolicySaving(false);
+        }
+    }, [computePolicy]);
 
     const statusIcon: Record<string, string> = {
         ok: "[OK]",
@@ -648,6 +717,57 @@ export function Settings() {
                     />
                     <span>Enable mesh hosting</span>
                 </label>
+            </div>
+
+            <div className="settings-section">
+                <div className="settings-section-header">Fleet Participation</div>
+                <p className="settings-section-desc">
+                    Declare how this node should participate in private fleet compute. This first
+                    slice stores durable operator intent only; dispatch behavior will be derived
+                    from it in later phases.
+                </p>
+                <div style={{ display: "grid", gap: 10, marginTop: 12 }}>
+                    {(["coordinator", "hybrid", "worker"] as ComputeParticipationMode[]).map((mode) => {
+                        const role = roleDescriptions[mode];
+                        const selected = computePolicy.mode === mode;
+                        return (
+                            <button
+                                key={mode}
+                                type="button"
+                                className={`storage-preset ${selected ? "active" : ""}`}
+                                onClick={() => handleSelectComputeMode(mode)}
+                                disabled={!computePolicyLoaded || computePolicySaving}
+                                style={{
+                                    textAlign: "left",
+                                    width: "100%",
+                                    padding: "12px 14px",
+                                    display: "flex",
+                                    flexDirection: "column",
+                                    gap: 4,
+                                }}
+                            >
+                                <span style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                                    <span>{role.label}</span>
+                                    <span style={{ opacity: 0.7, fontSize: 11 }}>
+                                        dispatch {mode === "worker" ? "off" : "on"} · serve {mode === "coordinator" ? "off" : "on"}
+                                    </span>
+                                </span>
+                                <span style={{ fontSize: 12, opacity: 0.85, whiteSpace: "normal" }}>
+                                    {role.description}
+                                </span>
+                            </button>
+                        );
+                    })}
+                </div>
+                <div style={{ marginTop: 10, fontSize: 12, color: "var(--text-secondary)" }}>
+                    {computePolicySaving
+                        ? "Saving participation policy…"
+                        : computePolicySaved
+                            ? "Participation policy saved."
+                            : computePolicyLoaded
+                                ? `Current mode: ${roleDescriptions[computePolicy.mode].label}.`
+                                : "Loading participation policy…"}
+                </div>
             </div>
 
             {/* --- Phase 18a (L1): Local LLM (Ollama) -------------------- */}

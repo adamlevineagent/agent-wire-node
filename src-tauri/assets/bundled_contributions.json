@@ -203,6 +203,21 @@
       "yaml_content": "schema_type: wire_update_polling\n# Interval between supersession-check polls in seconds. Default is\n# 21600 (6 hours) — the Wire doesn't change very fast and we'd\n# rather let updates arrive on the next cycle than waste bandwidth.\ninterval_secs: 21600\n",
       "triggering_note": "Bundled default wire_update_polling (wire-node v0.2.0)"
     },
+    {
+      "contribution_id": "bundled-schema_definition-compute_participation_policy-v1",
+      "schema_type": "schema_definition",
+      "slug": "compute_participation_policy",
+      "yaml_content": "{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"title\":\"Compute Participation Policy\",\"type\":\"object\",\"required\":[\"schema_type\",\"mode\"],\"properties\":{\"schema_type\":{\"type\":\"string\",\"const\":\"compute_participation_policy\"},\"mode\":{\"type\":\"string\",\"enum\":[\"coordinator\",\"hybrid\",\"worker\"]},\"allow_market_visibility\":{\"type\":\"boolean\"},\"allow_serving_while_degraded\":{\"type\":\"boolean\"},\"allow_fleet_dispatch\":{\"type\":\"boolean\"},\"allow_fleet_serving\":{\"type\":\"boolean\"}}}",
+      "triggering_note": "Bundled JSON schema for compute_participation_policy (wire-node v0.3.0)",
+      "applies_to": "compute_participation_policy"
+    },
+    {
+      "contribution_id": "bundled-compute_participation_policy-default-v1",
+      "schema_type": "compute_participation_policy",
+      "slug": null,
+      "yaml_content": "schema_type: compute_participation_policy\n# Default to current fleet semantics: nodes can both dispatch to\n# fleet peers and serve fleet work until the operator chooses a more\n# specialized role.\nmode: hybrid\nallow_market_visibility: false\nallow_serving_while_degraded: false\nallow_fleet_dispatch: true\nallow_fleet_serving: true\n",
+      "triggering_note": "Bundled default compute_participation_policy (wire-node v0.3.0)"
+    },
 
     {
       "contribution_id": "bundled-chain_defaults-default-v1",

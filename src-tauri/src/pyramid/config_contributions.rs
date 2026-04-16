@@ -897,6 +897,13 @@ pub fn sync_config_to_operational_with_registry(
             // and is readable via standard contribution queries.
             debug!("experimental_territory synced; no operational table — metadata only");
         }
+        "compute_participation_policy" => {
+            // Fleet MPS Phase 1: durable operator intent for how this node
+            // participates in private compute. No operational table yet —
+            // the desktop app reads this contribution directly via IPC and
+            // later phases derive dispatch behavior from it.
+            debug!("compute_participation_policy synced; no operational table — read from contribution store");
+        }
         "pyramid_viz_config" => {
             // Pyramid visualization engine configuration.
             // No operational table needed — the viz engine reads the

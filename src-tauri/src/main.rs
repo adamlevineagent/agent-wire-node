@@ -8967,6 +8967,32 @@ async fn pyramid_set_experimental_territory(
     Ok("Territory updated".to_string())
 }
 
+/// Fleet MPS WS1: read the current compute participation policy.
+#[tauri::command]
+async fn pyramid_get_compute_participation_policy(
+    state: tauri::State<'_, SharedState>,
+) -> Result<wire_node_lib::pyramid::local_mode::ComputeParticipationPolicy, String> {
+    let reader = state.pyramid.reader.lock().await;
+    wire_node_lib::pyramid::local_mode::get_compute_participation_policy(&reader)
+        .map_err(|e| e.to_string())
+}
+
+/// Fleet MPS WS1: create or supersede the compute participation policy.
+#[tauri::command]
+async fn pyramid_set_compute_participation_policy(
+    state: tauri::State<'_, SharedState>,
+    policy: wire_node_lib::pyramid::local_mode::ComputeParticipationPolicy,
+) -> Result<String, String> {
+    let mut writer = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::local_mode::set_compute_participation_policy(
+        &mut writer,
+        &state.pyramid.build_event_bus,
+        &policy,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok("Compute participation policy updated".to_string())
+}
+
 /// Read the active pyramid viz config contribution.
 /// Tries slug-scoped first, then global, then returns a default.
 #[tauri::command]
@@ -13177,6 +13203,9 @@ fn main() {
             // Phase 6 daemon control plane: experimental territory markers
             pyramid_get_experimental_territory,
             pyramid_set_experimental_territory,
+            // Fleet MPS WS1: compute participation policy
+            pyramid_get_compute_participation_policy,
+            pyramid_set_compute_participation_policy,
             // Pyramid visualization config
             pyramid_get_viz_config,
             pyramid_set_viz_config,

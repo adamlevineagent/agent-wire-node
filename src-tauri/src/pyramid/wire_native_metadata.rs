@@ -755,6 +755,7 @@ impl WireNativeMetadata {
 /// | custom_chains / custom_chain    | action      | ["chain", "wire-node"]                   |
 /// | wire_discovery_weights          | template    | ["config", "wire-node", "discovery"]     |
 /// | wire_auto_update_settings       | template    | ["config", "wire-node", "auto_update"]   |
+/// | compute_participation_policy    | template    | ["config", "wire-node", "fleet"]         |
 ///
 /// Pyramid node types (L0/L1/apex) do NOT flow through this helper —
 /// they publish via `PyramidPublisher::publish_pyramid_node()` and use
@@ -876,6 +877,14 @@ pub fn resolve_wire_type(schema_type: &str) -> Result<(WireContributionType, Vec
                 "config".to_string(),
                 "wire-node".to_string(),
                 "auto_update".to_string(),
+            ],
+        )),
+        "compute_participation_policy" => Ok((
+            WireContributionType::Template,
+            vec![
+                "config".to_string(),
+                "wire-node".to_string(),
+                "fleet".to_string(),
             ],
         )),
         // Ghost-engine fix: per-pyramid stale engine policy. NOT the same as
@@ -1451,6 +1460,7 @@ wire:
             ("custom_chain", WireContributionType::Action),
             ("wire_discovery_weights", WireContributionType::Template),
             ("wire_auto_update_settings", WireContributionType::Template),
+            ("compute_participation_policy", WireContributionType::Template),
             ("auto_update_policy", WireContributionType::Template),
             ("dispatch_policy", WireContributionType::Template),
             ("wire_update_polling", WireContributionType::Template),
