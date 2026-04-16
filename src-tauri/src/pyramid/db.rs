@@ -19745,6 +19745,54 @@ mod phase17_tests {
     }
 
     #[test]
+    fn test_market_outbox_job_id_collision_with_fleet_row_is_visible_to_lookup() {
+        // WS5 verifier pass: the table has a `UNIQUE INDEX` on `job_id`
+        // alone (db.rs:2301), so if a fleet row with `job_id = X`
+        // exists and the Wire later dispatches a market job with the
+        // same `job_id = X` (cross-protocol UUID collision,
+        // astronomically unlikely but not structurally impossible),
+        // the market insert MUST return `changes = 0` and `fleet_outbox_lookup`
+        // MUST report the foreign `dispatcher_node_id`. The market
+        // admission handler then branches on that mismatch to return
+        // 409 CONFLICT rather than surfacing the fleet row as "your
+        // market job's state is X" back to the Wire.
+        let conn = outbox_conn();
+        let expires = future_expires();
+        // Pre-existing fleet row under a real peer's dispatcher id.
+        fleet_outbox_insert_or_ignore(
+            &conn,
+            "peer-abc",
+            "shared-job-uuid",
+            "https://peer.example/v1/fleet/result",
+            &expires,
+        )
+        .unwrap();
+        // Market insert with the same job_id returns 0 (UNIQUE index).
+        let n = market_outbox_insert_or_ignore(
+            &conn,
+            "shared-job-uuid",
+            "https://wire.example/v1/compute/result-relay",
+            "MarketStandard",
+            &expires,
+        )
+        .unwrap();
+        assert_eq!(
+            n, 0,
+            "UNIQUE(job_id) index must reject market insert when a fleet row holds the same job_id"
+        );
+        // Lookup reports the fleet dispatcher — market handler must see
+        // `dispatcher_node_id != WIRE_PLATFORM_DISPATCHER` and 409 the
+        // Wire rather than treating it as a retry.
+        let lookup = fleet_outbox_lookup(&conn, "shared-job-uuid").unwrap().unwrap();
+        assert_eq!(lookup.dispatcher_node_id, "peer-abc");
+        assert_ne!(
+            lookup.dispatcher_node_id,
+            crate::fleet::WIRE_PLATFORM_DISPATCHER,
+            "cross-protocol collision must be visible to the market handler's dispatcher_id check"
+        );
+    }
+
+    #[test]
     fn test_fleet_views_migration_uses_new_event_types() {
         let conn = Connection::open_in_memory().unwrap();
         // Running init twice verifies DROP VIEW IF EXISTS + CREATE runs cleanly

@@ -2680,11 +2680,17 @@ async fn handle_market_dispatch(
     // Step 7 (§III L553, DD-D, DD-Q): Idempotent outbox insert.
     //
     // All SQL inside spawn_blocking (rusqlite is sync). Branch on the
-    // outcome enum to build the HTTP response. Unlike fleet dispatch,
-    // there's no cross-dispatcher conflict case — the Wire is the sole
+    // outcome enum to build the HTTP response. The Wire is the sole
     // dispatcher for market rows, identified by the WIRE_PLATFORM_DISPATCHER
-    // sentinel. A rowcount=0 outcome means a legitimate Wire retry
-    // (re-ACK) or a terminal state leaked back to the Wire (Gone).
+    // sentinel; cross-dispatcher conflicts within the market namespace are
+    // impossible, but a `UNIQUE INDEX` on `job_id` alone (db.rs:2301) means
+    // a pre-existing FLEET row with the same job_id (astronomically
+    // unlikely but not structurally impossible) would return changes=0
+    // with `lookup.dispatcher_node_id != WIRE_PLATFORM_DISPATCHER` —
+    // that's the `ConflictForeignDispatcher` branch (parallel to fleet's
+    // `ConflictDifferentDispatcher`). A rowcount=0 outcome with matching
+    // dispatcher_id means a legitimate Wire retry (re-ACK) or a terminal
+    // state leaked back to the Wire (Gone).
     #[derive(Debug)]
     enum MarketAdmissionOutcome {
         Admitted,
@@ -2692,6 +2698,7 @@ async fn handle_market_dispatch(
         GoneDelivered,
         GoneFailed(Option<String>),
         Rejected503, // max_inflight_jobs budget exhausted
+        ConflictForeignDispatcher,
         DbError(String),
     }
 
@@ -2730,11 +2737,15 @@ async fn handle_market_dispatch(
             Ok(n) => n,
             Err(e) => return MarketAdmissionOutcome::DbError(e.to_string()),
         };
-        // Look up the (now-either-just-inserted-or-pre-existing) row. Keyed
-        // on job_id alone — cross-dispatcher conflicts are impossible for
-        // market rows (WIRE_PLATFORM_DISPATCHER is the sole dispatcher),
-        // so a non-None lookup + changes=0 unambiguously means "existing
-        // market row with this job_id".
+        // Look up the (now-either-just-inserted-or-pre-existing) row.
+        // `fleet_outbox_lookup` keys on `job_id` alone (db.rs:2441),
+        // and the table has a `UNIQUE INDEX` on `job_id` (db.rs:2301),
+        // so changes=0 means a row with that job_id already exists —
+        // but the dispatcher might be a fleet peer rather than the
+        // Wire sentinel. We verify the ownership before branching on
+        // status so a fleet/relay row with a UUID collision doesn't
+        // get wrongly surfaced as "your market job is already
+        // delivered" back to the Wire.
         let lookup = match crate::pyramid::db::fleet_outbox_lookup(&tx, &job_id_tx) {
             Ok(Some(l)) => l,
             Ok(None) => {
@@ -2748,7 +2759,19 @@ async fn handle_market_dispatch(
         };
 
         if changes == 0 {
-            // Pre-existing row — branch on status.
+            // Pre-existing row. First: is it ours (WIRE_PLATFORM_DISPATCHER)
+            // or does a fleet/relay row hold the PK? A cross-protocol
+            // UUID collision is astronomically rare but possible — the
+            // `UNIQUE(job_id)` index allows exactly one row per job_id
+            // regardless of dispatcher, so INSERT OR IGNORE returning 0
+            // can mean "the Wire is retrying me" OR "some other
+            // dispatcher owns this job_id." Only the former is a
+            // legitimate retry path.
+            if lookup.dispatcher_node_id != crate::fleet::WIRE_PLATFORM_DISPATCHER {
+                let _ = tx.rollback();
+                return MarketAdmissionOutcome::ConflictForeignDispatcher;
+            }
+            // Pre-existing market row — branch on status.
             match lookup.status.as_str() {
                 "pending" | "ready" => {
                     if let Err(e) = tx.commit() {
@@ -2809,14 +2832,27 @@ async fn handle_market_dispatch(
     .await
     .unwrap_or_else(|je| MarketAdmissionOutcome::DbError(je.to_string()));
 
-    // Handle outbox-admission outcomes that short-circuit before queue
-    // enqueue. Only the `Admitted` path falls through to enqueue + spawn.
+    // Handle outbox-admission outcomes that short-circuit before the
+    // depth gate + worker spawn. Only the `Admitted` path falls through.
     match outcome {
         MarketAdmissionOutcome::DbError(msg) => {
             tracing::error!("Market dispatch admission DB error: {}", msg);
             return Ok(Box::new(warp::reply::with_status(
                 warp::reply::json(&serde_json::json!({"error": "admission db error"})),
                 warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            )));
+        }
+        MarketAdmissionOutcome::ConflictForeignDispatcher => {
+            // A row with this job_id already exists under a different
+            // dispatcher (fleet peer, relay hop, etc.). Surface as 409
+            // CONFLICT so the Wire can diagnose the UUID collision
+            // rather than silently treating it as a market retry.
+            // Parallel to fleet's `ConflictDifferentDispatcher`.
+            return Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({
+                    "error": "job_id conflict with foreign dispatcher",
+                })),
+                warp::http::StatusCode::CONFLICT,
             )));
         }
         MarketAdmissionOutcome::GoneDelivered => {
@@ -2847,14 +2883,23 @@ async fn handle_market_dispatch(
         MarketAdmissionOutcome::RetryExisting => {
             // Same Wire dispatcher, same job_id, outbox already pending/ready.
             // Legitimate retry — re-ACK without spawning a second worker.
-            // Use the current total queue depth as the peer_queue_depth for
-            // observability (may have changed since the first dispatch).
-            let depth = state
-                .compute_queue
-                .queue
-                .lock()
-                .await
-                .total_depth() as u64;
+            // Report the current market depth (Queued + Executing jobs in
+            // active_jobs) for observability; same source as the terminal
+            // 202 ACK at Step 11 so the Wire sees a consistent surface
+            // across fresh and retry paths.
+            let depth = {
+                let s = market_state_handle.read().await;
+                s.active_jobs
+                    .values()
+                    .filter(|j| {
+                        matches!(
+                            j.status,
+                            crate::compute_market::ComputeJobStatus::Queued
+                                | crate::compute_market::ComputeJobStatus::Executing
+                        )
+                    })
+                    .count() as u64
+            };
             let ack = crate::pyramid::market_dispatch::MarketDispatchAck {
                 job_id: req.job_id.clone(),
                 peer_queue_depth: depth,
@@ -2865,64 +2910,50 @@ async fn handle_market_dispatch(
             )));
         }
         MarketAdmissionOutcome::Admitted => {
-            // Fall through to enqueue + spawn.
+            // Fall through to per-offer depth gate + spawn worker.
         }
     }
 
-    // Step 8 (§III): Enqueue into the compute queue with `source =
-    // "market_received"`. enqueue_market forces the source field
-    // internally as a defense-in-depth invariant. If the per-model
-    // depth cap is exceeded, roll back the outbox row and reject 503.
+    // Step 8 (§III): Per-offer depth enforcement + runtime registration.
     //
-    // The queue entry carries a disconnected oneshot `result_tx` — the
-    // GPU loop will push the LlmResponse through it, but this handler
-    // does not await the receiver. The spawned worker runs the actual
-    // inference via `call_model_unified_with_options_and_ctx` outside
-    // the queue (mirror of spawn_fleet_worker — see rationale there);
-    // the oneshot is only a protocol-level placeholder. Dropping the
-    // receiver is fine — the GPU loop treats a closed channel as
-    // "caller gave up" and moves on.
-    let (result_tx, _result_rx) =
-        tokio::sync::oneshot::channel::<anyhow::Result<crate::pyramid::llm::LlmResponse>>();
-
-    // Clone a config for the queue entry. The queue entry's config field
-    // drives model lookup and per-call defaults; for the worker's actual
-    // inference call, spawn_market_worker builds its own config with
-    // fleet_dispatch/fleet_roster zeroed (see there).
-    let queue_config = state.pyramid.config.read().await.clone();
-    let chronicle_job_path = format!("market-recv:{}", req.job_id);
-    let queue_entry = crate::compute_queue::QueueEntry {
-        result_tx,
-        config: queue_config,
-        system_prompt: system_prompt.clone(),
-        user_prompt: user_prompt.clone(),
-        temperature: req.temperature.unwrap_or(0.0),
-        max_tokens: req.max_tokens.unwrap_or(4096),
-        response_format: req.response_format.clone(),
-        options: crate::pyramid::llm::LlmCallOptions {
-            skip_fleet_dispatch: true,
-            chronicle_job_path: Some(chronicle_job_path.clone()),
-            ..Default::default()
-        },
-        step_ctx: None,
-        model_id: req.model.clone(),
-        enqueued_at: std::time::Instant::now(),
-        work_item_id: None,  // TODO (WS8): populate from DADBEAR work item
-        attempt_id: None,    // TODO (WS8): populate from DADBEAR attempt
-        source: "market_received".to_string(), // enqueue_market forces this anyway
-        job_path: chronicle_job_path.clone(),
-        chronicle_job_path: Some(chronicle_job_path.clone()),
+    // DESIGN NOTE (WS5 verifier pass): An earlier implementation enqueued
+    // a market_received `QueueEntry` into `compute_queue` alongside
+    // spawning `spawn_market_worker`. That double-pathed the work — the
+    // GPU loop at main.rs:12171 dequeues every entry and calls
+    // `call_model_unified_with_audit_and_ctx` regardless of `source`, so
+    // market dispatches ran inference TWICE (once in the GPU loop, once
+    // in the spawned worker). The spec's "enqueue + GPU-loop CAS"
+    // vision at §III lines 557-568 depends on GPU-loop-side outbox
+    // integration (heartbeat + ready CAS + ComputeJob transitions)
+    // that was not in WS5's scope and remains to be added by WS6/WS8.
+    //
+    // Until the GPU loop gains outbox-aware post-processing, the worker
+    // runs the inference directly (`spawn_market_worker` below) and the
+    // compute_queue is not involved in market dispatch. Per-offer depth
+    // accounting therefore reads from `ComputeMarketState.active_jobs`
+    // filtered by model, scoped to `Queued` + `Executing` states (a
+    // `Ready` / `Failed` job is no longer consuming a worker slot).
+    //
+    // When WS6/WS8 land the GPU-loop-side outbox path, re-introduce the
+    // enqueue here and drop `spawn_market_worker`.
+    let active_depth_for_model = {
+        let s = market_state_handle.read().await;
+        s.active_jobs
+            .values()
+            .filter(|j| {
+                j.model_id == req.model
+                    && matches!(
+                        j.status,
+                        crate::compute_market::ComputeJobStatus::Queued
+                            | crate::compute_market::ComputeJobStatus::Executing
+                    )
+            })
+            .count()
     };
-
-    let enqueue_result = state
-        .compute_queue
-        .queue
-        .lock()
-        .await
-        .enqueue_market(&req.model, queue_entry, max_queue_depth);
-
-    if let Err(e) = enqueue_result {
-        // Queue depth cap hit. Roll back the outbox row we just committed.
+    if max_queue_depth != 0 && active_depth_for_model >= max_queue_depth {
+        // Per-offer depth cap hit. Roll back the outbox row we just
+        // committed so the Wire can re-match the job elsewhere without
+        // a stale pending row lingering on this provider.
         let db_rb = db_path.clone();
         let jid_rb = req.job_id.clone();
         let _ = tokio::task::spawn_blocking(move || {
@@ -2935,11 +2966,21 @@ async fn handle_market_dispatch(
             }
         })
         .await;
-        tracing::warn!("Market dispatch enqueue failed: {}", e);
+        tracing::warn!(
+            "Market dispatch depth cap hit for model={} active={} cap={}",
+            req.model,
+            active_depth_for_model,
+            max_queue_depth
+        );
         return Ok(Box::new(warp::reply::with_status(
             warp::reply::with_header(
                 warp::reply::with_header(
-                    warp::reply::json(&serde_json::json!({"error": format!("{}", e)})),
+                    warp::reply::json(&serde_json::json!({
+                        "error": "market queue depth exceeded",
+                        "model": req.model,
+                        "current": active_depth_for_model,
+                        "max": max_queue_depth,
+                    })),
                     "Retry-After",
                     policy.admission_retry_after_secs.to_string(),
                 ),
@@ -2949,10 +2990,6 @@ async fn handle_market_dispatch(
             warp::http::StatusCode::SERVICE_UNAVAILABLE,
         )));
     }
-
-    // Notify the GPU loop that a new entry is waiting. Fleet dispatch
-    // relies on the same notify pattern via its queue path.
-    state.compute_queue.notify.notify_waiters();
 
     // Step 9 (§III): Upsert the in-memory ComputeJob for runtime
     // observability. The outbox is the durable source of truth; this
@@ -3015,14 +3052,25 @@ async fn handle_market_dispatch(
         req.credit_rate_out_per_m,
     );
 
-    // Step 11 (§III): Return 202 ACK with the provider's current total
-    // queue depth for observability.
-    let depth = state
-        .compute_queue
-        .queue
-        .lock()
-        .await
-        .total_depth() as u64;
+    // Step 11 (§III): Return 202 ACK with the provider's current
+    // market queue depth for observability. This is the count of
+    // Queued + Executing market jobs in `active_jobs` — matches the
+    // "peer_queue_depth" surface the Wire uses for matching heuristics.
+    // NOT `compute_queue.total_depth` because market dispatches no
+    // longer enqueue there (see Step 8 DESIGN NOTE above).
+    let depth = {
+        let s = market_state_handle.read().await;
+        s.active_jobs
+            .values()
+            .filter(|j| {
+                matches!(
+                    j.status,
+                    crate::compute_market::ComputeJobStatus::Queued
+                        | crate::compute_market::ComputeJobStatus::Executing
+                )
+            })
+            .count() as u64
+    };
     let ack = crate::pyramid::market_dispatch::MarketDispatchAck {
         job_id: req.job_id.clone(),
         peer_queue_depth: depth,
@@ -3614,5 +3662,68 @@ mod market_dispatch_tests {
         // saturating_div handles negatives the same way i64 division does.
         let credits = market_credits_earned(-100, 500, 1_000_000, 1_000_000);
         assert_eq!(credits, 400); // -100 + 500 = 400 per million pair.
+    }
+
+    /// WS5 verifier pass regression: after the fix that removed
+    /// `enqueue_market` from `handle_market_dispatch`, per-offer depth
+    /// accounting reads from `ComputeMarketState.active_jobs` filtered by
+    /// `(model_id, status in {Queued, Executing})`. This test pins the
+    /// filter: a `Ready` or `Failed` job must NOT count toward the
+    /// per-model depth cap, and jobs on a different model must NOT count
+    /// either.
+    #[test]
+    fn active_jobs_depth_for_model_filters_to_queued_and_executing_same_model() {
+        use crate::compute_market::{ComputeJob, ComputeJobStatus};
+
+        let mk_job = |id: &str, model: &str, status: ComputeJobStatus| ComputeJob {
+            job_id: id.to_string(),
+            model_id: model.to_string(),
+            status,
+            messages: None,
+            temperature: None,
+            max_tokens: None,
+            wire_job_token: String::new(),
+            matched_rate_in: 0,
+            matched_rate_out: 0,
+            matched_multiplier_bps: 10000,
+            queued_at: "2026-04-16T00:00:00Z".to_string(),
+            filled_at: None,
+            work_item_id: None,
+            attempt_id: None,
+        };
+
+        let mut jobs: std::collections::HashMap<String, ComputeJob> =
+            std::collections::HashMap::new();
+        // 2 queued + 1 executing on target model = 3 that count.
+        jobs.insert("a".into(), mk_job("a", "model-x", ComputeJobStatus::Queued));
+        jobs.insert("b".into(), mk_job("b", "model-x", ComputeJobStatus::Queued));
+        jobs.insert(
+            "c".into(),
+            mk_job("c", "model-x", ComputeJobStatus::Executing),
+        );
+        // Terminal states on target model — MUST NOT count.
+        jobs.insert("d".into(), mk_job("d", "model-x", ComputeJobStatus::Ready));
+        jobs.insert("e".into(), mk_job("e", "model-x", ComputeJobStatus::Failed));
+        // Queued on a DIFFERENT model — MUST NOT count toward model-x cap.
+        jobs.insert("f".into(), mk_job("f", "model-y", ComputeJobStatus::Queued));
+        jobs.insert(
+            "g".into(),
+            mk_job("g", "model-y", ComputeJobStatus::Executing),
+        );
+
+        let active_depth_for_model_x = jobs
+            .values()
+            .filter(|j| {
+                j.model_id == "model-x"
+                    && matches!(
+                        j.status,
+                        ComputeJobStatus::Queued | ComputeJobStatus::Executing
+                    )
+            })
+            .count();
+        assert_eq!(
+            active_depth_for_model_x, 3,
+            "depth counter must scope to (model == model-x) AND status in (Queued, Executing)"
+        );
     }
 }
