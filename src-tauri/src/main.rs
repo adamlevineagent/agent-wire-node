@@ -962,14 +962,16 @@ async fn send_message(
         let health = messaging::check_health(
             &cfg.cache_dir(),
             cfg.storage_cap_gb,
-            tunnel_url.as_deref(),
+            // TunnelUrl: !Deref<Target=str>, so as_deref() doesn't work.
+            // .as_ref().map(|u| u.as_str()) yields Option<&str> (same shape as before).
+            tunnel_url.as_ref().map(|u| u.as_str()),
             last_sync.as_deref(),
         )
         .await;
         Some(messaging::collect_diagnostics(
             &health,
             env!("CARGO_PKG_VERSION"),
-            tunnel_url.as_deref(),
+            tunnel_url.as_ref().map(|u| u.as_str()),
             node_id,
         ))
     } else {
@@ -1015,7 +1017,8 @@ async fn get_health_status(
     Ok(messaging::check_health(
         &cfg.cache_dir(),
         cfg.storage_cap_gb,
-        tunnel_url.as_deref(),
+        // TunnelUrl: !Deref. Borrow → &str for check_health's Option<&str> arg.
+        tunnel_url.as_ref().map(|u| u.as_str()),
         last_sync.as_deref(),
     )
     .await)
@@ -2556,13 +2559,19 @@ async fn start_tunnel_flow(
     // Guard: if the persisted tunnel belongs to a different node_id (e.g. two
     // machines that previously shared an identity), discard and re-provision.
     let ts = if let Some(ref persisted_ts) = persisted {
-        let stale = persisted_ts.tunnel_url.as_deref().map_or(false, |url| {
-            // Tunnel URLs are https://node-{nodeId}.agent-wire.com — if the
-            // embedded node_id doesn't match ours, these credentials belong
-            // to a different node and must not be reused.
-            let expected_prefix = format!("https://node-{}.", node_id);
-            !url.starts_with(&expected_prefix)
-        });
+        // TunnelUrl: !Deref. Use .as_ref().map(|u| u.as_str()) to get
+        // Option<&str> so starts_with works in the closure below.
+        let stale = persisted_ts
+            .tunnel_url
+            .as_ref()
+            .map(|u| u.as_str())
+            .map_or(false, |url| {
+                // Tunnel URLs are https://node-{nodeId}.agent-wire.com — if the
+                // embedded node_id doesn't match ours, these credentials belong
+                // to a different node and must not be reused.
+                let expected_prefix = format!("https://node-{}.", node_id);
+                !url.starts_with(&expected_prefix)
+            });
         if stale {
             tracing::warn!(
                 "Persisted tunnel belongs to a different node (url={:?}, current node={}). Re-provisioning.",
@@ -5739,9 +5748,12 @@ async fn pyramid_open_web_as_owner(
         let ts = state.tunnel_state.read().await;
         ts.tunnel_url.clone()
     };
+    // TunnelUrl::parse rejects empty strings by construction, so a Some(_)
+    // implies a non-empty URL — the is_empty() check on the old String form
+    // is now redundant. Pattern-match on the Option directly.
     let base = match tunnel_url {
-        Some(u) if !u.is_empty() => u,
-        _ => {
+        Some(u) => u,
+        None => {
             return Err(
                 "No tunnel URL is set. Make sure the Cloudflare tunnel is running."
                     .to_string(),
@@ -5782,12 +5794,17 @@ async fn pyramid_open_web_as_owner(
         })
         .unwrap_or_default();
 
+    // TunnelUrl::endpoint() constructs a root-served URL with the given
+    // absolute path; it handles scheme/host/port correctly and replaces any
+    // stray path on the base. The trim_end_matches('/') dance is unneeded
+    // because TunnelUrl already normalizes trailing slashes at parse time
+    // and endpoint() builds the path portion from scratch.
     let url = if return_slug.is_empty() {
-        format!("{}/p/_owner_login?token={}", base.trim_end_matches('/'), token)
+        format!("{}?token={}", base.endpoint("/p/_owner_login"), token)
     } else {
         format!(
-            "{}/p/_owner_login?token={}&return={}",
-            base.trim_end_matches('/'),
+            "{}?token={}&return={}",
+            base.endpoint("/p/_owner_login"),
             token,
             return_slug
         )
@@ -5820,14 +5837,17 @@ async fn pyramid_get_public_url(
         let ts = state.tunnel_state.read().await;
         ts.tunnel_url.clone()
     };
+    // TunnelUrl::parse rejects empty strings, so Some(_) already guarantees
+    // non-empty — the prior is_empty filter is redundant with the newtype.
     let base = tunnel_url
-        .filter(|u| !u.is_empty())
         .ok_or_else(|| "Tunnel is not running. Click 'Retry Tunnel' in the header.".to_string())?;
     let path = match slug {
         Some(s) if !s.is_empty() => format!("/p/{}", s),
         _ => "/p/".to_string(),
     };
-    Ok(format!("{}{}", base.trim_end_matches('/'), path))
+    // endpoint() builds scheme://host[:port]/<path> without needing a
+    // defensive trim_end_matches('/') — the newtype normalizes at parse time.
+    Ok(base.endpoint(&path))
 }
 
 /// Returns the cached ASCII banner for a slug, or None if none has been generated.
@@ -11711,30 +11731,38 @@ fn main() {
                                                     // auth state too. Use the fleet_jwt presence as a
                                                     // signal that we have auth.
                                                     if roster.fleet_jwt.is_some() {
-                                                        let auth = config_auth.read().await;
-                                                        let self_node_id = auth.node_id.clone().unwrap_or_default();
-                                                        let self_operator_id = auth.operator_id.clone().unwrap_or_default();
-                                                        let self_operator_handle = auth.operator_handle.clone();
-                                                        drop(auth);
-                                                        let self_node_handle = Some(config_node_identity.node_handle.clone());
-                                                        let tunnel_url = {
+                                                        // FleetAnnouncement.tunnel_url is TunnelUrl (WS9, no Default).
+                                                        // Without a tunnel URL we have nothing meaningful to announce — skip
+                                                        // just the announce block (NOT the whole ConfigSynced handler,
+                                                        // which still needs to apply the dispatch_policy write below).
+                                                        let tunnel_url_opt = {
                                                             let ts = config_tunnel.read().await;
-                                                            ts.tunnel_url.clone().unwrap_or_default()
+                                                            ts.tunnel_url.clone()
                                                         };
-                                                        let announcement = wire_node_lib::fleet::FleetAnnouncement {
-                                                            node_id: self_node_id,
-                                                            name: None,
-                                                            node_handle: self_node_handle,
-                                                            operator_handle: self_operator_handle,
-                                                            tunnel_url,
-                                                            models_loaded: loaded_models,
-                                                            serving_rules,
-                                                            queue_depths,
-                                                            total_queue_depth,
-                                                            operator_id: self_operator_id,
-                                                        };
-                                                        wire_node_lib::fleet::announce_to_fleet(&roster, &announcement).await;
-                                                        tracing::info!("ConfigSynced: re-announced to fleet with updated serving_rules");
+                                                        if let Some(tunnel_url) = tunnel_url_opt {
+                                                            let auth = config_auth.read().await;
+                                                            let self_node_id = auth.node_id.clone().unwrap_or_default();
+                                                            let self_operator_id = auth.operator_id.clone().unwrap_or_default();
+                                                            let self_operator_handle = auth.operator_handle.clone();
+                                                            drop(auth);
+                                                            let self_node_handle = Some(config_node_identity.node_handle.clone());
+                                                            let announcement = wire_node_lib::fleet::FleetAnnouncement {
+                                                                node_id: self_node_id,
+                                                                name: None,
+                                                                node_handle: self_node_handle,
+                                                                operator_handle: self_operator_handle,
+                                                                tunnel_url,
+                                                                models_loaded: loaded_models,
+                                                                serving_rules,
+                                                                queue_depths,
+                                                                total_queue_depth,
+                                                                operator_id: self_operator_id,
+                                                            };
+                                                            wire_node_lib::fleet::announce_to_fleet(&roster, &announcement).await;
+                                                            tracing::info!("ConfigSynced: re-announced to fleet with updated serving_rules");
+                                                        } else {
+                                                            tracing::debug!("ConfigSynced: skipping fleet announce — no tunnel URL yet");
+                                                        }
                                                     }
                                                 }
                                             }
@@ -12389,10 +12417,13 @@ fn main() {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
                 loop {
                     interval.tick().await;
-                    // Read current tunnel URL for metadata publication (WS-ONLINE-B)
+                    // Read current tunnel URL for metadata publication (WS-ONLINE-B).
+                    // pyramid_sync_tick still takes Option<String>; convert the
+                    // newtype via as_str().to_string() so discovery metadata
+                    // publication keeps its existing wire format.
                     let tunnel_url = {
                         let ts = sync_tunnel_state.read().await;
-                        ts.tunnel_url.clone()
+                        ts.tunnel_url.as_ref().map(|u| u.as_str().to_string())
                     };
                     wire_node_lib::pyramid::sync::pyramid_sync_tick(
                         &sync_pyramid_state,
@@ -12623,7 +12654,10 @@ fn main() {
                             &heartbeat_config.api_url,
                             token,
                             node_id,
-                            tunnel_url.as_deref(),
+                            // TunnelUrl: !Deref. Borrow the inner &str for
+                            // heartbeat's Option<&str> param; same shape as
+                            // the old as_deref() call produced.
+                            tunnel_url.as_ref().map(|u| u.as_str()),
                             version.as_deref(),
                         ).await;
 
@@ -12758,9 +12792,18 @@ fn main() {
                                                 .as_ref()
                                                 .map(|ni| ni.node_handle.clone());
 
-                                            let tunnel_url = {
+                                            // FleetAnnouncement.tunnel_url is TunnelUrl (WS9). Without a
+                                            // tunnel URL we have nothing meaningful to announce.
+                                            let tunnel_url_opt = {
                                                 let ts = heartbeat_state.tunnel_state.read().await;
-                                                ts.tunnel_url.clone().unwrap_or_default()
+                                                ts.tunnel_url.clone()
+                                            };
+                                            let tunnel_url = match tunnel_url_opt {
+                                                Some(u) => u,
+                                                None => {
+                                                    tracing::debug!("Heartbeat: skipping fleet announce — no tunnel URL");
+                                                    continue;
+                                                }
                                             };
 
                                             // Read loaded models from local mode state (Ollama).

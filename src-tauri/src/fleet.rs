@@ -7,18 +7,41 @@
 // Fleet routing is direct peer-to-peer via Cloudflare tunnels. No
 // credits, no exchange, no relay. Same operator's hardware — cost is
 // electricity only.
+//
+// Phase 3 — Async Fleet Dispatch
+// ------------------------------
+// The dispatch protocol is split into two legs:
+//   1. Dispatcher POSTs `/v1/compute/fleet-dispatch` with a `job_id` and
+//      `callback_url`. Peer replies **202 Accepted** carrying a
+//      `FleetDispatchAck` (the peer's queue depth at accept time), or a
+//      fast-fail status (503 overloaded, 409 duplicate, 410 unknown rule).
+//   2. When the peer finishes, it POSTs `/v1/fleet/result` at the
+//      dispatcher's callback URL with a `FleetAsyncResultEnvelope`
+//      (success or error payload).
+//
+// Synchronous responses are gone from the wire protocol; the old
+// `FleetDispatchResponse` struct is retained as the payload carried
+// inside `FleetAsyncResult::Success`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use crate::pyramid::fleet_delivery_policy::FleetDeliveryPolicy;
 use crate::pyramid::llm::HTTP_CLIENT;
+use crate::pyramid::tunnel_url::TunnelUrl;
 
 /// A fleet peer node (same operator, different hardware).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetPeer {
     pub node_id: String,
     pub name: String,
-    pub tunnel_url: String,
+    /// Validated tunnel URL. Freeform strings are rejected at roster
+    /// ingress, so every downstream callsite can trust the invariants
+    /// of `TunnelUrl` (scheme ∈ {http, https}, host present, path
+    /// normalized). On-wire format remains plain string via
+    /// `TunnelUrl`'s Serialize impl — old peers stay compatible.
+    pub tunnel_url: TunnelUrl,
     /// Model IDs this peer has loaded (Ollama local models). Kept for observability.
     pub models_loaded: Vec<String>,
     /// Routing rule names this peer can serve locally.
@@ -52,6 +75,9 @@ impl FleetRoster {
     ///
     /// Merges rather than replacing wholesale — direct announcements
     /// may carry fresher model/queue data than the heartbeat snapshot.
+    ///
+    /// Malformed `tunnel_url` on any individual entry drops just that
+    /// entry (warn-logged); the rest of the batch is applied.
     pub fn update_from_heartbeat(
         &mut self,
         peers: Vec<HeartbeatFleetEntry>,
@@ -59,13 +85,25 @@ impl FleetRoster {
     ) {
         let now = chrono::Utc::now();
         for entry in peers {
+            let parsed_url = match TunnelUrl::parse(&entry.tunnel_url) {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!(
+                        node_id = %entry.node_id,
+                        raw = %entry.tunnel_url,
+                        err = %e,
+                        "heartbeat fleet entry has malformed tunnel_url; dropping entry"
+                    );
+                    continue;
+                }
+            };
             let peer = self
                 .peers
                 .entry(entry.node_id.clone())
                 .or_insert_with(|| FleetPeer {
                     node_id: entry.node_id.clone(),
                     name: entry.name.clone(),
-                    tunnel_url: entry.tunnel_url.clone(),
+                    tunnel_url: parsed_url.clone(),
                     models_loaded: Vec::new(),
                     serving_rules: Vec::new(),
                     queue_depths: HashMap::new(),
@@ -75,7 +113,7 @@ impl FleetRoster {
                 });
             // Heartbeat provides tunnel_url and name. Models + serving_rules
             // come from direct announcement (preferred) or queue state mirror.
-            peer.tunnel_url = entry.tunnel_url;
+            peer.tunnel_url = parsed_url;
             peer.name = entry.name;
             peer.last_seen = now;
             // Store handle_path when the server provides it.
@@ -89,6 +127,11 @@ impl FleetRoster {
     }
 
     /// Update from a direct fleet peer announcement.
+    ///
+    /// Note: `FleetAnnouncement` carries a `TunnelUrl` directly, so any
+    /// malformed URL would have been rejected at the deserialize boundary
+    /// in `handle_fleet_announce` (server.rs). This function can trust
+    /// the `announcement.tunnel_url` field.
     pub fn update_from_announcement(&mut self, announcement: FleetAnnouncement) {
         let now = chrono::Utc::now();
         let peer = self
@@ -127,10 +170,16 @@ impl FleetRoster {
 
     /// Find a fleet peer that can serve the given routing rule name,
     /// picking the one with the lowest total queue depth.
-    /// Returns None if no peer qualifies (stale peers older than 120s
-    /// are excluded).
-    pub fn find_peer_for_rule(&self, rule_name: &str) -> Option<&FleetPeer> {
-        let staleness_limit = chrono::Utc::now() - chrono::Duration::seconds(120);
+    ///
+    /// `staleness_secs` comes from `FleetDeliveryPolicy::peer_staleness_secs`.
+    /// Peers whose `last_seen` is older than that window are excluded.
+    pub fn find_peer_for_rule(
+        &self,
+        rule_name: &str,
+        staleness_secs: u64,
+    ) -> Option<&FleetPeer> {
+        let staleness_limit =
+            chrono::Utc::now() - chrono::Duration::seconds(staleness_secs as i64);
         self.peers
             .values()
             .filter(|p| p.last_seen > staleness_limit)
@@ -142,6 +191,10 @@ impl FleetRoster {
 // ── Heartbeat response shapes ─────────────────────────────────────────────
 
 /// Shape of a fleet roster entry from the heartbeat response.
+///
+/// `tunnel_url` is kept as `String` on the deserialize side so the
+/// ingress layer (`update_from_heartbeat`) can parse and drop bad
+/// entries individually instead of failing the whole batch.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HeartbeatFleetEntry {
     pub node_id: String,
@@ -162,6 +215,11 @@ pub struct HeartbeatFleetEntry {
 
 /// Shape of a direct fleet peer announcement.
 /// Sent when: startup, model load/unload, shutdown.
+///
+/// `tunnel_url` is a validated `TunnelUrl` — malformed URLs are rejected
+/// at the deserialize boundary (i.e. when the server decodes the
+/// announcement body). On-wire format remains a plain string thanks to
+/// `TunnelUrl`'s string-based Serialize/Deserialize.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetAnnouncement {
     pub node_id: String,
@@ -172,7 +230,7 @@ pub struct FleetAnnouncement {
     /// Operator handle (e.g. "hello") — new field for node identity.
     #[serde(default)]
     pub operator_handle: Option<String>,
-    pub tunnel_url: String,
+    pub tunnel_url: TunnelUrl,
     /// Model IDs this peer has loaded (kept for observability).
     pub models_loaded: Vec<String>,
     /// Routing rule names this peer can serve locally.
@@ -185,23 +243,48 @@ pub struct FleetAnnouncement {
     pub operator_id: String,
 }
 
-// ── Fleet dispatch request/response (LLM call forwarding) ─────────────────
+// ── Fleet dispatch request / response types (async protocol) ──────────────
 
 /// Shape of a fleet dispatch request (sent TO a peer node via HTTP POST).
-/// Dispatches by routing rule name — model names never cross node boundaries.
+///
+/// Dispatches by routing rule name — model names never cross node
+/// boundaries. The peer resolves the rule to a locally-loaded model.
+///
+/// The fleet JWT is **not** in the body any more; it rides in the
+/// `Authorization: Bearer …` header only. Carrying it in both places
+/// was a single-point-of-truth hazard (a forged body JWT vs a real
+/// header JWT — which wins?).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetDispatchRequest {
+    /// Dispatcher-issued correlation id. Returned on the callback so
+    /// the dispatcher can match the async result back to the pending
+    /// request.
+    pub job_id: String,
     pub rule_name: String,
     pub system_prompt: String,
     pub user_prompt: String,
     pub temperature: f32,
     pub max_tokens: usize,
     pub response_format: Option<serde_json::Value>,
-    /// Fleet JWT for authentication (sent in both body and Authorization header).
-    pub fleet_jwt: String,
+    /// URL the peer must POST the `FleetAsyncResultEnvelope` to when
+    /// the work finishes. `validate_callback_url` at the peer pins
+    /// authority + path before accepting.
+    pub callback_url: String,
 }
 
-/// Shape of a fleet dispatch response (returned FROM a peer node).
+/// Peer acknowledgement of a dispatch. Returned in the HTTP 202 body
+/// when the peer has accepted the job onto its queue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetDispatchAck {
+    pub job_id: String,
+    /// Peer's total queue depth at accept time. Used by the dispatcher
+    /// for optional load-shedding metrics, not for correctness.
+    pub peer_queue_depth: u64,
+}
+
+/// The success payload inside a `FleetAsyncResult::Success`. Identical
+/// in shape to the old synchronous response — the LLM output itself
+/// doesn't change, only the transport does.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetDispatchResponse {
     pub content: String,
@@ -211,6 +294,26 @@ pub struct FleetDispatchResponse {
     pub finish_reason: Option<String>,
     /// The model the peer actually resolved and used (for observability).
     pub peer_model: Option<String>,
+}
+
+/// Outcome of a fleet job, carried inside `FleetAsyncResultEnvelope`.
+///
+/// Tagged-enum JSON representation (`{"kind":"Success","data":{...}}` /
+/// `{"kind":"Error","data":"..."}`) so the callback handler can
+/// discriminate without a peek-then-parse dance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data")]
+pub enum FleetAsyncResult {
+    Success(FleetDispatchResponse),
+    Error(String),
+}
+
+/// Envelope the peer POSTs to the dispatcher's `callback_url` when a
+/// fleet job completes (or fails non-retryably).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetAsyncResultEnvelope {
+    pub job_id: String,
+    pub outcome: FleetAsyncResult,
 }
 
 // ── Fleet dispatch errors ────────────────────────────────────────────────
@@ -235,9 +338,11 @@ pub enum FleetDispatchErrorKind {
     OriginTimeout,
     /// Network/transport error (DNS, connection refused, tunnel down)
     Transport,
-    /// Non-success HTTP status (403, 500, etc.)
+    /// Non-success HTTP status (403, 500, etc.). Specific codes the
+    /// caller cares about (503 overloaded / 409 duplicate /
+    /// 410 unknown rule) live in `status_code`.
     HttpStatus,
-    /// Response body couldn't be parsed as FleetDispatchResponse
+    /// Response body couldn't be parsed as `FleetDispatchAck`.
     ResponseParse,
 }
 
@@ -255,15 +360,135 @@ impl FleetDispatchError {
     }
 }
 
+// ── Fleet delivery errors (callback POST from peer → dispatcher) ─────────
+
+/// Errors surfaced by [`deliver_fleet_result`]. Peer-side callers map
+/// these to outbox retry decisions (backoff vs give up).
+#[derive(Debug)]
+pub enum FleetDeliveryError {
+    /// Network/transport-level failure (connection refused, DNS, timeout).
+    Transport(String),
+    /// No fleet JWT available in the roster — cannot authenticate.
+    NoJwt,
+    /// Fleet JWT is expired. Caller should back off and retry after the
+    /// next heartbeat refreshes the token.
+    JwtExpired,
+    /// Dispatcher returned a non-2xx status.
+    HttpStatus { status_code: u16, message: String },
+    /// Dispatcher returned success but body was unparseable (logged;
+    /// currently we do not parse a response body, but reserve this for
+    /// future use).
+    ResponseParse(String),
+}
+
+impl std::fmt::Display for FleetDeliveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FleetDeliveryError::Transport(e) => {
+                write!(f, "fleet result delivery transport error: {}", e)
+            }
+            FleetDeliveryError::NoJwt => write!(f, "fleet result delivery: no fleet JWT in roster"),
+            FleetDeliveryError::JwtExpired => {
+                write!(f, "fleet result delivery: fleet JWT is expired")
+            }
+            FleetDeliveryError::HttpStatus { status_code, message } => {
+                write!(
+                    f,
+                    "fleet result delivery HTTP {}: {}",
+                    status_code, message
+                )
+            }
+            FleetDeliveryError::ResponseParse(e) => {
+                write!(f, "fleet result delivery response parse error: {}", e)
+            }
+        }
+    }
+}
+
+impl std::error::Error for FleetDeliveryError {}
+
+// ── JWT expiry helper ────────────────────────────────────────────────────
+
+/// Parse a JWT's `exp` claim without verifying the signature and check
+/// it against current time (with a ~5s clock-skew window).
+///
+/// Returns `true` if the token is expired OR the `exp` claim cannot be
+/// located. "Unparseable is expired" is the safe default — an
+/// unreadable token cannot be trusted to authenticate outbound calls.
+///
+/// NOTE: This is a lightweight pre-flight check before outbound calls.
+/// The authoritative verification still happens server-side on the
+/// receiving handler (which rejects expired tokens at decode time).
+pub fn is_jwt_expired(token: &str) -> bool {
+    use base64::Engine;
+
+    // Clock-skew window: permit tokens within 5 seconds of their nominal
+    // expiry to avoid false-positive rejections on slightly drifted
+    // clocks. Small enough that it doesn't meaningfully extend a
+    // compromised token's lifetime.
+    const CLOCK_SKEW_SECS: u64 = 5;
+
+    // JWT shape: header.payload.signature — all three base64url segments.
+    let mut parts = token.trim_start_matches("Bearer ").split('.');
+    let _header = parts.next();
+    let payload_b64 = match parts.next() {
+        Some(p) if !p.is_empty() => p,
+        _ => return true, // malformed → treat as expired
+    };
+
+    let payload_bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+    {
+        Ok(b) => b,
+        Err(_) => return true,
+    };
+
+    #[derive(Deserialize)]
+    struct ExpOnly {
+        exp: Option<u64>,
+    }
+    let exp = match serde_json::from_slice::<ExpOnly>(&payload_bytes)
+        .ok()
+        .and_then(|c| c.exp)
+    {
+        Some(e) => e,
+        None => return true, // no exp claim → treat as expired
+    };
+
+    let now = match std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+    {
+        Ok(d) => d.as_secs(),
+        // Clock before UNIX epoch — treat as expired. Impossible in
+        // practice; hedging is correct.
+        Err(_) => return true,
+    };
+
+    // Expired iff now has moved past (exp + skew).
+    now > exp.saturating_add(CLOCK_SKEW_SECS)
+}
+
 // ── Fleet dispatch client ─────────────────────────────────────────────────
 
 /// Dispatch an LLM call to a fleet peer by routing rule name.
 ///
 /// The peer resolves the rule name to a local model — model names never
-/// cross node boundaries. Timeout is configurable (reads from the matched
-/// rule's `max_wait_secs` in the dispatch policy).
+/// cross node boundaries. On success the peer replies 202 with a
+/// [`FleetDispatchAck`] and the actual work runs asynchronously; the
+/// peer will POST a [`FleetAsyncResultEnvelope`] back to `callback_url`
+/// when done.
+///
+/// `timeout_secs` is the ACK timeout (how long we wait for the 202),
+/// NOT the job wall-clock. Callers pass
+/// `policy.dispatch_ack_timeout_secs`.
+///
+/// 503/409/410 are surfaced via `FleetDispatchError { kind: HttpStatus,
+/// status_code: Some(…) }` — no new `FleetDispatchErrorKind` variants
+/// for these; callers discriminate on the HTTP code.
 pub async fn fleet_dispatch_by_rule(
     peer: &FleetPeer,
+    job_id: &str,
+    callback_url: &str,
     rule_name: &str,
     system_prompt: &str,
     user_prompt: &str,
@@ -272,18 +497,19 @@ pub async fn fleet_dispatch_by_rule(
     response_format: Option<&serde_json::Value>,
     fleet_jwt: &str,
     timeout_secs: u64,
-) -> Result<FleetDispatchResponse, FleetDispatchError> {
-    let url = format!("{}/v1/compute/fleet-dispatch", peer.tunnel_url);
+) -> Result<FleetDispatchAck, FleetDispatchError> {
+    let url = peer.tunnel_url.endpoint("/v1/compute/fleet-dispatch");
     let peer_id = peer.node_id.clone();
 
     let request = FleetDispatchRequest {
+        job_id: job_id.to_string(),
         rule_name: rule_name.to_string(),
         system_prompt: system_prompt.to_string(),
         user_prompt: user_prompt.to_string(),
         temperature,
         max_tokens,
         response_format: response_format.cloned(),
-        fleet_jwt: fleet_jwt.to_string(),
+        callback_url: callback_url.to_string(),
     };
 
     let resp = match HTTP_CLIENT
@@ -317,9 +543,11 @@ pub async fn fleet_dispatch_by_rule(
     if !status.is_success() {
         let status_code = status.as_u16();
         let text = resp.text().await.unwrap_or_default();
-        let kind = if status_code == 524 {
-            FleetDispatchErrorKind::OriginTimeout
-        } else if status_code == 408 || status_code == 504 {
+        // 524/408/504 are transport-side origin timeouts (Cloudflare or
+        // gateway-level). Every other non-success becomes HttpStatus
+        // and the caller discriminates via `status_code` (notably 503
+        // "peer overloaded", 409 "duplicate job_id", 410 "unknown rule").
+        let kind = if status_code == 524 || status_code == 408 || status_code == 504 {
             FleetDispatchErrorKind::OriginTimeout
         } else {
             FleetDispatchErrorKind::HttpStatus
@@ -332,7 +560,7 @@ pub async fn fleet_dispatch_by_rule(
         });
     }
 
-    resp.json::<FleetDispatchResponse>()
+    resp.json::<FleetDispatchAck>()
         .await
         .map_err(|e| FleetDispatchError {
             kind: FleetDispatchErrorKind::ResponseParse,
@@ -340,6 +568,311 @@ pub async fn fleet_dispatch_by_rule(
             status_code: Some(status.as_u16()),
             message: e.to_string(),
         })
+}
+
+// ── Callback URL validation (peer side) ───────────────────────────────────
+
+/// The kind of callback URL being validated. Each kind has a different
+/// policy for which roster to consult and which path to pin.
+///
+/// `MarketStandard` and `Relay` land in Phase 3 of the compute market;
+/// they are listed here so `validate_callback_url` has a single
+/// exhaustive switch across the whole callback surface, but the
+/// implementation is deferred.
+pub enum CallbackKind<'a> {
+    Fleet { dispatcher_nid: &'a str },
+    /// Reserved — compute market Phase 3.
+    MarketStandard,
+    /// Reserved — compute market Phase 3.
+    Relay,
+}
+
+/// Reasons `validate_callback_url` may reject a URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallbackValidationError {
+    /// `dispatcher_nid` is not in the local roster.
+    UnknownDispatcher,
+    /// URL authority (scheme/host/port) does not match the roster entry.
+    AuthorityMismatch,
+    /// URL path is not exactly `/v1/fleet/result`.
+    PathMismatch,
+    /// URL failed to parse as a valid tunnel URL.
+    UnparseableUrl,
+    /// `CallbackKind` variant is reserved for a future workstream.
+    KindNotImplemented,
+}
+
+impl std::fmt::Display for CallbackValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallbackValidationError::UnknownDispatcher => {
+                write!(f, "callback_url: dispatcher not in fleet roster")
+            }
+            CallbackValidationError::AuthorityMismatch => {
+                write!(f, "callback_url: authority does not match roster entry")
+            }
+            CallbackValidationError::PathMismatch => {
+                write!(f, "callback_url: path is not /v1/fleet/result")
+            }
+            CallbackValidationError::UnparseableUrl => {
+                write!(f, "callback_url: failed to parse as tunnel URL")
+            }
+            CallbackValidationError::KindNotImplemented => {
+                write!(f, "callback_url: kind not implemented yet")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CallbackValidationError {}
+
+/// Validate a `callback_url` given to us by a dispatcher against the
+/// local roster. For the `Fleet` kind:
+///   * the dispatcher's `nid` must be in our roster,
+///   * the URL authority must match the roster entry's tunnel,
+///   * the path must be exactly `/v1/fleet/result`.
+///
+/// Pinning both authority and path defends against dispatchers pointing
+/// callbacks at arbitrary hosts or exploit paths on the roster-known
+/// peer.
+pub fn validate_callback_url(
+    callback_url: &str,
+    kind: &CallbackKind,
+    roster: &FleetRoster,
+) -> Result<(), CallbackValidationError> {
+    let got =
+        TunnelUrl::parse(callback_url).map_err(|_| CallbackValidationError::UnparseableUrl)?;
+    match kind {
+        CallbackKind::Fleet { dispatcher_nid } => {
+            let peer = roster
+                .peers
+                .get(*dispatcher_nid)
+                .ok_or(CallbackValidationError::UnknownDispatcher)?;
+            if got.authority() != peer.tunnel_url.authority() {
+                return Err(CallbackValidationError::AuthorityMismatch);
+            }
+            if got.path() != "/v1/fleet/result" {
+                return Err(CallbackValidationError::PathMismatch);
+            }
+            Ok(())
+        }
+        CallbackKind::MarketStandard | CallbackKind::Relay => {
+            Err(CallbackValidationError::KindNotImplemented)
+        }
+    }
+}
+
+// ── Pending fleet jobs map (dispatcher side) ──────────────────────────────
+
+/// Pending-job registry on the dispatcher side: `job_id → oneshot sender`.
+///
+/// Synchronous `std::sync::Mutex` is deliberate — the entry points
+/// are short (`register`, `remove`, `peek_matches`, `sweep_expired`),
+/// they do NOT hold the lock across `.await`, and the async layer
+/// around them uses `tokio::sync::oneshot` for the actual wake-up. The
+/// moment a contributor adds an `.await` inside a `self.jobs.lock()`
+/// scope, that's a bug; a plain mutex makes the bug a compile-time
+/// `Send` error instead of a runtime deadlock risk.
+pub struct PendingFleetJobs {
+    /// std::sync::Mutex — never held across .await.
+    jobs: std::sync::Mutex<std::collections::HashMap<String, PendingFleetJob>>,
+}
+
+impl Default for PendingFleetJobs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PendingFleetJobs {
+    pub fn new() -> Self {
+        Self {
+            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Insert a new pending job. Overwrites a prior entry for the same
+    /// `job_id` (should not happen in practice — `job_id`s are UUIDs).
+    pub fn register(&self, job_id: String, entry: PendingFleetJob) {
+        let mut jobs = self.jobs.lock().expect("PendingFleetJobs mutex poisoned");
+        jobs.insert(job_id, entry);
+    }
+
+    /// Remove and return the pending entry for `job_id`. Returns
+    /// `None` if no entry is registered.
+    pub fn remove(&self, job_id: &str) -> Option<PendingFleetJob> {
+        let mut jobs = self.jobs.lock().expect("PendingFleetJobs mutex poisoned");
+        jobs.remove(job_id)
+    }
+
+    /// Check whether an incoming callback's (job_id, peer_id) pair
+    /// matches a registered entry without consuming it.
+    ///
+    /// Use pattern on the callback handler:
+    ///   match pending.peek_matches(&job_id, &caller_nid) {
+    ///       PeekResult::NotFound => orphan,
+    ///       PeekResult::Mismatch => forgery,
+    ///       PeekResult::Match    => pending.remove(&job_id) and deliver,
+    ///   }
+    pub fn peek_matches(&self, job_id: &str, expected_peer_id: &str) -> PeekResult {
+        let jobs = self.jobs.lock().expect("PendingFleetJobs mutex poisoned");
+        match jobs.get(job_id) {
+            None => PeekResult::NotFound,
+            Some(entry) if entry.peer_id == expected_peer_id => PeekResult::Match,
+            Some(_) => PeekResult::Mismatch,
+        }
+    }
+
+    /// Remove every entry whose `dispatched_at.elapsed() >
+    /// expected_timeout * multiplier`. Returns the evicted `job_id`s
+    /// for the caller to chronicle as `fleet_pending_orphaned`.
+    ///
+    /// `multiplier` is clamped to `[1, 10]` — a zero multiplier would
+    /// evict every entry immediately, and arbitrary-large multipliers
+    /// would let orphaned entries grow unboundedly. `saturating_mul`
+    /// on the resulting duration protects against overflow on
+    /// pathological timeouts.
+    pub fn sweep_expired(&self, multiplier: u64) -> Vec<String> {
+        let clamped = multiplier.clamp(1, 10);
+        let mut expired: Vec<String> = Vec::new();
+        {
+            let jobs = self.jobs.lock().expect("PendingFleetJobs mutex poisoned");
+            for (job_id, entry) in jobs.iter() {
+                // Total eviction window = expected_timeout * clamped.
+                let window = entry
+                    .expected_timeout
+                    .saturating_mul(clamped as u32);
+                if entry.dispatched_at.elapsed() > window {
+                    expired.push(job_id.clone());
+                }
+            }
+        }
+        // Second pass removes — keep the lock scope tight and avoid
+        // holding it across the potential allocation in remove().
+        {
+            let mut jobs = self.jobs.lock().expect("PendingFleetJobs mutex poisoned");
+            for job_id in &expired {
+                jobs.remove(job_id);
+            }
+        }
+        expired
+    }
+}
+
+/// Outcome of `PendingFleetJobs::peek_matches`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PeekResult {
+    /// No pending entry for this job_id.
+    NotFound,
+    /// Entry exists and `peer_id` matches the caller.
+    Match,
+    /// Entry exists but `peer_id` does NOT match — forgery attempt.
+    Mismatch,
+}
+
+/// A single pending dispatch waiting for its callback.
+pub struct PendingFleetJob {
+    /// Oneshot sender woken when the callback arrives. The receiving
+    /// side (the caller that registered this entry) awaits this and
+    /// then propagates the result to the waiting compute.
+    pub sender: tokio::sync::oneshot::Sender<FleetAsyncResult>,
+    /// Instant the dispatch POST was issued. Used by `sweep_expired`.
+    pub dispatched_at: std::time::Instant,
+    /// Raw node_id of the peer the job was dispatched to.
+    ///
+    /// **MUST be `peer.node_id` (raw), not `peer.handle_path`.** The
+    /// incoming callback authenticates via fleet JWT whose `nid`
+    /// claim carries the raw node_id; comparing against anything else
+    /// (e.g. a display-only `handle_path`) would false-positive
+    /// forgery checks or, worse, accept a forgery as a match.
+    pub peer_id: String,
+    /// Upper bound on how long this job should take. The orphan sweep
+    /// evicts entries older than `expected_timeout * multiplier`.
+    pub expected_timeout: std::time::Duration,
+}
+
+// ── Fleet dispatch context (plumbed into HTTP handlers) ──────────────────
+
+/// Collection of shared state the fleet dispatch paths need on both
+/// sides of the protocol. Constructed once at app startup and passed
+/// by clone (of the `Arc`s) into the HTTP handlers and the orphan
+/// sweep task.
+///
+/// Ownership:
+/// - `tunnel_state` is **borrowed** — mutated by the tunnel lifecycle
+///   elsewhere. We only read from it (for the local tunnel URL used
+///   to construct our own `callback_url`).
+/// - `pending` and `policy` are **owned by this feature**.
+pub struct FleetDispatchContext {
+    /// Borrowed handle to the node's tunnel state.
+    pub tunnel_state: Arc<tokio::sync::RwLock<crate::tunnel::TunnelState>>,
+    /// Owned: the in-memory pending-job registry.
+    pub pending: Arc<PendingFleetJobs>,
+    /// Owned: the operational policy, re-readable under hot reload.
+    pub policy: Arc<tokio::sync::RwLock<FleetDeliveryPolicy>>,
+}
+
+// ── Fleet result delivery (peer side → dispatcher callback) ───────────────
+
+/// POST a [`FleetAsyncResultEnvelope`] back to the dispatcher's
+/// callback URL.
+///
+/// URL resolution: if the dispatcher is in our roster, prefer
+/// `roster.peers[dispatcher_nid].tunnel_url.endpoint("/v1/fleet/result")`
+/// (tunnel URLs rotate, and the live roster value wins over a stale
+/// stored one). Otherwise fall back to the `stored_callback_url` the
+/// dispatcher supplied at dispatch time.
+///
+/// JWT sourcing: reads `roster.fleet_jwt` live — it rotates every
+/// heartbeat. If the token is missing we return `NoJwt`; if it is
+/// already expired we return `JwtExpired` without attempting the POST
+/// (Cloudflare would reject it, burning a delivery attempt).
+pub async fn deliver_fleet_result(
+    dispatcher_nid: &str,
+    stored_callback_url: &str,
+    envelope: &FleetAsyncResultEnvelope,
+    roster: &FleetRoster,
+    policy: &FleetDeliveryPolicy,
+) -> Result<(), FleetDeliveryError> {
+    // 1. Resolve effective URL.
+    let effective_url = match roster.peers.get(dispatcher_nid) {
+        Some(peer) => peer.tunnel_url.endpoint("/v1/fleet/result"),
+        None => stored_callback_url.to_string(),
+    };
+
+    // 2. Source JWT and pre-flight expiry.
+    let jwt = roster
+        .fleet_jwt
+        .as_deref()
+        .ok_or(FleetDeliveryError::NoJwt)?;
+    if is_jwt_expired(jwt) {
+        return Err(FleetDeliveryError::JwtExpired);
+    }
+
+    // 3. POST.
+    let resp = HTTP_CLIENT
+        .post(&effective_url)
+        .header("Authorization", format!("Bearer {}", jwt))
+        .header("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(
+            policy.callback_post_timeout_secs,
+        ))
+        .json(envelope)
+        .send()
+        .await
+        .map_err(|e| FleetDeliveryError::Transport(e.to_string()))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let status_code = status.as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(FleetDeliveryError::HttpStatus {
+            status_code,
+            message: format!("{}: {}", status, body),
+        });
+    }
+
+    Ok(())
 }
 
 // ── Derive serving rules ─────────────────────────────────────────────────
@@ -390,7 +923,7 @@ pub async fn announce_to_fleet(roster: &FleetRoster, self_announcement: &FleetAn
     };
 
     for peer in roster.peers.values() {
-        let url = format!("{}/v1/fleet/announce", peer.tunnel_url);
+        let url = peer.tunnel_url.endpoint("/v1/fleet/announce");
         let body = serde_json::to_value(self_announcement).unwrap_or_default();
         let jwt_clone = jwt.clone();
         let peer_id = peer.node_id.clone();
@@ -420,5 +953,448 @@ pub async fn announce_to_fleet(roster: &FleetRoster, self_announcement: &FleetAn
                 }
             }
         });
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+
+    // ── Helpers ─────────────────────────────────────────────────────────
+
+    fn mk_peer(node_id: &str, tunnel: &str) -> FleetPeer {
+        FleetPeer {
+            node_id: node_id.to_string(),
+            name: node_id.to_string(),
+            tunnel_url: TunnelUrl::parse(tunnel).expect("valid tunnel url"),
+            models_loaded: vec![],
+            serving_rules: vec!["rule-a".to_string()],
+            queue_depths: HashMap::new(),
+            total_queue_depth: 0,
+            last_seen: chrono::Utc::now(),
+            handle_path: None,
+        }
+    }
+
+    fn mk_roster_with(peer: FleetPeer) -> FleetRoster {
+        let mut roster = FleetRoster::default();
+        roster.peers.insert(peer.node_id.clone(), peer);
+        roster
+    }
+
+    /// Build a base64url JWT-shaped string with the given `exp`. No
+    /// signature verification is done by `is_jwt_expired`, so signing
+    /// is unnecessary.
+    fn mk_jwt_with_exp(exp: u64) -> String {
+        let header = r#"{"alg":"none","typ":"JWT"}"#;
+        let payload = format!(r#"{{"exp":{}}}"#, exp);
+        let h = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(header);
+        let p = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+        format!("{}.{}.fake-sig", h, p)
+    }
+
+    // ── FleetDispatchRequest serde (no fleet_jwt in body) ───────────────
+
+    #[test]
+    fn fleet_dispatch_request_serde_roundtrip() {
+        let req = FleetDispatchRequest {
+            job_id: "job-123".into(),
+            rule_name: "rule-a".into(),
+            system_prompt: "sys".into(),
+            user_prompt: "usr".into(),
+            temperature: 0.7,
+            max_tokens: 128,
+            response_format: Some(serde_json::json!({"type":"json_object"})),
+            callback_url: "https://me.example.com/v1/fleet/result".into(),
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        // No fleet_jwt in the body on the wire.
+        assert!(
+            !json.contains("fleet_jwt"),
+            "body must not carry fleet_jwt; got: {json}"
+        );
+        let back: FleetDispatchRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.job_id, "job-123");
+        assert_eq!(back.callback_url, "https://me.example.com/v1/fleet/result");
+        assert_eq!(back.rule_name, "rule-a");
+    }
+
+    // ── FleetDispatchAck serde ─────────────────────────────────────────
+
+    #[test]
+    fn fleet_dispatch_ack_serde_roundtrip() {
+        let ack = FleetDispatchAck {
+            job_id: "job-456".into(),
+            peer_queue_depth: 3,
+        };
+        let json = serde_json::to_string(&ack).expect("serialize");
+        let back: FleetDispatchAck = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.job_id, "job-456");
+        assert_eq!(back.peer_queue_depth, 3);
+    }
+
+    // ── FleetAsyncResult tagged enum serde ──────────────────────────────
+
+    #[test]
+    fn fleet_async_result_success_serde_shape() {
+        let ok = FleetAsyncResult::Success(FleetDispatchResponse {
+            content: "hello".into(),
+            prompt_tokens: Some(5),
+            completion_tokens: Some(7),
+            model: "llama3".into(),
+            finish_reason: Some("stop".into()),
+            peer_model: Some("llama3".into()),
+        });
+        let json = serde_json::to_value(&ok).expect("serialize");
+        assert_eq!(json["kind"], "Success");
+        assert_eq!(json["data"]["content"], "hello");
+        let back: FleetAsyncResult = serde_json::from_value(json).expect("deserialize");
+        match back {
+            FleetAsyncResult::Success(resp) => assert_eq!(resp.content, "hello"),
+            _ => panic!("expected Success variant"),
+        }
+    }
+
+    #[test]
+    fn fleet_async_result_error_serde_shape() {
+        let err = FleetAsyncResult::Error("model crashed".into());
+        let json = serde_json::to_value(&err).expect("serialize");
+        assert_eq!(json["kind"], "Error");
+        assert_eq!(json["data"], "model crashed");
+        let back: FleetAsyncResult = serde_json::from_value(json).expect("deserialize");
+        match back {
+            FleetAsyncResult::Error(msg) => assert_eq!(msg, "model crashed"),
+            _ => panic!("expected Error variant"),
+        }
+    }
+
+    // ── FleetAsyncResultEnvelope serde ──────────────────────────────────
+
+    #[test]
+    fn fleet_async_result_envelope_serde_roundtrip() {
+        let env = FleetAsyncResultEnvelope {
+            job_id: "job-789".into(),
+            outcome: FleetAsyncResult::Success(FleetDispatchResponse {
+                content: "ok".into(),
+                prompt_tokens: None,
+                completion_tokens: None,
+                model: "m".into(),
+                finish_reason: None,
+                peer_model: None,
+            }),
+        };
+        let json = serde_json::to_string(&env).expect("serialize");
+        let back: FleetAsyncResultEnvelope = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.job_id, "job-789");
+        match back.outcome {
+            FleetAsyncResult::Success(r) => assert_eq!(r.content, "ok"),
+            _ => panic!("expected Success"),
+        }
+    }
+
+    // ── validate_callback_url ───────────────────────────────────────────
+
+    #[test]
+    fn validate_callback_url_matches_authority_and_path() {
+        let peer = mk_peer("node-alpha", "https://alpha.example.com");
+        let roster = mk_roster_with(peer);
+        let r = validate_callback_url(
+            "https://alpha.example.com/v1/fleet/result",
+            &CallbackKind::Fleet {
+                dispatcher_nid: "node-alpha",
+            },
+            &roster,
+        );
+        assert!(r.is_ok(), "expected Ok, got {:?}", r);
+    }
+
+    #[test]
+    fn validate_callback_url_unknown_dispatcher() {
+        let roster = FleetRoster::default();
+        let r = validate_callback_url(
+            "https://alpha.example.com/v1/fleet/result",
+            &CallbackKind::Fleet {
+                dispatcher_nid: "node-alpha",
+            },
+            &roster,
+        );
+        assert_eq!(r.unwrap_err(), CallbackValidationError::UnknownDispatcher);
+    }
+
+    #[test]
+    fn validate_callback_url_authority_mismatch() {
+        let peer = mk_peer("node-alpha", "https://alpha.example.com");
+        let roster = mk_roster_with(peer);
+        let r = validate_callback_url(
+            "https://evil.example.com/v1/fleet/result",
+            &CallbackKind::Fleet {
+                dispatcher_nid: "node-alpha",
+            },
+            &roster,
+        );
+        assert_eq!(r.unwrap_err(), CallbackValidationError::AuthorityMismatch);
+    }
+
+    #[test]
+    fn validate_callback_url_path_mismatch() {
+        let peer = mk_peer("node-alpha", "https://alpha.example.com");
+        let roster = mk_roster_with(peer);
+        let r = validate_callback_url(
+            "https://alpha.example.com/v1/wrong/path",
+            &CallbackKind::Fleet {
+                dispatcher_nid: "node-alpha",
+            },
+            &roster,
+        );
+        assert_eq!(r.unwrap_err(), CallbackValidationError::PathMismatch);
+    }
+
+    #[test]
+    fn validate_callback_url_unparseable() {
+        let roster = FleetRoster::default();
+        let r = validate_callback_url(
+            "not a url",
+            &CallbackKind::Fleet {
+                dispatcher_nid: "whoever",
+            },
+            &roster,
+        );
+        assert_eq!(r.unwrap_err(), CallbackValidationError::UnparseableUrl);
+    }
+
+    #[test]
+    fn validate_callback_url_reserved_kinds() {
+        let roster = FleetRoster::default();
+        let r_ms = validate_callback_url(
+            "https://example.com/v1/fleet/result",
+            &CallbackKind::MarketStandard,
+            &roster,
+        );
+        assert_eq!(r_ms.unwrap_err(), CallbackValidationError::KindNotImplemented);
+        let r_r = validate_callback_url(
+            "https://example.com/v1/fleet/result",
+            &CallbackKind::Relay,
+            &roster,
+        );
+        assert_eq!(r_r.unwrap_err(), CallbackValidationError::KindNotImplemented);
+    }
+
+    // ── PendingFleetJobs register/peek/remove ───────────────────────────
+
+    #[test]
+    fn pending_fleet_jobs_register_peek_remove_roundtrip() {
+        let pending = PendingFleetJobs::new();
+        let (tx, _rx) = tokio::sync::oneshot::channel::<FleetAsyncResult>();
+        pending.register(
+            "job-1".to_string(),
+            PendingFleetJob {
+                sender: tx,
+                dispatched_at: std::time::Instant::now(),
+                peer_id: "peer-x".to_string(),
+                expected_timeout: std::time::Duration::from_secs(60),
+            },
+        );
+        assert_eq!(
+            pending.peek_matches("job-1", "peer-x"),
+            PeekResult::Match
+        );
+        assert!(pending.remove("job-1").is_some());
+        // Second remove returns None.
+        assert!(pending.remove("job-1").is_none());
+        // After removal, peek reports NotFound.
+        assert_eq!(
+            pending.peek_matches("job-1", "peer-x"),
+            PeekResult::NotFound
+        );
+    }
+
+    #[test]
+    fn pending_fleet_jobs_peek_forgery_returns_mismatch() {
+        let pending = PendingFleetJobs::new();
+        let (tx, _rx) = tokio::sync::oneshot::channel::<FleetAsyncResult>();
+        pending.register(
+            "job-2".to_string(),
+            PendingFleetJob {
+                sender: tx,
+                dispatched_at: std::time::Instant::now(),
+                peer_id: "legit-peer".to_string(),
+                expected_timeout: std::time::Duration::from_secs(60),
+            },
+        );
+        assert_eq!(
+            pending.peek_matches("job-2", "attacker-peer"),
+            PeekResult::Mismatch
+        );
+        // Mismatch must not consume — entry still present for legit caller.
+        assert_eq!(
+            pending.peek_matches("job-2", "legit-peer"),
+            PeekResult::Match
+        );
+    }
+
+    #[test]
+    fn pending_fleet_jobs_sweep_expired_only_evicts_expired() {
+        let pending = PendingFleetJobs::new();
+        // Fresh entry — expected_timeout 60s, dispatched now → not expired.
+        let (tx_fresh, _rx_fresh) = tokio::sync::oneshot::channel::<FleetAsyncResult>();
+        pending.register(
+            "fresh".to_string(),
+            PendingFleetJob {
+                sender: tx_fresh,
+                dispatched_at: std::time::Instant::now(),
+                peer_id: "peer".to_string(),
+                expected_timeout: std::time::Duration::from_secs(60),
+            },
+        );
+        // Expired entry: dispatched 10 minutes ago, expected_timeout 1ms —
+        // 1ms * multiplier is way in the past.
+        let (tx_old, _rx_old) = tokio::sync::oneshot::channel::<FleetAsyncResult>();
+        let long_ago = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(600))
+            .expect("subtract 10 minutes");
+        pending.register(
+            "old".to_string(),
+            PendingFleetJob {
+                sender: tx_old,
+                dispatched_at: long_ago,
+                peer_id: "peer".to_string(),
+                expected_timeout: std::time::Duration::from_millis(1),
+            },
+        );
+        let evicted = pending.sweep_expired(2);
+        assert_eq!(evicted, vec!["old".to_string()]);
+        // Fresh entry remains.
+        assert_eq!(
+            pending.peek_matches("fresh", "peer"),
+            PeekResult::Match
+        );
+        // Expired entry gone.
+        assert_eq!(
+            pending.peek_matches("old", "peer"),
+            PeekResult::NotFound
+        );
+    }
+
+    // ── find_peer_for_rule staleness ────────────────────────────────────
+
+    #[test]
+    fn find_peer_for_rule_respects_staleness_secs() {
+        let mut roster = FleetRoster::default();
+        let mut fresh = mk_peer("fresh", "https://fresh.example.com");
+        fresh.last_seen = chrono::Utc::now();
+        roster.peers.insert(fresh.node_id.clone(), fresh);
+
+        let mut stale = mk_peer("stale", "https://stale.example.com");
+        // Last seen 5 minutes ago — stale under the canonical 120s window.
+        stale.last_seen = chrono::Utc::now() - chrono::Duration::seconds(300);
+        roster.peers.insert(stale.node_id.clone(), stale);
+
+        // With 120s window: stale excluded, fresh picked.
+        let pick = roster
+            .find_peer_for_rule("rule-a", 120)
+            .expect("one peer is fresh");
+        assert_eq!(pick.node_id, "fresh");
+
+        // With a huge window (3600s): both qualify; picks the one with
+        // lowest queue depth — tie → any is fine. Since both tied at 0,
+        // assert simply that we still get a peer.
+        let pick2 = roster
+            .find_peer_for_rule("rule-a", 3600)
+            .expect("both peers qualify with wide window");
+        assert!(matches!(pick2.node_id.as_str(), "fresh" | "stale"));
+
+        // With a 1s window: even "fresh" might be excluded depending on
+        // test scheduling, so we only assert that we don't crash.
+        let _ = roster.find_peer_for_rule("rule-a", 1);
+    }
+
+    // ── is_jwt_expired ──────────────────────────────────────────────────
+
+    #[test]
+    fn is_jwt_expired_returns_true_for_expired_token() {
+        let past = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 3600;
+        let token = mk_jwt_with_exp(past);
+        assert!(is_jwt_expired(&token));
+    }
+
+    #[test]
+    fn is_jwt_expired_returns_false_for_fresh_token() {
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let token = mk_jwt_with_exp(future);
+        assert!(!is_jwt_expired(&token));
+    }
+
+    #[test]
+    fn is_jwt_expired_true_for_malformed_token() {
+        // No dots, no payload — expired by safe default.
+        assert!(is_jwt_expired("not-a-jwt"));
+        assert!(is_jwt_expired(""));
+        // Shape looks right but payload isn't base64url.
+        assert!(is_jwt_expired("aaa.!!!not-base64!!!.bbb"));
+    }
+
+    #[test]
+    fn is_jwt_expired_true_when_exp_absent() {
+        let header = r#"{"alg":"none"}"#;
+        let payload = r#"{"sub":"no-exp"}"#;
+        let h = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(header);
+        let p = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+        let token = format!("{}.{}.sig", h, p);
+        assert!(is_jwt_expired(&token));
+    }
+
+    #[test]
+    fn is_jwt_expired_strips_bearer_prefix() {
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let token = format!("Bearer {}", mk_jwt_with_exp(future));
+        assert!(!is_jwt_expired(&token));
+    }
+
+    // ── Heartbeat ingress drops malformed entries gracefully ────────────
+
+    #[test]
+    fn update_from_heartbeat_drops_malformed_entry_and_keeps_batch() {
+        let mut roster = FleetRoster::default();
+        let peers = vec![
+            HeartbeatFleetEntry {
+                node_id: "good".into(),
+                name: "good-node".into(),
+                tunnel_url: "https://good.example.com".into(),
+                handle_path: None,
+            },
+            HeartbeatFleetEntry {
+                node_id: "bad".into(),
+                name: "bad-node".into(),
+                tunnel_url: "not a url".into(),
+                handle_path: None,
+            },
+            HeartbeatFleetEntry {
+                node_id: "also-good".into(),
+                name: "also-good-node".into(),
+                tunnel_url: "http://localhost:8080".into(),
+                handle_path: None,
+            },
+        ];
+        roster.update_from_heartbeat(peers, None);
+        // Good entries present.
+        assert!(roster.peers.contains_key("good"));
+        assert!(roster.peers.contains_key("also-good"));
+        // Malformed entry dropped — did NOT fail the whole batch.
+        assert!(!roster.peers.contains_key("bad"));
     }
 }
