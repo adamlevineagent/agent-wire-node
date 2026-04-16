@@ -1014,6 +1014,118 @@ fn insert_bundled_contribution(
     Ok(rows > 0)
 }
 
+/// After the bundled manifest walk, ensure at most one `active` row
+/// exists per `(schema_type, slug)` pair. Called from
+/// `walk_bundled_contributions_manifest` to handle the version-bump
+/// scenario where an upgraded bundled entry (e.g. `-v2`) lands while
+/// the prior version (e.g. `-v1`) is still sitting active in the DB.
+///
+/// Rules:
+/// - If multiple rows have `status='active' AND superseded_by_id IS
+///   NULL` for the same `(schema_type, slug)`, keep the one whose row
+///   is chosen by the canonical `load_active_config_contribution`
+///   ordering (ORDER BY created_at DESC, id DESC LIMIT 1) unless a
+///   NON-bundled row is present — user refinements always win.
+/// - Mark the losers as `status='superseded'` pointing at the winner.
+///
+/// This is idempotent: once a pair has one active row, subsequent
+/// boots short-circuit with no changes.
+fn consolidate_bundled_versions(conn: &Connection) -> Result<()> {
+    // Find every (schema_type, slug_key) pair with more than one
+    // active row. `slug_key` is a synthetic column that treats NULL
+    // slugs as their own bucket (GROUP BY can't distinguish NULL
+    // values otherwise).
+    let mut stmt = conn.prepare(
+        "SELECT schema_type, COALESCE(slug, '__NULL__') AS slug_key
+         FROM pyramid_config_contributions
+         WHERE status = 'active' AND superseded_by_id IS NULL
+         GROUP BY schema_type, slug_key
+         HAVING COUNT(*) > 1",
+    )?;
+    let dupes: Vec<(String, String)> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    for (schema_type, slug_key) in dupes {
+        let slug_opt: Option<&str> = if slug_key == "__NULL__" {
+            None
+        } else {
+            Some(slug_key.as_str())
+        };
+
+        // Load every active row in this pair, annotated with source
+        // so we can prefer user refinements over bundled seeds.
+        let rows = if let Some(slug) = slug_opt {
+            let sql = "SELECT contribution_id, source, created_at, id
+                       FROM pyramid_config_contributions
+                       WHERE status = 'active' AND superseded_by_id IS NULL
+                         AND schema_type = ?1 AND slug = ?2
+                       ORDER BY created_at DESC, id DESC";
+            conn.prepare(sql)?
+                .query_map(rusqlite::params![schema_type, slug], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let sql = "SELECT contribution_id, source, created_at, id
+                       FROM pyramid_config_contributions
+                       WHERE status = 'active' AND superseded_by_id IS NULL
+                         AND schema_type = ?1 AND slug IS NULL
+                       ORDER BY created_at DESC, id DESC";
+            conn.prepare(sql)?
+                .query_map(rusqlite::params![schema_type], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        if rows.len() < 2 {
+            continue;
+        }
+
+        // Pick the winner. User refinements (source != 'bundled')
+        // always beat bundled seeds. Among bundled rows, the
+        // newest (first in DESC order) wins. Among user rows, the
+        // newest wins.
+        let user_winner = rows
+            .iter()
+            .find(|(_, source, _, _)| source != "bundled")
+            .cloned();
+        let winner = user_winner.unwrap_or_else(|| rows[0].clone());
+        let winner_id = winner.0;
+
+        for (loser_id, _, _, _) in rows.iter().filter(|(id, _, _, _)| id != &winner_id) {
+            conn.execute(
+                "UPDATE pyramid_config_contributions
+                 SET status = 'superseded', superseded_by_id = ?1
+                 WHERE contribution_id = ?2",
+                rusqlite::params![winner_id, loser_id],
+            )?;
+            debug!(
+                schema_type = %schema_type,
+                loser = %loser_id,
+                winner = %winner_id,
+                "consolidate_bundled_versions: marked duplicate-active row superseded"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Report from the Phase 9 bundled contributions walk. Counts how many
 /// bundled entries were freshly inserted, skipped (because a row with
 /// the same `contribution_id` already existed — either from a prior
@@ -1085,6 +1197,34 @@ pub fn walk_bundled_contributions_manifest(
                 report.failed += 1;
             }
         }
+    }
+
+    // ── Bundled version bump consolidation ───────────────────────────
+    //
+    // Bundled contributions are versioned by suffix (`-v1`, `-v2`, …).
+    // On an app upgrade that bumps the bundled version, both rows land
+    // in the DB with `status='active'` and `superseded_by_id IS NULL`
+    // because `INSERT OR IGNORE` only dedupes by contribution_id — it
+    // does NOT understand that v2 logically supersedes v1.
+    //
+    // `load_active_config_contribution` orders by `created_at DESC`
+    // and returns `LIMIT 1`, so v2 wins the read race. But the old v1
+    // row sits phantom-active in the table, and worse, a pre-upgrade
+    // USER refinement (active row supersedes=v1) has `created_at`
+    // earlier than v2's fresh-insertion timestamp — v2 silently
+    // overrides the user's explicit choice.
+    //
+    // Fix: after the manifest walk, consolidate each (schema_type,
+    // slug) pair so that at most ONE bundled row is active. The
+    // oldest-v2-wins-ordering bug on user refinements is also fixed —
+    // a user's active refinement (source != 'bundled', or supersedes
+    // a bundled row) marks any newer bundled default as superseded so
+    // the read path returns the user's choice.
+    if let Err(e) = consolidate_bundled_versions(conn) {
+        warn!(
+            error = %e,
+            "bundled version consolidation failed; duplicate-active rows may exist"
+        );
     }
 
     // ── Boot-time sync: hydrate chain_defaults operational table ─────
@@ -1777,6 +1917,235 @@ applies_to: 'chain_step_config'
         assert!(!report.ran);
         // But Phase 9 bundled walk still ran.
         assert!(report.bundled_inserted >= 15);
+    }
+
+    // ── Bundled version-bump consolidation tests (WS1a verifier) ──
+
+    /// Helper: insert an arbitrary active config contribution with an
+    /// explicit contribution_id and source, skipping the standard
+    /// create_config_contribution path. Used to simulate pre-existing
+    /// rows in the DB before calling the consolidation helper.
+    fn insert_active_row(
+        conn: &Connection,
+        contribution_id: &str,
+        schema_type: &str,
+        slug: Option<&str>,
+        source: &str,
+        yaml_content: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions (
+                contribution_id, slug, schema_type, yaml_content,
+                wire_native_metadata_json, wire_publication_state_json,
+                supersedes_id, superseded_by_id, triggering_note,
+                status, source, wire_contribution_id, created_by, accepted_at
+             ) VALUES (
+                ?1, ?2, ?3, ?4,
+                '{}', '{}',
+                NULL, NULL, 'test fixture',
+                'active', ?5, NULL, 'test', datetime('now')
+             )",
+            rusqlite::params![contribution_id, slug, schema_type, yaml_content, source],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn consolidate_supersedes_old_bundled_with_newest_bundled() {
+        // WS1a scenario: both v1 and v2 of a bundled default sit
+        // active-without-user-refinement. Consolidation must mark v1
+        // as superseded by v2 so `load_active_config_contribution`
+        // no longer sees dual-active rows.
+        let conn = mem_conn();
+        insert_active_row(
+            &conn,
+            "bundled-test_policy-default-v1",
+            "test_policy",
+            None,
+            "bundled",
+            "schema_type: test_policy\nversion: 1\n",
+        );
+        // Sleep 1s to ensure v2 has a later `datetime('now')` than v1.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        insert_active_row(
+            &conn,
+            "bundled-test_policy-default-v2",
+            "test_policy",
+            None,
+            "bundled",
+            "schema_type: test_policy\nversion: 2\n",
+        );
+
+        consolidate_bundled_versions(&conn).unwrap();
+
+        // v1 must be superseded by v2; v2 remains active.
+        let v1_state: (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, superseded_by_id FROM pyramid_config_contributions
+                 WHERE contribution_id = ?1",
+                rusqlite::params!["bundled-test_policy-default-v1"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(v1_state.0, "superseded");
+        assert_eq!(
+            v1_state.1.as_deref(),
+            Some("bundled-test_policy-default-v2")
+        );
+
+        let v2_state: (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, superseded_by_id FROM pyramid_config_contributions
+                 WHERE contribution_id = ?1",
+                rusqlite::params!["bundled-test_policy-default-v2"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(v2_state.0, "active");
+        assert!(v2_state.1.is_none());
+    }
+
+    #[test]
+    fn consolidate_preserves_user_refinement_over_newer_bundled() {
+        // Most important case: a user has refined the policy, their
+        // refinement sits active. Then an app upgrade inserts a new
+        // bundled v2 with a later `created_at`. Without consolidation,
+        // `load_active_config_contribution` would return v2 (newer
+        // timestamp) and silently override the user's choice.
+        //
+        // Consolidation must recognize the non-bundled row as the
+        // winner and mark the bundled row superseded instead.
+        let conn = mem_conn();
+        insert_active_row(
+            &conn,
+            "user-refined-policy-abc",
+            "test_policy",
+            None,
+            "local",
+            "schema_type: test_policy\nuser_choice: true\n",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Bundled v2 arrives later from an app upgrade.
+        insert_active_row(
+            &conn,
+            "bundled-test_policy-default-v2",
+            "test_policy",
+            None,
+            "bundled",
+            "schema_type: test_policy\nversion: 2\n",
+        );
+
+        consolidate_bundled_versions(&conn).unwrap();
+
+        // The user's refinement wins even though the bundled row is
+        // newer by created_at.
+        let user_state: (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, superseded_by_id FROM pyramid_config_contributions
+                 WHERE contribution_id = ?1",
+                rusqlite::params!["user-refined-policy-abc"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(user_state.0, "active");
+        assert!(user_state.1.is_none());
+
+        let v2_state: (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, superseded_by_id FROM pyramid_config_contributions
+                 WHERE contribution_id = ?1",
+                rusqlite::params!["bundled-test_policy-default-v2"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(v2_state.0, "superseded");
+        assert_eq!(v2_state.1.as_deref(), Some("user-refined-policy-abc"));
+    }
+
+    #[test]
+    fn consolidate_is_idempotent_on_already_clean_table() {
+        // Fresh-install scenario: only one active row per pair.
+        // Consolidation must not touch anything.
+        let conn = mem_conn();
+        walk_bundled_contributions_manifest(&conn).unwrap();
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_config_contributions
+                 WHERE status = 'active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        consolidate_bundled_versions(&conn).unwrap();
+        consolidate_bundled_versions(&conn).unwrap();
+
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_config_contributions
+                 WHERE status = 'active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, after, "no-op on a clean table");
+    }
+
+    #[test]
+    fn consolidate_handles_slug_scoped_pairs_independently() {
+        // Regression guard: slug-scoped and slug=NULL rows must be
+        // consolidated as distinct pairs. A duplicate on one slug
+        // shouldn't affect rows on a different slug.
+        let conn = mem_conn();
+        // Two active bundled rows on slug 'pyramid-A' (dup).
+        insert_active_row(
+            &conn,
+            "bundled-viz-A-v1",
+            "pyramid_viz_config",
+            Some("pyramid-A"),
+            "bundled",
+            "schema_type: pyramid_viz_config\n",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        insert_active_row(
+            &conn,
+            "bundled-viz-A-v2",
+            "pyramid_viz_config",
+            Some("pyramid-A"),
+            "bundled",
+            "schema_type: pyramid_viz_config\n",
+        );
+        // Single active row on slug 'pyramid-B' (not dup).
+        insert_active_row(
+            &conn,
+            "bundled-viz-B-v1",
+            "pyramid_viz_config",
+            Some("pyramid-B"),
+            "bundled",
+            "schema_type: pyramid_viz_config\n",
+        );
+
+        consolidate_bundled_versions(&conn).unwrap();
+
+        // A-v1 superseded, A-v2 active.
+        let a_v1_status: String = conn
+            .query_row(
+                "SELECT status FROM pyramid_config_contributions WHERE contribution_id = ?1",
+                rusqlite::params!["bundled-viz-A-v1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(a_v1_status, "superseded");
+
+        // B-v1 untouched — no duplicate on that slug.
+        let b_v1_status: String = conn
+            .query_row(
+                "SELECT status FROM pyramid_config_contributions WHERE contribution_id = ?1",
+                rusqlite::params!["bundled-viz-B-v1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_v1_status, "active");
     }
 
     #[test]

@@ -2537,20 +2537,21 @@ mod tests {
         // without the other, a fresh install would differ from what
         // the Rust path produces when no contribution is present.
         //
-        // We can't read the bundled file here without fs access, so we
-        // inline the expected YAML exactly as the bundled default.
-        let expected_yaml = "schema_type: compute_participation_policy\n\
-mode: hybrid\n\
-allow_fleet_dispatch: true\n\
-allow_fleet_serving: true\n\
-allow_market_dispatch: false\n\
-allow_market_visibility: false\n\
-allow_storage_pulling: false\n\
-allow_storage_hosting: false\n\
-allow_relay_usage: false\n\
-allow_relay_serving: false\n\
-allow_serving_while_degraded: false\n";
-        let parsed: ComputeParticipationPolicy = serde_yaml::from_str(expected_yaml).unwrap();
+        // Parse the actual bundled manifest via `load_bundled_manifest`
+        // so the test catches drift between Rust and JSON without
+        // requiring the inline YAML to be kept in sync by hand.
+        let manifest = crate::pyramid::wire_migration::load_bundled_manifest().unwrap();
+        let bundled_default = manifest
+            .contributions
+            .iter()
+            .find(|e| {
+                e.schema_type == "compute_participation_policy"
+                    && e.contribution_id
+                        .starts_with("bundled-compute_participation_policy-default-")
+            })
+            .expect("bundled manifest must contain a compute_participation_policy default");
+        let parsed: ComputeParticipationPolicy =
+            serde_yaml::from_str(&bundled_default.yaml_content).unwrap();
         assert_eq!(parsed, ComputeParticipationPolicy::default());
     }
 }
