@@ -668,13 +668,19 @@ pub fn validate_callback_url(
             // structural invariants only; the wire_job_token / relay JWT on
             // the callback POST is the actual auth.
             //
-            // Localhost is allowed (private-network test rigs + single-host
-            // dev deployments). If we want to gate localhost specifically,
-            // do it via relay_delivery_policy, not hardcoded here. Accept
-            // both http and https schemes — production Cloudflare tunnels
-            // are https; dev rigs may be plain http.
+            // HTTPS-only per DD-Q part 3 ("if got.0.scheme() != \"https\"").
+            // The three tiers all ride over Cloudflare tunnels at maturity
+            // and the Wire bootstrap endpoint is https. If dev rigs need to
+            // run without TLS later, add an explicit `allow_http_callbacks`
+            // knob on `market_delivery_policy` (per the "no hardcoded policy
+            // decisions" pattern) — do not loosen this check inline.
+            //
+            // Note: `TunnelUrl::parse` already rejects non-http(s) and
+            // empty-host URLs before we get here. The checks below are
+            // defense-in-depth against future paths into `TunnelUrl` that
+            // bypass `parse`.
             let (scheme, host, _port) = got.authority();
-            if scheme != "https" && scheme != "http" {
+            if scheme != "https" {
                 return Err(CallbackValidationError::SchemeNotHttps);
             }
             match host {
@@ -1299,24 +1305,59 @@ mod tests {
     }
 
     #[test]
-    fn validate_callback_url_reserved_kinds_accept_http_for_dev_rigs() {
-        // The MarketStandard/Relay branch accepts both http and https so
-        // single-host dev rigs without TLS can exercise the callback path.
-        // Production gating (if any) lives in relay_delivery_policy, not
-        // hardcoded here.
+    fn validate_callback_url_reserved_kinds_reject_http() {
+        // Per DD-Q part 3: HTTPS-only. `TunnelUrl::parse` may accept http
+        // for other purposes (the peer tunnel path is authority-matched, so
+        // http works there as long as the roster agrees), but the
+        // MarketStandard/Relay callback path is explicitly https-only.
+        // If dev rigs need non-TLS callbacks later, add an explicit
+        // `allow_http_callbacks` contribution field — do not relax the
+        // check inline.
         let roster = FleetRoster::default();
         let r_ms = validate_callback_url(
             "http://localhost:8080/v1/market/result",
             &CallbackKind::MarketStandard,
             &roster,
         );
-        assert!(r_ms.is_ok(), "http must pass for MarketStandard in dev: {:?}", r_ms);
+        assert_eq!(r_ms.unwrap_err(), CallbackValidationError::SchemeNotHttps);
         let r_r = validate_callback_url(
             "http://localhost:8080/v1/relay/result",
             &CallbackKind::Relay,
             &roster,
         );
-        assert!(r_r.is_ok(), "http must pass for Relay in dev: {:?}", r_r);
+        assert_eq!(r_r.unwrap_err(), CallbackValidationError::SchemeNotHttps);
+    }
+
+    #[test]
+    fn callback_kind_str_roundtrips_all_variants() {
+        // The column discriminator strings MUST stay byte-aligned with the
+        // SQL filters in `fleet_outbox_sweep_expired`, `fleet_outbox_retry_
+        // candidates`, `fleet_outbox_startup_recovery`,
+        // `fleet_outbox_count_inflight_excluding`, and
+        // `fleet_outbox_expire_exhausted`, all of which literal-match on
+        // `'Fleet'`. If a variant name changes or the string mapping drifts,
+        // the sweep loop would silently stop picking up rows. This test
+        // fails loudly before that can happen.
+        let f = CallbackKind::Fleet { dispatcher_nid: "nid-x" };
+        assert_eq!(callback_kind_str(&f), "Fleet");
+        assert_eq!(callback_kind_str(&CallbackKind::MarketStandard), "MarketStandard");
+        assert_eq!(callback_kind_str(&CallbackKind::Relay), "Relay");
+
+        assert_eq!(callback_kind_from_str("Fleet"), Some(CallbackKindColumn::Fleet));
+        assert_eq!(
+            callback_kind_from_str("MarketStandard"),
+            Some(CallbackKindColumn::MarketStandard)
+        );
+        assert_eq!(
+            callback_kind_from_str("Relay"),
+            Some(CallbackKindColumn::Relay)
+        );
+
+        // Unknown strings return None rather than panicking — the sweep
+        // call site will log + skip the row rather than crash the sweep.
+        assert_eq!(callback_kind_from_str(""), None);
+        assert_eq!(callback_kind_from_str("fleet"), None); // case-sensitive
+        assert_eq!(callback_kind_from_str("nonsense"), None);
     }
 
     // ── PendingFleetJobs register/peek/remove ───────────────────────────

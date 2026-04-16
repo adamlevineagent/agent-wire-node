@@ -2453,6 +2453,13 @@ pub fn fleet_outbox_lookup(
 /// `(dispatcher_node_id, job_id)`. Used to honor `max_inflight_jobs` as the
 /// actual limit rather than `max − 1` — the freshly inserted row is already
 /// counted by SELECT, so we subtract it here.
+///
+/// Scoped to `callback_kind = 'Fleet'` per architecture §VIII.6 DD-D / DD-Q:
+/// Fleet admission's `max_inflight_jobs` budget is configured by the fleet
+/// delivery policy and must not be eaten by market/relay rows (which have
+/// their own admission budget in `market_delivery_policy`). Without this
+/// filter, a busy compute market could starve fleet dispatches and vice
+/// versa.
 pub fn fleet_outbox_count_inflight_excluding(
     conn: &Connection,
     dispatcher_node_id: &str,
@@ -2461,6 +2468,7 @@ pub fn fleet_outbox_count_inflight_excluding(
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM fleet_result_outbox
          WHERE status IN ('pending','ready')
+           AND callback_kind = 'Fleet'
            AND NOT (dispatcher_node_id = ?1 AND job_id = ?2)",
         rusqlite::params![dispatcher_node_id, job_id],
         |r| r.get(0),
@@ -2613,6 +2621,15 @@ pub fn fleet_outbox_bump_delivery_attempt(
 /// `expires_at` to one second in the past; Predicate A on its next tick
 /// picks up the row and transitions it via the standard CAS path.
 /// Returns number of rows pushed into the past.
+///
+/// Scoped to `callback_kind = 'Fleet'` per architecture §VIII.6 DD-D / DD-Q:
+/// `max_attempts` here comes from the FLEET delivery policy, and Predicate A
+/// downstream (`fleet_outbox_sweep_expired`) only sees Fleet rows. Filtering
+/// here keeps the two sweep halves consistent — otherwise a market row would
+/// get its `expires_at` pushed into the past by this helper but would never
+/// be picked up by the Fleet sweep, leaving it orphaned in the outbox.
+/// Market rows use their own `max_delivery_attempts` from
+/// `market_delivery_policy`, applied by Phase 2+'s market sweep path.
 pub fn fleet_outbox_expire_exhausted(conn: &Connection, max_attempts: u64) -> Result<usize> {
     // SQLite integers are signed 64-bit; `FleetDeliveryPolicy.max_delivery_attempts`
     // is `u64`. Cap at `i64::MAX` before the cast — a policy value above that
@@ -2623,7 +2640,9 @@ pub fn fleet_outbox_expire_exhausted(conn: &Connection, max_attempts: u64) -> Re
     let n = conn.execute(
         "UPDATE fleet_result_outbox
             SET expires_at = datetime('now', '-1 second')
-          WHERE status = 'ready' AND delivery_attempts >= ?1",
+          WHERE status = 'ready'
+            AND callback_kind = 'Fleet'
+            AND delivery_attempts >= ?1",
         rusqlite::params![max_as_i64],
     )?;
     Ok(n)
@@ -19276,6 +19295,100 @@ mod phase17_tests {
         assert!(job_ids.contains(&"exhausted"));
         assert!(!job_ids.contains(&"below"));
         assert!(!job_ids.contains(&"pending"));
+    }
+
+    #[test]
+    fn test_fleet_outbox_expire_exhausted_ignores_market_rows() {
+        // Regression per architecture §VIII.6 DD-D / DD-Q: Fleet's
+        // `max_delivery_attempts` policy must not apply to market/relay
+        // rows — those have their own budget in `market_delivery_policy`.
+        // If this helper ever omitted the `callback_kind = 'Fleet'` guard,
+        // it would push market rows' `expires_at` into the past but Fleet's
+        // Predicate-A sweep (also Fleet-scoped) would never collect them,
+        // orphaning the row.
+        let conn = outbox_conn();
+        let expires = future_expires();
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "fleet-row", "https://x/cb", &expires)
+            .unwrap();
+        // Manually insert a market-kind row by overwriting callback_kind.
+        // Phase 2 WS1+ will wrap this in an official helper.
+        conn.execute(
+            "INSERT INTO fleet_result_outbox
+                (dispatcher_node_id, job_id, callback_url, callback_kind, status, expires_at)
+             VALUES ('wire-platform', 'market-row', 'https://x/cb', 'MarketStandard', 'pending', ?1)",
+            rusqlite::params![&expires],
+        )
+        .unwrap();
+
+        fleet_outbox_promote_ready_if_pending(&conn, "dispA", "fleet-row", "{}", 600).unwrap();
+        // Bump the market row's attempts via a direct UPDATE (bump helper is
+        // PK-scoped, not callback_kind-scoped — that's correct; market's own
+        // worker calls it for its own rows).
+        conn.execute(
+            "UPDATE fleet_result_outbox
+                SET status = 'ready',
+                    delivery_attempts = 5,
+                    ready_at = datetime('now')
+              WHERE job_id = 'market-row'",
+            [],
+        )
+        .unwrap();
+        // And the fleet row too.
+        for _ in 0..5 {
+            fleet_outbox_bump_delivery_attempt(&conn, "dispA", "fleet-row", "err").unwrap();
+        }
+
+        // Both have 5 attempts; expire_exhausted(max=5) must only touch Fleet.
+        let n = fleet_outbox_expire_exhausted(&conn, 5).unwrap();
+        assert_eq!(n, 1, "only the Fleet row should have its expires_at bumped");
+
+        // The market row's expires_at must remain the far-future fixture.
+        let market_expires: String = conn
+            .query_row(
+                "SELECT expires_at FROM fleet_result_outbox WHERE job_id = 'market-row'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(market_expires, expires);
+    }
+
+    #[test]
+    fn test_fleet_outbox_count_inflight_ignores_market_rows() {
+        // Regression per architecture §VIII.6 DD-D / DD-Q: Fleet admission's
+        // `max_inflight_jobs` budget must not be consumed by market/relay
+        // rows — those have their own admission budget in
+        // `market_delivery_policy`. Otherwise a busy compute market could
+        // starve fleet dispatches and vice versa.
+        let conn = outbox_conn();
+        let expires = future_expires();
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "fleet-j1", "https://x/cb", &expires)
+            .unwrap();
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "fleet-j2", "https://x/cb", &expires)
+            .unwrap();
+        // Insert two market rows directly (Phase 2 WS1+ owns the official
+        // insert path; this test pokes the column manually to prove the
+        // count helper filters correctly).
+        conn.execute(
+            "INSERT INTO fleet_result_outbox
+                (dispatcher_node_id, job_id, callback_url, callback_kind, status, expires_at)
+             VALUES
+                ('wire-platform', 'mkt-j1', 'https://x/cb', 'MarketStandard', 'pending', ?1),
+                ('wire-platform', 'mkt-j2', 'https://x/cb', 'Relay',          'ready',   ?1)",
+            rusqlite::params![&expires],
+        )
+        .unwrap();
+
+        // Count from Fleet's perspective excluding 'fleet-j1' — should see
+        // exactly one other Fleet row ('fleet-j2'); the two market rows
+        // must not be counted.
+        let n = fleet_outbox_count_inflight_excluding(&conn, "dispA", "fleet-j1").unwrap();
+        assert_eq!(n, 1);
+
+        // Excluding a key that doesn't exist — still only Fleet rows count.
+        let n =
+            fleet_outbox_count_inflight_excluding(&conn, "dispA", "nonexistent").unwrap();
+        assert_eq!(n, 2);
     }
 
     #[test]
