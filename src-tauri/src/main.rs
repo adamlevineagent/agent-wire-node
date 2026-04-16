@@ -2553,8 +2553,25 @@ async fn start_tunnel_flow(
     }
 
     // Step 2: Provision tunnel (or use persisted token)
+    // Guard: if the persisted tunnel belongs to a different node_id (e.g. two
+    // machines that previously shared an identity), discard and re-provision.
     let ts = if let Some(ref persisted_ts) = persisted {
-        if persisted_ts.tunnel_token.is_some() {
+        let stale = persisted_ts.tunnel_url.as_deref().map_or(false, |url| {
+            // Tunnel URLs are https://node-{nodeId}.agent-wire.com — if the
+            // embedded node_id doesn't match ours, these credentials belong
+            // to a different node and must not be reused.
+            let expected_prefix = format!("https://node-{}.", node_id);
+            !url.starts_with(&expected_prefix)
+        });
+        if stale {
+            tracing::warn!(
+                "Persisted tunnel belongs to a different node (url={:?}, current node={}). Re-provisioning.",
+                persisted_ts.tunnel_url, node_id
+            );
+            // Delete stale tunnel.json so we never pick it up again
+            let _ = std::fs::remove_file(data_dir.join("tunnel.json"));
+            provision_new_tunnel(&tunnel_state, api_url, access_token, node_id).await
+        } else if persisted_ts.tunnel_token.is_some() {
             tracing::info!("Using persisted tunnel credentials");
             let mut ts = tunnel_state.write().await;
             ts.tunnel_id = persisted_ts.tunnel_id.clone();
