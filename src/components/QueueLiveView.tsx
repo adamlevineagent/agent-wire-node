@@ -42,10 +42,17 @@ interface ModelQueueState {
     depth: number;
     isExecuting: boolean;
     currentJobStartedAt: number | null;
-    currentJobSource: string | null; // "local" | "fleet"
+    currentJobSource: string | null; // "local" | "fleet" | "market"
     completedCount: number;
     totalLatencyMs: number;
     fleetJobCount: number;
+    /// Phase 2 WS9: count of completed jobs whose source was "market_received"
+    /// on the backend. Displayed alongside fleetJobCount so operators can
+    /// see the split between same-operator fleet work, paid market work,
+    /// and local builds. Per phase-2-exchange.md §IV ComputeQueueView
+    /// Updates: "Now shows both local and market entries, distinguished
+    /// by the source field on QueueEntry."
+    marketJobCount: number;
     recentJobs: RecentJob[];
 }
 
@@ -95,6 +102,7 @@ function reduceQueueEvent(state: QueueState, event: QueueEvent): QueueState {
             completedCount: 0,
             totalLatencyMs: 0,
             fleetJobCount: 0,
+            marketJobCount: 0,
             recentJobs: [],
         };
     } else {
@@ -114,6 +122,13 @@ function reduceQueueEvent(state: QueueState, event: QueueEvent): QueueState {
             model.currentJobSource = event.source ?? 'local';
             if (event.source === 'fleet') {
                 model.fleetJobCount += 1;
+            }
+            // Phase 2 WS9: market entries tagged with source "market_received"
+            // on the backend QueueEntry.source field. Count them distinctly
+            // from fleet_received so the UI can surface the paid-market vs
+            // same-operator-fleet split.
+            if (event.source === 'market_received' || event.source === 'market') {
+                model.marketJobCount += 1;
             }
             // Depth decreases by 1 when a job is picked up
             model.depth = Math.max(0, model.depth - 1);
@@ -255,10 +270,24 @@ function QueueModelCard({ model }: { model: ModelQueueState }) {
                     {formatModelName(model.modelId)}
                 </div>
                 {model.isExecuting && (
-                    <span className="queue-executing-indicator" title={model.currentJobSource === 'fleet' ? 'Executing (fleet)' : 'Executing'}>
+                    <span
+                        className="queue-executing-indicator"
+                        title={
+                            model.currentJobSource === 'fleet'
+                                ? 'Executing (fleet)'
+                                : model.currentJobSource === 'market_received' ||
+                                  model.currentJobSource === 'market'
+                                    ? 'Executing (market)'
+                                    : 'Executing'
+                        }
+                    >
                         <span className="queue-executing-dot" />
                         {model.currentJobSource === 'fleet' && (
                             <span className="queue-fleet-badge">FLEET</span>
+                        )}
+                        {(model.currentJobSource === 'market_received' ||
+                            model.currentJobSource === 'market') && (
+                            <span className="queue-fleet-badge">MARKET</span>
                         )}
                     </span>
                 )}
@@ -287,6 +316,12 @@ function QueueModelCard({ model }: { model: ModelQueueState }) {
                         <span className="queue-stat-value">{model.fleetJobCount}</span>
                     </div>
                 )}
+                {model.marketJobCount > 0 && (
+                    <div className="queue-stat-row">
+                        <span className="queue-stat-label">Market jobs</span>
+                        <span className="queue-stat-value">{model.marketJobCount}</span>
+                    </div>
+                )}
                 {avgLatency > 0 && (
                     <div className="queue-stat-row">
                         <span className="queue-stat-label">Avg latency</span>
@@ -311,6 +346,9 @@ function QueueModelCard({ model }: { model: ModelQueueState }) {
                                 <span className="queue-recent-latency">{formatLatency(job.latencyMs)}</span>
                                 {job.source === 'fleet' && (
                                     <span className="queue-recent-fleet-badge">F</span>
+                                )}
+                                {(job.source === 'market_received' || job.source === 'market') && (
+                                    <span className="queue-recent-fleet-badge" title="market">M</span>
                                 )}
                             </div>
                         ))}
