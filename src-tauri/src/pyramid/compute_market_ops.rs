@@ -305,11 +305,11 @@ pub async fn create_offer(
             body: serde_json::to_string(&resp).unwrap_or_else(|_| "<unserializable>".to_string()),
         });
     }
-    // UUID-OR-HANDLE-PATH: Wire currently returns canonical UUID v4.
-    // Post-Pillar-14 migration, this will be a handle-path string
-    // `{agent_handle}/{epoch-day}/{seq}`. See `ComputeOffer::wire_offer_id`
-    // for the migration-wide note. No code change needed here — the
-    // string is opaque to us.
+    // UUID-OR-HANDLE-PATH: Wire returns a handle-path
+    // `{operator_handle}/{epoch_day}/{daily_seq}` as of Wire commit
+    // 29109d03 (2026-04-17). Legacy UUID strings may still exist in
+    // stored local state from pre-migration tester installs. Either
+    // format is opaque to us here.
     let offer_id = resp
         .get("offer_id")
         .and_then(|v| v.as_str())
@@ -423,9 +423,10 @@ pub async fn remove_offer(
         };
         // UUID-OR-HANDLE-PATH: `offer_id` is opaque and URL-encoded on
         // the way into the path. Handle-paths contain `/` characters
-        // (e.g. `myhandle/19852/42`) — urlencoding::encode turns them
-        // into `%2F`, so the DELETE request path stays a single path
-        // segment. Wire URL-decodes on receipt. Works for both formats.
+        // (e.g. `sage-raccoon-olive/106/4`) — urlencoding::encode
+        // turns them into `%2F`, so the DELETE path stays a single
+        // segment. Wire URL-decodes on receipt. Verified green on
+        // handle-path cutover smoke 2026-04-17.
         let path = format!("/api/v1/compute/offers/{}", urlencoding::encode(&offer_id));
         // We tolerate 404 (already deleted). Other failures still trigger
         // local cleanup below, then surface the error to the caller.

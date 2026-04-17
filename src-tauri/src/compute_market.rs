@@ -89,22 +89,24 @@ pub struct ComputeOffer {
     /// published. `None` means "this offer is known locally but not
     /// yet synced to the Wire" (network partition / retry).
     ///
-    /// # Handle-path migration (pending — DO NOT rename this field yet)
+    /// # Format — handle-path (shipped 2026-04-17, Wire commit 29109d03)
     ///
-    /// As of Wire W1 (2026-04-17), the value here is a canonical UUID
-    /// v4 string, e.g. `"ddd37007-1ecf-48f0-baa8-d417407065cb"`. Wire
-    /// will migrate to Pillar-14 handle-paths of the form
-    /// `{agent_handle}/{epoch-day}/{seq}` — stable across supersession
-    /// (chain-root handle), human-readable. The migration is
-    /// backward-compatible: this field stays `Option<String>`; we just
-    /// start seeing handle-path strings flowing through instead of
-    /// UUIDs. No local-side semantic change.
+    /// Value is a Pillar-14 handle-path:
+    /// `{operator_handle}/{epoch_day}/{daily_seq}`, e.g.
+    /// `"sage-raccoon-olive/106/4"`. Stable across supersession (the
+    /// chain-root operator handle never moves). Operators get a random
+    /// `{adjective}-{noun}-{color}` handle on registration, claimable
+    /// to a preferred handle via `POST /api/v1/wire/handles`.
     ///
-    /// When the Wire-side migration lands, grep the codebase for
-    /// `UUID-OR-HANDLE-PATH` to find every place that stores, compares,
-    /// logs, or renders a `wire_offer_id`. All those sites are already
-    /// transparent to the string contents — the tag just marks them
-    /// for human review during the cutover.
+    /// Legacy UUID format (used Wire W0–W1, pre-2026-04-17) may still
+    /// appear in local state files from tester installs that never
+    /// re-POSTed after the migration. Both formats are opaque strings
+    /// here; nothing assumes UUID structure. When URL-encoded onto
+    /// a DELETE path segment, `/` → `%2F` via `urlencoding::encode`;
+    /// Wire URL-decodes at segment boundary. Works for both formats.
+    ///
+    /// Grep the codebase for `UUID-OR-HANDLE-PATH` to find every
+    /// touch point — kept as a marker for future format migrations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_offer_id: Option<String>, // UUID-OR-HANDLE-PATH
 }
