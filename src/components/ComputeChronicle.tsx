@@ -1,8 +1,9 @@
 // ComputeChronicle.tsx — Persistent compute observability.
 // Renders event history table, filter bar, stats cards, and fleet analytics.
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -219,6 +220,49 @@ export function ComputeChronicle() {
         fetchEvents();
         fetchSummary();
     }, [fetchEvents, fetchSummary]);
+
+    // ── Live updates ──────────────────────────────────────────────
+    // Chronicle aggregates persisted events written via compute_chronicle::record_event.
+    // The same events also fan out as `cross-build-event` to the frontend.
+    // We don't consume the event payload directly (the table/summary still come from
+    // the DB queries above — dimensions + pagination + time-range filter only work
+    // there); we just use the event as a "something changed, refetch soon" trigger.
+    // Debounce at 750ms so bursty runs (evidence loops firing 10 events in 200ms)
+    // coalesce into a single refetch instead of hammering IPC.
+    const refreshDebounceRef = useRef<number | null>(null);
+    const scheduleRefresh = useCallback(() => {
+        if (refreshDebounceRef.current !== null) {
+            window.clearTimeout(refreshDebounceRef.current);
+        }
+        refreshDebounceRef.current = window.setTimeout(() => {
+            refreshDebounceRef.current = null;
+            fetchEvents();
+            fetchSummary();
+        }, 750);
+    }, [fetchEvents, fetchSummary]);
+
+    useEffect(() => {
+        let active = true;
+        let unlisten: UnlistenFn | null = null;
+        (async () => {
+            try {
+                unlisten = await listen<unknown>('cross-build-event', () => {
+                    if (!active) return;
+                    scheduleRefresh();
+                });
+            } catch (e) {
+                console.warn('ComputeChronicle: listen failed', e);
+            }
+        })();
+        return () => {
+            active = false;
+            if (unlisten) unlisten();
+            if (refreshDebounceRef.current !== null) {
+                window.clearTimeout(refreshDebounceRef.current);
+                refreshDebounceRef.current = null;
+            }
+        };
+    }, [scheduleRefresh]);
 
     // Aggregate stats from summary
     const totalCompleted = summary.reduce((s, r) => s + r.completed_count, 0);

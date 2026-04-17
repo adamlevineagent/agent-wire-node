@@ -939,6 +939,51 @@ pub fn resolve_wire_type(schema_type: &str) -> Result<(WireContributionType, Vec
                 "delivery".to_string(),
             ],
         )),
+        // Global content-type → chain mapping. Active contribution hydrates
+        // `pyramid_chain_defaults` on boot via wire_migration.
+        "chain_defaults" => Ok((
+            WireContributionType::Template,
+            vec![
+                "config".to_string(),
+                "wire-node".to_string(),
+                "chain".to_string(),
+                "chain_defaults".to_string(),
+            ],
+        )),
+        // Per-slug override pointing a specific pyramid at a chain.
+        // Active contributions hydrate `pyramid_chain_assignments` on boot.
+        "chain_assignment" => Ok((
+            WireContributionType::Template,
+            vec![
+                "config".to_string(),
+                "wire-node".to_string(),
+                "chain".to_string(),
+                "chain_assignment".to_string(),
+            ],
+        )),
+        // Pyramid Surface viz engine configuration — grid, chronicle,
+        // toolbar, artifact pane settings. Global or per-slug.
+        "pyramid_viz_config" => Ok((
+            WireContributionType::Template,
+            vec![
+                "config".to_string(),
+                "wire-node".to_string(),
+                "viz".to_string(),
+            ],
+        )),
+        // Post-build reconciliation artifact (orphan count, central nodes,
+        // weight map, gaps). Written by chain_executor, persisted as a
+        // contribution so it's queryable without a dedicated operational
+        // table. Typically internal, but published for cross-node diff /
+        // audit use cases.
+        "reconciliation_result" => Ok((
+            WireContributionType::Template,
+            vec![
+                "config".to_string(),
+                "wire-node".to_string(),
+                "reconciliation".to_string(),
+            ],
+        )),
         other => Err(format!(
             "unknown schema_type {other:?}; cannot resolve to Wire contribution type"
         )),
@@ -1492,6 +1537,10 @@ wire:
             ("wire_update_polling", WireContributionType::Template),
             ("fleet_delivery_policy", WireContributionType::Template),
             ("market_delivery_policy", WireContributionType::Template),
+            ("chain_defaults", WireContributionType::Template),
+            ("chain_assignment", WireContributionType::Template),
+            ("pyramid_viz_config", WireContributionType::Template),
+            ("reconciliation_result", WireContributionType::Template),
         ];
         for (schema_type, expected) in cases {
             let (actual, tags) = resolve_wire_type(schema_type).unwrap();

@@ -12549,8 +12549,13 @@ fn main() {
     // retry machinery attached.
     {
         let ctx_clone = Arc::clone(&fleet_dispatch_ctx);
+        let db_path_for_pending_sweep = Some(pyramid_db_path.to_path_buf());
         tauri::async_runtime::spawn(async move {
-            wire_node_lib::fleet::pending_jobs_sweep_loop(ctx_clone).await;
+            wire_node_lib::fleet::pending_jobs_sweep_loop(
+                ctx_clone,
+                db_path_for_pending_sweep,
+            )
+            .await;
         });
     }
     {

@@ -25,6 +25,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::pyramid::fleet_delivery_policy::FleetDeliveryPolicy;
@@ -956,18 +957,26 @@ pub async fn deliver_fleet_result(
 /// Background task that evicts stale [`PendingFleetJob`] entries whose
 /// dispatcher never received a callback within
 /// `expected_timeout * orphan_sweep_multiplier`. Spawned once at startup
-/// with an `Arc<FleetDispatchContext>`.
+/// with an `Arc<FleetDispatchContext>` plus an optional `db_path` for
+/// chronicle emission.
 ///
 /// Eviction drops the entry's `oneshot::Sender`; the Phase A await that
 /// registered the entry then wakes with `RecvError` and records
 /// `fleet_dispatch_failed` at the call site where `StepContext` is in
-/// scope. This loop itself writes only a `tracing::info!` breadcrumb —
-/// the dispatcher-side chronicle event comes from Phase A, not here.
+/// scope. In addition, when `db_path` is present we write a discrete
+/// `fleet_pending_orphaned` chronicle event here so the observability
+/// layer can distinguish "caller gave up, no callback ever arrived"
+/// (this sweep) from "caller gave up and we also never heard back"
+/// (Phase A timeout). Both events can fire for the same `job_id` —
+/// they describe different observations.
 ///
 /// Never exits under normal operation. Under Tauri async_runtime the
 /// task is cancelled when the app shuts down; there is no per-iteration
 /// shutdown channel because the sweep has no mid-flight state to flush.
-pub async fn pending_jobs_sweep_loop(ctx: Arc<FleetDispatchContext>) {
+pub async fn pending_jobs_sweep_loop(
+    ctx: Arc<FleetDispatchContext>,
+    db_path: Option<PathBuf>,
+) {
     loop {
         let (interval, multiplier) = {
             let p = ctx.policy.read().await;
@@ -983,6 +992,29 @@ pub async fn pending_jobs_sweep_loop(ctx: Arc<FleetDispatchContext>) {
                 %job_id,
                 "fleet_pending_orphaned: dispatcher sweep evicted stale pending entry"
             );
+            // Emit the canonical chronicle event so Fleet Analytics /
+            // Compute Chronicle can surface dispatcher-side orphans.
+            // We open a fresh connection inside spawn_blocking — the
+            // loop itself stays async-clean, and sweep cadence is low
+            // (~seconds) so the open overhead is negligible.
+            if let Some(ref dbp) = db_path {
+                let dbp_clone = dbp.clone();
+                let job_id_clone = job_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(conn) = rusqlite::Connection::open(&dbp_clone) {
+                        let ctx_ev = crate::pyramid::compute_chronicle::ChronicleEventContext::minimal(
+                            &format!("fleet-dispatch:{}", job_id_clone),
+                            crate::pyramid::compute_chronicle::EVENT_FLEET_PENDING_ORPHANED,
+                            crate::pyramid::compute_chronicle::SOURCE_FLEET,
+                        )
+                        .with_metadata(serde_json::json!({
+                            "job_id": job_id_clone,
+                            "reason": "dispatcher_sweep_evicted",
+                        }));
+                        let _ = crate::pyramid::compute_chronicle::record_event(&conn, &ctx_ev);
+                    }
+                });
+            }
         }
     }
 }
