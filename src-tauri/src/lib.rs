@@ -66,6 +66,12 @@ pub struct AppState {
     /// Persistent node identity (handle + token). Loaded before first
     /// registration attempt. None only if data_dir is unavailable.
     pub node_identity: Option<auth::NodeIdentity>,
+    /// Phase 3 requester-side: in-memory map of in-flight market
+    /// dispatches awaiting their push-delivery from Wire's delivery
+    /// worker at `/v1/compute/job-result`. Register at `/fill` time,
+    /// take+fire at inbound-push time. In-memory only; node restart
+    /// loses pending and `pyramid_build` retries the step.
+    pub pending_market_jobs: pyramid::pending_jobs::PendingJobs,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

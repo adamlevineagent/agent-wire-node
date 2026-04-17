@@ -61,6 +61,11 @@ pub struct ServerState {
     /// depth by state). Surfaced via `/pyramid/system/work-stats` for
     /// agent observability.
     pub work_stats: Arc<RwLock<crate::work::WorkStats>>,
+    /// Phase 3 requester-side pending jobs registry — shared between
+    /// the compute_requester client (inserts) and the inbound
+    /// `/v1/compute/job-result` handler (fires + removes). See
+    /// `pyramid::pending_jobs` for semantics.
+    pub pending_market_jobs: crate::pyramid::pending_jobs::PendingJobs,
 }
 
 #[derive(Serialize)]
@@ -440,6 +445,7 @@ pub async fn start_server(
     compute_market_state: Option<Arc<RwLock<crate::compute_market::ComputeMarketState>>>,
     config: Arc<RwLock<crate::WireNodeConfig>>,
     work_stats: Arc<RwLock<crate::work::WorkStats>>,
+    pending_market_jobs: crate::pyramid::pending_jobs::PendingJobs,
 ) {
     let state = ServerState {
         cache_dir,
@@ -458,6 +464,7 @@ pub async fn start_server(
         work_stats,
         compute_market_dispatch,
         compute_market_state,
+        pending_market_jobs,
     };
 
     // Phase 7: Initialize stale engines for auto-update pyramids (background)
@@ -1054,6 +1061,7 @@ pub async fn start_server(
             node_id: state.node_id.clone(),
             compute_market_state: state.compute_market_state.clone(),
             compute_market_dispatch: state.compute_market_dispatch.clone(),
+            pending_market_jobs: state.pending_market_jobs.clone(),
         },
     );
 
@@ -1178,11 +1186,41 @@ pub async fn start_server(
             })
     };
 
+    // POST /v1/compute/job-result — Wire's delivery worker pushes the
+    // result envelope here per contract §2.5. Phase 3 requester-side
+    // consumption point. Sibling of /v1/compute/job-dispatch (Wire →
+    // Provider); this is Wire → Requester.
+    //
+    // Auth: Wire-minted JWT with aud="result-delivery", sub=<uuid_job_id>,
+    // rid=<requester_operator_id>. Verified against the SAME Ed25519
+    // public key used for dispatch JWT (contract §3 — single key, many
+    // audiences).
+    //
+    // Flow: verify JWT → parse envelope → look up PendingJobs entry by
+    // UUID job_id → fire oneshot → remove map entry. Duplicate
+    // delivery after timeout fallback: no map entry found → return
+    // 2xx {"status":"already_settled"} so Wire marks delivery done
+    // and doesn't retry. See handle_compute_job_result for the full
+    // flow.
+    let compute_result_route = {
+        let state = state.clone();
+        warp::path!("v1" / "compute" / "job-result")
+            .and(warp::post())
+            .and(warp::header::<String>("authorization"))
+            .and(warp::body::json())
+            .and_then(move |auth_header: String, body: serde_json::Value| {
+                let state = state.clone();
+                async move {
+                    handle_compute_job_result(auth_header, body, state).await
+                }
+            })
+    };
+
     // Fleet CORS: permissive (peer-to-peer via Cloudflare tunnels).
-    // The compute-market dispatch endpoint shares the same CORS profile as
-    // the fleet routes — both accept inbound traffic from Cloudflare tunnel
-    // origins (the Wire for market, peer nodes for fleet) and auth via
-    // Authorization: Bearer.
+    // The compute-market dispatch + result endpoints share the same
+    // CORS profile as the fleet routes — both accept inbound traffic
+    // from Cloudflare tunnel origins (the Wire for market, peer nodes
+    // for fleet) and auth via Authorization: Bearer.
     let fleet_cors = warp::cors()
         .allow_any_origin()
         .allow_methods(vec!["POST", "OPTIONS"])
@@ -1191,6 +1229,7 @@ pub async fn start_server(
         .or(fleet_announce_route)
         .or(fleet_result_route)
         .or(compute_dispatch_route)
+        .or(compute_result_route)
         .with(fleet_cors);
 
     let routes = preflight
@@ -2455,6 +2494,203 @@ fn spawn_fleet_worker(
 ///
 /// See `docs/plans/compute-market-phase-2-exchange.md` §III for the
 /// full spec.
+/// Handler for `POST /v1/compute/job-result` — Wire → Requester push
+/// from the delivery worker. Contract §2.5. Phase 3 requester-side
+/// consumption point.
+///
+/// Auth: JWT with `aud="result-delivery"`, `sub=<uuid_job_id>`,
+/// `rid=<requester_operator_id>`. Rejected 401 on any mismatch.
+///
+/// Envelope: §2.3 success/failure tagged shape, forwarded verbatim
+/// from the provider → Wire callback path.
+///
+/// Flow:
+///   1. Minimal body parse to extract `job_id` (UUID string).
+///   2. Verify JWT binds to this job_id + this operator.
+///   3. Full body parse into the tagged envelope.
+///   4. `pending_jobs.take(job_id)` — if present, fire oneshot; if
+///      absent, respond 2xx `already_settled` (duplicate or late
+///      arrival after timeout fallback).
+///   5. 2xx response.
+///
+/// Idempotency (contract §2.5): Wire may retry on 5xx or network
+/// timeout; node returns 2xx `already_settled` for repeats so Wire
+/// marks delivery complete and stops retrying.
+async fn handle_compute_job_result(
+    auth_header: String,
+    body: serde_json::Value,
+    state: ServerState,
+) -> Result<Box<dyn warp::Reply>, warp::Rejection> {
+    // ── Step 1: minimal body parse for the job_id we need for JWT bind check.
+    //
+    // We extract `job_id` first (instead of full-parsing the envelope)
+    // because `verify_result_delivery_token` needs it to enforce the
+    // `sub`-binding check. Full body validation happens after auth
+    // passes — keeps the 401 path cheap and avoids leaking body-shape
+    // diagnostics on auth failures.
+    let job_id = match body.get("job_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({
+                    "error": "missing_job_id",
+                    "detail": "job_id is required in result envelope body",
+                })),
+                warp::http::StatusCode::BAD_REQUEST,
+            )));
+        }
+    };
+
+    // ── Step 2: verify the Wire-minted result-delivery JWT.
+    //
+    // The verifier binds three things: `aud=result-delivery`,
+    // `sub=<body.job_id>`, `rid=<self.operator_id>`. Any mismatch is a
+    // 401 — specific variant is logged but not surfaced.
+    let jwt_pk = state.jwt_public_key.read().await.clone();
+    let self_operator_id = state.auth.read().await.user_id.clone().unwrap_or_default();
+    if self_operator_id.is_empty() {
+        tracing::warn!(
+            "compute_job_result: local operator_id empty (not authenticated); cannot verify JWT"
+        );
+        return Ok(Box::new(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({
+                "error": "operator_not_registered",
+            })),
+            warp::http::StatusCode::UNAUTHORIZED,
+        )));
+    }
+    if let Err(e) = crate::pyramid::result_delivery_identity::verify_result_delivery_token(
+        &auth_header,
+        &jwt_pk,
+        &self_operator_id,
+        &job_id,
+    ) {
+        tracing::warn!(
+            error = %e,
+            job_id = %job_id,
+            "compute_job_result: JWT verification failed"
+        );
+        return Ok(Box::new(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({
+                "error": "unauthorized",
+            })),
+            warp::http::StatusCode::UNAUTHORIZED,
+        )));
+    }
+
+    // ── Step 3: full envelope parse. The `type` discriminator picks
+    //    success vs failure; any other shape is a 400. Tolerant to
+    //    Wire adding observability fields via a top-level extensions
+    //    bag (contract §10.1).
+    let envelope_type = body.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let payload = match envelope_type {
+        "success" => {
+            let result = match body.get("result") {
+                Some(r) => r,
+                None => {
+                    return Ok(Box::new(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({
+                            "error": "invalid_envelope",
+                            "detail": "success envelope missing `result` object",
+                        })),
+                        warp::http::StatusCode::BAD_REQUEST,
+                    )));
+                }
+            };
+            crate::pyramid::pending_jobs::DeliveryPayload::Success {
+                content: result
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                input_tokens: result
+                    .get("input_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0),
+                output_tokens: result
+                    .get("output_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0),
+                model_used: result
+                    .get("model_used")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                latency_ms: result.get("latency_ms").and_then(|v| v.as_i64()).unwrap_or(0),
+                finish_reason: result
+                    .get("finish_reason")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+            }
+        }
+        "failure" => {
+            let err = body.get("error").cloned().unwrap_or(serde_json::json!({}));
+            crate::pyramid::pending_jobs::DeliveryPayload::Failure {
+                code: err
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                message: err
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            }
+        }
+        other => {
+            return Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({
+                    "error": "invalid_envelope_type",
+                    "detail": format!("expected \"success\" or \"failure\", got \"{}\"", other),
+                })),
+                warp::http::StatusCode::BAD_REQUEST,
+            )));
+        }
+    };
+
+    // ── Step 4: rendezvous with the awaiting dispatcher.
+    //
+    // `take` both returns and removes the entry — if the awaiter has
+    // already timed out and cleaned up its own entry, we find nothing
+    // and respond `already_settled` so Wire tombstones the delivery
+    // and stops retrying (idempotency per contract §2.5).
+    match state.pending_market_jobs.take(&job_id).await {
+        Some(sender) => {
+            // Sender may be dropped if the awaiting receiver has been
+            // dropped (e.g. the inference call was cancelled). `send`
+            // returning Err is a no-op for our purposes — we still
+            // respond 2xx to Wire and tombstone the delivery.
+            let _ = sender.send(payload);
+            Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({
+                    "status": "ok",
+                    "job_id": job_id,
+                })),
+                warp::http::StatusCode::OK,
+            )))
+        }
+        None => {
+            // Late delivery after timeout fallback, OR a duplicate
+            // push Wire is retrying. Both are expected in steady state.
+            // Chronicle event fires elsewhere via compute_requester's
+            // EVENT_COMPUTE_MARKET_DELIVERY_LATE_ARRIVAL emission in
+            // 3f; keep this handler minimal.
+            tracing::info!(
+                job_id = %job_id,
+                "compute_job_result: late or duplicate delivery; responding already_settled"
+            );
+            Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({
+                    "status": "already_settled",
+                    "job_id": job_id,
+                })),
+                warp::http::StatusCode::OK,
+            )))
+        }
+    }
+}
+
 async fn handle_market_dispatch(
     auth_header: String,
     body: serde_json::Value,

@@ -1776,6 +1776,55 @@ pub struct ComputeParticipationPolicy {
     // Always-explicit. Defaults to false on any path that omits it.
     #[serde(default)]
     pub allow_serving_while_degraded: bool,
+
+    // ── Phase 3 requester-side knobs ────────────────────────────────
+    //
+    // These gate the "should this inference call go to the compute
+    // market?" decision in `call_model_unified`. They are NOT
+    // projectable from `mode` — operational tuning, not intent.
+    //
+    // All three default via `serde(default)` so legacy YAMLs without
+    // them continue to deserialize cleanly. Getter fallbacks live in
+    // `effective_booleans` via a parallel struct access pattern (see
+    // MarketDispatchKnobs below).
+
+    /// Max acceptable `queue_position` value returned by Wire's
+    /// `/match` endpoint before the node decides the market isn't
+    /// worth waiting for and falls back to local inference.
+    ///
+    /// 10 is the shipped default — tuned for tester networks where
+    /// depth >10 suggests the market is saturated and local will be
+    /// faster. Raise if the requester is willing to wait for a cheap
+    /// quote. 0 disables the gate (accept any queue position).
+    #[serde(default = "default_market_dispatch_threshold_queue_depth")]
+    pub market_dispatch_threshold_queue_depth: u32,
+
+    /// Wall-clock budget for a single market dispatch end-to-end
+    /// (match + fill + await-push + fallback-poll-on-timeout). On
+    /// timeout, the node falls back to local inference.
+    ///
+    /// 60000ms = 60s is sensible for interactive builds. Batch-style
+    /// pyramid L0 fan-outs may raise this to 600000ms (10 min) to
+    /// tolerate longer provider inference windows.
+    #[serde(default = "default_market_dispatch_max_wait_ms")]
+    pub market_dispatch_max_wait_ms: u64,
+
+    /// When true, try market first for every eligible call. When
+    /// false (default), try market only when local would be
+    /// serialized (the existing `compute_queue` indicates a local
+    /// queue) — a "market for overflow" posture.
+    ///
+    /// Testers opt into eager mode explicitly; the default is
+    /// conservative.
+    #[serde(default)]
+    pub market_dispatch_eager: bool,
+}
+
+fn default_market_dispatch_threshold_queue_depth() -> u32 {
+    10
+}
+fn default_market_dispatch_max_wait_ms() -> u64 {
+    60_000
 }
 
 /// Resolved booleans after applying mode projection + explicit overrides.
@@ -1793,6 +1842,13 @@ pub struct EffectiveParticipationPolicy {
     pub allow_relay_usage: bool,
     pub allow_relay_serving: bool,
     pub allow_serving_while_degraded: bool,
+
+    // Phase 3 operational knobs — passed through unchanged from the
+    // raw policy (no projection). See `ComputeParticipationPolicy`
+    // for per-field semantics.
+    pub market_dispatch_threshold_queue_depth: u32,
+    pub market_dispatch_max_wait_ms: u64,
+    pub market_dispatch_eager: bool,
 }
 
 /// Per DD-I: compute the 8 projectable booleans implied by a mode preset.
@@ -1852,6 +1908,9 @@ impl ComputeParticipationPolicy {
             allow_relay_usage: self.allow_relay_usage.unwrap_or(ru),
             allow_relay_serving: self.allow_relay_serving.unwrap_or(rs),
             allow_serving_while_degraded: self.allow_serving_while_degraded,
+            market_dispatch_threshold_queue_depth: self.market_dispatch_threshold_queue_depth,
+            market_dispatch_max_wait_ms: self.market_dispatch_max_wait_ms,
+            market_dispatch_eager: self.market_dispatch_eager,
         }
     }
 }
@@ -1888,6 +1947,11 @@ impl Default for ComputeParticipationPolicy {
             allow_relay_serving: Some(false),
             // Operational safety: off by default.
             allow_serving_while_degraded: false,
+            // Phase 3 knobs — conservative defaults matching the
+            // "market is opt-in overflow" stance.
+            market_dispatch_threshold_queue_depth: default_market_dispatch_threshold_queue_depth(),
+            market_dispatch_max_wait_ms: default_market_dispatch_max_wait_ms(),
+            market_dispatch_eager: false,
         }
     }
 }
@@ -2447,6 +2511,9 @@ mod tests {
             allow_relay_usage: None,
             allow_relay_serving: None,
             allow_serving_while_degraded: false,
+            market_dispatch_threshold_queue_depth: 10,
+            market_dispatch_max_wait_ms: 60_000,
+            market_dispatch_eager: false,
         };
         let eff = p.effective_booleans();
         assert!(eff.allow_fleet_dispatch, "explicit true must win over worker projection");
@@ -2477,6 +2544,9 @@ mod tests {
                 allow_relay_usage: None,
                 allow_relay_serving: None,
                 allow_serving_while_degraded: false,
+                market_dispatch_threshold_queue_depth: 10,
+                market_dispatch_max_wait_ms: 60_000,
+                market_dispatch_eager: false,
             };
             let eff = p.effective_booleans();
             let (fd, fs, md, mv, sp, sh, ru, rs) = project_mode(mode);
@@ -2510,6 +2580,9 @@ mod tests {
             allow_relay_usage: None,
             allow_relay_serving: None,
             allow_serving_while_degraded: true,
+            market_dispatch_threshold_queue_depth: 10,
+            market_dispatch_max_wait_ms: 60_000,
+            market_dispatch_eager: false,
         };
         let yaml = serde_yaml::to_string(&p).unwrap();
         // None fields are absent — no stray `null` or `~`.

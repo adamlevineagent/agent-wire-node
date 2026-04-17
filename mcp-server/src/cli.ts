@@ -1712,6 +1712,72 @@ async function run(): Promise<void> {
       break;
     }
 
+    case "compute-market-call": {
+      // Phase 3 smoke entry point: "ask the market to run this
+      // inference, give me the content." Blocks on the full round-trip
+      // (match → fill → push delivery) up to --max-wait-ms.
+      //
+      // Required args: model_id (positional). At minimum one of
+      // --prompt or --messages (JSON).
+      //
+      // If --requester-callback-url is omitted, the node builds it
+      // from its own tunnel URL per contract §2.5. That path requires
+      // a live Cloudflare tunnel; if the tunnel is dropped the node
+      // returns 503 with a clear message.
+      const modelId = requireArg(1, "model_id");
+      const body: Record<string, unknown> = { model_id: modelId };
+      if (flags.prompt !== undefined) body.prompt = flags.prompt;
+      if (flags.messages !== undefined) {
+        try {
+          body.messages = JSON.parse(flags.messages);
+        } catch (e) {
+          process.stderr.write(`Error: --messages must be valid JSON: ${e}\n`);
+          process.exit(1);
+        }
+      }
+      if (body.prompt === undefined && body.messages === undefined) {
+        process.stderr.write(
+          `Error: at least one of --prompt or --messages is required\n`,
+        );
+        process.exit(1);
+      }
+      for (const key of [
+        "max_budget",
+        "input_tokens",
+        "max_tokens",
+        "max_wait_ms",
+      ]) {
+        const cli = key.replace(/_/g, "-");
+        if (flags[cli] !== undefined) {
+          const n = Number(flags[cli]);
+          if (!Number.isFinite(n)) {
+            process.stderr.write(`Error: --${cli} must be a number\n`);
+            process.exit(1);
+          }
+          body[key] = n;
+        }
+      }
+      if (flags.temperature !== undefined) {
+        const t = Number(flags.temperature);
+        if (!Number.isFinite(t)) {
+          process.stderr.write(`Error: --temperature must be a number\n`);
+          process.exit(1);
+        }
+        body.temperature = t;
+      }
+      if (flags["latency-preference"] !== undefined) {
+        body.latency_preference = flags["latency-preference"];
+      }
+      if (flags["privacy-tier"] !== undefined) {
+        body.privacy_tier = flags["privacy-tier"];
+      }
+      if (flags["requester-callback-url"] !== undefined) {
+        body.requester_callback_url = flags["requester-callback-url"];
+      }
+      output(await pf(`/pyramid/compute/market-call`, { method: "POST", body }));
+      break;
+    }
+
     case "compute-policy-get": {
       output(await pf(`/pyramid/compute/policy`));
       break;
@@ -2046,6 +2112,8 @@ Compute Market:
   compute-market-enable                 Turn serving on
   compute-market-disable                Turn serving off
   compute-market-state                  Full in-memory ComputeMarketState snapshot
+  compute-market-call <model> --prompt "..." [--max-budget N] [--max-tokens N] [--max-wait-ms N]
+                                        Phase 3 smoke: dispatch one inference via the market
   compute-policy-get                    Read compute_participation_policy
   compute-policy-set [flags]            Set participation policy (see flags)
 

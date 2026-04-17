@@ -25,7 +25,9 @@
 use crate::compute_market::ComputeMarketState;
 use crate::http_utils::{json_error, json_ok};
 use crate::pyramid::compute_market_ops;
+use crate::pyramid::compute_requester::{self, LatencyPreference, MarketInferenceRequest};
 use crate::pyramid::market_dispatch::MarketDispatchContext;
+use crate::pyramid::pending_jobs::PendingJobs;
 use crate::pyramid::PyramidState;
 use crate::work::WorkStats;
 use crate::WireNodeConfig;
@@ -61,6 +63,11 @@ pub struct OperatorContext {
     /// touch these gate on 503 when absent.
     pub compute_market_state: Option<Arc<RwLock<ComputeMarketState>>>,
     pub compute_market_dispatch: Option<Arc<MarketDispatchContext>>,
+    /// Phase 3 requester-side PendingJobs registry, shared with the
+    /// `/v1/compute/job-result` inbound handler in `server.rs`.
+    /// Operator-facing smoke/test routes (compute-market-call) register
+    /// and await entries here.
+    pub pending_market_jobs: PendingJobs,
 }
 
 fn market_state_or_503(
@@ -392,6 +399,27 @@ pub fn operator_routes(
         .and(with_auth_state(ctx.pyramid.clone()))
         .and_then(|_slug: String, pyramid| handle_providers_list(pyramid)));
 
+    // POST /pyramid/compute/market-call — Phase 3 smoke entry point.
+    //
+    // One-shot "ask the market to run this inference." Blocks on the
+    // push-delivery round-trip and returns the content to the caller.
+    // This is the primitive call_model_unified will later delegate to
+    // for its market-dispatch branch; exposing it directly here gives
+    // us a CLI-level smoke surface without plumbing through the full
+    // LLM pipeline.
+    //
+    // LOCAL-ONLY auth (operator Bearer). Unauthorized callers can't
+    // drain the operator's balance.
+    let compute_market_call = route!(prefix
+        .and(warp::path("compute"))
+        .and(warp::path("market-call"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(ctx.pyramid.clone()))
+        .and(warp::body::json::<MarketCallBody>())
+        .and(with_ctx!())
+        .and_then(|_pyramid, body, ctx| handle_compute_market_call(body, ctx)));
+
     // ── Compose ─────────────────────────────────────────────────────────
     //
     // Warp's `.or().or()` chaining builds `Either` types that expand in
@@ -400,7 +428,13 @@ pub fn operator_routes(
     // same concrete `BoxedFilter<(Response,)>` so the chain type is
     // shallow. This mirrors the pattern in `pyramid_routes`.
 
-    compute_offers_create
+    // Batched `.or().unify().boxed()` chains to cap the warp type-
+    // explosion. Each `.or().unify()` link adds a nested Either in
+    // the filter's output type; the compiler blows the Unpin-check
+    // recursion at ~20 links without intermediate `.boxed()` resets.
+    // Batch into logical groups of ~5 routes, box the group result,
+    // then flatten across groups.
+    let compute_offers_group = compute_offers_create
         .or(compute_offers_update)
         .unify()
         .or(compute_offers_delete)
@@ -409,8 +443,9 @@ pub fn operator_routes(
         .unify()
         .or(compute_market_surface)
         .unify()
-        .or(compute_market_enable)
-        .unify()
+        .boxed();
+
+    let compute_market_group = compute_market_enable
         .or(compute_market_disable)
         .unify()
         .or(compute_market_state_route)
@@ -419,8 +454,11 @@ pub fn operator_routes(
         .unify()
         .or(compute_policy_set)
         .unify()
-        .or(system_health)
+        .or(compute_market_call)
         .unify()
+        .boxed();
+
+    let system_group_a = system_health
         .or(system_credits)
         .unify()
         .or(system_work_stats)
@@ -431,16 +469,18 @@ pub fn operator_routes(
         .unify()
         .or(system_auth)
         .unify()
-        .or(system_compute_events)
-        .unify()
+        .boxed();
+
+    let system_group_b = system_compute_events
         .or(system_compute_summary)
         .unify()
         .or(system_compute_timeline)
         .unify()
         .or(system_compute_dimensions)
         .unify()
-        .or(local_mode_status)
-        .unify()
+        .boxed();
+
+    let local_mode_group = local_mode_status
         .or(local_mode_enable)
         .unify()
         .or(local_mode_disable)
@@ -448,6 +488,17 @@ pub fn operator_routes(
         .or(local_mode_switch)
         .unify()
         .or(providers_list)
+        .unify()
+        .boxed();
+
+    compute_offers_group
+        .or(compute_market_group)
+        .unify()
+        .or(system_group_a)
+        .unify()
+        .or(system_group_b)
+        .unify()
+        .or(local_mode_group)
         .unify()
         .boxed()
 }
@@ -1163,4 +1214,181 @@ async fn handle_providers_list(
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let providers = pyramid.provider_registry.list_providers();
     Ok(json_ok(&serde_json::json!({ "providers": providers })))
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// compute-market-call — one-shot smoke entry point
+// ════════════════════════════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+struct MarketCallBody {
+    model_id: String,
+    /// Convenience: plain prompt text. Node constructs a single
+    /// ChatML `[{"role": "user", "content": prompt}]` from it. For
+    /// structured message arrays, use `messages` instead.
+    #[serde(default)]
+    prompt: Option<String>,
+    /// Full ChatML message array. Takes precedence over `prompt` when
+    /// both are present.
+    #[serde(default)]
+    messages: Option<serde_json::Value>,
+    #[serde(default = "default_max_budget")]
+    max_budget: i64,
+    #[serde(default = "default_input_tokens")]
+    input_tokens: i64,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+    #[serde(default = "default_temperature")]
+    temperature: f32,
+    #[serde(default = "default_latency_preference")]
+    latency_preference: String,
+    #[serde(default = "default_privacy_tier")]
+    privacy_tier: String,
+    /// Override the default `requester_callback_url`. Useful for
+    /// testing; the default is built from the node's tunnel URL.
+    #[serde(default)]
+    requester_callback_url: Option<String>,
+    /// Max wall-clock wait in milliseconds. Defaults to 60s.
+    #[serde(default = "default_max_wait_ms")]
+    max_wait_ms: u64,
+}
+
+fn default_max_budget() -> i64 {
+    10_000
+}
+fn default_input_tokens() -> i64 {
+    // Best-effort default. Callers doing anything real should pre-count.
+    256
+}
+fn default_max_tokens() -> usize {
+    512
+}
+fn default_temperature() -> f32 {
+    0.7
+}
+fn default_latency_preference() -> String {
+    "best_price".to_string()
+}
+fn default_privacy_tier() -> String {
+    "bootstrap-relay".to_string()
+}
+fn default_max_wait_ms() -> u64 {
+    60_000
+}
+
+async fn handle_compute_market_call(
+    body: MarketCallBody,
+    ctx: OperatorContext,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Build messages from either `prompt` (convenience) or `messages`
+    // (explicit). At least one must be supplied.
+    let messages = match (body.messages.as_ref(), body.prompt.as_ref()) {
+        (Some(m), _) => m.clone(),
+        (None, Some(p)) => serde_json::json!([{"role": "user", "content": p}]),
+        (None, None) => {
+            return Ok(json_error(
+                warp::http::StatusCode::BAD_REQUEST,
+                "either `messages` or `prompt` is required",
+            ));
+        }
+    };
+
+    // Resolve requester_callback_url. Prefer the body override (tester
+    // can point it at a specific URL); fall back to
+    // `<tunnel_url>/v1/compute/job-result` per contract §2.5.
+    let callback_url = match body.requester_callback_url {
+        Some(s) => s,
+        None => {
+            let tunnel = ctx.tunnel_state.read().await;
+            let base = match tunnel.tunnel_url.as_ref() {
+                Some(u) => u.as_str().to_string(),
+                None => {
+                    drop(tunnel);
+                    return Ok(json_error(
+                        warp::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "node tunnel URL unavailable — can't construct requester_callback_url",
+                    ));
+                }
+            };
+            drop(tunnel);
+            // Strip trailing slash if any, then append the canonical path.
+            let base_trimmed = base.trim_end_matches('/');
+            format!("{}/v1/compute/job-result", base_trimmed)
+        }
+    };
+
+    let latency = match body.latency_preference.as_str() {
+        "best_price" => LatencyPreference::BestPrice,
+        "balanced" => LatencyPreference::Balanced,
+        "lowest_latency" => LatencyPreference::LowestLatency,
+        other => {
+            return Ok(json_error(
+                warp::http::StatusCode::BAD_REQUEST,
+                &format!(
+                    "invalid latency_preference '{}' (want best_price|balanced|lowest_latency)",
+                    other
+                ),
+            ));
+        }
+    };
+
+    let req = MarketInferenceRequest {
+        model_id: body.model_id,
+        max_budget: body.max_budget,
+        input_tokens: body.input_tokens,
+        latency_preference: latency,
+        messages,
+        max_tokens: body.max_tokens,
+        temperature: body.temperature,
+        privacy_tier: body.privacy_tier,
+        requester_callback_url: callback_url,
+    };
+
+    match compute_requester::call_market(
+        req,
+        &ctx.auth,
+        &ctx.config,
+        &ctx.pending_market_jobs,
+        body.max_wait_ms,
+    )
+    .await
+    {
+        Ok(result) => Ok(json_ok(&serde_json::json!({
+            "content": result.content,
+            "input_tokens": result.input_tokens,
+            "output_tokens": result.output_tokens,
+            "model_used": result.model_used,
+            "latency_ms": result.latency_ms,
+            "finish_reason": result.finish_reason,
+        }))),
+        Err(e) => {
+            let status = match &e {
+                compute_requester::RequesterError::AuthFailed(_) => {
+                    warp::http::StatusCode::UNAUTHORIZED
+                }
+                compute_requester::RequesterError::InsufficientBalance { .. } => {
+                    warp::http::StatusCode::PAYMENT_REQUIRED
+                }
+                compute_requester::RequesterError::NoMatch { .. }
+                | compute_requester::RequesterError::DeliveryTombstoned { .. } => {
+                    warp::http::StatusCode::SERVICE_UNAVAILABLE
+                }
+                compute_requester::RequesterError::DeliveryTimedOut { .. } => {
+                    warp::http::StatusCode::GATEWAY_TIMEOUT
+                }
+                compute_requester::RequesterError::ProviderFailed { .. } => {
+                    warp::http::StatusCode::BAD_GATEWAY
+                }
+                compute_requester::RequesterError::MatchFailed { .. }
+                | compute_requester::RequesterError::FillFailed { .. }
+                | compute_requester::RequesterError::FillRejected { .. } => {
+                    warp::http::StatusCode::BAD_GATEWAY
+                }
+                compute_requester::RequesterError::Internal(_) => {
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR
+                }
+            };
+            Ok(json_error(status, &e.to_string()))
+        }
+    }
 }

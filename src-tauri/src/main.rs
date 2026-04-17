@@ -12689,6 +12689,11 @@ fn main() {
         compute_market_state: compute_market_state_shared.clone(),
         compute_market_dispatch: compute_market_dispatch_shared.clone(),
         node_identity: Some(node_identity.clone()),
+        // Phase 3 requester-side: fresh empty pending-jobs map at
+        // boot. In-memory only; node restart loses any in-flight
+        // dispatches by design. See pyramid::pending_jobs for the
+        // semantics rationale.
+        pending_market_jobs: wire_node_lib::pyramid::pending_jobs::PendingJobs::new(),
     });
 
     // ── Phase 2 WS6: queue mirror push task + market outbox sweep ──
@@ -12965,6 +12970,7 @@ fn main() {
                     compute_market_state,
                     server_state.config.clone(),
                     server_state.work_stats.clone(),
+                    server_state.pending_market_jobs.clone(),
                 ).await;
             });
 
