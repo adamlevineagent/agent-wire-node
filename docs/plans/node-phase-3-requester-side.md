@@ -26,7 +26,24 @@ From the node's perspective, each inference call that would normally go to `call
 
 Step 3 is a polling loop because the node is the REQUESTER, not the callback target — **Wire hosts the callback, not the requester node**. The provider POSTs its result to Wire's `/api/v1/compute/callback/:job_id`; Wire stores it in `wire_compute_result_transit`; the requester polls Wire for it.
 
-**This is important:** node-side Phase 3 adds ZERO new inbound HTTP routes. The only new HTTP surface is client-side (node hitting Wire). The provider-side dispatch handler from Phase 2 is unchanged.
+**This is important:** in polling-only mode, node-side Phase 3 adds ZERO new inbound HTTP routes. The only new HTTP surface is client-side (node hitting Wire). The provider-side dispatch handler from Phase 2 is unchanged.
+
+### 1.2 Polling vs push — two delivery modes
+
+Wire's W4 adds a delivery worker that also supports **push-to-requester-callback**: when the node calls `/fill`, it may optionally supply a `requester_callback_url`, and Wire's delivery worker pushes the result envelope there as soon as the provider's result arrives.
+
+Tradeoffs:
+
+| Mode | Latency | Node-side complexity | Fallback |
+|---|---|---|---|
+| **Poll** | ~500ms–8s (backoff plateau) per call | Zero new inbound routes | N/A — this IS the primitive |
+| **Push** | Near-zero (P99 bounded by Wire's delivery worker tick) | One new inbound route + auth + wake-waiter plumbing | Degrades to poll automatically when unreachable |
+
+**Sequencing plan:**
+- **Phase 3 ships polling-only.** Simpler, zero new inbound routes, validates end-to-end behavior first.
+- **Phase 3.5 adds push mode** as a post-ship perf optimization. A pyramid build with 200 concurrent L0 calls wants push badly (polling each is ~200× the wire chatter of push); but Phase 3 can prove the protocol works on poll alone. Push arrives when the baseline is solid.
+
+Phase 3 `MarketInferenceRequest` MAY include a reserved `requester_callback_url: Option<String>` field set to `None` in Phase 3, so the Phase 3.5 upgrade is a drop-in.
 
 ---
 
@@ -314,9 +331,13 @@ Per Wire's latest message — W3 rough shape:
 
 And crucially for me: a `GET /api/v1/compute/jobs/:job_id` poll endpoint on Wire — I need this for step 3 of my flow. **If it's not in Wire's W3+W4 scope, I need to raise it before implementation.** Flagging for Wire owner.
 
-### 9.1 Open question for Wire
+### 9.1 Open question for Wire — RESOLVED
 
-> The requester-side poll endpoint `GET /api/v1/compute/jobs/:job_id` returning `{status, result?, error?}` — is this in W3/W4, or a W5 concern? Contract §2.4 references it for polling during transit TTL, but Wire's W3/W4 summary doesn't list it explicitly. If it's not in W3/W4, I'll need it before node Phase 3 can smoke end-to-end.
+> The requester-side poll endpoint `GET /api/v1/compute/jobs/:job_id` returning `{status, result?, error?}` — is this in W3/W4, or a W5 concern?
+
+**Resolved 2026-04-17:** Wire owner confirmed this is W4. Shape per plan rev 6 §W4: `{status, tokens, latency, outcome_kind, delivery_status}`, role-scoped to requester-or-provider operator. No content body — content lives in `wire_compute_result_transit` for the 1h TTL window. W4 also adds a **delivery worker** that can push results to a `requester_callback_url` if the node supplied one at `/fill` time — see §1.2 for the poll-vs-push tradeoff.
+
+Phase 3 implementation gates on **W3 + W4 landing together on dev**. Wire owner will ping when both are available.
 
 ---
 
