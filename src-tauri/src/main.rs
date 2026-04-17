@@ -11429,6 +11429,17 @@ fn main() {
     let shared_auth: Arc<RwLock<auth::AuthState>> = Arc::new(RwLock::new(initial_auth.clone()));
     let shared_tunnel: Arc<RwLock<tunnel::TunnelState>> = Arc::new(RwLock::new(initial_tunnel));
 
+    // Hoist the shared WireNodeConfig and compute-market pending-jobs
+    // map so the Phase B market integration has the same handles the
+    // AppState will expose. Both must be the same Arc / self-Arc'd
+    // handle as AppState's fields — the inbound /v1/compute/job-result
+    // handler looks up in AppState.pending_market_jobs, and the gate
+    // reads AppState.config.api_url for dispatch.
+    let shared_config: Arc<RwLock<WireNodeConfig>> =
+        Arc::new(RwLock::new(config.clone()));
+    let shared_pending_market_jobs: wire_node_lib::pyramid::pending_jobs::PendingJobs =
+        wire_node_lib::pyramid::pending_jobs::PendingJobs::new();
+
     // Shared JWT public key and node ID for the server module.
     // Prefer the key from AuthState (persisted in session.json) over the config default.
     let jwt_public_key = Arc::new(RwLock::new(
@@ -11813,6 +11824,14 @@ fn main() {
                             cfg.compute_queue = Some(compute_queue_handle.clone());
                             cfg.fleet_roster = Some(fleet_roster.clone());
                             cfg.fleet_dispatch = Some(Arc::clone(&fleet_dispatch_ctx));
+                            cfg.compute_market_context = Some(
+                                wire_node_lib::pyramid::compute_market_ctx::ComputeMarketRequesterContext {
+                                    auth: shared_auth.clone(),
+                                    config: shared_config.clone(),
+                                    pending_jobs: shared_pending_market_jobs.clone(),
+                                    tunnel_state: shared_tunnel.clone(),
+                                },
+                            );
                             tracing::info!("Dispatch policy loaded from DB — per-provider pools active, compute queue wired");
                         }
                         Err(e) => {
@@ -11838,6 +11857,16 @@ fn main() {
             }
             if cfg.fleet_dispatch.is_none() {
                 cfg.fleet_dispatch = Some(Arc::clone(&fleet_dispatch_ctx));
+            }
+            if cfg.compute_market_context.is_none() {
+                cfg.compute_market_context = Some(
+                    wire_node_lib::pyramid::compute_market_ctx::ComputeMarketRequesterContext {
+                        auth: shared_auth.clone(),
+                        config: shared_config.clone(),
+                        pending_jobs: shared_pending_market_jobs.clone(),
+                        tunnel_state: shared_tunnel.clone(),
+                    },
+                );
             }
         }
     }
@@ -12680,7 +12709,7 @@ fn main() {
             market::load_market_state(&config.data_dir()).unwrap_or_default(),
         )),
         work_stats: Arc::new(RwLock::new(work::WorkStats::default())),
-        config: Arc::new(RwLock::new(config.clone())),
+        config: shared_config.clone(),
         pyramid: pyramid_state,
         partner: partner_state,
         pyramid_sync_state: pyramid_sync_state,
@@ -12693,7 +12722,7 @@ fn main() {
         // boot. In-memory only; node restart loses any in-flight
         // dispatches by design. See pyramid::pending_jobs for the
         // semantics rationale.
-        pending_market_jobs: wire_node_lib::pyramid::pending_jobs::PendingJobs::new(),
+        pending_market_jobs: shared_pending_market_jobs.clone(),
     });
 
     // ── Phase 2 WS6: queue mirror push task + market outbox sweep ──

@@ -377,10 +377,15 @@ mod tests {
     // ── Helpers for tests ────────────────────────────────────────────
 
     fn hybrid_with_markets_off() -> ComputeParticipationPolicy {
-        // Matches `ComputeParticipationPolicy::default()` — hybrid mode,
-        // fleet on, market off. Kept as a named helper so test intent is
-        // readable.
-        ComputeParticipationPolicy::default()
+        // Hybrid mode, fleet on, market EXPLICITLY off. Used by tests
+        // that want to exercise PrivateFleet visibility semantics.
+        // Post-purpose-lock, the Default has market ON (None → Hybrid
+        // projection), so this helper must explicitly override to Some(false)
+        // to get the "markets off" test scenario.
+        let mut p = ComputeParticipationPolicy::default();
+        p.allow_market_dispatch = Some(false);
+        p.allow_market_visibility = Some(false);
+        p
     }
 
     fn hybrid_with_market_on() -> ComputeParticipationPolicy {

@@ -1916,17 +1916,23 @@ impl ComputeParticipationPolicy {
 }
 
 impl Default for ComputeParticipationPolicy {
-    /// Conservative default: hybrid mode, but with every "serve / host /
-    /// be-visible / dispatch-to-market" capability EXPLICITLY off until
-    /// the operator opts in. Fleet peer participation is on (matches the
-    /// pre-DD-I shipped semantics). This preserves the current behavior
-    /// for operators who don't touch the policy: the node participates
-    /// in the private fleet but doesn't publish compute offers, host
-    /// storage, or relay traffic.
+    /// Default: hybrid mode with compute-market requester and fleet
+    /// participation on for fresh installs. Per the operational purpose
+    /// lock (docs/plans/call-model-unified-market-integration.md §Purpose):
+    /// a GPU-less tester should build a pyramid via the network without
+    /// seeing a market word. That demands compute market dispatch be
+    /// on-by-default for fresh installs — the cooperative network is
+    /// the point, not an opt-in.
     ///
-    /// Operators who want the full hybrid preset values can choose it
-    /// explicitly in Settings; the mode projection computes the expected
-    /// preset values.
+    /// Persisted explicit policies always win via `effective_booleans`'s
+    /// `.unwrap_or(projection)` — existing operators with a persisted
+    /// contribution aren't affected by changes here.
+    ///
+    /// Design: the four requester/visibility/storage/relay capabilities
+    /// that follow the mode projection use `None` so the Hybrid/Worker/
+    /// Coordinator projection applies naturally. Operators who pick
+    /// Worker mode later in Settings get worker semantics without re-
+    /// persisting every toggle.
     fn default() -> Self {
         Self {
             schema_type: "compute_participation_policy".to_string(),
@@ -1934,9 +1940,11 @@ impl Default for ComputeParticipationPolicy {
             // Fleet: participate (matches shipped default).
             allow_fleet_dispatch: Some(true),
             allow_fleet_serving: Some(true),
-            // Compute market: off by default (matches shipped default).
-            allow_market_dispatch: Some(false),
-            allow_market_visibility: Some(false),
+            // Compute market: follow mode projection (Hybrid → true).
+            // Fresh installs get cooperative-network-on; persisted explicit
+            // `Some(false)` still wins via unwrap_or in effective_booleans.
+            allow_market_dispatch: None,
+            allow_market_visibility: None,
             // Storage market: off by default — S1 hasn't shipped, but
             // when it does, operators opt in explicitly.
             allow_storage_pulling: Some(false),
@@ -1947,11 +1955,13 @@ impl Default for ComputeParticipationPolicy {
             allow_relay_serving: Some(false),
             // Operational safety: off by default.
             allow_serving_while_degraded: false,
-            // Phase 3 knobs — conservative defaults matching the
-            // "market is opt-in overflow" stance.
+            // Phase 3 knobs — eager-on default so GPU-less testers get
+            // market dispatch on their FIRST call rather than after the
+            // local queue saturates. Operators with a local GPU can
+            // flip to lazy via Settings → Advanced.
             market_dispatch_threshold_queue_depth: default_market_dispatch_threshold_queue_depth(),
             market_dispatch_max_wait_ms: default_market_dispatch_max_wait_ms(),
-            market_dispatch_eager: false,
+            market_dispatch_eager: true,
         }
     }
 }
@@ -2433,22 +2443,41 @@ mod tests {
     // ── Phase 2 WS1a: ComputeParticipationPolicy (DD-I canonical 10 fields) ──
 
     #[test]
-    fn compute_participation_policy_default_is_conservative() {
-        // Default must match the bundled YAML byte-for-byte on all 10
-        // fields — conservative (hybrid mode, fleet on, every market
-        // off by default). If this drifts from bundled_contributions.json
-        // the bundled-manifest test below catches it.
+    fn compute_participation_policy_default_matches_bundled_yaml() {
+        // Default must match the bundled YAML on all projectable fields.
+        // Current stance (see Default impl docs): compute-market requester
+        // defaults are None so Hybrid projection applies — cooperative
+        // network on for fresh installs per the operational purpose lock.
+        // Storage + relay stay explicitly off pending S1/R1.
         let p = ComputeParticipationPolicy::default();
         assert_eq!(p.mode, ComputeParticipationMode::Hybrid);
         assert_eq!(p.allow_fleet_dispatch, Some(true));
         assert_eq!(p.allow_fleet_serving, Some(true));
-        assert_eq!(p.allow_market_dispatch, Some(false));
-        assert_eq!(p.allow_market_visibility, Some(false));
+        // Market requester/visibility: None → Hybrid projection → true in effective_booleans.
+        assert_eq!(p.allow_market_dispatch, None);
+        assert_eq!(p.allow_market_visibility, None);
         assert_eq!(p.allow_storage_pulling, Some(false));
         assert_eq!(p.allow_storage_hosting, Some(false));
         assert_eq!(p.allow_relay_usage, Some(false));
         assert_eq!(p.allow_relay_serving, Some(false));
         assert!(!p.allow_serving_while_degraded);
+        // Phase 3 knobs — eager-on so the GPU-less tester's first call
+        // reaches the market rather than waiting for queue saturation.
+        assert!(p.market_dispatch_eager);
+    }
+
+    #[test]
+    fn compute_participation_policy_default_effective_enables_market() {
+        // Critical purpose-lock assertion: a fresh install's default
+        // policy, after effective_booleans projection, must have
+        // allow_market_dispatch=true. Otherwise GPU-less testers hit a
+        // dead-end gate on every call.
+        let p = ComputeParticipationPolicy::default();
+        let eff = p.effective_booleans();
+        assert!(eff.allow_market_dispatch,
+            "fresh install must have market dispatch ENABLED by default (purpose lock)");
+        assert!(eff.market_dispatch_eager,
+            "fresh install must have eager-dispatch ENABLED so first call reaches market");
     }
 
     #[test]

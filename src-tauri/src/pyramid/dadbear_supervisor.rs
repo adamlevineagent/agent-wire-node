@@ -1898,6 +1898,7 @@ fn reconstruct_step_context(
         chain_name: String::new(),
         content_type: String::new(),
         task_label: format!("dadbear:{}", item.primitive),
+        balance_exhausted_emitted: std::sync::OnceLock::new(),
     }
 }
 

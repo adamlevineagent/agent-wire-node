@@ -487,6 +487,161 @@ async fn run_post_build_hooks(
             }
         }
     }
+
+    // ── EVENT_BUILD_NETWORK_CONTRIBUTION emit ──────────────────────────────
+    //
+    // Aggregates the build's network-dispatched calls into a single
+    // chronicle summary row so the UI can render "built in N seconds
+    // using M network GPUs" without scanning the full timeline. Runs
+    // unconditionally (including on failure + zero-network builds) so
+    // every build emits exactly one row — absence never means zero.
+    //
+    // 2s flush barrier lets the fire-and-forget chronicle writes from
+    // the market branch settle before we aggregate. Individual writes
+    // complete <10ms under normal load; 2s is a ~200x safety margin.
+    // See `docs/plans/call-model-unified-market-integration.md` §4.7.
+    if let Some(data_dir) = state.data_dir.as_ref() {
+        let db_path = data_dir.join("pyramid.db").to_string_lossy().to_string();
+        let slug_owned = slug_name.to_string();
+        // NOTE: the first element of the Ok tuple is the apex node id,
+        // NOT the chronicle build_id. Chronicle rows carry their own
+        // UUID build_id allocated inside the chain executor; the outer
+        // Result does not expose it. We resolve the real build_id in
+        // the aggregation block below via a subquery against
+        // pyramid_compute_events for this slug. Build failures still
+        // emit a zeroed BUILD_NETWORK_CONTRIBUTION for the same slug
+        // with build_id NULL so the "absence never means zero"
+        // invariant from §7.6 holds.
+        let build_succeeded = result.is_ok();
+        tokio::task::spawn_blocking(move || {
+            // Fire-and-forget: spawn returns immediately; any error is
+            // a chronicle-write failure and does not affect the build.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+
+            let conn = match rusqlite::Connection::open(&db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "build_network_contribution: open chronicle conn failed"
+                    );
+                    return;
+                }
+            };
+
+            // Resolve the actual build_id for the just-completed build.
+            // Pick the build_id with the most recent event for this
+            // slug. Tester-scale serial builds land on the correct one;
+            // pathologically concurrent same-slug builds could pick a
+            // still-in-progress one — documented limitation, not a real
+            // concern at tester scale.
+            let resolved_build_id: Option<String> = conn
+                .query_row(
+                    "SELECT build_id FROM pyramid_compute_events
+                     WHERE slug = ?1 AND build_id IS NOT NULL
+                     ORDER BY timestamp DESC LIMIT 1",
+                    rusqlite::params![slug_owned],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok();
+
+            // Aggregate query — defensive COALESCE for empty-set safety.
+            // SQLite's COUNT returns 0 for empty sets; SUM/AVG return
+            // NULL which COALESCE maps to 0. SQLite 3.30+ supports FILTER.
+            // local_calls counts source='local' rows (actual pool-served
+            // executions) not network_fell_back_local attempts, per the
+            // plan §4.7 metadata semantics (total_llm_calls = network +
+            // local + openrouter).
+            let (network_calls, distinct_providers, avg_latency_ms,
+                 total_credits_spent, local_calls, openrouter_calls,
+                 total_llm_calls) = match &resolved_build_id {
+                Some(bid) => {
+                    let sql = "
+                        SELECT
+                          COUNT(*) FILTER (WHERE event_type = 'network_helped_build') AS network_calls,
+                          COUNT(DISTINCT json_extract(metadata, '$.provider_node_id'))
+                            FILTER (WHERE event_type = 'network_helped_build') AS distinct_providers,
+                          COALESCE(
+                            AVG(CAST(json_extract(metadata, '$.latency_ms') AS REAL))
+                              FILTER (WHERE event_type = 'network_result_returned'),
+                            0.0
+                          ) AS avg_network_latency_ms,
+                          COALESCE(
+                            SUM(CAST(json_extract(metadata, '$.reservation_held') AS INTEGER))
+                              FILTER (WHERE event_type = 'network_helped_build'),
+                            0
+                          ) AS total_credits_spent,
+                          COUNT(*) FILTER (WHERE source = 'local') AS local_calls,
+                          COUNT(*) FILTER (WHERE source = 'cloud' AND event_type = 'cloud_returned') AS openrouter_calls,
+                          COUNT(*) AS total_llm_calls
+                        FROM pyramid_compute_events
+                        WHERE slug = ?1 AND build_id = ?2
+                    ";
+                    match conn.query_row(
+                        sql,
+                        rusqlite::params![slug_owned, bid],
+                        |r| Ok((
+                            r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?,
+                            r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?,
+                            r.get::<_, i64>(6)?,
+                        )),
+                    ) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                slug = %slug_owned,
+                                build_id = %bid,
+                                "build_network_contribution: aggregation query failed"
+                            );
+                            (0, 0, 0.0, 0, 0, 0, 0)
+                        }
+                    }
+                }
+                // No chronicle rows for this slug (zero-LLM build or
+                // build that failed before any dispatch). Emit zeros.
+                None => (0, 0, 0.0, 0, 0, 0, 0),
+            };
+
+            let build_id_for_event = resolved_build_id
+                .clone()
+                .unwrap_or_else(|| format!("{}-no-events", slug_owned));
+            let job_path = format!(
+                "{}:{}",
+                super::compute_chronicle::SOURCE_NETWORK, build_id_for_event
+            );
+            let chronicle_ctx = super::compute_chronicle::ChronicleEventContext::minimal(
+                &job_path,
+                super::compute_chronicle::EVENT_BUILD_NETWORK_CONTRIBUTION,
+                super::compute_chronicle::SOURCE_NETWORK,
+            );
+            let chronicle_ctx = super::compute_chronicle::ChronicleEventContext {
+                slug: Some(slug_owned.clone()),
+                build_id: resolved_build_id.clone(),
+                ..chronicle_ctx
+            };
+            let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
+                "build_id": resolved_build_id,
+                "slug": slug_owned,
+                "build_succeeded": build_succeeded,
+                "total_llm_calls": total_llm_calls,
+                "network_calls": network_calls,
+                "local_calls": local_calls,
+                "openrouter_calls": openrouter_calls,
+                "distinct_providers": distinct_providers,
+                "avg_network_latency_ms": avg_latency_ms,
+                "total_credits_spent": total_credits_spent,
+            }));
+
+            if let Err(e) = super::compute_chronicle::record_event(&conn, &chronicle_ctx) {
+                tracing::warn!(
+                    error = %e,
+                    slug = %slug_owned,
+                    "build_network_contribution: record_event failed"
+                );
+            }
+        });
+    }
 }
 
 /// WS-ONLINE-F: Resolve remote web edges created during a build.

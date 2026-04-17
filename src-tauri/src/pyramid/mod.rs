@@ -24,6 +24,7 @@ pub mod chain_resolve;
 pub mod characterize;
 pub mod collapse;
 pub mod compute_chronicle;
+pub mod compute_market_ctx;
 pub mod compute_market_ops;
 pub mod compute_requester;
 pub mod config_contributions;
@@ -702,6 +703,7 @@ impl PyramidConfig {
             compute_queue: None,
             fleet_roster: None,
             fleet_dispatch: None,
+            compute_market_context: None,
         }
     }
 

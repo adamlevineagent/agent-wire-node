@@ -105,6 +105,21 @@ pub const EVENT_QUEUE_MIRROR_PUSH_FAILED: &str = "queue_mirror_push_failed";
 pub const EVENT_MARKET_WORKER_HEARTBEAT_LOST: &str = "market_worker_heartbeat_lost";
 pub const EVENT_MARKET_CALLBACK_EXHAUSTED: &str = "market_callback_exhausted";
 
+// Network-framed requester-side constants (call_model_unified market
+// integration — invisibility-safe names for the cross-operator peer
+// dispatch path). See
+// `docs/plans/call-model-unified-market-integration.md` §4.1. These
+// are the names the chronicle surfaces to UIs + agent-facing tooling;
+// the underlying transport is the compute market.
+pub const SOURCE_NETWORK: &str = "network";
+pub const SOURCE_NETWORK_RECEIVED: &str = "network_received";
+pub const EVENT_NETWORK_HELPED_BUILD: &str = "network_helped_build";
+pub const EVENT_NETWORK_RESULT_RETURNED: &str = "network_result_returned";
+pub const EVENT_NETWORK_FELL_BACK_LOCAL: &str = "network_fell_back_local";
+pub const EVENT_NETWORK_LATE_ARRIVAL: &str = "network_late_arrival";
+pub const EVENT_NETWORK_BALANCE_EXHAUSTED: &str = "network_balance_exhausted";
+pub const EVENT_BUILD_NETWORK_CONTRIBUTION: &str = "build_network_contribution";
+
 // ── Event context ─────────────────────────────────────────────────────────
 
 /// All context needed to record a chronicle event.

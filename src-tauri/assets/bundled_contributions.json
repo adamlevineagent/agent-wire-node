@@ -9,7 +9,10 @@
       "slug": "generation/evidence_policy.md",
       "yaml_content": "You are generating an evidence triage policy YAML for a Wire Node knowledge pyramid.\n\nAn evidence policy tells the pyramid how to handle \"evidence\" — the supporting\nmaterial attached to questions during and after a build. The three core levers\nare: triage rules (when to answer, defer, or skip an evidence request), demand\nsignals (thresholds that flip a deferred question back on), and budget (which\nmodel tiers and concurrency limits apply to evidence work).\n\nConvert the user's natural-language intent into a valid `evidence_policy` YAML\nconforming to the JSON Schema below. Keep the document minimal — only include\nfields the user's intent motivates. Omit optional sections when they have no\nexplicit driver in the intent.\n\n## Schema (JSON Schema)\n{schema}\n\n## User Intent\n{intent}\n\n{if current_yaml}\n## Current Values (you are refining this existing policy)\n{current_yaml}\n{end}\n\n{if notes}\n## User Refinement Notes\n{notes}\n\nApply these notes to the current values. Keep everything else the same unless\nthe notes imply changes. Preserve the user's intent from prior rounds.\n{end}\n\n## Output rules\n\n- Output ONLY the YAML document, no prose before or after\n- Start the document with `schema_type: evidence_policy`\n- Include brief inline comments (`# ...`) explaining non-obvious choices,\n  especially where the intent or notes drove a specific value\n- Use the enum values exactly as they appear in the schema (e.g. `answer`,\n  `defer`, `skip`, `normal`, `high`, `low`)\n- Prefer conservative defaults when the intent is ambiguous — users can always\n  refine via notes later\n",
       "triggering_note": "Bundled generation prompt for evidence_policy (wire-node v0.2.0)",
-      "topics_extra": ["generation", "evidence_policy"]
+      "topics_extra": [
+        "generation",
+        "evidence_policy"
+      ]
     },
     {
       "contribution_id": "bundled-schema_definition-evidence_policy-v1",
@@ -33,14 +36,16 @@
       "yaml_content": "schema_type: evidence_policy\ntriage_rules:\n  - condition: \"first_build AND depth == 0\"\n    action: answer\n    model_tier: stale_local\n    priority: normal\n  - condition: \"stale_check AND no_demand_signals\"\n    action: defer\n    check_interval: \"never\"\n  - condition: \"stale_check AND has_demand_signals\"\n    action: answer\n    model_tier: stale_local\ndemand_signals:\n  - type: agent_query_count\n    threshold: 2\n    window: \"14d\"\n  - type: user_drill_count\n    threshold: 1\n    window: \"7d\"\nbudget:\n  maintenance_model_tier: stale_local\n  initial_build_model_tier: stale_local\n  max_concurrent_evidence: 1\n  triage_batch_size: 15\n",
       "triggering_note": "Bundled default evidence_policy (wire-node v0.2.0)"
     },
-
     {
       "contribution_id": "bundled-skill-generation-build_strategy-v1",
       "schema_type": "skill",
       "slug": "generation/build_strategy.md",
       "yaml_content": "You are generating a build strategy YAML for a Wire Node knowledge pyramid.\n\nA build strategy tells the pyramid how to spend compute during its two primary\nbuild phases: initial_build (first-time pyramid construction) and maintenance\n(ongoing updates when source material changes). Each phase picks a model tier,\nconcurrency level, evidence depth, and whether to run webbing (cross-node\nrelationship discovery). The `quality` block gates what counts as a valid\npyramid output.\n\nConvert the user's natural-language intent into a valid `build_strategy` YAML\nconforming to the JSON Schema below. The user's intent typically covers trade-\noffs: more thorough vs faster, local-only vs cloud, shallow vs deep evidence,\nstrict vs lenient quality gates.\n\n## Schema (JSON Schema)\n{schema}\n\n## User Intent\n{intent}\n\n{if current_yaml}\n## Current Values (you are refining this existing strategy)\n{current_yaml}\n{end}\n\n{if notes}\n## User Refinement Notes\n{notes}\n\nApply these notes to the current values. Keep everything else the same unless\nthe notes imply changes.\n{end}\n\n## Output rules\n\n- Output ONLY the YAML document, no prose before or after\n- Start the document with `schema_type: build_strategy`\n- Use the tier names the user references (e.g. `synth_heavy`, `stale_local`,\n  `fast_extract`) — do NOT invent tier names; the user can edit them later\n- Include inline comments explaining why a tier or concurrency value was chosen\n- Prefer `evidence_mode: deep` for first builds unless the user explicitly asks\n  for a lighter touch; prefer `evidence_mode: demand_only` for maintenance\n",
       "triggering_note": "Bundled generation prompt for build_strategy (wire-node v0.2.0)",
-      "topics_extra": ["generation", "build_strategy"]
+      "topics_extra": [
+        "generation",
+        "build_strategy"
+      ]
     },
     {
       "contribution_id": "bundled-schema_definition-build_strategy-v1",
@@ -64,14 +69,16 @@
       "yaml_content": "schema_type: build_strategy\ninitial_build:\n  model_tier: synth_heavy\n  concurrency: 10\n  evidence_mode: deep\n  webbing: true\nmaintenance:\n  model_tier: stale_local\n  concurrency: 1\n  evidence_mode: demand_only\n  webbing: false\nquality:\n  min_distillation_length: 200\n  require_evidence: true\n  require_webbing: true\n",
       "triggering_note": "Bundled default build_strategy (wire-node v0.2.0)"
     },
-
     {
       "contribution_id": "bundled-skill-generation-dadbear_policy-v1",
       "schema_type": "skill",
       "slug": "generation/dadbear_policy.md",
       "yaml_content": "You are generating a DADBEAR policy YAML for a Wire Node knowledge pyramid.\n\nDADBEAR is Wire Node's background auto-update loop: it watches a source\ndirectory, debounces file changes, schedules maintenance scans, and propagates\nstaleness up the pyramid layers. The policy controls every knob — scan\nintervals, debounce windows, session timeouts, batch sizes, propagation depth,\nand the maintenance schedule (how aggressively DADBEAR keeps the pyramid fresh\nwhen nothing is actively demanding answers).\n\nConvert the user's natural-language intent into a valid `dadbear_policy` YAML\nconforming to the JSON Schema below. Users typically describe trade-offs:\nresponsive vs quiet, aggressive vs lazy, frequent-batch vs big-batch.\n\n## Schema (JSON Schema)\n{schema}\n\n## User Intent\n{intent}\n\n{if current_yaml}\n## Current Values (you are refining this existing policy)\n{current_yaml}\n{end}\n\n{if notes}\n## User Refinement Notes\n{notes}\n\nApply these notes to the current values. Keep everything else the same unless\nthe notes imply changes.\n{end}\n\n## Output rules\n\n- Output ONLY the YAML document, no prose before or after\n- Start the document with `schema_type: dadbear_policy`\n- Intervals are in seconds (`scan_interval_secs`, `debounce_secs`,\n  `session_timeout_secs`). Pick values that match the user's stated urgency —\n  e.g. \"responsive\" implies single-digit `scan_interval_secs`, \"quiet\" implies\n  tens to hundreds of seconds\n- `maintenance_schedule.mode` is one of `always`, `demand_only`, `manual`\n- Include inline comments that explain why a specific value was chosen when the\n  intent directly drove it\n",
       "triggering_note": "Bundled generation prompt for dadbear_policy (wire-node v0.2.0)",
-      "topics_extra": ["generation", "dadbear_policy"]
+      "topics_extra": [
+        "generation",
+        "dadbear_policy"
+      ]
     },
     {
       "contribution_id": "bundled-schema_definition-dadbear_policy-v1",
@@ -88,14 +95,16 @@
       "yaml_content": "schema_type: dadbear_policy\nscan_interval_secs: 30\ndebounce_secs: 60\nsession_timeout_secs: 1800\nbatch_size: 5\nstale_propagation:\n  max_cascade_depth: 3\n  propagation_model_tier: stale_local\nmaintenance_schedule:\n  mode: demand_only\n  check_interval: \"7d\"\n  model_tier: stale_local\n",
       "triggering_note": "Bundled default dadbear_policy (wire-node v0.2.0)"
     },
-
     {
       "contribution_id": "bundled-skill-generation-dadbear_norms-v1",
       "schema_type": "skill",
       "slug": "generation/dadbear_norms.md",
-      "yaml_content": "You are generating a DADBEAR norms YAML for a Wire Node knowledge pyramid.\n\nDADBEAR norms control the timing and threshold knobs for the background\nauto-update loop \u2014 how often it scans, how long it debounces, when it promotes\nsessions, how many files it batches, and when it considers a pyramid \"runaway\"\n(too many stale nodes to rebuild safely). Norms are layered: a global default\napplies to all pyramids, and per-pyramid overrides can tighten or loosen any\nfield.\n\nConvert the user's natural-language intent into a valid `dadbear_norms` YAML\nconforming to the JSON Schema below. Users typically describe trade-offs:\nresponsive vs quiet, aggressive vs lazy, frequent small batches vs large\nbatches, tight debounce vs generous debounce.\n\n## Schema (JSON Schema)\n{schema}\n\n## User Intent\n{intent}\n\n{if current_yaml}\n## Current Values (you are refining these existing norms)\n{current_yaml}\n{end}\n\n{if notes}\n## User Refinement Notes\n{notes}\n\nApply these notes to the current values. Keep everything else the same unless\nthe notes imply changes.\n{end}\n\n## Output rules\n\n- Output ONLY the YAML document, no prose before or after\n- Start the document with `schema_type: dadbear_norms`\n- Intervals are in seconds (`scan_interval_secs`, `debounce_secs`,\n  `session_timeout_secs`). Pick values that match the user's stated urgency \u2014\n  e.g. \"responsive\" implies single-digit `scan_interval_secs`, \"quiet\" implies\n  tens to hundreds of seconds\n- `runaway_threshold` is a float between 0.0 and 1.0 \u2014 lower means more\n  cautious (throttles earlier), higher means more aggressive (allows more\n  staleness before throttling)\n- `retention_window_days` is how long to keep old contribution versions \u2014\n  shorter saves disk, longer allows rollbacks\n- `min_changed_files` controls the trigger threshold \u2014 1 means every single\n  file change triggers a rebuild, higher values batch changes together\n- Include inline comments that explain why a specific value was chosen when the\n  intent directly drove it\n",
+      "yaml_content": "You are generating a DADBEAR norms YAML for a Wire Node knowledge pyramid.\n\nDADBEAR norms control the timing and threshold knobs for the background\nauto-update loop — how often it scans, how long it debounces, when it promotes\nsessions, how many files it batches, and when it considers a pyramid \"runaway\"\n(too many stale nodes to rebuild safely). Norms are layered: a global default\napplies to all pyramids, and per-pyramid overrides can tighten or loosen any\nfield.\n\nConvert the user's natural-language intent into a valid `dadbear_norms` YAML\nconforming to the JSON Schema below. Users typically describe trade-offs:\nresponsive vs quiet, aggressive vs lazy, frequent small batches vs large\nbatches, tight debounce vs generous debounce.\n\n## Schema (JSON Schema)\n{schema}\n\n## User Intent\n{intent}\n\n{if current_yaml}\n## Current Values (you are refining these existing norms)\n{current_yaml}\n{end}\n\n{if notes}\n## User Refinement Notes\n{notes}\n\nApply these notes to the current values. Keep everything else the same unless\nthe notes imply changes.\n{end}\n\n## Output rules\n\n- Output ONLY the YAML document, no prose before or after\n- Start the document with `schema_type: dadbear_norms`\n- Intervals are in seconds (`scan_interval_secs`, `debounce_secs`,\n  `session_timeout_secs`). Pick values that match the user's stated urgency —\n  e.g. \"responsive\" implies single-digit `scan_interval_secs`, \"quiet\" implies\n  tens to hundreds of seconds\n- `runaway_threshold` is a float between 0.0 and 1.0 — lower means more\n  cautious (throttles earlier), higher means more aggressive (allows more\n  staleness before throttling)\n- `retention_window_days` is how long to keep old contribution versions —\n  shorter saves disk, longer allows rollbacks\n- `min_changed_files` controls the trigger threshold — 1 means every single\n  file change triggers a rebuild, higher values batch changes together\n- Include inline comments that explain why a specific value was chosen when the\n  intent directly drove it\n",
       "triggering_note": "Bundled generation prompt for dadbear_norms (wire-node v0.2.0)",
-      "topics_extra": ["generation", "dadbear_norms"]
+      "topics_extra": [
+        "generation",
+        "dadbear_norms"
+      ]
     },
     {
       "contribution_id": "bundled-schema_definition-dadbear_norms-v1",
@@ -119,14 +128,16 @@
       "yaml_content": "schema_type: dadbear_norms\nscan_interval_secs: 10\ndebounce_secs: 30\nsession_timeout_secs: 1800\nbatch_size: 1\nmin_changed_files: 1\nrunaway_threshold: 0.5\nretention_window_days: 30\n",
       "triggering_note": "Bundled default dadbear_norms (wire-node v0.2.0)"
     },
-
     {
       "contribution_id": "bundled-skill-generation-tier_routing-v1",
       "schema_type": "skill",
       "slug": "generation/tier_routing.md",
       "yaml_content": "You are generating a tier routing YAML for a Wire Node knowledge pyramid.\n\nTier routing maps abstract \"model tiers\" (e.g. `fast_extract`, `synth_heavy`,\n`stale_local`) to concrete (provider, model) pairs. The pyramid executor asks\nfor tiers by name; the routing table resolves them to actual API targets with\nper-token pricing. Users typically care about cost vs quality trade-offs and\nlocal vs cloud preferences.\n\nConvert the user's natural-language intent into a valid `tier_routing` YAML\nconforming to the JSON Schema below. The generated tier list should cover\nevery tier the user mentions PLUS the standard Wire Node tiers (fast_extract,\nsynth_heavy, stale_local) so the executor never hits a missing-tier error.\n\n## Schema (JSON Schema)\n{schema}\n\n## User Intent\n{intent}\n\n{if current_yaml}\n## Current Values (you are refining this existing routing)\n{current_yaml}\n{end}\n\n{if notes}\n## User Refinement Notes\n{notes}\n\nApply these notes to the current values. Keep the tiers the user didn't\nmention the same unless the notes imply otherwise.\n{end}\n\n## Output rules\n\n- Output ONLY the YAML document, no prose before or after\n- Start the document with `schema_type: tier_routing`\n- `entries` is a list of tier entries; each entry has `tier_name`,\n  `provider_id`, `model_id`, and optional `priority`, `context_limit`,\n  `prompt_price_per_token`, `completion_price_per_token`\n- When the user references a named provider (e.g. \"openrouter\", \"ollama\",\n  \"anthropic\"), use that as `provider_id`. Users manage their providers\n  separately; the router does not need to validate them here\n- Pricing fields are per TOKEN, not per 1M tokens; encode in scientific\n  notation if needed (e.g. `3.0e-6`)\n- Include inline comments when a tier choice reflects a specific intent signal\n  (e.g. \"# user asked for local-only fallback when cloud is unavailable\")\n",
       "triggering_note": "Bundled generation prompt for tier_routing (wire-node v0.2.0)",
-      "topics_extra": ["generation", "tier_routing"]
+      "topics_extra": [
+        "generation",
+        "tier_routing"
+      ]
     },
     {
       "contribution_id": "bundled-schema_definition-tier_routing-v1",
@@ -143,14 +154,16 @@
       "yaml_content": "schema_type: tier_routing\nentries:\n  - tier_name: fast_extract\n    provider_id: openrouter\n    model_id: inception/mercury-2\n    priority: 1\n  - tier_name: synth_heavy\n    provider_id: openrouter\n    model_id: inception/mercury-2\n    priority: 1\n  - tier_name: stale_local\n    provider_id: openrouter\n    model_id: inception/mercury-2\n    priority: 1\n  - tier_name: high\n    provider_id: openrouter\n    model_id: qwen/qwen3.5-flash-02-23\n    priority: 1\n  - tier_name: max\n    provider_id: openrouter\n    model_id: x-ai/grok-4.20-beta\n    priority: 1\n",
       "triggering_note": "Bundled default tier_routing (wire-node v0.2.0)"
     },
-
     {
       "contribution_id": "bundled-skill-generation-custom_prompts-v1",
       "schema_type": "skill",
       "slug": "generation/custom_prompts.md",
       "yaml_content": "You are generating a custom prompts YAML for a Wire Node knowledge pyramid.\n\nCustom prompts steer what the pyramid extracts and synthesizes from its source\nmaterial. `extraction_focus` biases the chain's extractors toward particular\nconcepts; `synthesis_style` shapes how L1+ layer nodes phrase their\ndistillations; `vocabulary_priority` tells the clusterer which topic terms\nshould anchor the clustering; `ignore_patterns` marks material the extractors\nshould skip.\n\nConvert the user's natural-language intent into a valid `custom_prompts` YAML\nconforming to the JSON Schema below. The user's intent usually describes what\nthey care about in their source material (e.g. \"track API design decisions\",\n\"focus on user-visible behavior changes\", \"skip generated code\").\n\n## Schema (JSON Schema)\n{schema}\n\n## User Intent\n{intent}\n\n{if current_yaml}\n## Current Values (you are refining this existing prompt set)\n{current_yaml}\n{end}\n\n{if notes}\n## User Refinement Notes\n{notes}\n\nApply these notes to the current values. Keep unmentioned settings the same.\n{end}\n\n## Output rules\n\n- Output ONLY the YAML document, no prose before or after\n- Start the document with `schema_type: custom_prompts`\n- `extraction_focus` and `synthesis_style` are free-text strings describing\n  the desired extraction / synthesis bias. Keep them to 1-2 sentences each.\n- `vocabulary_priority` is a list of topic terms, most-important first\n- `ignore_patterns` is a list of textual patterns the extractor should ignore\n  (regex-flavored but treated literally by the chain runtime)\n- Include inline comments when the intent drives a specific choice\n",
       "triggering_note": "Bundled generation prompt for custom_prompts (wire-node v0.2.0)",
-      "topics_extra": ["generation", "custom_prompts"]
+      "topics_extra": [
+        "generation",
+        "custom_prompts"
+      ]
     },
     {
       "contribution_id": "bundled-schema_definition-custom_prompts-v1",
@@ -174,7 +187,6 @@
       "yaml_content": "schema_type: custom_prompts\nextraction_focus: \"the structure and meaning of the source material\"\nsynthesis_style: \"concise, decision-oriented\"\nvocabulary_priority: []\nignore_patterns:\n  - \"boilerplate\"\n  - \"generated code\"\n  - \"test fixtures\"\n",
       "triggering_note": "Bundled default custom_prompts (wire-node v0.2.0)"
     },
-
     {
       "contribution_id": "bundled-folder_ingestion_heuristics-default-v1",
       "schema_type": "folder_ingestion_heuristics",
@@ -215,10 +227,9 @@
       "contribution_id": "bundled-compute_participation_policy-default-v2",
       "schema_type": "compute_participation_policy",
       "slug": null,
-      "yaml_content": "schema_type: compute_participation_policy\n# Conservative default per DD-I (architecture §VIII.6): hybrid mode with\n# every market-facing capability EXPLICITLY off until the operator opts in.\n# Fleet participation is on (matches pre-DD-I shipped semantics).\n#\n# Operators who want the full hybrid preset (all capabilities on) can\n# choose that in Settings; the mode projection will fill in true values\n# wherever these explicit overrides are removed.\nmode: hybrid\n# Fleet: participate.\nallow_fleet_dispatch: true\nallow_fleet_serving: true\n# Compute market: off until operator opts in (Phase 2).\nallow_market_dispatch: false\nallow_market_visibility: false\n# Storage market: off until operator opts in (S1, not yet shipped).\nallow_storage_pulling: false\nallow_storage_hosting: false\n# Relay market: off until operator opts in (R1, not yet shipped).\nallow_relay_usage: false\nallow_relay_serving: false\n# Operational safety: off by default.\nallow_serving_while_degraded: false\n",
+      "yaml_content": "schema_type: compute_participation_policy\n# Default per operational purpose lock\n# (docs/plans/call-model-unified-market-integration.md §Purpose):\n# a GPU-less tester should build a pyramid via the network without\n# seeing a market word. That demands compute-market requester be\n# on-by-default for fresh installs.\n#\n# Persisted explicit operator overrides ALWAYS win via\n# effective_booleans unwrap_or(projection) — this seed only fires\n# when no persisted contribution exists.\n#\n# Null values on the projected booleans let the mode's projection\n# apply naturally. Persisted explicit `false` still takes precedence.\nmode: hybrid\n# Fleet: participate (matches shipped default).\nallow_fleet_dispatch: true\nallow_fleet_serving: true\n# Compute market: follow mode projection (Hybrid → true for dispatch +\n# visibility). Fresh installs get cooperative network on; operators\n# can disable per-capability in Settings.\nallow_market_dispatch: null\nallow_market_visibility: null\n# Storage market: off until operator opts in (S1, not yet shipped).\nallow_storage_pulling: false\nallow_storage_hosting: false\n# Relay market: off until operator opts in (R1, not yet shipped).\nallow_relay_usage: false\nallow_relay_serving: false\n# Operational safety: off by default.\nallow_serving_while_degraded: false\n# Phase 3 compute-market dispatch knobs — eager default so GPU-less\n# testers get market dispatch on their FIRST call rather than after\n# the local queue saturates.\nmarket_dispatch_threshold_queue_depth: 10\nmarket_dispatch_max_wait_ms: 60000\nmarket_dispatch_eager: true\n",
       "triggering_note": "Bundled default compute_participation_policy v2 (10-field DD-I canonical — wire-node Phase 2 WS1a)"
     },
-
     {
       "contribution_id": "bundled-chain_defaults-default-v1",
       "schema_type": "chain_defaults",
@@ -256,7 +267,6 @@
       "yaml_content": "schema_type: chain_assignment\napplies_to: chain_assignment\nversion: 1\nlabel: \"Chain Assignment\"\ndescription: \"Override which build pipeline runs for a specific pyramid\"\nfields:\n  chain_id:\n    label: \"Chain ID\"\n    help: \"The chain to use for this pyramid. Set to 'default' to remove the override and use the content-type default.\"\n    widget: text\n    visibility: basic\n",
       "triggering_note": "Bundled UI annotation for chain_assignment (wire-node v0.2.0)"
     },
-
     {
       "contribution_id": "bundled-schema_definition-pyramid_viz_config-v1",
       "schema_type": "schema_definition",
@@ -272,7 +282,6 @@
       "yaml_content": "schema_type: pyramid_viz_config\nrendering:\n  tier: auto\n  max_dots_per_layer: 10\n  always_collapse: false\n  force_all_nodes: false\noverlays:\n  structure: true\n  web_edges: true\n  staleness: true\n  provenance: true\n  weight_intensity: true\nchronicle:\n  show_mechanical_ops: false\n  auto_expand_decisions: true\nticker:\n  enabled: true\n  position: bottom\nwindow:\n  auto_pop_on_build: true\ndensity:\n  repulsion: auto\n  attraction: auto\n  damping: auto\n  settle_threshold: auto\n  label_min_radius: auto\n  max_iterations: auto\n  center_gravity: auto\n  max_nodes: auto\n",
       "triggering_note": "Bundled default pyramid_viz_config (wire-node v0.2.0)"
     },
-
     {
       "contribution_id": "bundled-schema_definition-reconciliation_result-v1",
       "schema_type": "schema_definition",
@@ -281,14 +290,17 @@
       "triggering_note": "Bundled JSON schema for reconciliation_result (wire-node v0.3.0)",
       "applies_to": "reconciliation_result"
     },
-
     {
       "contribution_id": "bundled-skill-migration-migrate_config-v1",
       "schema_type": "skill",
       "slug": "migration/migrate_config.md",
       "yaml_content": "You are migrating a configuration YAML from one schema version to another.\n\nA Wire Node configuration is a YAML document validated against a JSON Schema. When the schema for a configuration type evolves (a field is added, removed, renamed, or has its type/constraints changed), every existing YAML document for that schema_type may need updating to remain valid against the new schema. Your job: take the user's existing YAML and produce a new YAML that is valid against the new schema while preserving the user's original intent as faithfully as possible.\n\nThis is NOT a regeneration. The user already made deliberate choices when they wrote the existing YAML. Honor those choices wherever the new schema still accepts them. Only change what the schema change forces you to change.\n\n## Old schema (the user's current YAML below was valid against this)\n{old_schema}\n\n## New schema (the migrated YAML must be valid against this)\n{new_schema}\n\n## User's current YAML (against the old schema)\n{old_yaml}\n\n{if user_note}\n## User guidance for the migration\n{user_note}\n{end}\n\n## Migration rules\n\n- Preserve every value the user explicitly set in the old YAML, AS LONG AS the new schema still accepts that value at that path\n- For fields that exist in both schemas with compatible types, copy the value through unchanged\n- For fields that were RENAMED (same semantic meaning, new key name), copy the value to the new key\n- For fields that were REMOVED from the new schema, drop them silently\n- For fields that are NEW in the new schema and required, add them with the most conservative reasonable default that fits the user's apparent intent from the rest of the YAML — never invent values out of thin air\n- For fields whose TYPE changed, coerce the value only if the coercion is lossless (int → float is fine; \"yes\" → true is fine; an array of strings → a single string IS NOT fine)\n- For fields whose ENUM values changed, map the old value to the closest equivalent if one exists, otherwise drop and note in a comment\n- For fields whose CONSTRAINT tightened (e.g. min_value increased), clamp the user's value to the new bound and note the clamp in a comment\n\n## Output rules\n\n- Output ONLY the migrated YAML document, no prose before or after\n- Use inline YAML comments (`# ...`) for EVERY non-trivial transformation so the user can review what changed and why\n- Comment format: `# migrated: <what changed and why>`\n- Examples:\n    - `# migrated: renamed from 'batch_size' to 'concurrency' in v2 schema`\n    - `# migrated: dropped — field no longer exists in new schema`\n    - `# migrated: clamped from 32 to 16 (new max)`\n    - `# migrated: defaulted to 'review' — new required field, no signal in old YAML`\n- Start the document with `schema_type: <type>` matching the new schema's required value\n- Keep the YAML structurally minimal — do NOT add fields that were not in the old YAML and are not required by the new schema\n- The output must parse as valid YAML and validate against the new schema\n",
       "triggering_note": "Bundled migration prompt for config schema migration (wire-node v0.2.0)",
-      "topics_extra": ["migration", "schema_migration", "config"]
+      "topics_extra": [
+        "migration",
+        "schema_migration",
+        "config"
+      ]
     }
   ]
 }

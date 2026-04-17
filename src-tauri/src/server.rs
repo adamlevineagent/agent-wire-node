@@ -2649,6 +2649,39 @@ async fn handle_compute_job_result(
         }
     };
 
+    // Snapshot the pyramid data_dir so chronicle writes (below) can
+    // open a short-lived SQLite connection. Read before the take/fire
+    // rendezvous so the handler reply path is never blocked on a
+    // data_dir lookup.
+    let chronicle_db_path = state
+        .pyramid
+        .data_dir
+        .as_ref()
+        .map(|d| d.join("pyramid.db").to_string_lossy().to_string());
+
+    // Capture envelope metadata for chronicle BEFORE the payload moves
+    // into the oneshot send. The network-framed metadata keys mirror
+    // the plan §4.3 shape.
+    let (success_content_len, success_model_used, success_input_tokens, success_output_tokens,
+         success_latency_ms, success_finish_reason) = match &payload {
+        crate::pyramid::pending_jobs::DeliveryPayload::Success {
+            content,
+            model_used,
+            input_tokens,
+            output_tokens,
+            latency_ms,
+            finish_reason,
+        } => (
+            Some(content.len()),
+            Some(model_used.clone()),
+            Some(*input_tokens),
+            Some(*output_tokens),
+            Some(*latency_ms),
+            finish_reason.clone(),
+        ),
+        _ => (None, None, None, None, None, None),
+    };
+
     // ── Step 4: rendezvous with the awaiting dispatcher.
     //
     // `take` both returns and removes the entry — if the awaiter has
@@ -2662,6 +2695,42 @@ async fn handle_compute_job_result(
             // returning Err is a no-op for our purposes — we still
             // respond 2xx to Wire and tombstone the delivery.
             let _ = sender.send(payload);
+
+            // Chronicle: emit `network_result_returned` on success
+            // envelopes. Failure envelopes chronicle via the
+            // requester's soft-fail path (ProviderFailed → FELL_BACK_LOCAL).
+            if let (Some(db_path), Some(model_used)) =
+                (chronicle_db_path.clone(), success_model_used.clone())
+            {
+                let job_path = format!(
+                    "{}:{}",
+                    crate::pyramid::compute_chronicle::SOURCE_NETWORK_RECEIVED,
+                    job_id
+                );
+                let chronicle_ctx = crate::pyramid::compute_chronicle::ChronicleEventContext::minimal(
+                    &job_path,
+                    crate::pyramid::compute_chronicle::EVENT_NETWORK_RESULT_RETURNED,
+                    crate::pyramid::compute_chronicle::SOURCE_NETWORK_RECEIVED,
+                )
+                .with_model_id(model_used.clone())
+                .with_metadata(serde_json::json!({
+                    "job_id": job_path,
+                    "uuid_job_id": job_id,
+                    "input_tokens": success_input_tokens.unwrap_or(0),
+                    "output_tokens": success_output_tokens.unwrap_or(0),
+                    "latency_ms": success_latency_ms.unwrap_or(0),
+                    "model_used": model_used,
+                    "provider_node_id": serde_json::Value::Null,
+                    "finish_reason": success_finish_reason,
+                    "content_bytes": success_content_len.unwrap_or(0),
+                }));
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                        let _ = crate::pyramid::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                    }
+                });
+            }
+
             Ok(Box::new(warp::reply::with_status(
                 warp::reply::json(&serde_json::json!({
                     "status": "ok",
@@ -2673,13 +2742,36 @@ async fn handle_compute_job_result(
         None => {
             // Late delivery after timeout fallback, OR a duplicate
             // push Wire is retrying. Both are expected in steady state.
-            // Chronicle event fires elsewhere via compute_requester's
-            // EVENT_COMPUTE_MARKET_DELIVERY_LATE_ARRIVAL emission in
-            // 3f; keep this handler minimal.
             tracing::info!(
                 job_id = %job_id,
                 "compute_job_result: late or duplicate delivery; responding already_settled"
             );
+
+            // Chronicle: emit `network_late_arrival`. The handler
+            // does not know when the job was first registered, so the
+            // time_since_first_seen_ms field stays null.
+            if let Some(db_path) = chronicle_db_path.clone() {
+                let job_path = format!(
+                    "{}:{}",
+                    crate::pyramid::compute_chronicle::SOURCE_NETWORK_RECEIVED,
+                    job_id
+                );
+                let chronicle_ctx = crate::pyramid::compute_chronicle::ChronicleEventContext::minimal(
+                    &job_path,
+                    crate::pyramid::compute_chronicle::EVENT_NETWORK_LATE_ARRIVAL,
+                    crate::pyramid::compute_chronicle::SOURCE_NETWORK_RECEIVED,
+                )
+                .with_metadata(serde_json::json!({
+                    "uuid_job_id": job_id,
+                    "time_since_first_seen_ms": serde_json::Value::Null,
+                }));
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                        let _ = crate::pyramid::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                    }
+                });
+            }
+
             Ok(Box::new(warp::reply::with_status(
                 warp::reply::json(&serde_json::json!({
                     "status": "already_settled",

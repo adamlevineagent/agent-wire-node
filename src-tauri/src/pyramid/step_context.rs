@@ -310,6 +310,19 @@ pub struct StepContext {
     /// Format: "{step_name} depth {depth} ({chain_name})" when chain_name is set,
     /// or "{step_name} depth {depth}" when chain_name is empty.
     pub task_label: String,
+
+    // ── Per-build dedup for NETWORK_BALANCE_EXHAUSTED ──────────────
+    /// Per-build dedup for the `network_balance_exhausted` chronicle
+    /// event. Initialized fresh per StepContext. Thread-safe:
+    /// `OnceLock::set()` is atomic via stdlib, so concurrent race
+    /// callers get exactly one Ok; later callers see Err and skip emit.
+    ///
+    /// Using `std::sync::OnceLock` (stable Rust 1.70+) — no extra
+    /// crate dependency required.
+    ///
+    /// Leak on build crash: when the StepContext drops, the OnceLock
+    /// drops with it. Memory-only, not persistent state.
+    pub balance_exhausted_emitted: std::sync::OnceLock<()>,
 }
 
 impl std::fmt::Debug for StepContext {
@@ -331,6 +344,7 @@ impl std::fmt::Debug for StepContext {
             .field("chain_name", &self.chain_name)
             .field("content_type", &self.content_type)
             .field("task_label", &self.task_label)
+            .field("balance_exhausted_emitted", &"<oncelock>")
             .finish()
     }
 }
@@ -367,6 +381,7 @@ impl StepContext {
             chain_name: String::new(),
             content_type: String::new(),
             task_label: String::new(),
+            balance_exhausted_emitted: std::sync::OnceLock::new(),
         }
     }
 
