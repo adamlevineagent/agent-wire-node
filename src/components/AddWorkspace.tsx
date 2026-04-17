@@ -846,10 +846,12 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         'folder-ingest-review': 'Review',
     };
 
+    const isFullScreenBuild = buildFullScreen && step === 'building';
+
     return (
-        <div className="add-workspace-panel">
+        <div className={`add-workspace-panel${isFullScreenBuild ? ' add-workspace-panel--fullscreen' : ''}`}>
             {/* When build is fullscreen, show minimal header instead of wizard chrome */}
-            {buildFullScreen && step === 'building' ? (
+            {isFullScreenBuild ? (
                 <div className="build-fullscreen-header">
                     <span className="build-fullscreen-title">Building: {slug}</span>
                     <button

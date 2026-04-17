@@ -92,8 +92,20 @@ pub struct EscalationConfig {
 fn default_wait_timeout_secs() -> u64 {
     30
 }
+/// Default wall-clock ceiling for a single dispatched LLM job, in seconds.
+///
+/// 3600s = 1 hour. Prior default was 300s (5 minutes), which was too short
+/// for the long-tail of inference calls. In practice most calls complete in
+/// ~10 seconds, but occasional large-output calls run for many minutes —
+/// sometimes ~20 — especially on local fleet peers under load. Because the
+/// async dispatch path cannot cancel in-flight remote work, timing out at
+/// 5 minutes meant we paid the full cost of the work, then rejected its
+/// result when the late callback arrived (see `fleet_result_orphaned` in
+/// the Chronicle). Defaulting high and letting jobs take as long as they
+/// take is the correct posture. Operators who want tighter ceilings can
+/// override via the `dispatch_policy` YAML contribution per route / tier.
 fn default_max_wait_secs() -> u64 {
-    300
+    3600
 }
 
 impl Default for EscalationConfig {
