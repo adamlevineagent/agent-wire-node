@@ -88,8 +88,25 @@ pub struct ComputeOffer {
     /// Wire-side offer_id once the offer has been successfully
     /// published. `None` means "this offer is known locally but not
     /// yet synced to the Wire" (network partition / retry).
+    ///
+    /// # Handle-path migration (pending — DO NOT rename this field yet)
+    ///
+    /// As of Wire W1 (2026-04-17), the value here is a canonical UUID
+    /// v4 string, e.g. `"ddd37007-1ecf-48f0-baa8-d417407065cb"`. Wire
+    /// will migrate to Pillar-14 handle-paths of the form
+    /// `{agent_handle}/{epoch-day}/{seq}` — stable across supersession
+    /// (chain-root handle), human-readable. The migration is
+    /// backward-compatible: this field stays `Option<String>`; we just
+    /// start seeing handle-path strings flowing through instead of
+    /// UUIDs. No local-side semantic change.
+    ///
+    /// When the Wire-side migration lands, grep the codebase for
+    /// `UUID-OR-HANDLE-PATH` to find every place that stores, compares,
+    /// logs, or renders a `wire_offer_id`. All those sites are already
+    /// transparent to the string contents — the tag just marks them
+    /// for human review during the cutover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wire_offer_id: Option<String>,
+    pub wire_offer_id: Option<String>, // UUID-OR-HANDLE-PATH
 }
 
 /// A single point on an offer's queue discount curve. Multiplier is

@@ -27,6 +27,37 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Queue-discount curve point in the **Wire contract shape**:
+/// `{queue_depth, discount_bps}`. This is what agents / CLI send over
+/// HTTP and what we forward to Wire on `/api/v1/compute/offers`.
+///
+/// Distinct from the node-internal `QueueDiscountPoint` (fields
+/// `{depth, multiplier_bps}`) which is Wire's internal representation
+/// — Wire translates `multiplier_bps = 10000 - discount_bps` on the
+/// server side. We store in the internal shape locally because the
+/// rest of the node's admission + settlement logic already operates
+/// on multipliers; we translate at the HTTP boundary.
+///
+/// See §1.1 in `wire-node-compute-market-contract.md` — the on-wire
+/// shape is authoritative for field names.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfferQueueDiscountPoint {
+    pub queue_depth: usize,
+    /// Basis points of discount off the base rate. `500` = 5% off.
+    /// Wire translates to `multiplier_bps = 10000 - discount_bps`.
+    pub discount_bps: i32,
+}
+
+impl OfferQueueDiscountPoint {
+    /// Translate to the node-internal storage shape.
+    pub fn to_internal(&self) -> QueueDiscountPoint {
+        QueueDiscountPoint {
+            depth: self.queue_depth,
+            multiplier_bps: 10_000 - self.discount_bps,
+        }
+    }
+}
+
 /// Unified error type for compute market ops. The IPC layer maps this to
 /// `String`, the HTTP layer to `(StatusCode, error-json-body)`.
 #[derive(Debug, thiserror::Error)]
@@ -70,9 +101,10 @@ impl ComputeMarketOpError {
     }
 }
 
-/// Input for create/update offer. Mirrors the IPC `ComputeOfferRequest`
-/// struct 1:1 but lives here so the HTTP layer can deserialize the same
-/// shape.
+/// Input for create/update offer. Field names match the Wire contract
+/// §1.1 on-wire shape so that a CLI caller can cut+paste the Wire doc's
+/// example body and it just works. Also the exact body shape we forward
+/// to Wire — no field rewriting at the HTTP boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OfferRequest {
     pub model_id: String,
@@ -81,8 +113,10 @@ pub struct OfferRequest {
     pub rate_per_m_input: i64,
     pub rate_per_m_output: i64,
     pub reservation_fee: i64,
+    /// Wire contract shape: `{queue_depth, discount_bps}`. Translated
+    /// to node-internal `QueueDiscountPoint` before local storage.
     #[serde(default)]
-    pub queue_discount_curve: Vec<QueueDiscountPoint>,
+    pub queue_discount_curve: Vec<OfferQueueDiscountPoint>,
     pub max_queue_depth: usize,
 }
 
@@ -221,11 +255,19 @@ pub async fn create_offer(
     };
 
     // Wire-side publish first — we only touch local state if Wire accepts.
-    let (api_url, token) = {
+    let (api_url, token, node_id) = {
         let cfg = config.read().await;
-        (cfg.api_url.clone(), get_api_token(auth).await?)
+        let auth_read = auth.read().await;
+        let node_id = auth_read.node_id.clone();
+        drop(auth_read);
+        (cfg.api_url.clone(), get_api_token(auth).await?, node_id)
     };
-    let body = serde_json::json!({
+    // Include `node_id` when we know ours. Wire auto-infers when the
+    // operator owns exactly one node and the body omits it, but returns
+    // 400 `multiple_nodes_require_explicit_node_id` when >1 node is
+    // owned. Sending it always sidesteps the multi-node branch entirely
+    // — belt + suspenders against future operators adding more nodes.
+    let mut body = serde_json::json!({
         "model_id": req.model_id,
         "provider_type": req.provider_type,
         "rate_per_m_input": req.rate_per_m_input,
@@ -234,6 +276,11 @@ pub async fn create_offer(
         "queue_discount_curve": req.queue_discount_curve,
         "max_queue_depth": req.max_queue_depth,
     });
+    if let Some(nid) = node_id {
+        if !nid.is_empty() {
+            body["node_id"] = serde_json::Value::String(nid);
+        }
+    }
     let send_result = send_api_request(
         &api_url,
         "POST",
@@ -258,6 +305,11 @@ pub async fn create_offer(
             body: serde_json::to_string(&resp).unwrap_or_else(|_| "<unserializable>".to_string()),
         });
     }
+    // UUID-OR-HANDLE-PATH: Wire currently returns canonical UUID v4.
+    // Post-Pillar-14 migration, this will be a handle-path string
+    // `{agent_handle}/{epoch-day}/{seq}`. See `ComputeOffer::wire_offer_id`
+    // for the migration-wide note. No code change needed here — the
+    // string is opaque to us.
     let offer_id = resp
         .get("offer_id")
         .and_then(|v| v.as_str())
@@ -266,7 +318,15 @@ pub async fn create_offer(
         })?
         .to_string();
 
-    // Local state update + persist.
+    // Local state update + persist. Translate the Wire-contract-shaped
+    // curve (`{queue_depth, discount_bps}`) into the node-internal
+    // storage shape (`{depth, multiplier_bps}`) — the admission +
+    // settlement paths work on multipliers, not discounts.
+    let internal_curve: Vec<QueueDiscountPoint> = req
+        .queue_discount_curve
+        .iter()
+        .map(|p| p.to_internal())
+        .collect();
     let data_dir = resolve_data_dir(pyramid);
     {
         let mut ms = market_state.write().await;
@@ -278,7 +338,7 @@ pub async fn create_offer(
                 rate_per_m_input: req.rate_per_m_input,
                 rate_per_m_output: req.rate_per_m_output,
                 reservation_fee: req.reservation_fee,
-                queue_discount_curve: req.queue_discount_curve.clone(),
+                queue_discount_curve: internal_curve,
                 max_queue_depth: req.max_queue_depth,
                 wire_offer_id: Some(offer_id.clone()),
             },
@@ -361,6 +421,11 @@ pub async fn remove_offer(
             let cfg = config.read().await;
             (cfg.api_url.clone(), get_api_token(auth).await?)
         };
+        // UUID-OR-HANDLE-PATH: `offer_id` is opaque and URL-encoded on
+        // the way into the path. Handle-paths contain `/` characters
+        // (e.g. `myhandle/19852/42`) — urlencoding::encode turns them
+        // into `%2F`, so the DELETE request path stays a single path
+        // segment. Wire URL-decodes on receipt. Works for both formats.
         let path = format!("/api/v1/compute/offers/{}", urlencoding::encode(&offer_id));
         // We tolerate 404 (already deleted). Other failures still trigger
         // local cleanup below, then surface the error to the caller.
@@ -511,6 +576,10 @@ fn emit_market_offered_event(
         compute_chronicle::SOURCE_MARKET,
     )
     .with_model_id(model_id.to_string())
+    // UUID-OR-HANDLE-PATH: the `wire_offer_id` value in chronicle
+    // metadata is stored verbatim as a string. UUIDs today, handle-paths
+    // post-migration. Chronicle UI/query paths should render whatever
+    // shape the value has without assuming UUID structure.
     .with_metadata(serde_json::json!({
         "rate_per_m_input": rate_in,
         "rate_per_m_output": rate_out,

@@ -128,6 +128,16 @@ pub async fn send_api_request(
         return Err(format!("API error {}: {}", status.as_u16(), error_value));
     }
 
-    let result: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    // Handle empty-body 2xx (e.g. 204 No Content from DELETE routes).
+    // `resp.json()` would fail with "error decoding response body" on
+    // empty payloads, which the caller would mistake for an upstream
+    // failure even though the operation succeeded. Return Null in that
+    // case so callers can still match on `status.is_success()`.
+    let body_text = resp.text().await.unwrap_or_default();
+    if body_text.trim().is_empty() {
+        return Ok((status, serde_json::Value::Null));
+    }
+    let result: serde_json::Value = serde_json::from_str(&body_text)
+        .map_err(|e| format!("response body not valid JSON: {e}"))?;
     Ok((status, result))
 }

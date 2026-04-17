@@ -475,6 +475,9 @@ async fn handle_compute_offer_create(
     )
     .await
     {
+        // UUID-OR-HANDLE-PATH: `offer_id` echoed verbatim in the HTTP
+        // response. Agent/CLI callers treat it as an opaque string; no
+        // assumption of UUID shape anywhere downstream.
         Ok(offer_id) => Ok(json_ok(&serde_json::json!({ "offer_id": offer_id }))),
         Err(e) => Ok(op_error_to_response(e)),
     }
@@ -492,7 +495,17 @@ async fn handle_compute_offer_update(
     body: compute_market_ops::OfferRequest,
     ctx: OperatorContext,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    if path_model_id != body.model_id {
+    // URL-decode the path param before comparing. `warp::path::param`
+    // does NOT decode percent-encoded segments, so a colon-bearing
+    // model name like `gemma4:26b` arrives as `gemma4%3A26b` here.
+    // Agents that percent-encode the path (every HTTP client does)
+    // would false-match-fail without this. Bug caught during prod
+    // smoke 2026-04-17.
+    let decoded_path = match urlencoding::decode(&path_model_id) {
+        Ok(s) => s.into_owned(),
+        Err(_) => path_model_id.clone(),
+    };
+    if decoded_path != body.model_id {
         return Ok(json_error(
             warp::http::StatusCode::BAD_REQUEST,
             "model_id in URL path must match model_id in body",
@@ -526,8 +539,14 @@ async fn handle_compute_offer_delete(
         Ok(handles) => handles,
         Err(resp) => return Ok(resp),
     };
+    // URL-decode the path param — warp doesn't do it for us. Same bug
+    // as the update handler; see that function's decode comment.
+    let decoded_model_id = match urlencoding::decode(&model_id) {
+        Ok(s) => s.into_owned(),
+        Err(_) => model_id.clone(),
+    };
     match compute_market_ops::remove_offer(
-        &model_id,
+        &decoded_model_id,
         &ctx.auth,
         &ctx.config,
         &market_state,
