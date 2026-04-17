@@ -113,6 +113,23 @@ pub struct MarketDispatchRequest {
     /// future tiers as relay market grows. Carried through the
     /// dispatch → settlement chain for observability.
     pub privacy_tier: String,
+
+    /// Forward-compat escape hatch. Wire adds new observability fields
+    /// (e.g. `trace_id`) under `extensions.*` without forcing a
+    /// lockstep node upgrade. Older nodes silently deserialize
+    /// unknown fields into this map and ignore them; newer nodes read
+    /// the keys they care about. Per contract §10.1.
+    ///
+    /// The outer struct keeps `deny_unknown_fields` so typos at the
+    /// TOP level still surface as 400. This field is the bounded
+    /// escape valve: unknown fields must live under `extensions`, not
+    /// at the root.
+    ///
+    /// Phase 2 Wire sends `{}` here. Wire pings the node-side owner
+    /// 48h ahead before shipping the first extension key so any
+    /// node-side consumer lands first.
+    #[serde(default)]
+    pub extensions: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Success payload inside `MarketAsyncResult::Success`. Identical in

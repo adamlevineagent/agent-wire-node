@@ -24700,3 +24700,404 @@ select.compute-input {
         font-size: 11px;
     }
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+   Compute Network — cooperative-framed hero surface
+   See docs/plans/compute-market-invisibility-ux.md for the framing.
+   Language: network connectivity, not trading floor. Every primary
+   string here must pass the "could this be WiFi setup?" test.
+   ═══════════════════════════════════════════════════════════════════ */
+
+.compute-market-view {
+    padding: 20px 24px 40px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.compute-net-hero {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-lg);
+    padding: 24px 28px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    box-shadow: var(--shadow-soft);
+    transition: background var(--transition), border-color var(--transition);
+}
+
+/* State variants — subtle ambient cues, never loud */
+.compute-net-connected {
+    border-color: rgba(64, 208, 128, 0.25);
+}
+.compute-net-ready {
+    border-color: rgba(34, 211, 238, 0.2);
+}
+.compute-net-active {
+    border-color: var(--accent-green);
+    box-shadow: 0 0 24px rgba(64, 208, 128, 0.15), var(--shadow-soft);
+}
+.compute-net-paused {
+    border-color: rgba(240, 192, 64, 0.3);
+}
+.compute-net-quiet {
+    opacity: 0.85;
+}
+.compute-net-consumer {
+    border-color: rgba(167, 139, 250, 0.25);
+}
+
+/* Header row — icon + title + state */
+.compute-net-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 15px;
+}
+
+.compute-net-icon {
+    font-size: 20px;
+    line-height: 1;
+}
+
+.compute-net-icon-dim {
+    opacity: 0.5;
+}
+
+.compute-net-icon-pulse {
+    animation: compute-net-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes compute-net-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.6; transform: scale(0.92); }
+}
+
+.compute-net-title {
+    font-weight: 600;
+    color: var(--text-primary);
+    letter-spacing: 0.2px;
+}
+
+.compute-net-status {
+    margin-left: auto;
+    font-size: 13px;
+    color: var(--text-secondary);
+    font-weight: 500;
+    padding: 4px 12px;
+    background: var(--glass);
+    border-radius: 999px;
+    letter-spacing: 0.2px;
+}
+
+.compute-net-status-active {
+    color: var(--accent-green);
+    background: rgba(64, 208, 128, 0.1);
+}
+
+.compute-net-status-dim {
+    opacity: 0.6;
+}
+
+/* Body copy — readable but unobtrusive */
+.compute-net-body {
+    color: var(--text-primary);
+    font-size: 14px;
+    line-height: 1.6;
+    margin: 0;
+}
+
+.compute-net-body-dim {
+    color: var(--text-secondary);
+    font-size: 13px;
+}
+
+/* Toggle row — the primary action on Ready/Quiet/Paused/Connected */
+.compute-net-toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+    padding: 12px 0;
+    border-top: 1px solid var(--glass-border);
+    border-bottom: 1px solid var(--glass-border);
+}
+
+.compute-net-toggle-label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.compute-net-toggle-primary {
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text-primary);
+}
+
+.compute-net-toggle-sub {
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.compute-net-model {
+    color: var(--accent-cyan);
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 11px;
+}
+
+.compute-net-toggle {
+    appearance: none;
+    border: 1px solid var(--glass-border);
+    background: var(--glass);
+    color: var(--text-secondary);
+    padding: 8px 16px;
+    border-radius: 999px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    transition: all var(--transition);
+    min-width: 82px;
+    justify-content: center;
+}
+
+.compute-net-toggle:hover:not(:disabled) {
+    background: var(--bg-card-hover);
+}
+
+.compute-net-toggle:disabled {
+    opacity: 0.6;
+    cursor: wait;
+}
+
+.compute-net-toggle-on {
+    background: rgba(64, 208, 128, 0.12);
+    border-color: rgba(64, 208, 128, 0.4);
+    color: var(--accent-green);
+}
+
+.compute-net-toggle-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-muted);
+}
+
+.compute-net-toggle-on .compute-net-toggle-dot {
+    background: var(--accent-green);
+    box-shadow: 0 0 8px rgba(64, 208, 128, 0.6);
+}
+
+/* Divider within the Connected card */
+.compute-net-divider {
+    height: 1px;
+    background: var(--glass-border);
+    margin: 4px 0;
+}
+
+/* Contribution summary — Last hour / This week rows */
+.compute-net-summary {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.compute-net-summary-block {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.compute-net-summary-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-muted);
+    font-weight: 600;
+}
+
+.compute-net-summary-line {
+    font-size: 13px;
+    color: var(--text-primary);
+    font-family: 'SF Mono', Menlo, monospace;
+    line-height: 1.5;
+}
+
+.compute-net-balance-positive {
+    color: var(--accent-green);
+}
+
+.compute-net-balance-negative {
+    color: var(--accent-warm);
+}
+
+.compute-net-balance-line {
+    font-size: 12px;
+    color: var(--text-secondary);
+    font-family: 'SF Mono', Menlo, monospace;
+    padding-top: 4px;
+}
+
+/* Actions row — CTA + secondary button */
+.compute-net-actions {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.compute-net-primary {
+    appearance: none;
+    background: var(--gradient-hero);
+    color: var(--bg-deep);
+    font-weight: 600;
+    padding: 10px 20px;
+    border-radius: var(--radius-sm);
+    border: none;
+    cursor: pointer;
+    font-size: 13px;
+    letter-spacing: 0.3px;
+    text-decoration: none;
+    display: inline-block;
+    transition: transform var(--transition), box-shadow var(--transition);
+}
+
+.compute-net-primary:hover {
+    transform: translateY(-1px);
+    box-shadow: var(--shadow-glow);
+}
+
+.compute-net-secondary {
+    appearance: none;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    color: var(--text-primary);
+    padding: 10px 20px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    transition: all var(--transition);
+}
+
+.compute-net-secondary:hover:not(:disabled) {
+    background: var(--bg-card-hover);
+    border-color: var(--text-secondary);
+}
+
+.compute-net-secondary:disabled {
+    opacity: 0.5;
+    cursor: wait;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   Advanced Drawer — hidden expert surface, default-closed
+   ═══════════════════════════════════════════════════════════════════ */
+
+.advanced-drawer {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    transition: background var(--transition);
+}
+
+.advanced-drawer-closed {
+    background: transparent;
+}
+
+.advanced-drawer-toggle {
+    appearance: none;
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    padding: 12px 20px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    text-align: left;
+    transition: color var(--transition);
+}
+
+.advanced-drawer-toggle:hover {
+    color: var(--text-primary);
+}
+
+.advanced-drawer-caret {
+    display: inline-block;
+    transition: transform var(--transition);
+    font-size: 10px;
+    color: var(--text-muted);
+}
+
+.advanced-drawer-caret-open {
+    transform: rotate(90deg);
+}
+
+.advanced-drawer-label {
+    font-weight: 600;
+}
+
+.advanced-drawer-hint {
+    color: var(--text-muted);
+    font-weight: 400;
+    font-size: 12px;
+}
+
+.advanced-drawer-body {
+    padding: 16px 20px 24px;
+    border-top: 1px solid var(--glass-border);
+    background: rgba(0, 0, 0, 0.12);
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+}
+
+.compute-advanced-section {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.compute-advanced-heading {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: var(--text-muted);
+    font-weight: 700;
+    margin: 0;
+}
+
+/* Mobile breakpoint — keep things readable on narrow windows */
+@media (max-width: 720px) {
+    .compute-net-hero {
+        padding: 18px 20px;
+    }
+
+    .compute-net-toggle-row {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 12px;
+    }
+
+    .compute-net-toggle {
+        align-self: flex-start;
+    }
+
+    .compute-net-header {
+        flex-wrap: wrap;
+    }
+
+    .compute-net-status {
+        margin-left: 0;
+    }
+}
+

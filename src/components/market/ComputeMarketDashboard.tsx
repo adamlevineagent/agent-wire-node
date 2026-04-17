@@ -1,65 +1,117 @@
-// ComputeMarketDashboard.tsx — Top-level compute market page.
+// ComputeMarketDashboard.tsx — Top-level Market → Compute surface.
 //
-// Aggregates:
-//   - is_serving toggle + observability summary from
-//     `compute_market_get_state`.
-//   - ComputeOfferManager (publish/edit/remove offers).
-//   - ComputeMarketSurface (browse network pricing, read-only).
+// FRAMING (authoritative — see docs/plans/compute-market-invisibility-ux.md):
 //
-// Per `compute-market-phase-2-exchange.md` §IV + §III "compute_market_
-// enable/disable": the `is_serving` toggle is the RUNTIME pause
-// switch — distinct from the durable `compute_participation_policy.
-// allow_market_visibility`. A node with allow_market_visibility=false
-// AND is_serving=true still won't publish (policy gate wins). The
-// UX should reflect both states.
+// The compute market is a cooperative compute pool. Under the hood there's
+// real market machinery — rotator arm, prices, queue discounts, settlement.
+// But to the operator, the value proposition is *network connectivity*:
+// "my pyramids build fast because I'm in the network; when I'm idle, I
+// help others." Credits are accounting; the ledger exists, but isn't the
+// point.
+//
+// This component is now a thin shell:
+//   1. Poll the three IPCs needed to derive the network state.
+//   2. Render the ComputeNetworkStatus hero (6 possible card variants).
+//   3. Wrap the existing trader-surface components (offer config,
+//      market surface, policy matrix, raw ledger) in an AdvancedDrawer
+//      that's default-closed.
+//
+// The "Compute Market" hero title and the stats grid that used to live
+// here have been demoted to the Advanced drawer. Every string above
+// the fold is now in cooperative/connectivity language per the plan
+// doc's language contract.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { AdvancedDrawer } from "./AdvancedDrawer";
+import {
+    ComputeNetworkStatus,
+    deriveNetworkState,
+} from "./ComputeNetworkStatus";
 import { ComputeOfferManager } from "./ComputeOfferManager";
 import { ComputeMarketSurface } from "./ComputeMarketSurface";
+import type {
+    ComputeEvent,
+    ComputeMarketStateSnapshot,
+    LocalModeStatus,
+} from "./types";
 
-interface ComputeMarketStateSnapshot {
-    schema_version: number;
-    offers: Record<string, unknown>;
-    active_jobs: Record<string, unknown>;
-    total_jobs_completed: number;
-    total_credits_earned: number;
-    session_jobs_completed: number;
-    session_credits_earned: number;
-    is_serving: boolean;
-    last_evaluation_at: string | null;
-    queue_mirror_seq: Record<string, number>;
-}
+/// Refresh cadence for the snapshot + local-mode + recent-events
+/// triple. 5 seconds matches the prior dashboard's cadence; none of
+/// these IPCs hit the Wire, they're all local SQLite reads.
+const REFRESH_INTERVAL_MS = 5_000;
 
-type Tab = "offers" | "surface";
+/// Lookback for the "helped builds" activity indicator. An hour
+/// strikes the right "recent enough to be meaningful, long enough to
+/// register idle activity" balance.
+const RECENT_EVENTS_WINDOW_MS = 60 * 60 * 1_000;
+
+/// Session-scoped dismissal for the consumer-invite card. Keyed in
+/// sessionStorage so the invite returns on the next session but stays
+/// quiet for this one after the operator clicks "Not right now."
+const CONSUMER_INVITE_DISMISSED_KEY = "wire.compute.consumer-invite-dismissed";
 
 export function ComputeMarketDashboard() {
     const [snapshot, setSnapshot] = useState<ComputeMarketStateSnapshot | null>(null);
-    const [loading, setLoading] = useState(true);
+    const [localMode, setLocalMode] = useState<LocalModeStatus | null>(null);
+    const [recentEvents, setRecentEvents] = useState<ComputeEvent[]>([]);
     const [toggling, setToggling] = useState(false);
     const [error, setError] = useState<string | null>(null);
-    const [tab, setTab] = useState<Tab>("offers");
+    const [consumerDismissed, setConsumerDismissed] = useState<boolean>(() => {
+        try {
+            return sessionStorage.getItem(CONSUMER_INVITE_DISMISSED_KEY) === "1";
+        } catch {
+            return false;
+        }
+    });
 
     const refresh = useCallback(async () => {
-        try {
-            const snap = await invoke<ComputeMarketStateSnapshot>("compute_market_get_state");
-            setSnapshot(snap);
-            setError(null);
-        } catch (e) {
-            setError(String(e));
-        } finally {
-            setLoading(false);
-        }
+        // Three IPCs in parallel. None hit the Wire — all local reads —
+        // so there's no latency reason to serialize, and the surface
+        // stays coherent if they all land at once.
+        //
+        // Note: we don't call `get_compute_summary` here. That query
+        // returns event-counts + latency dimensions but not credit
+        // totals. Credit roll-ups live on ComputeMarketState itself
+        // (session_credits_earned, total_credits_earned). If we need
+        // a real week-scoped rollup later, Phase 3 will add a
+        // credit-scoped chronicle query.
+        const since = new Date(Date.now() - RECENT_EVENTS_WINDOW_MS).toISOString();
+
+        const [snapRes, localRes, eventsRes] = await Promise.allSettled([
+            invoke<ComputeMarketStateSnapshot>("compute_market_get_state"),
+            invoke<LocalModeStatus>("pyramid_get_local_mode_status"),
+            invoke<ComputeEvent[]>("get_compute_events", {
+                // chronicle filter: only provider-side accept events in
+                // the last hour. Matches EVENT_MARKET_RECEIVED emissions
+                // from spawn_market_worker — the "we helped a build"
+                // signal we want to surface.
+                eventType: "market_received",
+                after: since,
+                limit: 50,
+            }),
+        ]);
+
+        let firstError: string | null = null;
+        if (snapRes.status === "fulfilled") setSnapshot(snapRes.value);
+        else firstError ??= String(snapRes.reason);
+        if (localRes.status === "fulfilled") setLocalMode(localRes.value);
+        // Local-mode read failures are recoverable — the hero falls
+        // back to "no model" rendering. Don't surface them as top-level
+        // errors; that'd make the error banner spam on fresh installs.
+        if (eventsRes.status === "fulfilled") setRecentEvents(eventsRes.value ?? []);
+        else setRecentEvents([]);
+
+        setError(firstError);
     }, []);
 
     useEffect(() => {
         void refresh();
-        // Refresh every 5s to keep counters live. Cheap IPC, no Wire call.
-        const handle = setInterval(() => void refresh(), 5000);
+        const handle = setInterval(() => void refresh(), REFRESH_INTERVAL_MS);
         return () => clearInterval(handle);
     }, [refresh]);
 
-    const handleToggle = async () => {
+    const handleToggleServing = async () => {
         if (!snapshot) return;
         setToggling(true);
         setError(null);
@@ -74,42 +126,32 @@ export function ComputeMarketDashboard() {
         }
     };
 
-    // Null-safe accessors — the initial render before the first IPC
-    // returns has `snapshot === null`, and the `Record<string, unknown>`
-    // fields can come back missing in degraded states. Falling back to
-    // 0 everywhere prevents the "undefined" render bug on cold start.
-    const isServing = snapshot?.is_serving ?? false;
-    const offerCount = snapshot ? Object.keys(snapshot.offers ?? {}).length : 0;
-    const activeJobCount = snapshot ? Object.keys(snapshot.active_jobs ?? {}).length : 0;
-    const sessionJobs = snapshot?.session_jobs_completed ?? 0;
-    const sessionCredits = snapshot?.session_credits_earned ?? 0;
-    const lifetimeJobs = snapshot?.total_jobs_completed ?? 0;
-    const lifetimeCredits = snapshot?.total_credits_earned ?? 0;
+    const handleDismissConsumerInvite = () => {
+        setConsumerDismissed(true);
+        try {
+            sessionStorage.setItem(CONSUMER_INVITE_DISMISSED_KEY, "1");
+        } catch {
+            /* private-mode browsers — no-op */
+        }
+    };
+
+    const networkState = useMemo(
+        () => deriveNetworkState(snapshot, localMode, recentEvents, consumerDismissed),
+        [snapshot, localMode, recentEvents, consumerDismissed],
+    );
 
     return (
         <div className="compute-market-view">
-            <header className="compute-market-hero">
-                <div className="compute-market-hero-text">
-                    <h2 className="compute-market-hero-title">Compute Market</h2>
-                    <p className="compute-market-hero-sub">
-                        Publish your GPU as a compute offer on the Wire. Market dispatches land
-                        in the same queue as local + fleet work; settlement is Wire-side.
-                    </p>
-                </div>
-                <button
-                    className={`compute-market-toggle ${isServing ? "compute-market-toggle-on" : "compute-market-toggle-off"}`}
-                    onClick={handleToggle}
-                    disabled={toggling || loading}
-                    title={
-                        isServing
-                            ? "Pause serving — stops pushing queue state to the Wire. Does not remove offers."
-                            : "Start serving — resume pushing queue state. Requires allow_market_visibility on the participation policy."
-                    }
-                >
-                    <span className="compute-market-toggle-dot" />
-                    {toggling ? "…" : isServing ? "Pause serving" : "Start serving"}
-                </button>
-            </header>
+            <ComputeNetworkStatus
+                state={networkState}
+                snapshot={snapshot}
+                localMode={localMode}
+                recentEvents={recentEvents}
+                onToggleServing={handleToggleServing}
+                togglingServing={toggling}
+                onDismissConsumerInvite={handleDismissConsumerInvite}
+                consumerInviteDismissed={consumerDismissed}
+            />
 
             {error && (
                 <div className="compute-market-error" role="alert">
@@ -117,82 +159,16 @@ export function ComputeMarketDashboard() {
                 </div>
             )}
 
-            <section className="compute-market-stats">
-                <StatCard
-                    label="Serving"
-                    value={loading && !snapshot ? "…" : isServing ? "Yes" : "No"}
-                    tone={isServing ? "positive" : "muted"}
-                />
-                <StatCard label="Offers" value={String(offerCount)} />
-                <StatCard label="Active jobs" value={String(activeJobCount)} />
-                <StatCard
-                    label="Session credits"
-                    value={formatCredits(sessionCredits)}
-                    subtitle={`${sessionJobs} job${sessionJobs === 1 ? "" : "s"} · ${formatCredits(
-                        lifetimeCredits,
-                    )} lifetime (${lifetimeJobs})`}
-                />
-            </section>
-
-            <nav className="compute-market-subtabs">
-                <SubTab label="My offers" active={tab === "offers"} onClick={() => setTab("offers")} />
-                <SubTab
-                    label="Market surface"
-                    active={tab === "surface"}
-                    onClick={() => setTab("surface")}
-                />
-            </nav>
-
-            <div className="compute-market-subtab-content">
-                {tab === "offers" && <ComputeOfferManager />}
-                {tab === "surface" && <ComputeMarketSurface />}
-            </div>
+            <AdvancedDrawer label="Advanced" hint="rates, offers, market inspector">
+                <div className="compute-advanced-section">
+                    <h4 className="compute-advanced-heading">Your offers</h4>
+                    <ComputeOfferManager />
+                </div>
+                <div className="compute-advanced-section">
+                    <h4 className="compute-advanced-heading">Market surface</h4>
+                    <ComputeMarketSurface />
+                </div>
+            </AdvancedDrawer>
         </div>
     );
-}
-
-interface StatCardProps {
-    label: string;
-    value: string;
-    subtitle?: string;
-    tone?: "default" | "positive" | "muted";
-}
-
-function StatCard({ label, value, subtitle, tone = "default" }: StatCardProps) {
-    return (
-        <div className={`compute-stat compute-stat-tone-${tone}`}>
-            <div className="compute-stat-label">{label}</div>
-            <div className="compute-stat-value">{value}</div>
-            {subtitle && <div className="compute-stat-subtitle">{subtitle}</div>}
-        </div>
-    );
-}
-
-function SubTab({
-    label,
-    active,
-    onClick,
-}: {
-    label: string;
-    active: boolean;
-    onClick: () => void;
-}) {
-    return (
-        <button
-            className={`compute-market-subtab ${active ? "compute-market-subtab-active" : ""}`}
-            onClick={onClick}
-        >
-            {label}
-        </button>
-    );
-}
-
-/**
- * Format a credits i64 as a thousands-separated string.
- * Keeps integers exact (Pillar 9 — no float rounding on the
- * credit path).
- */
-function formatCredits(n: number): string {
-    if (!Number.isFinite(n)) return "0";
-    return n.toLocaleString("en-US", { maximumFractionDigits: 0 });
 }
