@@ -62,7 +62,10 @@ pub enum AuthSource {
 
 /// Validate bearer token and pass state through. LOCAL-ONLY auth — rejects Wire JWTs.
 /// Used for mutation endpoints and endpoints that should never be remotely accessible.
-fn with_auth_state(
+///
+/// `pub(super)` so sibling modules (e.g. `pyramid::routes_operator`) can
+/// reuse the same auth mechanism without re-implementing it.
+pub(super) fn with_auth_state(
     state: Arc<PyramidState>,
 ) -> impl Filter<Extract = (Arc<PyramidState>,), Error = warp::Rejection> + Clone {
     warp::header::optional::<String>("authorization")

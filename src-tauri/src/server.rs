@@ -52,6 +52,15 @@ pub struct ServerState {
     /// boot constructs this before spawning the HTTP server.
     pub compute_market_state:
         Option<Arc<RwLock<crate::compute_market::ComputeMarketState>>>,
+    /// Node configuration (api_url, supabase creds, cache paths).
+    /// Needed by operator HTTP routes that proxy to the Wire API
+    /// (compute offers, market surface) and by system observability
+    /// routes that surface the node's configured endpoints.
+    pub config: Arc<RwLock<crate::WireNodeConfig>>,
+    /// Rolling work statistics snapshot (jobs done, retries, queue
+    /// depth by state). Surfaced via `/pyramid/system/work-stats` for
+    /// agent observability.
+    pub work_stats: Arc<RwLock<crate::work::WorkStats>>,
 }
 
 #[derive(Serialize)]
@@ -429,6 +438,8 @@ pub async fn start_server(
     fleet_dispatch: Option<Arc<crate::fleet::FleetDispatchContext>>,
     compute_market_dispatch: Option<Arc<crate::pyramid::market_dispatch::MarketDispatchContext>>,
     compute_market_state: Option<Arc<RwLock<crate::compute_market::ComputeMarketState>>>,
+    config: Arc<RwLock<crate::WireNodeConfig>>,
+    work_stats: Arc<RwLock<crate::work::WorkStats>>,
 ) {
     let state = ServerState {
         cache_dir,
@@ -443,6 +454,8 @@ pub async fn start_server(
         fleet_roster,
         compute_queue,
         fleet_dispatch,
+        config,
+        work_stats,
         compute_market_dispatch,
         compute_market_state,
     };
@@ -1023,6 +1036,27 @@ pub async fn start_server(
         state.auth.clone(),    // Sprint 3: wire agent token for remote query proxy
     );
 
+    // Operator-facing HTTP surface — compute market, system observability,
+    // local mode / providers. LOCAL-ONLY auth (Bearer from
+    // pyramid_config.json::auth_token), mounted under /pyramid/* alongside
+    // the existing pyramid routes. Agent/CLI tooling (pyramid-cli) hits
+    // these endpoints to drive the node without touching the desktop UI.
+    let operator_routes = pyramid::routes_operator::operator_routes(
+        pyramid::routes_operator::OperatorContext {
+            pyramid: state.pyramid.clone(),
+            auth: state.auth.clone(),
+            credits: state.credits.clone(),
+            config: state.config.clone(),
+            tunnel_state: state.tunnel_state.clone(),
+            sync_state: state.sync_state.clone(),
+            fleet_roster: state.fleet_roster.clone(),
+            work_stats: state.work_stats.clone(),
+            node_id: state.node_id.clone(),
+            compute_market_state: state.compute_market_state.clone(),
+            compute_market_dispatch: state.compute_market_dispatch.clone(),
+        },
+    );
+
     // Post-agents-retro /p/ HTML web surface — mounted separately so it can
     // get a permissive CORS filter. The strict desktop-API allowlist above
     // would reject same-tunnel form POSTs (the browser sends an Origin header
@@ -1163,7 +1197,8 @@ pub async fn start_server(
         .or(public_html_with_cors)
         .or(openrouter_webhook_with_cors)
         .or(fleet_routes)
-        .or(pyramid_routes
+        .or(operator_routes
+            .or(pyramid_routes)
             .or(partner_routes)
             .or(auth_callback
                 .or(auth_complete)
@@ -1171,7 +1206,16 @@ pub async fn start_server(
                 .or(tunnel_debug)
                 .or(documents)
                 .or(stats))
-            .with(cors));
+            .with(cors))
+        // Root-level recover: maps our custom `Unauthorized` +
+        // `RateLimited` rejections onto proper 401 / 429 responses
+        // with JSON error bodies. Without this, warp's default
+        // rejection handler turns custom rejects into 404s, making
+        // auth failures look like missing routes. Applied at the root
+        // so every branch benefits (pyramid_routes, operator_routes,
+        // partner_routes, fleet_routes — all of which reject with
+        // custom types).
+        .recover(crate::http_utils::handle_rejection);
 
     tracing::info!("Wire Node HTTP server starting on 127.0.0.1:{}", port);
     warp::serve(routes).run(([127, 0, 0, 1], port)).await;
@@ -3064,6 +3108,14 @@ async fn handle_market_dispatch(
             active_depth_for_model,
             max_queue_depth
         );
+        // Field names are load-bearing: the Wire's queue-mirror
+        // fail-forward logic (per Phase-2 Wire-side handoff) reads
+        // `current_market_queue_depth` + `max_market_queue_depth`
+        // from this body to correct its stale mirror snapshot when
+        // the node rejects a dispatch. Keeping the short aliases
+        // (`current`, `max`) for UI/log readability; they're harmless
+        // extras and the Wire's schema-validator is set to warn-don't-
+        // reject on unknown fields (per Q-PROTO-3).
         return Ok(Box::new(warp::reply::with_status(
             warp::reply::with_header(
                 warp::reply::with_header(
@@ -3072,6 +3124,8 @@ async fn handle_market_dispatch(
                         "model": req.model,
                         "current": active_depth_for_model,
                         "max": max_queue_depth,
+                        "current_market_queue_depth": active_depth_for_model,
+                        "max_market_queue_depth": max_queue_depth,
                     })),
                     "Retry-After",
                     policy.admission_retry_after_secs.to_string(),

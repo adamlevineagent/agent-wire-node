@@ -1641,12 +1641,302 @@ async function run(): Promise<void> {
       break;
     }
 
+    // ── Compute Market ──────────────────────────────────────────────────
+    //
+    // Offer management + market browsing + serving toggle. Mirror the
+    // IPC surface exposed by the desktop UI (src-tauri/src/main.rs
+    // compute_* commands) via the /pyramid/compute/* HTTP routes
+    // (src-tauri/src/pyramid/routes_operator.rs).
+
+    case "compute-offer-create":
+    case "compute-offer-update": {
+      const modelId = requireArg(1, "model_id");
+      const body: Record<string, unknown> = {
+        model_id: modelId,
+        provider_type: flags["provider-type"] || "local",
+        rate_per_m_input: numberFlag("rate-per-m-input", true)!,
+        rate_per_m_output: numberFlag("rate-per-m-output", true)!,
+        reservation_fee: numberFlag("reservation-fee", true)!,
+        max_queue_depth: numberFlag("max-queue-depth", true)!,
+      };
+      if (flags["queue-discount-curve"]) {
+        try {
+          body.queue_discount_curve = JSON.parse(flags["queue-discount-curve"]);
+        } catch (e) {
+          process.stderr.write(`Error: --queue-discount-curve must be valid JSON: ${e}\n`);
+          process.exit(1);
+        }
+      }
+      // Both create (POST) and update (PUT /offers/:model_id) go through
+      // Wire's UPSERT. Update uses PUT for HTTP semantics + the path-
+      // param model_id match check on the server.
+      const isUpdate = command === "compute-offer-update";
+      const path = isUpdate
+        ? `/pyramid/compute/offers/${enc(modelId)}`
+        : `/pyramid/compute/offers`;
+      output(await pf(path, { method: isUpdate ? "PUT" : "POST", body }));
+      break;
+    }
+
+    case "compute-offer-remove": {
+      const modelId = requireArg(1, "model_id");
+      output(
+        await pf(`/pyramid/compute/offers/${enc(modelId)}`, { method: "DELETE" })
+      );
+      break;
+    }
+
+    case "compute-offers-list": {
+      output(await pf(`/pyramid/compute/offers`));
+      break;
+    }
+
+    case "compute-market-surface": {
+      const q = flags["model-id"] ? `?model_id=${enc(flags["model-id"])}` : "";
+      output(await pf(`/pyramid/compute/market/surface${q}`));
+      break;
+    }
+
+    case "compute-market-enable": {
+      output(await pf(`/pyramid/compute/market/enable`, { method: "POST" }));
+      break;
+    }
+
+    case "compute-market-disable": {
+      output(await pf(`/pyramid/compute/market/disable`, { method: "POST" }));
+      break;
+    }
+
+    case "compute-market-state": {
+      output(await pf(`/pyramid/compute/market/state`));
+      break;
+    }
+
+    case "compute-policy-get": {
+      output(await pf(`/pyramid/compute/policy`));
+      break;
+    }
+
+    case "compute-policy-set": {
+      // ComputeParticipationPolicy has some non-optional fields (e.g.
+      // `mode`), so a partial body fails deserialization. For an agent-
+      // friendly CLI we want "flip these flags, leave everything else
+      // alone" semantics — so we GET the current policy, patch it with
+      // the flags the caller provided, then PUT the merged body back.
+      // This is PATCH-over-PUT; it costs one extra round-trip but keeps
+      // the CLI declarative and prevents the caller from accidentally
+      // blanking fields they didn't mean to change.
+      const current = await pf(`/pyramid/compute/policy`);
+      if (!current.ok) {
+        output(current);
+        break;
+      }
+      const policy = (typeof current.data === "object" && current.data !== null)
+        ? { ...(current.data as Record<string, unknown>) }
+        : {};
+      if (flags.mode) policy.mode = flags.mode;
+      for (const key of [
+        "allow_fleet_dispatch",
+        "allow_fleet_serving",
+        "allow_market_dispatch",
+        "allow_market_visibility",
+        "allow_storage_pulling",
+        "allow_storage_hosting",
+        "allow_relay_usage",
+        "allow_relay_serving",
+        "allow_serving_while_degraded",
+      ]) {
+        const cli = key.replace(/_/g, "-");
+        if (flags[cli] !== undefined) {
+          policy[key] = flags[cli] === "true";
+        }
+      }
+      output(await pf(`/pyramid/compute/policy`, { method: "PUT", body: policy }));
+      break;
+    }
+
+    // ── System Observability ─────────────────────────────────────────────
+    //
+    // Node-level read-only state (no arguments). Surfaces via
+    // /pyramid/system/* routes. LOCAL-ONLY auth — these return credit
+    // balance, work stats, tunnel status, fleet roster, and compute
+    // chronicle data.
+
+    case "system-health": {
+      output(await pf(`/pyramid/system/health`));
+      break;
+    }
+
+    case "system-credits": {
+      output(await pf(`/pyramid/system/credits`));
+      break;
+    }
+
+    case "system-work-stats": {
+      output(await pf(`/pyramid/system/work-stats`));
+      break;
+    }
+
+    case "system-fleet-roster": {
+      output(await pf(`/pyramid/system/fleet-roster`));
+      break;
+    }
+
+    case "system-tunnel": {
+      output(await pf(`/pyramid/system/tunnel`));
+      break;
+    }
+
+    case "system-auth":
+    case "whoami": {
+      output(await pf(`/pyramid/system/auth`));
+      break;
+    }
+
+    case "system-compute-events": {
+      const params = new URLSearchParams();
+      for (const key of [
+        "slug",
+        "build_id",
+        "chain_name",
+        "content_type",
+        "step_name",
+        "primitive",
+        "depth",
+        "model_id",
+        "source",
+        "event_type",
+        "after",
+        "before",
+        "limit",
+        "offset",
+      ]) {
+        const cli = key.replace(/_/g, "-");
+        if (flags[cli] !== undefined) {
+          params.set(key, flags[cli]);
+        }
+      }
+      const qs = params.toString() ? `?${params.toString()}` : "";
+      output(await pf(`/pyramid/system/compute/events${qs}`));
+      break;
+    }
+
+    case "system-compute-summary": {
+      const periodStart = flags["period-start"];
+      const periodEnd = flags["period-end"];
+      if (!periodStart || !periodEnd) {
+        process.stderr.write(
+          "Error: --period-start and --period-end are required (RFC3339 timestamps).\n"
+        );
+        process.exit(1);
+      }
+      const groupBy = flags["group-by"] || "source";
+      const qs = `?period_start=${enc(periodStart)}&period_end=${enc(periodEnd)}&group_by=${enc(groupBy)}`;
+      output(await pf(`/pyramid/system/compute/summary${qs}`));
+      break;
+    }
+
+    case "system-compute-timeline": {
+      const start = flags.start;
+      const end = flags.end;
+      if (!start || !end) {
+        process.stderr.write(
+          "Error: --start and --end are required (RFC3339 timestamps).\n"
+        );
+        process.exit(1);
+      }
+      const bucket = flags["bucket-size-minutes"] || "60";
+      const qs = `?start=${enc(start)}&end=${enc(end)}&bucket_size_minutes=${enc(bucket)}`;
+      output(await pf(`/pyramid/system/compute/timeline${qs}`));
+      break;
+    }
+
+    case "system-compute-dimensions": {
+      output(await pf(`/pyramid/system/compute/chronicle-dimensions`));
+      break;
+    }
+
+    // ── Local Mode + Providers ──────────────────────────────────────────
+
+    case "local-mode-status": {
+      const slug = flags.slug || "default";
+      output(await pf(`/pyramid/${enc(slug)}/local-mode`));
+      break;
+    }
+
+    case "local-mode-enable": {
+      const slug = flags.slug || "default";
+      const baseUrl = flags["base-url"];
+      if (!baseUrl) {
+        process.stderr.write("Error: --base-url is required (e.g. http://localhost:11434/v1)\n");
+        process.exit(1);
+      }
+      const body: Record<string, unknown> = { base_url: baseUrl };
+      if (flags.model) body.model = flags.model;
+      output(
+        await pf(`/pyramid/${enc(slug)}/local-mode/enable`, {
+          method: "POST",
+          body,
+        })
+      );
+      break;
+    }
+
+    case "local-mode-disable": {
+      const slug = flags.slug || "default";
+      output(
+        await pf(`/pyramid/${enc(slug)}/local-mode/disable`, { method: "POST" })
+      );
+      break;
+    }
+
+    case "local-mode-switch-model": {
+      const slug = flags.slug || "default";
+      const model = requireArg(1, "model");
+      output(
+        await pf(`/pyramid/${enc(slug)}/local-mode/switch-model`, {
+          method: "POST",
+          body: { model },
+        })
+      );
+      break;
+    }
+
+    case "providers-list": {
+      const slug = flags.slug || "default";
+      output(await pf(`/pyramid/${enc(slug)}/providers`));
+      break;
+    }
+
     default: {
       process.stderr.write(`Unknown command: ${command}\n\n`);
       printUsage();
       process.exit(1);
     }
   }
+}
+
+// ── Helpers for new compute-market commands ─────────────────────────────────
+
+/**
+ * Parse a required number flag. Emits a usage error if missing or non-numeric.
+ * Pass `required = false` to return `undefined` when the flag is absent.
+ */
+function numberFlag(flagName: string, required: boolean): number | undefined {
+  const raw = flags[flagName];
+  if (raw === undefined) {
+    if (required) {
+      process.stderr.write(`Error: --${flagName} is required (number)\n`);
+      process.exit(1);
+    }
+    return undefined;
+  }
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    process.stderr.write(`Error: --${flagName} must be a number (got '${raw}')\n`);
+    process.exit(1);
+  }
+  return n;
 }
 
 function printUsage(): void {
@@ -1746,6 +2036,62 @@ Agent Coordination:
   react <slug> <annotation_id> up|down  Vote on an annotation
   session-register <slug> [--agent name]  Register an agent session
   sessions <slug>                List recent agent sessions
+
+Compute Market:
+  compute-offer-create <model_id>       Create an offer (see flags below)
+  compute-offer-update <model_id>       Update an offer (UPSERT, PUT to path)
+  compute-offer-remove <model_id>       Remove an offer
+  compute-offers-list                   List all offers this node has published
+  compute-market-surface [--model-id X] Wire-side market aggregation
+  compute-market-enable                 Turn serving on
+  compute-market-disable                Turn serving off
+  compute-market-state                  Full in-memory ComputeMarketState snapshot
+  compute-policy-get                    Read compute_participation_policy
+  compute-policy-set [flags]            Set participation policy (see flags)
+
+Offer create/update flags:
+  --rate-per-m-input N        Credits per million input tokens (required)
+  --rate-per-m-output N       Credits per million output tokens (required)
+  --reservation-fee N         Fixed per-request fee (required)
+  --max-queue-depth N         Per-offer queue cap (required)
+  --provider-type local|bridge (default: local)
+  --queue-discount-curve JSON Optional array of {queue_depth, discount_bps}
+
+Policy-set flags (matches ComputeParticipationPolicy struct; all optional):
+  --mode <coordinator|hub|leaf|silent>   Policy projection mode
+  --allow-fleet-dispatch true|false
+  --allow-fleet-serving true|false
+  --allow-market-dispatch true|false
+  --allow-market-visibility true|false
+  --allow-storage-pulling true|false
+  --allow-storage-hosting true|false
+  --allow-relay-usage true|false
+  --allow-relay-serving true|false
+  --allow-serving-while-degraded true|false
+
+System Observability:
+  system-health                  Node health (version, auth status, credits, tunnel)
+  system-credits                 Credit balance + topup history
+  system-work-stats              Queue depths, jobs done, retries
+  system-fleet-roster            Peer nodes in the operator's fleet
+  system-tunnel                  Cloudflare tunnel status
+  system-auth (alias: whoami)    Operator + node identity
+  system-compute-events [filters]      Query compute event chronicle
+  system-compute-summary --period-start ... --period-end ... [--group-by source]
+  system-compute-timeline --start ... --end ... [--bucket-size-minutes 60]
+  system-compute-dimensions            Distinct dimension values seen in chronicle
+
+Event filters (all optional):
+  --slug X  --build-id X  --chain-name X  --content-type X  --step-name X
+  --primitive X  --depth N  --model-id X  --source X  --event-type X
+  --after RFC3339  --before RFC3339  --limit N  --offset N
+
+Local Mode + Providers:
+  local-mode-status [--slug X]           Local mode on/off + selected model + reachability
+  local-mode-enable --base-url URL [--model M]  Enable Ollama local mode
+  local-mode-disable                     Disable local mode
+  local-mode-switch-model <model>        Switch to a different Ollama model
+  providers-list                         List configured LLM providers
 
 Annotation flags:
   --question "..."     Question this answers (triggers FAQ)

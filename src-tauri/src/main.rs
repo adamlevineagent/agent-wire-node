@@ -354,6 +354,10 @@ async fn get_operator_session(
 /// Helper: build and send an HTTP request, returning (status, body_value).
 /// Checks status BEFORE parsing JSON — non-JSON error responses (nginx 502, raw 401)
 /// produce a text fallback instead of misleading JSON parse errors.
+/// Thin delegation to the shared `http_utils::send_api_request`. The
+/// impl moved there so the warp HTTP handlers (which can't reach into
+/// main.rs symbols) can call it too. Signature preserved for all
+/// existing IPC callers.
 async fn send_api_request(
     api_url: &str,
     method: &str,
@@ -362,40 +366,8 @@ async fn send_api_request(
     body: Option<&serde_json::Value>,
     extra_headers: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<(reqwest::StatusCode, serde_json::Value), String> {
-    let client = reqwest::Client::new();
-    let url = format!("{}{}", api_url, path);
-    let mut req = match method {
-        "GET" => client.get(&url),
-        "POST" => client.post(&url),
-        "PATCH" => client.patch(&url),
-        "PUT" => client.put(&url),
-        "DELETE" => client.delete(&url),
-        _ => return Err("Invalid method".to_string()),
-    };
-    req = req.header("Authorization", format!("Bearer {}", token));
-    if let Some(headers) = extra_headers {
-        for (k, v) in headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-    }
-    if let Some(b) = body {
-        req = req.json(b);
-    }
-
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    let status = resp.status();
-
-    // Check status BEFORE attempting JSON parse
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        // Try to parse as JSON for structured errors, fall back to text
-        let error_value = serde_json::from_str::<serde_json::Value>(&text)
-            .unwrap_or_else(|_| serde_json::json!({ "error": text, "status": status.as_u16() }));
-        return Err(format!("API error {}: {}", status.as_u16(), error_value));
-    }
-
-    let result: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    Ok((status, result))
+    wire_node_lib::http_utils::send_api_request(api_url, method, path, token, body, extra_headers)
+        .await
 }
 
 /// Make an authenticated API call using the operator session token.
@@ -8654,33 +8626,13 @@ async fn pyramid_disable_local_mode(
 
 /// After a provider-registry refresh (local mode toggle, tier routing
 /// contribution apply, etc.), re-resolve the cascade model fields on the
-/// live LlmConfig from the current tier routing table. This ensures
-/// `call_model_unified`'s cascade sends the correct model name for
-/// whichever provider is now active.
+/// live LlmConfig from the current tier routing table.
+///
+/// IPC layer wrapper — delegates to the lib-level function so HTTP
+/// route handlers (in `pyramid::routes_operator`) can call the same
+/// logic without a round-trip through the Tauri State API.
 async fn rebuild_cascade_from_registry(state: &tauri::State<'_, SharedState>) {
-    let reg = &state.pyramid.provider_registry;
-    let mut live = state.pyramid.config.write().await;
-    if let Ok(r) = reg.resolve_tier("mid", None, None, None) {
-        live.primary_model = r.tier.model_id.clone();
-        if let Some(limit) = r.tier.context_limit {
-            live.primary_context_limit = limit;
-        }
-    }
-    if let Ok(r) = reg.resolve_tier("high", None, None, None) {
-        live.fallback_model_1 = r.tier.model_id.clone();
-        if let Some(limit) = r.tier.context_limit {
-            live.fallback_1_context_limit = limit;
-        }
-    }
-    if let Ok(r) = reg.resolve_tier("max", None, None, None) {
-        live.fallback_model_2 = r.tier.model_id.clone();
-    }
-    tracing::info!(
-        primary = %live.primary_model,
-        fallback_1 = %live.fallback_model_1,
-        fallback_2 = %live.fallback_model_2,
-        "rebuilt cascade model fields from tier routing",
-    );
+    wire_node_lib::pyramid::local_mode::rebuild_cascade_from_registry(&state.pyramid).await;
 }
 
 #[tauri::command]
@@ -9072,291 +9024,67 @@ async fn pyramid_set_compute_participation_policy(
 // is_serving; the policy gate takes precedence.
 // ═════════════════════════════════════════════════════════════════════════
 
-/// Frontend-facing offer payload. Matches `ComputeOffer` but with the
-/// fields the UI sends when creating/updating an offer.
-#[derive(Debug, Clone, serde::Deserialize)]
-struct ComputeOfferRequest {
-    pub model_id: String,
-    #[serde(default = "default_provider_type")]
-    pub provider_type: String,
-    pub rate_per_m_input: i64,
-    pub rate_per_m_output: i64,
-    pub reservation_fee: i64,
-    #[serde(default)]
-    pub queue_discount_curve: Vec<wire_node_lib::compute_market::QueueDiscountPoint>,
-    pub max_queue_depth: usize,
-}
+// The IPC-layer `ComputeOfferRequest`, `validate_model_loaded`, and
+// `persist_compute_market_state` helpers moved into
+// `wire_node_lib::pyramid::compute_market_ops` so the new HTTP routes
+// can share the same validation + persistence path. IPC commands below
+// now delegate to that module; the frontend payload shape is preserved
+// verbatim (the ops module's `OfferRequest` has the same field names
+// and serde defaults).
 
-fn default_provider_type() -> String {
-    "local".to_string()
-}
+/// IPC wrapper for the frontend: re-exports the ops module's
+/// `OfferRequest` so existing Tauri frontend callers see the same
+/// deserialization semantics.
+type ComputeOfferRequest = wire_node_lib::pyramid::compute_market_ops::OfferRequest;
 
-/// Validate that a model is actually loaded on this node. The Wire
-/// will accept an offer for any model_id string, but the frontend
-/// should guard against publishing an offer for something the
-/// provider can't serve. We check local_mode first (configured-on-
-/// disk loaded model) then fall through to success (the operator may
-/// be intentionally setting up an offer for a model they're about to
-/// load — the admission gate in the dispatch handler will catch a
-/// genuinely-missing model at run time).
-async fn validate_model_loaded(state: &AppState, model_id: &str) -> Result<(), String> {
-    let local_mode_status = {
-        let conn_result = wire_node_lib::pyramid::db::open_pyramid_connection(
-            state
-                .pyramid
-                .data_dir
-                .as_ref()
-                .ok_or("no data_dir")?,
-        );
-        match conn_result {
-            Ok(conn) => {
-                wire_node_lib::pyramid::local_mode::load_status_snapshot(&conn)
-                    .unwrap_or_else(|_| {
-                        wire_node_lib::pyramid::local_mode::LocalModeStatus::disabled_default()
-                    })
-            }
-            Err(e) => {
-                return Err(format!("failed to open pyramid db: {e}"));
-            }
-        }
-    };
-    if !local_mode_status.enabled {
-        // Local mode isn't on. Soft-pass — the operator might be
-        // running bridge-only offers. Phase 2 supports local +
-        // bridge; bridge validation would require checking the
-        // OpenRouter models registry which is Phase 4 scope.
-        return Ok(());
-    }
-    if local_mode_status.available_models.iter().any(|m| m == model_id) {
-        return Ok(());
-    }
-    // The configured model may not be the one being offered; allow
-    // if it matches the configured local model.
-    if local_mode_status.model.as_deref() == Some(model_id) {
-        return Ok(());
-    }
-    Err(format!(
-        "model '{model_id}' is not loaded locally — load the model first or check the name"
-    ))
-}
-
-/// Persist `ComputeMarketState` to disk after a mutation. On failure,
-/// log but don't return an error to the caller — the in-memory state
-/// is already updated and the disk write can be retried on the next
-/// save. If the disk is wedged, every persist will fail loudly in
-/// the logs so an operator can intervene.
-fn persist_compute_market_state(
-    state_lock: &wire_node_lib::compute_market::ComputeMarketState,
-    data_dir: &std::path::Path,
-) {
-    if let Err(e) = state_lock.save(data_dir) {
-        tracing::warn!(
-            data_dir = %data_dir.display(),
-            error = %e,
-            "compute_market_state save failed"
-        );
-    }
-}
-
-/// Create a new offer on this node and publish it to the Wire.
-///
-/// Flow: validate-model-loaded → POST `/api/v1/compute/offers` →
-/// extract `offer_id` from response → insert `ComputeOffer` into
-/// `state.compute_market_state.offers` → persist to disk.
-///
-/// Returns the Wire-assigned offer_id.
+/// Create a new offer on this node and publish it to the Wire. Thin
+/// delegation to `compute_market_ops::create_offer` (the shared
+/// IPC+HTTP path). Returns the Wire-assigned offer_id.
 #[tauri::command]
 async fn compute_offer_create(
     state: tauri::State<'_, SharedState>,
     offer: ComputeOfferRequest,
 ) -> Result<String, String> {
-    let state_ref: &AppState = &state;
-    validate_model_loaded(state_ref, &offer.model_id).await?;
-
-    // Wire-side call.
-    let (api_url, token) = {
-        let config = state.config.read().await;
-        (config.api_url.clone(), get_api_token(&state.auth).await?)
-    };
-    let body = serde_json::json!({
-        "model_id": offer.model_id,
-        "provider_type": offer.provider_type,
-        "rate_per_m_input": offer.rate_per_m_input,
-        "rate_per_m_output": offer.rate_per_m_output,
-        "reservation_fee": offer.reservation_fee,
-        "queue_discount_curve": offer.queue_discount_curve,
-        "max_queue_depth": offer.max_queue_depth,
-    });
-    let (status, resp) = send_api_request(
-        &api_url,
-        "POST",
-        "/api/v1/compute/offers",
-        &token,
-        Some(&body),
-        None,
+    wire_node_lib::pyramid::compute_market_ops::create_offer(
+        offer,
+        &state.auth,
+        &state.config,
+        &state.compute_market_state,
+        &state.compute_market_dispatch,
+        &state.pyramid,
     )
-    .await?;
-    if !status.is_success() {
-        return Err(format!("Wire rejected offer create: {status} — {resp}"));
-    }
-    let offer_id = resp
-        .get("offer_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("Wire response missing offer_id: {resp}"))?
-        .to_string();
-
-    // Local state update + persist.
-    {
-        let mut market_state = state.compute_market_state.write().await;
-        market_state.offers.insert(
-            offer.model_id.clone(),
-            wire_node_lib::compute_market::ComputeOffer {
-                model_id: offer.model_id.clone(),
-                provider_type: offer.provider_type,
-                rate_per_m_input: offer.rate_per_m_input,
-                rate_per_m_output: offer.rate_per_m_output,
-                reservation_fee: offer.reservation_fee,
-                queue_discount_curve: offer.queue_discount_curve,
-                max_queue_depth: offer.max_queue_depth,
-                wire_offer_id: Some(offer_id.clone()),
-            },
-        );
-        market_state.last_evaluation_at = Some(chrono::Utc::now().to_rfc3339());
-        let data_dir = state
-            .pyramid
-            .data_dir
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        persist_compute_market_state(&market_state, &data_dir);
-    }
-
-    // WS8 (§III L607-612): Emit `market_offered` chronicle event.
-    //
-    // job_path: `market/offer/{model_id}` — keeps offer-lifecycle events
-    //           grouped under a stable per-model path so an operator
-    //           filtering by job_path can see create → update → deactivate
-    //           for a single offer as a single stream.
-    // source:   SOURCE_MARKET (not SOURCE_MARKET_RECEIVED — the provider
-    //           is the ACTOR here, not the receiver).
-    // work_item_id: None (offer management is not DADBEAR-tracked; the
-    //                DADBEAR work item lifecycle is for matched jobs).
-    // metadata: model_id, rate_per_m_input, rate_per_m_output,
-    //           reservation_fee, wire_offer_id — the four fields the
-    //           spec names plus the Wire's assigned offer id for
-    //           correlation against the Wire-side observation.
-    //
-    // Chronicle write happens off the async thread because
-    // `record_event` is sync (rusqlite). Fire-and-forget — if the DB
-    // write fails, the offer has already been published successfully
-    // and the operator sees it in the Wire response. Chronicle is an
-    // observability side-channel, not the source of truth.
-    {
-        let data_dir_opt = state.pyramid.data_dir.as_ref().cloned();
-        if let Some(data_dir) = data_dir_opt {
-            let model_id = offer.model_id.clone();
-            let rate_in = offer.rate_per_m_input;
-            let rate_out = offer.rate_per_m_output;
-            let reservation_fee = offer.reservation_fee;
-            let wire_offer_id_clone = offer_id.clone();
-            let db_path = data_dir.join("pyramid.db");
-            let job_path = format!("market/offer/{}", model_id);
-            let ctx = wire_node_lib::pyramid::compute_chronicle::ChronicleEventContext::minimal(
-                &job_path,
-                wire_node_lib::pyramid::compute_chronicle::EVENT_MARKET_OFFERED,
-                wire_node_lib::pyramid::compute_chronicle::SOURCE_MARKET,
-            )
-            .with_model_id(model_id)
-            .with_metadata(serde_json::json!({
-                "rate_per_m_input": rate_in,
-                "rate_per_m_output": rate_out,
-                "reservation_fee": reservation_fee,
-                "wire_offer_id": wire_offer_id_clone,
-            }));
-            tokio::task::spawn_blocking(move || {
-                if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                    let _ = wire_node_lib::pyramid::compute_chronicle::record_event(&conn, &ctx);
-                }
-            });
-        }
-    }
-
-    // Phase 2 WS6: nudge the queue mirror task — a new offer expands
-    // the set of models the Wire should know we can serve. The mirror
-    // task's snapshot includes an entry for every offer in
-    // `ComputeMarketState.offers`.
-    let _ = state.compute_market_dispatch.mirror_nudge.send(());
-
-    Ok(offer_id)
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Update an existing offer. The Wire accepts the same POST endpoint
-/// with UPSERT semantics via UNIQUE(node_id, model_id, provider_type).
+/// with UPSERT semantics via UNIQUE(node_id, model_id, provider_type),
+/// so update is the same code path as create.
 #[tauri::command]
 async fn compute_offer_update(
     state: tauri::State<'_, SharedState>,
     offer: ComputeOfferRequest,
 ) -> Result<String, String> {
-    // Identical flow to create — the Wire's UPSERT handles both.
     compute_offer_create(state, offer).await
 }
 
-/// Remove an offer. Active jobs on this offer continue to completion;
-/// only new matches are prevented (per spec §III line 589).
+/// Remove an offer. Thin delegation — active jobs on this offer
+/// continue to completion; only new matches are prevented.
 #[tauri::command]
 async fn compute_offer_remove(
     state: tauri::State<'_, SharedState>,
     model_id: String,
 ) -> Result<(), String> {
-    // Look up the wire_offer_id from local state.
-    let wire_offer_id = {
-        let market_state = state.compute_market_state.read().await;
-        market_state
-            .offers
-            .get(&model_id)
-            .and_then(|o| o.wire_offer_id.clone())
-    };
-
-    // Wire-side DELETE if we know the offer_id. If we don't (local
-    // state drift), skip the Wire call and just clean up local.
-    if let Some(offer_id) = wire_offer_id {
-        let (api_url, token) = {
-            let config = state.config.read().await;
-            (config.api_url.clone(), get_api_token(&state.auth).await?)
-        };
-        // URL-encode offer_id for path safety — Wire offer IDs are
-        // typically UUIDs but the path is the Wire's call to make.
-        let path = format!(
-            "/api/v1/compute/offers/{}",
-            urlencoding::encode(&offer_id)
-        );
-        let (status, resp) =
-            send_api_request(&api_url, "DELETE", &path, &token, None, None).await?;
-        if !status.is_success() && status.as_u16() != 404 {
-            // 404 is OK (Wire already cleaned up); other failures are errors.
-            return Err(format!("Wire rejected offer remove: {status} — {resp}"));
-        }
-    }
-
-    // Local state cleanup.
-    {
-        let mut market_state = state.compute_market_state.write().await;
-        market_state.offers.remove(&model_id);
-        market_state.last_evaluation_at = Some(chrono::Utc::now().to_rfc3339());
-        let data_dir = state
-            .pyramid
-            .data_dir
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        persist_compute_market_state(&market_state, &data_dir);
-    }
-
-    // Phase 2 WS6: nudge the queue mirror task — removing the offer
-    // should retract us from that model's market surface at the Wire.
-    let _ = state.compute_market_dispatch.mirror_nudge.send(());
-
-    Ok(())
+    wire_node_lib::pyramid::compute_market_ops::remove_offer(
+        &model_id,
+        &state.auth,
+        &state.config,
+        &state.compute_market_state,
+        &state.compute_market_dispatch,
+        &state.pyramid,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// List all offers this node has published.
@@ -9364,114 +9092,63 @@ async fn compute_offer_remove(
 async fn compute_offers_list(
     state: tauri::State<'_, SharedState>,
 ) -> Result<Vec<wire_node_lib::compute_market::ComputeOffer>, String> {
-    let market_state = state.compute_market_state.read().await;
-    Ok(market_state.offers.values().cloned().collect())
+    Ok(wire_node_lib::pyramid::compute_market_ops::list_offers(&state.compute_market_state).await)
 }
 
-/// Fetch the market surface from the Wire — per-model aggregation of
-/// active offers, pricing ranges, queue depths, provider counts,
-/// performance medians. Read-only for Phase 2 (no buy action until
-/// Phase 3 requester integration).
+/// Fetch the market surface from the Wire — per-model aggregation.
+/// Read-only.
 #[tauri::command]
 async fn compute_market_surface(
     state: tauri::State<'_, SharedState>,
     model_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let (api_url, token) = {
-        let config = state.config.read().await;
-        (config.api_url.clone(), get_api_token(&state.auth).await?)
-    };
-    // URL-encode model_id so bridge provider IDs with slashes (e.g.
-    // `anthropic/claude-3-opus`) or query-reserved chars don't break
-    // the Wire's query parsing.
-    let path = match model_id {
-        Some(m) => format!(
-            "/api/v1/compute/market-surface?model_id={}",
-            urlencoding::encode(&m)
-        ),
-        None => "/api/v1/compute/market-surface".to_string(),
-    };
-    let (status, resp) =
-        send_api_request(&api_url, "GET", &path, &token, None, None).await?;
-    if !status.is_success() {
-        return Err(format!("Wire market-surface failed: {status} — {resp}"));
-    }
-    Ok(resp)
+    wire_node_lib::pyramid::compute_market_ops::market_surface(
+        model_id.as_deref(),
+        &state.auth,
+        &state.config,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
-/// Toggle the runtime `is_serving` flag on — starts queue mirror
-/// (WS6), publishes any configured offers.
-///
-/// Semantic note (spec §III line 601): this does NOT modify the
-/// `compute_participation_policy.allow_market_visibility` contribution.
-/// A node with `allow_market_visibility = false` AND `is_serving =
-/// true` still will not publish — the policy gate takes precedence.
+/// Toggle the runtime `is_serving` flag on. Does NOT modify the durable
+/// `compute_participation_policy.allow_market_visibility` — that gate
+/// takes precedence.
 #[tauri::command]
 async fn compute_market_enable(
     state: tauri::State<'_, SharedState>,
 ) -> Result<(), String> {
-    {
-        let mut market_state = state.compute_market_state.write().await;
-        market_state.is_serving = true;
-        market_state.last_evaluation_at = Some(chrono::Utc::now().to_rfc3339());
-        let data_dir = state
-            .pyramid
-            .data_dir
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        persist_compute_market_state(&market_state, &data_dir);
-    }
-    // Phase 2 WS6: nudge the queue mirror task — turning serving on
-    // should push the first snapshot immediately (subject to policy
-    // gating). The task itself also reads is_serving each tick, so
-    // a nudge that races with the boot debounce is harmless.
-    let _ = state.compute_market_dispatch.mirror_nudge.send(());
-    Ok(())
+    wire_node_lib::pyramid::compute_market_ops::set_serving(
+        true,
+        &state.compute_market_state,
+        &state.compute_market_dispatch,
+        &state.pyramid,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
-/// Toggle the runtime `is_serving` flag off — stops mirror loop,
-/// sets all Wire offers to `inactive`. Per spec §III line 600.
-///
-/// Does NOT remove local offer state (operator may just be pausing).
-/// Use `compute_offer_remove` for permanent removal.
+/// Toggle the runtime `is_serving` flag off.
 #[tauri::command]
 async fn compute_market_disable(
     state: tauri::State<'_, SharedState>,
 ) -> Result<(), String> {
-    {
-        let mut market_state = state.compute_market_state.write().await;
-        market_state.is_serving = false;
-        market_state.last_evaluation_at = Some(chrono::Utc::now().to_rfc3339());
-        let data_dir = state
-            .pyramid
-            .data_dir
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        persist_compute_market_state(&market_state, &data_dir);
-    }
-    // Phase 2 WS6: nudge the queue mirror task — the next tick will
-    // read `is_serving = false` inside `should_push` and skip the
-    // HTTP POST. Wire-side staleness deactivation via
-    // `compute_offer_staleness_secs` completes the disable within a
-    // bounded window; explicit batch inactive is a future TODO.
-    let _ = state.compute_market_dispatch.mirror_nudge.send(());
-    // TODO: POST to Wire to mark all offers inactive in a batch. For
-    // now just locally stop serving; the Wire will see staleness via
-    // the heartbeat path within `compute_offer_staleness_secs` and
-    // deactivate offers automatically.
-    Ok(())
+    wire_node_lib::pyramid::compute_market_ops::set_serving(
+        false,
+        &state.compute_market_state,
+        &state.compute_market_dispatch,
+        &state.pyramid,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
-/// Return the full `ComputeMarketState` for UI observability —
-/// offers, in-flight jobs, counters, is_serving flag. Read-only.
+/// Return the full `ComputeMarketState` for observability.
 #[tauri::command]
 async fn compute_market_get_state(
     state: tauri::State<'_, SharedState>,
 ) -> Result<wire_node_lib::compute_market::ComputeMarketState, String> {
-    let market_state = state.compute_market_state.read().await;
-    Ok(market_state.clone())
+    Ok(wire_node_lib::pyramid::compute_market_ops::get_state(&state.compute_market_state).await)
 }
 
 /// Read the active pyramid viz config contribution.
@@ -13286,6 +12963,8 @@ fn main() {
                     fleet_dispatch,
                     compute_market_dispatch,
                     compute_market_state,
+                    server_state.config.clone(),
+                    server_state.work_stats.clone(),
                 ).await;
             });
 

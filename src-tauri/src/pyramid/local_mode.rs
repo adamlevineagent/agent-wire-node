@@ -1996,6 +1996,43 @@ pub fn set_experimental_territory(
     Ok(())
 }
 
+// ── Cascade model field rebuild ─────────────────────────────────────────────
+
+/// After a provider-registry refresh (local mode toggle, tier routing
+/// contribution apply), re-resolve the cascade model fields on the live
+/// `LlmConfig` from the current tier routing table. Ensures
+/// `call_model_unified`'s cascade sends the correct model name for
+/// whichever provider is now active.
+///
+/// Was previously in main.rs; moved here so HTTP route handlers can
+/// call the same logic without depending on the binary's `SharedState`
+/// alias.
+pub async fn rebuild_cascade_from_registry(pyramid: &std::sync::Arc<super::PyramidState>) {
+    let reg = &pyramid.provider_registry;
+    let mut live = pyramid.config.write().await;
+    if let Ok(r) = reg.resolve_tier("mid", None, None, None) {
+        live.primary_model = r.tier.model_id.clone();
+        if let Some(limit) = r.tier.context_limit {
+            live.primary_context_limit = limit;
+        }
+    }
+    if let Ok(r) = reg.resolve_tier("high", None, None, None) {
+        live.fallback_model_1 = r.tier.model_id.clone();
+        if let Some(limit) = r.tier.context_limit {
+            live.fallback_1_context_limit = limit;
+        }
+    }
+    if let Ok(r) = reg.resolve_tier("max", None, None, None) {
+        live.fallback_model_2 = r.tier.model_id.clone();
+    }
+    tracing::info!(
+        primary = %live.primary_model,
+        fallback_1 = %live.fallback_model_1,
+        fallback_2 = %live.fallback_model_2,
+        "rebuilt cascade model fields from tier routing",
+    );
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
