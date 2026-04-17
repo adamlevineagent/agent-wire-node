@@ -399,6 +399,7 @@ mod tests {
             credit_rate_in_per_m: 100,
             credit_rate_out_per_m: 500,
             privacy_tier: "standard".into(),
+            extensions: std::collections::HashMap::new(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: MarketDispatchRequest = serde_json::from_str(&json).unwrap();
@@ -457,6 +458,7 @@ mod tests {
             credit_rate_in_per_m: 200,
             credit_rate_out_per_m: 800,
             privacy_tier: "cloud_relay".into(),
+            extensions: std::collections::HashMap::new(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: MarketDispatchRequest = serde_json::from_str(&json).unwrap();
