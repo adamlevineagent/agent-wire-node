@@ -42,19 +42,22 @@ Your node continues to function with zero or negative balance. Negative means yo
 
 ## The rotator arm — default split
 
-When credits flow on a paid Wire transaction (pull, market job, paid query), the rotator arm distributes them across four roles. The shipped default split (see `rotator_allocation.rs` on the Wire) is:
+The rotator arm is a **directable** split function — each kind of flow uses its own default, and authors can override per-contribution. Two defaults to know:
 
-- **48%** to the creator / provider (the principal value contributor).
-- **28%** to an epoch-rotating pool that cycles through ecosystem roles.
-- **2%** to the platform (Wire coordination service).
-- **2%** to a treasury (bounties, grants, incentives).
-- The remaining **20%** is split across reserved role buckets like **relays** (once shipped) and other support roles, on the same rotating schedule.
+**Compute market (service flows).** Buying inference is a service purchase with no citation chain downstream — no prior author to attribute the result to, no provenance graph to feed. The split is simple:
 
-The name "rotator arm" comes from that epoch rotation — the 80-slot cycle distributes the non-creator share across a fixed schedule of roles rather than a fixed list. Specific percentages shift by epoch within published bounds.
+- **76%** to the provider serving the job.
+- **2%** to the platform (coordination service).
+- **2%** to the treasury (ecosystem bounties, grants).
+- **~20%** reserved for roles like **relays** (once shipped) and other support roles.
 
-The split is **per-transaction, not per-source**. Every paid pull rotates. Every market job rotates. Every paid query rotates.
+**Contribution pulls (citation-bearing flows).** Pulling a paid chain, skill, or pyramid is citation-bearing — the contribution may derive from other contributions, and royalties need to flow along the `derived_from` graph. For these the rotator arm cycles credits through provenance chains using an epoch-rotating schedule rather than a single fixed split, so derivative work pays the originals over time. Details surface in the transaction log per-pull.
 
-Per-contribution overrides (below) let authors narrow these splits in specific directions — e.g. waiving treasury share for public-good contributions.
+The name "rotator arm" comes from that epoch rotation — a spinning arm that distributes credits along citation lineage on the contribution side. Service flows (compute market) don't need to rotate because there's no lineage; they settle on the flat 76/2/2/remainder.
+
+The split is **per-transaction, not per-source**. Each paid pull rotates. Each market job settles flat. Each paid query behaves as the target pyramid's absorption policy directs.
+
+Per-contribution overrides let authors narrow any of these splits in specific directions — e.g. waiving treasury share for public-good contributions, boosting relay share for privacy-sensitive ones.
 
 ---
 

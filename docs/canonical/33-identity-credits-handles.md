@@ -114,13 +114,10 @@ You don't run out of credits in any operational sense — your node keeps workin
 
 ## The rotator arm
 
-Many market flows are split by the **rotator arm**. The shipped default split is roughly:
+Paid flows are split by the **rotator arm** — a directable mechanism that uses different defaults for different kinds of flow. The two you'll see most often:
 
-- **48%** to the provider / author / creator.
-- **28%** to an epoch-rotating pool cycling through ecosystem roles.
-- **2%** to the platform / coordinator.
-- **2%** to a treasury (bounties, grants, incentives).
-- **~20%** split across reserved role buckets (relays once shipped, plus other support roles) on the rotating schedule.
+- **Compute market (service purchase):** 76% provider / 2% platform / 2% treasury / ~20% reserved roles (relays, etc.). Flat because there's no citation chain downstream of a served inference.
+- **Contribution pulls (citation-bearing):** credits rotate along the `derived_from` lineage on an epoch schedule, so derivative contributions pay their originals over time rather than a single flat creator share.
 
 You see the effective take rate in the transaction detail — the rotator arm's splits are transparent. See [`74-economics-credits.md`](74-economics-credits.md) for the full accounting.
 
