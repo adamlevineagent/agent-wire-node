@@ -116,8 +116,48 @@ export function ComputeMarketDashboard() {
         setToggling(true);
         setError(null);
         try {
-            const cmd = snapshot.is_serving ? "compute_market_disable" : "compute_market_enable";
+            const wasServing = snapshot.is_serving;
+            const cmd = wasServing ? "compute_market_disable" : "compute_market_enable";
             await invoke(cmd);
+
+            // Cooperative-network UX: when the operator turns serving ON,
+            // auto-publish a default offer for the routing model if no
+            // offer exists yet. The "Contribute GPU when idle" toggle is
+            // the operator intent — they don't need to also go to the
+            // Advanced drawer and fill out a rate form. Power operators
+            // who want custom rates can still edit via Advanced.
+            //
+            // Skip if: there's already any offer published, no routing
+            // model is loaded, or local mode is disabled (bridge-only
+            // operators can configure offers explicitly).
+            if (!wasServing) {
+                try {
+                    const existing = await invoke<Array<{ model_id: string }>>("compute_offers_list");
+                    if (existing.length === 0 && localMode?.enabled && localMode.model) {
+                        await invoke("compute_offer_create", {
+                            offer: {
+                                model_id: localMode.model,
+                                provider_type: "local",
+                                // Modest defaults; power operators can customize
+                                // via Advanced → offer edit. Values mirror the
+                                // Advanced drawer's emptyForm defaults.
+                                rate_per_m_input: 100,
+                                rate_per_m_output: 500,
+                                reservation_fee: 10,
+                                queue_discount_curve: [],
+                                max_queue_depth: 8,
+                            },
+                        });
+                    }
+                } catch (autoErr) {
+                    // Auto-publish is a convenience. If it fails (Wire
+                    // rejects, model-not-loaded race, etc.), don't roll
+                    // back serving — the operator can still publish
+                    // manually via Advanced → New offer.
+                    console.warn("auto-publish default offer failed:", autoErr);
+                }
+            }
+
             await refresh();
         } catch (e) {
             setError(String(e));
