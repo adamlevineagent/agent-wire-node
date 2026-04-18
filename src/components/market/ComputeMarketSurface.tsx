@@ -72,6 +72,12 @@ export function ComputeMarketSurface() {
 
     useEffect(() => {
         void refresh();
+        // Auto-poll every 30s so new offers appearing on the network show
+        // up without manual refresh. Matches the dashboard's IPC poll
+        // cadence (REFRESH_INTERVAL_MS in ComputeMarketDashboard).
+        // Cheap — unauthed public endpoint with 5-min Wire-side cache.
+        const handle = setInterval(() => void refresh(), 30_000);
+        return () => clearInterval(handle);
     }, [refresh]);
 
     const sortedModels = sortModels(surface?.models ?? [], sortBy);
