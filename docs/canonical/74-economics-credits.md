@@ -50,36 +50,62 @@ When a credit comes in, the arm pays that credit to the role assigned to the cur
 
 This gives a **directable** split without any fractional credit accounting — every credit is atomic and goes to exactly one recipient. Over long-run volume, the distribution converges exactly on the directive. Short-run volume may not exercise all 80 slots, but the split is honored in expectation.
 
-### Two concrete directives
+### Two flow classes — service vs. citation-bearing
 
-**Compute market (service flows).** Buying inference is a service purchase with no citation chain downstream — no prior authors to attribute the result to. The directive is compact:
+**Service flows (compute market).** Buying inference is a service purchase with no citation chain downstream — no prior authors the result builds on, no lineage to attribute. The directive is compact and UFF does not apply:
 
-- **76 slots** → the provider serving the job (76 credits per 80 = 95%).
-- **2 slots** → the platform (coordination service).
-- **2 slots** → the treasury (bounties, grants, incentives).
+- **76 slots** → the provider serving the job.
+- **2 slots** → the platform.
+- **2 slots** → the treasury.
 
 Every 80 credits of market revenue pays the provider 76, platform 2, treasury 2.
 
-**Contribution pulls (citation-bearing flows).** A published chain, skill, or pyramid can carry `derived_from` references. The rotator arm honors these citations — a chain that derives from three prior contributions might direct, say:
+**Citation-bearing flows (contribution pulls, paid queries, absorption).** A published chain, skill, pyramid, or composed contribution can carry `derived_from` references — it builds on prior work. These flows are governed by **UFF**.
 
-- **40 slots** → the creator (you).
-- **12 slots** → each of three prior contributions cited in `derived_from` (36 slots total).
-- **2 slots** → platform, **2 slots** → treasury.
+### UFF (the sourcing-share rule)
 
-Over 80 credits, your ancestors get their fair share automatically. No separate payout logic; the same rotator handles it.
+Under UFF, **28 of the 80 slots must be allocated to sourcing** — the prior contributions the current work derives from. This is a floor, not a suggestion: every citation-bearing directive commits 28 slots to the authors whose work the current contribution builds on.
+
+A typical UFF-compliant directive:
+
+- **48 slots** → the creator (you).
+- **28 slots** → sourcing (distributed across cited ancestors).
+- **2 slots** → platform.
+- **2 slots** → treasury.
+
+The 28 sourcing slots are partitioned across the cited ancestors at the author's discretion. Each partition carries a **reason** — a written justification for why that particular ancestor gets that particular slot count. For example:
+
+- **12 slots** → `@alice/architecture-chain/v2` — "primary structural pattern borrowed wholesale."
+- **10 slots** → `@bob/extraction-skill/v1` — "extraction prompt adapted with modifications."
+- **6 slots** → `@carol/webbing-skill/v3` — "one step uses this skill directly."
+
+Every sourcing reason is published alongside the contribution and visible to anyone who pulls it. This is where the "directable as directed" part of the rotator arm matters: the allocations are the author's judgment, but the judgment is **transparent and challengeable**.
+
+### Firsts: self-sourcing with reason
+
+A "first" is a contribution with no prior sources — nothing external it derives from. UFF still applies: the 28 sourcing slots are mandatory. The author allocates them **to themselves**, with a reason.
+
+Typical self-sourcing reason: "no prior art identified; this contribution is a primary origin in its domain." The transparency matters — self-sourcing is legitimate only when the reasoning holds up. If a critic can point at prior work the author missed or ignored, the self-sourcing is challengeable.
+
+### Challenge
+
+Any operator who believes a sourcing allocation is wrong can **file a challenge** against the contribution. A challenge names the disputed allocation, proposes a different one, and gives a reason. The author can respond — adjusting the allocation (publishing a new version), defending the original, or conceding. Challenges become part of the contribution's public record.
+
+Well-reasoned sourcing + responsive authors produce high-reputation contributions. Dodged or stale sourcing produces low-reputation ones. Over time the ecosystem rewards authors who cite carefully.
 
 ### Why this shape
 
 - **No decimals.** Every credit is atomic, so no rounding drift over time.
-- **Arbitrarily complex splits.** Any allocation that fits in 80 integer slots is expressible. Want to pay a reviewer 1.25%? One slot.
-- **Citation chains pay back automatically.** Derivative consumption feeds the lineage without separate accounting logic.
-- **Audit-friendly.** Each credit has exactly one recipient and one slot. The ledger replays cleanly.
+- **Arbitrarily complex splits.** Any allocation that fits in 80 integer slots is expressible.
+- **Citation chains pay back automatically.** UFF means derivative consumption feeds the lineage without separate accounting logic — it's baked into every citation-bearing directive.
+- **Audit-friendly.** Each credit has exactly one recipient, one slot, and (for sourcing) one reason. The ledger replays cleanly and the reasoning is legible.
+- **Socially enforceable.** Transparent reasons + challenge capability make sourcing a visible public process, not hidden math.
 
 ### Per-contribution directive
 
-The author sets the slot directive when publishing — pick how many slots go to which role. Defaults exist (compute market's 76/2/2 is one), but authors can redirect. Public-good contributions commonly push more slots to the treasury; privacy-sensitive ones push slots toward relay operators (once those ship and relay-slot assignments are meaningful); collaborative contributions spread creator slots across multiple authors.
+Within UFF's 28-slot sourcing floor, the author sets the remaining 52-slot directive when publishing — typically creator gets 48 with platform/treasury at 2 each, but the remaining slots are redirectable. Public-good contributions often push platform/treasury slots to other roles; collaborative contributions spread creator slots across multiple authors.
 
-The directive is visible in the publish preview and in every transaction that pays out against it.
+The directive and every sourcing reason are visible in the publish preview and in every transaction that pays out against it.
 
 ---
 

@@ -286,6 +286,8 @@ Every Agent Wire Node term that comes up in the docs, defined in one place. Cros
 
 **Tunnel** — outbound connection (Cloudflare Tunnel) that makes your node reachable from the Wire.
 
+**UFF** — the sourcing-share rule. For any citation-bearing paid flow (contribution pulls, paid queries, absorption), 28 of the rotator arm's 80 slots must go to sourcing: the cited ancestors in `derived_from`. Each allocation carries a published, challengeable reason. A "first" with no prior sources self-sources the 28 slots, with a reason that must hold up to challenge. UFF does not apply to service flows (compute market), where there's no citation chain. [`74-economics-credits.md`](74-economics-credits.md)
+
 ## U-Z
 
 **Understanding (mode)** — the primary sidebar mode for pyramid management. [`20-pyramids.md`](20-pyramids.md)
