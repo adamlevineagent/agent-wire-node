@@ -76,6 +76,12 @@ function effectiveRate(rate: number, depth: number, curve: QueueDiscountPoint[])
     return Math.floor((rate * multiplier) / 10000);
 }
 
+interface LocalModeStatus {
+    enabled?: boolean;
+    model?: string | null;
+    available_models?: string[];
+}
+
 export function ComputeOfferManager() {
     const [offers, setOffers] = useState<ComputeOffer[]>([]);
     const [loading, setLoading] = useState(true);
@@ -84,6 +90,8 @@ export function ComputeOfferManager() {
     const [error, setError] = useState<string | null>(null);
     const [editingModelId, setEditingModelId] = useState<string | null>(null);
     const [formOpen, setFormOpen] = useState(false);
+    const [availableModels, setAvailableModels] = useState<string[]>([]);
+    const [currentModel, setCurrentModel] = useState<string | null>(null);
 
     const refresh = useCallback(async () => {
         try {
@@ -97,9 +105,34 @@ export function ComputeOfferManager() {
         }
     }, []);
 
+    const refreshLoadedModels = useCallback(async () => {
+        try {
+            const status = await invoke<LocalModeStatus>("pyramid_get_local_mode_status");
+            setAvailableModels(status.available_models ?? []);
+            setCurrentModel(status.model ?? null);
+        } catch {
+            // Non-fatal — model picker just falls back to free text entry.
+            setAvailableModels([]);
+            setCurrentModel(null);
+        }
+    }, []);
+
     useEffect(() => {
         void refresh();
-    }, [refresh]);
+        void refreshLoadedModels();
+    }, [refresh, refreshLoadedModels]);
+
+    // When the New Offer form opens with no model selected yet, default
+    // to the currently-loaded model so the operator doesn't have to type
+    // the slug by hand. Respects editing mode (where model_id is pinned).
+    useEffect(() => {
+        if (formOpen && !editingModelId && !form.model_id) {
+            const picked = currentModel || availableModels[0] || "";
+            if (picked) {
+                setForm((prev) => ({ ...prev, model_id: picked }));
+            }
+        }
+    }, [formOpen, editingModelId, form.model_id, currentModel, availableModels]);
 
     const beginEdit = (offer: ComputeOffer) => {
         setForm({
@@ -130,13 +163,22 @@ export function ComputeOfferManager() {
         setSaving(true);
         setError(null);
         try {
+            // Wire-contract shape: OfferQueueDiscountPoint uses
+            // {queue_depth, discount_bps}. Internal display math uses
+            // {depth, multiplier_bps}. Translate at the IPC boundary.
+            //   discount_bps = 10000 - multiplier_bps
+            //   (10000 = no discount, 9500 = 5% off, 9000 = 10% off)
+            const wireCurve = form.curve.map((p) => ({
+                queue_depth: p.depth,
+                discount_bps: Math.max(0, 10000 - p.multiplier_bps),
+            }));
             const payload = {
                 model_id: form.model_id.trim(),
                 provider_type: form.provider_type,
                 rate_per_m_input: parseIntOrZero(form.rate_per_m_input),
                 rate_per_m_output: parseIntOrZero(form.rate_per_m_output),
                 reservation_fee: parseIntOrZero(form.reservation_fee),
-                queue_discount_curve: form.curve,
+                queue_discount_curve: wireCurve,
                 max_queue_depth: parseIntOrZero(form.max_queue_depth),
             };
             if (!payload.model_id) {
@@ -265,17 +307,40 @@ export function ComputeOfferManager() {
                     <div className="compute-form-grid">
                         <label className="compute-field">
                             <span className="compute-field-label">Model ID</span>
-                            <input
-                                className="compute-input"
-                                type="text"
-                                value={form.model_id}
-                                onChange={(e) => setForm({ ...form, model_id: e.target.value })}
-                                disabled={editingModelId !== null}
-                                placeholder="e.g. gemma3:27b"
-                            />
+                            {editingModelId !== null || availableModels.length === 0 ||
+                             form.provider_type === "bridge" ? (
+                                <input
+                                    className="compute-input"
+                                    type="text"
+                                    value={form.model_id}
+                                    onChange={(e) =>
+                                        setForm({ ...form, model_id: e.target.value })
+                                    }
+                                    disabled={editingModelId !== null}
+                                    placeholder="e.g. gemma3:27b"
+                                />
+                            ) : (
+                                <select
+                                    className="compute-input"
+                                    value={form.model_id}
+                                    onChange={(e) =>
+                                        setForm({ ...form, model_id: e.target.value })
+                                    }
+                                >
+                                    {!availableModels.includes(form.model_id) && form.model_id && (
+                                        <option value={form.model_id}>{form.model_id} (not loaded)</option>
+                                    )}
+                                    {availableModels.map((m) => (
+                                        <option key={m} value={m}>
+                                            {m}{m === currentModel ? " (routing)" : ""}
+                                        </option>
+                                    ))}
+                                </select>
+                            )}
                             <span className="compute-field-hint">
-                                Must match a locally-loaded model (or an OpenRouter slug if
-                                provider is bridge).
+                                {availableModels.length > 0 && form.provider_type === "local"
+                                    ? `${availableModels.length} locally-loaded model${availableModels.length === 1 ? "" : "s"} detected. Pick one, or switch to bridge for OpenRouter slugs.`
+                                    : "Must match a locally-loaded model (or an OpenRouter slug if provider is bridge)."}
                             </span>
                         </label>
 
