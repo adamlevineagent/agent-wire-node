@@ -114,14 +114,18 @@ You don't run out of credits in any operational sense — your node keeps workin
 
 ## The rotator arm
 
-Paid flows are split by the **rotator arm** — a directable mechanism that uses different defaults for different kinds of flow. The two you'll see most often:
+Paid flows are split by the **rotator arm** — a wheel of 80 slots where each slot is worth one credit (1.25% of a cycle). Each slot is assigned to a recipient role by the author at publish time. Incoming credits pay the current slot's role, then the arm advances one slot forward. After 80 credits, every role has received exactly its configured slot count.
 
-- **Compute market (service purchase):** 76% provider / 2% platform / 2% treasury / ~20% reserved roles (relays, etc.). Flat because there's no citation chain downstream of a served inference.
-- **Contribution pulls (citation-bearing):** credits rotate along the `derived_from` lineage on an epoch schedule, so derivative contributions pay their originals over time rather than a single flat creator share.
+Two directives you'll see most often:
 
-You see the effective take rate in the transaction detail — the rotator arm's splits are transparent. See [`74-economics-credits.md`](74-economics-credits.md) for the full accounting.
+- **Compute market (service purchase):** 76 slots → provider, 2 → platform, 2 → treasury. Every 80 credits pays the provider 76 and the rest 2 each.
+- **Contribution pulls (citation-bearing):** the author's slots, plus N slots each directed at ancestor contributions cited in `derived_from`. Derivative work pays originals automatically, no separate accounting needed.
 
-The rotator arm is configurable per contribution at publish time (some publishers opt to waive the platform/treasury cut for public-good contributions). Defaults are sensible.
+This gives a directable split without fractional-credit accounting — every credit is atomic. Over volume the distribution matches the directive exactly.
+
+You see the effective directive in the transaction detail. See [`74-economics-credits.md`](74-economics-credits.md) for the full accounting.
+
+The rotator arm's directive is configurable per contribution at publish time — public-good contributions often redirect slots toward the treasury; collaborative contributions spread creator slots across multiple authors.
 
 ---
 
