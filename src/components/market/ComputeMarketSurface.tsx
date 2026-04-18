@@ -1,16 +1,14 @@
 // ComputeMarketSurface.tsx — Browse the network's available compute providers.
 //
-// Per `docs/plans/compute-market-phase-2-exchange.md` §IV:
-//   - Fetches via IPC `compute_market_surface` (calls Wire
-//     /api/v1/compute/market-surface).
-//   - Per-model aggregation: offers, pricing ranges, queue depths,
-//     provider counts, network-observed performance medians.
-//   - Read-only for Phase 2 (no "buy compute" until Phase 3
-//     requester integration).
-//
-// The Wire response shape is not strictly typed in this component —
-// we display whatever the Wire returns and gracefully degrade on
-// missing fields. Phase 3 will firm up the contract.
+// - Fetches via IPC `compute_market_surface` (calls Wire
+//   /api/v1/compute/market-surface).
+// - Per-model aggregation: provider counts, active offers, pricing
+//   ranges, queue depth, network-observed performance medians.
+// - Read-only aggregate view. Per-provider detail is on the authed
+//   /market-surface/detailed endpoint — a "Show per-provider" button
+//   could surface it later.
+// - Schema follows the Wire ↔ Node contract rev 1.5 aggregate shape:
+//   nested price / queue / performance objects, providers as a count.
 
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";

@@ -348,9 +348,11 @@ function ServingToggle({ on, model, busy, onToggle }: ServingToggleProps) {
 /// The "Last hour / Session / All-time" rows. Only shown on the
 /// Connected card.
 ///
-/// Phase 2 has provider-side data only — no "used" column yet.
-/// Requester-side numbers (my-pyramids-used-the-network) land with
-/// Phase 3 and plug in here without shape changes.
+/// Currently provider-side only — how much I've contributed to the
+/// network. The mirror requester-side numbers (my pyramids built
+/// using N network GPUs) are surfaced on the Builds tab via
+/// EVENT_BUILD_NETWORK_CONTRIBUTION rather than here, so the hero
+/// stays a single-concept surface ("am I contributing").
 function ContributionSummary({
     recentEvents,
     snapshot,

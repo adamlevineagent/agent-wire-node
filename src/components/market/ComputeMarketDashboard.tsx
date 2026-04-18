@@ -73,9 +73,9 @@ export function ComputeMarketDashboard() {
         // Note: we don't call `get_compute_summary` here. That query
         // returns event-counts + latency dimensions but not credit
         // totals. Credit roll-ups live on ComputeMarketState itself
-        // (session_credits_earned, total_credits_earned). If we need
-        // a real week-scoped rollup later, Phase 3 will add a
-        // credit-scoped chronicle query.
+        // (session_credits_earned, total_credits_earned). A real
+        // week-scoped rollup would need a credit-scoped chronicle
+        // query — deferred until we have the observability need.
         const since = new Date(Date.now() - RECENT_EVENTS_WINDOW_MS).toISOString();
 
         const [snapRes, localRes, eventsRes] = await Promise.allSettled([
