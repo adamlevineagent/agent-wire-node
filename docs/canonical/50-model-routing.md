@@ -37,17 +37,16 @@ Resolution order for a step (narrowest wins):
 
 ## The shipped tier names
 
-These are the tier names used across shipped chains. The set is **not fixed** — you can name tiers whatever you want. These are the conventions:
+These are the tier names used across shipped chains. The set is **not fixed** — you can name tiers whatever you want. These are the conventions you will actually see in `chains/defaults/`:
 
 - **`extractor`** — per-chunk extraction. Fast, cheap, good at structured output.
 - **`web`** — cross-reference edge generation. Similar requirements to extractor.
 - **`mid`** — general-purpose mid-tier. Default for most steps without stronger requirements.
 - **`synth_heavy`** — apex and high-depth synthesis. Needs reasoning capacity.
-- **`stale_local`** *(planned workflow)* — staleness checks. Ideal target for a local Ollama model.
-- **`triage`** *(planned workflow)* — evidence pre-mapping. Cheaper tier.
-- **`low`, `high`, `max`** — legacy tier names from early chain versions, still present as aliases in some deprecated chains.
 
-The legacy `pyramid_config.json` also exposes three slots — `primary_model`, `fallback_model_1`, `fallback_model_2` — which older chains use as their only tier abstraction. Newer chains use tier routing through a proper registry. Both paths coexist in the shipped build.
+**Legacy aliases** (still present in some deprecated chains): `low`, `high`, `max`. The legacy `pyramid_config.json` also exposes three slots — `primary_model`, `fallback_model_1`, `fallback_model_2` — which older chains use as their only tier abstraction.
+
+**Tier names you might see in design docs but are not yet shipped as canonical tiers:** `stale_local` (planned workflow for routing staleness checks to local Ollama), `triage` (planned workflow for evidence pre-mapping). These are forward-looking; create them explicitly in tier routing if you want to use them today.
 
 ---
 
@@ -135,7 +134,7 @@ If you set up Ollama locally, there's a shortcut in **Settings → Local Mode**:
 
 Toggling off restores the previous tier routing (stored before activation).
 
-> **Status: known issue.** As of this writing, Local Mode has a wiring gap (P0-1 in `PUNCHLIST.md`): the dispatch path doesn't consistently consult the tier routing table when the chain engine is off. Mixed OpenRouter/Ollama routing works; pure Ollama routing for all tiers may error on the missing OpenRouter key. Fix is in progress. See [`51-local-mode-ollama.md`](51-local-mode-ollama.md).
+The older tier-routing gap (PUNCHLIST P0-1) that blocked pure-Ollama was fixed on 2026-04-11. All tiers now resolve through the provider registry cleanly.
 
 ---
 

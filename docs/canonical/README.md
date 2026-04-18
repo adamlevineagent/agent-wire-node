@@ -81,7 +81,7 @@ Something broke:
 ### Models and compute backends (50–52)
 
 - [`50-model-routing.md`](50-model-routing.md) — the AI Registry, tier routing.
-- [`51-local-mode-ollama.md`](51-local-mode-ollama.md) — Ollama integration (known wiring issue).
+- [`51-local-mode-ollama.md`](51-local-mode-ollama.md) — Ollama integration.
 - [`52-provider-registry.md`](52-provider-registry.md) — providers, adding new ones.
 
 ### The Wire (60–64)
@@ -139,8 +139,8 @@ Feature status at a glance:
 
 - **Shipped:** local pyramid builds, Pyramid Surface, annotations + FAQ, `pyramid-cli` (64 commands), MCP server, publish/pull (public/unlisted), compute market provider side (Phase 2), Cloudflare tunnel.
 - **Partially shipped:** compute market requester side (Phase 3), the chain executor as default (flag needs flipping on fresh installs), a few build phases still in Rust (evidence loop, decomposition — moving to YAML near-term), private and emergent access tiers, cross-provider fallback chains.
-- **Known issues:** Local Mode (Ollama-only) has a wiring gap; mixed cloud+Ollama works, pure Ollama needs P0-1 fix.
-- **Planned:** relays + unlinkable queries, pyramid stewards, steward-daemon three-tier node optimization, `invoke_chain` composition, handle release/transfer workflows.
+- **Known issues:** see [`docs/PUNCHLIST.md`](../PUNCHLIST.md). The earlier P0-1 Ollama tier-routing gap was fixed 2026-04-11.
+- **Planned:** relays + unlinkable queries, pyramid stewards, steward-daemon three-tier node optimization, cross-node `--ref @handle/slug/v1` on question pyramids, handle release/transfer workflows, full MCP coverage of CLI commands.
 
 The full status list is in the main repo [`README.md`](../../README.md) and in [`docs/PUNCHLIST.md`](../PUNCHLIST.md) (authoritative issues list).
 

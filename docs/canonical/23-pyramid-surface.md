@@ -124,6 +124,16 @@ You can walk the whole pyramid this way without closing and reopening the inspec
 - **Copy link** — copy a URL that opens this specific node. Useful for referencing in conversations.
 - **Open in agent** — emit a prompt that asks an agent to walk this node specifically.
 
+### Pyramid-level drawer actions (at the Understanding detail drawer, not per-node)
+
+A cluster of buttons on the pyramid detail drawer complement the surface-level actions:
+
+- **Navigate Pyramid** — opens a dedicated pyramid-navigation view, useful for guided exploration.
+- **Open in Vibesmithy** — hands off to the Vibesmithy spatial UI (if installed).
+- **View on Web** — opens the pyramid's public HTML view in the browser (useful for published pyramids).
+- **Open as Owner** — open with owner-level permissions even on a pyramid that's otherwise shared as a different persona.
+- **Generate Banner** — emit an ASCII-art banner for the pyramid. Useful for README headers.
+
 Close the inspector with Escape or by clicking outside.
 
 ---

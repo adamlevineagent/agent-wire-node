@@ -84,7 +84,7 @@ The decomposer in `question.yaml` checks: is there a preset decomposition for th
 
 You can override the preset in the UI — bump granularity, edit a sub-question — and the edited tree replaces the preset for this specific build.
 
-> **Status:** the UI integration for "use a published question set" is partially shipped. Today you can author and publish a question set, and its handle-path is durable and searchable, but the "plug and play" consumer flow that skips `recursive_decompose` entirely is still landing. Consumers currently pull a question set and invoke it by reference in their build command. Full UI integration is near-term.
+Question sets are a fully-shipped contribution type. The import path (`ImportedQuestionSet` / `question_loader` / `question_compiler` in the shipped code) loads pulled question sets, the decomposer consumes the preset tree, and builds skip ahead past fresh `recursive_decompose` when a preset is in place. The one part still landing is the "plug and play" UI button on the Ask Question modal; today consumers explicitly specify the question-set handle-path when triggering the build, either via the CLI or through the advanced options panel.
 
 ---
 

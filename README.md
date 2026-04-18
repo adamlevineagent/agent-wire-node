@@ -40,7 +40,7 @@ Alpha means some things work and some things don't. Accurate summary of the curr
 - Incremental question pyramids on top of source pyramids.
 - Pyramid Surface visualization, node inspector, reroll, annotate.
 - FAQ auto-generation from annotations with question context.
-- `pyramid-cli` and MCP server (64 commands across 16 categories).
+- `pyramid-cli` (65 commands across 16 categories). MCP server currently wires ~33 of them as tools; the rest are CLI-only while MCP coverage catches up.
 - Publishing and pulling contributions on the Wire.
 - Compute market as **provider** (Phase 2 shipped) — you can opt in to serve inference and earn credits.
 - Cloudflare tunnel for reachability from the Wire.
@@ -53,7 +53,7 @@ Alpha means some things work and some things don't. Accurate summary of the curr
 
 **Known issues:**
 
-- Ollama local mode has a tier-routing wiring gap (P0-1 in `docs/PUNCHLIST.md`) — configuring Ollama doesn't yet route tier resolution through the provider registry correctly. Builds on OpenRouter work fine; Ollama-only setups need the fix to land.
+- See `docs/PUNCHLIST.md` for the current authoritative list. (The earlier P0-1 Ollama tier-routing gap was fixed 2026-04-11.)
 
 **Planned (not yet shipped):**
 

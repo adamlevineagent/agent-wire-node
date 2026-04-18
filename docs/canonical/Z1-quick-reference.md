@@ -213,8 +213,8 @@ curl -s "${HDRS[@]}" -X POST http://localhost:8765/pyramid/my-pyramid/annotation
 - Local pyramid builds on OpenRouter.
 - Pyramid Surface visualization.
 - Annotations + FAQ.
-- `pyramid-cli` (64 commands) and MCP server.
-- Publish / pull (public / unlisted access tiers).
+- `pyramid-cli` (65 commands); MCP server wires ~33 of them as tools.
+- Publish / pull (`public`, `circle-scoped`, `priced`, `embargoed` access tiers).
 - Compute market **provider side** (Phase 2).
 - Cloudflare tunnel for Wire reachability.
 
@@ -226,7 +226,13 @@ curl -s "${HDRS[@]}" -X POST http://localhost:8765/pyramid/my-pyramid/annotation
 - Private access tier / circles.
 - Emergent (paid) access tier.
 
+**Planned (not yet shipped):**
+
+- Privacy-preserving relays · pyramid stewards · steward-daemon three-tier node optimization · cross-node `--ref @handle/slug/v1` on question pyramids · full MCP coverage of the remaining CLI commands.
+
 **Known issues:**
+
+See [`docs/PUNCHLIST.md`](../PUNCHLIST.md) for the authoritative list. The earlier P0-1 Ollama tier-routing gap was fixed 2026-04-11.
 
 - Local Mode (Ollama only) has a tier-routing wiring gap. Mixed cloud+Ollama works; pure Ollama hits P0-1. Fix in progress.
 

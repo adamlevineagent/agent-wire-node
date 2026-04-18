@@ -12,7 +12,7 @@ Each provider is a row with:
 
 - **ID** — e.g. `openrouter`, `ollama-local`, `anthropic-direct`, `my-private-gateway`. Used in tier routing.
 - **Display name** — for the UI.
-- **Type** — `openrouter`, `openai_compat`, `ollama_native`, or one of the other shipped provider types.
+- **Type** — `openrouter` or `openai_compat`. (These are the two shipped types; `openai_compat` is what you use for any OpenAI-compatible endpoint, including Ollama.)
 - **Base URL** — the endpoint to call. May contain `${VAR_NAME}` references (e.g. `${OLLAMA_PROD_URL}` for a URL that's an environment-specific secret).
 - **API key ref** — the credentials file variable that holds the auth token. Null for providers without auth (local Ollama).
 - **Auto-detect context** — whether Agent Wire Node should query the provider for context-window metadata on model selection.
@@ -35,11 +35,9 @@ The full schema is in the provider spec (`docs/specs/provider-registry.md`).
 
 Supports standard `chat/completions` path, optional bearer auth, structured output when the model supports it.
 
-**`ollama_native`** — alternate type that uses Ollama's native `/api/chat` endpoint instead of the OAI-compat path. Needed only when you want per-request `num_ctx` control or other Ollama-native options. Default OLlama setups use `openai_compat`.
+**Ollama setups** — configure as `openai_compat` with base URL `http://localhost:11434/v1`. Ollama's cloud-hosted models (e.g. `gpt-oss:120b-cloud`) use the same `openai_compat` type pointed at `https://ollama.com/api` with `OLLAMA_API_KEY` as the auth variable.
 
-**`ollama_cloud`** — variant of `openai_compat` tuned for `ollama.com/api`. Requires `OLLAMA_API_KEY` credential. Model IDs typically have a `-cloud` suffix (e.g. `gpt-oss:120b-cloud`).
-
-Additional types may be added over time as the provider ecosystem grows.
+Forward-looking variants (`ollama_native` for per-request `num_ctx` control, dedicated cloud-specific provider types) are on the roadmap but not yet shipped — the shipped `openai_compat` covers the common cases today.
 
 ---
 

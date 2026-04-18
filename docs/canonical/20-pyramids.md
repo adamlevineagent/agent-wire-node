@@ -33,9 +33,9 @@ Above the list, filter controls: search by slug, filter by content type, filter 
 Clicking a pyramid row opens a detail drawer on the right. The drawer has:
 
 - **Header** — slug, content type, summary counts.
-- **Publication control** — access tier (public/unlisted/private/emergent), price, circles filter, publish button.
-- **Absorption config** — how the pyramid responds to incoming questions from the Wire. Mode (open, rate-limited, daily cap), chain selector, rate limits.
-- **Actions** — rebuild, ask a question (creates a derivative question pyramid), open DADBEAR panel, open FAQ directory, open vine viewer, open in Vibesmithy, delete.
+- **Publication control** — access tier (`public`, `circle-scoped`, `priced`, `embargoed`), price (for `priced`), circle filter (for `circle-scoped`), **Publish Now** button.
+- **Absorption config** — how the pyramid responds to incoming questions from the Wire. Mode (`open`, `absorb-all`, `absorb-selective`), chain selector, rate limits.
+- **Actions** — rebuild, ask a question (creates a derivative question pyramid), open DADBEAR panel, open FAQ directory, open vine viewer, **Navigate Pyramid**, **Open in Vibesmithy**, **View on Web**, **Open as Owner**, **Generate Banner** (ASCII art), delete.
 - **Metadata** — node count, max depth, created/built timestamps, list of referenced slugs.
 
 The detail drawer is where you do almost everything on a specific pyramid. Most other operations (asking a question, publishing, configuring absorption) are shortcuts to specific sections of the drawer.
@@ -115,10 +115,10 @@ See [`23-pyramid-surface.md`](23-pyramid-surface.md).
 
 In the detail drawer, the publication control lets you:
 
-- Choose an access tier (public, unlisted, private, emergent).
-- Set a price (for emergent).
-- Restrict to specific circles (for private).
-- Click **Publish**.
+- Choose an access tier (`public`, `circle-scoped`, `priced`, `embargoed`).
+- Set a price (for `priced`).
+- Restrict to specific circles (for `circle-scoped`).
+- Click **Publish Now**.
 
 The publish preview runs a dry-run that shows what will be sent, how much it costs, and any warnings (e.g. credentials referenced in a chain variant). You confirm, and the pyramid gets a Wire handle-path and appears in the Wire's search index (if public).
 

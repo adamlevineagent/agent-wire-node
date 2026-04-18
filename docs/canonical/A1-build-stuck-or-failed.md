@@ -30,7 +30,7 @@ Click the running build. The activity log shows the current step and the last fe
 
 **Ollama hung.** Local Ollama occasionally deadlocks on specific prompts or resource contention. `ps aux | grep ollama` — if the process is alive but not responding, restart Ollama: `brew services restart ollama`.
 
-**P0-1 wiring gap.** If you're in pure Ollama mode and the build errors on "no OpenRouter key," you've hit the known issue. See [`51-local-mode-ollama.md`](51-local-mode-ollama.md) for the workaround (mixed routing).
+**Older P0-1 wiring gap.** The pure-Ollama mode error on "no OpenRouter key" was fixed 2026-04-11. If you're still seeing this error, update to the latest app version.
 
 ### Force reset
 

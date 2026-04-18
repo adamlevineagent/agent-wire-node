@@ -134,7 +134,7 @@ Some operators set **Always identify on pull** in Settings → Privacy (when shi
 
 Free contributions: 0 credits.
 
-Emergent (paid) contributions:
+`priced` contributions:
 
 - **Purchase price.** Set by the author.
 - **Rotator-arm split.** Of the price: 76% to author, 2% platform, 2% treasury, remainder to reserved roles. You see the breakdown in the pull preview and in your transaction log.

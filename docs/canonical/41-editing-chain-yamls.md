@@ -222,6 +222,21 @@ These trigger specialized executor paths rather than direct LLM calls. They are 
 
 **A note on current state:** these recipe primitives are **implemented in Rust** and invoked by name from the chain. They behave like built-ins you call but cannot rewrite in YAML. Moving them into expressible YAML (so that e.g. the evidence loop could itself be a chain you edit) is on the near-term roadmap but hasn't landed yet. Until it does, if you need to change how decomposition or evidence answering works, you change the prompts they reference (`$prompts/question/decompose.md`, `$prompts/question/pre_map.md`, `$prompts/question/answer.md`) — not the primitives themselves.
 
+### `invoke_chain` — call another chain from a step
+
+A step can call another chain by id, passing scoped inputs and receiving outputs back:
+
+```yaml
+- name: run_extraction_subchain
+  invoke_chain: extraction-subchain-v1
+  inputs:
+    chunks: "$chunks"
+    tier: "$model_tier"
+  save_as: step_only
+```
+
+Nested depth is tracked (to prevent runaway recursion). Variable scope is isolated — the invoked chain doesn't see the caller's context except through the `inputs` it was passed, and outputs come back via the step's `save_as`. Published chains can invoke other published chains by handle-path.
+
 ---
 
 ## Variables

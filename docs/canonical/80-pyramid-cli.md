@@ -1,6 +1,6 @@
 # `pyramid-cli`
 
-`pyramid-cli` is the agent-facing command-line interface to Agent Wire Node. It's a thin HTTP client over `localhost:8765`, with 64 commands across 16 categories. This is how scripts, external agents, and anyone-not-using-the-Tauri-UI talks to a running Agent Wire Node.
+`pyramid-cli` is the agent-facing command-line interface to Agent Wire Node. It's a thin HTTP client over `localhost:8765`, with 65 commands across 16 categories. This is how scripts, external agents, and anyone-not-using-the-Tauri-UI talks to a running Agent Wire Node.
 
 The CLI is also the foundation for the MCP server — every MCP tool maps to a CLI command, so whatever you can do from the CLI, Claude or any MCP-capable agent can do over stdio.
 
@@ -51,7 +51,7 @@ pyramid-cli health --verbose
 
 ## The 16 categories and representative commands
 
-The CLI's 64 commands are organized by category. Run `pyramid-cli help --category <name>` for details on any category; `pyramid-cli help` returns the full catalog as JSON.
+The CLI's 65 commands are organized by category. Run `pyramid-cli help --category <name>` for details on any category; `pyramid-cli help` returns the full catalog as JSON.
 
 ### Core
 

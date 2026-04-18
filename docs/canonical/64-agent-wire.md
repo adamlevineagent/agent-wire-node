@@ -60,35 +60,21 @@ The annotation itself is signed by the agent's key. Even if it travels through i
 
 ---
 
-## Cross-node question pyramids
+## Cross-pyramid question pyramids (local today, cross-node planned)
 
-The most interesting Agent Wire capability: question pyramids that reference remote source pyramids.
-
-Example:
-
-- You have a local pyramid `my-codebase-v2`.
-- Your collaborator published `@alice/api-design-principles/v1`.
-- A researcher published `@bob/security-threat-model-2026/v3`.
-
-Create a question pyramid that references all three:
+Question pyramids that reference other pyramids are fully shipped **when those source pyramids are on the same node**. You can do:
 
 ```bash
-pyramid-cli create-question-slug security-audit --ref my-codebase-v2 \
-  --ref @alice/api-design-principles/v1 --ref @bob/security-threat-model-2026/v3
-pyramid-cli question-build security-audit \
-  "Given Alice's principles and Bob's threat model, what are the security risks in my codebase?"
+pyramid-cli create-question-slug cross-codebase --ref my-codebase-v1 --ref my-codebase-v2
+pyramid-cli question-build cross-codebase \
+  "What breaking changes exist between v1 and v2?"
 ```
 
-The question-pipeline chain runs on your node:
+The question-pipeline chain decomposes the apex question, pulls L0 from both referenced pyramids, synthesizes across them. Evidence attribution is preserved — you can drill any node and walk back to the specific source pyramid and file.
 
-- Decomposes your apex question.
-- For each sub-question, checks local L0 first (your codebase).
-- For remaining sub-questions, queries the referenced pyramids — potentially hitting Alice's and Bob's nodes for evidence.
-- Synthesizes answers across evidence from all three sources.
+**Cross-node referenced pyramids** (`--ref @alice/api-design-principles/v1` — pulling evidence from a pyramid hosted on someone else's node) is planned but not yet shipped. The shipped `referenced_slugs` resolver looks for slugs in your local database. To work against someone else's pyramid today, pull it first (if they published it with a cache manifest) or query it through the MCP/HTTP surface and stitch the result into your own pyramid by hand.
 
-Evidence attribution is preserved: the resulting answers cite evidence nodes across all three source pyramids by handle-path. When you drill, you can walk back to specific passages in Alice's or Bob's material.
-
-Rotator-arm royalties: querying Alice's pyramid for evidence is a metered consumption event (free or priced per her access tier). Reputation flows to her as her pyramid's evidence gets used.
+When cross-node references ship, the UX described above will work transparently: you reference by handle-path, evidence flows through, and rotator-arm royalties settle for the authoring pyramids as their evidence is consumed.
 
 ---
 

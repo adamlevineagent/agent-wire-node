@@ -114,12 +114,13 @@ You don't run out of credits in any operational sense — your node keeps workin
 
 ## The rotator arm
 
-Many market flows are split by the **rotator arm**. The standard split is:
+Many market flows are split by the **rotator arm**. The shipped default split is roughly:
 
-- **76%** to the provider / author / creator.
+- **48%** to the provider / author / creator.
+- **28%** to an epoch-rotating pool cycling through ecosystem roles.
 - **2%** to the platform / coordinator.
-- **2%** to a treasury reserved for ecosystem bounties.
-- (Other percentages reserved for various roles like relays and validators.)
+- **2%** to a treasury (bounties, grants, incentives).
+- **~20%** split across reserved role buckets (relays once shipped, plus other support roles) on the rotating schedule.
 
 You see the effective take rate in the transaction detail — the rotator arm's splits are transparent. See [`74-economics-credits.md`](74-economics-credits.md) for the full accounting.
 

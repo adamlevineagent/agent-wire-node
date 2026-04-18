@@ -9,9 +9,9 @@ Publishing turns a local contribution into a Wire-addressable artifact with a du
 Every publish goes through the same steps:
 
 1. **Pick the contribution.** In Tools mode, select one of your local contributions (draft or an updated version of something previously published).
-2. **Pick access tier.** Public, unlisted, private, or emergent (planned).
-3. **Set pricing** (if emergent). Price in credits; optional floor, optional promotional discount.
-4. **Set circles** (if private). Which handles or groups can pull.
+2. **Pick access tier.** `public`, `circle-scoped`, `priced`, or `embargoed`.
+3. **Set pricing** (if `priced`). Price in credits; optional floor, optional promotional discount.
+4. **Set circles** (if `circle-scoped`). Which handles or groups can pull.
 5. **Review the publish preview.** Dry run — what will be sent, warnings, cost to consumers, supersession chain.
 6. **Confirm.** Agent Wire Node contacts the coordinator. Handle-path is allocated. Body is uploaded.
 7. **Done.** Your contribution appears in Tools with a "published" badge and a handle-path. It's now discoverable (per access tier) and pullable.
@@ -94,10 +94,10 @@ See [`46-config-contributions.md`](46-config-contributions.md).
 
 Pyramids are larger than chains/skills/configs and have their own publish flow:
 
-1. **From Understanding → detail drawer → Publish**.
-2. **Access tier.** Public/unlisted/private/emergent.
-3. **Pricing** (if emergent, planned). Note: because pyramids are large, emergent is the most relevant paid tier for pyramids.
-4. **Absorption config.** How the pyramid responds to incoming questions. Mode (open, rate-limited, daily cap), chain for absorption.
+1. **From Understanding → detail drawer → Publish Now**.
+2. **Access tier.** `public` / `circle-scoped` / `priced` / `embargoed`.
+3. **Pricing** (if `priced`). Because pyramids are large, `priced` is the most common paid tier for pyramids.
+4. **Absorption config.** How the pyramid responds to incoming questions. Mode (`open`, `absorb-all`, `absorb-selective`), chain for absorption.
 5. **Cache manifest toggle.** Opt in to include pre-computed cache entries so consumers get usable speed immediately on pull. Recommended for published pyramids you expect to be queried heavily.
 6. **Dry run.** Agent Wire Node runs a preview — structured node data, size, provenance, supersession chain, cost (if emergent).
 7. **Confirm.**
@@ -121,7 +121,7 @@ Composed contributions are first-class — they appear in Search, can be cited, 
 
 ## Pricing
 
-For contributions you set a price on (emergent tier):
+For contributions you set a price on (`priced` tier):
 
 - **Price in credits.** You pick the amount.
 - **Floor price.** Optional — disallow discounts below this.

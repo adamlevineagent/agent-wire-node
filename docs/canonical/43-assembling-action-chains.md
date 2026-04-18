@@ -12,14 +12,11 @@ This doc covers how compositional chains are built in the shipped executor, the 
 
 - Recipe primitives (`cross_build_input`, `recursive_decompose`, `build_lifecycle`, `evidence_loop`, `process_gaps`) that trigger specialized executor paths within one chain.
 - The `container` primitive for grouping a sub-sequence of steps into one logical unit.
+- **`invoke_chain`** as a step field that calls another named chain with scoped inputs and merges outputs back — a chain can cleanly delegate to another chain by id.
 - Cross-pyramid composition via vine chains — a vine pyramid's build triggers child pyramid builds.
 - Cross-build input via `cross_build_input` — a chain can load prior build state (nodes, evidence, question tree) from the same slug and decide fresh-vs-delta behavior.
 
-**What's planned (not yet shipped):**
-
-- `invoke_chain` as a step field that calls another named chain with scoped inputs and merges outputs. This would let small, focused chains compose into larger ones without a Rust-level executor change. Vision. See the forward note at the end of this doc.
-
-The shipped model is "one chain with rich primitives" rather than "many chains composed by invocation." Everything the question-pipeline chain needs to do is expressed as a sequence of steps inside that one chain, using recipe primitives for specialized phases.
+The shipped composition vocabulary is rich: one chain with recipe primitives for specialized phases plus `invoke_chain` for delegating to other chains. The question-pipeline chain leans on recipe primitives; larger compositional pipelines (vines, custom workflows) use `invoke_chain` to compose smaller chains.
 
 ---
 
@@ -228,13 +225,22 @@ In practice, most customization is tuning the shipped chain. Authoring entirely 
 
 ---
 
-## Planned: `invoke_chain`
+## `invoke_chain` in practice
 
-The natural next step in composition is `invoke_chain` — a step field that calls another chain by ID with scoped inputs and merges outputs back. This would let small, focused chains compose into larger ones without needing a single giant chain.
+`invoke_chain` is a step field that calls another chain by id with scoped inputs and merges outputs back:
 
-**Status: planned, not shipped.** Today you can't reference other chains from inside a step. If you're reading forward-looking design docs like `docs/SYSTEM.md` §3.2 that mention `invoke_chain`, they're describing the intended direction, not the shipped feature.
+```yaml
+- name: extract_and_cluster
+  invoke_chain: extraction-and-clustering-v2
+  inputs:
+    chunks: "$chunks"
+    tier: extractor
+  save_as: step_only
+```
 
-When `invoke_chain` ships, the compositional vocabulary expands: you'll author small reusable chains (e.g. `recursive-cluster-synthesis`, `cross-corpus-glossary`) and compose them from a thin orchestrator chain. In the meantime, the composition primitive is "one chain with many steps and recipe primitives."
+The invoked chain runs in its own context — its variables are scoped to itself. Inputs are the only thing that crosses the boundary from caller; outputs come back through the step's `save_as`. Nesting depth is tracked so recursive invocations can't run away.
+
+You author small, reusable chains (e.g. `recursive-cluster-synthesis`, `cross-corpus-glossary`) and compose them from a thin orchestrator chain. Published chains can invoke other published chains by handle-path, making chain composition a first-class sharable primitive on the Wire.
 
 ---
 

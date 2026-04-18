@@ -91,7 +91,7 @@ See [`A1-build-stuck-or-failed.md`](A1-build-stuck-or-failed.md).
 
 Quick checks:
 
-- Builds failing with "no OpenRouter key" when Ollama is on: P0-1 wiring gap. See [`51-local-mode-ollama.md`](51-local-mode-ollama.md).
+- Builds failing with "no OpenRouter key" when Ollama is configured: the earlier P0-1 wiring gap was fixed 2026-04-11. If you're still seeing this, update to the latest app version.
 - Builds timing out repeatedly: provider issues. Check **Settings → Providers → Test**.
 - Builds stuck at 0%: port conflict on 8765 or the backend is frozen. Force-quit and restart.
 

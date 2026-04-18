@@ -2,11 +2,7 @@
 
 Local Mode routes all LLM calls to a local [Ollama](https://ollama.com/) instance instead of OpenRouter or any other cloud provider. Free, private, works offline. Trade-offs: slower than cloud APIs, constrained by your hardware's RAM and GPU, one-model-at-a-time for most setups.
 
-> **Status: known issue.** As of this writing, full Local Mode has a wiring gap (P0-1 in `docs/PUNCHLIST.md`). The tier dispatch path doesn't consistently consult the provider registry when the legacy chain engine is off, which can cause builds to error on a missing OpenRouter key even when Ollama is configured. Fix is in progress. Mixed routing (some tiers Ollama, others OpenRouter) works today; pure-Ollama builds are the case that needs the fix.
->
-> Until that lands, the most reliable path is: use OpenRouter as the primary provider and route just `stale_local` (or similar) to Ollama. Once the P0-1 fix ships, pure Ollama setups will be first-class.
-
-This doc describes how Local Mode is *designed* to work and what you can do with it today given the caveat.
+The tier-routing wiring gap that blocked pure-Ollama builds (PUNCHLIST P0-1) was fixed on 2026-04-11. Pure Ollama is first-class today; mixed cloud+Ollama routing also works.
 
 ---
 
@@ -93,16 +89,16 @@ Cloud models show a lock icon in the model list. Agent Wire Node checks for cred
 
 ---
 
-## Mixed setups (recommended while P0-1 is unresolved)
+## Mixed setups (often what you want)
 
 A common and pragmatic setup:
 
-- **Cloud** (OpenRouter) for `extractor`, `web`, `mid`, `synth_heavy`.
-- **Local Ollama** for `stale_local`.
+- **Cloud** (OpenRouter) for `extractor`, `web`, `mid`, `synth_heavy` — fast, parallel, reasoning-heavy work.
+- **Local Ollama** for cheap staleness checks and other high-volume low-complexity tiers.
 
 This gives you cheap, fast staleness checks on local hardware (DADBEAR loops over source changes — the cost adds up if every check hits a cloud API) while keeping heavy build work on cloud models where speed matters.
 
-Set up the provider and tier routing manually (without flipping the Enable Local Mode toggle, which tries to move everything at once). This sidesteps the P0-1 wiring gap and is already the intended long-run shape for many operators anyway.
+Set up the provider and tier routing manually in Settings → Tier Routing if you want to mix. The Enable Local Mode toggle moves everything to Ollama at once, which is also valid for operators with capable local hardware.
 
 ---
 
@@ -114,7 +110,7 @@ Set up the provider and tier routing manually (without flipping the Enable Local
 
 **"Context window detection failed"** — `/api/show` didn't return usable metadata. Try pulling a fresher version of the model, or set context_limit manually in the tier routing.
 
-**Build errors with "no OpenRouter key" when Ollama is on** — you've hit P0-1. Workaround: use mixed routing (above) rather than full Local Mode toggle. Fix is in progress.
+**Build errors with "no OpenRouter key" when Ollama is on** — the older wiring gap that caused this was fixed 2026-04-11. If you're still seeing it, you may be on an older build; update the app and retry.
 
 **Slow inference** — check model size vs your RAM. If Ollama is swapping to disk, performance drops dramatically. Pull a smaller quantization (Q4 instead of Q8) or a smaller parameter count.
 

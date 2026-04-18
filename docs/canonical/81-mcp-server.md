@@ -8,18 +8,19 @@ This is how Claude connects to your pyramids.
 
 ## What it provides
 
-Every `pyramid-cli` command has a matching MCP tool. 63 tools currently (the vine commands are CLI-only for the moment), spanning the 16 categories documented in [`80-pyramid-cli.md`](80-pyramid-cli.md).
+The MCP server wires a subset of the CLI catalog into MCP tools. **As of this writing, about 33 tools are registered via `server.tool()`** in `mcp-server/src/index.ts`, covering the core exploration / analysis / annotation / question flows. The full CLI catalog (65 commands) is richer — the remaining commands (most of the primer, reading, manifest, vocabulary, recovery, demand-gen, and preview categories, plus the vine commands) are reachable via CLI but not yet wired into MCP.
 
-When Claude has the MCP server loaded, the full tool surface becomes available in any session:
+When Claude has the MCP server loaded, this surface is available in any session:
 
 - `pyramid_health`, `pyramid_list_slugs`, `pyramid_help`
-- `pyramid_apex`, `pyramid_search`, `pyramid_drill`, `pyramid_tree`, `pyramid_navigate`, `pyramid_faq_match`, `pyramid_faq_directory`
+- `pyramid_apex`, `pyramid_search`, `pyramid_drill`, `pyramid_node`, `pyramid_tree`, `pyramid_navigate`, `pyramid_faq_match`, `pyramid_faq_directory`
 - `pyramid_entities`, `pyramid_terms`, `pyramid_edges`, `pyramid_threads`, `pyramid_meta`, `pyramid_resolved`, `pyramid_corrections`
 - `pyramid_annotate`, `pyramid_react`, `pyramid_dadbear_status`, `pyramid_cost`, `pyramid_stale_log`, `pyramid_usage`, `pyramid_diff`
 - `pyramid_handoff`, `pyramid_compare`
 - `pyramid_create_question_slug`, `pyramid_question_build`, `pyramid_references`, `pyramid_composed_view`
 - `pyramid_session_register`, `pyramid_sessions`
-- And all of the primer, reading, manifest, vocabulary, recovery, demand-gen, preview tools.
+
+If you need a CLI command that isn't an MCP tool yet, call the CLI directly from a shell tool within the same session. Wiring the remaining tools into MCP is a near-term roadmap item.
 
 ---
 

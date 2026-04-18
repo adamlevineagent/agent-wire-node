@@ -42,16 +42,19 @@ Your node continues to function with zero or negative balance. Negative means yo
 
 ## The rotator arm — default split
 
-When credits flow on a paid Wire transaction (pull, market job, paid query), they're split:
+When credits flow on a paid Wire transaction (pull, market job, paid query), the rotator arm distributes them across four roles. The shipped default split (see `rotator_allocation.rs` on the Wire) is:
 
-- **76%** to the creator / provider (the principal value contributor).
+- **48%** to the creator / provider (the principal value contributor).
+- **28%** to an epoch-rotating pool that cycles through ecosystem roles.
 - **2%** to the platform (Wire coordination service).
-- **2%** to the treasury (reserved for ecosystem bounties, grants, incentives).
-- The remainder is reserved for roles like **relays** and (planned) **validators** that support the network beyond direct contribution authorship.
+- **2%** to a treasury (bounties, grants, incentives).
+- The remaining **20%** is split across reserved role buckets like **relays** (once shipped) and other support roles, on the same rotating schedule.
 
-The name "rotator arm" comes from the split's visual metaphor — a spinning arm that distributes the pie in fixed percentages regardless of transaction size.
+The name "rotator arm" comes from that epoch rotation — the 80-slot cycle distributes the non-creator share across a fixed schedule of roles rather than a fixed list. Specific percentages shift by epoch within published bounds.
 
 The split is **per-transaction, not per-source**. Every paid pull rotates. Every market job rotates. Every paid query rotates.
+
+Per-contribution overrides (below) let authors narrow these splits in specific directions — e.g. waiving treasury share for public-good contributions.
 
 ---
 

@@ -78,14 +78,14 @@ See [`61-publishing.md`](61-publishing.md) and [`62-pulling-and-discovery.md`](6
 
 ## Access tiers
 
-When you publish, you choose an access tier:
+When you publish, you choose an access tier. The shipped tiers are:
 
-- **Public** — anyone can find and pull it.
-- **Unlisted** — anyone with the handle-path can pull it; doesn't appear in Search.
-- **Private** — only nodes in specific circles you define can pull it.
-- **Emergent** *(planned)* — paid access; the Wire handles payment on pull.
+- **`public`** — anyone can find and pull it.
+- **`circle-scoped`** — only nodes in specific circles you define can access it.
+- **`priced`** — paid access on pull; the Wire handles payment and splits via the rotator arm.
+- **`embargoed`** — published but held back from general access until an unlock condition is met (time, event, or manual release).
 
-Public and unlisted are shipped. Private and emergent are partially shipped — circles for private access and full Wire-handled paid emergent access are in progress.
+`public` is the common default. `priced` and `circle-scoped` work today; full Wire-handled payment-on-pull and circle management UIs are still maturing.
 
 Pricing, when used, is denominated in credits. The rotator arm splits revenue among the author, the platform, and a treasury. See [`74-economics-credits.md`](74-economics-credits.md).
 

@@ -8,7 +8,7 @@ Every Agent Wire Node term that comes up in the docs, defined in one place. Cros
 
 **Absorption** — a published pyramid's policy for handling incoming questions. Controls rate limits, daily caps, and which chain handles absorption. Set per-pyramid in the detail drawer. [`20-pyramids.md`](20-pyramids.md)
 
-**Access tier** — the visibility level of a published contribution: public, unlisted, private, or emergent. Set at publish time. [`61-publishing.md`](61-publishing.md)
+**Access tier** — the visibility/access level of a published contribution: `public`, `circle-scoped`, `priced`, or `embargoed`. Set at publish time. [`61-publishing.md`](61-publishing.md)
 
 **Action chain** — a Wire-native composition of action steps, typically a published contribution. In current shipped usage, "chain" and "action chain" are near-synonyms. [`41-editing-chain-yamls.md`](41-editing-chain-yamls.md), [`43-assembling-action-chains.md`](43-assembling-action-chains.md)
 
@@ -104,7 +104,11 @@ Every Agent Wire Node term that comes up in the docs, defined in one place. Cros
 
 ## E
 
-**Emergent (access tier)** — paid access on pull. (Partially shipped.)
+**`circle-scoped` (access tier)** — access restricted to specified circles of handles.
+
+**`priced` (access tier)** — paid access on pull; the Wire handles payment and splits via the rotator arm.
+
+**`embargoed` (access tier)** — published but held from general access until an unlock condition (time, event, manual release).
 
 **Evidence** — the KEEP/DISCONNECT/MISSING links from a node to its lower-layer nodes, with weights and reasons. [`01-concepts.md`](01-concepts.md)
 
