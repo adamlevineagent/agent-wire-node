@@ -82,8 +82,9 @@ export function ComputeMarketSurface() {
                 <div className="compute-surface-header-text">
                     <h3 className="compute-section-title">Market surface</h3>
                     <p className="compute-section-sub">
-                        Browse compute providers across the network. Read-only — Phase 2 is
-                        provider-side only; requester-side purchase arrives in Phase 3.
+                        Browse compute providers across the network. Read-only view of
+                        who's helping with which models right now — sorted by price,
+                        latency, or queue depth.
                     </p>
                 </div>
                 <button
