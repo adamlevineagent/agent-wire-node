@@ -50,9 +50,11 @@ When a credit comes in, the arm pays that credit to the role assigned to the cur
 
 This gives a **directable** split without any fractional credit accounting — every credit is atomic and goes to exactly one recipient. Over long-run volume, the distribution converges exactly on the directive. Short-run volume may not exercise all 80 slots, but the split is honored in expectation.
 
-### Two flow classes — service vs. citation-bearing
+### Two flow classes — contributions vs. services
 
-**Service flows (compute market).** Buying inference is a service purchase with no citation chain downstream — no prior authors the result builds on, no lineage to attribute. The directive is compact and UFF does not apply:
+**Contributions.** Every contribution — chains, skills, templates, question sets, configs, pyramid nodes, annotations, supersessions, composed prose, everything with a `derived_from` lineage — is governed by **UFF**. When any paid or citation-triggered payout flows against a contribution, its UFF-compliant slot directive is what the rotator arm uses.
+
+**Services.** The compute market is the service exception. Buying inference is a service purchase, not a contribution — nothing is published, nothing enters the supersession graph, no `derived_from` chain is involved. UFF does not apply. The directive is compact:
 
 - **76 slots** → the provider serving the job.
 - **2 slots** → the platform.
@@ -60,11 +62,9 @@ This gives a **directable** split without any fractional credit accounting — e
 
 Every 80 credits of market revenue pays the provider 76, platform 2, treasury 2.
 
-**Citation-bearing flows (contribution pulls, paid queries, absorption).** A published chain, skill, pyramid, or composed contribution can carry `derived_from` references — it builds on prior work. These flows are governed by **UFF**.
+### UFF (the universal sourcing-share rule)
 
-### UFF (the sourcing-share rule)
-
-Under UFF, **28 of the 80 slots must be allocated to sourcing** — the prior contributions the current work derives from. This is a floor, not a suggestion: every citation-bearing directive commits 28 slots to the authors whose work the current contribution builds on.
+UFF covers every contribution. Under UFF, **28 of the 80 slots must be allocated to sourcing** — the prior contributions the current work derives from. This is a floor, not a suggestion: every contribution's directive commits 28 slots to the authors whose work it builds on. This is true for every contribution type — a chain YAML, a prompt markdown, a config, a pyramid node, a supersession of a prior config, a composed analysis, anything.
 
 A typical UFF-compliant directive:
 
@@ -73,13 +73,15 @@ A typical UFF-compliant directive:
 - **2 slots** → platform.
 - **2 slots** → treasury.
 
-The 28 sourcing slots are partitioned across the cited ancestors at the author's discretion. Each partition carries a **reason** — a written justification for why that particular ancestor gets that particular slot count. For example:
+The 28 sourcing slots are partitioned across the cited ancestors at the author's discretion. Each partition carries a **reason** — a written justification for why that particular ancestor gets that particular slot count. For example, for a chain that builds on three prior works:
 
 - **12 slots** → `@alice/architecture-chain/v2` — "primary structural pattern borrowed wholesale."
 - **10 slots** → `@bob/extraction-skill/v1` — "extraction prompt adapted with modifications."
 - **6 slots** → `@carol/webbing-skill/v3` — "one step uses this skill directly."
 
-Every sourcing reason is published alongside the contribution and visible to anyone who pulls it. This is where the "directable as directed" part of the rotator arm matters: the allocations are the author's judgment, but the judgment is **transparent and challengeable**.
+The same rule applies to every contribution type. A supersession of a config directs sourcing slots to the superseded version (with reasons for what changed and what's preserved). A pyramid node sourced from evidence directs slots to those L0 nodes and to the source document/chunk. An annotation on a published pyramid sources slots to the node being annotated. A composed analysis sources slots to the contributions it critiques, steelmans, or builds on.
+
+Every sourcing reason is published alongside the contribution and visible to anyone who pulls or queries it. This is where the "directable as directed" part of the rotator arm matters: the allocations are the author's judgment, but the judgment is **transparent and challengeable**.
 
 ### Firsts: self-sourcing with reason
 

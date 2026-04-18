@@ -118,8 +118,8 @@ Paid flows are split by the **rotator arm** — a wheel of 80 slots where each s
 
 Two flow classes:
 
-- **Service flows (compute market):** 76 → provider, 2 → platform, 2 → treasury. No citation chain, so UFF does not apply.
-- **Citation-bearing flows (contribution pulls, paid queries):** governed by **UFF** — 28 of the 80 slots are mandatory sourcing slots allocated to the cited ancestors (`derived_from`). Each sourcing allocation carries a published, challengeable reason. A "first" with no prior sources self-sources the 28 slots with a reason that has to hold up to challenge. The remaining 52 slots are the author's to direct — typically 48 creator + 2 platform + 2 treasury.
+- **Services (compute market):** 76 → provider, 2 → platform, 2 → treasury. A service purchase isn't a contribution — nothing is published, no lineage is involved — so UFF does not apply.
+- **Contributions (everything else — chains, skills, configs, question sets, pyramid nodes, annotations, supersessions, composed work):** governed by **UFF**. 28 of the 80 slots are mandatory sourcing slots allocated to the cited ancestors (`derived_from`). Each sourcing allocation carries a published, challengeable reason. A "first" with no prior sources self-sources the 28 slots with a reason that has to hold up to challenge. The remaining 52 slots are the author's to direct — typically 48 creator + 2 platform + 2 treasury.
 
 You see the effective directive and every sourcing reason in the transaction detail. See [`74-economics-credits.md`](74-economics-credits.md) for the full accounting.
 
