@@ -439,12 +439,43 @@ async fn push_snapshot(ctx: &MirrorTaskContext) -> Result<(), String> {
         let body = resp.text().await.unwrap_or_default();
         return Err(format!("http {}: {}", status.as_u16(), body));
     }
-    tracing::debug!(
+    // Bumped from DEBUG to INFO so the happy path is visible in default
+    // log output — critical for diagnosing the "is the mirror pushing?"
+    // question without needing RUST_LOG=debug on operator boxes.
+    tracing::info!(
         snapshot_seq = snapshot.snapshot_seq,
         offers = snapshot.offers.len(),
         is_serving = snapshot.is_serving,
         "queue mirror pushed"
     );
+
+    // Emit a node-local chronicle event so operators can see push
+    // activity in their own chronicle (the Wire-side
+    // `compute_queue_mirror_pushed` only lands in wire_chronicle,
+    // not here). Fire-and-forget via spawn_blocking matching the
+    // existing failure-path pattern.
+    let db_path = ctx.db_path.clone();
+    let snap_seq = snapshot.snapshot_seq;
+    let offers_count = snapshot.offers.len();
+    let push_is_serving = snapshot.is_serving;
+    let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        let job_path = format!("market/mirror/{}", chrono::Utc::now().timestamp());
+        let ctx_ev = ChronicleEventContext::minimal(
+            &job_path,
+            "queue_mirror_pushed",
+            SOURCE_MARKET,
+        )
+        .with_metadata(serde_json::json!({
+            "snapshot_seq": snap_seq,
+            "offers": offers_count,
+            "is_serving": push_is_serving,
+        }));
+        let _ = record_event(&conn, &ctx_ev);
+        Ok(())
+    })
+    .await;
+
     Ok(())
 }
 
