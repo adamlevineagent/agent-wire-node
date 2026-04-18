@@ -1,0 +1,12 @@
+# Delegate git fetches to the system `git` binary so cargo picks up the
+# user's credential helper (ssh-agent, osxkeychain, etc). Needed because
+# the `agent-wire-contracts` crate ships from the private
+# `adamlevineagent/GoodNewsEveryone` repo.
+#
+# Without this, `cargo check` fails with "failed to authenticate when
+# downloading repository" — cargo's built-in libgit2 client doesn't
+# read macOS keychain credentials.
+#
+# See https://doc.rust-lang.org/cargo/reference/config.html#netgit-fetch-with-cli
+[net]
+git-fetch-with-cli = true

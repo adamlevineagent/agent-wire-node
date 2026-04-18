@@ -118,6 +118,19 @@ pub struct OfferRequest {
     #[serde(default)]
     pub queue_discount_curve: Vec<OfferQueueDiscountPoint>,
     pub max_queue_depth: usize,
+    /// Estimated wall-clock time (seconds) until this offer's next
+    /// available slot, given current queue depth + inference throughput.
+    /// Wire's `sync_compute_offer_denorm` trigger (structural-fix plan
+    /// §2.2) reads this from the offer's `structured_data` JSONB and
+    /// writes it to the denormalized `est_next_available_s` column
+    /// that match_compute_job filters on. Omitted / None → leave the
+    /// denorm column null (Wire treats as "unknown, don't filter").
+    ///
+    /// NOT emitted on /queue-mirror push — per Privacy J7 the push body
+    /// carries only `{current_queue_depth, max_queue_depth}` per offer.
+    /// Wall-clock estimates flow through the offer publish path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub est_next_available_s: Option<i64>,
 }
 
 fn default_provider_type() -> String {
@@ -280,6 +293,13 @@ pub async fn create_offer(
         if !nid.is_empty() {
             body["node_id"] = serde_json::Value::String(nid);
         }
+    }
+    // est_next_available_s — only surface when caller provided a value.
+    // Wire's sync_compute_offer_denorm trigger reads it from the
+    // offer's structured_data; a missing key leaves the denorm column
+    // null (Wire treats as "unknown, don't filter").
+    if let Some(eta) = req.est_next_available_s {
+        body["est_next_available_s"] = serde_json::json!(eta);
     }
     let send_result = send_api_request(
         &api_url,

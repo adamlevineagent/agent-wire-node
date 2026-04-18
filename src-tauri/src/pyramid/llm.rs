@@ -249,7 +249,9 @@ fn classify_soft_fail_reason(err: &crate::pyramid::compute_requester::RequesterE
         RE::Internal(_) => "internal".into(),
         // Handled in outer match arms; pattern-match is exhaustive
         // via the catch-all below.
-        RE::AuthFailed(_) | RE::InsufficientBalance { .. } => "unclassified".into(),
+        RE::AuthFailed(_) | RE::InsufficientBalance { .. } | RE::ConfigError { .. } => {
+            "unclassified".into()
+        }
     }
 }
 
@@ -1985,6 +1987,29 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         )) => {
                             return Err(anyhow!(
                                 "network credentials invalid — session may be expired: {detail}"
+                            ));
+                        }
+                        Err(crate::pyramid::compute_requester::RequesterError::ConfigError {
+                            error_slug,
+                            detail,
+                        }) => {
+                            // Caller-misconfiguration class. MUST NOT
+                            // fall through to the pool — silent rerouting
+                            // is what kept the market broken for weeks
+                            // ("have 0, need 0" masquerade). Surface
+                            // loudly so the operator sees the slug and
+                            // can fix their config.
+                            tracing::error!(
+                                slug = %error_slug,
+                                ?detail,
+                                "network dispatch misconfigured; caller must fix"
+                            );
+                            let detail_str = detail
+                                .as_ref()
+                                .map(|v| format!(" — detail: {v}"))
+                                .unwrap_or_default();
+                            return Err(anyhow!(
+                                "network dispatch misconfigured: {error_slug}{detail_str}"
                             ));
                         }
                         Err(crate::pyramid::compute_requester::RequesterError::InsufficientBalance {

@@ -9,6 +9,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agent-wire-contracts"
+version = "0.1.0"
+source = "git+https://github.com/adamlevineagent/GoodNewsEveryone?rev=307cc226#307cc22682004dff50a1c9a55d9735252ae99972"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6468,6 +6477,7 @@ dependencies = [
 name = "wire-node-desktop"
 version = "0.3.0"
 dependencies = [
+ "agent-wire-contracts",
  "anyhow",
  "async-trait",
  "base64 0.22.1",

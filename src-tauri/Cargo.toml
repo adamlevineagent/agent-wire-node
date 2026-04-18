@@ -24,6 +24,11 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+# Wire ↔ node bilateral contract types (error bodies, chronicle event
+# enum, SQLSTATE taxonomy). Pinned to the Wire commit that introduced
+# the shared crate + the structural fix landing in this cycle.
+# Bump `rev` whenever Wire's contract shape changes on the Wire side.
+agent-wire-contracts = { git = "https://github.com/adamlevineagent/GoodNewsEveryone", rev = "307cc226" }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["full"] }
 sha2 = "0.10"

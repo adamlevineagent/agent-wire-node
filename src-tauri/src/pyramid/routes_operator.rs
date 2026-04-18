@@ -1366,6 +1366,12 @@ async fn handle_compute_market_call(
                 compute_requester::RequesterError::AuthFailed(_) => {
                     warp::http::StatusCode::UNAUTHORIZED
                 }
+                compute_requester::RequesterError::ConfigError { .. } => {
+                    // Caller-misconfiguration. Surface as 400 so the
+                    // client sees "you configured this wrong" rather
+                    // than a transient 5xx.
+                    warp::http::StatusCode::BAD_REQUEST
+                }
                 compute_requester::RequesterError::InsufficientBalance { .. } => {
                     warp::http::StatusCode::PAYMENT_REQUIRED
                 }

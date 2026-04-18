@@ -217,6 +217,19 @@ pub enum RequesterError {
     #[error("auth failed: {0}")]
     AuthFailed(String),
 
+    /// 400 from Wire with a structured `error` slug that indicates
+    /// the *caller's* configuration is wrong, not a transient capacity
+    /// issue. Examples: `multiple_nodes_require_explicit_node_id`,
+    /// `no_node_for_agent`, `invalid_body`. Must NOT fall through to
+    /// the local-pool fallback — config errors silently routing around
+    /// is the same class of bug as the "have 0, need 0" masquerade
+    /// that left the market silently broken for weeks. Surface loudly.
+    #[error("compute-market misconfigured: {error_slug}")]
+    ConfigError {
+        error_slug: String,
+        detail: Option<serde_json::Value>,
+    },
+
     /// Catch-all for I/O, serde, timeout-during-http, etc.
     #[error("internal: {0}")]
     Internal(String),
@@ -613,16 +626,35 @@ fn classify_match_error(e: String) -> RequesterError {
             if let Ok(status) = code_str.trim().parse::<u16>() {
                 let body = body.trim().to_string();
                 match status {
+                    400 => {
+                        // Caller-misconfiguration class: Wire rejected
+                        // the request because something about THIS
+                        // operator / node / body shape is wrong, not
+                        // because of capacity. Must surface — silent
+                        // fallback to pool would mask the config bug.
+                        return classify_400_config_error(&body);
+                    }
                     401 => return RequesterError::AuthFailed(body),
                     404 => {
                         // no_offer_for_model
                         return RequesterError::NoMatch { detail: body };
                     }
                     409 => {
-                        // insufficient_balance. `detail` MAY carry
-                        // {need, have}; we best-effort parse, else 0/0.
-                        let (need, have) = parse_balance_detail(&body);
-                        return RequesterError::InsufficientBalance { need, have };
+                        // Only map to InsufficientBalance if the body
+                        // actually says so. `parse_balance_detail`
+                        // gates on `error == "insufficient_balance"`
+                        // so unrelated 409s (e.g. `job_already_filled`)
+                        // don't silently masquerade as "have 0, need 0".
+                        // That masquerade is exactly how the market
+                        // stayed broken for weeks.
+                        match parse_balance_detail(&body) {
+                            Some((need, have)) => {
+                                return RequesterError::InsufficientBalance { need, have };
+                            }
+                            None => {
+                                return RequesterError::MatchFailed { status, body };
+                            }
+                        }
                     }
                     _ => {
                         return RequesterError::MatchFailed { status, body };
@@ -640,6 +672,9 @@ fn classify_fill_error(e: String) -> RequesterError {
             if let Ok(status) = code_str.trim().parse::<u16>() {
                 let body = body.trim().to_string();
                 match status {
+                    400 => {
+                        return classify_400_config_error(&body);
+                    }
                     401 => return RequesterError::AuthFailed(body),
                     503 => {
                         // `X-Wire-Reason` header isn't surfaced by
@@ -663,21 +698,64 @@ fn classify_fill_error(e: String) -> RequesterError {
     RequesterError::Internal(e)
 }
 
-fn parse_balance_detail(body: &str) -> (i64, i64) {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            let need = v
-                .pointer("/detail/need")
-                .and_then(|n| n.as_i64())
-                .or_else(|| v.get("need").and_then(|n| n.as_i64()))?;
-            let have = v
-                .pointer("/detail/have")
-                .and_then(|n| n.as_i64())
-                .or_else(|| v.get("have").and_then(|n| n.as_i64()))?;
-            Some((need, have))
-        })
-        .unwrap_or((0, 0))
+/// Parse Wire's 400-error body and classify as ConfigError. The 400
+/// class covers caller-misconfiguration slugs that Wire returns when
+/// the operator/node/body shape is wrong. Examples per structural-fix
+/// plan §5.6: `multiple_nodes_require_explicit_node_id`,
+/// `no_node_for_agent`, `invalid_body`, `privacy_field_rejected`.
+///
+/// Unknown `error` slugs fall through to MatchFailed so we surface
+/// the raw body instead of silently classifying as config. Unknown
+/// slugs are a forward-compat signal — Wire may add new 400 slugs
+/// that we want to see in the operator log, not bury.
+fn classify_400_config_error(body: &str) -> RequesterError {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    let error_slug = parsed
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(|e| e.as_str())
+        .map(|s| s.to_string());
+    match error_slug {
+        Some(slug) if !slug.is_empty() => {
+            let detail = parsed.and_then(|v| v.get("detail").cloned());
+            RequesterError::ConfigError {
+                error_slug: slug,
+                detail,
+            }
+        }
+        _ => RequesterError::MatchFailed {
+            status: 400,
+            body: body.to_string(),
+        },
+    }
+}
+
+/// Parse an `insufficient_balance` 409 body for `{need, have}`. Returns
+/// `None` if the body isn't an insufficient-balance response — that
+/// lets the caller classify non-balance 409s (e.g. `job_already_filled`)
+/// as MatchFailed instead of fake-zero-balance InsufficientBalance.
+///
+/// Historical note: previous behavior was "best-effort parse, default
+/// (0, 0) on fail." That indistinguishably collided with a real 0-credits
+/// operator hitting insufficient-balance, and with any unrelated 409
+/// that happened to not parse. Gating on the `error` discriminator
+/// means unrelated 409s now surface correctly as MatchFailed.
+fn parse_balance_detail(body: &str) -> Option<(i64, i64)> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v.get("error")?.as_str()? != "insufficient_balance" {
+        return None;
+    }
+    // Shared-types shape: `detail: {need, have}`. Legacy fallback:
+    // top-level need/have for older Wire responses pre-shared-types.
+    let need = v
+        .pointer("/detail/need")
+        .and_then(|n| n.as_i64())
+        .or_else(|| v.get("need").and_then(|n| n.as_i64()))?;
+    let have = v
+        .pointer("/detail/have")
+        .and_then(|n| n.as_i64())
+        .or_else(|| v.get("have").and_then(|n| n.as_i64()))?;
+    Some((need, have))
 }
 
 fn extract_error_field(body: &str) -> String {
@@ -744,11 +822,95 @@ mod tests {
     }
 
     #[test]
-    fn classify_fill_error_400_is_fill_failed() {
+    fn classify_fill_error_400_is_config_error() {
+        // Post structural-fix: 400s carry a typed error slug (e.g.
+        // `multiple_system_turns`) and must surface as ConfigError,
+        // not FillFailed — the caller's cascade branch treats
+        // ConfigError as hard-fail (no silent fallback to pool).
         let err = classify_fill_error(
             "API error 400: {\"error\":\"multiple_system_turns\"}".into(),
         );
-        matches!(err, RequesterError::FillFailed { status: 400, .. });
+        match err {
+            RequesterError::ConfigError { error_slug, .. } => {
+                assert_eq!(error_slug, "multiple_system_turns");
+            }
+            other => panic!("expected ConfigError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_match_error_400_is_config_error() {
+        let err = classify_match_error(
+            "API error 400: {\"error\":\"multiple_nodes_require_explicit_node_id\",\"detail\":{\"owned_node_count\":6}}"
+                .into(),
+        );
+        match err {
+            RequesterError::ConfigError { error_slug, detail } => {
+                assert_eq!(error_slug, "multiple_nodes_require_explicit_node_id");
+                assert!(detail.is_some());
+            }
+            other => panic!("expected ConfigError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_match_error_400_without_slug_falls_to_match_failed() {
+        // Unknown/missing error slug on a 400 — surface as MatchFailed
+        // with raw body so the operator log shows what Wire actually
+        // returned instead of swallowing into generic ConfigError.
+        let err = classify_match_error("API error 400: not-json-body".into());
+        match err {
+            RequesterError::MatchFailed { status: 400, .. } => {}
+            other => panic!("expected MatchFailed 400, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_match_error_409_non_balance_is_match_failed() {
+        // Historical bug: any 409 was classified as
+        // `InsufficientBalance { need: 0, have: 0 }` via the old
+        // default-parse behavior. That masked real bugs. A 409 whose
+        // error slug is NOT `insufficient_balance` must now fall
+        // through to MatchFailed with the real body.
+        let err = classify_match_error(
+            "API error 409: {\"error\":\"job_already_filled\",\"detail\":{}}".into(),
+        );
+        match err {
+            RequesterError::MatchFailed { status: 409, ref body } => {
+                assert!(body.contains("job_already_filled"));
+            }
+            other => panic!("expected MatchFailed 409, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_balance_detail_returns_none_on_non_balance_body() {
+        let out = parse_balance_detail("{\"error\":\"insufficient_credit_reserve\"}");
+        assert!(out.is_none(), "non-insufficient_balance body must return None");
+    }
+
+    #[test]
+    fn parse_balance_detail_returns_none_on_malformed_body() {
+        assert!(parse_balance_detail("not-json").is_none());
+        assert!(parse_balance_detail("{}").is_none());
+    }
+
+    #[test]
+    fn parse_balance_detail_returns_some_on_valid_body() {
+        let out = parse_balance_detail(
+            "{\"error\":\"insufficient_balance\",\"detail\":{\"need\":5000,\"have\":1200}}",
+        );
+        assert_eq!(out, Some((5000, 1200)));
+    }
+
+    #[test]
+    fn parse_balance_detail_legacy_top_level_shape() {
+        // Older Wire responses (pre-shared-types) put need/have at the
+        // top level instead of under detail. Legacy fallback path.
+        let out = parse_balance_detail(
+            "{\"error\":\"insufficient_balance\",\"need\":500,\"have\":100}",
+        );
+        assert_eq!(out, Some((500, 100)));
     }
 
     #[test]

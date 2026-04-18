@@ -64,52 +64,64 @@ use crate::pyramid::market_delivery_policy::MarketDeliveryPolicy;
 use crate::pyramid::market_dispatch::MarketDispatchContext;
 use crate::tunnel::TunnelState;
 
-/// HTTP path the Wire exposes for queue-state pushes. Spec §III L412.
-const QUEUE_STATE_PATH: &str = "/api/v1/compute/queue-state";
+/// HTTP path Wire exposes for queue-mirror pushes. Corrected from the
+/// never-registered `/api/v1/compute/queue-state` in the compute-market
+/// structural-fix plan §5.6 — every mirror push was 404'ing silently
+/// before this change, which explains why Wire never saw a node as
+/// matchable for match_compute_job's staleness filter.
+const QUEUE_MIRROR_PATH: &str = "/api/v1/compute/queue-mirror";
 
-/// Per-model slice of the snapshot pushed to the Wire. MUST NOT include
-/// `local_depth` or `executing_source` (J7). Field names match the
-/// spec's ModelQueueState wire form (L437-444).
+/// Per-offer slice of the snapshot pushed to Wire. Body shape matches
+/// `src/app/api/v1/compute/queue-mirror/route.ts` validator exactly —
+/// any unknown field returns 400 `privacy_field_rejected`. MUST NOT
+/// include `local_depth`, `executing_source`, `is_executing`, or
+/// `total_depth` (all Privacy J7 tripwires).
+///
+/// Mapping from old node shape (pre-structural-fix):
+///   `market_depth` → `current_queue_depth`  (Phase 2.9)
+///   `max_market_depth` → `max_queue_depth`
+///   DROP `total_depth`, `is_executing`, `max_total_depth`
+///   DROP `est_next_available_s` — moved to offer contribution body
+///   ADD `wire_offer_id` — Wire's identifier for the offer row
+///   ADD `allow_market_visibility` — per-offer, drives Wire's
+///        status transition (Phase 2.11)
 #[derive(Debug, Clone, Serialize)]
-struct ModelQueueState {
+struct QueueMirrorOffer {
     model_id: String,
-    /// Local + fleet + market entries for this model. Hint to the
-    /// matcher that the model's GPU is contended even if our own
-    /// market depth is low.
-    total_depth: usize,
-    /// Market-source entries only. Drives admission and pricing.
-    market_depth: usize,
-    /// Whether a market job for this model is currently executing. The
-    /// mirror task tracks this by consulting `ComputeMarketState.active_jobs`
-    /// (not the compute_queue, which doesn't distinguish executing vs
-    /// queued market source).
-    is_executing: bool,
-    /// Optional estimate for when the next slot opens. `None` if we
-    /// can't predict (no throughput data yet). Phase 2 always emits
-    /// `None` — Phase 4+ fills this from observed inference latencies.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    est_next_available_s: Option<u32>,
-    /// The operator's configured per-offer cap. The Wire mirrors this
-    /// so its admission-control UI can render the operator's intent.
-    max_market_depth: usize,
-    /// Node-wide cap across all sources for this model. For Phase 2 the
-    /// node doesn't have a separate total-depth knob — we surface the
-    /// `max_market_depth` here too so the Wire has a stable field in
-    /// the snapshot struct. Phase 4+ may split this.
-    max_total_depth: usize,
+    /// Wire-side identifier for this offer (handle-path post-migration,
+    /// UUID during transition). Emitted so Wire can match the push to
+    /// a specific `wire_compute_offers` row. Per structural-fix plan
+    /// §2.10: if None, the offer is SKIPPED entirely — don't push
+    /// `null` (validator rejects).
+    wire_offer_id: String,
+    /// Admission-relevant depth. Renamed from `market_depth` per
+    /// Phase 2.9 (single depth dimension; `total_depth` declared dead).
+    current_queue_depth: usize,
+    /// Per-offer cap. Renamed from `max_market_depth`.
+    max_queue_depth: usize,
+    /// Per-offer visibility driven by the operator's current
+    /// effective-policy visibility. Wire uses this to toggle the
+    /// offer's `inactive_reason=visibility_off` without requiring the
+    /// operator to re-publish. Phase 2.11.
+    allow_market_visibility: bool,
 }
 
-/// Top-level snapshot body sent to the Wire. Field names match the
-/// spec's `QueueMirrorSnapshot` wire form (L430-435).
+/// Top-level snapshot body. Field names must match Wire's validator
+/// exactly — unknown fields are rejected 400.
+///
+/// Mapping from old shape:
+///   `seq` → `snapshot_seq`
+///   `model_queues` → `offers`
+///   DROP `timestamp`  (Wire rejects)
+///   ADD `is_serving` — from `ComputeMarketState.is_serving`, drives
+///        Wire's "whole-node offline" state transition without
+///        requiring individual offer deletes.
 #[derive(Debug, Clone, Serialize)]
 struct QueueMirrorSnapshot {
     node_id: String,
-    /// Max seq across all per-model seqs in this push — the Wire uses
-    /// this as a tiebreaker for rate-limiting but the per-model seqs
-    /// are the canonical conflict check.
-    seq: u64,
-    model_queues: Vec<ModelQueueState>,
-    timestamp: String,
+    snapshot_seq: u64,
+    is_serving: bool,
+    offers: Vec<QueueMirrorOffer>,
 }
 
 /// Everything the mirror task's push body needs to reach the Wire.
@@ -241,17 +253,39 @@ async fn mirror_loop(ctx: MirrorTaskContext, mut rx: mpsc::UnboundedReceiver<()>
     tracing::info!("market queue mirror task exited (channel closed)");
 }
 
-/// Gate check: `is_serving` (runtime toggle) AND `allow_market_visibility`
-/// (durable operator intent). Either false skips the push silently.
+/// Gate check: `is_serving` (runtime toggle) AND tunnel connected.
+///
+/// Pre-structural-fix this ALSO gated on `allow_market_visibility` —
+/// when the operator flipped visibility off we skipped the mirror push
+/// entirely. That's wrong: Wire needs the push to know about state
+/// transitions (is_serving: true→false, per-offer visibility flips).
+/// Skipping the push prevents Wire from learning the operator went
+/// offline.
+///
+/// New model: always push (subject to serving + tunnel gates); emit
+/// `is_serving` at the top and `allow_market_visibility` per offer.
+/// Wire drives state transitions on its side from those fields.
 async fn should_push(ctx: &MirrorTaskContext) -> bool {
     let is_serving = ctx.market_state.read().await.is_serving;
     if !is_serving {
         return false;
     }
-    // Participation-policy check requires a blocking sqlite read; run
-    // off the reactor thread.
-    let db_path = ctx.db_path.clone();
-    let policy_allowed: bool = match tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+    // Don't push if the tunnel isn't up — Wire would never see it,
+    // and we don't want to burn request attempts during reconnect.
+    let tunnel_connected = matches!(
+        ctx.tunnel.read().await.status,
+        crate::tunnel::TunnelConnectionStatus::Connected
+    );
+    tunnel_connected
+}
+
+/// Read the operator's current effective `allow_market_visibility` for
+/// the push body. Non-fatal on read failure — default to `false` so
+/// Wire doesn't publish offers the operator may have intended to hide.
+/// Runs in a blocking thread (SQLite open).
+async fn read_allow_market_visibility(db_path: &std::path::Path) -> bool {
+    let db_path = db_path.to_path_buf();
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
         let conn = rusqlite::Connection::open(&db_path)?;
         let p = crate::pyramid::local_mode::get_compute_participation_policy(&conn)?;
         Ok(p.effective_booleans().allow_market_visibility)
@@ -262,35 +296,29 @@ async fn should_push(ctx: &MirrorTaskContext) -> bool {
         Ok(Err(e)) => {
             tracing::warn!(
                 err = %e,
-                "market mirror participation-policy read failed; skipping push"
+                "market mirror allow_market_visibility read failed; defaulting to false"
             );
             false
         }
         Err(je) => {
             tracing::warn!(
                 err = %je,
-                "market mirror participation-policy join error; skipping push"
+                "market mirror allow_market_visibility join error; defaulting to false"
             );
             false
         }
-    };
-    if !policy_allowed {
-        return false;
     }
-    // Don't push if the tunnel isn't up — the Wire would never see it.
-    let tunnel_connected = matches!(
-        ctx.tunnel.read().await.status,
-        crate::tunnel::TunnelConnectionStatus::Connected
-    );
-    tunnel_connected
 }
 
-/// Build the snapshot, bump seqs, POST to the Wire. Returns the full
-/// error message on any step that fails, for the caller's chronicle
-/// write + log.
+/// Build the snapshot, bump seqs, POST to Wire. Returns the full error
+/// message on any failure, for the caller's chronicle write + log.
+///
+/// Body shape matches Wire's `/queue-mirror` validator exactly per
+/// structural-fix plan §2.10. Offers whose `wire_offer_id` is None
+/// are SKIPPED (not emitted with null) — per the mapping table,
+/// null `wire_offer_id` is validator-rejected.
 async fn push_snapshot(ctx: &MirrorTaskContext) -> Result<(), String> {
-    // Step 1: resolve node_id. The explicit override (if provided) wins;
-    // otherwise read from AuthState.
+    // Step 1: resolve node_id.
     let node_id = match ctx.node_id_override.clone() {
         Some(s) if !s.is_empty() => s,
         _ => ctx
@@ -302,8 +330,7 @@ async fn push_snapshot(ctx: &MirrorTaskContext) -> Result<(), String> {
             .ok_or_else(|| "no node_id on AuthState".to_string())?,
     };
 
-    // Step 2: resolve bearer token. Mirror of get_api_token helper in
-    // main.rs — we don't have access to it here, so inline.
+    // Step 2: resolve bearer token.
     let bearer = ctx
         .auth
         .read()
@@ -313,65 +340,92 @@ async fn push_snapshot(ctx: &MirrorTaskContext) -> Result<(), String> {
         .filter(|t| !t.is_empty())
         .ok_or_else(|| "no api_token on AuthState".to_string())?;
 
-    // Step 3: snapshot build + seq bump. Hold the write lock briefly
-    // so both halves atomic vs another pusher. (There's only one
-    // mirror task; this is future-proofing against a second instance
-    // landing in a later phase.)
+    // Step 3: read effective `allow_market_visibility` once per push;
+    // emit on every offer entry (Phase 2.11). BEFORE snapshot build
+    // so we don't hold the market_state write lock across the
+    // DB read.
+    let allow_visibility = read_allow_market_visibility(&ctx.db_path).await;
+
+    // Step 4: read is_serving once at snapshot time (may differ from
+    // the gate in should_push if toggled between calls — that's fine,
+    // should_push is a push-rate gate, this is the truth).
+    let is_serving = ctx.market_state.read().await.is_serving;
+
+    // Step 5: snapshot build + seq bump. Hold the write lock briefly
+    // so both halves atomic vs another pusher.
     let snapshot = {
         let mut state = ctx.market_state.write().await;
-        let queue_snapshot = {
+
+        // Collect per-model admission-relevant depth up front so we can
+        // drop the queue lock before iterating offers. Only
+        // `market_queue_depth` crosses the wire (Privacy J7 — local
+        // depth stays local).
+        let market_depths: std::collections::HashMap<String, usize> = {
             let q = ctx.compute_queue.queue.lock().await;
-            // Collect (model_id, total_depth, market_depth) upfront so
-            // we drop the queue lock before reading offers from
-            // market_state. Intentionally does NOT expose local_depth
-            // or executing_source (J7).
             state
                 .offers
                 .keys()
-                .map(|model_id| {
-                    let total = q.queue_depth(model_id);
-                    let market = q.market_queue_depth(model_id);
-                    (model_id.clone(), total, market)
-                })
-                .collect::<Vec<_>>()
+                .map(|model_id| (model_id.clone(), q.market_queue_depth(model_id)))
+                .collect()
         };
 
+        // Collect the offer snapshot fields BEFORE calling
+        // `bump_mirror_seq` — iterating `state.offers` (&) while also
+        // mutating `state.queue_mirror_seq` (&mut) would fail the
+        // borrow checker. Two-pass: pass 1 collects what we want to
+        // emit; pass 2 bumps the seq counter for each emitted model.
+        let mut skipped_no_wire_id: Vec<String> = Vec::new();
+        let to_emit: Vec<(String, String, usize, usize)> = state
+            .offers
+            .iter()
+            .filter_map(|(model_id, offer)| {
+                let wire_offer_id = match offer.wire_offer_id.as_ref() {
+                    Some(id) if !id.is_empty() => id.clone(),
+                    _ => {
+                        skipped_no_wire_id.push(model_id.clone());
+                        return None;
+                    }
+                };
+                let current_queue_depth = market_depths.get(model_id).copied().unwrap_or(0);
+                Some((
+                    model_id.clone(),
+                    wire_offer_id,
+                    current_queue_depth,
+                    offer.max_queue_depth,
+                ))
+            })
+            .collect();
+        if !skipped_no_wire_id.is_empty() {
+            tracing::debug!(
+                skipped = ?skipped_no_wire_id,
+                "queue mirror push: offers with no wire_offer_id skipped"
+            );
+        }
+
         let mut max_seq: u64 = 0;
-        let mut model_queues = Vec::with_capacity(queue_snapshot.len());
-        for (model_id, total_depth, market_depth) in queue_snapshot {
-            let is_executing = state.active_jobs.values().any(|j| {
-                j.model_id == model_id
-                    && j.status == crate::compute_market::ComputeJobStatus::Executing
-            });
-            let (max_market_depth, max_total_depth) = match state.offers.get(&model_id) {
-                Some(offer) => (offer.max_queue_depth, offer.max_queue_depth),
-                None => (0, 0),
-            };
+        let mut offers: Vec<QueueMirrorOffer> = Vec::with_capacity(to_emit.len());
+        for (model_id, wire_offer_id, current_queue_depth, max_queue_depth) in to_emit {
             let seq = state.bump_mirror_seq(&model_id);
             max_seq = max_seq.max(seq);
-            model_queues.push(ModelQueueState {
+            offers.push(QueueMirrorOffer {
                 model_id,
-                total_depth,
-                market_depth,
-                is_executing,
-                est_next_available_s: None,
-                max_market_depth,
-                max_total_depth,
+                wire_offer_id,
+                current_queue_depth,
+                max_queue_depth,
+                allow_market_visibility: allow_visibility,
             });
         }
 
         QueueMirrorSnapshot {
             node_id: node_id.clone(),
-            seq: max_seq,
-            model_queues,
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            snapshot_seq: max_seq,
+            is_serving,
+            offers,
         }
     };
 
-    // Step 4: POST. Reuse the reqwest::Client pattern from main.rs's
-    // `send_api_request` — a fresh client per push is fine at the
-    // debounce cadence (default 500ms max + whatever work precedes it).
-    let url = format!("{}{}", ctx.api_url, QUEUE_STATE_PATH);
+    // Step 6: POST.
+    let url = format!("{}{}", ctx.api_url, QUEUE_MIRROR_PATH);
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
@@ -386,8 +440,9 @@ async fn push_snapshot(ctx: &MirrorTaskContext) -> Result<(), String> {
         return Err(format!("http {}: {}", status.as_u16(), body));
     }
     tracing::debug!(
-        seq = snapshot.seq,
-        models = snapshot.model_queues.len(),
+        snapshot_seq = snapshot.snapshot_seq,
+        offers = snapshot.offers.len(),
+        is_serving = snapshot.is_serving,
         "queue mirror pushed"
     );
     Ok(())
@@ -439,117 +494,96 @@ mod tests {
     //   - rely on `saturating_add` in `bump_mirror_seq` (tested in
     //     compute_market.rs).
 
-    #[test]
-    fn snapshot_omits_local_depth_and_executing_source() {
-        // Privacy invariant J7: the JSON body POSTed to the Wire MUST
-        // NOT contain either field. Enforced structurally (the struct
-        // doesn't carry them) and verified here against the serialized
-        // form so a future sibling struct edit can't silently
-        // reintroduce them.
-        let snap = QueueMirrorSnapshot {
-            node_id: "node-abc".into(),
-            seq: 7,
-            model_queues: vec![ModelQueueState {
-                model_id: "llama3.2:70b".into(),
-                total_depth: 5,
-                market_depth: 2,
-                is_executing: true,
-                est_next_available_s: None,
-                max_market_depth: 8,
-                max_total_depth: 8,
-            }],
-            timestamp: "2026-04-17T12:00:00Z".into(),
-        };
-        let body = serde_json::to_string(&snap).expect("serialize must succeed");
-        assert!(
-            !body.contains("local_depth"),
-            "snapshot must not expose local_depth (J7); got: {body}"
-        );
-        assert!(
-            !body.contains("executing_source"),
-            "snapshot must not expose executing_source (J7); got: {body}"
-        );
+    fn sample_offer() -> QueueMirrorOffer {
+        QueueMirrorOffer {
+            model_id: "llama3.2:70b".into(),
+            wire_offer_id: "playful/106/3".into(),
+            current_queue_depth: 2,
+            max_queue_depth: 8,
+            allow_market_visibility: true,
+        }
     }
 
     #[test]
-    fn model_queue_state_field_names_match_spec() {
-        // Pinned to the wire-form shape in
-        // docs/plans/compute-market-phase-2-exchange.md §III L437-444.
-        // A field rename here needs a concurrent Wire-side rename.
-        let mqs = ModelQueueState {
-            model_id: "m".into(),
-            total_depth: 1,
-            market_depth: 1,
-            is_executing: false,
-            est_next_available_s: None,
-            max_market_depth: 1,
-            max_total_depth: 1,
+    fn snapshot_omits_j7_fields() {
+        // Privacy invariant J7: the JSON body POSTed to Wire MUST NOT
+        // contain `local_depth`, `executing_source`, `is_executing`, or
+        // `total_depth` (all dropped in structural-fix plan §2.10).
+        // Enforced structurally (the struct doesn't carry them) and
+        // verified here so a future sibling-struct edit can't silently
+        // reintroduce them.
+        let snap = QueueMirrorSnapshot {
+            node_id: "node-abc".into(),
+            snapshot_seq: 7,
+            is_serving: true,
+            offers: vec![sample_offer()],
         };
-        let j = serde_json::to_value(&mqs).unwrap();
-        for k in &[
-            "model_id",
+        let body = serde_json::to_string(&snap).expect("serialize must succeed");
+        for forbidden in [
+            "local_depth",
+            "executing_source",
+            "is_executing",
             "total_depth",
             "market_depth",
-            "is_executing",
             "max_market_depth",
             "max_total_depth",
+            "est_next_available_s",
+            "timestamp",
         ] {
             assert!(
-                j.get(*k).is_some(),
-                "missing field {k} in serialized ModelQueueState"
+                !body.contains(forbidden),
+                "snapshot must not expose `{forbidden}` (J7 / dropped); got: {body}"
             );
         }
     }
 
     #[test]
-    fn est_next_available_omitted_when_none() {
-        // Phase 2 always emits None here. The Wire tolerates omission
-        // of optional fields; we save bytes on every push.
-        let mqs = ModelQueueState {
-            model_id: "m".into(),
-            total_depth: 0,
-            market_depth: 0,
-            is_executing: false,
-            est_next_available_s: None,
-            max_market_depth: 0,
-            max_total_depth: 0,
-        };
-        let s = serde_json::to_string(&mqs).unwrap();
-        assert!(
-            !s.contains("est_next_available_s"),
-            "optional None must be skipped; got: {s}"
-        );
+    fn offer_field_names_match_wire_contract() {
+        // Pinned to structural-fix plan §2.10 mapping table. A field
+        // rename here needs a concurrent Wire-side validator update.
+        let j = serde_json::to_value(sample_offer()).unwrap();
+        for k in &[
+            "model_id",
+            "wire_offer_id",
+            "current_queue_depth",
+            "max_queue_depth",
+            "allow_market_visibility",
+        ] {
+            assert!(
+                j.get(*k).is_some(),
+                "missing field `{k}` in serialized QueueMirrorOffer"
+            );
+        }
+        // Verify the exact set — no surprise extras.
+        let obj = j.as_object().unwrap();
+        assert_eq!(obj.len(), 5, "unexpected extra fields: {obj:?}");
     }
 
     #[test]
-    fn est_next_available_emitted_when_some() {
-        // Phase 4+ populates this. Pin the serialization contract so
-        // future emission sites get the exact wire name.
-        let mqs = ModelQueueState {
-            model_id: "m".into(),
-            total_depth: 0,
-            market_depth: 0,
-            is_executing: false,
-            est_next_available_s: Some(42),
-            max_market_depth: 0,
-            max_total_depth: 0,
-        };
-        let s = serde_json::to_string(&mqs).unwrap();
-        assert!(s.contains("\"est_next_available_s\":42"));
-    }
-
-    #[test]
-    fn snapshot_field_order_includes_required_top_level_fields() {
-        // Wire expects node_id, seq, model_queues, timestamp.
+    fn snapshot_top_level_fields_match_wire_contract() {
+        // Wire expects node_id, snapshot_seq, is_serving, offers.
+        // Anything else returns 400 privacy_field_rejected.
         let snap = QueueMirrorSnapshot {
             node_id: "n".into(),
-            seq: 1,
-            model_queues: vec![],
-            timestamp: "t".into(),
+            snapshot_seq: 1,
+            is_serving: true,
+            offers: vec![],
         };
         let j = serde_json::to_value(&snap).unwrap();
-        for k in &["node_id", "seq", "model_queues", "timestamp"] {
-            assert!(j.get(*k).is_some(), "missing top-level field {k}");
+        for k in &["node_id", "snapshot_seq", "is_serving", "offers"] {
+            assert!(j.get(*k).is_some(), "missing top-level field `{k}`");
         }
+        let obj = j.as_object().unwrap();
+        assert_eq!(obj.len(), 4, "unexpected extra top-level fields: {obj:?}");
+    }
+
+    #[test]
+    fn queue_mirror_path_points_at_queue_mirror_not_queue_state() {
+        // Regression guard: the original node code hit
+        // /api/v1/compute/queue-state (never registered on Wire).
+        // Every mirror push 404'd silently, which in turn made Wire's
+        // match_compute_job skip the offer as stale. That's how the
+        // market stayed broken for weeks.
+        assert_eq!(QUEUE_MIRROR_PATH, "/api/v1/compute/queue-mirror");
     }
 }
