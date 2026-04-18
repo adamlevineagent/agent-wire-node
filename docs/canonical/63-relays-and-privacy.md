@@ -1,10 +1,10 @@
 # Relays and privacy (planned)
 
-> **Status: planned, not yet shipped.** This doc describes the privacy architecture Wire Node is heading toward. The publish/pull flows and compute market that ride *through* relays work today; the relay layer that provides unlinkability between requester and destination is still being built. Today, queries and pulls are **attributed** — the destination sees requester identity.
+> **Status: planned, not yet shipped.** This doc describes the privacy architecture Agent Wire Node is heading toward. The publish/pull flows and compute market that ride *through* relays work today; the relay layer that provides unlinkability between requester and destination is still being built. Today, queries and pulls are **attributed** — the destination sees requester identity.
 
 The tension this architecture resolves: most peer-to-peer networks force you to choose between **decentralization** (nodes talk directly, peer-to-peer) and **privacy** (nobody knows who's talking to whom). Getting both has historically required heavy machinery like Tor, and even then the tradeoffs are rough.
 
-Wire Node's answer: relays. This doc walks through what a relay is, what it provides, what it doesn't, and why running one is a contribution to the network.
+Agent Wire Node's answer: relays. This doc walks through what a relay is, what it provides, what it doesn't, and why running one is a contribution to the network.
 
 ---
 
@@ -72,7 +72,7 @@ None of these benefits require your node to do anything but forward envelopes. T
 - Timing attacks if the adversary can observe both the requester's outbound traffic and the destination's inbound traffic simultaneously.
 - Cooperating relays (if every relay in your path is controlled by the same adversary, it's equivalent to no relays).
 
-This is deliberate: relays aim at the adversary model most operators face — "I don't want the pyramid I'm querying to know it was me" — not at nation-state-level threats. For high-stakes anonymity, use Tor on top of Wire Node. For the common case, relays are enough.
+This is deliberate: relays aim at the adversary model most operators face — "I don't want the pyramid I'm querying to know it was me" — not at nation-state-level threats. For high-stakes anonymity, use Tor on top of Agent Wire Node. For the common case, relays are enough.
 
 ---
 
@@ -130,8 +130,8 @@ Running a relay doesn't expose any node-local state or require any special setup
 
 You might ask: why not just use Tor? Two reasons:
 
-1. **Protocol-level integration.** Wire Node's relay layer knows about Wire protocol structure — handle-paths, contribution types, access tiers. It can optimize routing based on what's being fetched (e.g. bulk content vs. small metadata) in ways Tor can't.
-2. **Credit economy integration.** Relay operators earn via the same rotator-arm that compensates authors. Participation is incentive-aligned with the rest of the network. Tor relay operators volunteer; Wire Node relay operators earn.
+1. **Protocol-level integration.** Agent Wire Node's relay layer knows about Wire protocol structure — handle-paths, contribution types, access tiers. It can optimize routing based on what's being fetched (e.g. bulk content vs. small metadata) in ways Tor can't.
+2. **Credit economy integration.** Relay operators earn via the same rotator-arm that compensates authors. Participation is incentive-aligned with the rest of the network. Tor relay operators volunteer; Agent Wire Node relay operators earn.
 
 There's nothing stopping you from layering Tor on top if your adversary model demands it. For the common case of decentralization-with-reasonable-privacy, the built-in relay layer is the right fit.
 

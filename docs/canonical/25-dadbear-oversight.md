@@ -1,6 +1,6 @@
 # DADBEAR oversight
 
-**DADBEAR** is the mechanism that keeps your pyramids current as source material changes. It runs continuously in the background: detecting changes, evaluating what needs re-answering, applying supersessions, and recursing upward. Understanding DADBEAR — what it's doing, when to let it run, and when to pause or intervene — is a meaningful part of operating Wire Node well.
+**DADBEAR** is the mechanism that keeps your pyramids current as source material changes. It runs continuously in the background: detecting changes, evaluating what needs re-answering, applying supersessions, and recursing upward. Understanding DADBEAR — what it's doing, when to let it run, and when to pause or intervene — is a meaningful part of operating Agent Wire Node well.
 
 The Oversight tab in Understanding is where you watch and control DADBEAR.
 
@@ -56,7 +56,7 @@ If any of your LLM providers is having trouble (repeated errors, 5xx responses, 
 
 ### Orphan broadcasts panel
 
-Sometimes the LLM cost-webhook arrives but Wire Node can't match it to any in-flight request. This is usually benign (a retry that succeeded after the original was abandoned). If orphans accumulate rapidly, it can indicate a bug or a misconfigured webhook secret. The panel shows recent orphans with sources and suggests actions (acknowledge, investigate).
+Sometimes the LLM cost-webhook arrives but Agent Wire Node can't match it to any in-flight request. This is usually benign (a retry that succeeded after the original was abandoned). If orphans accumulate rapidly, it can indicate a bug or a misconfigured webhook secret. The panel shows recent orphans with sources and suggests actions (acknowledge, investigate).
 
 ### Cost rollup section
 

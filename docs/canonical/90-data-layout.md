@@ -1,6 +1,6 @@
 # Data layout
 
-Wire Node keeps all your data in one well-defined directory. This doc is a map: what lives where, why, and what you'd touch it for.
+Agent Wire Node keeps all your data in one well-defined directory. This doc is a map: what lives where, why, and what you'd touch it for.
 
 The root is:
 
@@ -38,7 +38,7 @@ This is the source of truth for your node. The binary in `/Applications` is repl
 
 The bulk of your state. Every pyramid you've built, every annotation, every FAQ entry, every cost log, every DADBEAR mutation, every contribution. Multiple gigabytes in active use.
 
-You don't edit `pyramid.db` directly. Wire Node's API surfaces (UI, CLI, MCP, HTTP) are the way in. If you need raw SQL for analysis, read-only access is fine (`sqlite3 pyramid.db ".tables"`), but write operations can corrupt state if they bypass the application's invariants.
+You don't edit `pyramid.db` directly. Agent Wire Node's API surfaces (UI, CLI, MCP, HTTP) are the way in. If you need raw SQL for analysis, read-only access is fine (`sqlite3 pyramid.db ".tables"`), but write operations can corrupt state if they bypass the application's invariants.
 
 **Backup regularly.** If you care about the pyramids you've built, back up `pyramid.db` + `pyramid.db-shm` + `pyramid.db-wal` together. An inconsistent WAL state after a crash mid-write is the rarest case of corruption; standard WAL-aware backup tools handle this correctly.
 
@@ -95,7 +95,7 @@ Never commit this to git. Never include it in a public backup. Loss means re-iss
 
 ### `compute_market_state.json`
 
-Live market state snapshot — active offers, in-flight jobs, counters. Updated frequently while the market is active. On a normal shutdown this is written cleanly; on a crash it may be stale, and Wire Node reconciles on next start.
+Live market state snapshot — active offers, in-flight jobs, counters. Updated frequently while the market is active. On a normal shutdown this is written cleanly; on a crash it may be stale, and Agent Wire Node reconciles on next start.
 
 Don't hand-edit.
 
@@ -108,7 +108,7 @@ Don't hand-edit.
 For longer-running diagnostics, redirect app stderr to a file yourself:
 
 ```bash
-"/Applications/Wire Node.app/Contents/MacOS/Wire Node" 2>> ~/wire-node-extended.log
+"/Applications/Agent Wire Node.app/Contents/MacOS/Agent Wire Node" 2>> ~/wire-node-extended.log
 ```
 
 Launching from terminal captures stderr; launching from Finder does not. See [`91-logs-and-diagnostics.md`](91-logs-and-diagnostics.md).
@@ -126,7 +126,7 @@ chains/
     └── variants/
 ```
 
-The `defaults/` subtree is managed by the app. Updating Wire Node can overwrite it. If you want to persist your edits, put them in `variants/` with a distinct ID.
+The `defaults/` subtree is managed by the app. Updating Agent Wire Node can overwrite it. If you want to persist your edits, put them in `variants/` with a distinct ID.
 
 Chain variants are loaded on app start or when the chain registry is refreshed. Prompt changes are picked up lazily on next step dispatch.
 
@@ -136,7 +136,7 @@ Chain variants are loaded on app start or when the chain registry is refreshed. 
 
 Cache for documents you host as mesh member, plus downloaded copies of documents referenced by pulled pyramids. Managed by the mesh sync worker. Disk usage capped by `storage_cap_gb`.
 
-Safe to delete contents if you need disk space; Wire Node will re-download on demand.
+Safe to delete contents if you need disk space; Agent Wire Node will re-download on demand.
 
 ---
 
@@ -150,7 +150,7 @@ Per-build cache directories, one per `(slug, build_id)`. Contains:
 
 Bulk consumer of disk for active work. Can be cleaned up for completed builds without affecting pyramid state (the pyramid is in `pyramid.db`; the build cache is for diagnostic walk-back).
 
-Wire Node will clean old build directories on its own schedule. If disk is tight, deleting older build folders is safe.
+Agent Wire Node will clean old build directories on its own schedule. If disk is tight, deleting older build folders is safe.
 
 ---
 
@@ -184,7 +184,7 @@ Managed by the tunnel subsystem. Don't hand-edit unless you know what you're doi
 
 - Everything in the data directory.
 
-Backups should include WAL state (`pyramid.db-shm`, `pyramid.db-wal`) — either back up while Wire Node isn't running, or use a backup tool that's WAL-aware (Time Machine is; most rsync invocations aren't unless scripted correctly).
+Backups should include WAL state (`pyramid.db-shm`, `pyramid.db-wal`) — either back up while Agent Wire Node isn't running, or use a backup tool that's WAL-aware (Time Machine is; most rsync invocations aren't unless scripted correctly).
 
 See [`92-backup-reset-migrate.md`](92-backup-reset-migrate.md).
 
@@ -195,7 +195,7 @@ See [`92-backup-reset-migrate.md`](92-backup-reset-migrate.md).
 - **Base install** (empty node, just onboarded): ~10 MB.
 - **One small code pyramid built**: +100-300 MB (DB grows fast with extraction).
 - **A month of active use across several pyramids**: 2-5 GB.
-- **With local Ollama models**: add the model sizes (several GB to tens of GB per model; Ollama's own storage is outside Wire Node's data dir).
+- **With local Ollama models**: add the model sizes (several GB to tens of GB per model; Ollama's own storage is outside Agent Wire Node's data dir).
 - **With mesh hosting**: up to your configured `storage_cap_gb`.
 
 Most operators' data dir grows slowly after the first few builds. DADBEAR maintenance adds incrementally; new pyramids are the main jump factor.
@@ -204,7 +204,7 @@ Most operators' data dir grows slowly after the first few builds. DADBEAR mainte
 
 ## Migrating to a new machine
 
-Stop Wire Node. Copy the entire `~/Library/Application Support/wire-node/` directory to the new machine. Install Wire Node there. Launch.
+Stop Agent Wire Node. Copy the entire `~/Library/Application Support/wire-node/` directory to the new machine. Install Agent Wire Node there. Launch.
 
 Your node identity, pyramids, annotations, credentials — all intact. Wire sees the node re-connect from a new IP but with the same handle and token; no re-registration required.
 

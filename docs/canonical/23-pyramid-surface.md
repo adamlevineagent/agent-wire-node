@@ -1,6 +1,6 @@
 # Pyramid Surface and node inspector
 
-The Pyramid Surface is the visualization at the heart of Wire Node. Every built pyramid can be opened as a surface — a spatial rendering of the nodes, edges, and the ongoing build activity. The surface is where you get a sense of the shape of the pyramid; the node inspector is where you pull any specific node apart.
+The Pyramid Surface is the visualization at the heart of Agent Wire Node. Every built pyramid can be opened as a surface — a spatial rendering of the nodes, edges, and the ongoing build activity. The surface is where you get a sense of the shape of the pyramid; the node inspector is where you pull any specific node apart.
 
 This doc covers both.
 

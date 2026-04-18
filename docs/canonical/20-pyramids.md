@@ -6,7 +6,7 @@ Understanding is the mode where most of your work happens. It is the list, dashb
 
 ## What you see
 
-Open Wire Node → click **Understanding** in the sidebar (the first item under YOUR WORLD). The main area shows four tabs:
+Open Agent Wire Node → click **Understanding** in the sidebar (the first item under YOUR WORLD). The main area shows four tabs:
 
 - **Dashboard** — the list of all pyramids, filtered and sorted.
 - **Grid** — a visual grid of pyramids, density-encoded so you can see at a glance which ones are rich and which are thin.

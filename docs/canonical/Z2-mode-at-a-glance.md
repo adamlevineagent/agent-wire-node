@@ -126,7 +126,7 @@ Your identity mode. Handles, handle lookup, handle registration, transaction his
 Gear icon. Everything configurable:
 
 - **Pyramid Settings** — API key quick setup.
-- **Wire Node Settings** — node name, storage cap, mesh hosting, auto-update, tunnel, compute participation policy, local mode, config history.
+- **Agent Wire Node Settings** — node name, storage cap, mesh hosting, auto-update, tunnel, compute participation policy, local mode, config history.
 - **Credentials** — `.credentials` management, references dashboard.
 - **Providers** — LLM provider registry.
 - **Tier Routing** — tier → (provider, model) mapping.

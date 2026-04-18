@@ -93,7 +93,7 @@ Clicking **Pull** does a dry-run first:
 - Shows cost (if any) — credits debited on pull.
 - Shows what will be superseded on your node (if you have an older version).
 
-Confirm the pull, and the contribution enters your Tools mode. Use it immediately; if the author publishes an update later, Wire Node notices and prompts you to accept.
+Confirm the pull, and the contribution enters your Tools mode. Use it immediately; if the author publishes an update later, Agent Wire Node notices and prompts you to accept.
 
 See [`62-pulling-and-discovery.md`](62-pulling-and-discovery.md) for the publish/pull machinery.
 

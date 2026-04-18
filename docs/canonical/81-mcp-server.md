@@ -1,6 +1,6 @@
 # MCP server
 
-The **MCP server** exposes Wire Node's capabilities to any MCP-capable agent (Claude Desktop, Claude Code, or any other MCP client). It runs on stdio transport and delegates to the same HTTP backend as `pyramid-cli` — one code path, two surfaces.
+The **MCP server** exposes Agent Wire Node's capabilities to any MCP-capable agent (Claude Desktop, Claude Code, or any other MCP client). It runs on stdio transport and delegates to the same HTTP backend as `pyramid-cli` — one code path, two surfaces.
 
 This is how Claude connects to your pyramids.
 
@@ -65,7 +65,7 @@ Claude Code reads from a similar MCP configuration. Consult your version's docs;
 
 ### Configure other MCP clients
 
-Any MCP-capable client that accepts a stdio-transport MCP server can use Wire Node's. The entry is `mcp-server/dist/index.js`; auth is via `PYRAMID_AUTH_TOKEN` env var.
+Any MCP-capable client that accepts a stdio-transport MCP server can use Agent Wire Node's. The entry is `mcp-server/dist/index.js`; auth is via `PYRAMID_AUTH_TOKEN` env var.
 
 ---
 
@@ -92,7 +92,7 @@ For attribution and reputation, agents should be registered in your node's fleet
 To set this up:
 
 1. **Settings → Fleet → Create Agent.** Name it something like `claude-desktop-adam` or `onboarding-assistant`.
-2. Wire Node generates a per-agent token. Copy it.
+2. Agent Wire Node generates a per-agent token. Copy it.
 3. Update the MCP server config to use this token:
    ```json
    "env": {
@@ -108,9 +108,9 @@ For casual use, the generic node token is fine. For serious work where you want 
 
 ## Multi-agent setups
 
-You can configure multiple Claude Desktop instances or multiple MCP clients to talk to the same Wire Node, each with a different agent token. The pyramids see multiple named agents working in parallel; attributions stay separate.
+You can configure multiple Claude Desktop instances or multiple MCP clients to talk to the same Agent Wire Node, each with a different agent token. The pyramids see multiple named agents working in parallel; attributions stay separate.
 
-Similarly, a single Claude session can have multiple MCP servers loaded — one for Wire Node, one for something else — and Claude uses both.
+Similarly, a single Claude session can have multiple MCP servers loaded — one for Agent Wire Node, one for something else — and Claude uses both.
 
 ---
 
@@ -120,7 +120,7 @@ If tools aren't appearing in Claude:
 
 - **Check the MCP server runs.** `node "/Users/…/mcp-server/dist/index.js"` from a terminal. It should start and wait for stdio input. Kill with Ctrl-C.
 - **Check the config JSON is valid.** Typos in `claude_desktop_config.json` silently disable MCP servers.
-- **Check Wire Node is running.** MCP server talks to `localhost:8765`; if that's down, tools error.
+- **Check Agent Wire Node is running.** MCP server talks to `localhost:8765`; if that's down, tools error.
 - **Check auth.** Wrong token = tools appear but fail. The verbose CLI output (`pyramid-cli health --verbose`) can confirm your token works.
 - **Claude Desktop logs.** On macOS, `~/Library/Logs/Claude/` often has MCP server connection diagnostics.
 

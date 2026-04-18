@@ -1,6 +1,6 @@
 # The Wire and decentralization
 
-Wire Node is local-first. But it is also networked. Both of those things are doing real work, and the way they coexist is important to understand before you decide what to share and what not to. This doc walks through why the network exists, what moves across it today, what's still planned, and where the decentralization-plus-privacy design is headed.
+Agent Wire Node is local-first. But it is also networked. Both of those things are doing real work, and the way they coexist is important to understand before you decide what to share and what not to. This doc walks through why the network exists, what moves across it today, what's still planned, and where the decentralization-plus-privacy design is headed.
 
 This is an overview. The Wire docs in the 60 series go deeper on each area.
 
@@ -8,7 +8,7 @@ This is an overview. The Wire docs in the 60 series go deeper on each area.
 
 ## What "the Wire" is
 
-The Wire is the network your node participates in. It is not a company's servers — it is a protocol that lets Wire Node instances on different machines publish contributions, pull each other's contributions, dispatch inference to each other, and pass structured queries between pyramids.
+The Wire is the network your node participates in. It is not a company's servers — it is a protocol that lets Agent Wire Node instances on different machines publish contributions, pull each other's contributions, dispatch inference to each other, and pass structured queries between pyramids.
 
 There are three kinds of node roles on the Wire, and most nodes play more than one:
 
@@ -16,7 +16,7 @@ There are three kinds of node roles on the Wire, and most nodes play more than o
 - **Consuming node** — your node when you pull a contribution, query a published pyramid, or dispatch inference.
 - **Relay node** *(planned — see below)* — your node when it forwards Wire traffic on someone else's behalf with privacy separation. Not shipped today.
 
-When you install Wire Node you're authoring + consuming by default.
+When you install Agent Wire Node you're authoring + consuming by default.
 
 There is a **coordination service** in the middle for convenience — it helps nodes discover each other, stores the compute market order book, handles handle-path allocation at publish time. But contributions live on the authoring node, not on the coordinator. If the coordinator were to disappear, pyramids and data still exist; only discovery and marketplace flows would be interrupted.
 
@@ -63,7 +63,7 @@ The Wire is chatty about small structured objects and quiet about large unstruct
 
 Publishing is always explicit. You pick a contribution, choose an access tier, confirm. The dry-run preview shows what will be sent and warns about anything unusual (credentials referenced, large payloads).
 
-Pulling is always explicit. You find a contribution via Search, or receive a handle-path. You pull it, the contribution copies into your local store. If the author publishes a newer version, Wire Node notices and asks whether you want to accept the update.
+Pulling is always explicit. You find a contribution via Search, or receive a handle-path. You pull it, the contribution copies into your local store. If the author publishes a newer version, Agent Wire Node notices and asks whether you want to accept the update.
 
 Provenance is the spine. Every contribution records what it was derived from. This forms a traceable graph — you can walk any contribution's provenance to see where its ideas came from.
 

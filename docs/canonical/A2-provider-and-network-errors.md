@@ -16,7 +16,7 @@ Fix: regenerate the key at the provider's dashboard, update `.credentials`, test
 
 You're hitting the provider's rate limits.
 
-Short-term: Wire Node's retry backoff handles transient 429s. You'll see "retry 1", "retry 2" in the activity log. Usually self-heals.
+Short-term: Agent Wire Node's retry backoff handles transient 429s. You'll see "retry 1", "retry 2" in the activity log. Usually self-heals.
 
 Sustained: bump to a higher tier on the provider's plan, or spread load across multiple providers via tier routing with fallback chains.
 
@@ -24,11 +24,11 @@ Sustained: bump to a higher tier on the provider's plan, or spread load across m
 
 Your provider account is out of funds.
 
-Fix: top up at the provider's dashboard. If you configured OpenRouter's management key (`OPENROUTER_MANAGEMENT_KEY`), Wire Node proactively warns before builds fail.
+Fix: top up at the provider's dashboard. If you configured OpenRouter's management key (`OPENROUTER_MANAGEMENT_KEY`), Agent Wire Node proactively warns before builds fail.
 
 ### 5xx errors
 
-Provider-side outage. No user fix — wait for the provider to recover. If you have fallback chains configured, Wire Node routes around to the next provider automatically (when fallback chains are wired; partial shipping state — see [`50-model-routing.md`](50-model-routing.md)).
+Provider-side outage. No user fix — wait for the provider to recover. If you have fallback chains configured, Agent Wire Node routes around to the next provider automatically (when fallback chains are wired; partial shipping state — see [`50-model-routing.md`](50-model-routing.md)).
 
 ### Timeouts
 
@@ -46,7 +46,7 @@ Retry logic handles most timeouts. Sustained timeouts = bigger problem; check pr
 
 ### Tunnel shows "Offline"
 
-Settings → Wire Node Settings → Tunnel Status → **Retry**. Most common fix.
+Settings → Agent Wire Node Settings → Tunnel Status → **Retry**. Most common fix.
 
 ### Tunnel keeps reconnecting
 
@@ -151,7 +151,7 @@ The evidence-triage system expects each synchronous cost reconciliation to have 
 
 If you see leak detection alerts in Oversight:
 
-- **Check broadcast configuration.** OpenRouter's broadcast webhook needs to be configured with the shared secret Wire Node expects.
+- **Check broadcast configuration.** OpenRouter's broadcast webhook needs to be configured with the shared secret Agent Wire Node expects.
 - **Check tunnel.** Broadcasts come in through your tunnel; if it's flaky, broadcasts arrive late or not at all.
 - **Check the grace window.** Alerts fire after a grace period. If you're just seeing late-but-arriving broadcasts, extend the grace window in the evidence triage policy.
 
@@ -163,7 +163,7 @@ If you see leak detection alerts in Oversight:
 
 **When one provider is problematic:** route away from it via tier routing. Fallback chains (when fully shipped) automate this; manual routing works today.
 
-**When your network is the problem:** check basic internet connectivity before debugging Wire Node. `ping 8.8.8.8`, `curl https://openrouter.ai/api/v1/auth/key -H "Authorization: Bearer $KEY"`.
+**When your network is the problem:** check basic internet connectivity before debugging Agent Wire Node. `ping 8.8.8.8`, `curl https://openrouter.ai/api/v1/auth/key -H "Authorization: Bearer $KEY"`.
 
 ---
 

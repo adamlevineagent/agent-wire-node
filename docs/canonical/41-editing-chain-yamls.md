@@ -2,7 +2,7 @@
 
 A **chain** is a YAML file that defines how a pyramid gets built. It lists the steps, the order, the primitives, the prompts, the iteration modes, and the model tier per step. Every pyramid build runs a chain; editing a chain changes how future builds behave.
 
-Chains are the primary way you customize Wire Node's build behavior. The binary is a dumb executor; the intelligence is in the YAML + markdown prompt files.
+Chains are the primary way you customize Agent Wire Node's build behavior. The binary is a dumb executor; the intelligence is in the YAML + markdown prompt files.
 
 This doc reflects the **shipped state as of 2026-04** — specifically what the chain executor currently runs on. Where something is planned-but-not-shipped, it's marked.
 
@@ -23,7 +23,7 @@ There is also a feature flag — `use_chain_engine` in `pyramid_config.json`. Wh
 ```bash
 CONFIG="$HOME/Library/Application Support/wire-node/pyramid_config.json"
 python3 -c "import json; c=json.load(open('$CONFIG')); c['use_chain_engine']=True; json.dump(c, open('$CONFIG','w'), indent=2)"
-# Then restart Wire Node.
+# Then restart Agent Wire Node.
 ```
 
 ---

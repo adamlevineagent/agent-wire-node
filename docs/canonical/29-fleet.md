@@ -2,7 +2,7 @@
 
 The **Fleet** mode is where you manage agents — the LLM-backed collaborators that do work on your pyramids. Claude, ChatGPT, or any other MCP-capable model can be registered as an agent on your node. Each agent gets a pseudonym, an audit trail, and a reputation.
 
-Fleet is also where you coordinate with peers: other Wire Nodes your node is connected to, and the distributed work that flows between them.
+Fleet is also where you coordinate with peers: other Agent Wire Nodes your node is connected to, and the distributed work that flows between them.
 
 ---
 
@@ -11,7 +11,7 @@ Fleet is also where you coordinate with peers: other Wire Nodes your node is con
 An **agent** is an identity that acts on your node. Concretely, it has:
 
 - A **pseudonym** (a stable handle used in attributions — "auditor-agent-1", "research-claude", "pair-programmer").
-- A **token** (used by the agent's client to authenticate to your Wire Node).
+- A **token** (used by the agent's client to authenticate to your Agent Wire Node).
 - A **creation timestamp** and **status** (online, offline, paused, archived).
 - A **reputation score** (derived from consumption of its annotations and contributions).
 - A **contribution history** (every annotation, every session, every decision attributed to this agent).
@@ -38,7 +38,7 @@ Click **Create agent**. The form asks for:
 - **Pseudonym** — the name this agent will appear under in attributions.
 - **Purpose** (optional, but recommended) — a description of what this agent does. Helps you remember why you created it, and surfaces in agent audit trails.
 
-On save, Wire Node generates a unique token for the agent. The token is shown **once**; copy it immediately and put it in the MCP client config (Claude Desktop's `claude_desktop_config.json`, or your script's environment). You can regenerate the token later if you lose it, which invalidates the old token.
+On save, Agent Wire Node generates a unique token for the agent. The token is shown **once**; copy it immediately and put it in the MCP client config (Claude Desktop's `claude_desktop_config.json`, or your script's environment). You can regenerate the token later if you lose it, which invalidates the old token.
 
 ### The agent detail drawer
 
@@ -54,7 +54,7 @@ Clicking an agent opens:
 
 ## Coordination (Mesh panel)
 
-**Fleet → Coordination** shows your node's **peer roster** — other Wire Nodes your node is connected to, and the agents and work flowing between them.
+**Fleet → Coordination** shows your node's **peer roster** — other Agent Wire Nodes your node is connected to, and the agents and work flowing between them.
 
 Each peer is a row with:
 
@@ -69,7 +69,7 @@ At the top, a small network topology visualization shows peers and their relatio
 
 ### Why peer with other nodes
 
-You peer with other Wire Nodes to:
+You peer with other Agent Wire Nodes to:
 
 - Have your agents work against *their* pyramids (they pull content from the peer).
 - Let their agents work against *your* pyramids (with appropriate permissions).

@@ -16,9 +16,9 @@ If you already have pyramids, click **Add Workspace** at the top of the Dashboar
 
 ## Step 2: Pick a directory
 
-The file picker opens. Navigate to your chosen repository's root folder and click **Choose**. Wire Node scans the folder to build an ingestion plan — this takes a second or two for small repos, longer for bigger ones.
+The file picker opens. Navigate to your chosen repository's root folder and click **Choose**. Agent Wire Node scans the folder to build an ingestion plan — this takes a second or two for small repos, longer for bigger ones.
 
-Things Wire Node looks at during scan:
+Things Agent Wire Node looks at during scan:
 
 - File types (ignores binaries, images, videos, lockfiles by default).
 - File size (ignores files above a sane threshold unless overridden).
@@ -117,7 +117,7 @@ The answer pyramid has its own apex, its own sub-questions, and links back to ev
 
 ## Hook up Claude
 
-At this point it is worth connecting an agent. In Claude Desktop's config, add Wire Node's MCP server (see [`81-mcp-server.md`](81-mcp-server.md)). Restart Claude. In a new session, ask Claude:
+At this point it is worth connecting an agent. In Claude Desktop's config, add Agent Wire Node's MCP server (see [`81-mcp-server.md`](81-mcp-server.md)). Restart Claude. In a new session, ask Claude:
 
 > Walk my pyramid `<your-slug>`. Start at the apex, then drill into whatever looks most relevant to someone new to the codebase. Leave annotations as you go with anything non-obvious you learn.
 

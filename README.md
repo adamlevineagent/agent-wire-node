@@ -1,4 +1,4 @@
-# Wire Node
+# Agent Wire Node
 
 A desktop app that builds **knowledge pyramids** over your local files — code, documents, conversations — and makes that structured understanding queryable by humans and agents. It also connects your machine to **the Wire**, an intelligence marketplace where pyramids, skills, chains, and compute capacity are shared and traded.
 
@@ -14,10 +14,10 @@ Every user-facing concept and workflow is documented in [`docs/canonical/`](docs
 
 Start here:
 
-- [What is Wire Node](docs/canonical/00-what-is-wire-node.md) — the elevator pitch
+- [What is Agent Wire Node](docs/canonical/00-what-is-wire-node.md) — the elevator pitch
 - [Core concepts](docs/canonical/01-concepts.md) — vocabulary
 - [How it all fits together](docs/canonical/02-how-it-all-fits.md) — the shape of the system
-- [Why Wire Node exists](docs/canonical/03-why-wire-node-exists.md) — what it's trying to solve
+- [Why Agent Wire Node exists](docs/canonical/03-why-wire-node-exists.md) — what it's trying to solve
 - [The Wire and decentralization](docs/canonical/04-the-wire-and-decentralization.md) — the network layer
 - [Steward experimentation (vision)](docs/canonical/05-steward-experimentation-vision.md) — the autonomous-optimization horizon
 
@@ -72,7 +72,7 @@ The per-doc shipped/planned status is noted in each canonical doc. If something 
 Pre-built `.dmg` (macOS only in the alpha, Apple Silicon or Intel):
 
 1. Download the `.dmg` from the alpha channel.
-2. Double-click, drag **Wire Node** to `/Applications`.
+2. Double-click, drag **Agent Wire Node** to `/Applications`.
 3. Right-click → **Open** the first launch (Gatekeeper).
 4. Sign in with email (magic link). Walk through the onboarding wizard.
 5. Add your OpenRouter API key in **Settings → Credentials**.
@@ -94,8 +94,8 @@ cargo tauri dev
 
 # Production build
 cargo tauri build
-# Output: src-tauri/target/release/bundle/macos/Wire Node.app
-#         src-tauri/target/release/bundle/dmg/Wire Node_<version>_<arch>.dmg
+# Output: src-tauri/target/release/bundle/macos/Agent Wire Node.app
+#         src-tauri/target/release/bundle/dmg/Agent Wire Node_<version>_<arch>.dmg
 ```
 
 The HTTP server runs on `localhost:8765` (agent-facing API). The Tauri window is the operator UI.
@@ -132,7 +132,7 @@ agent-wire-node/
 
 ## Core loop, briefly
 
-Wire Node builds knowledge pyramids over local corpora. There is one build path, one staleness system (DADBEAR), and one extensibility mechanism (contributions).
+Agent Wire Node builds knowledge pyramids over local corpora. There is one build path, one staleness system (DADBEAR), and one extensibility mechanism (contributions).
 
 - **Questions drive everything.** A "mechanical" content-type build is a preset question with a frozen decomposition. One executor; content types are chain variants, not different code paths.
 - **DADBEAR keeps pyramids current.** Every change — file edit, deletion, rename, new file, annotation, policy change — becomes a mutation that feeds one recursive loop. Per-layer timers, batched evaluation, supersession upward until nothing more is stale.
@@ -157,7 +157,7 @@ Auth: bearer token resolved via `PYRAMID_AUTH_TOKEN` env var or `~/Library/Appli
 
 ## Reporting issues
 
-Alpha testers: please file friction in the Wire Node feedback channel. Include:
+Alpha testers: please file friction in the Agent Wire Node feedback channel. Include:
 
 - Node version (Settings → About, or bottom of the sidebar).
 - macOS version + architecture.
@@ -172,4 +172,4 @@ Check [`docs/canonical/70-common-issues.md`](docs/canonical/70-common-issues.md)
 
 License: TBD in the alpha. Ask Adam.
 
-Wire Node is a working name for what Adam calls "the Wire platform" — an intelligence marketplace with local-first nodes. See [`docs/canonical/04-the-wire-and-decentralization.md`](docs/canonical/04-the-wire-and-decentralization.md) for the network vision; [`docs/canonical/05-steward-experimentation-vision.md`](docs/canonical/05-steward-experimentation-vision.md) for where autonomous node optimization is headed.
+Agent Wire Node is a working name for what Adam calls "the Wire platform" — an intelligence marketplace with local-first nodes. See [`docs/canonical/04-the-wire-and-decentralization.md`](docs/canonical/04-the-wire-and-decentralization.md) for the network vision; [`docs/canonical/05-steward-experimentation-vision.md`](docs/canonical/05-steward-experimentation-vision.md) for where autonomous node optimization is headed.

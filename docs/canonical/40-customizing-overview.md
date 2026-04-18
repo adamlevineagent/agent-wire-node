@@ -1,6 +1,6 @@
-# Customizing Wire Node (overview)
+# Customizing Agent Wire Node (overview)
 
-Almost everything in Wire Node is configurable. The chains that define how a build runs, the prompts the LLM sees, the policies that govern DADBEAR, the tier routing that picks which model handles which step — all of it is data, not code. This is a deliberate design choice: the binary is a runtime, and the interesting work is in the **contributions** that run on top of it.
+Almost everything in Agent Wire Node is configurable. The chains that define how a build runs, the prompts the LLM sees, the policies that govern DADBEAR, the tier routing that picks which model handles which step — all of it is data, not code. This is a deliberate design choice: the binary is a runtime, and the interesting work is in the **contributions** that run on top of it.
 
 This doc is the map. It tells you what's customizable, which layer to change for which kind of change, and where to go next for detailed walkthroughs.
 
@@ -66,7 +66,7 @@ See [`45-question-sets.md`](45-question-sets.md).
 
 ### Layer 7: Schema types (new kinds of configurable data)
 
-A schema type is a new category of configurable data in Wire Node. Adding a schema type is rare — most of the time the existing schema types cover what you need. But when you really do need a new kind of policy (say, a new kind of rate-limiting rule that no existing schema type captures), you can add one.
+A schema type is a new category of configurable data in Agent Wire Node. Adding a schema type is rare — most of the time the existing schema types cover what you need. But when you really do need a new kind of policy (say, a new kind of rate-limiting rule that no existing schema type captures), you can add one.
 
 **Use this layer when:** nothing else expresses the kind of data you need.
 
@@ -76,7 +76,7 @@ See [`47-schema-types.md`](47-schema-types.md).
 
 ## Where the files live
 
-All customization happens in files under your Wire Node data directory:
+All customization happens in files under your Agent Wire Node data directory:
 
 ```
 ~/Library/Application Support/wire-node/
@@ -106,7 +106,7 @@ The Tools mode's Create wizard creates variants for you automatically. If you're
 
 ## Hot reload
 
-All contribution changes are hot-reloaded. There is no "restart Wire Node after editing YAML". The next build that uses the contribution picks up the new version automatically.
+All contribution changes are hot-reloaded. There is no "restart Agent Wire Node after editing YAML". The next build that uses the contribution picks up the new version automatically.
 
 This is true for:
 
@@ -139,7 +139,7 @@ Every contribution you author locally can be published to the Wire as a versione
 
 Conversely, most of what you'll consume from other operators is contributions: chain variants they've authored, skills they've published, configs they've tuned. Pulling a well-crafted contribution can save hours of authoring from scratch.
 
-The combination — local customization that can ripple across operators — is the reason Wire Node is a network rather than a standalone app. See [`04-the-wire-and-decentralization.md`](04-the-wire-and-decentralization.md).
+The combination — local customization that can ripple across operators — is the reason Agent Wire Node is a network rather than a standalone app. See [`04-the-wire-and-decentralization.md`](04-the-wire-and-decentralization.md).
 
 ---
 

@@ -1,6 +1,6 @@
 # Core concepts
 
-This file defines the vocabulary used throughout Wire Node. Every other doc in this set assumes you have skimmed this one. Nothing here is about how Wire Node is built internally — these are the ideas you will actually run into as you use it.
+This file defines the vocabulary used throughout Agent Wire Node. Every other doc in this set assumes you have skimmed this one. Nothing here is about how Agent Wire Node is built internally — these are the ideas you will actually run into as you use it.
 
 ---
 
@@ -8,7 +8,7 @@ This file defines the vocabulary used throughout Wire Node. Every other doc in t
 
 A **pyramid** is a layered, evidence-backed graph built over a body of source material. It has three layers:
 
-- **Source** — the files on disk (code, documents, conversation transcripts). Wire Node watches these; it never modifies them.
+- **Source** — the files on disk (code, documents, conversation transcripts). Agent Wire Node watches these; it never modifies them.
 - **L0 (evidence)** — structured extractions from the source. Each L0 node points back to a specific chunk of a specific file. L0 is shaped by questions — different questions produce different L0 shapes over the same material.
 - **L1 and above (understanding)** — answers to questions. Each answer is backed by evidence links to lower-layer nodes. The top answer is the apex.
 
@@ -58,7 +58,7 @@ A **vine** is a pyramid whose children are other pyramids. Folder ingestion uses
 
 ## Chain
 
-A **chain** is a YAML file that defines a build pipeline — a sequence of steps with iteration modes (`for_each`, `recursive_cluster`, `container`) and primitives (`extract`, `classify`, `synthesize`, `web`, `compress`, `fuse` plus recipe primitives). Chains live in the `chains/` folder that Wire Node ships with, plus any variants you author or pull from the Wire.
+A **chain** is a YAML file that defines a build pipeline — a sequence of steps with iteration modes (`for_each`, `recursive_cluster`, `container`) and primitives (`extract`, `classify`, `synthesize`, `web`, `compress`, `fuse` plus recipe primitives). Chains live in the `chains/` folder that Agent Wire Node ships with, plus any variants you author or pull from the Wire.
 
 The canonical chain as of 2026-04 is `question.yaml` (the `question-pipeline`); all content types route through it. The per-content-type defaults (`code.yaml`, `document.yaml`, `conversation.yaml`) are deprecated but kept for parity testing.
 
@@ -125,7 +125,7 @@ If you find yourself thinking "I need a new setting for this," the answer is alm
 
 **Annotations** are knowledge pinned to a specific node. Humans and agents both leave them. Each annotation has a type (`observation`, `correction`, `question`, `friction`, `idea`) and optionally a **question context** — the question it answers.
 
-Annotations with a question context automatically feed the **FAQ**. Wire Node matches the question against existing FAQ entries, either extends an existing entry or creates a new one, and the entry becomes the canonical answer to that question from then on.
+Annotations with a question context automatically feed the **FAQ**. Agent Wire Node matches the question against existing FAQ entries, either extends an existing entry or creates a new one, and the entry becomes the canonical answer to that question from then on.
 
 This is how the pyramid learns from agent work. Every time an agent annotates *"how does X actually work?"*, the next agent asking the same question gets the accumulated answer, not a fresh search. The FAQ is continuously improving prior knowledge. See [`26-annotations-and-faqs.md`](26-annotations-and-faqs.md).
 
@@ -168,7 +168,7 @@ The **rotator arm** is the distribution mechanism for certain market flows — a
 
 ## Provider / AI Registry / Tier
 
-Wire Node does not hardcode which model to call. Each chain step declares a **model tier** (`extractor`, `synth_heavy`, `stale_local`, `web`, `mid`, `fast`, and others you can define). A **tier routing table** maps each tier to a `(provider, model)` pair. A **provider registry** knows how to reach each provider — its base URL, its auth, its response format.
+Agent Wire Node does not hardcode which model to call. Each chain step declares a **model tier** (`extractor`, `synth_heavy`, `stale_local`, `web`, `mid`, `fast`, and others you can define). A **tier routing table** maps each tier to a `(provider, model)` pair. A **provider registry** knows how to reach each provider — its base URL, its auth, its response format.
 
 This three-level indirection (step → tier → provider+model) is the **AI Registry**. You can swap one model for another without touching any chain. You can switch globally to Ollama with a single toggle. You can override individual steps for individual pyramids. See [`50-model-routing.md`](50-model-routing.md).
 
@@ -180,12 +180,12 @@ API keys live in a **credentials file** at `~/Library/Application Support/wire-n
 
 ## Publish / pull
 
-Wire Node is local-first. Connecting to the Wire happens through two explicit verbs:
+Agent Wire Node is local-first. Connecting to the Wire happens through two explicit verbs:
 
 - **Publish** — export a local contribution (a pyramid, chain, skill, template, question set) to the Wire. You set an access tier (public / unlisted / private / emergent) and optionally a price. Publishing generates a durable Wire handle-path; people cite your contribution by that path.
 - **Pull** — import a Wire contribution into your local store. Typically used to pick up a chain variant, a generation skill, or a question set another operator authored.
 
-Neither happens implicitly. During a pyramid build, no Wire API calls happen. The Wire is a sharing layer *on top of* Wire Node, not a runtime dependency.
+Neither happens implicitly. During a pyramid build, no Wire API calls happen. The Wire is a sharing layer *on top of* Agent Wire Node, not a runtime dependency.
 
 ## Handle-path
 
@@ -195,7 +195,7 @@ A **handle-path** is a Wire-wide durable identifier for a published contribution
 
 ## Identity / handle
 
-Your node has a persistent **node identity** (stored in your Wire Node data directory). Your user account has one or more **handles** — the `@you` identifiers that appear on your published contributions. Handles are registered on-Wire and can be transferred. See [`33-identity-credits-handles.md`](33-identity-credits-handles.md).
+Your node has a persistent **node identity** (stored in your Agent Wire Node data directory). Your user account has one or more **handles** — the `@you` identifiers that appear on your published contributions. Handles are registered on-Wire and can be transferred. See [`33-identity-credits-handles.md`](33-identity-credits-handles.md).
 
 ---
 
@@ -211,7 +211,7 @@ A **relay** is a node that forwards Wire traffic on someone else's behalf, with 
 
 ## Tunnel
 
-The **tunnel** is the outbound connection your Wire Node maintains to make itself reachable from the Wire — typically Cloudflare Tunnel, so you do not need to port-forward or expose your home network. Tunnel status is visible in the sidebar (a green/yellow/red dot). If the tunnel is down, you are "offline" from the Wire's perspective even if the app is running.
+The **tunnel** is the outbound connection your Agent Wire Node maintains to make itself reachable from the Wire — typically Cloudflare Tunnel, so you do not need to port-forward or expose your home network. Tunnel status is visible in the sidebar (a green/yellow/red dot). If the tunnel is down, you are "offline" from the Wire's perspective even if the app is running.
 
 ---
 

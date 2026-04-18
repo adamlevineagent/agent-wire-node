@@ -1,4 +1,4 @@
-# Chain Developer Guide — Wire Node Pyramid System
+# Chain Developer Guide — Agent Wire Node Pyramid System
 
 This guide is everything you need to create, modify, and improve pyramid build pipelines. You never need to read Rust code. The chain executor is a dumb execution engine — all intelligence lives in YAML chain definitions and .md prompt files.
 

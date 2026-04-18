@@ -13,7 +13,7 @@ Every publish goes through the same steps:
 3. **Set pricing** (if emergent). Price in credits; optional floor, optional promotional discount.
 4. **Set circles** (if private). Which handles or groups can pull.
 5. **Review the publish preview.** Dry run — what will be sent, warnings, cost to consumers, supersession chain.
-6. **Confirm.** Wire Node contacts the coordinator. Handle-path is allocated. Body is uploaded.
+6. **Confirm.** Agent Wire Node contacts the coordinator. Handle-path is allocated. Body is uploaded.
 7. **Done.** Your contribution appears in Tools with a "published" badge and a handle-path. It's now discoverable (per access tier) and pullable.
 
 The publish preview is load-bearing — it's your last chance to catch issues. It explicitly lists:
@@ -99,10 +99,10 @@ Pyramids are larger than chains/skills/configs and have their own publish flow:
 3. **Pricing** (if emergent, planned). Note: because pyramids are large, emergent is the most relevant paid tier for pyramids.
 4. **Absorption config.** How the pyramid responds to incoming questions. Mode (open, rate-limited, daily cap), chain for absorption.
 5. **Cache manifest toggle.** Opt in to include pre-computed cache entries so consumers get usable speed immediately on pull. Recommended for published pyramids you expect to be queried heavily.
-6. **Dry run.** Wire Node runs a preview — structured node data, size, provenance, supersession chain, cost (if emergent).
+6. **Dry run.** Agent Wire Node runs a preview — structured node data, size, provenance, supersession chain, cost (if emergent).
 7. **Confirm.**
 
-Published pyramids are queryable by anyone with access. Queries happen against your running Wire Node through the coordinator. Today those queries are **attributed** (the authoring node sees requester identity); when relays ship, unlinkable queries become possible.
+Published pyramids are queryable by anyone with access. Queries happen against your running Agent Wire Node through the coordinator. Today those queries are **attributed** (the authoring node sees requester identity); when relays ship, unlinkable queries become possible.
 
 ---
 
@@ -147,7 +147,7 @@ See [`74-economics-credits.md`](74-economics-credits.md).
 
 When you publish an updated version of a previously-published contribution:
 
-1. Wire Node detects the supersession chain (your local version supersedes a previously-published contribution).
+1. Agent Wire Node detects the supersession chain (your local version supersedes a previously-published contribution).
 2. The publish preview shows the chain: "This supersedes `@you/slug/v2`."
 3. On confirm, the new version is published with `supersedes_id` set to the previous handle-path.
 4. Consumers who pulled v2 see a notification that v3 is available.
@@ -177,7 +177,7 @@ You can run the dry-run preview without committing to publish. From Tools → yo
 
 ## Things to be careful about
 
-**Credentials in the body.** Wire Node scans for `${VAR_NAME}` references (fine) and for raw credential values (aborts). Still, check the preview. Any raw secret you paste into a YAML will be caught by the scan, but build the habit of using variables.
+**Credentials in the body.** Agent Wire Node scans for `${VAR_NAME}` references (fine) and for raw credential values (aborts). Still, check the preview. Any raw secret you paste into a YAML will be caught by the scan, but build the habit of using variables.
 
 **Overbroad tags.** Tagging a skill with every conceivable topic doesn't help discovery; it just dilutes signal. Pick tags that describe what the contribution actually does.
 

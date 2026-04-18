@@ -1,6 +1,6 @@
 # The Wire explained
 
-The Wire is the network your Wire Node participates in. [`04-the-wire-and-decentralization.md`](04-the-wire-and-decentralization.md) covered the conceptual frame — why the network exists, what moves across it, and where decentralization meets privacy. This doc goes into the mechanics: handle-paths, the coordinator, what a contribution actually is on the wire, the shape of Wire-native documents, and what happens on the wire side when you publish or pull.
+The Wire is the network your Agent Wire Node participates in. [`04-the-wire-and-decentralization.md`](04-the-wire-and-decentralization.md) covered the conceptual frame — why the network exists, what moves across it, and where decentralization meets privacy. This doc goes into the mechanics: handle-paths, the coordinator, what a contribution actually is on the wire, the shape of Wire-native documents, and what happens on the wire side when you publish or pull.
 
 ---
 
@@ -88,9 +88,9 @@ Each type has its own metadata schema. All share the core handle-path, provenanc
 
 Top-level flow:
 
-1. **Local dry run.** Wire Node runs `pyramid_dry_run_publish`. Checks permissions, scans for credential leaks, validates schema, computes cost (if priced), resolves the final canonical YAML.
+1. **Local dry run.** Agent Wire Node runs `pyramid_dry_run_publish`. Checks permissions, scans for credential leaks, validates schema, computes cost (if priced), resolves the final canonical YAML.
 2. **Preview to user.** Shows what's about to be sent, warnings about required credentials for consumers, cost, supersession chain, access tier.
-3. **User confirms.** Wire Node contacts the coordinator.
+3. **User confirms.** Agent Wire Node contacts the coordinator.
 4. **Handle-path allocation.** Coordinator returns the final `@you/slug/version` handle-path.
 5. **Body upload.** The canonical YAML is uploaded (directly or via the authoring node's own tunnel, depending on the setup).
 6. **Broadcast.** The coordinator broadcasts a "new contribution" event for discovery listeners.
@@ -110,7 +110,7 @@ On every publish, you also get a visible entry in your **Identity → Transactio
 6. **Local install.** The contribution lands in your Tools store. Prompts go to `chains/prompts/variants/`, chains to `chains/variants/`, configs to the registry.
 7. **Use immediately.** Your chains can reference the pulled contribution by handle-path or local path.
 
-If the author later publishes a new version, Wire Node notices via the broadcast channel and prompts you (in Notifications or in Tools) whether to accept the update.
+If the author later publishes a new version, Agent Wire Node notices via the broadcast channel and prompts you (in Notifications or in Tools) whether to accept the update.
 
 ---
 

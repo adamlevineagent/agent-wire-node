@@ -1,6 +1,6 @@
 # Credentials and keys
 
-Before Wire Node can run any pyramid build, it needs a way to call an LLM. That means either:
+Before Agent Wire Node can run any pyramid build, it needs a way to call an LLM. That means either:
 
 - An **OpenRouter API key** (recommended to start — pay-as-you-go, no local setup).
 - A local **Ollama** instance (free, private, slower, needs a capable machine).
@@ -27,13 +27,13 @@ OLLAMA_LOCAL_URL: http://localhost:11434
 ANTHROPIC_KEY: sk-ant-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-Keys are uppercase SNAKE_CASE. Values are arbitrary strings. Wire Node locks the file to `0600` (user read/write only) on every load. If permissions are wider than that, the app refuses to read the file and surfaces a blocking error in Settings — this is to protect you from accidentally leaking a key through a too-permissive backup or sync.
+Keys are uppercase SNAKE_CASE. Values are arbitrary strings. Agent Wire Node locks the file to `0600` (user read/write only) on every load. If permissions are wider than that, the app refuses to read the file and surfaces a blocking error in Settings — this is to protect you from accidentally leaking a key through a too-permissive backup or sync.
 
 You can edit this file directly with any editor if you want to. The Settings UI is the convenient path.
 
 ## How configs reference credentials
 
-Wire Node keeps a hard wall between configs (which are shareable) and secrets (which are private). Configs reference credentials by variable name, not by value.
+Agent Wire Node keeps a hard wall between configs (which are shareable) and secrets (which are private). Configs reference credentials by variable name, not by value.
 
 A provider config might look like:
 
@@ -61,18 +61,18 @@ This pattern is what makes provider configs safe to publish on the Wire. When so
 4. Fund the account with a small amount ($5 is more than enough to start).
 5. Copy the key. It looks like `sk-or-v1-...` and is 60-ish characters.
 
-### Putting it in Wire Node
+### Putting it in Agent Wire Node
 
 Two paths:
 
 **Via Settings UI (easy):**
 
-1. Open Wire Node → **Settings** (gear, bottom of sidebar).
-2. Go to the **Credentials** panel (inside Wire Node Settings, or via the Pyramid Settings shortcut).
+1. Open Agent Wire Node → **Settings** (gear, bottom of sidebar).
+2. Go to the **Credentials** panel (inside Agent Wire Node Settings, or via the Pyramid Settings shortcut).
 3. Click **Add credential**.
 4. Name: `OPENROUTER_KEY`. Value: paste your key.
 5. Click **Save**. The app writes to the credentials file with correct permissions.
-6. Click **Test** to confirm it works. Wire Node sends a tiny test prompt to OpenRouter; if it comes back with token counts and a cost, you're good.
+6. Click **Test** to confirm it works. Agent Wire Node sends a tiny test prompt to OpenRouter; if it comes back with token counts and a cost, you're good.
 
 **Via direct file edit (for scripts or CI):**
 
@@ -84,14 +84,14 @@ EOF
 chmod 0600 ~/Library/Application\ Support/wire-node/.credentials
 ```
 
-Wire Node picks up the new value on the next LLM call; you don't need to restart.
+Agent Wire Node picks up the new value on the next LLM call; you don't need to restart.
 
 ### The two OpenRouter key types
 
 OpenRouter has two kinds of keys:
 
 - **Inference keys** (`sk-or-v1-...`) — for making LLM calls. This is the one you need for builds.
-- **Management keys** (`sk-or-mgmt-...`) — for reading account status, including credit balance. Optional. If you set `OPENROUTER_MANAGEMENT_KEY` as well, Wire Node can show your remaining OpenRouter credits in the oversight panel and proactively switch providers when you're running low.
+- **Management keys** (`sk-or-mgmt-...`) — for reading account status, including credit balance. Optional. If you set `OPENROUTER_MANAGEMENT_KEY` as well, Agent Wire Node can show your remaining OpenRouter credits in the oversight panel and proactively switch providers when you're running low.
 
 Start with just the inference key. Add the management key when you want the visibility.
 
@@ -117,11 +117,11 @@ curl http://localhost:11434/api/tags
 # Should return {"models":[]} or a list of models you have pulled.
 ```
 
-### Pointing Wire Node at it
+### Pointing Agent Wire Node at it
 
-You don't need to set a credential for local Ollama — there's no API key. What you do need is to tell Wire Node the URL.
+You don't need to set a credential for local Ollama — there's no API key. What you do need is to tell Agent Wire Node the URL.
 
-**Easy path:** Go to **Settings → Wire Node Settings → Local Mode**. Toggle Local Mode on. Wire Node discovers your Ollama at `http://localhost:11434` by default, probes it, and shows the list of installed models. Pick one for each tier (extractor, synth_heavy, stale_local, etc.), or just set it globally. See [`51-local-mode-ollama.md`](51-local-mode-ollama.md) for details.
+**Easy path:** Go to **Settings → Agent Wire Node Settings → Local Mode**. Toggle Local Mode on. Agent Wire Node discovers your Ollama at `http://localhost:11434` by default, probes it, and shows the list of installed models. Pick one for each tier (extractor, synth_heavy, stale_local, etc.), or just set it globally. See [`51-local-mode-ollama.md`](51-local-mode-ollama.md) for details.
 
 **Manual path:** add an entry to your credentials file so configs can reference a Wire-shareable Ollama URL:
 
@@ -133,7 +133,7 @@ This is useful if you're authoring provider configs that reference `${OLLAMA_LOC
 
 ### Pulling a model
 
-Ollama ships with no models by default. Pull at least one before you expect Wire Node to use it:
+Ollama ships with no models by default. Pull at least one before you expect Agent Wire Node to use it:
 
 ```bash
 ollama pull gemma3:27b
@@ -145,7 +145,7 @@ ollama pull qwen2.5-coder:32b
 
 The model file can be 10-50 GB. Pulls take a while on first run.
 
-Wire Node's **Settings → Local Mode** panel also has a "Pull model" button that wraps this. Use the terminal path if you want more control.
+Agent Wire Node's **Settings → Local Mode** panel also has a "Pull model" button that wraps this. Use the terminal path if you want more control.
 
 ---
 
@@ -172,11 +172,11 @@ Then configure a provider in **Settings → Providers** that uses `${OLLAMA_GATE
 
 ## Credential safety rules
 
-Wire Node is designed to make credential leaks hard, but it relies on a few things from you.
+Agent Wire Node is designed to make credential leaks hard, but it relies on a few things from you.
 
-**Permissions on the credentials file must be `0600`.** If they are wider, Wire Node refuses to read the file. If you see the "credentials file has unsafe permissions" error, use the **Fix permissions** button or run `chmod 0600 ~/Library/Application\ Support/wire-node/.credentials` and retry.
+**Permissions on the credentials file must be `0600`.** If they are wider, Agent Wire Node refuses to read the file. If you see the "credentials file has unsafe permissions" error, use the **Fix permissions** button or run `chmod 0600 ~/Library/Application\ Support/wire-node/.credentials` and retry.
 
-**Never paste a credential value into a config YAML directly.** Always use `${VAR_NAME}` references. If you paste a value into YAML and then publish that config, your key goes on the Wire permanently. Wire Node tries to catch this at publish time with a pre-publish scan, but don't rely on that check — develop the habit.
+**Never paste a credential value into a config YAML directly.** Always use `${VAR_NAME}` references. If you paste a value into YAML and then publish that config, your key goes on the Wire permanently. Agent Wire Node tries to catch this at publish time with a pre-publish scan, but don't rely on that check — develop the habit.
 
 **Don't commit `.credentials` to git.** It lives outside your repo; keep it that way. If you are syncing your home directory via iCloud or similar, consider excluding `~/Library/Application Support/wire-node/.credentials` or moving the whole data directory out of the sync path.
 
@@ -186,9 +186,9 @@ Wire Node is designed to make credential leaks hard, but it relies on a few thin
 
 ---
 
-## What Wire Node does for you automatically
+## What Agent Wire Node does for you automatically
 
-- On every read of the credentials file, Wire Node verifies the file exists, is regular (not a symlink to somewhere suspicious), and has 0600 permissions. If any check fails, it surfaces an error rather than silently using the file.
+- On every read of the credentials file, Agent Wire Node verifies the file exists, is regular (not a symlink to somewhere suspicious), and has 0600 permissions. If any check fails, it surfaces an error rather than silently using the file.
 - The in-memory wrapper for resolved credentials has no Display, Debug, or Serialize implementations. Attempts to log or serialize a resolved credential fail at compile time. The only way a credential value exits the process is through the HTTP client, which masks the Authorization header in its request logs.
 - At Wire publish time, the YAML is scanned for `${…}` patterns, and warnings are surfaced for each credential your config requires. The pre-publish preview also scans for raw credential values (from your file) and aborts if any are found.
 
@@ -234,7 +234,7 @@ Pulls show required credentials in their preview. You'll see something like "Thi
 
 ### I rotated my key; do I need to restart the app?
 
-No. Wire Node reads the credentials file on each resolve, not at startup. Next LLM call uses the new value.
+No. Agent Wire Node reads the credentials file on each resolve, not at startup. Next LLM call uses the new value.
 
 ---
 
@@ -247,7 +247,7 @@ OPENROUTER_KEY: sk-or-v1-personal...
 OPENROUTER_KEY_WORK: sk-or-v1-work...
 ```
 
-Then configure two providers, each using a different variable. Wire Node's tier routing lets you mix and match per pyramid or per step.
+Then configure two providers, each using a different variable. Agent Wire Node's tier routing lets you mix and match per pyramid or per step.
 
 ---
 

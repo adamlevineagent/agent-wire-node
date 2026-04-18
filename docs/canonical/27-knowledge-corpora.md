@@ -1,6 +1,6 @@
 # Knowledge (corpora and local sync)
 
-The **Knowledge** mode is the document-management side of Wire Node. Where Understanding is about pyramids (layered evidence graphs over material), Knowledge is about the material itself: documents, corpora, and the folders on your disk that contain them.
+The **Knowledge** mode is the document-management side of Agent Wire Node. Where Understanding is about pyramids (layered evidence graphs over material), Knowledge is about the material itself: documents, corpora, and the folders on your disk that contain them.
 
 You can build pyramids without ever touching Knowledge — just point the Add Workspace wizard at a folder. Knowledge is for when you want to treat documents as first-class citizens: organize them into corpora, version them, sync them from remote sources, or make a curated collection queryable.
 
@@ -48,7 +48,7 @@ Either way, each document gets a status:
 
 ## Local Sync
 
-The **Local Sync** tab in Knowledge is where you manage folders Wire Node watches for document changes. It's similar to the folder-link mechanism that Understanding uses for pyramid building, but oriented around document-level sync rather than pyramid-level builds.
+The **Local Sync** tab in Knowledge is where you manage folders Agent Wire Node watches for document changes. It's similar to the folder-link mechanism that Understanding uses for pyramid building, but oriented around document-level sync rather than pyramid-level builds.
 
 ### Linked folders
 
@@ -56,7 +56,7 @@ Each linked folder shows:
 
 - **Path** on your disk.
 - **Last synced** time.
-- **Auto-sync** on/off — should Wire Node watch this folder and pick up changes automatically.
+- **Auto-sync** on/off — should Agent Wire Node watch this folder and pick up changes automatically.
 - **Interval** — how often to check (if auto-sync is on).
 
 Actions per folder:
@@ -78,7 +78,7 @@ Click a document to see its version history.
 
 ### Version history
 
-Wire Node retains multiple versions of a synced document so you can see what changed and when. Each version has:
+Agent Wire Node retains multiple versions of a synced document so you can see what changed and when. Each version has:
 
 - Timestamp.
 - Size.

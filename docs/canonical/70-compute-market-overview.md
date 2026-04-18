@@ -2,7 +2,7 @@
 
 The **compute market** is the Wire-wide order book for inference. Operators with idle GPU capacity publish offers to serve specific models at specific prices. Operators with work to do dispatch inference to the market and let the cheapest qualified offer win. Payment flows in credits; outcomes are logged and attributed.
 
-This makes the idle capacity on thousands of operator machines available as a pooled inference resource — and makes the cost of running Wire Node builds lower than paying OpenRouter directly for anyone willing to use the market.
+This makes the idle capacity on thousands of operator machines available as a pooled inference resource — and makes the cost of running Agent Wire Node builds lower than paying OpenRouter directly for anyone willing to use the market.
 
 ---
 
@@ -33,10 +33,10 @@ Most nodes will do both. A **Hybrid** compute participation policy (see [`73-par
 Provider side (shipped):
 
 1. You publish an offer: *"I'll serve `gemma3:27b` at 3 credits per 1K output tokens, up to 2 concurrent jobs."*
-2. Wire Node registers the offer with the coordinator's order book.
+2. Agent Wire Node registers the offer with the coordinator's order book.
 3. A requester on the Wire dispatches a job matching your offer.
 4. Coordinator selects your offer (cheapest qualified, or based on requester's policy).
-5. Coordinator push-delivers the job to your Wire Node.
+5. Coordinator push-delivers the job to your Agent Wire Node.
 6. Your node's compute queue for `gemma3:27b` picks up the job (same FIFO queue as your local builds use).
 7. Your local Ollama runs the inference.
 8. Result posts back to the requester (via the Wire).

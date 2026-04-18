@@ -1,6 +1,6 @@
 # Provider registry
 
-A **provider** is a compute backend Wire Node can call for inference — OpenRouter, Ollama, a self-hosted OpenAI-compatible endpoint, or anything that speaks that API. The provider registry is the set of configured providers on your node. Tier routing maps tiers to `(provider, model)` pairs; the provider registry is what resolves `provider` to a real URL + auth.
+A **provider** is a compute backend Agent Wire Node can call for inference — OpenRouter, Ollama, a self-hosted OpenAI-compatible endpoint, or anything that speaks that API. The provider registry is the set of configured providers on your node. Tier routing maps tiers to `(provider, model)` pairs; the provider registry is what resolves `provider` to a real URL + auth.
 
 This doc covers what a provider definition looks like, how to add a new provider, and the common configurations you'll want.
 
@@ -15,7 +15,7 @@ Each provider is a row with:
 - **Type** — `openrouter`, `openai_compat`, `ollama_native`, or one of the other shipped provider types.
 - **Base URL** — the endpoint to call. May contain `${VAR_NAME}` references (e.g. `${OLLAMA_PROD_URL}` for a URL that's an environment-specific secret).
 - **API key ref** — the credentials file variable that holds the auth token. Null for providers without auth (local Ollama).
-- **Auto-detect context** — whether Wire Node should query the provider for context-window metadata on model selection.
+- **Auto-detect context** — whether Agent Wire Node should query the provider for context-window metadata on model selection.
 - **Extra headers** — custom headers (e.g. for a proxy gateway's auth).
 - **Enabled** — can be toggled off without removing the row.
 
@@ -155,19 +155,19 @@ When OpenRouter is down, fall back to Anthropic direct. When Anthropic is down, 
 
 See [`50-model-routing.md`](50-model-routing.md) for the fallback chain shape.
 
-**Status:** defined in the spec, partially wired through the dispatch path. The intra-provider fallback (OpenRouter's own `route: "fallback"`) works today. Cross-provider fallback at Wire Node level is landing.
+**Status:** defined in the spec, partially wired through the dispatch path. The intra-provider fallback (OpenRouter's own `route: "fallback"`) works today. Cross-provider fallback at Agent Wire Node level is landing.
 
 ---
 
 ## OpenRouter account state (optional monitoring)
 
-If you're using OpenRouter, Wire Node can optionally monitor your credit balance. Requires a separate **Management API Key** (distinct from inference keys). Setup:
+If you're using OpenRouter, Agent Wire Node can optionally monitor your credit balance. Requires a separate **Management API Key** (distinct from inference keys). Setup:
 
 1. Go to https://openrouter.ai/settings/keys, create a Management key (it's a different key type).
 2. Put it in your credentials file as `OPENROUTER_MANAGEMENT_KEY`.
 3. In **Settings → Providers → OpenRouter → Credits**, enable the balance widget.
 
-Wire Node periodically queries `/api/v1/credits` with the management key and shows your remaining balance + recent spend. Helpful for catching "about to exhaust credits" before builds start failing.
+Agent Wire Node periodically queries `/api/v1/credits` with the management key and shows your remaining balance + recent spend. Helpful for catching "about to exhaust credits" before builds start failing.
 
 ---
 

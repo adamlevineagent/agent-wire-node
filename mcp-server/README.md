@@ -1,8 +1,8 @@
-# Wire Node Pyramid -- CLI & MCP Server
+# Agent Wire Node Pyramid -- CLI & MCP Server
 
 > Agent-facing interface to Knowledge Pyramids. Navigate, search, annotate, and compose structured intelligence.
 
-Both interfaces (`pyramid-cli` and the MCP server) are thin HTTP clients that talk to the Wire Node Rust backend at `localhost:8765`. The CLI outputs JSON to stdout. The MCP server exposes the same capabilities over stdio using the Model Context Protocol.
+Both interfaces (`pyramid-cli` and the MCP server) are thin HTTP clients that talk to the Agent Wire Node Rust backend at `localhost:8765`. The CLI outputs JSON to stdout. The MCP server exposes the same capabilities over stdio using the Model Context Protocol.
 
 Package: `wire-node-pyramid-mcp` v0.2.0
 
@@ -52,7 +52,7 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 }
 ```
 
-The MCP server runs on stdio transport. On startup it performs a non-blocking connectivity check against Wire Node and logs the result to stderr. If Wire Node is not running, tools will return clear error messages until it comes online.
+The MCP server runs on stdio transport. On startup it performs a non-blocking connectivity check against Agent Wire Node and logs the result to stderr. If Agent Wire Node is not running, tools will return clear error messages until it comes online.
 
 ---
 
@@ -86,7 +86,7 @@ pyramid-cli health --verbose
 
 #### health
 
-Check if Wire Node is running. Returns server version and status.
+Check if Agent Wire Node is running. Returns server version and status.
 
 ```
 pyramid-cli health
@@ -972,7 +972,7 @@ pyramid-cli composed migration-questions
          HTTP (localhost:8765)
                       |
                       v
-           Wire Node (Rust backend)
+           Agent Wire Node (Rust backend)
                       |
                       v
                    SQLite
@@ -986,12 +986,12 @@ pyramid-cli composed migration-questions
          HTTP (localhost:8765)
                       |
                       v
-           Wire Node (Rust backend)
+           Agent Wire Node (Rust backend)
 ```
 
 - **CLI** (`cli.ts`) -- Thin HTTP client. Parses args, calls the Rust backend, enriches responses (breadcrumbs, re-ranking, hints), outputs JSON to stdout.
 - **MCP Server** (`index.ts`) -- Same HTTP client wrapped in MCP protocol over stdio. Uses `@modelcontextprotocol/sdk`. Each MCP tool maps to one or more backend endpoints.
 - **Shared library** (`lib.ts`) -- Auth token resolution, `pyramidFetch` HTTP helper with timeout and error handling, and the self-documenting `TOOL_CATALOG`.
-- **Wire Node** -- Tauri/Rust desktop app that owns the SQLite database, runs builds, manages DADBEAR auto-updates, and serves the HTTP API.
+- **Agent Wire Node** -- Tauri/Rust desktop app that owns the SQLite database, runs builds, manages DADBEAR auto-updates, and serves the HTTP API.
 
-The Wire Node HTTP server must be running for any command to work. The base URL is hardcoded to `http://localhost:8765`. Request timeout is 10 seconds.
+The Agent Wire Node HTTP server must be running for any command to work. The base URL is hardcoded to `http://localhost:8765`. Request timeout is 10 seconds.

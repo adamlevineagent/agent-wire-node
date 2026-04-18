@@ -1,6 +1,6 @@
 # `pyramid-cli`
 
-`pyramid-cli` is the agent-facing command-line interface to Wire Node. It's a thin HTTP client over `localhost:8765`, with 64 commands across 16 categories. This is how scripts, external agents, and anyone-not-using-the-Tauri-UI talks to a running Wire Node.
+`pyramid-cli` is the agent-facing command-line interface to Agent Wire Node. It's a thin HTTP client over `localhost:8765`, with 64 commands across 16 categories. This is how scripts, external agents, and anyone-not-using-the-Tauri-UI talks to a running Agent Wire Node.
 
 The CLI is also the foundation for the MCP server — every MCP tool maps to a CLI command, so whatever you can do from the CLI, Claude or any MCP-capable agent can do over stdio.
 
@@ -8,7 +8,7 @@ The CLI is also the foundation for the MCP server — every MCP tool maps to a C
 
 ## Install and invocation
 
-The CLI ships with Wire Node's repo at `mcp-server/`. Build:
+The CLI ships with Agent Wire Node's repo at `mcp-server/`. Build:
 
 ```bash
 cd mcp-server && npm install && npm run build
@@ -27,7 +27,7 @@ alias pyramid-cli='node "/Users/adamlevine/AI Project Files/agent-wire-node/mcp-
 pyramid-cli health
 ```
 
-The CLI requires Wire Node to be running (HTTP server at `localhost:8765`).
+The CLI requires Agent Wire Node to be running (HTTP server at `localhost:8765`).
 
 ---
 
@@ -57,7 +57,7 @@ The CLI's 64 commands are organized by category. Run `pyramid-cli help --categor
 
 `health`, `slugs`, `help`
 
-- **`health`** — Wire Node connectivity check. Server version + status.
+- **`health`** — Agent Wire Node connectivity check. Server version + status.
 - **`slugs`** — list all available pyramids with metadata.
 - **`help`** — self-documenting. Returns the tool catalog.
 

@@ -1,6 +1,6 @@
 # HTTP operator API
 
-Wire Node exposes an HTTP API on `localhost:8765` for operator and agent use. The CLI and MCP server are thin wrappers over this API; anything they do, you can do via raw HTTP.
+Agent Wire Node exposes an HTTP API on `localhost:8765` for operator and agent use. The CLI and MCP server are thin wrappers over this API; anything they do, you can do via raw HTTP.
 
 This doc covers the operator-facing routes — roughly 25 of them as of this writing, plus the broader pyramid read/write surface. Useful when writing custom tooling that doesn't fit either the CLI or the MCP pattern.
 
@@ -171,7 +171,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ## Tunnel considerations
 
-Your Wire Node's HTTP server is reachable via:
+Your Agent Wire Node's HTTP server is reachable via:
 
 - **localhost:8765** — on your machine, direct.
 - **Your tunnel URL** — the public Cloudflare Tunnel endpoint. Other nodes and the coordinator reach you through this.
@@ -214,5 +214,5 @@ Pick the CLI or MCP when:
 
 - [`80-pyramid-cli.md`](80-pyramid-cli.md) — the CLI over the same API.
 - [`81-mcp-server.md`](81-mcp-server.md) — the MCP server over the same API.
-- [`34-settings.md`](34-settings.md) → Wire Node Settings — where your auth token lives.
+- [`34-settings.md`](34-settings.md) → Agent Wire Node Settings — where your auth token lives.
 - [`mcp-server/README.md`](../../mcp-server/README.md) — authoritative route-to-tool mapping.

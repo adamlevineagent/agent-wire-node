@@ -1,6 +1,6 @@
 # Logs and diagnostics
 
-Wire Node writes operational signals to a log file and exposes health checks, cost rollups, and subsystem diagnostics through the UI. This doc covers what's available and when to reach for each.
+Agent Wire Node writes operational signals to a log file and exposes health checks, cost rollups, and subsystem diagnostics through the UI. This doc covers what's available and when to reach for each.
 
 ---
 
@@ -11,13 +11,13 @@ Location: `~/Library/Application Support/wire-node/wire-node.log`.
 Rotation: **truncated on each app start** (no rolling files in the current build). If you want to capture logs across restarts, redirect stderr when launching from terminal:
 
 ```bash
-"/Applications/Wire Node.app/Contents/MacOS/Wire Node" 2>> ~/wire-node-extended.log
+"/Applications/Agent Wire Node.app/Contents/MacOS/Agent Wire Node" 2>> ~/wire-node-extended.log
 ```
 
 Log level: `info` by default. To get more verbose diagnostics, set `RUST_LOG` before launch:
 
 ```bash
-RUST_LOG=debug "/Applications/Wire Node.app/Contents/MacOS/Wire Node"
+RUST_LOG=debug "/Applications/Agent Wire Node.app/Contents/MacOS/Agent Wire Node"
 ```
 
 Common log namespaces:
@@ -35,7 +35,7 @@ The last ~500 lines of the log are also accessible via the `pyramid_logs` CLI or
 
 ## Health checks
 
-**Settings → Wire Node Settings → Health Status.**
+**Settings → Agent Wire Node Settings → Health Status.**
 
 Each check shows status (green/yellow/red) and a message:
 
@@ -129,7 +129,7 @@ See [`25-dadbear-oversight.md`](25-dadbear-oversight.md).
 
 ## Tunnel diagnostics
 
-**Settings → Wire Node Settings → Tunnel Status.**
+**Settings → Agent Wire Node Settings → Tunnel Status.**
 
 - Current state (Connected / Connecting / Offline / Error).
 - Public endpoint URL (if connected).
@@ -167,12 +167,12 @@ If your balance is moving in ways you don't expect, the transaction history is t
 ## When things go wrong: a triage flow
 
 1. **Check Operations → Notifications.** Most significant issues surface here as notifications.
-2. **Check Settings → Wire Node Settings → Health Status.** Failing checks tell you which subsystem is the problem.
+2. **Check Settings → Agent Wire Node Settings → Health Status.** Failing checks tell you which subsystem is the problem.
 3. **For build issues:** Understanding → Builds → click the problem build → activity log.
 4. **For cost anomalies:** Understanding → Oversight → Cost Rollup → drill into the anomalous pyramid or phase.
 5. **For DADBEAR weirdness:** Understanding → Oversight → pyramid card → View activity or Configure.
 6. **For provider issues:** Settings → Providers → Test button, then check the log's provider namespace.
-7. **For tunnel issues:** Settings → Wire Node Settings → Tunnel Status → Retry, then check log.
+7. **For tunnel issues:** Settings → Agent Wire Node Settings → Tunnel Status → Retry, then check log.
 
 If after all of that you still don't know what's wrong, capture the last section of the log + a screenshot of the relevant diagnostic panels and ask in the alpha channel.
 

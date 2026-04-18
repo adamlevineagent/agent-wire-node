@@ -1,6 +1,6 @@
 # First run and onboarding
 
-This doc covers what happens the first time you launch Wire Node: signing in, the onboarding wizard, generating your node identity, and landing on the main app. It assumes you have already installed the app (see [`10-install.md`](10-install.md)).
+This doc covers what happens the first time you launch Agent Wire Node: signing in, the onboarding wizard, generating your node identity, and landing on the main app. It assumes you have already installed the app (see [`10-install.md`](10-install.md)).
 
 Set aside about 5 minutes. The one task with external dependencies is waiting for the magic link email to arrive.
 
@@ -8,7 +8,7 @@ Set aside about 5 minutes. The one task with external dependencies is waiting fo
 
 ## Step 1: Launch and loading screen
 
-Open `/Applications/Wire Node.app`. You see the loading screen — a "W" logo over a tunneling animation. The backend is starting up:
+Open `/Applications/Agent Wire Node.app`. You see the loading screen — a "W" logo over a tunneling animation. The backend is starting up:
 
 - Opening the SQLite database (creates it on first run).
 - Generating a node identity if one doesn't already exist — a durable handle and a random token, stored in `node_identity.json`.
@@ -25,7 +25,7 @@ You need a Wire account to use the app. If you haven't been given an account yet
 
 The login screen has two modes:
 
-- **Magic link** (default) — enter your email, click Send. Wire sends a one-time link to your inbox; you click it, and macOS opens Wire Node and completes sign-in automatically. If automatic deep-linking doesn't work (some email clients break it), you can paste the URL into the text area the screen provides, or paste the six-digit OTP code.
+- **Magic link** (default) — enter your email, click Send. Wire sends a one-time link to your inbox; you click it, and macOS opens Agent Wire Node and completes sign-in automatically. If automatic deep-linking doesn't work (some email clients break it), you can paste the URL into the text area the screen provides, or paste the six-digit OTP code.
 - **Password** — if you have set a password on your account, you can use it directly. New accounts generally start magic-link-only.
 
 Magic link is recommended. It keeps passwords out of your head and out of leak lists.
@@ -36,7 +36,7 @@ Magic link is recommended. It keeps passwords out of your head and out of leak l
 - Wait 60 seconds and try again (the first attempt may have been rate-limited silently).
 - If you keep getting nothing, the Wire service is having trouble. Check the alpha channel for outage notices.
 
-Once sign-in succeeds, Wire Node registers your node with the Wire coordinator: the coordinator learns your node's identity and returns an `api_token` for subsequent requests. You don't see this step happen — it's automatic — but it's why you need to be online for first-run login.
+Once sign-in succeeds, Agent Wire Node registers your node with the Wire coordinator: the coordinator learns your node's identity and returns an `api_token` for subsequent requests. You don't see this step happen — it's automatic — but it's why you need to be online for first-run login.
 
 ## Step 3: The onboarding wizard
 
@@ -44,11 +44,11 @@ First-time users get a four-step wizard. Existing users skip this entirely.
 
 ### Step 3a: Welcome and node name
 
-Pick a human-readable name for your node. This is what appears in fleet lists, in compute market chronicle events, and in the system tray tooltip. Something descriptive is better than something cute: `adam-laptop`, `studio-m2`, `homeserver-beefy`. You can change this later in **Settings → Wire Node Settings → Node name**, so don't agonize.
+Pick a human-readable name for your node. This is what appears in fleet lists, in compute market chronicle events, and in the system tray tooltip. Something descriptive is better than something cute: `adam-laptop`, `studio-m2`, `homeserver-beefy`. You can change this later in **Settings → Agent Wire Node Settings → Node name**, so don't agonize.
 
 ### Step 3b: Storage allocation
 
-Choose how much disk Wire Node is allowed to use for cached documents and mesh hosting. Options: 10 GB, 40 GB, 100 GB, or custom.
+Choose how much disk Agent Wire Node is allowed to use for cached documents and mesh hosting. Options: 10 GB, 40 GB, 100 GB, or custom.
 
 - **10 GB** — good if you're just kicking the tires. Enough for a small codebase pyramid and a few documents.
 - **40 GB** (the default) — enough for serious use without thinking about it.
@@ -59,7 +59,7 @@ This cap is on *cached / hosted* content. Your own pyramids and source material 
 
 ### Step 3c: Link a first folder (optional)
 
-This is where you point Wire Node at something to build a pyramid over. You can pick:
+This is where you point Agent Wire Node at something to build a pyramid over. You can pick:
 
 - A codebase (a repo root, or any folder of source files).
 - A folder of documents (PDFs, Markdown, text files).
@@ -93,12 +93,12 @@ Your node isn't fully useful until you've set up credentials (step 5) and built 
 
 ## Step 5: Set up credentials
 
-By default, Wire Node can log you in and register your node, but it can't yet run any pyramid builds because it has no way to call an LLM. You need either:
+By default, Agent Wire Node can log you in and register your node, but it can't yet run any pyramid builds because it has no way to call an LLM. You need either:
 
 - An **OpenRouter API key**, for cloud LLMs. Recommended for getting started because you don't need any local setup and you pay only for what you use.
 - A **local Ollama instance** with at least one model pulled, for fully offline operation. Slower, but free and private.
 
-Go to **Settings → Wire Node Settings → Credentials** (or **Settings → Pyramid Settings** for the quick API-key shortcut). Paste in your OpenRouter key. Test it. Save.
+Go to **Settings → Agent Wire Node Settings → Credentials** (or **Settings → Pyramid Settings** for the quick API-key shortcut). Paste in your OpenRouter key. Test it. Save.
 
 Full walkthrough in [`12-credentials-and-keys.md`](12-credentials-and-keys.md). Ollama-specific setup in [`51-local-mode-ollama.md`](51-local-mode-ollama.md).
 
@@ -151,7 +151,7 @@ You're ready to actually use the app.
 
 ## Troubleshooting first-run specifically
 
-### The magic link opens my browser but Wire Node doesn't launch
+### The magic link opens my browser but Agent Wire Node doesn't launch
 
 The deep link handler isn't registered. Usually this self-heals on second launch. If it doesn't, copy the URL from the email and paste it into the "Paste magic link" box on the login screen.
 
@@ -161,11 +161,11 @@ The deep link handler isn't registered. Usually this self-heals on second launch
 
 ### Sign-in succeeds but my node doesn't register
 
-The Wire coordinator is reachable but something is rejecting the registration. Most often this is because a node with the same handle already exists (rare — happens if you nuked data and a stale record is still on the server). Check **Settings → Wire Node Settings → Node ID** — if it's blank, registration didn't complete. Try logging out and back in; if it still fails, get help from the alpha channel.
+The Wire coordinator is reachable but something is rejecting the registration. Most often this is because a node with the same handle already exists (rare — happens if you nuked data and a stale record is still on the server). Check **Settings → Agent Wire Node Settings → Node ID** — if it's blank, registration didn't complete. Try logging out and back in; if it still fails, get help from the alpha channel.
 
 ### Onboarding choices are wrong
 
-You can change all of them later in **Settings → Wire Node Settings**. Node name, storage cap, and mesh hosting are all editable. The only thing that's sticky is your node identity, which is tied to the `node_identity.json` file — overwriting it effectively creates a new node.
+You can change all of them later in **Settings → Agent Wire Node Settings**. Node name, storage cap, and mesh hosting are all editable. The only thing that's sticky is your node identity, which is tied to the `node_identity.json` file — overwriting it effectively creates a new node.
 
 ---
 

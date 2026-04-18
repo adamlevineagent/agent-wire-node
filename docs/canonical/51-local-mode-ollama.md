@@ -16,7 +16,7 @@ This doc describes how Local Mode is *designed* to work and what you can do with
 2. **Pull at least one model.** `ollama pull gemma3:27b` (or smaller if your machine won't fit it). For a code-focused workflow: `ollama pull qwen2.5-coder:32b`. For a document-focused workflow: `ollama pull llama3.1:70b` if you have the hardware, or `gemma3:12b` on a smaller box.
 3. **Confirm reachable.** `curl http://localhost:11434/api/tags` — should list your installed models.
 
-Wire Node doesn't install Ollama for you. Once Ollama is running and has a model, Wire Node can discover and use it.
+Agent Wire Node doesn't install Ollama for you. Once Ollama is running and has a model, Agent Wire Node can discover and use it.
 
 ---
 
@@ -24,11 +24,11 @@ Wire Node doesn't install Ollama for you. Once Ollama is running and has a model
 
 ### Via Settings UI
 
-1. Open **Settings → Wire Node Settings → Local Mode**.
+1. Open **Settings → Agent Wire Node Settings → Local Mode**.
 2. Toggle **Enable local mode**.
-3. Wire Node probes your Ollama URL, lists installed models.
+3. Agent Wire Node probes your Ollama URL, lists installed models.
 4. Pick a model for the default tier routing. You can pick different models for different tiers, or assign one model globally.
-5. Save. Wire Node writes the new routing atomically, storing the old routing for fallback.
+5. Save. Agent Wire Node writes the new routing atomically, storing the old routing for fallback.
 
 ### Via provider config
 
@@ -46,23 +46,23 @@ This path lets you selectively route some tiers to Ollama (e.g. cheap staleness 
 
 ---
 
-## Model management inside Wire Node
+## Model management inside Agent Wire Node
 
 Once Local Mode is enabled, the Local Mode settings panel exposes Ollama management:
 
 - **Installed models list** — from Ollama's `/api/tags`. Each row shows name, size on disk, family, parameter count, quantization, capabilities (from `/api/show`), last used.
-- **Pull model** — form with model name, optional autocomplete. Wire Node invokes `/api/pull` with streaming progress.
+- **Pull model** — form with model name, optional autocomplete. Agent Wire Node invokes `/api/pull` with streaming progress.
 - **Delete model** — reclaims disk space (confirmation required — destructive).
 - **Unload** — `/api/generate` with `keep_alive: 0`. Frees VRAM without deleting the model.
 - **Keep-alive** — how long Ollama holds a model in VRAM between calls. Short keep-alive saves memory; long keep-alive keeps calls fast.
 
-Disk management banner: if your Ollama models exceed a configurable threshold of disk usage, Wire Node surfaces a warning.
+Disk management banner: if your Ollama models exceed a configurable threshold of disk usage, Agent Wire Node surfaces a warning.
 
 ---
 
 ## Context windows and detection
 
-Ollama models advertise a context window in their metadata. Wire Node detects it via `/api/show` when you pick a model:
+Ollama models advertise a context window in their metadata. Agent Wire Node detects it via `/api/show` when you pick a model:
 
 1. Read `model_info["general.architecture"]` → e.g. `gemma3`.
 2. Read `model_info["<arch>.context_length"]` → e.g. `131072`.
@@ -70,7 +70,7 @@ Ollama models advertise a context window in their metadata. Wire Node detects it
 
 Detected context window populates the tier routing entry's `context_limit` automatically. If auto-detection fails, you can set it manually.
 
-**Note on setting context per-request:** the OpenAI-compatible path (`/v1/chat/completions`) uses whatever context window the model was loaded with — you cannot override per-request. To override, you'd need to use Ollama's native `/api/chat` endpoint with `options: {num_ctx: ...}`. Wire Node's default provider path is OAI-compat; an alternate Ollama native provider exists for setups that need per-request context override but isn't the default.
+**Note on setting context per-request:** the OpenAI-compatible path (`/v1/chat/completions`) uses whatever context window the model was loaded with — you cannot override per-request. To override, you'd need to use Ollama's native `/api/chat` endpoint with `options: {num_ctx: ...}`. Agent Wire Node's default provider path is OAI-compat; an alternate Ollama native provider exists for setups that need per-request context override but isn't the default.
 
 ---
 
@@ -81,7 +81,7 @@ Ollama also offers cloud-hosted models (e.g. `gpt-oss:120b-cloud`). Using these 
 - Sign in to ollama.com (via `ollama signin` in your terminal), OR
 - Set `OLLAMA_API_KEY` in your credentials file and configure it as the auth variable on your Ollama provider.
 
-Cloud models show a lock icon in the model list. Wire Node checks for credentials before offering to use them.
+Cloud models show a lock icon in the model list. Agent Wire Node checks for credentials before offering to use them.
 
 ---
 
@@ -118,7 +118,7 @@ Set up the provider and tier routing manually (without flipping the Enable Local
 
 **Slow inference** — check model size vs your RAM. If Ollama is swapping to disk, performance drops dramatically. Pull a smaller quantization (Q4 instead of Q8) or a smaller parameter count.
 
-**VRAM exhausted on GPU** — keep only one large model loaded at a time. Use Wire Node's Unload action after a big build to free the model.
+**VRAM exhausted on GPU** — keep only one large model loaded at a time. Use Agent Wire Node's Unload action after a big build to free the model.
 
 ---
 

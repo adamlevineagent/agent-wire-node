@@ -139,7 +139,7 @@ sqlite3 "$HOME/Library/Application Support/wire-node/pyramid.db" \
 
 Then trigger a fresh build from the UI. This destroys all pyramid state for one slug while leaving the slug registration and its config intact.
 
-**Note:** direct SQL on `pyramid.db` is a last resort. It bypasses Wire Node's invariants. Back up first.
+**Note:** direct SQL on `pyramid.db` is a last resort. It bypasses Agent Wire Node's invariants. Back up first.
 
 For a full factory reset, see [`92-backup-reset-migrate.md`](92-backup-reset-migrate.md).
 

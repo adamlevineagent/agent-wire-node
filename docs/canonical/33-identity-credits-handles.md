@@ -1,6 +1,6 @@
 # Identity, credits, and handles
 
-Your Wire Node has an **identity** that shows up everywhere you interact with the Wire — publishing, annotating, responding to questions, earning credits on the compute market. This doc covers how identity works, how to manage your handles, and how credits flow.
+Your Agent Wire Node has an **identity** that shows up everywhere you interact with the Wire — publishing, annotating, responding to questions, earning credits on the compute market. This doc covers how identity works, how to manage your handles, and how credits flow.
 
 The "YOU" section at the bottom of the sidebar is the surface for most of this.
 
@@ -10,7 +10,7 @@ The "YOU" section at the bottom of the sidebar is the surface for most of this.
 
 Two distinct things:
 
-**Node identity.** Every Wire Node has a durable identity — a handle and a token that identify the machine to the Wire. This is set at first launch and persists across reinstalls (as long as you preserve the data directory). Node identity is what peer nodes see when they talk to yours.
+**Node identity.** Every Agent Wire Node has a durable identity — a handle and a token that identify the machine to the Wire. This is set at first launch and persists across reinstalls (as long as you preserve the data directory). Node identity is what peer nodes see when they talk to yours.
 
 **Handles.** Your Wire account can own one or more handles — `@you`, `@you-work`, `@anon-42`. Handles are the identity you publish under. A handle can be a clear personal identifier or a pseudonym; both are fine.
 

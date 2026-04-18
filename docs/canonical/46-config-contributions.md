@@ -1,10 +1,10 @@
 # Config contributions
 
-Many of the numbers, policies, and thresholds that govern Wire Node's behavior are stored as **config contributions** — YAML configs with a schema type, rendered into UI widgets, editable through the YAML-to-UI renderer, versioned in the contribution store, and publishable to the Wire.
+Many of the numbers, policies, and thresholds that govern Agent Wire Node's behavior are stored as **config contributions** — YAML configs with a schema type, rendered into UI widgets, editable through the YAML-to-UI renderer, versioned in the contribution store, and publishable to the Wire.
 
 This is the layer where you change behavior without touching chains or prompts. If a chain's step takes `model_tier: extractor`, the policy that maps `extractor` to a concrete `(provider, model)` pair lives in a config contribution. If folder ingestion uses a minimum file count to decide pyramid-vs-loose-file, that count lives in a config contribution. If DADBEAR has a debounce minutes value, it's a config contribution.
 
-Config contributions are also how Wire Node avoids hardcoding numbers into code or prompts — any number that would otherwise live as a Rust constant lives here, where operators and agents can tune it.
+Config contributions are also how Agent Wire Node avoids hardcoding numbers into code or prompts — any number that would otherwise live as a Rust constant lives here, where operators and agents can tune it.
 
 ---
 
@@ -69,7 +69,7 @@ Beyond editing values, you can refine a config contribution by describing what y
 4. The LLM (via the schema's generation skill) reads the current YAML, your note, and the schema. It produces a refined YAML.
 5. You review the diff. Accept (creates a new superseding contribution) or reject (discard).
 
-This loop is the "generative config" pattern. Every behavioral configuration in Wire Node flows through it — intent in, YAML out, review, accept. New contributions are versioned and shareable.
+This loop is the "generative config" pattern. Every behavioral configuration in Agent Wire Node flows through it — intent in, YAML out, review, accept. New contributions are versioned and shareable.
 
 ---
 

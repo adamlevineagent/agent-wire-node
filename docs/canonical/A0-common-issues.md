@@ -8,13 +8,13 @@ For active known issues the team is tracking, see [`docs/PUNCHLIST.md`](../PUNCH
 
 ## Installation
 
-### "Wire Node cannot be opened because Apple could not verify it"
+### "Agent Wire Node cannot be opened because Apple could not verify it"
 
 Right-click the app in `/Applications`, choose **Open**, confirm. Bypasses Gatekeeper once. Future launches work normally.
 
-If that doesn't work: `sudo xattr -rd com.apple.quarantine "/Applications/Wire Node.app"`.
+If that doesn't work: `sudo xattr -rd com.apple.quarantine "/Applications/Agent Wire Node.app"`.
 
-### "Wire Node is damaged and can't be opened"
+### "Agent Wire Node is damaged and can't be opened"
 
 The `.dmg` downloaded truncated. Re-download. If the issue persists, quarantine-removal as above.
 
@@ -23,7 +23,7 @@ The `.dmg` downloaded truncated. Re-download. If the issue persists, quarantine-
 Backend crashed before the UI attached. Launch from terminal to see stderr:
 
 ```bash
-"/Applications/Wire Node.app/Contents/MacOS/Wire Node"
+"/Applications/Agent Wire Node.app/Contents/MacOS/Agent Wire Node"
 ```
 
 Common causes: port 8765 in use by another process (`lsof -i :8765`), corrupt data directory (rare — see [`92-backup-reset-migrate.md`](92-backup-reset-migrate.md)), missing dependencies (uncommon with the bundled build).
@@ -37,7 +37,7 @@ lsof -i :8765
 # shows the offending PID; kill it or use a different app that claimed it.
 ```
 
-Wire Node's port is currently hardcoded. Changing it requires a source build.
+Agent Wire Node's port is currently hardcoded. Changing it requires a source build.
 
 ---
 
@@ -47,7 +47,7 @@ Wire Node's port is currently hardcoded. Changing it requires a source build.
 
 Check spam. Wait 60s and try again. If repeated attempts fail, check the alpha channel for service outages.
 
-### Magic link opens browser but Wire Node doesn't launch
+### Magic link opens browser but Agent Wire Node doesn't launch
 
 Deep link handler didn't register. Usually self-heals on second launch. If not, paste the URL into the "Paste magic link" text box on the login screen.
 
@@ -57,7 +57,7 @@ Deep link handler didn't register. Usually self-heals on second launch. If not, 
 
 ### "Node not registered" after login
 
-Your login succeeded with Supabase but Wire Node couldn't register with the Wire coordinator. Check tunnel status (Settings). If the tunnel is offline, registration can't complete. Retry the tunnel; restart the app; if persistent, check the alpha channel.
+Your login succeeded with Supabase but Agent Wire Node couldn't register with the Wire coordinator. Check tunnel status (Settings). If the tunnel is offline, registration can't complete. Retry the tunnel; restart the app; if persistent, check the alpha channel.
 
 ---
 
@@ -65,7 +65,7 @@ Your login succeeded with Supabase but Wire Node couldn't register with the Wire
 
 ### "Credentials file has unsafe permissions"
 
-Wire Node refuses to read `.credentials` if its permissions are wider than 0600. Click **Fix permissions** in Settings → Credentials, or:
+Agent Wire Node refuses to read `.credentials` if its permissions are wider than 0600. Click **Fix permissions** in Settings → Credentials, or:
 
 ```bash
 chmod 0600 "$HOME/Library/Application Support/wire-node/.credentials"
@@ -129,7 +129,7 @@ See [`A2-provider-and-network-errors.md`](A2-provider-and-network-errors.md).
 
 ### Tunnel dropped
 
-Settings → Wire Node Settings → Tunnel Status → Retry. Usually self-heals. If persistent, check your network (Cloudflare blocks? VPN interference?).
+Settings → Agent Wire Node Settings → Tunnel Status → Retry. Usually self-heals. If persistent, check your network (Cloudflare blocks? VPN interference?).
 
 ### Compute market jobs not arriving
 
@@ -148,7 +148,7 @@ Large pyramids (tens of thousands of nodes) strain the visualization. Switch to 
 
 ### Notifications missing or stuck unread
 
-Quit and restart Wire Node. Transient UI state sometimes gets confused.
+Quit and restart Agent Wire Node. Transient UI state sometimes gets confused.
 
 ### Tool panel doesn't refresh after pulling a contribution
 

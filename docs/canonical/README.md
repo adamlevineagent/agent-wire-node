@@ -1,6 +1,6 @@
-# Wire Node — canonical documentation
+# Agent Wire Node — canonical documentation
 
-This directory is the authoritative user-facing documentation for Wire Node. Everything you need to understand the app, use it, customize it, connect it to the Wire, and troubleshoot it is here.
+This directory is the authoritative user-facing documentation for Agent Wire Node. Everything you need to understand the app, use it, customize it, connect it to the Wire, and troubleshoot it is here.
 
 These docs are the corpus the alpha tester's pyramid is built on — so when you (or an agent on your behalf) ask a question about how something works, the answer comes from this set. The docs describe the system **as shipped today**, with known issues and planned features explicitly marked.
 
@@ -8,7 +8,7 @@ These docs are the corpus the alpha tester's pyramid is built on — so when you
 
 ## Where to start
 
-New to Wire Node:
+New to Agent Wire Node:
 
 1. [`00-what-is-wire-node.md`](00-what-is-wire-node.md) — elevator pitch.
 2. [`01-concepts.md`](01-concepts.md) — vocabulary (pyramid, chain, DADBEAR, contribution, the Wire).

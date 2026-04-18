@@ -1,6 +1,6 @@
-# Installing Wire Node
+# Installing Agent Wire Node
 
-This doc covers getting Wire Node onto your machine, whether you got a pre-built `.dmg` from the alpha channel or you are building from source. It also covers what to expect from the installer, what gets put where on disk, and how to confirm the install worked.
+This doc covers getting Agent Wire Node onto your machine, whether you got a pre-built `.dmg` from the alpha channel or you are building from source. It also covers what to expect from the installer, what gets put where on disk, and how to confirm the install worked.
 
 **System requirements (alpha):**
 
@@ -15,21 +15,21 @@ Linux and Windows are **not** supported in the alpha. Support is on the roadmap 
 
 ## Installing from a pre-built `.dmg` (the common path)
 
-1. Obtain the `.dmg` from the alpha channel you were given access to. The filename looks like `Wire Node_0.3.0_aarch64.dmg` or `Wire Node_0.3.0_x64.dmg` — pick the one that matches your Mac's architecture. If you don't know, Apple Silicon Macs (M1 and later) want aarch64; older Macs want x64.
+1. Obtain the `.dmg` from the alpha channel you were given access to. The filename looks like `Agent Wire Node_0.3.0_aarch64.dmg` or `Agent Wire Node_0.3.0_x64.dmg` — pick the one that matches your Mac's architecture. If you don't know, Apple Silicon Macs (M1 and later) want aarch64; older Macs want x64.
 
-2. Double-click the `.dmg` to mount it. macOS opens a Finder window showing **Wire Node.app** and a shortcut to `/Applications`.
+2. Double-click the `.dmg` to mount it. macOS opens a Finder window showing **Agent Wire Node.app** and a shortcut to `/Applications`.
 
-3. Drag **Wire Node.app** onto the `/Applications` shortcut. Wait for the copy to complete.
+3. Drag **Agent Wire Node.app** onto the `/Applications` shortcut. Wait for the copy to complete.
 
 4. Eject the `.dmg` by dragging it to the trash in Dock (or right-click → Eject).
 
-5. Open `/Applications` in Finder. Right-click (or Control-click) **Wire Node** and choose **Open**. Use this right-click-Open path the first time — it tells macOS Gatekeeper that you intend to run this app. Plain double-click on a freshly-downloaded app may be blocked.
+5. Open `/Applications` in Finder. Right-click (or Control-click) **Agent Wire Node** and choose **Open**. Use this right-click-Open path the first time — it tells macOS Gatekeeper that you intend to run this app. Plain double-click on a freshly-downloaded app may be blocked.
 
-6. macOS will prompt: *"Wire Node is from an identified developer. Are you sure you want to open it?"* Click **Open**.
+6. macOS will prompt: *"Agent Wire Node is from an identified developer. Are you sure you want to open it?"* Click **Open**.
 
 7. The loading screen appears with a tunneling "W" logo. After a few seconds the login screen loads.
 
-If macOS refuses to let you run it with a message like *"Wire Node cannot be opened because it is from an unidentified developer"* or *"Apple could not verify Wire Node is free of malware"*, you are on a build with a different signing state than expected. See Troubleshooting below.
+If macOS refuses to let you run it with a message like *"Agent Wire Node cannot be opened because it is from an unidentified developer"* or *"Apple could not verify Agent Wire Node is free of malware"*, you are on a build with a different signing state than expected. See Troubleshooting below.
 
 ## Building from source
 
@@ -65,12 +65,12 @@ This runs the frontend via Vite dev server and the backend in debug mode. Window
 
 ## What gets put where
 
-Wire Node puts user data in one well-defined directory so you can back it up, move it between machines, or reset from scratch cleanly. Installing the app itself adds one `.app` bundle and nothing else outside user data.
+Agent Wire Node puts user data in one well-defined directory so you can back it up, move it between machines, or reset from scratch cleanly. Installing the app itself adds one `.app` bundle and nothing else outside user data.
 
 **The application:**
 
 ```
-/Applications/Wire Node.app
+/Applications/Agent Wire Node.app
 ```
 
 **Your data:**
@@ -110,14 +110,14 @@ If `/health` responds, the install is fine. Proceed to [`11-first-run-and-onboar
 
 ## Troubleshooting installation
 
-### "Wire Node cannot be opened because Apple could not verify it"
+### "Agent Wire Node cannot be opened because Apple could not verify it"
 
 The build you got is signed but not notarized, or notarization is still in progress. Two options:
 
 1. Right-click the app in `/Applications`, choose **Open**, then confirm in the dialog. This bypasses the check once; future launches are fine.
-2. From a terminal: `sudo xattr -rd com.apple.quarantine "/Applications/Wire Node.app"` then launch normally.
+2. From a terminal: `sudo xattr -rd com.apple.quarantine "/Applications/Agent Wire Node.app"` then launch normally.
 
-### "Wire Node is damaged and can't be opened"
+### "Agent Wire Node is damaged and can't be opened"
 
 The `.dmg` probably downloaded truncated. Re-download. If it persists, you may need to remove the quarantine flag as above.
 
@@ -126,25 +126,25 @@ The `.dmg` probably downloaded truncated. Re-download. If it persists, you may n
 Check `~/Library/Application Support/wire-node/wire-node.log`. If it's empty or missing, the backend crashed before it could log. Start the app from Terminal to see stderr:
 
 ```bash
-"/Applications/Wire Node.app/Contents/MacOS/Wire Node"
+"/Applications/Agent Wire Node.app/Contents/MacOS/Agent Wire Node"
 ```
 
 Common causes: another process is already bound to port 8765 (`lsof -i :8765` to find it), or the data directory is corrupt (rare; nuke and restart — see [`94-uninstall.md`](94-uninstall.md)).
 
 ### `/health` returns a connection error
 
-The HTTP server didn't bind. Same causes as above: port conflict, backend crash, or the app isn't actually running. Quit the app fully (menu bar → Quit Wire Node), check Activity Monitor for lingering `Wire Node` processes and kill them, then relaunch.
+The HTTP server didn't bind. Same causes as above: port conflict, backend crash, or the app isn't actually running. Quit the app fully (menu bar → Quit Agent Wire Node), check Activity Monitor for lingering `Agent Wire Node` processes and kill them, then relaunch.
 
 ### Port 8765 is already in use
 
-Wire Node currently hardcodes port 8765 for the HTTP server. If that port is taken by another app, Wire Node will fail to start. Identify and stop the other process:
+Agent Wire Node currently hardcodes port 8765 for the HTTP server. If that port is taken by another app, Agent Wire Node will fail to start. Identify and stop the other process:
 
 ```bash
 lsof -i :8765
 # Shows the process holding the port. Decide whether to stop it.
 ```
 
-Changing Wire Node's port is not exposed in the UI yet.
+Changing Agent Wire Node's port is not exposed in the UI yet.
 
 ### Clean reinstall
 
@@ -162,7 +162,7 @@ This wipes everything, including your node identity, your pyramids, and your cre
 
 ## Updating the app
 
-Wire Node has a built-in updater (DADBEAR for the app itself). When an update is available, you see a banner in **Settings → Wire Node Settings → Auto-Update**. You click **Install update** and the app downloads, verifies the signature, replaces itself, and restarts.
+Agent Wire Node has a built-in updater (DADBEAR for the app itself). When an update is available, you see a banner in **Settings → Agent Wire Node Settings → Auto-Update**. You click **Install update** and the app downloads, verifies the signature, replaces itself, and restarts.
 
 User data is preserved across updates; onboarding does not re-run.
 

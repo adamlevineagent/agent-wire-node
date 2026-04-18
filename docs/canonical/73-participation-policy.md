@@ -8,7 +8,7 @@ Three presets: **Coordinator**, **Hybrid**, **Worker**.
 
 ## Where to set it
 
-**Settings → Wire Node Settings → Compute Participation Policy.**
+**Settings → Agent Wire Node Settings → Compute Participation Policy.**
 
 Three preset buttons, each with a one-line description. Pick one and the eight underlying toggles snap to the matching values. Click **Advanced** to expose the individual toggles if you want finer control.
 
@@ -118,7 +118,7 @@ The coordinator's order book reflects the new state within seconds. No restart r
 
 ## Policy history
 
-All policy changes are versioned. The current policy is a contribution in your store; editing creates a new superseding version. You can see the history in Settings → Wire Node Settings → Config History.
+All policy changes are versioned. The current policy is a contribution in your store; editing creates a new superseding version. You can see the history in Settings → Agent Wire Node Settings → Config History.
 
 "Go back to yesterday's policy" is one click — select a prior version and apply. This becomes useful once the steward experimentation vision ships (see [`05-steward-experimentation-vision.md`](05-steward-experimentation-vision.md)) — autonomous policy tuning needs clean rollback.
 

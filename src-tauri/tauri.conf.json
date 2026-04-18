@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicegui/nicegui/main/.schemas/tauri-conf.schema.json",
-  "productName": "Wire Node",
+  "productName": "Agent Wire Node",
   "version": "0.3.0",
   "identifier": "com.agentwire.node",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Wire Node",
+        "title": "Agent Wire Node",
         "width": 1200,
         "height": 800,
         "resizable": true,
@@ -23,7 +23,7 @@
     "trayIcon": {
       "iconPath": "icons/icon.png",
       "iconAsTemplate": true,
-      "tooltip": "Wire Node"
+      "tooltip": "Agent Wire Node"
     },
     "security": {
       "csp": "default-src 'self'; connect-src 'self' https://openrouter.ai https://newsbleach.com https://supabase.newsbleach.com http://localhost:* https://localhost:*; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com"

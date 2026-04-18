@@ -77,7 +77,7 @@ You pull contributions, query paid pyramids, dispatch to the market. You don't s
 - Outflow: moderate (cost of your inference and pulled contributions).
 - Net: negative balance unless you buy credits.
 
-Common for users who just want to use Wire Node for their own pyramids and don't care about market participation.
+Common for users who just want to use Agent Wire Node for their own pyramids and don't care about market participation.
 
 ### Hybrid operator
 

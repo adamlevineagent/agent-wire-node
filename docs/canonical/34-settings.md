@@ -13,13 +13,13 @@ The top panel is a shortcut for the most common first-run task: getting an OpenR
 - **Configuration Status** — shows at a glance: OpenRouter API key (set / unset), auth token (set / unset), primary model.
 - **Primary Model** — the default model for tier routes that don't specify one. Input field + a link to openrouter.ai/models.
 - **Test API Key** — sends a test prompt to OpenRouter via your key; shows token counts and cost on success, or the specific error.
-- **Auto-Execute toggle** — whether Wire Node automatically runs pyramid builds triggered by external events (absorption, DADBEAR, etc.). Off means builds need manual confirmation.
+- **Auto-Execute toggle** — whether Agent Wire Node automatically runs pyramid builds triggered by external events (absorption, DADBEAR, etc.). Off means builds need manual confirmation.
 
 For anything beyond the basic OpenRouter key, use the panels below.
 
 ---
 
-## Wire Node Settings
+## Agent Wire Node Settings
 
 The main Settings body, several sub-sections.
 
@@ -27,7 +27,7 @@ The main Settings body, several sub-sections.
 
 - **Node name** — the human-readable name for your node. Shown in fleet, chronicle, tray tooltip. Change anytime.
 - **Node ID** (read-only) — your durable identity. Don't change; if you want a fresh identity, nuke the data directory.
-- **Storage cap (GB)** — slider, 1-1000. How much disk Wire Node can use for cached documents and mesh hosting. Does not limit your own pyramid data.
+- **Storage cap (GB)** — slider, 1-1000. How much disk Agent Wire Node can use for cached documents and mesh hosting. Does not limit your own pyramid data.
 - **Mesh hosting toggle** — whether your node hosts documents from published corpora for the Wire.
 
 ### Health Status
@@ -39,7 +39,7 @@ If any check is failing, this panel tells you what and suggests remediation.
 
 ### Auto-Update (for the app itself)
 
-- **Enable toggle** — auto-update the Wire Node binary when updates are available.
+- **Enable toggle** — auto-update the Agent Wire Node binary when updates are available.
 - **Update available** banner — appears when an update is ready. Shows version, release notes link.
 - **Install update** button — downloads, verifies signature, installs, restarts.
 

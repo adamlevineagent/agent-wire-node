@@ -1,8 +1,8 @@
 # Tools (contributions you author)
 
-The **Tools** mode is where you author, manage, and publish **contributions** — the reusable units that shape how Wire Node works. Chains, skills, templates, question sets, and other configs all live here.
+The **Tools** mode is where you author, manage, and publish **contributions** — the reusable units that shape how Agent Wire Node works. Chains, skills, templates, question sets, and other configs all live here.
 
-If Understanding is about the pyramids you build and Knowledge is about the documents you work with, Tools is about the machinery you use to build them. Changing the machinery is how you make Wire Node do what the defaults don't.
+If Understanding is about the pyramids you build and Knowledge is about the documents you work with, Tools is about the machinery you use to build them. Changing the machinery is how you make Agent Wire Node do what the defaults don't.
 
 ---
 
@@ -99,7 +99,7 @@ You can always publish later from the My Tools tab if you save locally first.
 
 The wizard is the friendly path. You can also author contributions directly by editing YAML files.
 
-Chains and prompts live under `chains/` in the Wire Node data directory. The shipped defaults are in `chains/defaults/` (don't modify those — they're tracked as bundled contributions). Your variants go in `chains/variants/`.
+Chains and prompts live under `chains/` in the Agent Wire Node data directory. The shipped defaults are in `chains/defaults/` (don't modify those — they're tracked as bundled contributions). Your variants go in `chains/variants/`.
 
 ```
 ~/Library/Application Support/wire-node/chains/

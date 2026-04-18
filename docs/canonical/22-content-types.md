@@ -100,7 +100,7 @@ Use `conversation` for JSONL files of structured chat transcripts — Claude Cod
 
 **Tips:**
 
-- For Claude Code logs, use the preset for CC directly — Wire Node knows the JSONL shape and auto-discovers the right directories.
+- For Claude Code logs, use the preset for CC directly — Agent Wire Node knows the JSONL shape and auto-discovers the right directories.
 - Conversations benefit disproportionately from DADBEAR running over time, because new conversations can extend existing threads or supersede existing decisions.
 
 ## Vine

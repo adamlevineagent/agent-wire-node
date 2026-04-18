@@ -1,6 +1,6 @@
 # Model routing (the AI Registry)
 
-Wire Node does not hardcode which LLM to call for each step. Each chain step declares a **model tier** (a string like `extractor`, `synth_heavy`, `stale_local`, `web`, `mid`). A **tier routing table** maps each tier to a specific `(provider, model)` pair. A **provider registry** describes how to reach each provider.
+Agent Wire Node does not hardcode which LLM to call for each step. Each chain step declares a **model tier** (a string like `extractor`, `synth_heavy`, `stale_local`, `web`, `mid`). A **tier routing table** maps each tier to a specific `(provider, model)` pair. A **provider registry** describes how to reach each provider.
 
 This three-level indirection — step → tier → provider+model — is the **AI Registry**. Changing which model runs a step means editing tier routing, not the chain.
 
@@ -129,8 +129,8 @@ The executor walks the chain on failure. Credential-aware — a fallback entry i
 If you set up Ollama locally, there's a shortcut in **Settings → Local Mode**:
 
 - Toggle **Enable local mode**.
-- Wire Node probes your Ollama, lists installed models.
-- Pick a model; Wire Node writes it to every tier in the routing table.
+- Agent Wire Node probes your Ollama, lists installed models.
+- Pick a model; Agent Wire Node writes it to every tier in the routing table.
 - Concurrency is set to 1 (home hardware constraint) and tier routing is swapped over atomically.
 
 Toggling off restores the previous tier routing (stored before activation).
@@ -149,7 +149,7 @@ OpenRouter returns `usage.cost` synchronously in the response body — reconcile
 
 ## Dynamic defaults from the models endpoint (planned)
 
-A planned enhancement: on first-run provider setup or on user-triggered refresh, Wire Node queries OpenRouter's `/api/v1/models` endpoint and seeds tier defaults by ranking models on (context length, price, capability). This avoids hardcoded defaults that decay — the rankings are computed fresh against the current market.
+A planned enhancement: on first-run provider setup or on user-triggered refresh, Agent Wire Node queries OpenRouter's `/api/v1/models` endpoint and seeds tier defaults by ranking models on (context length, price, capability). This avoids hardcoded defaults that decay — the rankings are computed fresh against the current market.
 
 **Status:** the ranking logic is designed (see `docs/specs/provider-registry.md` §Dynamic Default Model Selection). Not yet wired through the shipped first-run path. For now, tier defaults are seeded from `pyramid_config.json` and adjusted by user edits.
 

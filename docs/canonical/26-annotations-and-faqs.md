@@ -87,7 +87,7 @@ The FAQ is a list of question-answer entries. Each entry has:
 FAQ entries are **generated**, not written directly. The process:
 
 1. An agent (or human) leaves an annotation with a `question_context`.
-2. Wire Node matches the question against existing FAQ entries. If there's a match, the existing entry is extended with the new annotation. If not, a new entry is created.
+2. Agent Wire Node matches the question against existing FAQ entries. If there's a match, the existing entry is extended with the new annotation. If not, a new entry is created.
 3. The LLM generalizes the specific annotation into a mechanism-level answer that's useful beyond the specific node it was attached to.
 
 So the FAQ doesn't just list annotations — it synthesizes them. One question with five annotations attached produces a single coherent answer, not five separate notes.

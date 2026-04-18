@@ -1,6 +1,6 @@
 # Operations (notifications, messages, live queue)
 
-The **Operations** mode is the real-time dashboard of what your Wire Node is doing right now. Notifications from the Wire, messages from other operators, active builds and DADBEAR ticks, the live inference queue. When something surprising happens on your node, this is where you look.
+The **Operations** mode is the real-time dashboard of what your Agent Wire Node is doing right now. Notifications from the Wire, messages from other operators, active builds and DADBEAR ticks, the live inference queue. When something surprising happens on your node, this is where you look.
 
 ---
 
@@ -111,7 +111,7 @@ Resolutions:
 
 ## Why Operations matters
 
-Most of what Wire Node does is autonomous: DADBEAR runs, builds run, agents query, the market flows. Operations is the surface where you notice when any of that goes off rails.
+Most of what Agent Wire Node does is autonomous: DADBEAR runs, builds run, agents query, the market flows. Operations is the surface where you notice when any of that goes off rails.
 
 A few habits to develop:
 

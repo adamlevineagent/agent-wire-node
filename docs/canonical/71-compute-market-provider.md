@@ -1,6 +1,6 @@
 # Compute market — provider side
 
-This doc covers opting your node in as a **compute market provider** — publishing offers to serve inference for other Wire Node operators and earning credits per job completed.
+This doc covers opting your node in as a **compute market provider** — publishing offers to serve inference for other Agent Wire Node operators and earning credits per job completed.
 
 **Status: shipped (Phase 2).** The provider side works. You can opt in, publish offers, serve jobs, earn credits today.
 
@@ -8,7 +8,7 @@ This doc covers opting your node in as a **compute market provider** — publish
 
 ## Prerequisites
 
-- Wire Node is running and registered (tunnel online).
+- Agent Wire Node is running and registered (tunnel online).
 - You have at least one model ready to serve — typically via local Ollama (see [`51-local-mode-ollama.md`](51-local-mode-ollama.md)).
 - Your compute participation policy allows serving (not Coordinator-only mode).
 
@@ -20,7 +20,7 @@ This doc covers opting your node in as a **compute market provider** — publish
 
 1. Open **Market** mode.
 2. Compute tab → the network status hero card. If it says "Marketplace disabled," click **Enable**.
-3. Wire Node registers your offers with the coordinator (default offers are seeded from your installed Ollama models).
+3. Agent Wire Node registers your offers with the coordinator (default offers are seeded from your installed Ollama models).
 4. The hero card now says "Idle, helping the network" (when nothing's running) or "Active, serving jobs" (when jobs are in flight).
 
 That's it. Default offers are conservative (low concurrency, moderate pricing). Tune from the Advanced drawer if you want more control.
@@ -61,7 +61,7 @@ Start conservative. You can always raise rates once you've got usage history. Dr
 ## What happens when a job arrives
 
 1. Coordinator push-delivers the job to your node (HTTP POST with the request payload and a settlement envelope).
-2. Your Wire Node validates the job against your active offer and acceptance rules.
+2. Your Agent Wire Node validates the job against your active offer and acceptance rules.
 3. If valid, the job enters your compute queue for the specific model — same FIFO queue your local builds use. This is important: **market jobs don't jump ahead of your own work.**
 4. When the queue worker pulls the job, it calls Ollama (or whichever provider the model is routed to).
 5. The result is sent back through the Wire's response path.

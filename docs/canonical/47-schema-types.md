@@ -1,6 +1,6 @@
 # Schema types
 
-A **schema type** is a registered category of configurable data. Every config contribution in Wire Node has a `schema_type` that identifies what kind of thing it is — `tier_routing`, `dadbear_policy`, `folder_ingestion_heuristics`, and so on.
+A **schema type** is a registered category of configurable data. Every config contribution in Agent Wire Node has a `schema_type` that identifies what kind of thing it is — `tier_routing`, `dadbear_policy`, `folder_ingestion_heuristics`, and so on.
 
 Most operators never author a new schema type; the shipped set covers the common cases. This doc is for the rarer situation where you genuinely need a new category of configurable data that the existing schemas can't express.
 
@@ -132,7 +132,7 @@ These four — schema, annotation, generation skill, default seed — are all co
 
 ## The shipped schema types (non-exhaustive)
 
-These are the current shipped schema types in Wire Node. The set grows over time:
+These are the current shipped schema types in Agent Wire Node. The set grows over time:
 
 - `tier_routing` — tier-to-model mapping.
 - `provider` — LLM provider definition (one per provider).

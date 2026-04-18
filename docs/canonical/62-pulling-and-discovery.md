@@ -48,7 +48,7 @@ Step by step:
    - Cost checked against your balance (if priced).
    - Supersession chain shown (if you have an older version, what this replaces).
 
-3. **Confirm.** Wire Node:
+3. **Confirm.** Agent Wire Node:
 
    - Pays any pull cost (rotator-arm split flows automatically).
    - Writes the contribution to your local store.
@@ -74,7 +74,7 @@ The preview is the same as the real pull's first-few-steps, minus the install. Y
 
 ## Updates to pulled contributions
 
-When the author publishes a new version of something you've pulled, Wire Node notices via the broadcast channel. You see:
+When the author publishes a new version of something you've pulled, Agent Wire Node notices via the broadcast channel. You see:
 
 - A **notification** in Operations.
 - An **update available** badge on the contribution card in Tools.

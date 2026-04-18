@@ -1,6 +1,6 @@
 # Glossary
 
-Every Wire Node term that comes up in the docs, defined in one place. Cross-references tell you where to go for depth.
+Every Agent Wire Node term that comes up in the docs, defined in one place. Cross-references tell you where to go for depth.
 
 ---
 
@@ -182,7 +182,7 @@ Every Wire Node term that comes up in the docs, defined in one place. Cross-refe
 
 **Offer** — a provider's commitment to serve a specific model at a specific rate on the compute market. [`71-compute-market-provider.md`](71-compute-market-provider.md)
 
-**Ollama** — local LLM runtime. Wire Node integrates via OpenAI-compat or native endpoints. [`51-local-mode-ollama.md`](51-local-mode-ollama.md)
+**Ollama** — local LLM runtime. Agent Wire Node integrates via OpenAI-compat or native endpoints. [`51-local-mode-ollama.md`](51-local-mode-ollama.md)
 
 **OpenRouter** — LLM aggregator. The default provider type. [`52-provider-registry.md`](52-provider-registry.md)
 
@@ -296,11 +296,11 @@ Every Wire Node term that comes up in the docs, defined in one place. Cross-refe
 
 **`web` (primitive)** — produces lateral edges between sibling nodes.
 
-**Wire** — the network protocol and ecosystem Wire Node participates in. [`04-the-wire-and-decentralization.md`](04-the-wire-and-decentralization.md)
+**Wire** — the network protocol and ecosystem Agent Wire Node participates in. [`04-the-wire-and-decentralization.md`](04-the-wire-and-decentralization.md)
 
 **Wire Native Document** — typed contribution on the Wire (chain, skill, pyramid, question contract, annotation, etc.).
 
-**Wire Node** — this app.
+**Agent Wire Node** — this app.
 
 **Worker (policy mode)** — serve-only; no market dispatch. For dedicated compute nodes.
 

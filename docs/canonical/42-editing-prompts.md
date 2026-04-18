@@ -229,7 +229,7 @@ This iterate loop is where most prompt-level improvement happens.
 
 ## The cache and prompts
 
-Wire Node caches LLM calls by a hash of `(prompt_content + resolved_inputs + model_id)`. Editing a prompt changes the hash — the next invocation misses the cache and calls the model freshly. Reverting the prompt brings the old cache entries back in reach.
+Agent Wire Node caches LLM calls by a hash of `(prompt_content + resolved_inputs + model_id)`. Editing a prompt changes the hash — the next invocation misses the cache and calls the model freshly. Reverting the prompt brings the old cache entries back in reach.
 
 Practically, this means prompt edits are cheap: you don't lose accumulated work when you change a prompt. You just start accumulating new cache entries for the new version.
 

@@ -7,7 +7,7 @@ One-page cheat sheet of the most-used commands, shortcuts, paths, and mental mod
 ## Paths
 
 ```
-/Applications/Wire Node.app                                 — the app
+/Applications/Agent Wire Node.app                                 — the app
 ~/Library/Application Support/wire-node/                    — all data
   ├── pyramid.db                                            — SQLite
   ├── .credentials                                          — API keys (0600)
@@ -28,16 +28,16 @@ One-page cheat sheet of the most-used commands, shortcuts, paths, and mental mod
 
 ```bash
 # Normal
-open -a "Wire Node"
+open -a "Agent Wire Node"
 
 # From terminal (captures stderr)
-"/Applications/Wire Node.app/Contents/MacOS/Wire Node"
+"/Applications/Agent Wire Node.app/Contents/MacOS/Agent Wire Node"
 
 # With verbose logging
-RUST_LOG=debug "/Applications/Wire Node.app/Contents/MacOS/Wire Node"
+RUST_LOG=debug "/Applications/Agent Wire Node.app/Contents/MacOS/Agent Wire Node"
 
 # Quit
-pkill -x "Wire Node"
+pkill -x "Agent Wire Node"
 ```
 
 ---
@@ -74,7 +74,7 @@ YOU
 alias pcl='node "/Users/adamlevine/AI Project Files/agent-wire-node/mcp-server/dist/cli.js"'
 
 # core
-pcl health                                       # is Wire Node up?
+pcl health                                       # is Agent Wire Node up?
 pcl slugs                                        # list pyramids
 
 # explore
@@ -153,8 +153,8 @@ pcl help --category <cat>                        # categories: core,
 ## Settings checklist for a new install
 
 1. **Settings → Credentials** — add `OPENROUTER_KEY`.
-2. **Settings → Wire Node Settings → Node name** — make it meaningful.
-3. **Settings → Wire Node Settings → Storage cap** — set appropriately.
+2. **Settings → Agent Wire Node Settings → Node name** — make it meaningful.
+3. **Settings → Agent Wire Node Settings → Storage cap** — set appropriately.
 4. **Settings → Providers → Test** — verify OpenRouter.
 5. **Settings → Tier Routing** — glance at defaults.
 6. **Settings → Local Mode** — set up Ollama if relevant (note: known wiring issue in full Ollama mode).
@@ -243,7 +243,7 @@ curl -s "${HDRS[@]}" -X POST http://localhost:8765/pyramid/my-pyramid/annotation
 
 ```bash
 # Quit
-pkill -x "Wire Node"
+pkill -x "Agent Wire Node"
 
 # Reset one pyramid (removes its data, keeps everything else)
 sqlite3 "$HOME/Library/Application Support/wire-node/pyramid.db" \
@@ -260,7 +260,7 @@ rm -rf "$HOME/Library/Application Support/wire-node/builds"
 rm -rf "$HOME/Library/Application Support/wire-node"
 
 # Then relaunch
-open -a "Wire Node"
+open -a "Agent Wire Node"
 ```
 
 ---
