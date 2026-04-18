@@ -15,30 +15,31 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
-interface MarketSurfaceProvider {
-    node_id?: string;
-    provider_type?: string;
-    rate_per_m_input?: number;
-    rate_per_m_output?: number;
-    reservation_fee?: number;
-    queue_depth?: number;
-    max_queue_depth?: number;
-    median_tps?: number;
-    p95_latency_ms?: number;
-    observation_count?: number;
+interface PriceRange {
+    min?: number;
+    median?: number;
+    max?: number;
 }
 
 interface MarketSurfaceModel {
     model_id: string;
-    providers?: MarketSurfaceProvider[];
-    min_rate_input?: number;
-    max_rate_input?: number;
-    min_rate_output?: number;
-    max_rate_output?: number;
-    total_queue_depth?: number;
-    provider_count?: number;
-    median_tps?: number;
-    p95_latency_ms?: number;
+    // Wire contract rev 1.5 shape.
+    active_offers?: number;
+    providers?: number;  // count, not array — matches Wire /market-surface
+    price?: {
+        rate_per_m_input?: PriceRange;
+        rate_per_m_output?: PriceRange;
+    };
+    queue?: {
+        total_capacity?: number;
+        current_depth?: number;
+        unbounded_offers?: number;
+    };
+    performance?: {
+        p50_latency_ms?: number | null;
+        p95_latency_ms?: number | null;
+        median_tps?: number | null;
+    };
 }
 
 interface MarketSurface {
@@ -171,25 +172,44 @@ function sortModels(models: MarketSurfaceModel[], field: SortField): MarketSurfa
     const copy = [...models];
     switch (field) {
         case "price":
-            copy.sort(
-                (a, b) => (a.min_rate_output ?? Infinity) - (b.min_rate_output ?? Infinity),
-            );
+            copy.sort((a, b) => {
+                const aOut = a.price?.rate_per_m_output?.min ?? Infinity;
+                const bOut = b.price?.rate_per_m_output?.min ?? Infinity;
+                return aOut - bOut;
+            });
             break;
         case "queue":
-            copy.sort(
-                (a, b) => (a.total_queue_depth ?? Infinity) - (b.total_queue_depth ?? Infinity),
-            );
+            copy.sort((a, b) => {
+                const aQ = a.queue?.current_depth ?? Infinity;
+                const bQ = b.queue?.current_depth ?? Infinity;
+                return aQ - bQ;
+            });
             break;
         case "speed":
-            copy.sort((a, b) => (b.median_tps ?? 0) - (a.median_tps ?? 0));
+            copy.sort((a, b) => {
+                const aT = a.performance?.median_tps ?? 0;
+                const bT = b.performance?.median_tps ?? 0;
+                return bT - aT;
+            });
             break;
     }
     return copy;
 }
 
 function ModelCard({ model }: { model: MarketSurfaceModel }) {
-    const [expanded, setExpanded] = useState(false);
-    const providerCount = model.provider_count ?? model.providers?.length ?? 0;
+    // Wire's public /market-surface returns `providers` as a COUNT, not
+    // an array. `active_offers` is also a count (multiple offers per
+    // provider is possible but we surface providers as the headline).
+    const providerCount = model.providers ?? 0;
+    const activeOffers = model.active_offers ?? 0;
+
+    const priceIn = model.price?.rate_per_m_input;
+    const priceOut = model.price?.rate_per_m_output;
+    const tps = model.performance?.median_tps;
+    const p95 = model.performance?.p95_latency_ms;
+    const p50 = model.performance?.p50_latency_ms;
+    const currentDepth = model.queue?.current_depth;
+    const totalCapacity = model.queue?.total_capacity;
 
     return (
         <div className="compute-surface-card">
@@ -199,109 +219,58 @@ function ModelCard({ model }: { model: MarketSurfaceModel }) {
                     <span>
                         {providerCount} provider{providerCount === 1 ? "" : "s"}
                     </span>
-                    {model.median_tps != null && (
-                        <span>{formatNumber(model.median_tps, 0)} tok/s median</span>
+                    {activeOffers > 0 && activeOffers !== providerCount && (
+                        <span>
+                            {activeOffers} offer{activeOffers === 1 ? "" : "s"}
+                        </span>
                     )}
-                    {model.p95_latency_ms != null && (
-                        <span>{formatLatency(model.p95_latency_ms)} p95</span>
+                    {tps != null && (
+                        <span>{formatNumber(tps, 0)} tok/s median</span>
+                    )}
+                    {p95 != null && (
+                        <span>{formatLatency(p95)} p95</span>
                     )}
                 </div>
             </div>
 
             <dl className="compute-surface-card-stats">
-                {model.min_rate_input != null && model.max_rate_input != null && (
+                {priceIn && priceIn.min != null && priceIn.max != null && (
                     <div className="compute-surface-card-stat">
                         <dt>Input</dt>
                         <dd className="compute-mono">
-                            {formatRange(model.min_rate_input, model.max_rate_input)}
+                            {formatRange(priceIn.min, priceIn.max)}
                         </dd>
                     </div>
                 )}
-                {model.min_rate_output != null && model.max_rate_output != null && (
+                {priceOut && priceOut.min != null && priceOut.max != null && (
                     <div className="compute-surface-card-stat">
                         <dt>Output</dt>
                         <dd className="compute-mono">
-                            {formatRange(model.min_rate_output, model.max_rate_output)}
+                            {formatRange(priceOut.min, priceOut.max)}
                         </dd>
                     </div>
                 )}
-                {model.total_queue_depth != null && (
+                {currentDepth != null && totalCapacity != null && (
                     <div className="compute-surface-card-stat">
-                        <dt>Total queue</dt>
-                        <dd className="compute-mono">{model.total_queue_depth}</dd>
+                        <dt>Queue</dt>
+                        <dd className="compute-mono">
+                            {currentDepth}/{totalCapacity}
+                        </dd>
+                    </div>
+                )}
+                {p50 != null && (
+                    <div className="compute-surface-card-stat">
+                        <dt>p50 latency</dt>
+                        <dd className="compute-mono">{formatLatency(p50)}</dd>
                     </div>
                 )}
             </dl>
 
-            {(model.providers?.length ?? 0) > 0 && (
-                <>
-                    <button
-                        className="compute-ghost-btn compute-ghost-btn-sm compute-surface-card-toggle"
-                        onClick={() => setExpanded((x) => !x)}
-                    >
-                        {expanded ? "Hide" : "Show"} per-provider pricing
-                    </button>
-                    {expanded && model.providers && (
-                        <div className="compute-surface-provider-table">
-                            <div className="compute-surface-provider-row compute-surface-provider-head">
-                                <div>Node</div>
-                                <div>Type</div>
-                                <div className="compute-col-num">Input / M</div>
-                                <div className="compute-col-num">Output / M</div>
-                                <div className="compute-col-num">Queue</div>
-                                <div className="compute-col-num">TPS</div>
-                                <div className="compute-col-num">p95</div>
-                                <div className="compute-col-num">Obs</div>
-                            </div>
-                            {model.providers.map((p, idx) => (
-                                <div
-                                    className="compute-surface-provider-row"
-                                    key={`${p.node_id ?? ""}-${idx}`}
-                                >
-                                    <div className="compute-surface-provider-node" title={p.node_id}>
-                                        {shortNode(p.node_id)}
-                                    </div>
-                                    <div>{p.provider_type ?? "?"}</div>
-                                    <div className="compute-col-num compute-mono">
-                                        {p.rate_per_m_input ?? "—"}
-                                    </div>
-                                    <div className="compute-col-num compute-mono">
-                                        {p.rate_per_m_output ?? "—"}
-                                    </div>
-                                    <div className="compute-col-num compute-mono">
-                                        {p.queue_depth ?? "—"}
-                                        {p.max_queue_depth != null && (
-                                            <span className="compute-surface-provider-cap">
-                                                /{p.max_queue_depth}
-                                            </span>
-                                        )}
-                                    </div>
-                                    <div className="compute-col-num compute-mono">
-                                        {formatNumber(p.median_tps, 0)}
-                                    </div>
-                                    <div className="compute-col-num compute-mono">
-                                        {formatLatency(p.p95_latency_ms)}
-                                    </div>
-                                    <div
-                                        className="compute-col-num compute-mono"
-                                        title="observation count (confidence)"
-                                    >
-                                        {p.observation_count ?? 0}
-                                    </div>
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                </>
-            )}
+            {/* Per-provider detail is only available on the authed
+                /market-surface/detailed endpoint. The public aggregate
+                surface (this component) exposes counts + ranges only. */}
         </div>
     );
-}
-
-function shortNode(node_id: string | undefined): string {
-    if (!node_id) return "?";
-    if (node_id.length <= 12) return node_id;
-    return `${node_id.slice(0, 6)}…${node_id.slice(-4)}`;
 }
 
 function formatNumber(n: number | null | undefined, decimals: number): string {
