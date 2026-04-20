@@ -60,6 +60,22 @@ use crate::pyramid::tunnel_url::TunnelUrl;
 /// hasn't been upgraded to recognize) surfaces as a visible 400
 /// instead of being silently dropped. Matches the `MarketDeliveryPolicy`
 /// pattern — strict-on-read for everything contribution-shaped.
+/// Bearer-token envelope Wire uses for the callback auth. Echoed
+/// verbatim by the provider in its `Authorization: Bearer <token>`
+/// header when POSTing the result envelope — the provider does not
+/// interpret `kind`, just carries the opaque `token`.
+///
+/// Per contract §2.1 rev 1.5 — `callback_auth: {"type": "bearer",
+/// "token": "<opaque>"}`. The `type` JSON key is renamed from the
+/// Rust-reserved `type` to `kind` via serde rename.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CallbackAuth {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub token: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MarketDispatchRequest {
@@ -71,7 +87,23 @@ pub struct MarketDispatchRequest {
 
     /// Requested model id. Resolved by the provider's local runtime
     /// (Ollama / bridge) — the Wire does not require a specific backend.
-    pub model: String,
+    /// Renamed from `model` to `model_id` in contract rev 1.5 — the
+    /// dispatch body field name matches `/match` response + `/offers`
+    /// creation, so the whole dispatch chain uses one canonical key.
+    pub model_id: String,
+
+    /// Wire-side offer identifier (handle-path, e.g.
+    /// `behem/106/1`). Used for chronicle correlation + stale-offer
+    /// cleanup when the provider rejects dispatch with
+    /// `no_offer_for_model`. Added in contract rev 1.5.
+    pub offer_id: String,
+
+    /// Queue-discount multiplier applied at match time (in basis
+    /// points; 10000 = 1.0×). Authoritative for settlement — the
+    /// provider MUST use this value, not recompute from its own
+    /// offer curve, since the Wire quoted this rate to the requester
+    /// at match time. Added in contract rev 1.5.
+    pub matched_multiplier_bps: i32,
 
     /// ChatML array: `[{role: "system"|"user", content: "..."}, ...]`.
     /// Converted to the two-string `(system_prompt, user_prompt)` pair
@@ -85,9 +117,6 @@ pub struct MarketDispatchRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<usize>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response_format: Option<serde_json::Value>,
-
     /// Where the provider POSTs the `MarketAsyncResultEnvelope` when
     /// the job completes. Under the SOTA privacy model:
     ///   - Bootstrap mode (network launch): Wire relay endpoint
@@ -95,24 +124,29 @@ pub struct MarketDispatchRequest {
     ///   - Post-relay-market, 0 relays: requester's tunnel URL.
     ///   - Post-relay-market, N relays: first relay hop.
     /// Validated by `fleet::validate_callback_url(kind=MarketStandard)`
-    /// or `(kind=Relay)` — structural https+host only; the JWT on
-    /// the POST is the actual auth.
+    /// or `(kind=Relay)` — structural https+host only; the
+    /// `callback_auth` token below is the actual auth on the POST.
     pub callback_url: TunnelUrl,
 
-    /// Credit rate negotiated at match time (input side), per million
-    /// tokens. Stored on the outbox row for settlement; the provider
-    /// does not consult it for its own gating (Wire-side quoting is
-    /// authoritative).
-    pub credit_rate_in_per_m: i64,
+    /// Bearer-token envelope the provider echoes in its result POST.
+    /// Added in contract rev 1.5 — pre-rev-1.5 Wire relied on the
+    /// original `wire_job_token` JWT for the callback round-trip;
+    /// rev 1.5 issues a separate opaque token so the callback auth
+    /// is narrowly scoped to one result POST. Provider treats `kind`
+    /// + `token` as opaque and echoes `token` verbatim.
+    pub callback_auth: CallbackAuth,
 
-    /// Credit rate negotiated at match time (output side), per million
-    /// tokens. Same role as `credit_rate_in_per_m`.
-    pub credit_rate_out_per_m: i64,
-
-    /// Privacy tier string — currently `"standard"` or `"cloud_relay"`;
-    /// future tiers as relay market grows. Carried through the
-    /// dispatch → settlement chain for observability.
+    /// Privacy tier string — currently `"standard"`, `"direct"`, or
+    /// `"bootstrap-relay"`. Warn-don't-reject on unknown values per
+    /// contract Q-PROTO-3. Carried through the dispatch → settlement
+    /// chain for observability.
     pub privacy_tier: String,
+
+    /// ACK-handshake timeout in milliseconds (NOT inference timeout).
+    /// Wire enforces on its side of the fetch; the provider reads it
+    /// for observability + outbox row timing. Default 5000ms. Added
+    /// in contract rev 1.5.
+    pub timeout_ms: u64,
 
     /// Forward-compat escape hatch. Wire adds new observability fields
     /// (e.g. `trace_id`) under `extensions.*` without forcing a
@@ -124,10 +158,6 @@ pub struct MarketDispatchRequest {
     /// TOP level still surface as 400. This field is the bounded
     /// escape valve: unknown fields must live under `extensions`, not
     /// at the root.
-    ///
-    /// Phase 2 Wire sends `{}` here. Wire pings the node-side owner
-    /// 48h ahead before shipping the first extension key so any
-    /// node-side consumer lands first.
     #[serde(default)]
     pub extensions: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -389,31 +419,80 @@ mod tests {
     fn market_dispatch_request_roundtrips_minimal() {
         let req = MarketDispatchRequest {
             job_id: "job-abc".into(),
-            model: "gemma3:27b".into(),
+            model_id: "gemma3:27b".into(),
+            offer_id: "playful/106/1".into(),
+            matched_multiplier_bps: 10000,
             messages: serde_json::json!([{"role": "user", "content": "hi"}]),
             temperature: None,
             max_tokens: None,
-            response_format: None,
             callback_url: TunnelUrl::parse("https://wire.example.com/v1/compute/result-relay")
                 .unwrap(),
-            credit_rate_in_per_m: 100,
-            credit_rate_out_per_m: 500,
+            callback_auth: CallbackAuth {
+                kind: "bearer".into(),
+                token: "opaque-token".into(),
+            },
             privacy_tier: "standard".into(),
+            timeout_ms: 5000,
             extensions: std::collections::HashMap::new(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: MarketDispatchRequest = serde_json::from_str(&json).unwrap();
         // Compare field-by-field (MarketDispatchRequest isn't Eq).
         assert_eq!(back.job_id, req.job_id);
-        assert_eq!(back.model, req.model);
+        assert_eq!(back.model_id, req.model_id);
+        assert_eq!(back.offer_id, req.offer_id);
+        assert_eq!(back.matched_multiplier_bps, req.matched_multiplier_bps);
         assert_eq!(back.callback_url, req.callback_url);
-        assert_eq!(back.credit_rate_in_per_m, req.credit_rate_in_per_m);
+        assert_eq!(back.callback_auth, req.callback_auth);
         assert_eq!(back.privacy_tier, req.privacy_tier);
+        assert_eq!(back.timeout_ms, req.timeout_ms);
         // Optional fields elided from wire (skip_serializing_if).
         assert!(!json.contains("\"temperature\""),
             "None optional must not serialize: {json}");
         assert!(!json.contains("\"max_tokens\""),
             "None optional must not serialize: {json}");
+        // callback_auth serializes with renamed JSON key (`type`).
+        assert!(json.contains("\"type\":\"bearer\""),
+            "callback_auth.kind must serialize as `type`: {json}");
+    }
+
+    #[test]
+    fn market_dispatch_request_accepts_contract_shape_verbatim() {
+        // Regression guard: this is the exact body shape the Wire's
+        // /api/v1/compute/fill route constructs per contract §2.1
+        // rev 1.5. If a field gets renamed without updating the Wire
+        // side (or this struct drifts ahead of Wire), this test
+        // surfaces the mismatch immediately. The JSON below is
+        // copy-pasted from the contract doc + the literal
+        // `dispatchBody` object at fill/route.ts.
+        let contract_shape = r#"{
+            "job_id": "b8d98b7b-0ba0-4f8a-ac6e-d0a9c1c62a3c",
+            "model_id": "gemma4:26b",
+            "offer_id": "playful/106/1",
+            "matched_multiplier_bps": 10000,
+            "privacy_tier": "bootstrap-relay",
+            "callback_url": "https://newsbleach.com/api/v1/compute/callback/b8d98b7b-0ba0-4f8a-ac6e-d0a9c1c62a3c",
+            "callback_auth": {"type": "bearer", "token": "zOpYp-4-o8EQsX4pDEFzKGrEcJGNsoH5Y39E0VTHV9Q"},
+            "max_tokens": 2048,
+            "messages": [
+                {"role": "system", "content": "Be concise."},
+                {"role": "user", "content": "hi"}
+            ],
+            "temperature": 0.7,
+            "timeout_ms": 5000,
+            "extensions": {"request_id": "0c5e3d4c-dba6-4ef7-a21a-0f6a76fe7e84"}
+        }"#;
+        let parsed = serde_json::from_str::<MarketDispatchRequest>(contract_shape)
+            .expect("contract §2.1 rev 1.5 body must parse; if this fails, struct has drifted from the Wire-side /fill dispatch body");
+        assert_eq!(parsed.model_id, "gemma4:26b");
+        assert_eq!(parsed.offer_id, "playful/106/1");
+        assert_eq!(parsed.matched_multiplier_bps, 10000);
+        assert_eq!(parsed.callback_auth.kind, "bearer");
+        assert_eq!(parsed.timeout_ms, 5000);
+        assert_eq!(
+            parsed.extensions.get("request_id").and_then(|v| v.as_str()),
+            Some("0c5e3d4c-dba6-4ef7-a21a-0f6a76fe7e84")
+        );
     }
 
     #[test]
@@ -421,17 +500,18 @@ mod tests {
         // `deny_unknown_fields` ensures a Wire-side typo or a
         // forward-compatible-but-unknown field surfaces as a visible
         // deserialization failure (handler returns 400) rather than a
-        // silent drop. This guards against the class of bug where
-        // `creditRateIn` (camelCase) or a future `priority` field
-        // silently vanishes on older providers.
+        // silent drop. This guards against the class of bug where a
+        // future `priority` field silently vanishes on older providers.
         let json_with_typo = r#"{
             "job_id": "job-abc",
-            "model": "gemma3:27b",
+            "model_id": "gemma3:27b",
+            "offer_id": "playful/106/1",
+            "matched_multiplier_bps": 10000,
             "messages": [{"role": "user", "content": "hi"}],
             "callback_url": "https://wire.example.com/v1/compute/result-relay",
-            "credit_rate_in_per_m": 100,
-            "credit_rate_out_per_m": 500,
+            "callback_auth": {"type": "bearer", "token": "t"},
             "privacy_tier": "standard",
+            "timeout_ms": 5000,
             "priority": "urgent"
         }"#;
         let err = serde_json::from_str::<MarketDispatchRequest>(json_with_typo);
@@ -446,26 +526,31 @@ mod tests {
     fn market_dispatch_request_roundtrips_full() {
         let req = MarketDispatchRequest {
             job_id: "job-xyz".into(),
-            model: "llama3.2:70b".into(),
+            model_id: "llama3.2:70b".into(),
+            offer_id: "mac-lan/106/2".into(),
+            matched_multiplier_bps: 9500,
             messages: serde_json::json!([
                 {"role": "system", "content": "Be concise."},
                 {"role": "user", "content": "What is 2+2?"}
             ]),
             temperature: Some(0.2),
             max_tokens: Some(1024),
-            response_format: Some(serde_json::json!({"type": "json_object"})),
             callback_url: TunnelUrl::parse("https://relay-hop.example.com/r/inbound").unwrap(),
-            credit_rate_in_per_m: 200,
-            credit_rate_out_per_m: 800,
+            callback_auth: CallbackAuth {
+                kind: "bearer".into(),
+                token: "some-opaque-token".into(),
+            },
             privacy_tier: "cloud_relay".into(),
+            timeout_ms: 7000,
             extensions: std::collections::HashMap::new(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: MarketDispatchRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.temperature, Some(0.2));
         assert_eq!(back.max_tokens, Some(1024));
-        assert_eq!(back.response_format, req.response_format);
+        assert_eq!(back.matched_multiplier_bps, 9500);
         assert_eq!(back.privacy_tier, "cloud_relay");
+        assert_eq!(back.timeout_ms, 7000);
     }
 
     #[test]

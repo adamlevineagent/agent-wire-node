@@ -3028,32 +3028,30 @@ async fn handle_market_dispatch(
     }
 
     // Step 6 (§III): Look up the offer for the requested model, clone out
-    // `max_queue_depth` for the enqueue cap and the matched-bps value for
-    // the ComputeJob record. Offer absence is 503 with a reason header —
-    // the Wire's stale-offer cleanup consumes this to deactivate the
-    // offer.
-    let (max_queue_depth, offer_matched_multiplier_bps) = {
+    // the max-queue-depth cap + the offer's base rates. Settlement rates
+    // (`matched_rate_in_per_m`, `matched_rate_out_per_m`) come from the
+    // offer's base rate × the Wire-authoritative `matched_multiplier_bps`
+    // from the dispatch body — NOT a locally-computed bps value, because
+    // the Wire quoted the requester using its own bps at match time and
+    // we must settle at that same value.
+    //
+    // Offer absence is 503 with a reason header — the Wire's stale-offer
+    // cleanup consumes this to deactivate the offer.
+    let (max_queue_depth, offer_base_rate_in, offer_base_rate_out) = {
         let s = market_state_handle.read().await;
-        match s.offers.get(&req.model) {
-            Some(offer) => {
-                // Derive a base multiplier from the first curve point (or
-                // 10000 / 1.0x if the curve is empty). Deep-queue matching
-                // is Wire-side; we only need the value for the ComputeJob
-                // observability record.
-                let bps = offer
-                    .queue_discount_curve
-                    .first()
-                    .map(|p| p.multiplier_bps)
-                    .unwrap_or(10000);
-                (offer.max_queue_depth, bps)
-            }
+        match s.offers.get(&req.model_id) {
+            Some(offer) => (
+                offer.max_queue_depth,
+                offer.rate_per_m_input,
+                offer.rate_per_m_output,
+            ),
             None => {
                 return Ok(Box::new(warp::reply::with_status(
                     warp::reply::with_header(
                         warp::reply::with_header(
                             warp::reply::json(&serde_json::json!({
                                 "error": "no offer for model",
-                                "model": req.model,
+                                "model": req.model_id,
                             })),
                             "Retry-After",
                             policy.admission_retry_after_secs.to_string(),
@@ -3066,6 +3064,15 @@ async fn handle_market_dispatch(
             }
         }
     };
+
+    // Settlement rates = base × matched_multiplier_bps / 10000 (integer
+    // truncation matches Wire-side math). `offer.rate_per_m_input/output`
+    // are i64; matched_multiplier_bps is i32 widened to i64 for the
+    // multiply to avoid overflow on max-discount-max-rate corner cases.
+    let matched_rate_in_per_m: i64 =
+        (offer_base_rate_in * req.matched_multiplier_bps as i64) / 10000;
+    let matched_rate_out_per_m: i64 =
+        (offer_base_rate_out * req.matched_multiplier_bps as i64) / 10000;
 
     // Step 6b (§V DADBEAR Integration, DD-H): Admission hold check.
     //
@@ -3423,7 +3430,7 @@ async fn handle_market_dispatch(
         s.active_jobs
             .values()
             .filter(|j| {
-                j.model_id == req.model
+                j.model_id == req.model_id
                     && matches!(
                         j.status,
                         crate::compute_market::ComputeJobStatus::Queued
@@ -3450,7 +3457,7 @@ async fn handle_market_dispatch(
         .await;
         tracing::warn!(
             "Market dispatch depth cap hit for model={} active={} cap={}",
-            req.model,
+            req.model_id,
             active_depth_for_model,
             max_queue_depth
         );
@@ -3467,7 +3474,7 @@ async fn handle_market_dispatch(
                 warp::reply::with_header(
                     warp::reply::json(&serde_json::json!({
                         "error": "market queue depth exceeded",
-                        "model": req.model,
+                        "model": req.model_id,
                         "current": active_depth_for_model,
                         "max": max_queue_depth,
                         "current_market_queue_depth": active_depth_for_model,
@@ -3531,7 +3538,7 @@ async fn handle_market_dispatch(
         let target_id = req.job_id.clone();
         let system_prompt_wi = system_prompt.clone();
         let user_prompt_wi = user_prompt.clone();
-        let model_tier_wi = req.model.clone();
+        let model_tier_wi = req.model_id.clone();
         let wi_call_result: Result<String, String> =
             tokio::task::spawn_blocking(move || -> Result<String, String> {
                 let conn = rusqlite::Connection::open(&db_path_wi)
@@ -3637,15 +3644,15 @@ async fn handle_market_dispatch(
         let queued_at = chrono::Utc::now().to_rfc3339();
         let job = crate::compute_market::ComputeJob {
             job_id: req.job_id.clone(),
-            model_id: req.model.clone(),
+            model_id: req.model_id.clone(),
             status: crate::compute_market::ComputeJobStatus::Queued,
             messages: Some(req.messages.clone()),
             temperature: req.temperature,
             max_tokens: req.max_tokens,
             wire_job_token: bearer_stripped,
-            matched_rate_in: req.credit_rate_in_per_m,
-            matched_rate_out: req.credit_rate_out_per_m,
-            matched_multiplier_bps: offer_matched_multiplier_bps,
+            matched_rate_in: matched_rate_in_per_m,
+            matched_rate_out: matched_rate_out_per_m,
+            matched_multiplier_bps: req.matched_multiplier_bps,
             queued_at,
             filled_at: None,
             work_item_id: Some(dadbear_work_item_id.clone()),
@@ -3675,10 +3682,10 @@ async fn handle_market_dispatch(
     {
         let db_path_chr = db_path.clone();
         let job_path = dadbear_work_item_id.clone();
-        let model_id_chr = req.model.clone();
+        let model_id_chr = req.model_id.clone();
         let job_id_chr = req.job_id.clone();
-        let rate_in = req.credit_rate_in_per_m;
-        let rate_out = req.credit_rate_out_per_m;
+        let rate_in = matched_rate_in_per_m;
+        let rate_out = matched_rate_out_per_m;
         let privacy_tier = req.privacy_tier.clone();
         let wi_id_chr = Some(dadbear_work_item_id.clone());
         let attempt_id_chr = dadbear_attempt_id.clone();
@@ -3717,14 +3724,17 @@ async fn handle_market_dispatch(
         db_path.clone(),
         policy.clone(),
         req.job_id.clone(),
-        req.model.clone(),
+        req.model_id.clone(),
         system_prompt,
         user_prompt,
         req.temperature.unwrap_or(0.0),
         req.max_tokens.unwrap_or(4096),
-        req.response_format.clone(),
-        req.credit_rate_in_per_m,
-        req.credit_rate_out_per_m,
+        // Contract rev 1.5 dropped `response_format` from MarketDispatchRequest
+        // — Wire never sends it. Pass None; the worker uses the model's
+        // natural output format.
+        None,
+        matched_rate_in_per_m,
+        matched_rate_out_per_m,
     );
 
     // Step 11 (§III): Return 202 ACK with the provider's current
