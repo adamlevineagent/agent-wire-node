@@ -445,6 +445,12 @@ impl ComputeMarketState {
 // contract §6, economic_parameter canonical vocabulary). Node stores
 // the raw `HashMap<String, serde_json::Value>` on `AuthState.wire_parameters`
 // (schema-agnostic bag; see `auth.rs` + `main.rs` heartbeat self-heal).
+// Because Wire's `node_facing_parameters` allow-list marks this entry
+// `project_key: null`, the value is the entire structured_data object
+// — policy fields AND envelope fields (`schema_type`, `parameter_name`,
+// `description`). `from_wire_parameters` strips the envelope fields
+// before deserializing so `deny_unknown_fields` catches only genuine
+// policy-field typos (mirrors `MarketDeliveryPolicy::from_yaml`).
 // The delivery worker reads with a read-time fallback:
 //
 // ```ignore
@@ -495,13 +501,24 @@ impl ComputeDeliveryPolicy {
 
     /// Parse a `ComputeDeliveryPolicy` from `AuthState.wire_parameters`.
     ///
+    /// Wire's `wire_parameters` projection ships the full structured_data
+    /// object when the `node_facing_parameters` allow-list entry has
+    /// `project_key: null` — see Wire's `src/lib/server/wire-parameters.ts`.
+    /// That object carries envelope fields (`schema_type`, `parameter_name`,
+    /// `description`) alongside the policy fields. Those envelope fields
+    /// are stripped before deserialization so `deny_unknown_fields` on the
+    /// struct still catches genuine policy-field typos (operator tuning
+    /// mistakes) — mirrors the `MarketDeliveryPolicy::from_yaml` precedent
+    /// (`pyramid/market_delivery_policy.rs`).
+    ///
     /// Returns `None` if:
     ///   - the `compute_delivery_policy` key is absent (pre-rev-2.0 Wire),
     ///   - the value is not a JSON object,
-    ///   - the object is missing any required field,
-    ///   - any field has the wrong type (e.g. `backoff_schedule_secs`
+    ///   - the object is missing any required policy field,
+    ///   - any policy field has the wrong type (e.g. `backoff_schedule_secs`
     ///     is not an array of non-negative integers),
-    ///   - deny_unknown_fields triggers on an unexpected nested key.
+    ///   - deny_unknown_fields triggers on an unexpected nested key
+    ///     (after envelope-field stripping — a real operator typo).
     ///
     /// Callers MUST fall back to `contract_defaults()` on `None`. This
     /// is intentionally a total parse (all-or-nothing) rather than a
@@ -512,8 +529,17 @@ impl ComputeDeliveryPolicy {
     pub fn from_wire_parameters(
         params: &HashMap<String, serde_json::Value>,
     ) -> Option<Self> {
-        let value = params.get("compute_delivery_policy")?;
-        serde_json::from_value::<Self>(value.clone()).ok()
+        let mut value = params.get("compute_delivery_policy")?.clone();
+        // Strip envelope fields added by Wire's economic_parameter
+        // contribution shape before deny_unknown_fields sees them.
+        // Only named envelope keys are stripped — anything else (including
+        // future policy-field typos) still surfaces loudly via serde reject.
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.remove("schema_type");
+            map.remove("parameter_name");
+            map.remove("description");
+        }
+        serde_json::from_value::<Self>(value).ok()
     }
 
     /// Backoff delay (seconds) for a given attempt number (1-based).
@@ -1038,6 +1064,9 @@ mod tests {
         assert!(ComputeDeliveryPolicy::from_wire_parameters(&p3).is_none());
 
         // Unknown field (deny_unknown_fields guard; operator typos surface loudly).
+        // NOTE: the stripped envelope keys (schema_type, parameter_name,
+        // description) are tolerated by from_wire_parameters on purpose;
+        // only non-envelope unknown keys should trigger rejection.
         let mut p4: HashMap<String, serde_json::Value> = HashMap::new();
         p4.insert(
             "compute_delivery_policy".into(),
@@ -1049,6 +1078,36 @@ mod tests {
             }),
         );
         assert!(ComputeDeliveryPolicy::from_wire_parameters(&p4).is_none());
+    }
+
+    #[test]
+    fn compute_delivery_policy_from_wire_parameters_with_contribution_envelope() {
+        // Real Wire heartbeat shape: node_facing_parameters allow-list entry
+        // has `project_key: null` for `compute_delivery_policy`, so Wire's
+        // heartbeat projection (`src/lib/server/wire-parameters.ts`) ships
+        // the FULL economic_parameter structured_data object — which carries
+        // `schema_type`, `parameter_name`, and `description` alongside the
+        // policy fields. Without envelope stripping, `deny_unknown_fields`
+        // rejects the valid Wire payload and the node silently falls back
+        // to contract defaults — a Pillar 37 violation (Wire supersessions
+        // would be ignored). Regression guard for that bug.
+        let mut p: HashMap<String, serde_json::Value> = HashMap::new();
+        p.insert(
+            "compute_delivery_policy".into(),
+            serde_json::json!({
+                "schema_type": "economic_parameter",
+                "parameter_name": "compute_delivery_policy",
+                "description": "Per-leg retry budget for two-POST delivery.",
+                "max_attempts_content": 7,
+                "max_attempts_settlement": 3,
+                "backoff_schedule_secs": [2, 8, 60]
+            }),
+        );
+        let dp = ComputeDeliveryPolicy::from_wire_parameters(&p)
+            .expect("contribution-envelope shape from Wire projection should parse");
+        assert_eq!(dp.max_attempts_content, 7);
+        assert_eq!(dp.max_attempts_settlement, 3);
+        assert_eq!(dp.backoff_schedule_secs, vec![2, 8, 60]);
     }
 
     #[test]
