@@ -299,7 +299,7 @@ Distinct per-leg:
 | `backoff_schedule_secs` | same — array `[1, 5, 30, 300, 3600]` default | Shared backoff on both legs (indexed by attempt#) |
 | `callback_post_timeout_secs` | `MarketDeliveryPolicy` | Per-POST timeout (both legs) |
 | `lease_grace_secs` | `MarketDeliveryPolicy` | Added to POST timeout for lease duration |
-| `max_concurrent_deliveries` | `MarketDeliveryPolicy` | Split between legs (each leg gets half, or unified cap via `for_each_concurrent`) |
+| `max_concurrent_deliveries` | `MarketDeliveryPolicy` | **Unified cap across both legs.** `for_each_concurrent(N)` over a flat list of `(row_id, leg)` pairs — NOT per-leg. The cap bounds the node's outbound HTTP/socket budget, which is a shared resource across both legs of all in-flight rows. Q-PROTO-6's per-leg semantic lives in the retry budget (attempts), not the concurrency budget (in-flight POSTs). Bilateral clarification with Wire owner 2026-04-20. |
 | `max_error_message_chars` | `MarketDeliveryPolicy` | Truncation cap (both legs) |
 | `callback_secret_grace_secs` | `wire_parameters` (Wire ships via heartbeat) | Settlement-leg 401-likely-secret-expired discriminator |
 | `requester_delivery_jwt_ttl_secs` | `wire_parameters` | Content-leg 401-likely-jwt-expired discriminator |
@@ -500,9 +500,9 @@ None — P1 resolved (D1–D8 all answered; paste-back confirmed). Any further b
 
 3. **Startup-migration ordering.** Rev 0.5 shipped 5 columns; rev 0.6 adds 9 more. A node restarting between rev 0.5 and rev 0.6 deploys gets both migrations in order; no cross-version rows exist because nothing ever wrote the rev 0.5 columns in production. Safe.
 
-4. **Per-leg concurrency budget split.** `max_concurrent_deliveries` divides across legs — half each? Dynamic based on observed legs? Start simple: half each (ceil). If ops data shows asymmetry, tune.
+4. **Per-leg concurrency budget split — RESOLVED.** Unified cap across legs, not split. `for_each_concurrent(max_concurrent_deliveries)` over a flat list of `(row_id, leg)` pairs. Bounds the node's outbound HTTP/socket budget as a shared resource. Q-PROTO-6 per-leg semantic applies to retry attempts, not concurrency. Per bilateral with Wire owner 2026-04-20.
 
-5. **Content envelope size.** §2.6 content POST carries full LLM output. 50KB+ responses possible. Add body size cap on the requester side (per §2.6 validator) and on provider's POST (bounded writer). Not in spec yet — raise in rev 0.6 implementation.
+5. **Content envelope size — RESOLVED.** Not a protocol-level cap (Pillar 37 — Wire doesn't prescribe LLM output size). Rev 2.0 §2.6 adds a NOTE recommending requester implementations enforce a bounded reader (10 MiB recommended) and return 413 on overflow. Node-side (when acting as requester): bounded body read on `/v1/compute/job-result`, 413 with `X-Wire-Retry: never` on overflow. Node-side (when acting as provider): provider also SHOULD bound its own outbound POST body reader so a pathological LLM output doesn't blow the reqwest timeout budget. Implementation note, not a contract constraint. If post-launch ops shows pathological payloads, revisit as `max_result_content_bytes` economic_parameter.
 
 ---
 
