@@ -197,6 +197,287 @@ pub fn verify_result_delivery_token(
     Ok(ResultDeliveryIdentity { sub_job_id, rid })
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Rev 2.0 — Requester-delivery JWT verifier
+//
+// Sibling of `verify_result_delivery_token`. Same Ed25519 key material,
+// same `iss="wire"` check, same ±60s skew, same UUID `sub`/`job_id`
+// binding — but with `aud="requester-delivery"` (the rev 2.0 P2P
+// audience) instead of legacy `aud="result-delivery"`.
+//
+// Clean-cut, no dual-aud fallback. Per spec §"Requester-delivery JWT
+// verifier", rev 2.0 contract §3.4 sanctions only `aud="requester-
+// delivery"`; admitting both-aud opens a small replay surface for
+// outstanding legacy tokens. The legacy verifier above stays intact
+// during transition for existing callers; once no reads remain it will
+// be removed in a later commit.
+//
+// Error variants are more fine-grained than the legacy
+// `ResultDeliveryAuthError` — each spec-reject reason maps to a
+// distinct variant with `got`/`expected` detail. Handlers still map
+// every variant to HTTP 401 per contract §3.4.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Failure modes for [`verify_requester_delivery_token`]. Handlers map
+/// every variant to HTTP 401 per contract §3.4.
+#[derive(Clone, PartialEq, Eq)]
+pub enum RequesterDeliveryVerifyError {
+    /// `Authorization` header was absent, empty, or didn't parse as a
+    /// bearer token. (The verifier itself accepts raw tokens too and
+    /// strips a leading `"Bearer "` prefix; this variant exists so
+    /// handlers can surface a distinct 401 reason when the header is
+    /// structurally malformed upstream of the decode attempt.)
+    MissingOrMalformedBearer,
+    /// Ed25519 signature did not verify, OR the token was not a
+    /// well-formed JWT, OR the public key material was malformed.
+    InvalidSignature,
+    /// `exp` claim was in the past (beyond the ±60s skew tolerance),
+    /// OR `exp` was missing entirely.
+    Expired,
+    /// `aud` claim was present but not the string `"requester-delivery"`.
+    /// Catches both replayed legacy tokens (`aud="result-delivery"`)
+    /// and dispatch-token replay (`aud="compute"`).
+    WrongAud { got: String },
+    /// `iss` claim was present but not the string `"wire"`.
+    WrongIss,
+    /// `rid` claim did not match the receiver's `self.operator_id`.
+    /// Catches cross-operator mis-delivery.
+    WrongRid { got: String, expected: String },
+    /// `sub` claim did not match the envelope body's `job_id`.
+    /// Catches cross-job token replay.
+    WrongSub { got: String, expected: String },
+    /// Claims JSON was structurally invalid, or required fields (sub,
+    /// rid, aud, iss, exp) were missing or empty, or sub/expected_job_id
+    /// did not parse as valid UUIDs. Also covers the verifier-input
+    /// guard (`expected_operator_id` or `expected_job_id` empty) —
+    /// surfaced as 401 so we never silently skip the check.
+    MalformedClaims,
+}
+
+impl fmt::Debug for RequesterDeliveryVerifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingOrMalformedBearer => {
+                write!(f, "RequesterDeliveryVerifyError::MissingOrMalformedBearer")
+            }
+            Self::InvalidSignature => {
+                write!(f, "RequesterDeliveryVerifyError::InvalidSignature")
+            }
+            Self::Expired => write!(f, "RequesterDeliveryVerifyError::Expired"),
+            Self::WrongAud { got } => {
+                write!(f, "RequesterDeliveryVerifyError::WrongAud {{ got: {:?} }}", got)
+            }
+            Self::WrongIss => write!(f, "RequesterDeliveryVerifyError::WrongIss"),
+            Self::WrongRid { got, expected } => write!(
+                f,
+                "RequesterDeliveryVerifyError::WrongRid {{ got: {:?}, expected: {:?} }}",
+                got, expected
+            ),
+            Self::WrongSub { got, expected } => write!(
+                f,
+                "RequesterDeliveryVerifyError::WrongSub {{ got: {:?}, expected: {:?} }}",
+                got, expected
+            ),
+            Self::MalformedClaims => {
+                write!(f, "RequesterDeliveryVerifyError::MalformedClaims")
+            }
+        }
+    }
+}
+
+impl fmt::Display for RequesterDeliveryVerifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingOrMalformedBearer => write!(
+                f,
+                "requester-delivery Authorization header missing or malformed"
+            ),
+            Self::InvalidSignature => write!(
+                f,
+                "requester-delivery JWT signature invalid or token malformed"
+            ),
+            Self::Expired => write!(f, "requester-delivery JWT expired"),
+            Self::WrongAud { got } => write!(
+                f,
+                "requester-delivery JWT aud mismatch: got {:?}, expected \"requester-delivery\"",
+                got
+            ),
+            Self::WrongIss => write!(
+                f,
+                "requester-delivery JWT iss mismatch: expected \"wire\""
+            ),
+            Self::WrongRid { got, expected } => write!(
+                f,
+                "requester-delivery JWT rid mismatch: got {:?}, expected {:?}",
+                got, expected
+            ),
+            Self::WrongSub { got, expected } => write!(
+                f,
+                "requester-delivery JWT sub mismatch: got {:?}, expected {:?}",
+                got, expected
+            ),
+            Self::MalformedClaims => write!(
+                f,
+                "requester-delivery JWT claims malformed or verifier input empty"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RequesterDeliveryVerifyError {}
+
+/// Claims shape for the rev 2.0 requester-delivery JWT. All five
+/// fields are required; absence is treated as malformed.
+#[derive(Debug, Deserialize)]
+struct RequesterDeliveryClaims {
+    aud: Option<String>,
+    iss: Option<String>,
+    exp: Option<u64>,
+    sub: Option<String>,
+    rid: Option<String>,
+}
+
+/// Decode + verify a rev 2.0 requester-delivery JWT.
+///
+/// Returns `Ok(())` iff every spec-required check passes:
+/// - Ed25519 signature against `jwt_public_key` (PEM).
+/// - `aud == "requester-delivery"` (exact; no dual-aud fallback).
+/// - `iss == "wire"`.
+/// - `exp` not in the past (±60s skew tolerance, same as legacy).
+/// - `sub` parses as a UUID and equals `expected_job_id` (which must
+///   itself be a valid UUID — §10.5 uuid-not-handle-path).
+/// - `rid` equals `expected_operator_id` (the receiving node's
+///   `self.operator_id`).
+///
+/// `bearer_token` may include a leading `"Bearer "` prefix which is
+/// stripped before decode.
+///
+/// See contract §3.4 and spec §"Requester-delivery JWT verifier" for
+/// the full rationale.
+pub fn verify_requester_delivery_token(
+    bearer_token: &str,
+    jwt_public_key: &str,
+    expected_operator_id: &str,
+    expected_job_id: &str,
+) -> Result<(), RequesterDeliveryVerifyError> {
+    if expected_operator_id.is_empty() || expected_job_id.is_empty() {
+        return Err(RequesterDeliveryVerifyError::MalformedClaims);
+    }
+    // Require expected_job_id be a UUID per contract §10.5 — we compare
+    // the JWT's sub against this value as a string, but we also want
+    // the caller to be handing us well-formed UUIDs so the match below
+    // is meaningful.
+    if uuid::Uuid::parse_str(expected_job_id).is_err() {
+        return Err(RequesterDeliveryVerifyError::MalformedClaims);
+    }
+
+    let token = match bearer_token.strip_prefix("Bearer ") {
+        Some(stripped) if !stripped.is_empty() => stripped,
+        Some(_) => return Err(RequesterDeliveryVerifyError::MissingOrMalformedBearer),
+        None if bearer_token.is_empty() => {
+            return Err(RequesterDeliveryVerifyError::MissingOrMalformedBearer)
+        }
+        None => bearer_token,
+    };
+
+    let decoding_key = DecodingKey::from_ed_pem(jwt_public_key.as_bytes())
+        .map_err(|_| RequesterDeliveryVerifyError::InvalidSignature)?;
+
+    // Decode WITHOUT jsonwebtoken's aud/exp validation so we can emit
+    // the fine-grained error variants the contract asks for (WrongAud
+    // with `got`, explicit `Expired`, etc.). We still enforce the
+    // Ed25519 signature via Algorithm::EdDSA and check exp / aud / iss
+    // ourselves below.
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.validate_exp = false;
+    validation.validate_aud = false;
+    validation.required_spec_claims.clear();
+    // We still honor the same ±60s skew the legacy verifier uses.
+    validation.leeway = 60;
+
+    let token_data = match decode::<RequesterDeliveryClaims>(token, &decoding_key, &validation) {
+        Ok(td) => td,
+        Err(err) => {
+            use jsonwebtoken::errors::ErrorKind;
+            return Err(match err.kind() {
+                ErrorKind::InvalidToken
+                | ErrorKind::InvalidSignature
+                | ErrorKind::InvalidAlgorithm
+                | ErrorKind::InvalidAlgorithmName
+                | ErrorKind::InvalidKeyFormat
+                | ErrorKind::Crypto(_)
+                | ErrorKind::Base64(_)
+                | ErrorKind::Json(_)
+                | ErrorKind::Utf8(_) => RequesterDeliveryVerifyError::InvalidSignature,
+                _ => RequesterDeliveryVerifyError::InvalidSignature,
+            });
+        }
+    };
+    let claims = token_data.claims;
+
+    // ── iss ─────────────────────────────────────────────────────────
+    match claims.iss.as_deref() {
+        Some("wire") => {}
+        Some(_) => return Err(RequesterDeliveryVerifyError::WrongIss),
+        None => return Err(RequesterDeliveryVerifyError::MalformedClaims),
+    }
+
+    // ── aud ─────────────────────────────────────────────────────────
+    // Exact match — no dual-aud fallback. aud="compute" (dispatch
+    // replay) and aud="result-delivery" (legacy) both fail here.
+    match claims.aud.as_deref() {
+        Some("requester-delivery") => {}
+        Some(other) => {
+            return Err(RequesterDeliveryVerifyError::WrongAud {
+                got: other.to_string(),
+            })
+        }
+        None => return Err(RequesterDeliveryVerifyError::MalformedClaims),
+    }
+
+    // ── exp ─────────────────────────────────────────────────────────
+    let exp = claims.exp.ok_or(RequesterDeliveryVerifyError::MalformedClaims)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| RequesterDeliveryVerifyError::MalformedClaims)?;
+    // ±60s skew tolerance matches legacy verifier + contract §3.2.
+    if exp + 60 < now {
+        return Err(RequesterDeliveryVerifyError::Expired);
+    }
+
+    // ── sub / job_id binding ────────────────────────────────────────
+    let sub = claims.sub.unwrap_or_default();
+    if sub.is_empty() {
+        return Err(RequesterDeliveryVerifyError::MalformedClaims);
+    }
+    // sub MUST be a UUID per contract §10.5 — reject handle-path
+    // confusion early.
+    if uuid::Uuid::parse_str(&sub).is_err() {
+        return Err(RequesterDeliveryVerifyError::MalformedClaims);
+    }
+    if sub != expected_job_id {
+        return Err(RequesterDeliveryVerifyError::WrongSub {
+            got: sub,
+            expected: expected_job_id.to_string(),
+        });
+    }
+
+    // ── rid / operator binding ──────────────────────────────────────
+    let rid = claims.rid.unwrap_or_default();
+    if rid.is_empty() {
+        return Err(RequesterDeliveryVerifyError::MalformedClaims);
+    }
+    if rid != expected_operator_id {
+        return Err(RequesterDeliveryVerifyError::WrongRid {
+            got: rid,
+            expected: expected_operator_id.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,6 +761,336 @@ mod tests {
         ] {
             let s = format!("{}", err);
             assert!(!s.is_empty(), "Display should produce non-empty string");
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Rev 2.0 — Requester-delivery JWT verifier tests
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod requester_delivery_tests {
+    use super::*;
+
+    use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+    use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
+    use ed25519_dalek::{SigningKey, SECRET_KEY_LENGTH};
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use rand::RngCore;
+    use serde::Serialize;
+
+    #[derive(Debug, Serialize)]
+    struct RqClaims {
+        aud: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        iss: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sub: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rid: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        iat: Option<u64>,
+        exp: u64,
+    }
+
+    struct Keypair {
+        private_pem: String,
+        public_pem: String,
+    }
+
+    fn generate_keypair() -> Keypair {
+        let mut secret_bytes = [0u8; SECRET_KEY_LENGTH];
+        rand::thread_rng().fill_bytes(&mut secret_bytes);
+        let signing_key = SigningKey::from_bytes(&secret_bytes);
+        let verifying_key = signing_key.verifying_key();
+        let private_pem = signing_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("pkcs8 pem")
+            .to_string();
+        let public_pem = verifying_key
+            .to_public_key_pem(LineEnding::LF)
+            .expect("public pem");
+        Keypair { private_pem, public_pem }
+    }
+
+    fn future_exp() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("unix epoch")
+            .as_secs()
+            + 120
+    }
+
+    fn past_exp() -> u64 {
+        // 1 hour in the past, well beyond the 60s skew tolerance.
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("unix epoch")
+            .as_secs()
+            - 3600
+    }
+
+    fn sign_token(claims: &RqClaims, private_pem: &str) -> String {
+        let header = Header::new(Algorithm::EdDSA);
+        let encoding_key = EncodingKey::from_ed_pem(private_pem.as_bytes()).expect("encoding key");
+        encode(&header, claims, &encoding_key).expect("sign token")
+    }
+
+    const JOB_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const OP_ID: &str = "84213678-bd09-4d05-9cfd-7a5446659bb4";
+
+    fn default_claims() -> RqClaims {
+        RqClaims {
+            aud: "requester-delivery".into(),
+            iss: Some("wire".into()),
+            sub: Some(JOB_ID.into()),
+            rid: Some(OP_ID.into()),
+            iat: Some(future_exp() - 120),
+            exp: future_exp(),
+        }
+    }
+
+    // ── Test 1: Happy path ─────────────────────────────────────────
+
+    #[test]
+    fn requester_delivery_jwt_verifier_happy_path() {
+        let kp = generate_keypair();
+        let token = sign_token(&default_claims(), &kp.private_pem);
+        verify_requester_delivery_token(&token, &kp.public_pem, OP_ID, JOB_ID)
+            .expect("valid token with correct aud/iss/rid/sub/exp should verify");
+
+        // Also accept a "Bearer " prefix.
+        let bearer = format!("Bearer {}", token);
+        verify_requester_delivery_token(&bearer, &kp.public_pem, OP_ID, JOB_ID)
+            .expect("Bearer prefix should be stripped");
+    }
+
+    // ── Test 2: aud mismatch ───────────────────────────────────────
+
+    #[test]
+    fn requester_delivery_jwt_aud_mismatch_rejected() {
+        let kp = generate_keypair();
+
+        // aud="compute" (dispatch-token replay).
+        let claims = RqClaims {
+            aud: "compute".into(),
+            ..default_claims()
+        };
+        let token = sign_token(&claims, &kp.private_pem);
+        let err = verify_requester_delivery_token(&token, &kp.public_pem, OP_ID, JOB_ID)
+            .expect_err("aud=compute must reject");
+        match err {
+            RequesterDeliveryVerifyError::WrongAud { got } => {
+                assert_eq!(got, "compute");
+            }
+            other => panic!("expected WrongAud{{got:\"compute\"}}, got {:?}", other),
+        }
+    }
+
+    // ── Test 3: rid mismatch ───────────────────────────────────────
+
+    #[test]
+    fn requester_delivery_jwt_rid_mismatch_rejected() {
+        let kp = generate_keypair();
+        let other_op = "99999999-9999-9999-9999-999999999999";
+        let claims = RqClaims {
+            rid: Some(other_op.into()),
+            ..default_claims()
+        };
+        let token = sign_token(&claims, &kp.private_pem);
+        let err = verify_requester_delivery_token(&token, &kp.public_pem, OP_ID, JOB_ID)
+            .expect_err("wrong rid must reject");
+        match err {
+            RequesterDeliveryVerifyError::WrongRid { got, expected } => {
+                assert_eq!(got, other_op);
+                assert_eq!(expected, OP_ID);
+            }
+            other => panic!("expected WrongRid, got {:?}", other),
+        }
+    }
+
+    // ── Test 4: sub mismatch ───────────────────────────────────────
+
+    #[test]
+    fn requester_delivery_jwt_sub_mismatch_rejected() {
+        let kp = generate_keypair();
+        let other_job = "11111111-2222-3333-4444-555555555555";
+        let claims = RqClaims {
+            sub: Some(other_job.into()),
+            ..default_claims()
+        };
+        let token = sign_token(&claims, &kp.private_pem);
+        let err = verify_requester_delivery_token(&token, &kp.public_pem, OP_ID, JOB_ID)
+            .expect_err("wrong sub must reject");
+        match err {
+            RequesterDeliveryVerifyError::WrongSub { got, expected } => {
+                assert_eq!(got, other_job);
+                assert_eq!(expected, JOB_ID);
+            }
+            other => panic!("expected WrongSub, got {:?}", other),
+        }
+    }
+
+    // ── Test 5: expired ────────────────────────────────────────────
+
+    #[test]
+    fn requester_delivery_jwt_expired_rejected() {
+        let kp = generate_keypair();
+        let claims = RqClaims {
+            exp: past_exp(),
+            ..default_claims()
+        };
+        let token = sign_token(&claims, &kp.private_pem);
+        let err = verify_requester_delivery_token(&token, &kp.public_pem, OP_ID, JOB_ID)
+            .expect_err("expired token must reject");
+        assert_eq!(err, RequesterDeliveryVerifyError::Expired);
+    }
+
+    // ── Test 6: bad signature ──────────────────────────────────────
+
+    #[test]
+    fn requester_delivery_jwt_bad_signature_rejected() {
+        let signer_kp = generate_keypair();
+        let verifier_kp = generate_keypair();
+        let token = sign_token(&default_claims(), &signer_kp.private_pem);
+        let err = verify_requester_delivery_token(&token, &verifier_kp.public_pem, OP_ID, JOB_ID)
+            .expect_err("wrong-key signature must reject");
+        assert_eq!(err, RequesterDeliveryVerifyError::InvalidSignature);
+    }
+
+    // ── Test 7: legacy aud explicitly rejected (spec test #22) ─────
+
+    #[test]
+    fn legacy_aud_result_delivery_rejected() {
+        // Per spec §"Requester-delivery JWT verifier": clean-cut, no
+        // dual-aud fallback. aud="result-delivery" (the legacy rev 0.5
+        // audience) MUST reject with WrongAud — not silently accepted.
+        let kp = generate_keypair();
+        let claims = RqClaims {
+            aud: "result-delivery".into(),
+            ..default_claims()
+        };
+        let token = sign_token(&claims, &kp.private_pem);
+        let err = verify_requester_delivery_token(&token, &kp.public_pem, OP_ID, JOB_ID)
+            .expect_err("legacy aud=result-delivery must reject — no dual-aud fallback");
+        match err {
+            RequesterDeliveryVerifyError::WrongAud { got } => {
+                assert_eq!(got, "result-delivery");
+            }
+            other => panic!(
+                "expected WrongAud{{got:\"result-delivery\"}}, got {:?}",
+                other
+            ),
+        }
+    }
+
+    // ── Supplementary coverage (not in the 7 required) ─────────────
+
+    #[test]
+    fn missing_iss_rejected_as_malformed() {
+        let kp = generate_keypair();
+        let claims = RqClaims {
+            iss: None,
+            ..default_claims()
+        };
+        let token = sign_token(&claims, &kp.private_pem);
+        let err = verify_requester_delivery_token(&token, &kp.public_pem, OP_ID, JOB_ID)
+            .expect_err("missing iss must reject");
+        assert_eq!(err, RequesterDeliveryVerifyError::MalformedClaims);
+    }
+
+    #[test]
+    fn wrong_iss_rejected() {
+        let kp = generate_keypair();
+        let claims = RqClaims {
+            iss: Some("attacker".into()),
+            ..default_claims()
+        };
+        let token = sign_token(&claims, &kp.private_pem);
+        let err = verify_requester_delivery_token(&token, &kp.public_pem, OP_ID, JOB_ID)
+            .expect_err("wrong iss must reject");
+        assert_eq!(err, RequesterDeliveryVerifyError::WrongIss);
+    }
+
+    #[test]
+    fn empty_bearer_token_rejected() {
+        let kp = generate_keypair();
+        let err = verify_requester_delivery_token("", &kp.public_pem, OP_ID, JOB_ID)
+            .expect_err("empty bearer must reject");
+        assert_eq!(err, RequesterDeliveryVerifyError::MissingOrMalformedBearer);
+
+        let err = verify_requester_delivery_token("Bearer ", &kp.public_pem, OP_ID, JOB_ID)
+            .expect_err("bare 'Bearer ' prefix with empty body must reject");
+        assert_eq!(err, RequesterDeliveryVerifyError::MissingOrMalformedBearer);
+    }
+
+    #[test]
+    fn non_uuid_sub_rejected_as_malformed() {
+        let kp = generate_keypair();
+        let claims = RqClaims {
+            sub: Some("not-a-uuid".into()),
+            ..default_claims()
+        };
+        let token = sign_token(&claims, &kp.private_pem);
+        let err = verify_requester_delivery_token(&token, &kp.public_pem, OP_ID, JOB_ID)
+            .expect_err("non-UUID sub must reject");
+        assert_eq!(err, RequesterDeliveryVerifyError::MalformedClaims);
+    }
+
+    #[test]
+    fn empty_verifier_inputs_rejected() {
+        let kp = generate_keypair();
+        let token = sign_token(&default_claims(), &kp.private_pem);
+
+        let err = verify_requester_delivery_token(&token, &kp.public_pem, "", JOB_ID)
+            .expect_err("empty expected_operator_id must reject");
+        assert_eq!(err, RequesterDeliveryVerifyError::MalformedClaims);
+
+        let err = verify_requester_delivery_token(&token, &kp.public_pem, OP_ID, "")
+            .expect_err("empty expected_job_id must reject");
+        assert_eq!(err, RequesterDeliveryVerifyError::MalformedClaims);
+
+        let err = verify_requester_delivery_token(&token, &kp.public_pem, OP_ID, "not-a-uuid")
+            .expect_err("non-UUID expected_job_id must reject");
+        assert_eq!(err, RequesterDeliveryVerifyError::MalformedClaims);
+    }
+
+    #[test]
+    fn malformed_public_key_rejected() {
+        let err = verify_requester_delivery_token(
+            "some.token.here",
+            "-----BEGIN NOT A KEY-----",
+            OP_ID,
+            JOB_ID,
+        )
+        .expect_err("malformed pubkey must reject");
+        assert_eq!(err, RequesterDeliveryVerifyError::InvalidSignature);
+    }
+
+    #[test]
+    fn display_and_debug_cover_all_variants() {
+        let variants = [
+            RequesterDeliveryVerifyError::MissingOrMalformedBearer,
+            RequesterDeliveryVerifyError::InvalidSignature,
+            RequesterDeliveryVerifyError::Expired,
+            RequesterDeliveryVerifyError::WrongAud {
+                got: "compute".into(),
+            },
+            RequesterDeliveryVerifyError::WrongIss,
+            RequesterDeliveryVerifyError::WrongRid {
+                got: "a".into(),
+                expected: "b".into(),
+            },
+            RequesterDeliveryVerifyError::WrongSub {
+                got: "c".into(),
+                expected: "d".into(),
+            },
+            RequesterDeliveryVerifyError::MalformedClaims,
+        ];
+        for v in &variants {
+            assert!(!format!("{}", v).is_empty());
+            assert!(!format!("{:?}", v).is_empty());
         }
     }
 }
