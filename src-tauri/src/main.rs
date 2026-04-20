@@ -12707,9 +12707,8 @@ fn main() {
     // worker failure-now-fixed-to-promote, sweep heartbeat-lost synth). The
     // supervise_delivery_loop task consumes the receiver; sender lives on
     // MarketDispatchContext so every mutation site can send(()).ok() without
-    // caring about shutdown races. Receiver will be handed to the delivery
-    // task spawn in a later commit (Commit 2 — the delivery worker itself).
-    let (market_delivery_nudge_tx, _market_delivery_nudge_rx) =
+    // caring about shutdown races.
+    let (market_delivery_nudge_tx, market_delivery_nudge_rx) =
         tokio::sync::mpsc::unbounded_channel::<()>();
     let compute_market_dispatch_shared = Arc::new(
         wire_node_lib::pyramid::market_dispatch::MarketDispatchContext {
@@ -12779,12 +12778,120 @@ fn main() {
         );
     }
     {
+        // Phase 3 startup recovery: clear any stale delivery_lease_until
+        // stamps left over from a prior process that died mid-POST.
+        // Fire-and-forget spawn — even if the delivery task's first tick
+        // fires before this lands, stale leases just delay reclaim by
+        // the lease_duration (~35s default), not block delivery
+        // correctness.
+        let db_path_recover = pyramid_db_path.to_path_buf();
+        tauri::async_runtime::spawn(async move {
+            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let conn = rusqlite::Connection::open(&db_path_recover)?;
+                let n =
+                    wire_node_lib::pyramid::db::market_outbox_delivery_startup_recovery(&conn)?;
+                if n > 0 {
+                    tracing::info!(
+                        recovered = n,
+                        "market delivery startup: cleared stale leases"
+                    );
+                }
+                Ok(())
+            })
+            .await;
+            if let Err(e) = res {
+                tracing::warn!(err = %e, "market delivery startup recovery join error");
+            }
+        });
+    }
+    {
+        // Phase 3: spawn the supervised delivery loop. Consumes the
+        // receiver constructed upstream alongside the mirror_nudge
+        // receiver. Supervisor lives for process lifetime; panic → 5s
+        // backoff → respawn; clean channel close → loud exit event.
+        let delivery_ctx = wire_node_lib::pyramid::market_delivery::DeliveryContext {
+            db_path: pyramid_db_path.to_path_buf(),
+            policy: compute_market_dispatch_shared.policy.clone(),
+            auth: shared_auth.clone(),
+        };
+        wire_node_lib::pyramid::market_delivery::spawn_market_delivery_task(
+            delivery_ctx,
+            market_delivery_nudge_rx,
+        );
+    }
+    {
+        // Phase 3: ConfigSynced hot-reload for `market_delivery_policy`.
+        // Mirror of the fleet_delivery_policy ConfigSynced arm higher up
+        // in main.rs, spawned here because `compute_market_dispatch_shared`
+        // is constructed AFTER the primary ConfigSynced listener
+        // (~line 11905) boots — a separate listener on the same
+        // build_event_bus subscriber is the minimal-disruption wiring.
+        //
+        // Without this, the three new policy fields added in rev 0.5
+        // (lease_grace_secs, max_concurrent_deliveries,
+        // max_error_message_chars) would require node restart to take
+        // effect — invalidating the Pillar 37 tunability claim the spec
+        // makes. In-scope per the rev 0.4 audit response (item A).
+        let config_market_dispatch = Arc::clone(&compute_market_dispatch_shared);
+        let config_bus = state.pyramid.build_event_bus.clone();
+        let config_db_path = pyramid_db_path.to_path_buf();
+        let mut rx = config_bus.tx.subscribe();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if let wire_node_lib::pyramid::event_bus::TaggedKind::ConfigSynced {
+                            schema_type,
+                            ..
+                        } = event.kind
+                        {
+                            if schema_type == "market_delivery_policy" {
+                                let yaml_opt =
+                                    match wire_node_lib::pyramid::db::open_pyramid_connection(&config_db_path) {
+                                        Ok(conn) => {
+                                            wire_node_lib::pyramid::market_delivery_policy::read_market_delivery_policy(&conn)
+                                                .ok()
+                                                .flatten()
+                                        }
+                                        Err(_) => None,
+                                    };
+                                if let Some(new_policy) = yaml_opt {
+                                    *config_market_dispatch.policy.write().await = new_policy;
+                                    tracing::info!(
+                                        "ConfigSynced: market_delivery_policy reloaded"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        "ConfigSynced: market_delivery_policy broadcast but no row readable"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!(
+                            "market_delivery_policy ConfigSynced listener lagged by {n} events"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::debug!(
+                            "market_delivery_policy ConfigSynced listener: bus closed, exiting"
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    {
         let policy_handle = compute_market_dispatch_shared.policy.clone();
         let db_path_clone = pyramid_db_path.to_path_buf();
+        let delivery_nudge_for_sweep = compute_market_dispatch_shared.delivery_nudge.clone();
         tauri::async_runtime::spawn(async move {
             wire_node_lib::pyramid::fleet_outbox_sweep::market_outbox_sweep_loop(
                 db_path_clone,
                 policy_handle,
+                Some(delivery_nudge_for_sweep),
             )
             .await;
         });
@@ -13373,6 +13480,59 @@ fn main() {
                                             save_session(&heartbeat_config, &auth);
                                             tracing::info!("JWT public key updated from heartbeat");
                                         }
+                                    }
+                                }
+
+                                // ── Wire parameters from heartbeat (Phase 3) ───────
+                                // Wire ships a keyed `wire_parameters` map on every
+                                // heartbeat response, projected from an allow-list
+                                // economic_parameter contribution on its side.
+                                // Subsystems (delivery worker, future: market-surface
+                                // filter, match policy) read AuthState.wire_parameters
+                                // and fall back to contract-default constants on
+                                // missing keys. Zero-lockstep with Wire's upgrade:
+                                // nodes running pre-Wire-upgrade just see the field
+                                // absent and use defaults.
+                                //
+                                // Emit market_wire_parameters_updated on any diff so
+                                // operators see Wire supersessions land. Cold-boot
+                                // population also emits (old = empty, new = populated).
+                                if let Some(wp_obj) = response.get("wire_parameters").and_then(|v| v.as_object()) {
+                                    let new_map: std::collections::HashMap<String, serde_json::Value> =
+                                        wp_obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                                    let mut auth = heartbeat_state.auth.write().await;
+                                    if auth.wire_parameters != new_map {
+                                        let diff: Vec<(String, serde_json::Value, serde_json::Value)> =
+                                            new_map.iter()
+                                                .filter(|(k, v)| auth.wire_parameters.get(k.as_str()) != Some(v))
+                                                .map(|(k, v)| (
+                                                    k.clone(),
+                                                    auth.wire_parameters.get(k.as_str()).cloned().unwrap_or(serde_json::Value::Null),
+                                                    v.clone(),
+                                                ))
+                                                .collect();
+                                        auth.wire_parameters = new_map;
+                                        save_session(&heartbeat_config, &auth);
+                                        drop(auth);
+                                        // Fire-and-forget chronicle emit. Non-fatal on
+                                        // failure; observability aid only.
+                                        let db_path_chr = heartbeat_config.data_dir().join("pyramid.db");
+                                        let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                                            let conn = rusqlite::Connection::open(&db_path_chr)?;
+                                            let ctx_ev = wire_node_lib::pyramid::compute_chronicle::ChronicleEventContext::minimal(
+                                                &format!("market/wire_parameters/{}", chrono::Utc::now().timestamp()),
+                                                wire_node_lib::pyramid::compute_chronicle::EVENT_MARKET_WIRE_PARAMETERS_UPDATED,
+                                                wire_node_lib::pyramid::compute_chronicle::SOURCE_MARKET,
+                                            ).with_metadata(serde_json::json!({
+                                                "changed_keys": diff.iter().map(|(k, _, _)| k.clone()).collect::<Vec<_>>(),
+                                                "diff": diff.iter().map(|(k, o, n)| serde_json::json!({
+                                                    "key": k, "old": o, "new": n,
+                                                })).collect::<Vec<_>>(),
+                                            }));
+                                            let _ = wire_node_lib::pyramid::compute_chronicle::record_event(&conn, &ctx_ev);
+                                            Ok(())
+                                        });
+                                        tracing::info!("wire_parameters updated from heartbeat");
                                     }
                                 }
 

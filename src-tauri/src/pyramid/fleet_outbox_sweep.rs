@@ -502,9 +502,19 @@ fn market_job_path_for(row: &OutboxRow) -> String {
 /// sharing the fleet policy would let a fleet-tuning change silently
 /// alter market sweep behavior. Making the market loop a public `fn`
 /// keeps its signature pinned.
+/// Market outbox sweep loop. See §"Trigger model" for architecture.
+///
+/// `delivery_nudge` (Phase 3): optional sender for the market delivery
+/// worker's nudge channel. `Some` in production (wired from
+/// MarketDispatchContext); `None` in tests that exercise the sweep
+/// directly. When `Some`, sweep fires a nudge after any pending→ready
+/// promotion (heartbeat-lost synth path) so the delivery worker picks
+/// up the synthesized-error row without waiting for its next natural
+/// tick.
 pub async fn market_outbox_sweep_loop(
     db_path: PathBuf,
     policy_handle: Arc<tokio::sync::RwLock<MarketDeliveryPolicy>>,
+    delivery_nudge: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 ) {
     tracing::info!(
         db_path = %db_path.display(),
@@ -527,9 +537,20 @@ pub async fn market_outbox_sweep_loop(
         }
 
         // Predicate A: expiry-driven transitions. Sync sqlite +
-        // chronicle writes inside spawn_blocking.
-        if let Err(e) = sweep_expired_market_once(db_path.clone(), policy.clone()).await {
-            tracing::warn!(err = %e, "Market outbox sweep (Predicate A) errored");
+        // chronicle writes inside spawn_blocking. The sweep returns
+        // the number of pending→ready promotions so we can nudge the
+        // delivery worker if any fired.
+        match sweep_expired_market_once(db_path.clone(), policy.clone()).await {
+            Ok(promoted) => {
+                if promoted > 0 {
+                    if let Some(nudge) = delivery_nudge.as_ref() {
+                        let _ = nudge.send(());
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "Market outbox sweep (Predicate A) errored");
+            }
         }
     }
 }
@@ -541,10 +562,11 @@ pub async fn market_outbox_sweep_loop(
 async fn sweep_expired_market_once(
     db_path: PathBuf,
     policy: MarketDeliveryPolicy,
-) -> anyhow::Result<()> {
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
         let conn = rusqlite::Connection::open(&db_path)?;
         let rows = market_outbox_sweep_expired(&conn)?;
+        let mut promoted_count: usize = 0;
         for row in rows {
             match row.status.as_str() {
                 "pending" => {
@@ -562,6 +584,7 @@ async fn sweep_expired_market_once(
                         policy.ready_retention_secs,
                     ) {
                         Ok(1) => {
+                            promoted_count += 1;
                             let ev = ChronicleEventContext::minimal(
                                 &market_job_path_for(&row),
                                 crate::pyramid::compute_chronicle::EVENT_MARKET_WORKER_HEARTBEAT_LOST,
@@ -643,11 +666,10 @@ async fn sweep_expired_market_once(
                 }
             }
         }
-        Ok(())
+        Ok(promoted_count)
     })
     .await
-    .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))??;
-    Ok(())
+    .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))?
 }
 
 /// Push market rows at/above their attempt budget into the past so
@@ -797,6 +819,8 @@ mod tests {
             "https://wire.example.com/v1/compute/result-relay",
             "MarketStandard",
             "1970-01-01 00:00:00",
+            None,
+            None,
         )
         .unwrap();
         drop(conn);
@@ -851,6 +875,8 @@ mod tests {
             "https://wire.example.com/v1/compute/result-relay",
             "MarketStandard",
             "1970-01-01 00:00:00",
+            None,
+            None,
         )
         .unwrap();
         drop(conn);
@@ -901,6 +927,8 @@ mod tests {
             "https://wire/x",
             "MarketStandard",
             far_future,
+            None,
+            None,
         )
         .unwrap();
         conn.execute(

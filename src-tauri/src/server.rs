@@ -3196,6 +3196,16 @@ async fn handle_market_dispatch(
     let db_path_tx = db_path.clone();
     let job_id_tx = req.job_id.clone();
     let callback_url_tx = callback_url_str.clone();
+    // Phase 3: persist the bearer + request_id onto the outbox row at admission
+    // so the delivery worker reads them at POST time (restart-safe, survives
+    // process crashes mid-inference). callback_auth is required per contract
+    // rev 1.5; extensions.request_id is optional per contract §10.1.
+    let callback_auth_token_tx = req.callback_auth.token.clone();
+    let request_id_tx: Option<String> = req
+        .extensions
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     let outcome = tokio::task::spawn_blocking(move || -> MarketAdmissionOutcome {
         let mut conn = match rusqlite::Connection::open(&db_path_tx) {
@@ -3222,6 +3232,8 @@ async fn handle_market_dispatch(
             &callback_url_tx,
             crate::fleet::callback_kind_str(&crate::fleet::CallbackKind::MarketStandard),
             &expires_at,
+            Some(&callback_auth_token_tx),
+            request_id_tx.as_deref(),
         ) {
             Ok(n) => n,
             Err(e) => return MarketAdmissionOutcome::DbError(e.to_string()),
@@ -4018,6 +4030,10 @@ fn spawn_market_worker(
                         // Phase 2 WS6: nudge mirror — Executing → Ready
                         // means a slot just opened for the model.
                         let _ = market_ctx.mirror_nudge.send(());
+                        // Phase 3: nudge the delivery worker so the
+                        // result callback fires within the debounce
+                        // window, not after the next 15s tick.
+                        let _ = market_ctx.delivery_nudge.send(());
                         // TODO (WS8): chronicle event market_completed with
                         //   model_id, job_id, prompt_tokens, completion_tokens,
                         //   credits_earned.
@@ -4050,31 +4066,72 @@ fn spawn_market_worker(
                 }
             }
             Some(Err(e)) => {
-                // Inference failed. Bump delivery_attempts so Phase 3's
-                // callback-delivery worker surfaces this as a failed job
-                // (and Predicate B's retries-exhausted path eventually
-                // marks the row failed). Transition the ComputeJob to
-                // Failed immediately for observability — the outbox row
-                // is the durable source of truth; this is the runtime view.
-                //
-                // Phase 3 owns the retry loop: the attempt counter here
-                // feeds into `max_delivery_attempts`, and the sweep will
-                // push the row to failed status once the budget is spent.
+                // Inference failed. Previously (pre-Phase-3) this branch
+                // called `fleet_outbox_bump_delivery_attempt` against a
+                // `status='pending'` row. That helper CASes on
+                // `status='ready'`, so it silently no-op'd — the real
+                // inference error never reached the delivery worker, and
+                // the row sat pending until the sweep synthesized a
+                // generic "worker heartbeat lost" message. Phase 3 fix:
+                // promote pending→ready with the REAL error envelope,
+                // identical to the success path's promote call. The
+                // delivery worker then POSTs the proper failure callback.
                 let err_msg = format!("{}", e);
+                let outcome = crate::pyramid::market_dispatch::MarketAsyncResult::Error(
+                    err_msg.clone(),
+                );
+                let result_json = match serde_json::to_string(&outcome) {
+                    Ok(s) => s,
+                    Err(e_ser) => crate::pyramid::db::synthesize_worker_error_json(&format!(
+                        "inference failed + result serialize failed: {}; original: {}",
+                        e_ser, err_msg
+                    )),
+                };
                 let db_fail = db_path.clone();
                 let jid_fail = job_id.clone();
-                let err_clone = err_msg.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let conn = rusqlite::Connection::open(&db_fail).ok()?;
-                    crate::pyramid::db::fleet_outbox_bump_delivery_attempt(
-                        &conn,
-                        crate::fleet::WIRE_PLATFORM_DISPATCHER,
-                        &jid_fail,
-                        &err_clone,
-                    )
-                    .ok()
-                })
-                .await;
+                let rj_fail = result_json.clone();
+                let ready_retention_secs = policy.ready_retention_secs;
+                let promote_res: Result<usize, String> =
+                    tokio::task::spawn_blocking(move || {
+                        let conn = rusqlite::Connection::open(&db_fail)
+                            .map_err(|e| e.to_string())?;
+                        crate::pyramid::db::fleet_outbox_promote_ready_if_pending(
+                            &conn,
+                            crate::fleet::WIRE_PLATFORM_DISPATCHER,
+                            &jid_fail,
+                            &rj_fail,
+                            ready_retention_secs,
+                        )
+                        .map_err(|e| e.to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|je| Err(je.to_string()));
+                match promote_res {
+                    Ok(1) => {
+                        // Row promoted to ready; nudge the delivery worker
+                        // so the failure callback fires within the debounce
+                        // window rather than waiting for the next tick.
+                        let _ = market_ctx.delivery_nudge.send(());
+                    }
+                    Ok(_) => {
+                        // Sweep already promoted us with a synthesized
+                        // generic Error — acceptable; the generic message
+                        // is less informative but the delivery flow still
+                        // completes. Nudge anyway.
+                        let _ = market_ctx.delivery_nudge.send(());
+                        tracing::warn!(
+                            "Market worker failure promote CAS lost to sweep for job_id={}",
+                            job_id
+                        );
+                    }
+                    Err(e_db) => {
+                        tracing::error!(
+                            "market outbox promote_ready (failure branch) failed: {} (job_id={})",
+                            e_db,
+                            job_id
+                        );
+                    }
+                }
 
                 {
                     let mut s = market_state_handle.write().await;

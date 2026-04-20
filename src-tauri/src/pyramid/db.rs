@@ -2680,17 +2680,22 @@ pub fn market_outbox_insert_or_ignore(
     callback_url: &str,
     callback_kind_str: &str,
     expires_at: &str,
+    callback_auth_token: Option<&str>,
+    request_id: Option<&str>,
 ) -> Result<usize> {
     let n = conn.execute(
         "INSERT OR IGNORE INTO fleet_result_outbox
-            (dispatcher_node_id, job_id, callback_url, callback_kind, status, expires_at)
-         VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+            (dispatcher_node_id, job_id, callback_url, callback_kind, status,
+             expires_at, callback_auth_token, request_id)
+         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7)",
         rusqlite::params![
             crate::fleet::WIRE_PLATFORM_DISPATCHER,
             job_id,
             callback_url,
             callback_kind_str,
-            expires_at
+            expires_at,
+            callback_auth_token,
+            request_id,
         ],
     )?;
     Ok(n)
@@ -2812,12 +2817,20 @@ pub fn fleet_outbox_mark_delivered_if_ready(
     job_id: &str,
     delivered_retention_secs: u64,
 ) -> Result<usize> {
+    // Phase 3 spec §"Split columns": on terminal transitions, both
+    // `delivery_lease_until` and `delivery_next_attempt_at` are cleared.
+    // Invariant: those columns are only meaningful for transient retry
+    // contexts (ready state). Their persistence past terminal would make
+    // a hypothetical "reset failed row to ready" operator action behave
+    // surprisingly on the backoff gate.
     let modifier = format!("+{} seconds", delivered_retention_secs);
     let n = conn.execute(
         "UPDATE fleet_result_outbox
             SET status = 'delivered',
                 delivered_at = datetime('now'),
-                expires_at = datetime('now', ?3)
+                expires_at = datetime('now', ?3),
+                delivery_lease_until = NULL,
+                delivery_next_attempt_at = NULL
           WHERE dispatcher_node_id = ?1 AND job_id = ?2 AND status = 'ready'",
         rusqlite::params![dispatcher_node_id, job_id, modifier],
     )?;
@@ -2828,6 +2841,17 @@ pub fn fleet_outbox_mark_delivered_if_ready(
 /// now + failed_retention_secs` so the row is kept for post-mortem visibility
 /// before final cleanup. Returns rowcount — `0` means the row was already
 /// delivered, deleted, or in another state.
+///
+/// **Phase 3 lease-aware guard:** refuses to transition a row that is
+/// actively being POSTed by the delivery worker (`delivery_lease_until >
+/// now`). Without this guard, the sweep could flip a row to `failed`
+/// while the POST is in flight; Wire then receives 2xx but the node's
+/// row shows `failed`, and the `mark_delivered_if_ready` CAS on the
+/// delivery side returns 0. The CAS-lost chronicle event fires but
+/// operator dashboards show phantom-failed rows that Wire actually
+/// delivered. Adding `(delivery_lease_until IS NULL OR
+/// delivery_lease_until < now)` to the CAS predicate prevents the race
+/// entirely.
 pub fn fleet_outbox_mark_failed_if_ready(
     conn: &Connection,
     dispatcher_node_id: &str,
@@ -2838,8 +2862,13 @@ pub fn fleet_outbox_mark_failed_if_ready(
     let n = conn.execute(
         "UPDATE fleet_result_outbox
             SET status = 'failed',
-                expires_at = datetime('now', ?3)
-          WHERE dispatcher_node_id = ?1 AND job_id = ?2 AND status = 'ready'",
+                expires_at = datetime('now', ?3),
+                delivery_lease_until = NULL,
+                delivery_next_attempt_at = NULL
+          WHERE dispatcher_node_id = ?1 AND job_id = ?2
+            AND status = 'ready'
+            AND (delivery_lease_until IS NULL
+                 OR delivery_lease_until < datetime('now'))",
         rusqlite::params![dispatcher_node_id, job_id, modifier],
     )?;
     Ok(n)
@@ -3018,6 +3047,175 @@ pub fn market_outbox_retry_candidates(conn: &Connection) -> Result<Vec<OutboxRow
 /// serialization shape. The message itself is JSON-encoded via `serde_json`
 /// so quotes, backslashes, and other control characters are escaped
 /// correctly.
+// ── Phase 3 market delivery worker helpers ──────────────────────────────────
+//
+// Four helpers the delivery worker in `pyramid::market_delivery` uses.
+// Kept together here so the CAS/claim machinery for the outbox stays in
+// one module.
+//
+// State machine reference (spec §"State machine"):
+//   pending --worker success/failure--> ready -> [delivered | failed]
+// The delivery worker owns the ready → delivered CAS + the bump-attempt-
+// with-backoff path. Terminal writes (ready → failed) are CAS-guarded so a
+// concurrent sweep transition doesn't corrupt state.
+
+/// Claim up to `max_concurrent_deliveries` `ready` MarketStandard rows,
+/// acquiring the lease in the same statement via `UPDATE ... RETURNING *`.
+/// Atomic — no TOCTOU window between "pick rows" and "mark claimed."
+///
+/// Two predicate gates enforce correctness:
+///   - `delivery_lease_until IS NULL OR delivery_lease_until < now` —
+///     skip rows actively being POSTed by another worker (or this
+///     worker on a prior not-yet-timed-out attempt).
+///   - `delivery_next_attempt_at IS NULL OR delivery_next_attempt_at <= now`
+///     — skip rows in their backoff window after a transient failure.
+///
+/// Relay rows are deliberately excluded (`callback_kind = 'MarketStandard'`
+/// only) per spec §Scope — the relay market is deferred; Relay rows stay
+/// in `ready` until the relay market ships.
+pub fn market_outbox_claim_ready_for_delivery(
+    conn: &Connection,
+    lease_secs: u64,
+    max_concurrent_deliveries: u64,
+) -> Result<Vec<OutboxRow>> {
+    let lease_mod = format!("+{} seconds", lease_secs);
+    // RETURNING * lets us capture the lease-stamped rows in one round-trip.
+    // SQLite 3.35+ supports RETURNING in UPDATE; bundled rusqlite has this.
+    let sql = format!(
+        "UPDATE fleet_result_outbox
+            SET delivery_lease_until = datetime('now', ?1)
+          WHERE rowid IN (
+              SELECT rowid FROM fleet_result_outbox
+               WHERE status = 'ready'
+                 AND callback_kind = 'MarketStandard'
+                 AND (delivery_lease_until IS NULL
+                      OR delivery_lease_until < datetime('now'))
+                 AND (delivery_next_attempt_at IS NULL
+                      OR delivery_next_attempt_at <= datetime('now'))
+               ORDER BY created_at ASC
+               LIMIT ?2
+          )
+        RETURNING {}",
+        // Same column order as OUTBOX_SELECT_PROJECTION_* consts so the
+        // shared map_outbox_row helper materializes rows unchanged.
+        "dispatcher_node_id, job_id, status, callback_url, result_json, \
+         delivery_attempts, last_attempt_at, expires_at, created_at, \
+         callback_auth_token, delivery_lease_until, delivery_next_attempt_at, \
+         inference_latency_ms, request_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let max_i64: i64 = max_concurrent_deliveries.min(i64::MAX as u64) as i64;
+    let rows = stmt
+        .query_map(rusqlite::params![lease_mod, max_i64], map_outbox_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Terminal-write CAS: promote `pending → failed` OR `ready → failed`
+/// (both source states permitted — malformed envelope can be discovered
+/// on a pending row if the worker wrote a bad result_json before promote,
+/// though in practice every terminal path reaches this helper via a
+/// `ready` row). Writes `last_error` + `failed` + clears lease/next-attempt
+/// columns + stamps `expires_at`.
+///
+/// Rowcount=0 means the row transitioned away from (pending|ready)
+/// between our decision to terminal-fail and this CAS — usually the
+/// sweep promoted ready→failed first OR mark_delivered_if_ready won
+/// first. Log, do not error.
+pub fn market_outbox_mark_failed_with_error_cas(
+    conn: &Connection,
+    dispatcher_node_id: &str,
+    job_id: &str,
+    last_error: &str,
+    failed_retention_secs: u64,
+) -> Result<usize> {
+    let modifier = format!("+{} seconds", failed_retention_secs);
+    let n = conn.execute(
+        "UPDATE fleet_result_outbox
+            SET status = 'failed',
+                last_error = ?3,
+                last_attempt_at = datetime('now'),
+                expires_at = datetime('now', ?4),
+                delivery_lease_until = NULL,
+                delivery_next_attempt_at = NULL
+          WHERE dispatcher_node_id = ?1 AND job_id = ?2
+            AND status IN ('pending', 'ready')",
+        rusqlite::params![dispatcher_node_id, job_id, last_error, modifier],
+    )?;
+    Ok(n)
+}
+
+/// Transient-failure bookkeeping: bump `delivery_attempts`, stash
+/// `last_error`, clear the lease so the row is claimable again after the
+/// backoff window elapses, and set `delivery_next_attempt_at = now +
+/// backoff_secs` to gate the next claim.
+///
+/// Gated on `status = 'ready'` so a concurrent sweep transition doesn't
+/// pollute the attempt counter. Rowcount=0 is acceptable (terminal
+/// transition won the race).
+pub fn market_outbox_bump_attempt_with_backoff(
+    conn: &Connection,
+    dispatcher_node_id: &str,
+    job_id: &str,
+    last_error: &str,
+    backoff_secs: u64,
+) -> Result<usize> {
+    let backoff_mod = format!("+{} seconds", backoff_secs);
+    let n = conn.execute(
+        "UPDATE fleet_result_outbox
+            SET delivery_attempts = delivery_attempts + 1,
+                last_error = ?3,
+                last_attempt_at = datetime('now'),
+                delivery_lease_until = NULL,
+                delivery_next_attempt_at = datetime('now', ?4)
+          WHERE dispatcher_node_id = ?1 AND job_id = ?2
+            AND status = 'ready'",
+        rusqlite::params![dispatcher_node_id, job_id, last_error, backoff_mod],
+    )?;
+    Ok(n)
+}
+
+/// Startup recovery for the market delivery worker. Clears stale
+/// `delivery_lease_until` on all `ready` MarketStandard/Relay rows at
+/// boot — a prior process that died mid-POST would leave the lease stamp
+/// in place, and the new process would wait the full lease window before
+/// reclaiming. Clearing on boot makes reclaim immediate.
+///
+/// Does NOT clear `delivery_next_attempt_at` — backoff across restarts
+/// is correct behavior (a Wire blip doesn't resolve just because the
+/// node rebooted). Returns rowcount for observability.
+pub fn market_outbox_delivery_startup_recovery(conn: &Connection) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE fleet_result_outbox
+            SET delivery_lease_until = NULL
+          WHERE status = 'ready'
+            AND callback_kind IN ('MarketStandard', 'Relay')
+            AND delivery_lease_until IS NOT NULL",
+        [],
+    )?;
+    Ok(n)
+}
+
+/// Returns the `applied_at` timestamp for a named migration in
+/// `pyramid_schema_versions`, if present. Used by the delivery worker's
+/// `row_predates_migration` helper to distinguish deploy-artifact orphans
+/// (NULL `callback_auth_token` on a row whose `created_at` is before the
+/// migration's apply-time) from genuine token-plumbing bugs.
+pub fn pyramid_schema_version_applied_at(
+    conn: &Connection,
+    name: &str,
+) -> Result<Option<String>> {
+    match conn.query_row(
+        "SELECT applied_at FROM pyramid_schema_versions WHERE name = ?1",
+        rusqlite::params![name],
+        |r| r.get::<_, String>(0),
+    ) {
+        Ok(s) => Ok(Some(s)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub fn synthesize_worker_error_json(msg: &str) -> String {
     // `serde_json::to_string` on a `&str` yields the properly-escaped,
     // quoted JSON string literal — we splice that directly into the object
@@ -19822,6 +20020,8 @@ mod phase17_tests {
             "https://wire.example.com/v1/compute/result-relay",
             "MarketStandard",
             &expires,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(n, 1, "fresh insert returns rowcount=1");
@@ -19853,6 +20053,8 @@ mod phase17_tests {
             "https://wire.example.com/v1/compute/result-relay",
             "MarketStandard",
             &expires,
+            None,
+            None,
         )
         .unwrap();
         let n = market_outbox_insert_or_ignore(
@@ -19861,6 +20063,8 @@ mod phase17_tests {
             "https://wire.example.com/v1/compute/result-relay",
             "MarketStandard",
             &expires,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(n, 0, "duplicate insert returns rowcount=0");
@@ -19878,6 +20082,8 @@ mod phase17_tests {
             "https://relay-hop-7.example.com/r/inbound",
             "Relay",
             &expires,
+            None,
+            None,
         )
         .unwrap();
         let kind: String = conn
@@ -19904,11 +20110,11 @@ mod phase17_tests {
         fleet_outbox_insert_or_ignore(&conn, "dispA", "fleet-j2", "https://x/cb", &expires)
             .unwrap();
         // Two MarketStandard + one Relay row.
-        market_outbox_insert_or_ignore(&conn, "mkt-j1", "https://w/cb", "MarketStandard", &expires)
+        market_outbox_insert_or_ignore(&conn, "mkt-j1", "https://w/cb", "MarketStandard", &expires, None, None)
             .unwrap();
-        market_outbox_insert_or_ignore(&conn, "mkt-j2", "https://w/cb", "MarketStandard", &expires)
+        market_outbox_insert_or_ignore(&conn, "mkt-j2", "https://w/cb", "MarketStandard", &expires, None, None)
             .unwrap();
-        market_outbox_insert_or_ignore(&conn, "rly-j1", "https://r/cb", "Relay", &expires)
+        market_outbox_insert_or_ignore(&conn, "rly-j1", "https://r/cb", "Relay", &expires, None, None)
             .unwrap();
         // Excluding mkt-j1 — count should see mkt-j2 + rly-j1 = 2.
         let n = market_outbox_count_inflight_excluding(
@@ -19936,11 +20142,11 @@ mod phase17_tests {
         // consume the admission budget.
         let conn = outbox_conn();
         let expires = future_expires();
-        market_outbox_insert_or_ignore(&conn, "mkt-j1", "https://w/cb", "MarketStandard", &expires)
+        market_outbox_insert_or_ignore(&conn, "mkt-j1", "https://w/cb", "MarketStandard", &expires, None, None)
             .unwrap();
-        market_outbox_insert_or_ignore(&conn, "mkt-j2", "https://w/cb", "MarketStandard", &expires)
+        market_outbox_insert_or_ignore(&conn, "mkt-j2", "https://w/cb", "MarketStandard", &expires, None, None)
             .unwrap();
-        market_outbox_insert_or_ignore(&conn, "mkt-j3", "https://w/cb", "MarketStandard", &expires)
+        market_outbox_insert_or_ignore(&conn, "mkt-j3", "https://w/cb", "MarketStandard", &expires, None, None)
             .unwrap();
         // Promote one to delivered, one to failed.
         conn.execute(
@@ -19994,6 +20200,8 @@ mod phase17_tests {
             "https://wire.example/v1/compute/result-relay",
             "MarketStandard",
             &expires,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -20037,6 +20245,8 @@ mod phase17_tests {
             "https://w/cb",
             "MarketStandard",
             "1970-01-01 00:00:00",
+            None,
+            None,
         )
         .unwrap();
         market_outbox_insert_or_ignore(
@@ -20045,6 +20255,8 @@ mod phase17_tests {
             "https://r/cb",
             "Relay",
             "1970-01-01 00:00:00",
+            None,
+            None,
         )
         .unwrap();
         // Unexpired market row — must NOT be returned.
@@ -20054,6 +20266,8 @@ mod phase17_tests {
             "https://w/cb",
             "MarketStandard",
             "9999-12-31 23:59:59",
+            None,
+            None,
         )
         .unwrap();
 
@@ -20088,7 +20302,7 @@ mod phase17_tests {
             rusqlite::params![&expires],
         )
         .unwrap();
-        market_outbox_insert_or_ignore(&conn, "mkt-row", "https://w/cb", "MarketStandard", &expires)
+        market_outbox_insert_or_ignore(&conn, "mkt-row", "https://w/cb", "MarketStandard", &expires, None, None)
             .unwrap();
         conn.execute(
             "UPDATE fleet_result_outbox
@@ -20137,7 +20351,7 @@ mod phase17_tests {
         // past. A row at 4 with max=5 remains untouched.
         let conn = outbox_conn();
         let expires = future_expires();
-        market_outbox_insert_or_ignore(&conn, "mkt-below", "https://w/cb", "MarketStandard", &expires)
+        market_outbox_insert_or_ignore(&conn, "mkt-below", "https://w/cb", "MarketStandard", &expires, None, None)
             .unwrap();
         conn.execute(
             "UPDATE fleet_result_outbox
@@ -20172,7 +20386,7 @@ mod phase17_tests {
         fleet_outbox_insert_or_ignore(&conn, "dispA", "fleet-ready", "https://x/cb", &expires).unwrap();
         fleet_outbox_promote_ready_if_pending(&conn, "dispA", "fleet-ready", "{}", 60).unwrap();
         // Ready Market row — MUST be returned.
-        market_outbox_insert_or_ignore(&conn, "mkt-ready", "https://w/cb", "MarketStandard", &expires)
+        market_outbox_insert_or_ignore(&conn, "mkt-ready", "https://w/cb", "MarketStandard", &expires, None, None)
             .unwrap();
         conn.execute(
             "UPDATE fleet_result_outbox
@@ -20184,7 +20398,7 @@ mod phase17_tests {
         )
         .unwrap();
         // Pending market row — must NOT be returned (only ready).
-        market_outbox_insert_or_ignore(&conn, "mkt-pending", "https://w/cb", "MarketStandard", &expires)
+        market_outbox_insert_or_ignore(&conn, "mkt-pending", "https://w/cb", "MarketStandard", &expires, None, None)
             .unwrap();
 
         let rows = market_outbox_retry_candidates(&conn).unwrap();

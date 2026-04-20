@@ -68,12 +68,28 @@ use crate::pyramid::tunnel_url::TunnelUrl;
 /// Per contract §2.1 rev 1.5 — `callback_auth: {"type": "bearer",
 /// "token": "<opaque>"}`. The `type` JSON key is renamed from the
 /// Rust-reserved `type` to `kind` via serde rename.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `Debug` is implemented manually below to redact `token` — preventing
+/// the bearer from leaking through any `tracing::warn!("{:?}", req)`
+/// site or chronicle metadata that serializes the full request body.
+/// The token is single-use-per-job but enables forged deliveries if
+/// exfiltrated; redaction in Debug is defense-in-depth. Phase 3 spec
+/// §"Token redaction."
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CallbackAuth {
     #[serde(rename = "type")]
     pub kind: String,
     pub token: String,
+}
+
+impl std::fmt::Debug for CallbackAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallbackAuth")
+            .field("kind", &self.kind)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

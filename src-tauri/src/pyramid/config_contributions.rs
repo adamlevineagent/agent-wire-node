@@ -3629,7 +3629,10 @@ mod tests {
                           match_search_fee: 5\n\
                           offer_creation_fee: 3\n\
                           queue_push_fee: 2\n\
-                          queue_mirror_debounce_ms: 1000\n";
+                          queue_mirror_debounce_ms: 1000\n\
+                          lease_grace_secs: 10\n\
+                          max_concurrent_deliveries: 8\n\
+                          max_error_message_chars: 2048\n";
         let id2 = create_config_contribution_with_metadata(
             &conn,
             "market_delivery_policy",

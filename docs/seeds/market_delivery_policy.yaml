@@ -77,3 +77,18 @@ queue_push_fee: 1
 # Milliseconds debounce on queue mirror pushes. Matches DD-9 economic-gate
 # intent — avoid charging per individual queue mutation.
 queue_mirror_debounce_ms: 500
+
+# ── Phase 3 provider delivery worker ───────────────────────────────────
+# Added to callback_post_timeout_secs to form the lease duration during a
+# delivery POST. Operator-tunable because the right grace depends on
+# network jitter characteristics (Pillar 37 spirit).
+lease_grace_secs: 5
+
+# Max concurrent POSTs per delivery-loop tick. Bounded fan-in per Pillar 44
+# spirit — prevents head-of-line blocking when N>1 ready rows race.
+max_concurrent_deliveries: 4
+
+# Truncation cap for error messages persisted to last_error + chronicle.
+# Balances "enough to debug a reqwest error" with "chronicle doesn't fill
+# up with multi-KB TLS stack dumps."
+max_error_message_chars: 1024

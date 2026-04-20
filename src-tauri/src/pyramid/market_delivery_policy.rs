@@ -71,6 +71,28 @@ pub struct MarketDeliveryPolicy {
     pub offer_creation_fee: u64,
     pub queue_push_fee: u64,
     pub queue_mirror_debounce_ms: u64,
+
+    // ── Phase 3 provider delivery worker ─────────────────────────────────────
+    /// Added to `callback_post_timeout_secs` to form the total lease
+    /// duration during a delivery POST. Rev 0.3-0.5 audit promoted this
+    /// from a hardcoded `+5` to a policy field (Pillar 37 spirit) — the
+    /// right grace depends on network jitter characteristics and operators
+    /// may want to tune it.
+    pub lease_grace_secs: u64,
+
+    /// Max concurrent POSTs per delivery-loop tick. Bounded fan-in per
+    /// Pillar 44 spirit. With N ready rows and K = max_concurrent_deliveries,
+    /// the tick dispatches K POSTs in parallel; remaining rows wait for the
+    /// next tick (or the next nudge). Prevents head-of-line blocking under
+    /// pathological load where a single slow POST would gate all others.
+    pub max_concurrent_deliveries: u64,
+
+    /// Truncation cap for error messages written to `last_error` + chronicle
+    /// metadata. Operator-tunable because chronicle verbosity is an
+    /// operational concern. Default 1024 is a sane compromise between "enough
+    /// to debug a reqwest error" and "not filling pyramid_compute_events
+    /// with multi-KB TLS stack dumps."
+    pub max_error_message_chars: u64,
 }
 
 impl Default for MarketDeliveryPolicy {
@@ -104,6 +126,11 @@ impl Default for MarketDeliveryPolicy {
             offer_creation_fee: 1,
             queue_push_fee: 1,
             queue_mirror_debounce_ms: 500,
+
+            // Phase 3 provider delivery worker
+            lease_grace_secs: 5,
+            max_concurrent_deliveries: 4,
+            max_error_message_chars: 1024,
         }
     }
 }
@@ -262,6 +289,9 @@ match_search_fee: 1
 offer_creation_fee: 1
 queue_push_fee: 1
 queue_mirror_debounce_ms: 500
+lease_grace_secs: 5
+max_concurrent_deliveries: 4
+max_error_message_chars: 1024
 # The typo below is what deny_unknown_fields catches.
 bogus_field_that_does_not_exist: 42
 "#;

@@ -103,6 +103,23 @@ pub const EVENT_QUEUE_MIRROR_PUSH_FAILED: &str = "queue_mirror_push_failed";
 pub const EVENT_MIRROR_TASK_PANICKED: &str = "market_mirror_task_panicked";
 pub const EVENT_MIRROR_TASK_EXITED: &str = "market_mirror_task_exited";
 
+// Phase 3 provider-delivery worker events. Node-side only — Wire's
+// chronicle has its own `compute_result_delivered` for the Wire→requester
+// hop, which we avoid colliding with by keeping this prefix `market_*`
+// matching the existing compute_chronicle.rs taxonomy.
+//
+// Emission sites are all in `pyramid::market_delivery` + the integration
+// points in server.rs (spawn_market_worker) and fleet_outbox_sweep.rs
+// (heartbeat-lost path).
+pub const EVENT_MARKET_RESULT_DELIVERED_TO_WIRE: &str = "market_result_delivered_to_wire";
+pub const EVENT_MARKET_RESULT_DELIVERY_CAS_LOST: &str = "market_result_delivery_cas_lost";
+pub const EVENT_MARKET_RESULT_DELIVERY_ATTEMPT_FAILED: &str =
+    "market_result_delivery_attempt_failed";
+pub const EVENT_MARKET_RESULT_DELIVERY_FAILED: &str = "market_result_delivery_failed";
+pub const EVENT_MARKET_DELIVERY_TASK_PANICKED: &str = "market_delivery_task_panicked";
+pub const EVENT_MARKET_DELIVERY_TASK_EXITED: &str = "market_delivery_task_exited";
+pub const EVENT_MARKET_WIRE_PARAMETERS_UPDATED: &str = "market_wire_parameters_updated";
+
 // Market sweep companions to the fleet sweep events (Phase 2 WS6).
 // Emitted by the market outbox sweep loop in
 // `pyramid::fleet_outbox_sweep::market_outbox_sweep_loop` when a market
