@@ -21256,4 +21256,123 @@ mod rev061_leg_helpers_tests {
             "settlement_next_attempt_at must NOT be cleared by startup recovery"
         );
     }
+
+    // Spec test 4 (DB layer) — `content_leg_exhausts_settlement_unaffected`:
+    // after the content leg fails its budget and settlement has already
+    // posted 2xx, the row's terminal state is `failed` + last_error prefixed
+    // `failed_content_only:` (the tag market_delivery::terminal_leg_fail
+    // composes). Settlement-side columns remain the success trace; content-
+    // side columns carry the error message. This test directly simulates
+    // the post-leg-outcomes column shape and verifies the CAS path preserves
+    // the mixed-terminal classification. Full tick-level HTTP coverage is
+    // deferred to the integration harness — DB-state invariants covered here.
+    #[test]
+    fn content_exhausted_while_settlement_ok_mark_failed_preserves_classification() {
+        let conn = mem_conn();
+        let rowid = ready_market_row(&conn, "mkt-cx-sok");
+        // Settlement succeeded: posted_ok=1. Content exhausted: posted_ok=0,
+        // content_last_error set.
+        assert!(market_outbox_mark_settlement_posted_ok_if_ready(&conn, rowid).unwrap());
+        market_outbox_bump_content_attempt_with_backoff(&conn, rowid, 0, "content 503 × N").unwrap();
+        // Terminal CAS with the composed last_error the delivery worker emits.
+        let composed = "failed_content_only: content 503 × N (max_attempts_content exceeded)";
+        let n = market_outbox_mark_failed_with_error_cas(
+            &conn, "wire-platform", "mkt-cx-sok", composed, 3600,
+        )
+        .unwrap();
+        assert_eq!(n, 1, "terminal CAS must flip one row");
+        let (status, last_err, content_ok, settlement_ok): (
+            String, Option<String>, i64, i64,
+        ) = conn
+            .query_row(
+                "SELECT status, last_error, content_posted_ok, settlement_posted_ok
+                   FROM fleet_result_outbox WHERE rowid = ?1",
+                rusqlite::params![rowid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert!(
+            last_err.as_deref().unwrap_or("").starts_with("failed_content_only:"),
+            "last_error must carry the mixed-terminal prefix; got: {last_err:?}"
+        );
+        assert_eq!(content_ok, 0, "content leg never posted ok");
+        assert_eq!(settlement_ok, 1, "settlement leg must remain marked posted_ok=1");
+    }
+
+    // Spec test 5 (DB layer) — inverse of the content-exhausted test.
+    // Settlement exhausts, content succeeded. Row ends `failed_settlement_only:`.
+    #[test]
+    fn settlement_exhausted_while_content_ok_mark_failed_preserves_classification() {
+        let conn = mem_conn();
+        let rowid = ready_market_row(&conn, "mkt-cok-sx");
+        assert!(market_outbox_mark_content_posted_ok_if_ready(&conn, rowid).unwrap());
+        market_outbox_bump_settlement_attempt_with_backoff(&conn, rowid, 0, "settle 503 × N").unwrap();
+        let composed = "failed_settlement_only: settle 503 × N (max_attempts_settlement exceeded)";
+        let n = market_outbox_mark_failed_with_error_cas(
+            &conn, "wire-platform", "mkt-cok-sx", composed, 3600,
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        let (status, last_err, content_ok, settlement_ok): (
+            String, Option<String>, i64, i64,
+        ) = conn
+            .query_row(
+                "SELECT status, last_error, content_posted_ok, settlement_posted_ok
+                   FROM fleet_result_outbox WHERE rowid = ?1",
+                rusqlite::params![rowid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert!(
+            last_err.as_deref().unwrap_or("").starts_with("failed_settlement_only:"),
+            "last_error must carry the mixed-terminal prefix; got: {last_err:?}"
+        );
+        assert_eq!(content_ok, 1);
+        assert_eq!(settlement_ok, 0);
+    }
+
+    // Spec test 6 (DB layer) — `both_legs_exhaust_row_failed`. Neither leg
+    // posted_ok; both carry error text. Terminal CAS with the `failed_both:`
+    // prefix must flip the row to `failed` and preserve the summary text.
+    #[test]
+    fn both_legs_exhaust_mark_failed_both_preserves_classification() {
+        let conn = mem_conn();
+        let rowid = ready_market_row(&conn, "mkt-both-exhaust");
+        // Simulate exhaustion on both legs — per-leg error columns set,
+        // posted_ok flags remain 0.
+        market_outbox_bump_content_attempt_with_backoff(&conn, rowid, 0, "content 503").unwrap();
+        market_outbox_bump_settlement_attempt_with_backoff(&conn, rowid, 0, "settle 503").unwrap();
+        // `check_both_legs_complete_and_mark_delivered` must NOT transition
+        // the row (neither leg succeeded) — guard the failure-path invariant.
+        assert!(
+            !market_outbox_check_both_legs_complete_and_mark_delivered(&conn, rowid, 3600).unwrap(),
+            "row with both legs 0 must never transition to delivered"
+        );
+        let composed = "failed_both: content 503 (max_attempts_content exceeded)";
+        let n = market_outbox_mark_failed_with_error_cas(
+            &conn, "wire-platform", "mkt-both-exhaust", composed, 3600,
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        let (status, last_err, cerr, serr): (
+            String, Option<String>, Option<String>, Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT status, last_error, content_last_error, settlement_last_error
+                   FROM fleet_result_outbox WHERE rowid = ?1",
+                rusqlite::params![rowid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert!(
+            last_err.as_deref().unwrap_or("").starts_with("failed_both:"),
+            "last_error must carry failed_both prefix; got: {last_err:?}"
+        );
+        // Per-leg error trails preserved for diagnostics.
+        assert_eq!(cerr.as_deref(), Some("content 503"));
+        assert_eq!(serr.as_deref(), Some("settle 503"));
+    }
 }

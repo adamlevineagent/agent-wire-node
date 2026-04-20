@@ -583,6 +583,90 @@ mod tests {
             "expected error to mention the unknown field; got: {msg}");
     }
 
+    // Spec test 18 — `pre_rev_2_0_dispatch_missing_fields_400s`: a dispatch
+    // body lacking `requester_callback_url` (pre-rev-2.0 Wire shape) must
+    // fail serde's required-field validation. The admission handler maps
+    // this failure to a 400 `requester_callback_url_missing_or_invalid`.
+    // This test guards the serde-enforced half of that contract — the
+    // required-field gate cannot regress silently.
+    #[test]
+    fn market_dispatch_request_rejects_missing_requester_callback_url() {
+        let json_missing = r#"{
+            "job_id": "job-pre-rev2",
+            "model_id": "gemma3:27b",
+            "offer_id": "playful/106/1",
+            "matched_multiplier_bps": 10000,
+            "messages": [{"role": "user", "content": "hi"}],
+            "callback_url": "https://wire.example.com/v1/compute/settle/x",
+            "callback_auth": {"type": "bearer", "token": "t"},
+            "requester_delivery_jwt": "opaque",
+            "privacy_tier": "standard",
+            "timeout_ms": 5000
+        }"#;
+        let err = serde_json::from_str::<MarketDispatchRequest>(json_missing);
+        assert!(err.is_err(),
+            "missing requester_callback_url must be rejected by serde; got {:?}", err);
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("requester_callback_url") || msg.contains("missing field"),
+            "expected error to mention the missing field; got: {msg}");
+    }
+
+    // Spec test 18 corollary — same guard for the sibling required field
+    // `requester_delivery_jwt`. Pre-rev-2.0 Wire dispatches won't carry
+    // either; omitting this one must also 400 at admission via serde.
+    #[test]
+    fn market_dispatch_request_rejects_missing_requester_delivery_jwt() {
+        let json_missing = r#"{
+            "job_id": "job-pre-rev2",
+            "model_id": "gemma3:27b",
+            "offer_id": "playful/106/1",
+            "matched_multiplier_bps": 10000,
+            "messages": [{"role": "user", "content": "hi"}],
+            "callback_url": "https://wire.example.com/v1/compute/settle/x",
+            "callback_auth": {"type": "bearer", "token": "t"},
+            "requester_callback_url": "https://newsbleach.example/cb/x",
+            "privacy_tier": "standard",
+            "timeout_ms": 5000
+        }"#;
+        let err = serde_json::from_str::<MarketDispatchRequest>(json_missing);
+        assert!(err.is_err(),
+            "missing requester_delivery_jwt must be rejected by serde; got {:?}", err);
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("requester_delivery_jwt") || msg.contains("missing field"),
+            "expected error to mention the missing field; got: {msg}");
+    }
+
+    // Spec test 19 (serde half) — `privacy_tier_bootstrap_relay_not_rejected`:
+    // the legacy `"bootstrap-relay"` value is a free-form string, not an
+    // enum, and must round-trip cleanly through the dispatch struct.
+    // `handle_market_dispatch` then applies the warn-don't-reject branch
+    // (Q-PROTO-3) and emits the `market_unknown_privacy_tier` chronicle
+    // event — that admission-handler behavior is an integration concern and
+    // is covered by the handler's unit-of-work wiring tests. This narrow
+    // serde test guards the "not rejected at parse time" half of the
+    // contract so a future `#[serde(deny_unknown_variants)]` or enum tightening
+    // can't silently break zero-lockstep compatibility with an older Wire.
+    #[test]
+    fn market_dispatch_request_accepts_legacy_privacy_tier_bootstrap_relay() {
+        let json_bootstrap = r#"{
+            "job_id": "job-bootstrap",
+            "model_id": "gemma3:27b",
+            "offer_id": "playful/106/1",
+            "matched_multiplier_bps": 10000,
+            "messages": [{"role": "user", "content": "hi"}],
+            "callback_url": "https://wire.example.com/v1/compute/settle/x",
+            "callback_auth": {"type": "bearer", "token": "t"},
+            "requester_callback_url": "https://newsbleach.example/cb/x",
+            "requester_delivery_jwt": "opaque",
+            "privacy_tier": "bootstrap-relay",
+            "timeout_ms": 5000
+        }"#;
+        let parsed = serde_json::from_str::<MarketDispatchRequest>(json_bootstrap)
+            .expect("legacy privacy_tier='bootstrap-relay' must parse — warn-don't-reject per Q-PROTO-3");
+        assert_eq!(parsed.privacy_tier, "bootstrap-relay",
+            "legacy tier string must round-trip verbatim, not be normalized");
+    }
+
     #[test]
     fn market_dispatch_request_roundtrips_full() {
         let req = MarketDispatchRequest {
