@@ -2556,10 +2556,18 @@ async fn handle_compute_job_result(
     // the raw header value including the prefix). The verifier itself also
     // handles this, but stripping here keeps the tracing log clean.
     let jwt_pk = state.jwt_public_key.read().await.clone();
-    let self_operator_id = state.auth.read().await.user_id.clone().unwrap_or_default();
+    // Wire mints the requester-delivery JWT with `rid=<requester_operator_id>`
+    // (contract §3.4, line 634). The node's `AuthState` has both `user_id`
+    // (Supabase Auth UUID — from OAuth login) and `operator_id` (Wire
+    // operator identity — populated by `register_with_session` response).
+    // The `rid` claim binds to `operator_id`, not `user_id`. Prior rev-0.5
+    // code here read `user_id` — pre-existing bug (would 401 every
+    // legitimate token); fixed in rev 2.0 cutover to match the fleet
+    // identity verifier pattern (server.rs:1589) + pyramid query verifier.
+    let self_operator_id = state.auth.read().await.operator_id.clone().unwrap_or_default();
     if self_operator_id.is_empty() {
         tracing::warn!(
-            "compute_job_result: local operator_id empty (not authenticated); cannot verify JWT"
+            "compute_job_result: local operator_id empty (not registered with Wire); cannot verify JWT"
         );
         return Ok(Box::new(warp::reply::with_status(
             warp::reply::json(&serde_json::json!({
