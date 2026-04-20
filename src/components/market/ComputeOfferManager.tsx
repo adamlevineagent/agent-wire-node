@@ -257,6 +257,194 @@ function MirrorHealth() {
     );
 }
 
+/**
+ * Delivery health indicator — the market_delivery.rs worker's status as
+ * seen by the operator, parallel to MirrorHealth above.
+ *
+ * Reads the node's local chronicle for delivery events and renders the
+ * most recent outcome. Pillar 42: every backend feature gets a frontend
+ * surface so operators can test by feel, not by curl.
+ *
+ *   green  — "Delivered N job(s) to Wire Ns ago" (recent success)
+ *   green  — "Delivery worker idle (no rows waiting)" (steady state)
+ *   yellow — "Retrying N job(s)" (transient failures in the last hour)
+ *   red    — "Delivery task panicked (supervisor respawned)"
+ *   red    — "Delivery task exited — restart node"
+ *   red    — "Last delivery failed: <reason>" (terminal failure)
+ */
+function DeliveryHealth() {
+    const [state, setState] = useState<
+        | { kind: "loading" }
+        | { kind: "idle" }
+        | { kind: "delivered"; ageSecs: number; count24h: number }
+        | { kind: "retrying"; attemptFailedCount: number }
+        | { kind: "failed"; reason: string; ageSecs: number }
+        | { kind: "panicked"; message: string; ageSecs: number }
+        | { kind: "exited"; ageSecs: number }
+    >({ kind: "loading" });
+
+    const refresh = useCallback(async () => {
+        try {
+            const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+            const sinceHr = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+
+            // Parallel fetch of all event types we care about. Lifecycle
+            // events have small limits (just need latest). The delivered +
+            // retrying series use slightly larger windows for counts.
+            const [delivered, attemptFailed, terminalFailed, panicked, exited] =
+                await Promise.all([
+                    invoke<MirrorHealthEvent[]>("get_compute_events", {
+                        eventType: "market_result_delivered_to_wire",
+                        after: since24h,
+                        limit: 50,
+                    }).catch(() => [] as MirrorHealthEvent[]),
+                    invoke<MirrorHealthEvent[]>("get_compute_events", {
+                        eventType: "market_result_delivery_attempt_failed",
+                        after: sinceHr,
+                        limit: 50,
+                    }).catch(() => [] as MirrorHealthEvent[]),
+                    invoke<MirrorHealthEvent[]>("get_compute_events", {
+                        eventType: "market_result_delivery_failed",
+                        after: since24h,
+                        limit: 1,
+                    }).catch(() => [] as MirrorHealthEvent[]),
+                    invoke<MirrorHealthEvent[]>("get_compute_events", {
+                        eventType: "market_delivery_task_panicked",
+                        after: sinceHr,
+                        limit: 1,
+                    }).catch(() => [] as MirrorHealthEvent[]),
+                    invoke<MirrorHealthEvent[]>("get_compute_events", {
+                        eventType: "market_delivery_task_exited",
+                        after: since24h,
+                        limit: 1,
+                    }).catch(() => [] as MirrorHealthEvent[]),
+                ]);
+
+            // Precedence: panic/exit always win (they indicate task
+            // malfunction). Then recent terminal failures. Then retrying
+            // (if count > 0). Then delivered recency. Then idle.
+            const ageOf = (iso: string | undefined): number =>
+                iso
+                    ? Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000))
+                    : Number.POSITIVE_INFINITY;
+
+            if (panicked.length > 0) {
+                const msg =
+                    typeof panicked[0].metadata?.message === "string"
+                        ? panicked[0].metadata.message
+                        : "panic";
+                setState({ kind: "panicked", message: msg, ageSecs: ageOf(panicked[0].timestamp) });
+                return;
+            }
+            // An "exited" event means the loop hit clean channel-close;
+            // supervisor returned. If a "delivered" event fires more recently,
+            // the supervisor came back up (shouldn't happen; channel drop
+            // is process-lifetime-scoped) — show delivered. Otherwise, red.
+            if (exited.length > 0) {
+                const exitAge = ageOf(exited[0].timestamp);
+                const lastDeliveryAge =
+                    delivered.length > 0 ? ageOf(delivered[0].timestamp) : Number.POSITIVE_INFINITY;
+                if (exitAge < lastDeliveryAge) {
+                    setState({ kind: "exited", ageSecs: exitAge });
+                    return;
+                }
+            }
+            if (terminalFailed.length > 0 && ageOf(terminalFailed[0].timestamp) < 300) {
+                const reason =
+                    typeof terminalFailed[0].metadata?.reason === "string"
+                        ? terminalFailed[0].metadata.reason
+                        : "unknown";
+                setState({
+                    kind: "failed",
+                    reason,
+                    ageSecs: ageOf(terminalFailed[0].timestamp),
+                });
+                return;
+            }
+            if (attemptFailed.length > 0) {
+                // Transient retries in flight — surface the count for the
+                // last hour (same window as the fetch).
+                setState({
+                    kind: "retrying",
+                    attemptFailedCount: attemptFailed.length,
+                });
+                return;
+            }
+            if (delivered.length > 0) {
+                setState({
+                    kind: "delivered",
+                    ageSecs: ageOf(delivered[0].timestamp),
+                    count24h: delivered.length,
+                });
+                return;
+            }
+            setState({ kind: "idle" });
+        } catch {
+            setState({ kind: "idle" });
+        }
+    }, []);
+
+    useEffect(() => {
+        void refresh();
+        const handle = setInterval(() => void refresh(), 15000);
+        return () => clearInterval(handle);
+    }, [refresh]);
+
+    if (state.kind === "loading") return null;
+    if (state.kind === "idle") {
+        return (
+            <div className="compute-mirror-health compute-mirror-health-neutral">
+                Delivery: no jobs delivered yet
+            </div>
+        );
+    }
+    if (state.kind === "delivered") {
+        return (
+            <div
+                className="compute-mirror-health compute-mirror-health-green"
+                title={`${state.count24h} delivery events in last 24h`}
+            >
+                Delivered {formatAge(state.ageSecs)} ago ({state.count24h}/24h)
+            </div>
+        );
+    }
+    if (state.kind === "retrying") {
+        return (
+            <div
+                className="compute-mirror-health compute-mirror-health-yellow"
+                title="Transient delivery failures (5xx, network) in the last hour"
+            >
+                Delivery retrying — {state.attemptFailedCount} attempt(s) failed in last hour
+            </div>
+        );
+    }
+    if (state.kind === "failed") {
+        return (
+            <div
+                className="compute-mirror-health compute-mirror-health-red"
+                title={state.reason}
+            >
+                Last delivery failed ({formatAge(state.ageSecs)} ago): {state.reason}
+            </div>
+        );
+    }
+    if (state.kind === "panicked") {
+        return (
+            <div
+                className="compute-mirror-health compute-mirror-health-red"
+                title={state.message}
+            >
+                Delivery task panicked ({formatAge(state.ageSecs)} ago) — supervisor respawned
+            </div>
+        );
+    }
+    return (
+        <div className="compute-mirror-health compute-mirror-health-red">
+            Delivery task exited ({formatAge(state.ageSecs)} ago) — restart node
+        </div>
+    );
+}
+
 export function ComputeOfferManager() {
     const [offers, setOffers] = useState<ComputeOffer[]>([]);
     const [loading, setLoading] = useState(true);
@@ -418,6 +606,17 @@ export function ComputeOfferManager() {
                     {error}
                 </div>
             )}
+
+            {/* Phase 3: two provider-path health indicators at the top of
+                the offers panel. MirrorHealth surfaces the queue-mirror
+                push loop (how Wire sees your queue depth); DeliveryHealth
+                surfaces the result-callback loop (how Wire receives your
+                inference results). Each refreshes every 15s against the
+                local chronicle. */}
+            <div className="compute-offers-health-row">
+                <MirrorHealth />
+                <DeliveryHealth />
+            </div>
 
             <div className="compute-offers-header">
                 <div className="compute-offers-header-text">
