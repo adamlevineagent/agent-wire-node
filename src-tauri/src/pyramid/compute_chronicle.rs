@@ -111,6 +111,11 @@ pub const EVENT_MIRROR_TASK_EXITED: &str = "market_mirror_task_exited";
 // Emission sites are all in `pyramid::market_delivery` + the integration
 // points in server.rs (spawn_market_worker) and fleet_outbox_sweep.rs
 // (heartbeat-lost path).
+// Rev 0.5 (Wire-in-middle) — DEPRECATED for new emissions as of rev 0.6.1.
+// Constant kept so downstream chronicle queries can UNION the deprecated
+// name against its rev-0.6.1 replacements during the grandfathering window.
+// New code MUST NOT emit this event; the rev 0.6.1 delivery worker emits
+// `EVENT_MARKET_RESULT_DELIVERED` (both legs OK) instead.
 pub const EVENT_MARKET_RESULT_DELIVERED_TO_WIRE: &str = "market_result_delivered_to_wire";
 pub const EVENT_MARKET_RESULT_DELIVERY_CAS_LOST: &str = "market_result_delivery_cas_lost";
 pub const EVENT_MARKET_RESULT_DELIVERY_ATTEMPT_FAILED: &str =
@@ -119,6 +124,26 @@ pub const EVENT_MARKET_RESULT_DELIVERY_FAILED: &str = "market_result_delivery_fa
 pub const EVENT_MARKET_DELIVERY_TASK_PANICKED: &str = "market_delivery_task_panicked";
 pub const EVENT_MARKET_DELIVERY_TASK_EXITED: &str = "market_delivery_task_exited";
 pub const EVENT_MARKET_WIRE_PARAMETERS_UPDATED: &str = "market_wire_parameters_updated";
+
+// Phase 3 rev 0.6.1 (two-POST P2P delivery) — final taxonomy per spec §
+// "Chronicle events (rev 0.6 final taxonomy)". The delivery worker now owns
+// two independent legs (content → requester direct, settlement → Wire).
+// Events split into per-leg attempt/success/terminal + a final summary
+// event for both-legs-OK and a final dual-terminal for both-legs-dead.
+//
+// Emission sites live in `pyramid::market_delivery` (`deliver_leg` and
+// friends). The legacy `EVENT_MARKET_RESULT_DELIVERED_TO_WIRE` is kept in
+// this module purely for grandfathered chronicle rows; rev 0.6.1 code
+// path MUST NOT emit it (grep enforced at build time by the wanderer).
+pub const EVENT_MARKET_RESULT_DELIVERED: &str = "market_result_delivered";
+pub const EVENT_MARKET_CONTENT_LEG_SUCCEEDED: &str = "market_content_leg_succeeded";
+pub const EVENT_MARKET_SETTLEMENT_LEG_SUCCEEDED: &str = "market_settlement_leg_succeeded";
+pub const EVENT_MARKET_CONTENT_DELIVERY_ATTEMPT_FAILED: &str =
+    "market_content_delivery_attempt_failed";
+pub const EVENT_MARKET_SETTLEMENT_DELIVERY_ATTEMPT_FAILED: &str =
+    "market_settlement_delivery_attempt_failed";
+pub const EVENT_MARKET_CONTENT_DELIVERY_FAILED: &str = "market_content_delivery_failed";
+pub const EVENT_MARKET_SETTLEMENT_DELIVERY_FAILED: &str = "market_settlement_delivery_failed";
 
 // Market sweep companions to the fleet sweep events (Phase 2 WS6).
 // Emitted by the market outbox sweep loop in

@@ -1,71 +1,93 @@
-//! Phase 3 — Provider-side compute-market delivery worker.
+//! Phase 3 rev 0.6.1 — Provider-side compute-market delivery worker.
 //!
-//! Closes the last hop of the compute-market provider path: fleet outbox
-//! rows in state=`ready` get POSTed to Wire's callback URL, and CAS-promoted
-//! to `delivered` on 2xx. Before this existed, every provider dispatch
-//! completed inference locally and then abandoned the result — Wire's
-//! `wire_compute_jobs.delivery_status` stayed `pending` forever.
+//! Implements the two-POST P2P delivery state machine per contract rev 2.0
+//! (§2.3 + §2.6). After a market dispatch completes inference the provider
+//! node must independently land TWO POSTs, each with its own URL, Bearer
+//! token, and retry budget:
 //!
-//! Full spec: `docs/plans/compute-market-phase-3-provider-delivery-spec.md`
-//! (rev 0.5). Wire-side mirror plan at
-//! `GoodNewsEveryone/docs/plans/compute-market-phase-3-wire-side-build-plan-2026-04-20.md`.
+//!   * **Content leg** — provider → requester direct (§2.6). URL and bearer
+//!     come from the dispatch body: `requester_callback_url` +
+//!     `requester_delivery_jwt`. Body includes `result.content`. Failure
+//!     variant goes to the requester too (D4) so the requester can stop
+//!     polling rather than wait forever.
+//!   * **Settlement leg** — provider → Wire (§2.3). URL and bearer come
+//!     from the dispatch body too (`callback_url` + `callback_auth.token`).
+//!     Body is the §2.3 envelope with `result.content` OMITTED — Wire is
+//!     zero-storage for content (§2.4).
+//!
+//! Spec: `docs/plans/compute-market-phase-3-provider-delivery-spec.md`
+//! rev 0.6.1. Contract: `GoodNewsEveryone/docs/architecture/
+//! wire-node-compute-market-contract.md` §§2.3, 2.6, 3.4, 10.5.
 //!
 //! # Architecture
 //!
 //! - **Trigger model:** `tokio::select!` on (a) nudge-channel recv, (b)
-//!   periodic tick. Nudge fires at every ready-promotion site (worker
-//!   success, worker failure after the WS2 bug-fix, sweep heartbeat-lost
-//!   synth). Tick catches anything that missed a nudge or is past its
-//!   backoff window.
-//! - **Claim:** batched `UPDATE ... RETURNING *` returns up to
-//!   `max_concurrent_deliveries` rows per tick with the lease stamp
-//!   already applied (atomic — no TOCTOU).
-//! - **POST:** per-row, bounded-parallel via
-//!   `for_each_concurrent(max_concurrent_deliveries)`. Client configured
-//!   with `redirect(Policy::none())` so the bearer can't be cross-origin-
-//!   exfiltrated on a DNS compromise.
-//! - **Envelope adapter:** parses bare `MarketAsyncResult` (the shape
-//!   `server.rs::spawn_market_worker` + `db::synthesize_worker_error_json`
-//!   actually persist) into Wire's `CallbackEnvelope` shape per contract
-//!   §2.3. Job_id on the envelope is always `row.job_id` (UUID; never the
-//!   handle-path that lives in `callback_url`).
-//! - **Retry classification:** reads `X-Wire-Retry: never | transient |
-//!   backoff` header from Wire's non-2xx response; falls back to
-//!   HTTP-code enum (400/401/403/404/409/410/413) when header is absent
-//!   (pre-upgrade Wire).
+//!   periodic tick. Unchanged from rev 0.5.
+//! - **Claim:** per-tick the worker issues TWO claim queries — one for
+//!   content-leg eligibles, one for settlement-leg eligibles — via
+//!   `market_outbox_claim_content_for_delivery` and
+//!   `market_outbox_claim_settlement_for_delivery` (Wave 1A). Each leg's
+//!   claim asks for up to `max_concurrent_deliveries` rows; the combined
+//!   list is bounded-parallel POSTed at the `max_concurrent_deliveries`
+//!   cap. Per contract §2.6 concurrency note, the cap is UNIFIED across
+//!   legs (not per-leg) because both legs share the same outbound
+//!   HTTP/socket budget.
+//! - **POST:** `deliver_leg` is a pure per-leg function invoked twice per
+//!   row (once for each leg) in bounded-parallel `for_each_concurrent`.
+//!   Client config unchanged from rev 0.5: `redirect(Policy::none())`
+//!   + per-POST timeout so a bearer can't cross-origin-leak on a DNS
+//!   compromise.
+//! - **Envelope adapter split:** `build_content_envelope` produces the
+//!   §2.6 full shape (includes `result.content`); `build_settlement_envelope`
+//!   produces the §2.3 shape minus `result.content`. Failure variants are
+//!   identical across both (D4).
+//! - **Retry classification per leg:**
+//!     * Settlement leg reads `X-Wire-Retry` (Wire's protocol header per
+//!       §2.2) and falls back to terminal-HTTP-code enum for pre-upgrade
+//!       Wire.
+//!     * Content leg does NOT read `X-Wire-Retry` (arbitrary requester
+//!       HTTP doesn't standardize that header) — reads standard
+//!       `Retry-After` if present, falls back to the
+//!       `compute_delivery_policy.backoff_schedule_secs` table.
+//! - **Per-leg retry budget:** sourced from `compute_delivery_policy`
+//!   economic_parameter via `ComputeDeliveryPolicy::from_wire_parameters`
+//!   at tick start; falls back to `contract_defaults()` when Wire
+//!   hasn't shipped the key yet (zero-lockstep). Budgets are independent
+//!   (Q-PROTO-6): flaky requester tunnel burning the content-leg budget
+//!   does NOT exhaust the settlement-leg budget.
+//! - **Row-level terminal composition** — `delivery_status` uses the same
+//!   vocabulary as Wire's `wire_compute_jobs.delivery_status` per spec
+//!   line 78 (`failed_content_only | failed_settlement_only | failed_both`).
 //! - **Supervisor:** `supervise_delivery_loop` wraps the loop in
-//!   `AssertUnwindSafe::catch_unwind`; panics emit
-//!   `market_delivery_task_panicked` chronicle, 5s backoff, respawn.
-//!   Clean exit (channel sender dropped) emits
-//!   `market_delivery_task_exited`.
+//!   `AssertUnwindSafe::catch_unwind`; unchanged from rev 0.5.
 //! - **Redaction:** `CallbackAuth` has a custom `Debug` impl that elides
-//!   `token`. Error messages from reqwest are truncated to
-//!   `max_error_message_chars` before DB write or chronicle emit.
-//! - **No periodic mirror-heartbeat:** per the staleness refactor from
-//!   2026-04-20, idle providers remain matchable via `wire_nodes.last_heartbeat`
-//!   freshness; this worker does NOT push mirror snapshots on idle. Only
-//!   when an actual state transition happens.
+//!   `token`; the same no-`{:?}`-on-request discipline now applies to the
+//!   `requester_delivery_jwt` string too (truncate + no `{:?}` on the POST
+//!   body). Error messages truncated to `max_error_message_chars` before
+//!   DB write or chronicle emit.
 //!
 //! # Invariants
 //!
-//! 1. A row in state=`ready` with a non-null `delivery_lease_until > now()`
-//!    is owned by exactly one delivery worker tick. `market_outbox_claim_
-//!    ready_for_delivery`'s `UPDATE ... RETURNING` makes this atomic.
-//! 2. On terminal transition (delivered/failed), both `delivery_lease_until`
-//!    and `delivery_next_attempt_at` are cleared.
-//! 3. The Wire-facing envelope `body.job_id` is always a UUID, never the
-//!    handle-path in `callback_url`. Debug assertion guards the POST site.
-//! 4. The callback_auth bearer token never enters a log or chronicle
-//!    metadata string. Enforced structurally (no `{:?}` on
-//!    `MarketDispatchRequest` / `CallbackAuth`) + test
-//!    `error_metadata_does_not_leak_token`.
+//! 1. Each leg's `*_lease_until > now()` on a ready row is owned by
+//!    exactly one delivery worker tick. Per-leg claims are CAS-atomic
+//!    (UPDATE ... RETURNING) so no TOCTOU window exists.
+//! 2. On terminal row transition (delivered / failed_*), both legs'
+//!    `*_lease_until` and `*_next_attempt_at` are cleared by the DB helper.
+//! 3. Both envelope adapters (`build_content_envelope` +
+//!    `build_settlement_envelope`) emit `body.job_id` as a UUID — never
+//!    the handle-path — per §10.5 + Pillar J7. Debug-assertion guards
+//!    the POST site (regression guard against a future write-path bug).
+//! 4. The `callback_auth.token` bearer AND the `requester_delivery_jwt`
+//!    never enter a log or chronicle metadata string. Enforced structurally
+//!    (no `{:?}` on `MarketDispatchRequest` / `CallbackAuth` / the opaque
+//!    JWT), and by the `requester_delivery_jwt_never_in_logs` unit test.
 //!
 //! # Relay deferral
 //!
-//! Relay rows (`callback_kind = 'Relay'`) are NOT claimed by this worker.
-//! Relay-market ships separately; when it does, either this worker extends
-//! or a parallel relay-delivery worker spawns against the same table. Today
-//! no code path produces Relay rows so the deferral is inert.
+//! Relay rows (`callback_kind = 'Relay'`) are NOT claimed by this worker
+//! for content-leg POST — the relay hop adds a second decryption layer
+//! that's not implemented yet. The per-leg claim helpers already scope
+//! `callback_kind = 'MarketStandard'`.
 
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
@@ -77,11 +99,14 @@ use reqwest::header::HeaderMap;
 use serde_json::json;
 use tokio::sync::{mpsc, RwLock};
 
+use crate::compute_market::ComputeDeliveryPolicy;
 use crate::pyramid::compute_chronicle::{
-    record_event, ChronicleEventContext, EVENT_MARKET_DELIVERY_TASK_EXITED,
-    EVENT_MARKET_DELIVERY_TASK_PANICKED, EVENT_MARKET_RESULT_DELIVERED_TO_WIRE,
-    EVENT_MARKET_RESULT_DELIVERY_ATTEMPT_FAILED, EVENT_MARKET_RESULT_DELIVERY_CAS_LOST,
-    EVENT_MARKET_RESULT_DELIVERY_FAILED, SOURCE_MARKET,
+    record_event, ChronicleEventContext, EVENT_MARKET_CONTENT_DELIVERY_ATTEMPT_FAILED,
+    EVENT_MARKET_CONTENT_DELIVERY_FAILED, EVENT_MARKET_CONTENT_LEG_SUCCEEDED,
+    EVENT_MARKET_DELIVERY_TASK_EXITED, EVENT_MARKET_DELIVERY_TASK_PANICKED,
+    EVENT_MARKET_RESULT_DELIVERED, EVENT_MARKET_RESULT_DELIVERY_CAS_LOST,
+    EVENT_MARKET_RESULT_DELIVERY_FAILED, EVENT_MARKET_SETTLEMENT_DELIVERY_ATTEMPT_FAILED,
+    EVENT_MARKET_SETTLEMENT_DELIVERY_FAILED, EVENT_MARKET_SETTLEMENT_LEG_SUCCEEDED, SOURCE_MARKET,
 };
 use crate::pyramid::market_delivery_policy::MarketDeliveryPolicy;
 use crate::pyramid::market_dispatch::MarketAsyncResult;
@@ -92,24 +117,54 @@ use crate::pyramid::market_dispatch::MarketAsyncResult;
 const MIGRATION_NAME: &str = "fleet_result_outbox_v2_callback_auth_token";
 
 /// Hardcoded sanity cap on bearer length. Base64url-encoded 32-byte tokens
-/// are ~43 chars; this guards against a hypothetical DoS where Wire or a
-/// man-in-the-middle ships a multi-MB "token" that the Authorization
+/// are ~43 chars; JWTs used for the content leg are bigger (typically
+/// 200-400 bytes — EdDSA signature + claim payload). Lift the cap to 4096
+/// so a full JWT fits; still guards against a hypothetical DoS where Wire
+/// or a man-in-the-middle ships a multi-MB "token" that the Authorization
 /// header build would copy.
-const MAX_TOKEN_LEN: usize = 512;
+const MAX_TOKEN_LEN: usize = 4096;
 
 /// HTTP status codes that mean "retrying will not help" when Wire doesn't
 /// ship the `X-Wire-Retry` header (pre-upgrade Wire). See spec §2 + Wire
 /// compute-errors.ts classifier output enumeration.
 const TERMINAL_HTTP_CODES_FALLBACK: &[u16] = &[400, 401, 403, 404, 409, 410, 413];
 
-// ── Wire-facing envelope (CallbackEnvelope) ─────────────────────────────────
+// ── Leg discriminator ───────────────────────────────────────────────────────
+
+/// Which leg of the two-POST delivery state machine is being processed.
+/// Threaded through `deliver_leg`, the envelope adapters, and the outcome
+/// classifier so a single code path can serve both hops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leg {
+    /// Content leg: provider → requester direct (§2.6). Body includes
+    /// `result.content`; auth is `requester_delivery_jwt`; URL is
+    /// `requester_callback_url`.
+    Content,
+    /// Settlement leg: provider → Wire (§2.3). Body OMITS `result.content`;
+    /// auth is `callback_auth.token`; URL is `callback_url`.
+    Settlement,
+}
+
+impl Leg {
+    /// Human-friendly label used in chronicle metadata + error strings.
+    /// Stable identifier — do not change lightly; downstream dashboards
+    /// match on exact value.
+    fn label(&self) -> &'static str {
+        match self {
+            Leg::Content => "content",
+            Leg::Settlement => "settlement",
+        }
+    }
+}
+
+// ── Content-leg envelope (§2.6 — includes result.content) ──────────────────
 
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum CallbackEnvelope {
+enum ContentEnvelope {
     Success {
         job_id: String,
-        result: CallbackResult,
+        result: ContentResult,
     },
     Failure {
         job_id: String,
@@ -118,7 +173,7 @@ enum CallbackEnvelope {
 }
 
 #[derive(Debug, serde::Serialize)]
-struct CallbackResult {
+struct ContentResult {
     content: String,
     input_tokens: u64,
     output_tokens: u64,
@@ -127,6 +182,37 @@ struct CallbackResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     finish_reason: Option<String>,
 }
+
+// ── Settlement-leg envelope (§2.3 — result.content OMITTED) ────────────────
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SettlementEnvelope {
+    Success {
+        job_id: String,
+        result: SettlementResult,
+    },
+    Failure {
+        job_id: String,
+        error: CallbackError,
+    },
+}
+
+/// §2.3 settlement result — same shape as ContentResult MINUS `content`.
+/// If Wire receives `content` on a settlement POST it MAY drop-and-log
+/// or MUST 400 with `settlement_carried_content` — this struct
+/// structurally cannot emit it.
+#[derive(Debug, serde::Serialize)]
+struct SettlementResult {
+    input_tokens: u64,
+    output_tokens: u64,
+    model_used: String,
+    latency_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finish_reason: Option<String>,
+}
+
+// ── Failure shape (identical across both legs per D4) ──────────────────────
 
 #[derive(Debug, serde::Serialize)]
 struct CallbackError {
@@ -141,16 +227,18 @@ enum RetryDecision {
     Retry { source: &'static str },
 }
 
-fn classify_retry(status: reqwest::StatusCode, headers: &HeaderMap) -> RetryDecision {
-    // Explicit protocol data wins over HTTP-code enumeration.
+/// Classifier for the settlement leg. Reads Wire's explicit
+/// `X-Wire-Retry` protocol header first; falls back to the terminal-HTTP
+/// code enum for pre-upgrade Wire. Content-leg responses are NOT routed
+/// through this function — the content leg uses `classify_retry_content`
+/// which ignores `X-Wire-Retry` (not a requester-protocol header).
+fn classify_retry_settlement(status: reqwest::StatusCode, headers: &HeaderMap) -> RetryDecision {
     if let Some(raw) = headers.get("X-Wire-Retry").and_then(|v| v.to_str().ok()) {
         match raw {
             "never" => return RetryDecision::Terminal { source: "x_wire_retry_never" },
             "transient" => return RetryDecision::Retry { source: "x_wire_retry_transient" },
             "backoff" => return RetryDecision::Retry { source: "x_wire_retry_backoff" },
             other => {
-                // Unknown value — forward-compat warn-don't-reject per
-                // contract Q-PROTO-3.
                 tracing::warn!(
                     header_value = %other,
                     "X-Wire-Retry: unknown value; falling back to HTTP-code enumeration"
@@ -158,7 +246,19 @@ fn classify_retry(status: reqwest::StatusCode, headers: &HeaderMap) -> RetryDeci
             }
         }
     }
-    // Fallback: HTTP-code enumeration for pre-upgrade Wire.
+    if TERMINAL_HTTP_CODES_FALLBACK.contains(&status.as_u16()) {
+        RetryDecision::Terminal { source: "http_code_fallback" }
+    } else {
+        RetryDecision::Retry { source: "http_code_fallback" }
+    }
+}
+
+/// Classifier for the content leg. Ignores `X-Wire-Retry` (not a
+/// requester-protocol header per spec lines 334-337) and decides based
+/// on the HTTP status code alone. Terminal set is the same as the
+/// settlement fallback — the same error classes (auth/NotFound/etc.)
+/// are non-retriable regardless of who's on the other end.
+fn classify_retry_content(status: reqwest::StatusCode) -> RetryDecision {
     if TERMINAL_HTTP_CODES_FALLBACK.contains(&status.as_u16()) {
         RetryDecision::Terminal { source: "http_code_fallback" }
     } else {
@@ -181,13 +281,10 @@ fn parse_retry_after_header(headers: &HeaderMap) -> (Option<u64>, RetryAfterSour
         None => return (None, RetryAfterSource::Absent),
     };
 
-    // Form 1: decimal integer seconds.
     if let Ok(secs) = v.parse::<u64>() {
         return (Some(secs), RetryAfterSource::HeaderSeconds);
     }
 
-    // Form 2: HTTP-date. Convert to delta-seconds relative to now; past
-    // dates clamp to 0.
     if let Ok(target) = httpdate::parse_http_date(v) {
         let now = std::time::SystemTime::now();
         let delta = target.duration_since(now).map(|d| d.as_secs()).unwrap_or(0);
@@ -210,16 +307,19 @@ fn retry_after_source_label(src: &RetryAfterSource) -> &'static str {
     }
 }
 
-// ── Envelope adapter: MarketAsyncResult → CallbackEnvelope ──────────────────
+// ── Envelope adapters: MarketAsyncResult → per-leg envelope ────────────────
 
-/// Pure function. No I/O; callable from tests.
-fn build_callback_envelope(
+/// Content-leg adapter (§2.6 full shape including `result.content`).
+/// Pure function; no I/O; callable from tests.
+///
+/// Invariant: `row.job_id` is a UUID. Handle-path lives only in
+/// `callback_url` / `requester_callback_url`; body never carries it
+/// per §10.5 + Pillar J7. Debug-assertion guards against a future
+/// write-path bug that smuggles the handle-path into the outbox PK.
+fn build_content_envelope(
     row: &crate::pyramid::db::OutboxRow,
     result: &MarketAsyncResult,
-) -> CallbackEnvelope {
-    // Invariant: row.job_id is the UUID stored at admission time. Debug
-    // assertion guards against a future write-path bug that smuggles the
-    // handle-path into the outbox PK.
+) -> ContentEnvelope {
     debug_assert!(
         uuid::Uuid::parse_str(&row.job_id).is_ok(),
         "OutboxRow.job_id must be UUID-format (contract §10.5); handle-path lives in callback_url"
@@ -227,33 +327,13 @@ fn build_callback_envelope(
 
     match result {
         MarketAsyncResult::Success(resp) => {
-            // Wire requires non-negative integers for input_tokens +
-            // output_tokens; None maps to 0 (per Phase 3 spec §Envelope
-            // adapter).
             let input_tokens = resp.prompt_tokens.unwrap_or(0).max(0) as u64;
             let output_tokens = resp.completion_tokens.unwrap_or(0).max(0) as u64;
-            // model_used: prefer provider_model if non-empty; fall back to
-            // model (worker always sets this non-empty from dispatch body);
-            // last-resort "unknown" to avoid terminal-failing on an observability
-            // field Wire treats as non-load-bearing.
-            let model_used = resp
-                .provider_model
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    if !resp.model.is_empty() {
-                        resp.model.clone()
-                    } else {
-                        "unknown".to_string()
-                    }
-                });
-            // latency_ms: from outbox column; None → 0 + chronicle metadata
-            // records `latency_ms_source: "sweep_synth"` at emit time.
+            let model_used = pick_model_used(resp);
             let latency_ms = row.inference_latency_ms.unwrap_or(0).max(0) as u64;
-            CallbackEnvelope::Success {
+            ContentEnvelope::Success {
                 job_id: row.job_id.clone(),
-                result: CallbackResult {
+                result: ContentResult {
                     content: resp.content.clone(),
                     input_tokens,
                     output_tokens,
@@ -263,23 +343,68 @@ fn build_callback_envelope(
                 },
             }
         }
-        MarketAsyncResult::Error(msg) => CallbackEnvelope::Failure {
+        MarketAsyncResult::Error(msg) => ContentEnvelope::Failure {
             job_id: row.job_id.clone(),
-            error: CallbackError {
-                code: classify_failure_code(msg),
-                message: msg.clone(),
-            },
+            error: CallbackError { code: classify_failure_code(msg), message: msg.clone() },
         },
     }
+}
+
+/// Settlement-leg adapter (§2.3 shape MINUS `result.content`).
+/// Pure function; structurally cannot emit `content` (the
+/// `SettlementResult` struct has no such field). Failure variant is
+/// identical to `build_content_envelope`'s Failure variant per D4 —
+/// the same pinned §2.3 error code + message flows to both legs.
+fn build_settlement_envelope(
+    row: &crate::pyramid::db::OutboxRow,
+    result: &MarketAsyncResult,
+) -> SettlementEnvelope {
+    debug_assert!(
+        uuid::Uuid::parse_str(&row.job_id).is_ok(),
+        "OutboxRow.job_id must be UUID-format (contract §10.5); handle-path lives in callback_url"
+    );
+
+    match result {
+        MarketAsyncResult::Success(resp) => {
+            let input_tokens = resp.prompt_tokens.unwrap_or(0).max(0) as u64;
+            let output_tokens = resp.completion_tokens.unwrap_or(0).max(0) as u64;
+            let model_used = pick_model_used(resp);
+            let latency_ms = row.inference_latency_ms.unwrap_or(0).max(0) as u64;
+            SettlementEnvelope::Success {
+                job_id: row.job_id.clone(),
+                result: SettlementResult {
+                    input_tokens,
+                    output_tokens,
+                    model_used,
+                    latency_ms,
+                    finish_reason: resp.finish_reason.clone(),
+                },
+            }
+        }
+        MarketAsyncResult::Error(msg) => SettlementEnvelope::Failure {
+            job_id: row.job_id.clone(),
+            error: CallbackError { code: classify_failure_code(msg), message: msg.clone() },
+        },
+    }
+}
+
+/// Shared helper: model_used falls back through provider_model → model →
+/// "unknown". Matches rev 0.5 semantics; Wire treats the field as
+/// observability-only (non-load-bearing) so the "unknown" sentinel is
+/// acceptable rather than terminal-failing.
+fn pick_model_used(resp: &crate::pyramid::market_dispatch::MarketDispatchResponse) -> String {
+    resp.provider_model
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if !resp.model.is_empty() { resp.model.clone() } else { "unknown".to_string() }
+        })
 }
 
 /// Maps a MarketAsyncResult::Error(String) into one of the contract §2.3
 /// pinned codes. Substring-matching on known failure-shape phrases; unknown
 /// messages default to `model_error` (Wire's catch-all via mapFailureCodeToReason).
-///
-/// Codes coordinated with Wire-side build plan WS5: `worker_heartbeat_lost`,
-/// `model_timeout`, `oom`, `invalid_messages`, `model_error` — pinned in
-/// contract §2.3 + shared-types.
 fn classify_failure_code(msg: &str) -> &'static str {
     let lower = msg.to_ascii_lowercase();
     if lower.contains("worker heartbeat") || lower.contains("heartbeat lost") {
@@ -298,15 +423,17 @@ fn classify_failure_code(msg: &str) -> &'static str {
 // ── Token validation + string truncation ────────────────────────────────────
 
 /// Defense-in-depth: reject obviously-malformed bearer tokens before
-/// building the Authorization header. base64url alphabet is
-/// `[A-Za-z0-9_-]`; Wire does not send padding. A token containing
-/// whitespace or control characters indicates corruption or injection;
-/// hit a terminal chronicle rather than a mysterious 401.
+/// building the Authorization header. Accepts the base64url alphabet
+/// (`[A-Za-z0-9_-]`) plus padding (`=`) and the JWT dot separator (`.`) —
+/// content-leg bearers are EdDSA JWTs of the form `header.payload.signature`,
+/// settlement-leg bearers are opaque base64url. A token containing whitespace
+/// or control characters indicates corruption or injection; hit a terminal
+/// chronicle rather than a mysterious 401.
 fn is_valid_bearer(t: &str) -> bool {
     !t.is_empty()
         && t.len() <= MAX_TOKEN_LEN
         && t.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '=')
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '=' || c == '.')
 }
 
 /// UTF-8-boundary-safe truncation to the given character cap. Prevents
@@ -323,8 +450,8 @@ fn truncate(s: &str, max_chars: u64) -> String {
 // ── Orphan detection helper (deploy-artifact vs token bug) ──────────────────
 
 /// Returns true iff this row was admitted BEFORE the Phase 3 migration
-/// that added `callback_auth_token`. Called only when the token column
-/// is NULL; lets us emit a distinct terminal reason
+/// that added `callback_auth_token`. Called only when the settlement-leg
+/// token column is NULL; lets us emit a distinct terminal reason
 /// (`orphaned_by_migration`) so operators see deploy artifacts as a
 /// one-shot event rather than a token-plumbing bug.
 async fn row_predates_migration(db_path: &std::path::Path, row_created_at: &str) -> bool {
@@ -351,19 +478,14 @@ pub struct DeliveryContext {
     pub db_path: PathBuf,
     pub policy: Arc<RwLock<MarketDeliveryPolicy>>,
     /// Wire parameters from the last-observed heartbeat response. Populated
-    /// by the heartbeat self-heal path in main.rs. Empty on fresh install;
-    /// the delivery worker falls back to contract-default constants for
-    /// any missing key. Cloned by value per-tick so the loop doesn't hold
-    /// a read lock across `.await`.
+    /// by the heartbeat self-heal path in main.rs. The delivery worker
+    /// clones the HashMap per-tick and parses `ComputeDeliveryPolicy` out
+    /// of it so the read lock is never held across `.await`.
     pub auth: Arc<RwLock<crate::auth::AuthState>>,
 }
 
 /// Spawn the supervisor task that owns the delivery loop. Mirrors the
-/// pattern shipped in `market_mirror::spawn_market_mirror_task` +
-/// `supervise_mirror_loop` (commit 57b1fa4).
-///
-/// Caller constructs the nudge channel first and places the sender on
-/// `MarketDispatchContext.delivery_nudge`; the receiver is handed here.
+/// pattern shipped in `market_mirror::spawn_market_mirror_task`.
 pub fn spawn_market_delivery_task(
     ctx: DeliveryContext,
     rx: mpsc::UnboundedReceiver<()>,
@@ -423,7 +545,7 @@ async fn delivery_loop(
     ctx: &DeliveryContext,
     rx: &mut mpsc::UnboundedReceiver<()>,
 ) {
-    tracing::info!("market delivery task started");
+    tracing::info!("market delivery task started (rev 0.6.1 two-POST)");
 
     // One boot-push so a post-restart serving-true offer with ready rows
     // queued by the sweep gets processed immediately, not after the first
@@ -439,14 +561,9 @@ async fn delivery_loop(
             maybe = rx.recv() => {
                 match maybe {
                     Some(()) => {
-                        // Drain any further nudges queued up — they all
-                        // represent the same eventual "scan ready rows"
-                        // action.
                         while rx.try_recv().is_ok() {}
                     }
                     None => {
-                        // Channel closed (all senders dropped). Supervisor
-                        // emits the loud lifecycle event; just return.
                         return;
                     }
                 }
@@ -458,23 +575,49 @@ async fn delivery_loop(
     }
 }
 
-/// One iteration: claim + deliver.
+/// One iteration: claim both legs + deliver the union in bounded-parallel.
 async fn tick(ctx: &DeliveryContext) {
     let p = ctx.policy.read().await.clone();
     let lease_secs = p.callback_post_timeout_secs + p.lease_grace_secs;
-
-    let db_path = ctx.db_path.clone();
     let max_concurrent = p.max_concurrent_deliveries;
-    let claimed = match tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<_>> {
-        let conn = rusqlite::Connection::open(&db_path)?;
-        crate::pyramid::db::market_outbox_claim_ready_for_delivery(
-            &conn, lease_secs, max_concurrent,
-        )
-        .map_err(|e| anyhow::anyhow!("claim_ready_for_delivery: {}", e))
-    })
-    .await
-    {
-        Ok(Ok(rows)) => rows,
+
+    // Read Wire parameters snapshot for this tick; fall back to contract
+    // defaults when the key isn't present or parses malformed. Clone
+    // `wire_parameters` out of the AuthState RwLock so we don't hold a
+    // read lock across the DB/HTTP awaits below (Pillar 9 discipline).
+    let wire_parameters = ctx.auth.read().await.wire_parameters.clone();
+    let delivery_policy =
+        ComputeDeliveryPolicy::from_wire_parameters(&wire_parameters)
+            .unwrap_or_else(ComputeDeliveryPolicy::contract_defaults);
+
+    // Two claim queries — one per leg. Each asks for up to max_concurrent;
+    // the combined stream is then bounded-parallel at max_concurrent at the
+    // for_each_concurrent level (§2.6 concurrency note — unified cap across
+    // both legs because they share the same outbound HTTP/socket budget).
+    let db_path = ctx.db_path.clone();
+    let max_for_claim = max_concurrent;
+    let claim_result = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(Vec<crate::pyramid::db::OutboxRow>, Vec<crate::pyramid::db::OutboxRow>)> {
+            let conn = rusqlite::Connection::open(&db_path)?;
+            let content = crate::pyramid::db::market_outbox_claim_content_for_delivery(
+                &conn,
+                lease_secs,
+                max_for_claim,
+            )
+            .map_err(|e| anyhow::anyhow!("claim_content_for_delivery: {}", e))?;
+            let settlement = crate::pyramid::db::market_outbox_claim_settlement_for_delivery(
+                &conn,
+                lease_secs,
+                max_for_claim,
+            )
+            .map_err(|e| anyhow::anyhow!("claim_settlement_for_delivery: {}", e))?;
+            Ok((content, settlement))
+        },
+    )
+    .await;
+
+    let (content_rows, settlement_rows) = match claim_result {
+        Ok(Ok(pair)) => pair,
         Ok(Err(e)) => {
             tracing::warn!(err = %e, "delivery tick: claim query failed");
             return;
@@ -485,29 +628,106 @@ async fn tick(ctx: &DeliveryContext) {
         }
     };
 
-    if claimed.is_empty() {
+    if content_rows.is_empty() && settlement_rows.is_empty() {
         return;
     }
 
-    // Bounded-parallel POSTs per spec §Bounded parallelism. Holds the
-    // policy snapshot (p) by move-and-clone into each future.
+    // Resolve rowids for each claimed row in a single blocking hop.
+    // The per-leg DB helpers (Wave 1A) accept rowid rather than the
+    // compound PK — easier SQLite CAS, but OutboxRow doesn't carry
+    // rowid. We look them up here by (dispatcher_node_id, job_id) —
+    // the outbox has a unique index on that pair.
+    let jobs: Vec<(String, String, Leg)> = content_rows
+        .iter()
+        .map(|r| (r.dispatcher_node_id.clone(), r.job_id.clone(), Leg::Content))
+        .chain(
+            settlement_rows
+                .iter()
+                .map(|r| (r.dispatcher_node_id.clone(), r.job_id.clone(), Leg::Settlement)),
+        )
+        .collect();
+
+    let db_path = ctx.db_path.clone();
+    let rowid_map = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<std::collections::HashMap<(String, String), i64>> {
+            let conn = rusqlite::Connection::open(&db_path)?;
+            let mut out = std::collections::HashMap::new();
+            for (did, jid, _leg) in &jobs {
+                let key = (did.clone(), jid.clone());
+                if out.contains_key(&key) {
+                    continue;
+                }
+                let rowid: Option<i64> = conn
+                    .query_row(
+                        "SELECT rowid FROM fleet_result_outbox
+                         WHERE dispatcher_node_id = ?1 AND job_id = ?2",
+                        rusqlite::params![did, jid],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                if let Some(rid) = rowid {
+                    out.insert(key, rid);
+                }
+            }
+            Ok(out)
+        },
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .unwrap_or_default();
+
+    // Flatten into a single stream of (row, leg) pairs.
+    let union: Vec<(crate::pyramid::db::OutboxRow, Leg, Option<i64>)> = content_rows
+        .into_iter()
+        .map(|r| {
+            let rid = rowid_map.get(&(r.dispatcher_node_id.clone(), r.job_id.clone())).copied();
+            (r, Leg::Content, rid)
+        })
+        .chain(settlement_rows.into_iter().map(|r| {
+            let rid = rowid_map.get(&(r.dispatcher_node_id.clone(), r.job_id.clone())).copied();
+            (r, Leg::Settlement, rid)
+        }))
+        .collect();
+
     let p_arc = Arc::new(p);
-    futures_util::stream::iter(claimed)
-        .for_each_concurrent(Some(max_concurrent as usize), |row| {
+    let dp_arc = Arc::new(delivery_policy);
+    futures_util::stream::iter(union)
+        .for_each_concurrent(Some(max_concurrent as usize), |(row, leg, rowid)| {
             let p = Arc::clone(&p_arc);
+            let dp = Arc::clone(&dp_arc);
             let ctx = ctx;
-            async move { deliver_one(ctx, row, &p).await }
+            async move {
+                match rowid {
+                    Some(rid) => deliver_leg(ctx, row, leg, rid, &p, &dp).await,
+                    None => {
+                        tracing::warn!(
+                            job_id = %row.job_id,
+                            leg = leg.label(),
+                            "delivery tick: rowid lookup failed; skipping leg"
+                        );
+                    }
+                }
+            }
         })
         .await;
 }
 
-async fn deliver_one(
+/// Per-leg POST flow. Pure per-leg function; called twice per row (once
+/// for each leg, from the `tick` unified stream). See spec lines 158-211.
+async fn deliver_leg(
     ctx: &DeliveryContext,
     row: crate::pyramid::db::OutboxRow,
+    leg: Leg,
+    rowid: i64,
     p: &MarketDeliveryPolicy,
+    dp: &ComputeDeliveryPolicy,
 ) {
-    // 1. Result parse — bare MarketAsyncResult (see module doc + spec
-    //    §Envelope adapter). Malformed = terminal (code bug, no retry).
+    // 1. Result parse — bare MarketAsyncResult. Malformed is terminal
+    //    (code bug, no retry). Both legs see the same parse failure
+    //    independently — the other leg will also terminal-fail when
+    //    its tick comes around. Row-level composition handles the
+    //    dual-terminal flip.
     let async_result: MarketAsyncResult = match row
         .result_json
         .as_deref()
@@ -522,55 +742,144 @@ async fn deliver_one(
                 ),
                 p.max_error_message_chars,
             );
-            terminal_fail(ctx, &row, &err, "envelope_parse_failed", p).await;
+            terminal_leg_fail(ctx, &row, rowid, leg, &err, "envelope_parse_failed", p).await;
             return;
         }
     };
 
-    // 2. Bearer extract + validation. NULL on a pre-migration row gets
-    //    its own reason so deploy-artifact orphans are distinguishable
-    //    from genuine token-plumbing bugs.
-    let bearer = match row.callback_auth_token.as_deref() {
-        Some(t) if is_valid_bearer(t) => t.to_string(),
-        None if row_predates_migration(&ctx.db_path, &row.created_at).await => {
-            terminal_fail(ctx, &row, "orphaned by migration", "orphaned_by_migration", p).await;
-            return;
+    // 2. Resolve per-leg URL + Bearer.
+    let (url, bearer, kind_for_ssrf) = match leg {
+        Leg::Content => {
+            let url = match row.requester_callback_url.as_deref() {
+                Some(u) if !u.is_empty() => u.to_string(),
+                _ => {
+                    terminal_leg_fail(
+                        ctx,
+                        &row,
+                        rowid,
+                        leg,
+                        "requester_callback_url is missing",
+                        "requester_callback_url_missing",
+                        p,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let jwt = match row.requester_delivery_jwt.as_deref() {
+                Some(t) if is_valid_bearer(t) => t.to_string(),
+                _ => {
+                    terminal_leg_fail(
+                        ctx,
+                        &row,
+                        rowid,
+                        leg,
+                        "requester_delivery_jwt missing or malformed",
+                        "requester_delivery_jwt_missing_or_invalid",
+                        p,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            (url, jwt, crate::fleet::CallbackKind::MarketStandard)
         }
-        _ => {
-            terminal_fail(
-                ctx,
-                &row,
-                "callback_auth_token missing or malformed",
-                "callback_auth_token_invalid",
-                p,
-            )
+        Leg::Settlement => {
+            let url = row.callback_url.clone();
+            let bearer = match row.callback_auth_token.as_deref() {
+                Some(t) if is_valid_bearer(t) => t.to_string(),
+                None if row_predates_migration(&ctx.db_path, &row.created_at).await => {
+                    terminal_leg_fail(
+                        ctx,
+                        &row,
+                        rowid,
+                        leg,
+                        "orphaned by migration",
+                        "orphaned_by_migration",
+                        p,
+                    )
+                    .await;
+                    return;
+                }
+                _ => {
+                    terminal_leg_fail(
+                        ctx,
+                        &row,
+                        rowid,
+                        leg,
+                        "callback_auth_token missing or malformed",
+                        "callback_auth_token_missing_or_malformed",
+                        p,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            (url, bearer, crate::fleet::CallbackKind::MarketStandard)
+        }
+    };
+
+    // 3. SSRF re-validate URL. The MarketStandard CallbackKind variant
+    //    ignores the roster (Wire + requester tunnels aren't roster
+    //    peers) and only enforces the HTTPS + non-empty-host invariant.
+    if let Err(e) = crate::fleet::validate_callback_url(
+        &url,
+        &kind_for_ssrf,
+        &crate::fleet::FleetRoster::default(),
+    ) {
+        let msg = truncate(
+            &format!("callback_url_validation_failed: {e}"),
+            p.max_error_message_chars,
+        );
+        terminal_leg_fail(ctx, &row, rowid, leg, &msg, "callback_url_validation_failed", p)
             .await;
-            return;
+        return;
+    }
+
+    // 4. Serialize the per-leg envelope. Serialize errors are terminal
+    //    (code bug; retrying won't help).
+    let envelope_body = match leg {
+        Leg::Content => {
+            let env = build_content_envelope(&row, &async_result);
+            match serde_json::to_string(&env) {
+                Ok(s) => s,
+                Err(e) => {
+                    let err = truncate(
+                        &format!("envelope serialize (content): {e}"),
+                        p.max_error_message_chars,
+                    );
+                    terminal_leg_fail(ctx, &row, rowid, leg, &err, "envelope_parse_failed", p)
+                        .await;
+                    return;
+                }
+            }
+        }
+        Leg::Settlement => {
+            let env = build_settlement_envelope(&row, &async_result);
+            match serde_json::to_string(&env) {
+                Ok(s) => s,
+                Err(e) => {
+                    let err = truncate(
+                        &format!("envelope serialize (settlement): {e}"),
+                        p.max_error_message_chars,
+                    );
+                    terminal_leg_fail(ctx, &row, rowid, leg, &err, "envelope_parse_failed", p)
+                        .await;
+                    return;
+                }
+            }
         }
     };
 
-    // 3. Envelope adapter (pure).
-    let wire_envelope = build_callback_envelope(&row, &async_result);
-    let envelope_body = match serde_json::to_string(&wire_envelope) {
-        Ok(s) => s,
-        Err(e) => {
-            let err = truncate(&format!("envelope serialize: {e}"), p.max_error_message_chars);
-            terminal_fail(ctx, &row, &err, "envelope_serialize_failed", p).await;
-            return;
-        }
-    };
-
-    // Determine latency_ms_source for metadata. This answers the question
-    // "where did the number we just sent in result.latency_ms come from?"
     let latency_ms_source = if row.inference_latency_ms.is_some() {
         "inference"
     } else {
         "sweep_synth"
     };
 
-    // 4. POST. Client configured with redirect(Policy::none()) so the
-    //    bearer can't leak cross-origin on a DNS compromise. 30s timeout
-    //    bounds any single attempt.
+    // 5. POST. Client configured with redirect(Policy::none()) so the
+    //    bearer can't leak cross-origin on a DNS compromise. Per-POST
+    //    timeout bounds any single attempt.
     let client = match reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(p.callback_post_timeout_secs))
@@ -579,14 +888,15 @@ async fn deliver_one(
         Ok(c) => c,
         Err(e) => {
             let err = truncate(&format!("http client build: {e}"), p.max_error_message_chars);
-            tracing::error!(err = %err, "delivery_worker: http client construction failed");
+            tracing::error!(err = %err, leg = leg.label(),
+                "delivery_worker: http client construction failed");
             return;
         }
     };
 
     let post_started = std::time::Instant::now();
     let response = client
-        .post(&row.callback_url)
+        .post(&url)
         .header("Authorization", format!("Bearer {bearer}"))
         .header("Content-Type", "application/json")
         .body(envelope_body)
@@ -597,182 +907,330 @@ async fn deliver_one(
     let (status, headers) = match response {
         Ok(resp) => (resp.status(), resp.headers().clone()),
         Err(net_err) => {
-            // Network-level failure (TCP reset, DNS, timeout, TLS). These
-            // are transient by default. Display via {} not {:?} so any
-            // future reqwest upgrade that serialized request headers
-            // doesn't leak the bearer.
-            let err = truncate(
-                &format!("network: {net_err}"),
-                p.max_error_message_chars,
-            );
-            transient_fail(ctx, &row, &err, None, RetryAfterSource::Absent, p, post_duration_ms).await;
+            // Network-level failure (TCP reset, DNS, timeout, TLS). Transient.
+            // Display via {} not {:?} so any future reqwest upgrade that
+            // serialized request headers doesn't leak the bearer.
+            let err = truncate(&format!("network: {net_err}"), p.max_error_message_chars);
+            transient_leg_fail(
+                ctx,
+                &row,
+                rowid,
+                leg,
+                &err,
+                None,
+                RetryAfterSource::Absent,
+                p,
+                dp,
+                post_duration_ms,
+            )
+            .await;
             return;
         }
     };
 
-    // 5. Branch on outcome.
+    // 6. Branch on outcome.
     if status.is_success() {
-        // CAS ready → delivered. Rowcount=0 means concurrent sweep won
-        // the race; chronicle a distinct event so operator sees the
-        // delivery still happened despite the local state lost.
-        let cas_rows = cas_mark_delivered(ctx, &row, p).await;
-        if cas_rows == 1 {
-            emit(
-                ctx,
-                &row,
-                EVENT_MARKET_RESULT_DELIVERED_TO_WIRE,
-                json!({
-                    "job_id": row.job_id,
-                    "request_id": row.request_id,
-                    "attempts": row.delivery_attempts + 1,
-                    "latency_ms": row.inference_latency_ms.unwrap_or(0),
-                    "latency_ms_source": latency_ms_source,
-                    "duration_ms": post_duration_ms,
-                }),
-            )
-            .await;
-        } else {
-            emit(
-                ctx,
-                &row,
-                EVENT_MARKET_RESULT_DELIVERY_CAS_LOST,
-                json!({
-                    "job_id": row.job_id,
-                    "request_id": row.request_id,
-                    "attempts": row.delivery_attempts + 1,
-                    "reason": "sweep_raced_to_failed",
-                    "duration_ms": post_duration_ms,
-                }),
-            )
-            .await;
-        }
+        leg_success(ctx, &row, rowid, leg, p, post_duration_ms, latency_ms_source).await;
         return;
     }
 
-    // Non-2xx — classify retry intent.
-    match classify_retry(status, &headers) {
+    let decision = match leg {
+        Leg::Content => classify_retry_content(status),
+        Leg::Settlement => classify_retry_settlement(status, &headers),
+    };
+
+    match decision {
         RetryDecision::Terminal { source } => {
             let code = status.as_u16();
-            let row_age_secs = age_secs_from_created_at(&row.created_at);
-            // Discriminator for the 401-likely-secret-expired case
-            // (spec §Wire-parameters-aware secret-expiry detection).
-            let reason = if code == 401 && row_age_secs > p.ready_retention_secs as i64 {
-                "terminal_http_401_likely_secret_expired".to_string()
-            } else {
-                format!("terminal_http_{code}")
-            };
+            let reason = leg_terminal_http_reason(leg, code, &row, p);
             let err = truncate(&format!("terminal http {code}"), p.max_error_message_chars);
-            if cas_mark_failed_with_error(ctx, &row, &err, p).await >= 1 {
-                emit(
-                    ctx,
-                    &row,
-                    EVENT_MARKET_RESULT_DELIVERY_FAILED,
-                    json!({
-                        "job_id": row.job_id,
-                        "request_id": row.request_id,
-                        "attempts": row.delivery_attempts + 1,
-                        "final_error": err,
-                        "reason": reason,
-                        "retry_source": source,
-                        "status_code": code,
-                    }),
-                )
-                .await;
-            }
+            terminal_leg_fail_with_extra(
+                ctx,
+                &row,
+                rowid,
+                leg,
+                &err,
+                &reason,
+                p,
+                Some(json!({
+                    "retry_source": source,
+                    "status_code": code,
+                })),
+            )
+            .await;
         }
         RetryDecision::Retry { source } => {
             let code = status.as_u16();
             let err = truncate(&format!("http {code}"), p.max_error_message_chars);
             let (retry_after, retry_after_source) = parse_retry_after_header(&headers);
-            transient_fail(
+            let _ = source;
+            transient_leg_fail(
                 ctx,
                 &row,
+                rowid,
+                leg,
                 &err,
                 retry_after,
                 retry_after_source,
                 p,
+                dp,
                 post_duration_ms,
             )
             .await;
-            // Metadata note: the `source` from classify_retry indicates
-            // whether Wire told us explicitly ("x_wire_retry_transient")
-            // or we fell back ("http_code_fallback"). Chronicle already
-            // carries the info via `retry_after_source`.
-            let _ = source;
         }
     }
 }
 
-// ── Transient failure path ──────────────────────────────────────────────────
-
-async fn transient_fail(
+/// 2xx path for either leg. Marks the leg's `*_posted_ok` flag with the
+/// Wave 1A CAS helper; if that flip succeeds AND the OTHER leg is already
+/// `*_posted_ok=1`, the row transitions `ready → delivered` and we emit
+/// the summary `market_result_delivered` event. Otherwise emits the
+/// per-leg success chronicle.
+async fn leg_success(
     ctx: &DeliveryContext,
     row: &crate::pyramid::db::OutboxRow,
+    rowid: i64,
+    leg: Leg,
+    p: &MarketDeliveryPolicy,
+    post_duration_ms: i64,
+    latency_ms_source: &'static str,
+) {
+    let db_path = ctx.db_path.clone();
+    let delivered_retention = p.delivered_retention_secs;
+    // Flip leg + check both-complete in a single blocking hop.
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(bool, bool)> {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        let flipped = match leg {
+            Leg::Content => {
+                crate::pyramid::db::market_outbox_mark_content_posted_ok_if_ready(&conn, rowid)?
+            }
+            Leg::Settlement => {
+                crate::pyramid::db::market_outbox_mark_settlement_posted_ok_if_ready(
+                    &conn, rowid,
+                )?
+            }
+        };
+        // Even if we didn't flip (double-success race), re-check whether
+        // both legs are now done — the other leg may have raced ahead and
+        // we still want to flip the row if so.
+        let both_done = crate::pyramid::db::market_outbox_check_both_legs_complete_and_mark_delivered(
+            &conn,
+            rowid,
+            delivered_retention,
+        )?;
+        Ok((flipped, both_done))
+    })
+    .await;
+
+    let (flipped, both_done) = match result {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
+            tracing::warn!(err = %e, leg = leg.label(),
+                "delivery: leg_success CAS failed");
+            return;
+        }
+        Err(je) => {
+            tracing::warn!(err = %je, leg = leg.label(),
+                "delivery: leg_success join error");
+            return;
+        }
+    };
+
+    if !flipped {
+        // CAS lost — the row already transitioned past `ready` OR the leg
+        // was already flipped. Emit the CAS-lost chronicle so operator sees
+        // the delivery attempt actually landed even though local state
+        // raced. Counts as a successful POST from Wire/requester's view.
+        emit(
+            ctx,
+            row,
+            EVENT_MARKET_RESULT_DELIVERY_CAS_LOST,
+            json!({
+                "job_id": row.job_id,
+                "request_id": row.request_id,
+                "leg": leg.label(),
+                "reason": "cas_lost_or_double_success",
+                "duration_ms": post_duration_ms,
+            }),
+        )
+        .await;
+        return;
+    }
+
+    if both_done {
+        // Final state — the row just transitioned `ready → delivered`.
+        // Summary chronicle for the operator. Per-leg events for the
+        // other leg have already been emitted on its own tick.
+        let content_attempts = row.delivery_attempts + if leg == Leg::Content { 1 } else { 0 };
+        let settlement_attempts =
+            row.settlement_delivery_attempts + if leg == Leg::Settlement { 1 } else { 0 };
+        emit(
+            ctx,
+            row,
+            EVENT_MARKET_RESULT_DELIVERED,
+            json!({
+                "job_id": row.job_id,
+                "request_id": row.request_id,
+                "content_attempts": content_attempts,
+                "settlement_attempts": settlement_attempts,
+                "latency_ms": row.inference_latency_ms.unwrap_or(0),
+                "latency_ms_source": latency_ms_source,
+                "last_leg": leg.label(),
+                "total_duration_ms": post_duration_ms,
+            }),
+        )
+        .await;
+    } else {
+        // Per-leg success — the other leg is still in flight (or terminal).
+        let event = match leg {
+            Leg::Content => EVENT_MARKET_CONTENT_LEG_SUCCEEDED,
+            Leg::Settlement => EVENT_MARKET_SETTLEMENT_LEG_SUCCEEDED,
+        };
+        let attempts = match leg {
+            Leg::Content => row.delivery_attempts + 1,
+            Leg::Settlement => row.settlement_delivery_attempts + 1,
+        };
+        emit(
+            ctx,
+            row,
+            event,
+            json!({
+                "job_id": row.job_id,
+                "request_id": row.request_id,
+                "leg": leg.label(),
+                "attempts": attempts,
+                "duration_ms": post_duration_ms,
+                "latency_ms_source": latency_ms_source,
+            }),
+        )
+        .await;
+    }
+}
+
+/// Terminal HTTP reason helper. Distinguishes the 401-likely-secret-expired
+/// (settlement) / 401-likely-jwt-expired (content) cases from a plain
+/// `terminal_http_401`, using the row's `created_at` + the relevant TTL
+/// knob from policy.
+fn leg_terminal_http_reason(
+    leg: Leg,
+    code: u16,
+    row: &crate::pyramid::db::OutboxRow,
+    p: &MarketDeliveryPolicy,
+) -> String {
+    if code != 401 {
+        return format!("terminal_http_{code}");
+    }
+    let row_age_secs = age_secs_from_created_at(&row.created_at);
+    match leg {
+        Leg::Settlement => {
+            if row_age_secs > p.ready_retention_secs as i64 {
+                "terminal_http_401_likely_secret_expired".to_string()
+            } else {
+                "terminal_http_401".to_string()
+            }
+        }
+        Leg::Content => {
+            // The requester_delivery_jwt TTL is shipped separately via
+            // wire_parameters (`requester_delivery_jwt_ttl_secs`; §3.4
+            // default = fill_job_ttl_secs = 1800s). We don't plumb it
+            // through MarketDeliveryPolicy — use ready_retention_secs
+            // as a conservative proxy (same default value), same as
+            // settlement leg's heuristic.
+            if row_age_secs > p.ready_retention_secs as i64 {
+                "terminal_http_401_likely_jwt_expired".to_string()
+            } else {
+                "terminal_http_401".to_string()
+            }
+        }
+    }
+}
+
+/// Per-leg transient failure path. Bumps the leg's attempt counter,
+/// schedules backoff via `compute_delivery_policy.backoff_for_attempt`,
+/// emits the per-leg attempt_failed chronicle. If the bump puts the leg
+/// at its `max_attempts_*` budget (Q-PROTO-6), terminal-fails the leg
+/// instead.
+#[allow(clippy::too_many_arguments)]
+async fn transient_leg_fail(
+    ctx: &DeliveryContext,
+    row: &crate::pyramid::db::OutboxRow,
+    rowid: i64,
+    leg: Leg,
     err_msg: &str,
     retry_after: Option<u64>,
     retry_after_source: RetryAfterSource,
     p: &MarketDeliveryPolicy,
+    dp: &ComputeDeliveryPolicy,
     _post_duration_ms: i64,
 ) {
-    let new_attempts = row.delivery_attempts + 1;
+    let prior_attempts = match leg {
+        Leg::Content => row.delivery_attempts,
+        Leg::Settlement => row.settlement_delivery_attempts,
+    };
+    let new_attempts = prior_attempts + 1;
 
-    // If we've hit max_delivery_attempts, this transient failure is
-    // actually terminal.
-    if (new_attempts as u64) >= p.max_delivery_attempts {
+    let leg_budget = match leg {
+        Leg::Content => dp.max_attempts_content,
+        Leg::Settlement => dp.max_attempts_settlement,
+    } as i64;
+
+    // Budget exhausted → terminal with per-leg reason.
+    if new_attempts >= leg_budget {
+        let reason = match leg {
+            Leg::Content => "max_attempts_content",
+            Leg::Settlement => "max_attempts_settlement",
+        };
         let err = truncate(
-            &format!("{err_msg} (max_delivery_attempts exceeded)"),
+            &format!("{err_msg} (max_attempts_{} exceeded)", leg.label()),
             p.max_error_message_chars,
         );
-        if cas_mark_failed_with_error(ctx, row, &err, p).await >= 1 {
-            emit(
-                ctx,
-                row,
-                EVENT_MARKET_RESULT_DELIVERY_FAILED,
-                json!({
-                    "job_id": row.job_id,
-                    "request_id": row.request_id,
-                    "attempts": new_attempts,
-                    "final_error": err,
-                    "reason": "max_attempts",
-                }),
-            )
-            .await;
-        }
+        terminal_leg_fail(ctx, row, rowid, leg, &err, reason, p).await;
         return;
     }
 
-    // Otherwise: compute backoff, bump attempt, set next-attempt gate.
-    // Backoff = Retry-After if present, else exponential min(base * 2^attempts, cap).
-    let backoff_secs = retry_after.unwrap_or_else(|| {
-        let exp = (new_attempts as u32).min(20);
-        let computed = p.backoff_base_secs.saturating_mul(1u64 << exp);
-        computed.min(p.backoff_cap_secs)
-    });
+    // Compute backoff: Retry-After header if present, else policy schedule.
+    let schedule_secs = dp.backoff_for_attempt(new_attempts as u32) as u64;
+    let backoff_secs = retry_after.unwrap_or(schedule_secs);
 
-    // Clone into the blocking task.
     let db_path = ctx.db_path.clone();
-    let dispatcher = row.dispatcher_node_id.clone();
-    let job_id = row.job_id.clone();
     let err_copy = err_msg.to_string();
-    let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+    let bump_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let conn = rusqlite::Connection::open(&db_path)?;
-        Ok(crate::pyramid::db::market_outbox_bump_attempt_with_backoff(
-            &conn,
-            &dispatcher,
-            &job_id,
-            &err_copy,
-            backoff_secs,
-        )?)
+        match leg {
+            Leg::Content => crate::pyramid::db::market_outbox_bump_content_attempt_with_backoff(
+                &conn,
+                rowid,
+                backoff_secs,
+                &err_copy,
+            )?,
+            Leg::Settlement => {
+                crate::pyramid::db::market_outbox_bump_settlement_attempt_with_backoff(
+                    &conn,
+                    rowid,
+                    backoff_secs,
+                    &err_copy,
+                )?
+            }
+        };
+        Ok(())
     })
     .await;
+    if let Ok(Err(e)) = bump_result {
+        tracing::warn!(err = %e, leg = leg.label(), "delivery: bump_attempt failed");
+    }
 
+    let event = match leg {
+        Leg::Content => EVENT_MARKET_CONTENT_DELIVERY_ATTEMPT_FAILED,
+        Leg::Settlement => EVENT_MARKET_SETTLEMENT_DELIVERY_ATTEMPT_FAILED,
+    };
     emit(
         ctx,
         row,
-        EVENT_MARKET_RESULT_DELIVERY_ATTEMPT_FAILED,
+        event,
         json!({
             "job_id": row.job_id,
             "request_id": row.request_id,
+            "leg": leg.label(),
             "attempt": new_attempts,
             "error": err_msg,
             "backoff_secs": backoff_secs,
@@ -782,82 +1240,195 @@ async fn transient_fail(
     .await;
 }
 
-// ── Terminal failure path ───────────────────────────────────────────────────
-
-async fn terminal_fail(
+/// Per-leg terminal failure. Marks the row terminal IFF both legs are now
+/// terminal; otherwise records the leg's terminal state on its error
+/// column and clears its lease — the row stays `ready` so the other leg
+/// keeps independently making progress per spec line 71.
+async fn terminal_leg_fail(
     ctx: &DeliveryContext,
     row: &crate::pyramid::db::OutboxRow,
+    rowid: i64,
+    leg: Leg,
     err_msg: &str,
     reason: &str,
     p: &MarketDeliveryPolicy,
 ) {
-    if cas_mark_failed_with_error(ctx, row, err_msg, p).await >= 1 {
-        emit(
-            ctx,
-            row,
-            EVENT_MARKET_RESULT_DELIVERY_FAILED,
-            json!({
-                "job_id": row.job_id,
-                "request_id": row.request_id,
-                "attempts": row.delivery_attempts + 1,
-                "final_error": err_msg,
-                "reason": reason,
-            }),
-        )
-        .await;
-    }
+    terminal_leg_fail_with_extra(ctx, row, rowid, leg, err_msg, reason, p, None).await;
 }
 
-// ── DB CAS helpers (run in spawn_blocking) ──────────────────────────────────
-
-async fn cas_mark_delivered(
+/// Full-fat terminal-leg-fail — allows extra metadata (status_code,
+/// retry_source) to be threaded into the chronicle event for the HTTP
+/// terminal code path without double-emitting.
+async fn terminal_leg_fail_with_extra(
     ctx: &DeliveryContext,
     row: &crate::pyramid::db::OutboxRow,
-    p: &MarketDeliveryPolicy,
-) -> usize {
-    let db_path = ctx.db_path.clone();
-    let dispatcher = row.dispatcher_node_id.clone();
-    let job_id = row.job_id.clone();
-    let retention = p.delivered_retention_secs;
-    tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
-        let conn = rusqlite::Connection::open(&db_path)?;
-        Ok(crate::pyramid::db::fleet_outbox_mark_delivered_if_ready(
-            &conn, &dispatcher, &job_id, retention,
-        )?)
-    })
-    .await
-    .unwrap_or(Ok(0))
-    .unwrap_or(0)
-}
-
-async fn cas_mark_failed_with_error(
-    ctx: &DeliveryContext,
-    row: &crate::pyramid::db::OutboxRow,
+    rowid: i64,
+    leg: Leg,
     err_msg: &str,
+    reason: &str,
     p: &MarketDeliveryPolicy,
-) -> usize {
+    extra_metadata: Option<serde_json::Value>,
+) {
+    // 1. Mark the leg's terminal state: flip its `*_last_error`, clear its
+    //    lease, and stamp a far-future `*_next_attempt_at` so this leg is
+    //    never reclaimed (even if the row stays `ready` for the other
+    //    leg's sake). We reuse the `bump_*_attempt_with_backoff` helper
+    //    with a huge backoff as the "leg is dead" sentinel — the leg-
+    //    specific terminal state vocabulary lives implicitly in
+    //    `*_last_error` being set AND never being eligible to claim.
+    const LEG_DEAD_BACKOFF_SECS: u64 = 60 * 60 * 24 * 365 * 10; // 10y ≈ "never"
+
     let db_path = ctx.db_path.clone();
-    let dispatcher = row.dispatcher_node_id.clone();
-    let job_id = row.job_id.clone();
-    let err = err_msg.to_string();
-    let retention = p.failed_retention_secs;
-    tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+    let err_copy = err_msg.to_string();
+    let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let conn = rusqlite::Connection::open(&db_path)?;
-        Ok(crate::pyramid::db::market_outbox_mark_failed_with_error_cas(
-            &conn, &dispatcher, &job_id, &err, retention,
-        )?)
+        match leg {
+            Leg::Content => crate::pyramid::db::market_outbox_bump_content_attempt_with_backoff(
+                &conn,
+                rowid,
+                LEG_DEAD_BACKOFF_SECS,
+                &err_copy,
+            )?,
+            Leg::Settlement => {
+                crate::pyramid::db::market_outbox_bump_settlement_attempt_with_backoff(
+                    &conn,
+                    rowid,
+                    LEG_DEAD_BACKOFF_SECS,
+                    &err_copy,
+                )?
+            }
+        };
+        Ok(())
     })
+    .await;
+
+    // 2. Decide row-level composition: is the OTHER leg already terminal?
+    //    We peek at the freshly-updated row.
+    let db_path = ctx.db_path.clone();
+    let leg_state = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(Option<String>, Option<String>, i64, i64)> {
+            let conn = rusqlite::Connection::open(&db_path)?;
+            let tup: (Option<String>, Option<String>, i64, i64) = conn.query_row(
+                "SELECT content_last_error, settlement_last_error,
+                        content_posted_ok, settlement_posted_ok
+                   FROM fleet_result_outbox WHERE rowid = ?1",
+                rusqlite::params![rowid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            Ok(tup)
+        },
+    )
     .await
-    .unwrap_or(Ok(0))
-    .unwrap_or(0)
+    .ok()
+    .and_then(|r| r.ok());
+
+    let (content_terminal, settlement_terminal, final_delivery_status) = match leg_state {
+        Some((content_err, settlement_err, content_ok, settlement_ok)) => {
+            let c_term = content_err.is_some() && content_ok == 0;
+            let s_term = settlement_err.is_some() && settlement_ok == 0;
+            let status = match (c_term, s_term, content_ok, settlement_ok) {
+                (true, true, _, _) => Some("failed_both"),
+                (true, false, _, 1) => Some("failed_content_only"),
+                (false, true, 1, _) => Some("failed_settlement_only"),
+                _ => None,
+            };
+            (c_term, s_term, status)
+        }
+        None => (false, false, None),
+    };
+
+    // 3. Emit per-leg terminal chronicle.
+    let per_leg_event = match leg {
+        Leg::Content => EVENT_MARKET_CONTENT_DELIVERY_FAILED,
+        Leg::Settlement => EVENT_MARKET_SETTLEMENT_DELIVERY_FAILED,
+    };
+    let attempts = match leg {
+        Leg::Content => row.delivery_attempts + 1,
+        Leg::Settlement => row.settlement_delivery_attempts + 1,
+    };
+    let mut per_leg_meta = json!({
+        "job_id": row.job_id,
+        "request_id": row.request_id,
+        "leg": leg.label(),
+        "attempts": attempts,
+        "final_error": err_msg,
+        "reason": reason,
+    });
+    if let Some(extra) = extra_metadata {
+        if let (serde_json::Value::Object(ref mut base), serde_json::Value::Object(extra_map)) =
+            (&mut per_leg_meta, extra)
+        {
+            for (k, v) in extra_map {
+                base.insert(k, v);
+            }
+        }
+    }
+    emit(ctx, row, per_leg_event, per_leg_meta).await;
+
+    // 4. If BOTH legs are terminal, flip the row to failed with the
+    //    `failed_both` terminal status and emit the row-level summary.
+    //    If only this leg is terminal and the OTHER leg is already 2xx,
+    //    flip to `failed_content_only` / `failed_settlement_only`.
+    if let Some(terminal_status) = final_delivery_status {
+        let db_path = ctx.db_path.clone();
+        let last_err = format!("{}: {}", terminal_status, err_msg);
+        let dispatcher = row.dispatcher_node_id.clone();
+        let job_id = row.job_id.clone();
+        let retention = p.failed_retention_secs;
+        let cas = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = rusqlite::Connection::open(&db_path)?;
+            Ok(crate::pyramid::db::market_outbox_mark_failed_with_error_cas(
+                &conn,
+                &dispatcher,
+                &job_id,
+                &last_err,
+                retention,
+            )?)
+        })
+        .await;
+        if let Ok(Ok(n)) = cas {
+            if n >= 1 && terminal_status == "failed_both" {
+                emit(
+                    ctx,
+                    row,
+                    EVENT_MARKET_RESULT_DELIVERY_FAILED,
+                    json!({
+                        "job_id": row.job_id,
+                        "request_id": row.request_id,
+                        "delivery_status": terminal_status,
+                        "content_terminal": content_terminal,
+                        "settlement_terminal": settlement_terminal,
+                        "content_error": row.content_last_error,
+                        "settlement_error": row.settlement_last_error,
+                    }),
+                )
+                .await;
+            } else if n >= 1 {
+                // Mixed-terminal (failed_content_only / failed_settlement_only)
+                // — row is terminal but only one leg died. Reuse the same
+                // row-level summary event with a distinct delivery_status.
+                emit(
+                    ctx,
+                    row,
+                    EVENT_MARKET_RESULT_DELIVERY_FAILED,
+                    json!({
+                        "job_id": row.job_id,
+                        "request_id": row.request_id,
+                        "delivery_status": terminal_status,
+                        "terminal_leg": leg.label(),
+                        "final_error": err_msg,
+                        "reason": reason,
+                    }),
+                )
+                .await;
+            }
+        }
+    }
 }
 
 // ── Chronicle emission helpers ──────────────────────────────────────────────
 
 fn age_secs_from_created_at(created_at: &str) -> i64 {
-    // SQLite's `datetime('now')` returns "YYYY-MM-DD HH:MM:SS" (UTC).
-    // chrono::NaiveDateTime parses that; on parse error, return 0
-    // (don't surface wrong reason).
     chrono::NaiveDateTime::parse_from_str(created_at, "%Y-%m-%d %H:%M:%S")
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(created_at, "%Y-%m-%dT%H:%M:%S%.f"))
         .map(|ndt| {
@@ -918,7 +1489,7 @@ mod tests {
             dispatcher_node_id: "wire-platform".into(),
             job_id: "4f93e9f4-5e7a-4a2a-9a6c-6d0c9c5d0b9a".into(),
             status: "ready".into(),
-            callback_url: "https://newsbleach.com/api/v1/compute/callback/playful%2F109%2F7".into(),
+            callback_url: "https://wire.example/api/v1/compute/settlement/playful%2F109%2F7".into(),
             result_json: Some(
                 r#"{"kind":"Success","data":{"content":"hi","prompt_tokens":10,"completion_tokens":3,"model":"gemma4:26b","provider_model":"gemma4:26b","finish_reason":"stop"}}"#
                     .into(),
@@ -932,8 +1503,8 @@ mod tests {
             delivery_next_attempt_at: None,
             inference_latency_ms: Some(450),
             request_id: Some("req-abc-123".into()),
-            requester_callback_url: None,
-            requester_delivery_jwt: None,
+            requester_callback_url: Some("https://newsbleach.example/v1/compute/job-result".into()),
+            requester_delivery_jwt: Some("eyJhbGciOiJFZERTQSJ9.payload.sig".into()),
             content_posted_ok: 0,
             content_lease_until: None,
             content_next_attempt_at: None,
@@ -946,38 +1517,56 @@ mod tests {
         }
     }
 
-    // ── Envelope adapter ───────────────────────────────────────────────────
-
-    #[test]
-    fn envelope_success_maps_required_fields() {
-        let row = sample_row();
-        let result = MarketAsyncResult::Success(MarketDispatchResponse {
+    fn success_result() -> MarketAsyncResult {
+        MarketAsyncResult::Success(MarketDispatchResponse {
             content: "the answer".into(),
             prompt_tokens: Some(7),
             completion_tokens: Some(3),
             model: "gemma4:26b".into(),
             finish_reason: Some("stop".into()),
             provider_model: Some("gemma4:26b".into()),
-        });
-        let env = build_callback_envelope(&row, &result);
-        match env {
-            CallbackEnvelope::Success { job_id, result } => {
-                assert_eq!(job_id, row.job_id);
-                assert_eq!(result.content, "the answer");
-                assert_eq!(result.input_tokens, 7);
-                assert_eq!(result.output_tokens, 3);
-                assert_eq!(result.model_used, "gemma4:26b");
-                assert_eq!(result.latency_ms, 450);
-                assert_eq!(result.finish_reason.as_deref(), Some("stop"));
-            }
-            _ => panic!("expected Success"),
-        }
+        })
+    }
+
+    // ── Leg enum ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn leg_labels_are_stable_snake_case() {
+        // Dashboards + chronicle queries key on these literals.
+        assert_eq!(Leg::Content.label(), "content");
+        assert_eq!(Leg::Settlement.label(), "settlement");
+    }
+
+    // ── Content envelope (§2.6) ──────────────────────────────────────────────
+
+    #[test]
+    fn content_envelope_success_includes_content() {
+        let row = sample_row();
+        let env = build_content_envelope(&row, &success_result());
+        let json_str = serde_json::to_string(&env).unwrap();
+        assert!(json_str.contains("\"content\":\"the answer\""), "got: {json_str}");
+        assert!(json_str.contains("\"input_tokens\":7"));
+        assert!(json_str.contains("\"output_tokens\":3"));
+        assert!(json_str.contains("\"latency_ms\":450"));
+        assert!(json_str.contains("\"type\":\"success\""));
     }
 
     #[test]
-    fn envelope_none_tokens_map_to_zero() {
-        // Wire requires non-negative integers; None must map to 0
-        // (contract §2.3 isIntNonNeg validator).
+    fn content_envelope_failure_mirrors_settlement_shape() {
+        // D4: failure variant goes to BOTH legs with identical shape.
+        let row = sample_row();
+        let err = MarketAsyncResult::Error("worker heartbeat lost".into());
+        let content = build_content_envelope(&row, &err);
+        let settlement = build_settlement_envelope(&row, &err);
+        let cj = serde_json::to_value(&content).unwrap();
+        let sj = serde_json::to_value(&settlement).unwrap();
+        // Identical: type, job_id, error.code, error.message.
+        assert_eq!(cj, sj,
+            "failure envelope must be identical across legs per D4; content={cj} settlement={sj}");
+    }
+
+    #[test]
+    fn content_envelope_none_tokens_map_to_zero() {
         let row = sample_row();
         let result = MarketAsyncResult::Success(MarketDispatchResponse {
             content: "".into(),
@@ -987,92 +1576,70 @@ mod tests {
             finish_reason: None,
             provider_model: None,
         });
-        let env = build_callback_envelope(&row, &result);
-        match env {
-            CallbackEnvelope::Success { result, .. } => {
-                assert_eq!(result.input_tokens, 0);
-                assert_eq!(result.output_tokens, 0);
-                // model_used falls back to `model` (non-empty).
-                assert_eq!(result.model_used, "gemma4:26b");
-            }
-            _ => panic!("expected Success"),
-        }
-    }
-
-    #[test]
-    fn envelope_model_used_fallback_chain() {
-        // provider_model None + model empty → "unknown" (not a fail).
-        let row = sample_row();
-        let result = MarketAsyncResult::Success(MarketDispatchResponse {
-            content: "x".into(),
-            prompt_tokens: Some(1),
-            completion_tokens: Some(1),
-            model: String::new(),
-            finish_reason: None,
-            provider_model: None,
-        });
-        let env = build_callback_envelope(&row, &result);
-        match env {
-            CallbackEnvelope::Success { result, .. } => {
-                assert_eq!(result.model_used, "unknown");
-            }
-            _ => panic!("expected Success"),
-        }
-    }
-
-    #[test]
-    fn envelope_sweep_synth_latency_defaults_to_zero() {
-        let mut row = sample_row();
-        row.inference_latency_ms = None; // sweep-synth row
-        let result = MarketAsyncResult::Error("worker heartbeat lost".into());
-        let env = build_callback_envelope(&row, &result);
-        match env {
-            CallbackEnvelope::Failure { error, job_id } => {
-                assert_eq!(job_id, row.job_id);
-                assert_eq!(error.code, "worker_heartbeat_lost");
-                assert_eq!(error.message, "worker heartbeat lost");
-            }
-            _ => panic!("expected Failure"),
-        }
-    }
-
-    #[test]
-    fn envelope_job_id_is_uuid_not_handle_path() {
-        // Regression guard for contract §10.5: body.job_id is always
-        // the UUID (row.job_id); handle-path appears only in callback_url.
-        let row = sample_row();
-        let result = MarketAsyncResult::Success(MarketDispatchResponse {
-            content: "x".into(),
-            prompt_tokens: Some(1),
-            completion_tokens: Some(1),
-            model: "m".into(),
-            finish_reason: None,
-            provider_model: None,
-        });
-        let env = build_callback_envelope(&row, &result);
-        let json_bytes = serde_json::to_string(&env).unwrap();
-        assert!(
-            json_bytes.contains("4f93e9f4-5e7a-4a2a-9a6c-6d0c9c5d0b9a"),
-            "body.job_id must be the UUID; got: {json_bytes}"
-        );
-        assert!(
-            !json_bytes.contains("playful%2F109%2F7"),
-            "body.job_id MUST NOT leak handle-path: {json_bytes}"
-        );
-    }
-
-    #[test]
-    fn envelope_serializes_snake_case_type() {
-        let row = sample_row();
-        let result = MarketAsyncResult::Error("kaboom".into());
-        let env = build_callback_envelope(&row, &result);
+        let env = build_content_envelope(&row, &result);
         let json_str = serde_json::to_string(&env).unwrap();
-        // Contract §2.3: type is "failure" (lowercase), not "Error" or
-        // "Failure".
+        assert!(json_str.contains("\"input_tokens\":0"));
+        assert!(json_str.contains("\"output_tokens\":0"));
+    }
+
+    // ── Settlement envelope (§2.3 — content MUST NOT appear) ─────────────────
+
+    #[test]
+    fn settlement_envelope_never_serializes_content() {
+        // Contract §2.3: "result.content MUST NOT appear on this endpoint".
+        // Structural guard — SettlementResult has no `content` field.
+        let row = sample_row();
+        let env = build_settlement_envelope(&row, &success_result());
+        let json_str = serde_json::to_string(&env).unwrap();
         assert!(
-            json_str.contains("\"type\":\"failure\""),
-            "expected snake_case `type` tag; got: {json_str}"
+            !json_str.contains("content"),
+            "settlement envelope MUST NOT contain the string 'content' anywhere: {json_str}"
         );
+        // Sanity: other §2.3 required fields are present.
+        assert!(json_str.contains("\"input_tokens\":7"));
+        assert!(json_str.contains("\"output_tokens\":3"));
+        assert!(json_str.contains("\"model_used\":"));
+        assert!(json_str.contains("\"latency_ms\":"));
+        assert!(json_str.contains("\"type\":\"success\""));
+    }
+
+    #[test]
+    fn settlement_envelope_failure_serializes_snake_case_type() {
+        // Use a message that doesn't substring-match any of the pinned
+        // §2.3 codes (`classify_failure_code` looks for "heartbeat",
+        // "timeout", "oom", "invalid messages"). A plain "kaboom" would
+        // sneak into the oom bucket via "oom" substring, so picking a
+        // phrase that falls through to the catch-all is intentional.
+        let row = sample_row();
+        let env =
+            build_settlement_envelope(&row, &MarketAsyncResult::Error("garbled response".into()));
+        let json_str = serde_json::to_string(&env).unwrap();
+        assert!(json_str.contains("\"type\":\"failure\""), "got: {json_str}");
+        assert!(
+            json_str.contains("\"code\":\"model_error\""),
+            "expected code=model_error in settlement failure envelope; got: {json_str}"
+        );
+    }
+
+    // ── §10.5 UUID invariant (both adapters) ─────────────────────────────────
+
+    #[test]
+    fn both_envelopes_emit_uuid_job_id_not_handle_path() {
+        let row = sample_row();
+        let content = build_content_envelope(&row, &success_result());
+        let settlement = build_settlement_envelope(&row, &success_result());
+        let cj = serde_json::to_string(&content).unwrap();
+        let sj = serde_json::to_string(&settlement).unwrap();
+        for body in [&cj, &sj] {
+            assert!(
+                body.contains("4f93e9f4-5e7a-4a2a-9a6c-6d0c9c5d0b9a"),
+                "body.job_id must be the UUID; got: {body}"
+            );
+            assert!(
+                !body.contains("playful%2F109%2F7"),
+                "body.job_id MUST NOT leak handle-path: {body}"
+            );
+        }
     }
 
     // ── Failure classifier ─────────────────────────────────────────────────
@@ -1087,55 +1654,55 @@ mod tests {
         assert_eq!(classify_failure_code("garbled LLM response"), "model_error");
     }
 
-    // ── Retry classification ───────────────────────────────────────────────
+    // ── Retry classification — per-leg split ─────────────────────────────────
 
     #[test]
-    fn classify_retry_explicit_header_wins_over_http_code() {
+    fn classify_retry_settlement_reads_x_wire_retry_header() {
         let mut headers = HeaderMap::new();
         headers.insert("X-Wire-Retry", "never".parse().unwrap());
-        // 500 would normally be Retry per fallback; explicit header overrides.
         let status = reqwest::StatusCode::INTERNAL_SERVER_ERROR;
-        match classify_retry(status, &headers) {
+        match classify_retry_settlement(status, &headers) {
             RetryDecision::Terminal { source } => assert_eq!(source, "x_wire_retry_never"),
-            _ => panic!("explicit never must produce Terminal"),
+            _ => panic!("explicit X-Wire-Retry: never must produce Terminal"),
         }
     }
 
     #[test]
-    fn classify_retry_fallback_for_missing_header() {
-        let headers = HeaderMap::new();
-        // 404 is in fallback terminal list.
-        let status = reqwest::StatusCode::NOT_FOUND;
-        match classify_retry(status, &headers) {
-            RetryDecision::Terminal { source } => assert_eq!(source, "http_code_fallback"),
-            _ => panic!("404 without header must fall back to Terminal"),
-        }
-        // 503 is NOT in terminal list — fallback treats as Retry.
-        let status = reqwest::StatusCode::SERVICE_UNAVAILABLE;
-        match classify_retry(status, &headers) {
-            RetryDecision::Retry { source } => assert_eq!(source, "http_code_fallback"),
-            _ => panic!("503 without header must fall back to Retry"),
+    fn classify_retry_content_ignores_x_wire_retry_header() {
+        // Content leg: requester HTTP doesn't standardize X-Wire-Retry.
+        // If the requester happens to emit it, we ignore it and decide
+        // purely on the HTTP status. 500 → Retry (not in terminal set).
+        let status = reqwest::StatusCode::INTERNAL_SERVER_ERROR;
+        match classify_retry_content(status) {
+            RetryDecision::Retry { .. } => {}
+            _ => panic!("500 on content leg must be Retry (header ignored)"),
         }
     }
 
     #[test]
-    fn classify_retry_terminal_codes_cover_contract_set() {
+    fn classify_retry_fallback_terminal_codes_both_legs() {
+        // Both classifiers treat the contract-pinned terminal HTTP codes
+        // as Terminal under fallback.
         let headers = HeaderMap::new();
-        // All codes in TERMINAL_HTTP_CODES_FALLBACK are terminal under fallback.
         for code in TERMINAL_HTTP_CODES_FALLBACK {
             let status = reqwest::StatusCode::from_u16(*code).unwrap();
-            assert!(matches!(classify_retry(status, &headers), RetryDecision::Terminal { .. }),
-                "HTTP {code} must be terminal");
+            assert!(
+                matches!(classify_retry_settlement(status, &headers), RetryDecision::Terminal { .. }),
+                "settlement: HTTP {code} must be terminal"
+            );
+            assert!(
+                matches!(classify_retry_content(status), RetryDecision::Terminal { .. }),
+                "content: HTTP {code} must be terminal"
+            );
         }
     }
 
     #[test]
-    fn classify_retry_unknown_header_warns_and_falls_back() {
+    fn classify_retry_settlement_unknown_header_falls_back() {
         let mut headers = HeaderMap::new();
         headers.insert("X-Wire-Retry", "schedule-next-eclipse".parse().unwrap());
         let status = reqwest::StatusCode::INTERNAL_SERVER_ERROR;
-        // Should fall back to HTTP-code; 500 is NOT terminal → Retry.
-        match classify_retry(status, &headers) {
+        match classify_retry_settlement(status, &headers) {
             RetryDecision::Retry { source } => assert_eq!(source, "http_code_fallback"),
             _ => panic!("unknown header must fall through to HTTP-code decision"),
         }
@@ -1154,7 +1721,6 @@ mod tests {
 
     #[test]
     fn retry_after_http_date_future() {
-        // A far-future HTTP-date must produce a positive delta.
         let mut headers = HeaderMap::new();
         headers.insert(
             reqwest::header::RETRY_AFTER,
@@ -1185,10 +1751,14 @@ mod tests {
     // ── Bearer validation ──────────────────────────────────────────────────
 
     #[test]
-    fn bearer_accepts_base64url_with_optional_padding() {
+    fn bearer_accepts_base64url_and_jwt() {
+        // Base64url + padding (settlement-leg bearers).
         assert!(is_valid_bearer("abcDEFghi123_-"));
         assert!(is_valid_bearer("abcDEFghi123="));
         assert!(is_valid_bearer("a"));
+        // JWT shape (content-leg bearers). Three base64url segments
+        // separated by dots.
+        assert!(is_valid_bearer("eyJhbGciOiJFZERTQSJ9.payload.sig"));
     }
 
     #[test]
@@ -1205,7 +1775,6 @@ mod tests {
 
     #[test]
     fn truncate_respects_char_boundary() {
-        // Multi-byte chars don't get sliced.
         let input = "αβγδε".repeat(10);
         let t = truncate(&input, 5);
         assert_eq!(t.chars().count(), 6); // 5 chars + "…"
@@ -1230,5 +1799,54 @@ mod tests {
             "token must be redacted in Debug; got: {debug_str}");
         assert!(debug_str.contains("<redacted>"));
         assert!(debug_str.contains("bearer"));
+    }
+
+    // ── Terminal HTTP reason composition ────────────────────────────────────
+
+    #[test]
+    fn leg_terminal_http_reason_401_settlement_old_row() {
+        let mut row = sample_row();
+        // Fake old row — created far in the past so age > ready_retention.
+        row.created_at = "2020-01-01 00:00:00".into();
+        let p = MarketDeliveryPolicy::default();
+        let reason = leg_terminal_http_reason(Leg::Settlement, 401, &row, &p);
+        assert_eq!(reason, "terminal_http_401_likely_secret_expired");
+    }
+
+    #[test]
+    fn leg_terminal_http_reason_401_content_old_row() {
+        let mut row = sample_row();
+        row.created_at = "2020-01-01 00:00:00".into();
+        let p = MarketDeliveryPolicy::default();
+        let reason = leg_terminal_http_reason(Leg::Content, 401, &row, &p);
+        assert_eq!(reason, "terminal_http_401_likely_jwt_expired");
+    }
+
+    #[test]
+    fn leg_terminal_http_reason_fresh_row_is_plain_401() {
+        // Row created just now → too young to blame secret expiry.
+        let row = sample_row(); // created_at = 2026-04-20 (recent)
+        let p = MarketDeliveryPolicy::default();
+        // MarketDeliveryPolicy::contract_defaults might not exist; fall back
+        // to a constructed policy by reading the field. Use a liberal
+        // ready_retention to avoid flakiness.
+        let mut p2 = p.clone();
+        p2.ready_retention_secs = 24 * 60 * 60 * 365 * 100; // 100y → any row is "fresh"
+        let reason = leg_terminal_http_reason(Leg::Settlement, 401, &row, &p2);
+        assert_eq!(reason, "terminal_http_401");
+    }
+
+    #[test]
+    fn leg_terminal_http_reason_non_401_passthrough() {
+        let row = sample_row();
+        let p = MarketDeliveryPolicy::default();
+        assert_eq!(
+            leg_terminal_http_reason(Leg::Content, 404, &row, &p),
+            "terminal_http_404"
+        );
+        assert_eq!(
+            leg_terminal_http_reason(Leg::Settlement, 413, &row, &p),
+            "terminal_http_413"
+        );
     }
 }
