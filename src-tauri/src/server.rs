@@ -2541,11 +2541,20 @@ async fn handle_compute_job_result(
         }
     };
 
-    // ── Step 2: verify the Wire-minted result-delivery JWT.
+    // ── Step 2: verify the Wire-minted requester-delivery JWT (rev 2.0).
     //
-    // The verifier binds three things: `aud=result-delivery`,
-    // `sub=<body.job_id>`, `rid=<self.operator_id>`. Any mismatch is a
-    // 401 — specific variant is logged but not surfaced.
+    // Wave 2B hard-swaps to `verify_requester_delivery_token`
+    // (aud="requester-delivery", sub=<body.job_id>, rid=<self.operator_id>).
+    // Per spec §"Requester-delivery JWT verifier" + §3.4 the transition is
+    // clean-cut: legacy aud="result-delivery" tokens are rejected with 401
+    // WrongAud, no fallback to `verify_result_delivery_token`. Outstanding
+    // legacy tokens self-expire within `fill_job_ttl_secs`; the provider's
+    // content leg exhausts to `failed_content_only` and the requester
+    // reconciles via §2.4 status-poll. Zero-lockstep fail-loud.
+    //
+    // Strip any leading `"Bearer "` prefix (warp's header filter gives us
+    // the raw header value including the prefix). The verifier itself also
+    // handles this, but stripping here keeps the tracing log clean.
     let jwt_pk = state.jwt_public_key.read().await.clone();
     let self_operator_id = state.auth.read().await.user_id.clone().unwrap_or_default();
     if self_operator_id.is_empty() {
@@ -2559,20 +2568,27 @@ async fn handle_compute_job_result(
             warp::http::StatusCode::UNAUTHORIZED,
         )));
     }
-    if let Err(e) = crate::pyramid::result_delivery_identity::verify_result_delivery_token(
+    if let Err(e) = crate::pyramid::result_delivery_identity::verify_requester_delivery_token(
         &auth_header,
         &jwt_pk,
         &self_operator_id,
         &job_id,
     ) {
+        // Surface the variant name so operators can diagnose aud/sub/rid
+        // mismatches versus signature vs expiry failures. No token
+        // material or key bytes are in the Debug impl — each variant
+        // carries only typed discriminator data.
+        let variant = format!("{:?}", e);
         tracing::warn!(
             error = %e,
+            variant = %variant,
             job_id = %job_id,
-            "compute_job_result: JWT verification failed"
+            "compute_job_result: requester-delivery JWT verification failed"
         );
         return Ok(Box::new(warp::reply::with_status(
             warp::reply::json(&serde_json::json!({
                 "error": "unauthorized",
+                "variant": variant,
             })),
             warp::http::StatusCode::UNAUTHORIZED,
         )));
@@ -2907,6 +2923,78 @@ async fn handle_market_dispatch(
         }
     } // roster read-lock drops here
 
+    // Step 4b (rev 2.0 §2.1 / spec §"`handle_market_dispatch`" line 360):
+    // admission-time SSRF re-validation of `requester_callback_url`.
+    //
+    // Wire also validates at match time, but defense-in-depth says every
+    // receiver re-checks — a compromised Wire or in-flight mutation of the
+    // dispatch body could otherwise pivot the provider's outbound HTTP
+    // client onto loopback / RFC1918 / link-local. Same structural shape
+    // as the settlement-leg URL (https + non-empty host; no roster
+    // participation). `CallbackKind::MarketStandard` is the correct variant
+    // here because the requester tunnel is an external HTTPS callback URL
+    // with exactly the same constraints as the Wire settlement URL — third-
+    // party endpoint, JWT-gated, scheme-must-be-https, no fleet roster
+    // entry. `Relay` would also work (identical branch), but `MarketStandard`
+    // is the direct-P2P tier and keeps this admission check symmetric with
+    // the settlement-leg validation above. An empty `FleetRoster::default()`
+    // is passed because the roster is never consulted for these variants
+    // (see fleet.rs::validate_callback_url match arm).
+    let requester_callback_url_str = req.requester_callback_url.to_string();
+    if let Err(e) = crate::fleet::validate_callback_url(
+        &requester_callback_url_str,
+        &crate::fleet::CallbackKind::MarketStandard,
+        &crate::fleet::FleetRoster::default(),
+    ) {
+        tracing::warn!(
+            "Market dispatch requester_callback_url rejected: {} (job_id={})",
+            e,
+            req.job_id
+        );
+        return Ok(Box::new(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({
+                "error": "requester_callback_url_missing_or_invalid",
+                "detail": format!("{}", e),
+            })),
+            warp::http::StatusCode::BAD_REQUEST,
+        )));
+    }
+
+    // Step 4c (Q-PROTO-3, spec §"`handle_market_dispatch`" line 354):
+    // `privacy_tier` warn-don't-reject. Only `"direct"` is silent; any
+    // other value (including the deprecated `"bootstrap-relay"`) logs a
+    // chronicle event and proceeds with direct-delivery semantics. Never
+    // reject — a future relay-market Wire may ship new tier strings
+    // ahead of node relay support, and zero-lockstep requires the node
+    // to degrade gracefully rather than 400 on an unknown tier.
+    if req.privacy_tier != "direct" {
+        if let Some(data_dir) = state.pyramid.data_dir.as_ref() {
+            let db_path_chr = data_dir.join("pyramid.db");
+            let tier = req.privacy_tier.clone();
+            let job_id_chr = req.job_id.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(conn) = rusqlite::Connection::open(&db_path_chr) {
+                    let job_path = format!("market:{}", job_id_chr);
+                    let ctx = crate::pyramid::compute_chronicle::ChronicleEventContext::minimal(
+                        &job_path,
+                        "market_unknown_privacy_tier",
+                        crate::pyramid::compute_chronicle::SOURCE_MARKET_RECEIVED,
+                    )
+                    .with_metadata(serde_json::json!({
+                        "tier": tier,
+                        "job_id": job_id_chr,
+                    }));
+                    let _ = crate::pyramid::compute_chronicle::record_event(&conn, &ctx);
+                }
+            });
+        }
+        tracing::info!(
+            job_id = %req.job_id,
+            privacy_tier = %req.privacy_tier,
+            "Market dispatch accepted with non-direct privacy_tier; proceeding with direct-delivery semantics"
+        );
+    }
+
     // Step 5 (§III L547-551, DD-H): Admission gates.
     //
     // Several gates are NOT implemented in this workstream — see TODOs
@@ -3206,6 +3294,13 @@ async fn handle_market_dispatch(
         .get("request_id")
         .and_then(|v| v.as_str())
         .map(String::from);
+    // Rev 0.6.1 Wave 2B: thread the two new dispatch-body fields through
+    // to the outbox row. Wave 1 added the DB columns + the helper-fn
+    // parameters; Wave 1 call sites passed `None, None` pending this
+    // admission handler change. The delivery worker (Wave 2A) reads these
+    // columns at POST time for the content leg.
+    let requester_callback_url_tx = requester_callback_url_str.clone();
+    let requester_delivery_jwt_tx = req.requester_delivery_jwt.clone();
 
     let outcome = tokio::task::spawn_blocking(move || -> MarketAdmissionOutcome {
         let mut conn = match rusqlite::Connection::open(&db_path_tx) {
@@ -3234,12 +3329,14 @@ async fn handle_market_dispatch(
             &expires_at,
             Some(&callback_auth_token_tx),
             request_id_tx.as_deref(),
-            // Wave 1 scope: rev 0.6.1 dispatch body fields plumb through
-            // in Wave 2. Pass None here — the admission handler's body
-            // parsing + TunnelUrl extraction lands alongside the
-            // MarketDispatchRequest consumer change.
-            None,
-            None,
+            // Rev 0.6.1 Wave 2B: plumb the content-leg URL + opaque
+            // requester-delivery JWT onto the outbox row. Wave 2A's
+            // delivery worker consumes these on the content leg; the
+            // token is treated as opaque by this node (verification
+            // happens on the requester side via
+            // `verify_requester_delivery_token`).
+            Some(&requester_callback_url_tx),
+            Some(&requester_delivery_jwt_tx),
         ) {
             Ok(n) => n,
             Err(e) => return MarketAdmissionOutcome::DbError(e.to_string()),

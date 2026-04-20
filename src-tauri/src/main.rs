@@ -12784,16 +12784,42 @@ fn main() {
         // fires before this lands, stale leases just delay reclaim by
         // the lease_duration (~35s default), not block delivery
         // correctness.
+        //
+        // Rev 0.6.1 Wave 2B: additionally clear per-leg leases
+        // (`content_lease_until`, `settlement_lease_until`) via
+        // `market_outbox_startup_recovery_clear_leg_leases`. The rev 0.5
+        // helper above only clears the old single `delivery_lease_until`
+        // column (dead per spec line 84 but kept for back-compat); rev
+        // 0.6 moves to per-leg columns so the new helper is additive.
+        // Double-clear is idempotent — the rev 0.5 helper touches a
+        // different column and is safe to leave in place.
         let db_path_recover = pyramid_db_path.to_path_buf();
         tauri::async_runtime::spawn(async move {
             let res = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let conn = rusqlite::Connection::open(&db_path_recover)?;
-                let n =
+                // Legacy (rev 0.5) single-lease column — kept for safety
+                // in case any row still has it set from a pre-migration
+                // instance. No-op on rows where the column is already NULL.
+                let n_legacy =
                     wire_node_lib::pyramid::db::market_outbox_delivery_startup_recovery(&conn)?;
-                if n > 0 {
+                if n_legacy > 0 {
                     tracing::info!(
-                        recovered = n,
-                        "market delivery startup: cleared stale leases"
+                        recovered = n_legacy,
+                        "market delivery startup: cleared stale legacy (rev 0.5) leases"
+                    );
+                }
+                // Rev 0.6 per-leg leases — the live recovery path. Clears
+                // `content_lease_until` + `settlement_lease_until` on any
+                // ready MarketStandard/Relay row so the delivery task
+                // reclaims immediately after restart.
+                let n_legs =
+                    wire_node_lib::pyramid::db::market_outbox_startup_recovery_clear_leg_leases(
+                        &conn,
+                    )?;
+                if n_legs > 0 {
+                    tracing::info!(
+                        recovered = n_legs,
+                        "market delivery startup: cleared stale per-leg leases (content + settlement)"
                     );
                 }
                 Ok(())
