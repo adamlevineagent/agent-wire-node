@@ -3,7 +3,7 @@
 **Date:** 2026-04-20
 **Author:** Claude (agent-wire-node upstairs mac)
 **Status:** Draft — rewritten against rev 2.0 contract (P2P delivery)
-**Rev:** 0.6
+**Rev:** 0.6.1 (cross-audit applied)
 **Contract:** `GoodNewsEveryone/docs/architecture/wire-node-compute-market-contract.md` rev 2.0 (commit `838b7700`)
 **Supersedes:** rev 0.1–0.5 (Wire-in-middle topology)
 
@@ -28,7 +28,7 @@ This spec replaces rev 0.5's Wire-in-middle architecture entirely. Commits `5faf
 
 - **Two-POST state machine** on the existing `fleet_result_outbox`. Per-leg state tracked in new columns; one outbox row owns both legs of the delivery.
 - **Per-leg retry budget** per Q-PROTO-6 — independent `max_attempts_content` + `max_attempts_settlement` from `compute_delivery_policy` economic_parameter. Shared `backoff_schedule_secs`.
-- **Two envelope adapters** (`build_content_envelope` + `build_settlement_envelope`) from one internal `MarketAsyncResult`. Settlement is §2.3 shape minus `result.content`; content is §2.6 full shape.
+- **Two envelope adapters** (`build_content_envelope` + `build_settlement_envelope`) from one internal `MarketAsyncResult`. Settlement is §2.3 shape minus `result.content`; content is §2.6 full shape. Both adapters emit `job_id` as UUID (§10.5 — handle-path NEVER crosses delivery-hop body JSON; Pillar J7). Failure variant (worker failed inference) flows to BOTH legs per D4: `{type: "failure", job_id, error: {code, message}}` identical shape. Requester receives the failure envelope too so it can stop polling rather than wait forever.
 - **Two Bearer sources:** `requester_delivery_jwt` from dispatch body for content POST (opaque to provider, verified by requester); `callback_auth.token` from dispatch body for settlement POST (unchanged from rev 0.5 semantic, matches Wire's sha256-at-rest verification).
 - **Per-leg lease** — prevents double-POST of the same leg; leg independence means the content leg can be in-flight while settlement is already done, or vice versa.
 - **Chronicle events renamed** per rev 2.0 §2.5 grandfathering — new emissions use the rev-2.0-aligned names; old names stay in the CHECK constraint as deprecated.
@@ -75,7 +75,7 @@ admission (worker success/failure → ready)
 - Both legs 2xx → row transitions `ready → delivered`. Emit `market_result_delivered` summary chronicle.
 - Content exhausts, settlement 2xx → `delivery_status = failed_content_only` on row (terminal). Chronicle `market_result_content_delivery_failed` + metadata flag. Requester polls Wire to reconcile.
 - Settlement exhausts, content 2xx → `delivery_status = failed_settlement_only`. Chronicle `market_result_settlement_delivery_failed`. **Provider unpaid; Wire doesn't know inference ran.** Dispute/manual-recovery path.
-- Both exhaust → `delivery_status = failed`. Chronicle `market_result_delivery_failed` with both reasons.
+- Both exhaust → `delivery_status = failed_both`. Chronicle `market_result_delivery_failed` with both reasons. **Naming convention:** node-side `delivery_status` uses the same terminal-value vocabulary as Wire's `wire_compute_jobs.delivery_status` per Wire P3 plan WSβ (`awaiting_settlement | settled | failed_content_only | failed_settlement_only | failed_both | expired_unsettled | no_callback`). Keeping strings identical prevents operator-grep confusion when rows from both sides appear in aggregated dashboards.
 
 ### Schema changes
 
@@ -229,14 +229,21 @@ When this node is the REQUESTER (not provider), inbound `POST /v1/compute/job-re
 
 - `aud = "requester-delivery"` (distinct from `"compute"` and legacy `"result-delivery"`)
 - `iss = "wire"`
-- `sub = <uuid_job_id>` (must match `body.job_id`)
+- `sub = <uuid_job_id>` (must match `body.job_id` — §10.5 UUID-not-handle-path)
 - `rid = <requester_operator_id>` (must match `self.operator_id`)
 - `exp` not expired (±60s skew)
 - EdDSA signature vs `jwt_public_key` (same key material as dispatch JWT)
 
-Implementation: new function `verify_requester_delivery_token` in `src-tauri/src/pyramid/result_delivery_identity.rs` (sibling of existing `verify_result_delivery_token` from commit `43b8704`). The existing handler at `server.rs::handle_compute_job_result` switches from `verify_result_delivery_token` to `verify_requester_delivery_token` (or adds a compat mode that tries both during rev-2.0-transition).
+Implementation: new function `verify_requester_delivery_token` in `src-tauri/src/pyramid/result_delivery_identity.rs` (sibling of existing `verify_result_delivery_token` from commit `43b8704`). The existing handler at `server.rs::handle_compute_job_result` swaps from `verify_result_delivery_token` to `verify_requester_delivery_token` at the rev-2.0 cutover commit.
 
-**Zero-lockstep note:** pre-rev-2.0 Wire emits `aud="result-delivery"` (legacy); rev 2.0 emits `aud="requester-delivery"`. Transition: the handler accepts EITHER `aud` for a short transition window, logs which one was used, and emits a deprecation chronicle on the legacy aud. After Wire is fully rev-2.0, legacy aud acceptance drops.
+**Clean-cut, no dual-aud transition.** Rev 2.0 contract §3.4 sanctions only `aud="requester-delivery"`. Spec does NOT fabricate a dual-aud transition window — the contract doesn't authorize it and admitting both-aud opens a small replay surface for outstanding legacy tokens. Post-R2 Wire mints only the new aud; the only legacy tokens in flight are from jobs filled before Wire's R2 commit, which self-expire within `fill_job_ttl_secs` (default 1800s). The rev-2.0 node emits 401 on legacy aud; legacy provider's content-leg exhausts to `failed_content_only`; requester reconciles via §2.4 status-poll. Zero-lockstep fail-loud posture (consistent with §2.1 `deny_unknown_fields` on dispatch body).
+
+**Duplicate-delivery idempotency** (§2.6 contract requirement): on inbound POST, after JWT verification:
+1. Look up `pending_jobs` by `body.job_id`.
+2. If found: fire oneshot, remove entry, respond 200 with the normal body.
+3. If NOT found (duplicate arrived after prior attempt succeeded, OR node restart lost in-memory state): respond 2xx with body `{"status": "already_settled"}`. This is the signal per §2.6 that tells the provider to stop retrying the content leg — the content was received on a prior attempt.
+
+Idempotent behavior is REQUIRED; without it the provider's content-leg retry budget burns for no reason and the job lands as spurious `failed_content_only`.
 
 ### Auth token shapes persisted on outbox
 
@@ -338,8 +345,13 @@ Per-attempt delay looks up `backoff_schedule_secs[attempt-1]` with the last elem
 - New fields on `MarketDispatchRequest`:
   - `requester_callback_url: TunnelUrl` (not optional — dispatch requires it; pre-rev-2.0 compat = reject with 400 `requester_callback_url_required`)
   - `requester_delivery_jwt: String` (opaque to provider; store on row)
+- **Preserve existing `extensions: HashMap<String, serde_json::Value>` field** (§10.1 forward-compat escape hatch from rev 0.5). The two new fields are additive alongside `extensions`, not replacements. Wire may ship future non-lockstep additions via `extensions.*` keys; node's `deny_unknown_fields` at the struct level + `extensions` at the escape-hatch level preserves forward compat.
+- **Body `job_id` stays UUID** (§10.5 reaffirmed; unchanged since rev 0.1). Handle-path is HTTP-surface-only; dispatch body + delivery body both use the UUID.
+- **`compute_callback_mode` economic_parameter** (deprecated in contract §6 rev 2.0): node ignores any value received via `wire_parameters`; no code path reads it. Remove any rev-0.5-era read sites if present (none in rev 0.5 codebase; confirmed).
 
-Zero-lockstep: if Wire sends a pre-rev-2.0 dispatch missing these fields, `deny_unknown_fields` serde config catches it as malformed request → node 400s with `requester_callback_url_missing`. Wire owner's plan will ship rev 2.0 Wire-side ahead of node; transition handled via handshake-fail-loud rather than handshake-succeed-broken.
+Zero-lockstep: if Wire sends a pre-rev-2.0 dispatch missing these fields, serde's required-field validation catches the missing fields (they're declared as `TunnelUrl` / `String`, not `Option<_>` and not `#[serde(default)]`) → node 400s with `requester_callback_url_missing_or_invalid`. `deny_unknown_fields` on the struct is a belt-and-suspenders guard for the inverse case (pre-rev-2.0 Wire sending fields this node's struct doesn't know about — not expected given additive-only contract evolution, but cheap insurance). Wire owner's plan ships rev 2.0 Wire-side ahead of node; transition handled via handshake-fail-loud rather than handshake-succeed-broken.
+
+**`privacy_tier` warn-don't-reject** (Q-PROTO-3): the dispatch body's `privacy_tier` field is typed as `String` (not enum) per contract. Rev 0.6 node acknowledges `"direct"` semantically (only supported Phase 3 tier) but MUST NOT reject unknown values — a pre-rev-2.0 Wire may still ship `"bootstrap-relay"` (deprecated), and future relay-market Wire ships new tier strings ahead of node relay support. On inbound: log unknown tier to chronicle (`market_unknown_privacy_tier` event, metadata `{tier, job_id}`), proceed with `"direct"`-style delivery (P2P, no relay hop). Admission test: `privacy_tier_bootstrap_relay_not_rejected` seeds dispatch with the deprecated string and asserts admission succeeds.
 
 ### `handle_market_dispatch` (server.rs)
 
@@ -361,7 +373,7 @@ Roughly half-rewrite of rev 0.5's module. Kept: supervisor, nudge+tick, reqwest 
 
 - `DeliveryContext` gains `wire_parameters: Arc<RwLock<AuthState>>` (already had via auth ref — just document).
 - `tick()` issues TWO claim queries (content + settlement), dispatches POSTs to `deliver_leg(Leg::Content)` + `deliver_leg(Leg::Settlement)` in bounded parallel.
-- Envelope adapter split: `build_content_envelope(&row, &result) → CallbackEnvelope`, `build_settlement_envelope(&row, &result) → SettlementEnvelope`. Settlement envelope omits `content`; internally can be a struct with `#[serde(skip_serializing_if = "never_serialize")]` on content, or a distinct type.
+- Envelope adapter split: `build_content_envelope(&row, &result) → CallbackEnvelope`, `build_settlement_envelope(&row, &result) → SettlementEnvelope`. Settlement envelope omits `content`; internally can be a struct with `#[serde(skip_serializing_if = "never_serialize")]` on content, or a distinct type. Both adapters: pre-POST `debug_assert!(uuid::Uuid::parse_str(&body.job_id).is_ok())` per §10.5 (handle-path never crosses delivery-hop body). Failure variant serialization mirrors Success-variant structure but with `error: {code, message}` instead of `result: {...}`; classify_failure_code emits the §2.3 pinned enum code; per D4 the failure envelope goes to BOTH legs identically.
 - DB helpers: 4 new per-leg CAS helpers (`claim_content_for_delivery`, `claim_settlement_for_delivery`, `mark_content_posted_ok_if_ready`, `mark_settlement_posted_ok_if_ready`, `bump_content_attempt_with_backoff`, `bump_settlement_attempt_with_backoff`). All CAS-guarded on `status='ready'` + per-leg `posted_ok=0`.
 - `market_outbox_mark_failed_with_error_cas` keeps terminal-row semantics; called only when at least one leg terminal-exhausts AND the other is also terminal (both-ways exhaust) OR on early terminal (envelope parse fails, etc.).
 - New helper `check_both_legs_complete(row) → bool`: after any leg's success CAS, re-read the row and flip `status → delivered` if both legs are now OK.
@@ -427,7 +439,7 @@ admission ─(worker)→  │   pending   │
    (content in, settlement lost)         (settlement in, content lost)
 ```
 
-Both-exhausted → `delivery_status = failed` + terminal chronicle.
+Both-exhausted → `delivery_status = failed_both` + terminal chronicle.
 
 ---
 
@@ -452,10 +464,14 @@ Builds on rev 0.5's 19 unit tests. Adds:
 15. `requester_delivery_jwt_aud_mismatch_rejected` — `aud="compute"` or `"result-delivery"` rejected.
 16. `requester_delivery_jwt_rid_mismatch_rejected` — wrong operator_id rejected.
 17. `backoff_schedule_from_economic_parameter` — policy supersession updates delay; assert retry after schedule[attempt].
-18. `pre_rev_2_0_dispatch_missing_fields_400s` — dispatch body without `requester_callback_url` → 400 at admission.
-19. `legacy_aud_accepted_during_transition` — `verify_result_delivery_token` falls through to legacy aud; emits deprecation chronicle.
+18. `pre_rev_2_0_dispatch_missing_fields_400s` — dispatch body without `requester_callback_url` → 400 at admission (required-field serde validation).
+19. `privacy_tier_bootstrap_relay_not_rejected` — legacy `"bootstrap-relay"` value accepted; chronicle `market_unknown_privacy_tier` fired; delivery proceeds as `"direct"`.
+20. `content_envelope_failure_branch_to_requester` — worker failure variant produces `{type: "failure", job_id, error: {code, message}}` on content leg (D4 — failure goes to both).
+21. `duplicate_content_delivery_returns_already_settled` — second POST with same `job_id` hits requester; `pending_jobs.take` returns None; handler emits 2xx `{"status": "already_settled"}` per §2.6 idempotency.
+22. `legacy_aud_result_delivery_rejected` — JWT with `aud="result-delivery"` (legacy) → 401 with no dual-aud fallback (rev 2.0 contract §3.4 sanctions only `"requester-delivery"`).
+23. `envelope_job_id_is_uuid_not_handle_path` — `build_content_envelope` + `build_settlement_envelope` both emit `body.job_id` as the UUID, never handle-path (§10.5 + Pillar J7).
 
-Total: rev 0.5's 19 + 19 new = 38+. Keep each small.
+Total: rev 0.5's 19 + new tests (19 from rev 0.6 + 6 from audit) = 44+. Keep each small.
 
 ---
 
@@ -496,7 +512,7 @@ None — P1 resolved (D1–D8 all answered; paste-back confirmed). Any further b
 
 1. **`requester_delivery_jwt` mint timing.** Wire mints at `/fill`; if the content retry sequence exceeds `requester_delivery_jwt_ttl_secs`, token expires mid-retry. Phase 3 default TTL = fill_job_ttl_secs (30 min) so the full retry sequence should fit. If ops shows otherwise, §2.6 "Token refresh" option 1 (Wire-side refresh endpoint) ships in v0.2.
 
-2. **Requester-side verifier backwards-compat window.** `aud="result-delivery"` (legacy) vs `"requester-delivery"` (rev 2.0). Both-accepted transition has a small security risk (replay of legacy token against new verifier). Mitigation: deprecation chronicle on every legacy use so operators see when to drop legacy.
+2. **Legacy-aud clean-cut (no transition window).** Rev 2.0 contract §3.4 sanctions only `aud="requester-delivery"`. Rev 0.6 does NOT fabricate a dual-aud transition fallback — the contract doesn't authorize one and admitting both-aud opens a replay surface. Post-R2 Wire mints only the new aud; legacy tokens self-expire within `fill_job_ttl_secs`; any in-flight legacy token at the cutover fails 401 → content leg exhausts to `failed_content_only` → requester reconciles via §2.4 status-poll. Zero-lockstep fail-loud consistent with §2.1 posture.
 
 3. **Startup-migration ordering.** Rev 0.5 shipped 5 columns; rev 0.6 adds 9 more. A node restarting between rev 0.5 and rev 0.6 deploys gets both migrations in order; no cross-version rows exist because nothing ever wrote the rev 0.5 columns in production. Safe.
 
@@ -513,3 +529,17 @@ None — P1 resolved (D1–D8 all answered; paste-back confirmed). Any further b
 - **rev 0.5 → 0.6 (2026-04-20)**: Architectural reversal per rev 2.0 contract (`GoodNewsEveryone@838b7700`). Wire ownership reclassified as coordinator, not content carrier (canonical `63-relays-and-privacy.md`). Two-POST topology: content → requester direct (§2.6), settlement → Wire (§2.3 minus content). Per-leg retry budget (Q-PROTO-6). New `requester_delivery_jwt` (§3.4, `aud="requester-delivery"`). Nine new outbox columns (per-leg state). ~60% of rev 0.5 code survives: supervisor, envelope adapter pattern (split into two), JWT verification pattern, reqwest config, classify_retry, truncate, Debug redaction, heartbeat self-heal, chronicle supervisor. Target URLs + Bearer sources + retry bookkeeping new.
 
 - **Pending**: Wire-side P3 re-plan (Wire owner shipping in parallel). Cross-audit after both sides finalize plans. Zero-lockstep via fallback behaviors on both sides.
+
+- **rev 0.6 → 0.6.1 (2026-04-20)**: Cross-audit pass complete. Three parallel agents (node-spec-vs-contract, Wire-plan-vs-contract, bilateral consistency) returned findings; node-side revisions applied inline:
+  - **Clean-cut on `aud="requester-delivery"` transition** (GAP-9 / DRIFT-5): removed the fabricated dual-aud fallback. Contract §3.4 sanctions only the new aud; legacy tokens self-expire in ≤`fill_job_ttl_secs` and fail 401 naturally (zero-lockstep fail-loud).
+  - **Duplicate-delivery idempotency** (GAP-1): requester-side handler returns 2xx `{"status": "already_settled"}` on `pending_jobs.take() → None` per §2.6.
+  - **Content envelope UUID assertion** (GAP-2): explicit `debug_assert!` on `body.job_id` + regression test; §10.5 + Pillar J7.
+  - **Content-leg failure envelope** (GAP-3): D4 — worker failure flows to both legs; test added.
+  - **`privacy_tier` warn-don't-reject** (GAP-6): Q-PROTO-3 compliance; accept unknown tiers, log `market_unknown_privacy_tier` chronicle; admission test.
+  - **`delivery_status = failed_both`** (DRIFT-2): rename aligns node-side string with Wire's `wire_compute_jobs.delivery_status` enum; prevents operator-grep confusion.
+  - **Serde mechanism wording** (DRIFT-3): required-field validation catches missing fields, not `deny_unknown_fields`. Clarified with belt-and-suspenders explanation.
+  - **`extensions` field preservation** (GAP-10): §10.1 escape hatch explicitly carried forward.
+  - **§10.5 UUID reaffirmation** (GAP-7): one-line note in integration points.
+  - **`compute_callback_mode` ignore** (GAP-5): explicit node-side no-op on received value.
+  - 6 new tests: `privacy_tier_bootstrap_relay_not_rejected`, `content_envelope_failure_branch_to_requester`, `duplicate_content_delivery_returns_already_settled`, `legacy_aud_result_delivery_rejected`, `envelope_job_id_is_uuid_not_handle_path`, `pre_rev_2_0_dispatch_missing_fields_400s`. Total now 44+.
+  - Wire-side findings relayed separately (6 MAJOR + 3 MINOR) — not yet incorporated; Wire owner fixes applied on their side.
