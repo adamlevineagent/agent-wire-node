@@ -1168,23 +1168,22 @@ async fn leg_success(
         .await;
         if let Ok(Ok(n)) = cas {
             if n >= 1 {
-                emit(
+                let terminal_leg_label = match leg {
+                    Leg::Content => Leg::Settlement.label(),
+                    Leg::Settlement => Leg::Content.label(),
+                };
+                emit_result_delivery_failed(
                     ctx,
                     row,
-                    EVENT_MARKET_RESULT_DELIVERY_FAILED,
-                    json!({
-                        "job_id": row.job_id,
-                        "request_id": row.request_id,
-                        "delivery_status": terminal_status,
-                        "terminal_leg": match leg {
-                            Leg::Content => Leg::Settlement.label(),
-                            Leg::Settlement => Leg::Content.label(),
-                        },
-                        "content_error": content_last_error,
-                        "settlement_error": settlement_last_error,
-                        "final_error": other_error_text,
-                        "succeeded_leg": leg.label(),
-                    }),
+                    ResultDeliveryFailedMeta {
+                        delivery_status: terminal_status,
+                        terminal_leg: Some(terminal_leg_label),
+                        succeeded_leg: Some(leg.label()),
+                        content_error: content_last_error.as_deref(),
+                        settlement_error: settlement_last_error.as_deref(),
+                        final_error: Some(&other_error_text),
+                        reason: None,
+                    },
                 )
                 .await;
             }
@@ -1529,37 +1528,36 @@ async fn terminal_leg_fail_with_extra(
         .await;
         if let Ok(Ok(n)) = cas {
             if n >= 1 && terminal_status == "failed_both" {
-                emit(
+                emit_result_delivery_failed(
                     ctx,
                     row,
-                    EVENT_MARKET_RESULT_DELIVERY_FAILED,
-                    json!({
-                        "job_id": row.job_id,
-                        "request_id": row.request_id,
-                        "delivery_status": terminal_status,
-                        "content_terminal": content_terminal,
-                        "settlement_terminal": settlement_terminal,
-                        "content_error": row.content_last_error,
-                        "settlement_error": row.settlement_last_error,
-                    }),
+                    ResultDeliveryFailedMeta {
+                        delivery_status: terminal_status,
+                        terminal_leg: None,
+                        succeeded_leg: None,
+                        content_error: row.content_last_error.as_deref(),
+                        settlement_error: row.settlement_last_error.as_deref(),
+                        final_error: None,
+                        reason: None,
+                    },
                 )
                 .await;
             } else if n >= 1 {
                 // Mixed-terminal (failed_content_only / failed_settlement_only)
                 // — row is terminal but only one leg died. Reuse the same
                 // row-level summary event with a distinct delivery_status.
-                emit(
+                emit_result_delivery_failed(
                     ctx,
                     row,
-                    EVENT_MARKET_RESULT_DELIVERY_FAILED,
-                    json!({
-                        "job_id": row.job_id,
-                        "request_id": row.request_id,
-                        "delivery_status": terminal_status,
-                        "terminal_leg": leg.label(),
-                        "final_error": err_msg,
-                        "reason": reason,
-                    }),
+                    ResultDeliveryFailedMeta {
+                        delivery_status: terminal_status,
+                        terminal_leg: Some(leg.label()),
+                        succeeded_leg: None,
+                        content_error: None,
+                        settlement_error: None,
+                        final_error: Some(err_msg),
+                        reason: Some(reason),
+                    },
                 )
                 .await;
             }
@@ -1614,6 +1612,61 @@ async fn record_lifecycle_event(
         let _ = record_event(&conn, &ctx_ev);
         Ok(())
     })
+    .await;
+}
+
+/// Canonical shape for the row-level `market_result_delivery_failed`
+/// chronicle event. Emitted from three sites (leg-terminal-then-other-ok,
+/// both-legs-terminal, mixed-terminal); unifying the shape lets operators
+/// grep chronicle without a fallback chain. Optional fields are skipped
+/// when `None`.
+///
+/// Frontend `extractReason` (ComputeOfferManager.tsx) reads these keys in
+/// fallback order: `reason` → `final_error` → `content_error +
+/// settlement_error` → whichever is present.
+struct ResultDeliveryFailedMeta<'a> {
+    delivery_status: &'a str,
+    terminal_leg: Option<&'a str>,
+    succeeded_leg: Option<&'a str>,
+    content_error: Option<&'a str>,
+    settlement_error: Option<&'a str>,
+    final_error: Option<&'a str>,
+    reason: Option<&'a str>,
+}
+
+async fn emit_result_delivery_failed(
+    ctx: &DeliveryContext,
+    row: &crate::pyramid::db::OutboxRow,
+    meta: ResultDeliveryFailedMeta<'_>,
+) {
+    let mut m = serde_json::Map::new();
+    m.insert("job_id".into(), json!(row.job_id));
+    m.insert("request_id".into(), json!(row.request_id));
+    m.insert("delivery_status".into(), json!(meta.delivery_status));
+    if let Some(v) = meta.terminal_leg {
+        m.insert("terminal_leg".into(), json!(v));
+    }
+    if let Some(v) = meta.succeeded_leg {
+        m.insert("succeeded_leg".into(), json!(v));
+    }
+    if let Some(v) = meta.content_error {
+        m.insert("content_error".into(), json!(v));
+    }
+    if let Some(v) = meta.settlement_error {
+        m.insert("settlement_error".into(), json!(v));
+    }
+    if let Some(v) = meta.final_error {
+        m.insert("final_error".into(), json!(v));
+    }
+    if let Some(v) = meta.reason {
+        m.insert("reason".into(), json!(v));
+    }
+    emit(
+        ctx,
+        row,
+        EVENT_MARKET_RESULT_DELIVERY_FAILED,
+        serde_json::Value::Object(m),
+    )
     .await;
 }
 
