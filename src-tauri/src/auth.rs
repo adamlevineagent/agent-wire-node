@@ -159,6 +159,17 @@ pub struct AuthState {
     /// announce verification works across app restarts.
     #[serde(default)]
     pub jwt_public_key: Option<String>,
+    /// Phase 3: Wire's keyed `wire_parameters` block piggybacked on every
+    /// heartbeat response. Projected from an allow-list contribution on
+    /// Wire's side; value shapes defined per key (see contract §X). Used
+    /// by the market delivery worker for secret-window invariants; future
+    /// subsystems consume other keys without re-plumbing.
+    ///
+    /// Empty map on fresh install + pre-Wire-upgrade nodes. Consumers
+    /// MUST fall back to contract-default constants when a key is absent.
+    /// Persisted to session.json so the last-known values survive restart.
+    #[serde(default)]
+    pub wire_parameters: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl AuthState {
@@ -292,6 +303,7 @@ pub async fn verify_magic_link_token(
         operator_session_expires_at: None,
         operator_handle: None,
         jwt_public_key: None,
+        wire_parameters: std::collections::HashMap::new(),
     })
 }
 
@@ -350,6 +362,7 @@ pub async fn verify_otp(
         operator_session_expires_at: None,
         operator_handle: None,
         jwt_public_key: None,
+        wire_parameters: std::collections::HashMap::new(),
     })
 }
 
@@ -403,6 +416,7 @@ pub async fn login(
         operator_session_expires_at: None,
         operator_handle: None,
         jwt_public_key: None,
+        wire_parameters: std::collections::HashMap::new(),
     })
 }
 

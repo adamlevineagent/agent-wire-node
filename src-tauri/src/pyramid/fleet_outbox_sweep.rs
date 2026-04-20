@@ -688,6 +688,12 @@ mod tests {
             delivery_attempts: attempts,
             last_attempt_at: last.map(|s| s.to_string()),
             expires_at: "2099-01-01 00:00:00".into(),
+            created_at: "1970-01-01 00:00:00".into(),
+            callback_auth_token: None,
+            delivery_lease_until: None,
+            delivery_next_attempt_at: None,
+            inference_latency_ms: None,
+            request_id: None,
         }
     }
 
@@ -759,6 +765,12 @@ mod tests {
             delivery_attempts: 0,
             last_attempt_at: None,
             expires_at: "1970-01-01 00:00:00".into(),
+            created_at: "1970-01-01 00:00:00".into(),
+            callback_auth_token: None,
+            delivery_lease_until: None,
+            delivery_next_attempt_at: None,
+            inference_latency_ms: None,
+            request_id: None,
         };
         assert_eq!(market_job_path_for(&row), "market-recv:abc-123");
         // Note: parallel `job_path_for` (fleet) uses the pattern

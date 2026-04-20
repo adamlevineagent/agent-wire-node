@@ -12702,6 +12702,15 @@ fn main() {
     // a shutdown race never panics.
     let (market_mirror_nudge_tx, market_mirror_nudge_rx) =
         tokio::sync::mpsc::unbounded_channel::<()>();
+    // Phase 3: second nudge channel for the market delivery worker. Fired
+    // whenever a market outbox row transitions into `ready` (worker success,
+    // worker failure-now-fixed-to-promote, sweep heartbeat-lost synth). The
+    // supervise_delivery_loop task consumes the receiver; sender lives on
+    // MarketDispatchContext so every mutation site can send(()).ok() without
+    // caring about shutdown races. Receiver will be handed to the delivery
+    // task spawn in a later commit (Commit 2 — the delivery worker itself).
+    let (market_delivery_nudge_tx, _market_delivery_nudge_rx) =
+        tokio::sync::mpsc::unbounded_channel::<()>();
     let compute_market_dispatch_shared = Arc::new(
         wire_node_lib::pyramid::market_dispatch::MarketDispatchContext {
             tunnel_state: shared_tunnel.clone(),
@@ -12710,6 +12719,7 @@ fn main() {
             ),
             policy: Arc::new(RwLock::new(market_delivery_policy_init)),
             mirror_nudge: market_mirror_nudge_tx,
+            delivery_nudge: market_delivery_nudge_tx,
         },
     );
 

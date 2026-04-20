@@ -407,6 +407,17 @@ pub struct MarketDispatchContext {
     /// the receiver has been dropped (mirror task gone). Call sites
     /// use `.ok()` so a shutdown race can't panic on a dispatch path.
     pub mirror_nudge: tokio::sync::mpsc::UnboundedSender<()>,
+    /// Phase 3 (provider delivery worker): nudge channel fired whenever a
+    /// market outbox row transitions into `ready` — (1) worker success
+    /// path after promote_ready_if_pending, (2) worker failure path after
+    /// the bug-fix promote-with-error, (3) sweep's heartbeat-lost
+    /// synthesize path. The delivery task (`pyramid::market_delivery::
+    /// supervise_delivery_loop`) receives on the paired receiver and
+    /// claims ready rows for POST to Wire's callback endpoint.
+    ///
+    /// Same discipline as `mirror_nudge`: unbounded send, fire-and-forget,
+    /// `.ok()` on the send so a shutdown race can't panic the call site.
+    pub delivery_nudge: tokio::sync::mpsc::UnboundedSender<()>,
 }
 
 #[cfg(test)]

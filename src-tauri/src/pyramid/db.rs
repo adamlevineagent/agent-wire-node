@@ -2332,6 +2332,82 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_fleet_outbox_callback_kind ON fleet_result_outbox (callback_kind);",
     )?;
 
+    // ── Phase 3 (market delivery worker) — fleet_result_outbox columns ─────
+    //
+    // Five new columns supporting the node→Wire callback delivery path:
+    //   callback_auth_token      — opaque bearer from contract rev 1.5
+    //                              callback_auth.token. NULL on fleet rows
+    //                              (fleet uses a different auth mechanism).
+    //   delivery_lease_until     — set by delivery worker's claim CAS; prevents
+    //                              double-POST in flight. Cleared on terminal.
+    //   delivery_next_attempt_at — post-failure backoff gate. Set to future
+    //                              time on transient failure. Cleared on
+    //                              terminal.
+    //   inference_latency_ms     — wall-clock ms of the worker's LLM call.
+    //                              Written at promote-ready; read at delivery
+    //                              POST time into CallbackEnvelope.result.latency_ms.
+    //                              NULL on sweep-synthesized error rows.
+    //   request_id               — Wire's extensions.request_id from dispatch
+    //                              body (§10.1 forward-compat extension). Used
+    //                              for cross-system trace correlation in
+    //                              chronicle metadata. NULL if dispatch body
+    //                              didn't include one.
+    //
+    // Additive migration; all columns nullable; zero breaking change for fleet.
+    //
+    // Phase 3 spec: docs/plans/compute-market-phase-3-provider-delivery-spec.md
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(fleet_result_outbox)")?;
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let want = &[
+            ("callback_auth_token", "TEXT"),
+            ("delivery_lease_until", "TEXT"),
+            ("delivery_next_attempt_at", "TEXT"),
+            ("inference_latency_ms", "INTEGER"),
+            ("request_id", "TEXT"),
+        ];
+        for (name, ty) in want {
+            if !cols.iter().any(|c| c == name) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE fleet_result_outbox ADD COLUMN {} {};",
+                    name, ty
+                ))?;
+            }
+        }
+    }
+
+    // Index on the claim query's primary filter combination so the delivery
+    // loop's lease-acquiring UPDATE is fast even at depth. Partial index on
+    // MarketStandard+Relay rows only — fleet rows bypass this entirely.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_fleet_outbox_market_delivery
+           ON fleet_result_outbox (status, delivery_lease_until, delivery_next_attempt_at)
+         WHERE callback_kind IN ('MarketStandard', 'Relay');",
+    )?;
+
+    // ── Schema version tracking (Phase 3 spec §Callback auth token storage) ─
+    //
+    // Minimal migration-apply-time tracking so the delivery worker's
+    // `row_predates_migration` helper can distinguish deploy-artifact orphans
+    // (rows with NULL callback_auth_token whose created_at is earlier than
+    // this migration's apply-time) from genuine token-plumbing bugs.
+    //
+    // INSERT OR IGNORE means the first process to run the migration on a
+    // fresh DB records the apply-time; subsequent boots are no-ops.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pyramid_schema_versions (
+            name       TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );",
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO pyramid_schema_versions (name) VALUES (?1)",
+        rusqlite::params!["fleet_result_outbox_v2_callback_auth_token"],
+    )?;
+
     // ── Market delivery policy singleton ───────────────────────────────────
     //
     // Per architecture §VIII.6 DD-E + DD-Q: shape-parallel to
@@ -2370,6 +2446,74 @@ pub const FLEET_STATUS_READY: &str = "ready";
 pub const FLEET_STATUS_DELIVERED: &str = "delivered";
 pub const FLEET_STATUS_FAILED: &str = "failed";
 
+/// Centralized SELECT projection + `OutboxRow` row-mapper for every
+/// outbox sweep/retry helper. Single source of truth for column order so
+/// adding a field never leaves one of the four helpers out of sync.
+///
+/// **Invariant (grep-checkable):** every non-ephemeral column of
+/// `fleet_result_outbox` that `OutboxRow` materializes appears in each of
+/// the four OUTBOX_SELECT_PROJECTION_* consts below in struct-definition
+/// order. A future column addition requires editing exactly: (1) the ALTER
+/// in `init_pyramid_db`, (2) the struct, (3) all four consts below,
+/// (4) `map_outbox_row`. The test `outbox_projection_consts_match_struct`
+/// asserts the SELECT column count matches struct field count.
+const OUTBOX_SELECT_PROJECTION_WHERE_EXPIRED_FLEET: &str = "\
+    SELECT dispatcher_node_id, job_id, status, callback_url, result_json, \
+           delivery_attempts, last_attempt_at, expires_at, created_at, \
+           callback_auth_token, delivery_lease_until, delivery_next_attempt_at, \
+           inference_latency_ms, request_id \
+      FROM fleet_result_outbox \
+     WHERE expires_at <= datetime('now') \
+       AND callback_kind = 'Fleet'";
+
+const OUTBOX_SELECT_PROJECTION_WHERE_READY_FLEET: &str = "\
+    SELECT dispatcher_node_id, job_id, status, callback_url, result_json, \
+           delivery_attempts, last_attempt_at, expires_at, created_at, \
+           callback_auth_token, delivery_lease_until, delivery_next_attempt_at, \
+           inference_latency_ms, request_id \
+      FROM fleet_result_outbox \
+     WHERE status = 'ready' \
+       AND callback_kind = 'Fleet'";
+
+const OUTBOX_SELECT_PROJECTION_WHERE_EXPIRED_MARKET: &str = "\
+    SELECT dispatcher_node_id, job_id, status, callback_url, result_json, \
+           delivery_attempts, last_attempt_at, expires_at, created_at, \
+           callback_auth_token, delivery_lease_until, delivery_next_attempt_at, \
+           inference_latency_ms, request_id \
+      FROM fleet_result_outbox \
+     WHERE expires_at <= datetime('now') \
+       AND callback_kind != 'Fleet'";
+
+const OUTBOX_SELECT_PROJECTION_WHERE_READY_MARKET: &str = "\
+    SELECT dispatcher_node_id, job_id, status, callback_url, result_json, \
+           delivery_attempts, last_attempt_at, expires_at, created_at, \
+           callback_auth_token, delivery_lease_until, delivery_next_attempt_at, \
+           inference_latency_ms, request_id \
+      FROM fleet_result_outbox \
+     WHERE status = 'ready' \
+       AND callback_kind != 'Fleet'";
+
+/// Maps a row from any of the OUTBOX_SELECT_PROJECTION_* queries into an
+/// `OutboxRow`. Column indices correspond to `OUTBOX_SELECT_COLUMNS` order.
+fn map_outbox_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
+    Ok(OutboxRow {
+        dispatcher_node_id: r.get(0)?,
+        job_id: r.get(1)?,
+        status: r.get(2)?,
+        callback_url: r.get(3)?,
+        result_json: r.get(4)?,
+        delivery_attempts: r.get(5)?,
+        last_attempt_at: r.get(6)?,
+        expires_at: r.get(7)?,
+        created_at: r.get(8)?,
+        callback_auth_token: r.get(9)?,
+        delivery_lease_until: r.get(10)?,
+        delivery_next_attempt_at: r.get(11)?,
+        inference_latency_ms: r.get(12)?,
+        request_id: r.get(13)?,
+    })
+}
+
 /// Row shape returned by sweep helpers (`fleet_outbox_sweep_expired`,
 /// `fleet_outbox_retry_candidates`, etc.). Carries enough fields for both
 /// Predicate A's state-transition branching and Predicate B's retry filtering.
@@ -2383,6 +2527,33 @@ pub struct OutboxRow {
     pub delivery_attempts: i64,
     pub last_attempt_at: Option<String>,
     pub expires_at: String,
+    /// Outbox-row creation time — the admission moment. Used by the Phase 3
+    /// delivery worker's `row_predates_migration` helper to distinguish
+    /// deploy-artifact orphans from genuine token-plumbing bugs, and by the
+    /// runtime secret-expiry detector to compare row age against Wire's
+    /// `fill_job_ttl_secs + callback_secret_grace_secs` window.
+    pub created_at: String,
+    /// Phase 3: bearer token echoed verbatim in the callback POST. Wire mints
+    /// at `/fill` time per contract rev 1.5 §2.1 `callback_auth.token`;
+    /// provider stores opaque. NULL on fleet rows (fleet uses different auth)
+    /// and on pre-migration MarketStandard rows (detected as orphans).
+    pub callback_auth_token: Option<String>,
+    /// Phase 3: set to `now + callback_post_timeout_secs + lease_grace_secs`
+    /// by the delivery worker's claim CAS. Blocks concurrent claims for the
+    /// lease duration. Cleared on terminal transition.
+    pub delivery_lease_until: Option<String>,
+    /// Phase 3: set to `now + backoff` on transient failure. Acts as the
+    /// backoff gate in the next claim query — a row isn't eligible until
+    /// `now >= delivery_next_attempt_at`. Cleared on terminal transition.
+    pub delivery_next_attempt_at: Option<String>,
+    /// Phase 3: wall-clock duration of the worker's LLM call, milliseconds.
+    /// Emitted into `CallbackEnvelope.result.latency_ms`. NULL on
+    /// sweep-synthesized error rows (worker never ran).
+    pub inference_latency_ms: Option<i64>,
+    /// Phase 3: Wire's `extensions.request_id` from the dispatch body
+    /// (contract §10.1). Threaded into every chronicle event's metadata for
+    /// cross-system trace correlation. NULL if dispatch didn't include it.
+    pub request_id: Option<String>,
 }
 
 /// Insert a new outbox row in `pending` state. Uses INSERT OR IGNORE so repeat
@@ -2737,25 +2908,10 @@ pub fn fleet_outbox_sweep_expired(conn: &Connection) -> Result<Vec<OutboxRow>> {
     // compute market Phase 2+ delivery paths (not this sweeper).
     // See architecture §VIII.6 DD-D / DD-Q for the outbox reuse decision.
     let mut stmt = conn.prepare(
-        "SELECT dispatcher_node_id, job_id, status, callback_url, result_json,
-                delivery_attempts, last_attempt_at, expires_at
-           FROM fleet_result_outbox
-          WHERE expires_at <= datetime('now')
-            AND callback_kind = 'Fleet'",
+        OUTBOX_SELECT_PROJECTION_WHERE_EXPIRED_FLEET,
     )?;
     let rows = stmt
-        .query_map([], |r| {
-            Ok(OutboxRow {
-                dispatcher_node_id: r.get(0)?,
-                job_id: r.get(1)?,
-                status: r.get(2)?,
-                callback_url: r.get(3)?,
-                result_json: r.get(4)?,
-                delivery_attempts: r.get(5)?,
-                last_attempt_at: r.get(6)?,
-                expires_at: r.get(7)?,
-            })
-        })?
+        .query_map([], map_outbox_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -2767,26 +2923,9 @@ pub fn fleet_outbox_sweep_expired(conn: &Connection) -> Result<Vec<OutboxRow>> {
 pub fn fleet_outbox_retry_candidates(conn: &Connection) -> Result<Vec<OutboxRow>> {
     // Filter to `callback_kind = 'Fleet'`: market/relay rows are owned by
     // compute market Phase 2+ delivery paths (not this sweeper).
-    let mut stmt = conn.prepare(
-        "SELECT dispatcher_node_id, job_id, status, callback_url, result_json,
-                delivery_attempts, last_attempt_at, expires_at
-           FROM fleet_result_outbox
-          WHERE status = 'ready'
-            AND callback_kind = 'Fleet'",
-    )?;
+    let mut stmt = conn.prepare(OUTBOX_SELECT_PROJECTION_WHERE_READY_FLEET)?;
     let rows = stmt
-        .query_map([], |r| {
-            Ok(OutboxRow {
-                dispatcher_node_id: r.get(0)?,
-                job_id: r.get(1)?,
-                status: r.get(2)?,
-                callback_url: r.get(3)?,
-                result_json: r.get(4)?,
-                delivery_attempts: r.get(5)?,
-                last_attempt_at: r.get(6)?,
-                expires_at: r.get(7)?,
-            })
-        })?
+        .query_map([], map_outbox_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -2816,26 +2955,9 @@ pub fn fleet_outbox_retry_candidates(conn: &Connection) -> Result<Vec<OutboxRow>
 /// `fleet_outbox_sweep_expired`. Without the partition, the two sweeps
 /// would race on the same rows and bounce transitions back and forth.
 pub fn market_outbox_sweep_expired(conn: &Connection) -> Result<Vec<OutboxRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT dispatcher_node_id, job_id, status, callback_url, result_json,
-                delivery_attempts, last_attempt_at, expires_at
-           FROM fleet_result_outbox
-          WHERE expires_at <= datetime('now')
-            AND callback_kind != 'Fleet'",
-    )?;
+    let mut stmt = conn.prepare(OUTBOX_SELECT_PROJECTION_WHERE_EXPIRED_MARKET)?;
     let rows = stmt
-        .query_map([], |r| {
-            Ok(OutboxRow {
-                dispatcher_node_id: r.get(0)?,
-                job_id: r.get(1)?,
-                status: r.get(2)?,
-                callback_url: r.get(3)?,
-                result_json: r.get(4)?,
-                delivery_attempts: r.get(5)?,
-                last_attempt_at: r.get(6)?,
-                expires_at: r.get(7)?,
-            })
-        })?
+        .query_map([], map_outbox_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -2882,26 +3004,9 @@ pub fn market_outbox_expire_exhausted(
 /// included now so Phase 3's sweep can reuse the same partition
 /// mechanism without the module adding two more functions later.
 pub fn market_outbox_retry_candidates(conn: &Connection) -> Result<Vec<OutboxRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT dispatcher_node_id, job_id, status, callback_url, result_json,
-                delivery_attempts, last_attempt_at, expires_at
-           FROM fleet_result_outbox
-          WHERE status = 'ready'
-            AND callback_kind != 'Fleet'",
-    )?;
+    let mut stmt = conn.prepare(OUTBOX_SELECT_PROJECTION_WHERE_READY_MARKET)?;
     let rows = stmt
-        .query_map([], |r| {
-            Ok(OutboxRow {
-                dispatcher_node_id: r.get(0)?,
-                job_id: r.get(1)?,
-                status: r.get(2)?,
-                callback_url: r.get(3)?,
-                result_json: r.get(4)?,
-                delivery_attempts: r.get(5)?,
-                last_attempt_at: r.get(6)?,
-                expires_at: r.get(7)?,
-            })
-        })?
+        .query_map([], map_outbox_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
