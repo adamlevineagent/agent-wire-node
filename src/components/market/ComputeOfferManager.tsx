@@ -397,8 +397,15 @@ function DeliveryHealth() {
                 setUnknownTierWarn(null);
             }
 
+            // UNION both old + new delivered-row event names for back-compat.
+            const deliveredUnion = [...deliveredNew, ...deliveredLegacy].sort((a, b) =>
+                a.timestamp < b.timestamp ? 1 : -1,
+            );
+
             // Precedence (primary badge):
-            //  1. Lifecycle red states (panic/exit)
+            //  1. Lifecycle red states (panic/exit) — but only if NEWER than
+            //     the most-recent successful delivery, else supervisor has
+            //     clearly recovered and the badge would be stuck red.
             //  2. Row-level terminal dead (both legs dead)
             //  3. Per-leg terminal split (one leg delivered, other dead)
             //  4. CAS-lost race
@@ -406,18 +413,27 @@ function DeliveryHealth() {
             //  6. In-flight (one leg ok, waiting on other, no terminal)
             //  7. Delivered (rev-0.6 + rev-0.5 UNION)
             //  8. Idle
+            const lastDeliveryTs = deliveredUnion[0]?.timestamp;
+            // A "panicked" event is a worker crash; supervisor re-spawns and
+            // continues delivering. If a successful delivery fires AFTER the
+            // panic, supervisor has recovered — don't leave the badge stuck
+            // red for the whole hour window. Same rule as `exited`.
             if (panicked.length > 0) {
-                const msg =
-                    typeof panicked[0].metadata?.message === "string"
-                        ? panicked[0].metadata.message
-                        : "panic";
-                setState({ kind: "panicked", message: msg, ageSecs: ageOf(panicked[0].timestamp) });
-                return;
+                const panicTs = panicked[0].timestamp;
+                const recovered = lastDeliveryTs ? lastDeliveryTs > panicTs : false;
+                if (!recovered) {
+                    const msg =
+                        typeof panicked[0].metadata?.message === "string"
+                            ? panicked[0].metadata.message
+                            : "panic";
+                    setState({
+                        kind: "panicked",
+                        message: msg,
+                        ageSecs: ageOf(panicTs),
+                    });
+                    return;
+                }
             }
-            // UNION both old + new delivered-row event names for back-compat.
-            const deliveredUnion = [...deliveredNew, ...deliveredLegacy].sort((a, b) =>
-                a.timestamp < b.timestamp ? 1 : -1,
-            );
             // An "exited" event means the loop hit clean channel-close;
             // supervisor returned. If a "delivered" event fires more recently,
             // the supervisor came back up — show delivered. Otherwise, red.
