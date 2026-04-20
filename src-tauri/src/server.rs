@@ -2803,9 +2803,27 @@ async fn handle_market_dispatch(
     ) {
         Ok(i) => i,
         Err(e) => {
-            tracing::warn!("Market dispatch JWT verify failed: {}", e);
+            // Surface the variant in the 401 body so the Wire's
+            // `compute_fill_jwt_rejected` chronicle (which captures
+            // `provider_error` from our response) can record the
+            // specific failure mode. Pre-hardening the body was empty
+            // and Wire only saw `provider_error: null`; during
+            // first-run verification of the /fill path that opacity
+            // meant every auth failure looked identical across the
+            // four MarketAuthError variants (InvalidToken / PidMismatch
+            // / MissingJobId / MissingSelfNodeId). The variant name
+            // alone (a type discriminator, no token material, no key
+            // bytes, no JWT claims) is safe to surface to the dispatcher
+            // since the dispatcher is Wire itself, not a hostile
+            // third party — the JWT decode path prevents anyone but
+            // Wire from issuing a dispatch that reaches this handler.
+            let variant = format!("{:?}", e);
+            tracing::warn!("Market dispatch JWT verify failed: {} ({})", e, variant);
             return Ok(Box::new(warp::reply::with_status(
-                warp::reply::json(&serde_json::json!({})),
+                warp::reply::json(&serde_json::json!({
+                    "error": "jwt_verify_failed",
+                    "variant": variant,
+                })),
                 warp::http::StatusCode::UNAUTHORIZED,
             )));
         }

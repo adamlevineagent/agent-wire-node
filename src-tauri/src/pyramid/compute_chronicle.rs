@@ -97,6 +97,12 @@ pub const EVENT_MARKET_RECEIVED: &str = "market_received";
 pub const EVENT_MARKET_MATCHED: &str = "market_matched";
 pub const EVENT_QUEUE_MIRROR_PUSH_FAILED: &str = "queue_mirror_push_failed";
 
+// Mirror-task lifecycle events — loud signals when the task is not
+// doing its job. Before these existed, 54 hours of silent non-pushing
+// looked identical to a healthy idle node from the operator's view.
+pub const EVENT_MIRROR_TASK_PANICKED: &str = "market_mirror_task_panicked";
+pub const EVENT_MIRROR_TASK_EXITED: &str = "market_mirror_task_exited";
+
 // Market sweep companions to the fleet sweep events (Phase 2 WS6).
 // Emitted by the market outbox sweep loop in
 // `pyramid::fleet_outbox_sweep::market_outbox_sweep_loop` when a market

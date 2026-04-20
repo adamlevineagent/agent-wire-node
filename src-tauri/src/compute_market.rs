@@ -393,10 +393,26 @@ impl ComputeMarketState {
     /// Bump the mirror seq for a model, returning the new value.
     /// Monotonic per-model — never decrements. Called by the queue
     /// mirror task (WS6) before each push.
+    ///
+    /// Anchored to wall-clock unix-millis so a restart can't regress.
+    /// Wire-side stores the max seq seen and rejects anything ≤ it
+    /// (`compute_queue_seq_regressed` chronicle); if we restart and
+    /// reload in-memory seq=N while Wire has stored_seq=N, a naive
+    /// `prev + 1` would either collide or need a handshake. Using
+    /// `max(prev + 1, now_unix_millis)` sidesteps the race: every
+    /// fresh bump is strictly greater than any seq emitted by any
+    /// prior process (u64 unix-millis has ~50,000 years of headroom).
+    /// Across the same process it still monotonic-increments by 1 as
+    /// long as pushes happen faster than a millisecond apart.
     pub fn bump_mirror_seq(&mut self, model_id: &str) -> u64 {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         let slot = self.queue_mirror_seq.entry(model_id.to_string()).or_insert(0);
-        *slot = slot.saturating_add(1);
-        *slot
+        let next = slot.saturating_add(1).max(now_ms);
+        *slot = next;
+        next
     }
 
     /// Record a successful completion — called when a job transitions
@@ -672,13 +688,52 @@ mod tests {
     #[test]
     fn bump_mirror_seq_is_monotonic_per_model() {
         let mut state = ComputeMarketState::default();
-        assert_eq!(state.bump_mirror_seq("gemma3:27b"), 1);
-        assert_eq!(state.bump_mirror_seq("gemma3:27b"), 2);
-        assert_eq!(state.bump_mirror_seq("gemma3:27b"), 3);
-        // Different model starts fresh at 1.
-        assert_eq!(state.bump_mirror_seq("llama3.2:70b"), 1);
-        // Original model keeps its independent sequence.
-        assert_eq!(state.bump_mirror_seq("gemma3:27b"), 4);
+        let a = state.bump_mirror_seq("gemma3:27b");
+        let b = state.bump_mirror_seq("gemma3:27b");
+        let c = state.bump_mirror_seq("gemma3:27b");
+        assert!(b > a, "seq must strictly increase: {a} -> {b}");
+        assert!(c > b, "seq must strictly increase: {b} -> {c}");
+        // Different model bumps are independent, but also >0 and
+        // anchored to wall-clock.
+        let d = state.bump_mirror_seq("llama3.2:70b");
+        assert!(d > 0);
+        // Original model keeps advancing.
+        let e = state.bump_mirror_seq("gemma3:27b");
+        assert!(e > c);
+    }
+
+    #[test]
+    fn bump_mirror_seq_anchors_to_wall_clock() {
+        // The seq should be at least unix-millis at bump time — this
+        // is what makes the mirror seq monotonic across process
+        // restarts (a fresh process can't regress below a prior
+        // process's pushed seq). Regression guard: if someone reverts
+        // to `prev + 1`, this breaks because 1 << now_unix_ms.
+        let mut state = ComputeMarketState::default();
+        let before_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let seq = state.bump_mirror_seq("m");
+        assert!(
+            seq >= before_ms,
+            "seq must be ≥ unix-millis at bump time (got {seq}, before {before_ms})"
+        );
+    }
+
+    #[test]
+    fn bump_mirror_seq_does_not_regress_after_reload() {
+        // Simulates the BEHEM restart scenario: persisted state
+        // reloads with some prior seq; a fresh bump must strictly
+        // exceed that prior seq even if two processes somehow
+        // reload the same persisted row.
+        let mut state = ComputeMarketState::default();
+        // Pretend prior process pushed and persisted seq=5.
+        state.queue_mirror_seq.insert("m".into(), 5);
+        let next = state.bump_mirror_seq("m");
+        assert!(next > 5, "bump after reload must not regress: got {next}");
+        // And it anchors to wall-clock, not to 6.
+        assert!(next > 1_000_000_000, "seq must be unix-ms scale: got {next}");
     }
 
     #[test]

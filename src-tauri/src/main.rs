@@ -11445,7 +11445,22 @@ fn main() {
     let jwt_public_key = Arc::new(RwLock::new(
         initial_auth.jwt_public_key.clone().unwrap_or_else(|| config.jwt_public_key.clone())
     ));
-    let node_id_shared = Arc::new(RwLock::new(config.node_id.clone()));
+    // Same precedence as jwt_public_key — AuthState (session.json) over
+    // config.node_id. Caught during the first-ever /fill attempt on
+    // 2026-04-20: BEHEM's config.node_id was empty (older boot), api_token
+    // was valid so the startup re-register path below didn't run, leaving
+    // node_id_shared empty for the process lifetime. `verify_market_identity`
+    // then saw `self_node_id=""` on every /v1/compute/job-dispatch and
+    // returned `MissingSelfNodeId` → 401 with empty body.
+    //
+    // AuthState.node_id is written on every register + persisted to
+    // session.json, so reading it here gives the authoritative value
+    // the heartbeat loop would use. No equivalent heal-from-heartbeat
+    // path exists for node_id (the heartbeat response doesn't echo it),
+    // so getting this init right is load-bearing.
+    let node_id_shared = Arc::new(RwLock::new(
+        initial_auth.node_id.clone().unwrap_or_else(|| config.node_id.clone())
+    ));
 
     // Initialize pyramid SQLite database (reader + writer connections)
     let pyramid_db_path = config.data_dir().join("pyramid.db");

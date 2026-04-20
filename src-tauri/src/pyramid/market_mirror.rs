@@ -35,9 +35,30 @@
 //! On any push failure (network, non-2xx, JSON parse of error body) we
 //! write a `queue_mirror_push_failed` chronicle event with the
 //! specific error + current seq + a rolling retry counter in metadata,
-//! and continue. Aggressive retry is intentional NOT — the next nudge
-//! (state changed or not, any mutation triggers one) re-pushes the
-//! current snapshot, so getting stuck at an old seq is self-correcting.
+//! and continue. The next mutation-driven nudge re-pushes the current
+//! snapshot, so getting stuck at an old seq is self-correcting.
+//!
+//! # Idle liveness
+//!
+//! This task does NOT run a periodic heartbeat. Wire's staleness
+//! filter accepts either a fresh queue push OR a fresh
+//! `wire_nodes.last_heartbeat` (the node heartbeat loop in `main.rs`
+//! already pings every 60s), so idle providers remain matchable via
+//! the node heartbeat without this task paying `queue_push_fee` on
+//! every tick. Adding a periodic mirror push would duplicate the
+//! existing node-heartbeat signal and charge the operator credits to
+//! do so.
+//!
+//! # Supervision
+//!
+//! `spawn_market_mirror_task` wraps the loop in a supervisor that
+//! catches panics via `AssertUnwindSafe::catch_unwind`, emits a
+//! `market_mirror_task_panicked` chronicle event with the payload,
+//! sleeps briefly, and respawns. A clean exit (channel sender dropped)
+//! emits `market_mirror_task_exited` before returning — so an operator
+//! querying their chronicle can tell the difference between "idle" and
+//! "task is dead." Pre-supervisor, a silent panic or channel close
+//! looked identical to a healthy idle node.
 //!
 //! # Seq semantics
 //!
@@ -49,8 +70,10 @@
 //! if the Wire-side seq drifted ahead, the post returns 409 and we log
 //! it as a failure — Phase 3's reconnect path handles seq re-sync.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
+use futures_util::FutureExt;
 use serde::Serialize;
 use tokio::sync::{mpsc, RwLock};
 
@@ -58,7 +81,8 @@ use crate::auth::AuthState;
 use crate::compute_market::ComputeMarketState;
 use crate::compute_queue::ComputeQueueHandle;
 use crate::pyramid::compute_chronicle::{
-    record_event, ChronicleEventContext, EVENT_QUEUE_MIRROR_PUSH_FAILED, SOURCE_MARKET,
+    record_event, ChronicleEventContext, EVENT_MIRROR_TASK_EXITED, EVENT_MIRROR_TASK_PANICKED,
+    EVENT_QUEUE_MIRROR_PUSH_FAILED, SOURCE_MARKET,
 };
 use crate::pyramid::market_delivery_policy::MarketDeliveryPolicy;
 use crate::pyramid::market_dispatch::MarketDispatchContext;
@@ -158,7 +182,7 @@ pub struct MirrorTaskContext {
     pub node_id_override: Option<String>,
 }
 
-/// Spawn the queue mirror push task.
+/// Spawn the queue mirror push task under a supervisor.
 ///
 /// The caller supplies BOTH the context and the receiver half of the
 /// nudge channel. The sender half is constructed by the caller FIRST
@@ -172,9 +196,12 @@ pub struct MirrorTaskContext {
 /// self-creating-channel API would recurse through the Arc and
 /// deadlock initialization.
 ///
-/// The task body never exits on its own (only on app shutdown or
-/// channel close). It's infallible to spawn — a
-/// `tauri::async_runtime::spawn` at startup is fire-and-forget.
+/// The supervisor catches panics in `mirror_loop` and respawns with a
+/// short backoff so a single bad push can't take the task down for
+/// the lifetime of the node. Clean exit (channel closed because every
+/// sender was dropped) emits `market_mirror_task_exited` before
+/// returning — operators can differentiate "idle" from "dead" in the
+/// chronicle.
 ///
 /// WHY this shape (nudge channel + task-owned context) rather than
 /// triggering the push inline on each mutation:
@@ -191,15 +218,127 @@ pub fn spawn_market_mirror_task(
     rx: mpsc::UnboundedReceiver<()>,
 ) {
     tauri::async_runtime::spawn(async move {
-        mirror_loop(ctx, rx).await;
+        supervise_mirror_loop(ctx, rx).await;
     });
+}
+
+/// Panic-catching supervisor around `mirror_loop`. On panic, emit a
+/// loud chronicle event, back off briefly, and respawn (the same rx
+/// is passed through — if it panicked mid-drain we keep the remaining
+/// items). On clean exit (all senders dropped), emit a final
+/// chronicle event and return.
+///
+/// Backoff is a fixed 5s rather than exponential because a panicking
+/// mirror task under retry pressure is an operator problem that needs
+/// visibility (loud chronicle), not self-smoothing. The bounded
+/// backoff keeps the chronicle from filling up if something is truly
+/// wedged.
+async fn supervise_mirror_loop(
+    ctx: MirrorTaskContext,
+    mut rx: mpsc::UnboundedReceiver<()>,
+) {
+    const PANIC_BACKOFF_SECS: u64 = 5;
+
+    loop {
+        // AssertUnwindSafe is required because MirrorTaskContext
+        // holds Arcs / RwLocks that aren't statically UnwindSafe.
+        // A panic mid-await leaves those in whatever state they were
+        // in; we respawn with the same handles and continue — same
+        // pattern as fleet_outbox_sweep's sweep loop.
+        let result = AssertUnwindSafe(mirror_loop(&ctx, &mut rx))
+            .catch_unwind()
+            .await;
+
+        match result {
+            // Clean exit: channel sender dropped. Emit a loud
+            // chronicle event so operators can see the task died
+            // rather than assuming it's healthily idle.
+            Ok(()) => {
+                record_lifecycle_event(
+                    &ctx,
+                    EVENT_MIRROR_TASK_EXITED,
+                    serde_json::json!({
+                        "reason": "channel_closed",
+                    }),
+                )
+                .await;
+                tracing::info!(
+                    "market queue mirror task exited cleanly (channel closed); supervisor stopping"
+                );
+                return;
+            }
+            // Panic: extract a best-effort message and emit a loud
+            // chronicle event before respawning.
+            Err(panic_payload) => {
+                let message = if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
+                    (*s).to_string()
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "panic in mirror_loop (payload not string)".to_string()
+                };
+                record_lifecycle_event(
+                    &ctx,
+                    EVENT_MIRROR_TASK_PANICKED,
+                    serde_json::json!({
+                        "message": message,
+                        "backoff_secs": PANIC_BACKOFF_SECS,
+                    }),
+                )
+                .await;
+                tracing::error!(
+                    panic = %message,
+                    backoff_secs = PANIC_BACKOFF_SECS,
+                    "market queue mirror task panicked; respawning"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(PANIC_BACKOFF_SECS)).await;
+                // Fall through to loop — respawn mirror_loop.
+            }
+        }
+    }
+}
+
+/// Write a lifecycle chronicle event (panic / exit). Fire-and-forget
+/// via `spawn_blocking` matching the existing failure-path pattern.
+async fn record_lifecycle_event(
+    ctx: &MirrorTaskContext,
+    event_type: &'static str,
+    metadata: serde_json::Value,
+) {
+    let db_path = ctx.db_path.clone();
+    let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        let job_path = format!("market/mirror/{}", chrono::Utc::now().timestamp());
+        let ctx_ev = ChronicleEventContext::minimal(&job_path, event_type, SOURCE_MARKET)
+            .with_metadata(metadata);
+        let _ = record_event(&conn, &ctx_ev);
+        Ok(())
+    })
+    .await;
 }
 
 /// Main loop — drain nudges, debounce, push. The split exists so the
 /// task body can be exercised by a test harness that doesn't want to
-/// invoke `tauri::async_runtime::spawn`.
-async fn mirror_loop(ctx: MirrorTaskContext, mut rx: mpsc::UnboundedReceiver<()>) {
+/// invoke `tauri::async_runtime::spawn`. Takes references so the
+/// supervisor can re-enter after a panic without losing state.
+///
+/// Emits a synthetic boot nudge on entry: a fresh process with a
+/// saved-state offer (e.g. post-restart with `is_serving=true` and an
+/// already-published offer row) has nothing that would naturally fire
+/// the channel, so without this the offer would sit uninformed on
+/// Wire until the next mutation. Matters for the GPU-less-tester
+/// story: a provider boots and should be matchable within one
+/// debounce window, not only after the next dispatch arrives.
+async fn mirror_loop(ctx: &MirrorTaskContext, rx: &mut mpsc::UnboundedReceiver<()>) {
     tracing::info!("market queue mirror task started");
+
+    // Synthetic boot tick — run one push attempt before waiting on
+    // the channel so a post-restart serving-true node publishes its
+    // current snapshot immediately (subject to should_push gates).
+    // Gate failure here is silent (same as any other gate failure);
+    // push failure emits the usual chronicle.
+    boot_push(ctx).await;
+
     // Rolling retry counter for the `retry_count` field on chronicle
     // failure events. Reset on success. Observability aid only — does
     // NOT gate push attempts (every nudge re-pushes).
@@ -227,20 +366,20 @@ async fn mirror_loop(ctx: MirrorTaskContext, mut rx: mpsc::UnboundedReceiver<()>
 
         // Gate the push. Both gates need to be true; either false is
         // silent (no push, no chronicle).
-        if !should_push(&ctx).await {
+        if !should_push(ctx).await {
             // Reset the retry counter — our decision not to push is
             // a policy gate, not a failure.
             retry_count = 0;
             continue;
         }
 
-        match push_snapshot(&ctx).await {
+        match push_snapshot(ctx).await {
             Ok(()) => {
                 retry_count = 0;
             }
             Err(e) => {
                 retry_count = retry_count.saturating_add(1);
-                record_push_failure(&ctx, &e, retry_count).await;
+                record_push_failure(ctx, &e, retry_count).await;
                 tracing::warn!(
                     err = %e,
                     retry = retry_count,
@@ -250,7 +389,21 @@ async fn mirror_loop(ctx: MirrorTaskContext, mut rx: mpsc::UnboundedReceiver<()>
         }
     }
 
-    tracing::info!("market queue mirror task exited (channel closed)");
+    // Fall-through: channel closed. Supervisor emits the loud
+    // chronicle event — we just return.
+}
+
+/// One-shot push on task entry. Runs the same gates as a normal push
+/// (no debounce — we're not coalescing anything). Silent on gate
+/// failure; emits the usual failure chronicle on HTTP error.
+async fn boot_push(ctx: &MirrorTaskContext) {
+    if !should_push(ctx).await {
+        return;
+    }
+    if let Err(e) = push_snapshot(ctx).await {
+        record_push_failure(ctx, &e, 1).await;
+        tracing::warn!(err = %e, "queue mirror boot push failed");
+    }
 }
 
 /// Gate check: `is_serving` (runtime toggle) AND tunnel connected.

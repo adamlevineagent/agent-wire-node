@@ -82,6 +82,181 @@ interface LocalModeStatus {
     available_models?: string[];
 }
 
+// Chronicle row shape we consume for mirror health.
+interface MirrorHealthEvent {
+    event_type: string;
+    timestamp: string;
+    metadata?: Record<string, unknown>;
+}
+
+// Wire's staleness threshold (queue_mirror_staleness_s economic_parameter
+// at time of writing). We mirror it here for the freshness badge — yellow
+// at half-threshold, red at full. If Wire tunes the threshold, update
+// this constant to match. Not read dynamically because it's UX tuning,
+// not a correctness signal.
+const STALENESS_YELLOW_SECS = 45;
+const STALENESS_RED_SECS = 90;
+
+function formatAge(secs: number): string {
+    if (secs < 60) return `${secs}s`;
+    if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+    if (secs < 86400) return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+    return `${Math.floor(secs / 86400)}d`;
+}
+
+/**
+ * Mirror health indicator — renders a single badge describing the state
+ * of the node's market-mirror task:
+ *
+ *   green "Pushed Ns ago"         — last push fresh (under YELLOW threshold)
+ *   yellow "Pushed Ns ago"        — last push aging
+ *   red "Stale — Ns since push"   — last push past RED threshold
+ *                                   (matcher will reject)
+ *   red "Mirror task panicked"    — supervisor caught a panic recently
+ *   red "Mirror task exited"      — loop exited and didn't respawn
+ *   red "Last push failed"        — most recent push errored
+ *   gray "No pushes yet"          — fresh install, nothing to report
+ *
+ * Why surface this: prior to the supervisor + wall-clock seq fix, a
+ * provider could go 54 hours without a push and look identical to a
+ * healthy idle node from the operator's view. This badge makes the
+ * liveness state visible so an operator doesn't have to dig into the
+ * chronicle to know whether their mirror is functioning.
+ *
+ * Note: the Wire-side staleness CTE also accepts `last_heartbeat`
+ * freshness (node heartbeat, 60s cadence) as an alternative — so a
+ * stale mirror doesn't necessarily mean the node is unmatchable. This
+ * badge is specifically about the mirror-push pathway, which is what
+ * you want to know for "is my queue depth being reported to Wire?"
+ */
+function MirrorHealth() {
+    const [state, setState] = useState<
+        | { kind: "loading" }
+        | { kind: "none" }
+        | { kind: "pushed"; ageSecs: number }
+        | { kind: "failed"; error: string; ageSecs: number }
+        | { kind: "panicked"; message: string; ageSecs: number }
+        | { kind: "exited"; ageSecs: number }
+    >({ kind: "loading" });
+
+    const refresh = useCallback(async () => {
+        try {
+            // Look back 24h — enough to catch the "silently stale since
+            // Saturday" class of bug that motivated this work.
+            const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+            // Query each lifecycle event type; keep the most recent
+            // across all of them to decide the indicator state.
+            const kinds: Array<MirrorHealthEvent["event_type"]> = [
+                "queue_mirror_pushed",
+                "queue_mirror_push_failed",
+                "market_mirror_task_panicked",
+                "market_mirror_task_exited",
+            ];
+            const results = await Promise.all(
+                kinds.map((k) =>
+                    invoke<MirrorHealthEvent[]>("get_compute_events", {
+                        eventType: k,
+                        after: since,
+                        limit: 1,
+                    }).catch(() => [] as MirrorHealthEvent[]),
+                ),
+            );
+            // Flatten + pick the newest event. Event timestamps are ISO
+            // strings; lexicographic compare works for same-timezone UTC.
+            const all = results.flat();
+            if (all.length === 0) {
+                setState({ kind: "none" });
+                return;
+            }
+            all.sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
+            const latest = all[0];
+            const ageSecs = Math.max(
+                0,
+                Math.floor((Date.now() - new Date(latest.timestamp).getTime()) / 1000),
+            );
+            if (latest.event_type === "queue_mirror_pushed") {
+                setState({ kind: "pushed", ageSecs });
+            } else if (latest.event_type === "queue_mirror_push_failed") {
+                const err = typeof latest.metadata?.error === "string"
+                    ? latest.metadata.error
+                    : "unknown error";
+                setState({ kind: "failed", error: err, ageSecs });
+            } else if (latest.event_type === "market_mirror_task_panicked") {
+                const msg = typeof latest.metadata?.message === "string"
+                    ? latest.metadata.message
+                    : "panic";
+                setState({ kind: "panicked", message: msg, ageSecs });
+            } else {
+                setState({ kind: "exited", ageSecs });
+            }
+        } catch {
+            // Non-fatal — this component is pure observability, a read
+            // failure shouldn't block the offer manager from rendering.
+            setState({ kind: "none" });
+        }
+    }, []);
+
+    useEffect(() => {
+        void refresh();
+        const handle = setInterval(() => void refresh(), 15000);
+        return () => clearInterval(handle);
+    }, [refresh]);
+
+    if (state.kind === "loading") return null;
+    if (state.kind === "none") {
+        return (
+            <div className="compute-mirror-health compute-mirror-health-neutral">
+                Mirror: no pushes yet
+            </div>
+        );
+    }
+    if (state.kind === "pushed") {
+        const tone =
+            state.ageSecs > STALENESS_RED_SECS
+                ? "red"
+                : state.ageSecs > STALENESS_YELLOW_SECS
+                  ? "yellow"
+                  : "green";
+        const label =
+            tone === "red"
+                ? `Mirror stale — last push ${formatAge(state.ageSecs)} ago (matcher may skip)`
+                : `Mirror pushed ${formatAge(state.ageSecs)} ago`;
+        return (
+            <div
+                className={`compute-mirror-health compute-mirror-health-${tone}`}
+                title="Queue-mirror push liveness. Matcher accepts node heartbeat freshness as an alternative, so stale here doesn't necessarily mean unmatchable."
+            >
+                {label}
+            </div>
+        );
+    }
+    if (state.kind === "failed") {
+        return (
+            <div
+                className="compute-mirror-health compute-mirror-health-red"
+                title={state.error}
+            >
+                Last mirror push failed ({formatAge(state.ageSecs)} ago)
+            </div>
+        );
+    }
+    if (state.kind === "panicked") {
+        return (
+            <div
+                className="compute-mirror-health compute-mirror-health-red"
+                title={state.message}
+            >
+                Mirror task panicked ({formatAge(state.ageSecs)} ago) — supervisor respawned
+            </div>
+        );
+    }
+    return (
+        <div className="compute-mirror-health compute-mirror-health-red">
+            Mirror task exited ({formatAge(state.ageSecs)} ago) — restart node
+        </div>
+    );
+}
+
 export function ComputeOfferManager() {
     const [offers, setOffers] = useState<ComputeOffer[]>([]);
     const [loading, setLoading] = useState(true);
