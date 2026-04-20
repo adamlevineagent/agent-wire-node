@@ -265,69 +265,147 @@ function MirrorHealth() {
  * most recent outcome. Pillar 42: every backend feature gets a frontend
  * surface so operators can test by feel, not by curl.
  *
- *   green  — "Delivered N job(s) to Wire Ns ago" (recent success)
- *   green  — "Delivery worker idle (no rows waiting)" (steady state)
- *   yellow — "Retrying N job(s)" (transient failures in the last hour)
- *   red    — "Delivery task panicked (supervisor respawned)"
- *   red    — "Delivery task exited — restart node"
- *   red    — "Last delivery failed: <reason>" (terminal failure)
+ * Phase 3 rev 0.6.1 — two-leg P2P delivery. The worker now runs content
+ * and settlement legs independently, each with its own attempt/succeed/
+ * terminal event stream. Per spec line 404 we stay with ONE badge (end-
+ * state focus; operators care delivered/failing/dead, not leg breakdowns
+ * until triaging), but the label text describes the split outcome when
+ * the legs diverge (content delivered + settlement dead, or vice versa).
+ *
+ * Back-compat: rev-0.5 rows emitted `market_result_delivered_to_wire`;
+ * queries here UNION the old + new name so historical rows still count
+ * as "delivered" for display purposes.
+ *
+ * State machine (badge tones):
+ *   green   — "Both legs delivered Ns ago (N/24h)"
+ *   blue    — "In flight: one leg delivered, waiting on the other"
+ *   amber   — "Retrying — N transient leg attempt(s) failed"
+ *   amber   — "Content delivered, settlement failed — <reason>"
+ *   amber   — "Settlement delivered, content failed — <reason>"
+ *   red     — "Delivery failed — <reason>" (both legs dead)
+ *   red     — "Delivery task panicked (supervisor respawned)"
+ *   red     — "Delivery task exited — restart node"
+ *   info    — "Unknown privacy tier warning" (surfaced subtly when fresh)
  */
 function DeliveryHealth() {
+    type FailedState = {
+        kind: "failed";
+        reason: string;
+        ageSecs: number;
+    };
+    type PartialState = {
+        kind: "content-only" | "settlement-only";
+        reason: string;
+        ageSecs: number;
+    };
+    type InFlightState = {
+        kind: "in-flight";
+        leg: "content" | "settlement";
+        ageSecs: number;
+    };
     const [state, setState] = useState<
         | { kind: "loading" }
         | { kind: "idle" }
         | { kind: "delivered"; ageSecs: number; count24h: number }
         | { kind: "retrying"; attemptFailedCount: number }
-        | { kind: "failed"; reason: string; ageSecs: number }
+        | InFlightState
+        | PartialState
+        | FailedState
         | { kind: "panicked"; message: string; ageSecs: number }
         | { kind: "exited"; ageSecs: number }
+        | { kind: "cas-lost"; ageSecs: number; reason: string }
     >({ kind: "loading" });
+
+    // Secondary info badge for unknown privacy tier warnings. Rendered
+    // alongside the primary badge when fresh so operators can see Q-PROTO-3
+    // tier-mismatch noise without it stealing attention from delivery state.
+    const [unknownTierWarn, setUnknownTierWarn] = useState<
+        { ageSecs: number; tier: string } | null
+    >(null);
 
     const refresh = useCallback(async () => {
         try {
             const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
             const sinceHr = new Date(Date.now() - 60 * 60 * 1000).toISOString();
 
+            const fetchEvents = (eventType: string, after: string, limit: number) =>
+                invoke<MirrorHealthEvent[]>("get_compute_events", {
+                    eventType,
+                    after,
+                    limit,
+                }).catch(() => [] as MirrorHealthEvent[]);
+
             // Parallel fetch of all event types we care about. Lifecycle
             // events have small limits (just need latest). The delivered +
             // retrying series use slightly larger windows for counts.
-            const [delivered, attemptFailed, terminalFailed, panicked, exited] =
-                await Promise.all([
-                    invoke<MirrorHealthEvent[]>("get_compute_events", {
-                        eventType: "market_result_delivered_to_wire",
-                        after: since24h,
-                        limit: 50,
-                    }).catch(() => [] as MirrorHealthEvent[]),
-                    invoke<MirrorHealthEvent[]>("get_compute_events", {
-                        eventType: "market_result_delivery_attempt_failed",
-                        after: sinceHr,
-                        limit: 50,
-                    }).catch(() => [] as MirrorHealthEvent[]),
-                    invoke<MirrorHealthEvent[]>("get_compute_events", {
-                        eventType: "market_result_delivery_failed",
-                        after: since24h,
-                        limit: 1,
-                    }).catch(() => [] as MirrorHealthEvent[]),
-                    invoke<MirrorHealthEvent[]>("get_compute_events", {
-                        eventType: "market_delivery_task_panicked",
-                        after: sinceHr,
-                        limit: 1,
-                    }).catch(() => [] as MirrorHealthEvent[]),
-                    invoke<MirrorHealthEvent[]>("get_compute_events", {
-                        eventType: "market_delivery_task_exited",
-                        after: since24h,
-                        limit: 1,
-                    }).catch(() => [] as MirrorHealthEvent[]),
-                ]);
+            //
+            // Rev 0.6.1 adds per-leg events; we also keep rev-0.5 names in
+            // the query set for back-compat (historical rows can still
+            // contribute to the delivered count and to the "idle" check).
+            const [
+                deliveredNew,
+                deliveredLegacy,
+                contentLegOk,
+                settlementLegOk,
+                contentAttemptFailed,
+                settlementAttemptFailed,
+                attemptFailedLegacy,
+                contentDeliveryFailed,
+                settlementDeliveryFailed,
+                rowDeliveryFailed,
+                casLost,
+                panicked,
+                exited,
+                unknownTier,
+            ] = await Promise.all([
+                fetchEvents("market_result_delivered", since24h, 50),
+                fetchEvents("market_result_delivered_to_wire", since24h, 50),
+                fetchEvents("market_content_leg_succeeded", since24h, 10),
+                fetchEvents("market_settlement_leg_succeeded", since24h, 10),
+                fetchEvents("market_content_delivery_attempt_failed", sinceHr, 50),
+                fetchEvents("market_settlement_delivery_attempt_failed", sinceHr, 50),
+                fetchEvents("market_result_delivery_attempt_failed", sinceHr, 50),
+                fetchEvents("market_content_delivery_failed", since24h, 5),
+                fetchEvents("market_settlement_delivery_failed", since24h, 5),
+                fetchEvents("market_result_delivery_failed", since24h, 1),
+                fetchEvents("market_result_delivery_cas_lost", sinceHr, 1),
+                fetchEvents("market_delivery_task_panicked", sinceHr, 1),
+                fetchEvents("market_delivery_task_exited", since24h, 1),
+                fetchEvents("market_unknown_privacy_tier", sinceHr, 1),
+            ]);
 
-            // Precedence: panic/exit always win (they indicate task
-            // malfunction). Then recent terminal failures. Then retrying
-            // (if count > 0). Then delivered recency. Then idle.
             const ageOf = (iso: string | undefined): number =>
                 iso
                     ? Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000))
                     : Number.POSITIVE_INFINITY;
 
+            // Surface unknown-privacy-tier warnings as a subtle secondary
+            // badge if seen in the last hour. Not blocking — this is a
+            // Q-PROTO-3 soft warn when Wire sends an unrecognized tier.
+            if (unknownTier.length > 0) {
+                const tier =
+                    typeof unknownTier[0].metadata?.privacy_tier === "string"
+                        ? unknownTier[0].metadata.privacy_tier
+                        : typeof unknownTier[0].metadata?.tier === "string"
+                          ? (unknownTier[0].metadata.tier as string)
+                          : "unknown";
+                setUnknownTierWarn({
+                    ageSecs: ageOf(unknownTier[0].timestamp),
+                    tier,
+                });
+            } else {
+                setUnknownTierWarn(null);
+            }
+
+            // Precedence (primary badge):
+            //  1. Lifecycle red states (panic/exit)
+            //  2. Row-level terminal dead (both legs dead)
+            //  3. Per-leg terminal split (one leg delivered, other dead)
+            //  4. CAS-lost race
+            //  5. Any attempt-failed (transient) → retrying
+            //  6. In-flight (one leg ok, waiting on other, no terminal)
+            //  7. Delivered (rev-0.6 + rev-0.5 UNION)
+            //  8. Idle
             if (panicked.length > 0) {
                 const msg =
                     typeof panicked[0].metadata?.message === "string"
@@ -336,45 +414,149 @@ function DeliveryHealth() {
                 setState({ kind: "panicked", message: msg, ageSecs: ageOf(panicked[0].timestamp) });
                 return;
             }
+            // UNION both old + new delivered-row event names for back-compat.
+            const deliveredUnion = [...deliveredNew, ...deliveredLegacy].sort((a, b) =>
+                a.timestamp < b.timestamp ? 1 : -1,
+            );
             // An "exited" event means the loop hit clean channel-close;
             // supervisor returned. If a "delivered" event fires more recently,
-            // the supervisor came back up (shouldn't happen; channel drop
-            // is process-lifetime-scoped) — show delivered. Otherwise, red.
+            // the supervisor came back up — show delivered. Otherwise, red.
             if (exited.length > 0) {
                 const exitAge = ageOf(exited[0].timestamp);
                 const lastDeliveryAge =
-                    delivered.length > 0 ? ageOf(delivered[0].timestamp) : Number.POSITIVE_INFINITY;
+                    deliveredUnion.length > 0
+                        ? ageOf(deliveredUnion[0].timestamp)
+                        : Number.POSITIVE_INFINITY;
                 if (exitAge < lastDeliveryAge) {
                     setState({ kind: "exited", ageSecs: exitAge });
                     return;
                 }
             }
-            if (terminalFailed.length > 0 && ageOf(terminalFailed[0].timestamp) < 300) {
-                const reason =
-                    typeof terminalFailed[0].metadata?.reason === "string"
-                        ? terminalFailed[0].metadata.reason
-                        : "unknown";
+
+            const extractReason = (ev: MirrorHealthEvent | undefined): string => {
+                if (!ev) return "unknown";
+                const md = ev.metadata ?? {};
+                if (typeof md.reason === "string") return md.reason;
+                if (typeof md.final_error === "string") return md.final_error;
+                if (typeof md.content_error === "string" && typeof md.settlement_error === "string")
+                    return `content: ${md.content_error}; settlement: ${md.settlement_error}`;
+                if (typeof md.content_error === "string") return md.content_error;
+                if (typeof md.settlement_error === "string") return md.settlement_error;
+                return "unknown";
+            };
+
+            // Row-level terminal — both legs dead. Recent (<5 min) wins
+            // over everything below.
+            if (rowDeliveryFailed.length > 0 && ageOf(rowDeliveryFailed[0].timestamp) < 300) {
                 setState({
                     kind: "failed",
-                    reason,
-                    ageSecs: ageOf(terminalFailed[0].timestamp),
+                    reason: extractReason(rowDeliveryFailed[0]),
+                    ageSecs: ageOf(rowDeliveryFailed[0].timestamp),
                 });
                 return;
             }
-            if (attemptFailed.length > 0) {
-                // Transient retries in flight — surface the count for the
-                // last hour (same window as the fetch).
+
+            // Per-leg terminal split — one leg dead, the other succeeded.
+            // Take the most recent terminal-leg event, correlate by job_id
+            // with the opposite leg's success stream to decide the label.
+            const latestContentDead = contentDeliveryFailed[0];
+            const latestSettlementDead = settlementDeliveryFailed[0];
+            const contentDeadAge = ageOf(latestContentDead?.timestamp);
+            const settlementDeadAge = ageOf(latestSettlementDead?.timestamp);
+            const jobIdOf = (ev: MirrorHealthEvent | undefined): string | null => {
+                if (!ev) return null;
+                const v = ev.metadata?.job_id;
+                return typeof v === "string" ? v : null;
+            };
+            const contentOkJobIds = new Set(
+                contentLegOk.map((e) => jobIdOf(e)).filter((v): v is string => v !== null),
+            );
+            const settlementOkJobIds = new Set(
+                settlementLegOk.map((e) => jobIdOf(e)).filter((v): v is string => v !== null),
+            );
+            // Pick the more recent terminal-leg event — if that row has the
+            // opposite leg succeeded, we're in a partial-delivery state.
+            if (contentDeadAge < 300 || settlementDeadAge < 300) {
+                if (settlementDeadAge <= contentDeadAge && latestSettlementDead) {
+                    const jobId = jobIdOf(latestSettlementDead);
+                    if (jobId && contentOkJobIds.has(jobId)) {
+                        setState({
+                            kind: "content-only",
+                            reason: extractReason(latestSettlementDead),
+                            ageSecs: settlementDeadAge,
+                        });
+                        return;
+                    }
+                }
+                if (contentDeadAge < settlementDeadAge && latestContentDead) {
+                    const jobId = jobIdOf(latestContentDead);
+                    if (jobId && settlementOkJobIds.has(jobId)) {
+                        setState({
+                            kind: "settlement-only",
+                            reason: extractReason(latestContentDead),
+                            ageSecs: contentDeadAge,
+                        });
+                        return;
+                    }
+                }
+            }
+
+            // CAS-lost race — rare under per-leg model but possible.
+            if (casLost.length > 0 && ageOf(casLost[0].timestamp) < 300) {
+                const reason =
+                    typeof casLost[0].metadata?.reason === "string"
+                        ? casLost[0].metadata.reason
+                        : "cas_lost";
+                setState({
+                    kind: "cas-lost",
+                    reason,
+                    ageSecs: ageOf(casLost[0].timestamp),
+                });
+                return;
+            }
+
+            const attemptFailedCount =
+                contentAttemptFailed.length +
+                settlementAttemptFailed.length +
+                attemptFailedLegacy.length;
+            if (attemptFailedCount > 0) {
+                // Before declaring "retrying", check if one leg has
+                // succeeded but the other hasn't terminated — that's
+                // in-flight, not generic retry. In-flight wins because
+                // it's a more specific signal for the operator.
+                const mostRecentLegSuccess = [...contentLegOk, ...settlementLegOk].sort((a, b) =>
+                    a.timestamp < b.timestamp ? 1 : -1,
+                )[0];
+                const mostRecentRowDone =
+                    deliveredUnion[0]?.timestamp ?? rowDeliveryFailed[0]?.timestamp;
+                if (
+                    mostRecentLegSuccess &&
+                    ageOf(mostRecentLegSuccess.timestamp) < 300 &&
+                    (!mostRecentRowDone ||
+                        mostRecentLegSuccess.timestamp > mostRecentRowDone)
+                ) {
+                    const leg = contentLegOk.includes(mostRecentLegSuccess)
+                        ? "content"
+                        : "settlement";
+                    setState({
+                        kind: "in-flight",
+                        leg,
+                        ageSecs: ageOf(mostRecentLegSuccess.timestamp),
+                    });
+                    return;
+                }
                 setState({
                     kind: "retrying",
-                    attemptFailedCount: attemptFailed.length,
+                    attemptFailedCount,
                 });
                 return;
             }
-            if (delivered.length > 0) {
+
+            if (deliveredUnion.length > 0) {
                 setState({
                     kind: "delivered",
-                    ageSecs: ageOf(delivered[0].timestamp),
-                    count24h: delivered.length,
+                    ageSecs: ageOf(deliveredUnion[0].timestamp),
+                    count24h: deliveredUnion.length,
                 });
                 return;
             }
@@ -391,57 +573,115 @@ function DeliveryHealth() {
     }, [refresh]);
 
     if (state.kind === "loading") return null;
+
+    const unknownTierBadge = unknownTierWarn ? (
+        <div
+            className="compute-mirror-health compute-mirror-health-neutral"
+            title={`Wire sent a privacy tier this node doesn't recognize (tier: ${unknownTierWarn.tier}). Non-blocking; delivery still proceeds with the default handling.`}
+        >
+            Unknown privacy tier seen ({formatAge(unknownTierWarn.ageSecs)} ago)
+        </div>
+    ) : null;
+
+    const withTierWarn = (primary: JSX.Element): JSX.Element => (
+        <>
+            {primary}
+            {unknownTierBadge}
+        </>
+    );
+
     if (state.kind === "idle") {
-        return (
+        return withTierWarn(
             <div className="compute-mirror-health compute-mirror-health-neutral">
                 Delivery: no jobs delivered yet
-            </div>
+            </div>,
         );
     }
     if (state.kind === "delivered") {
-        return (
+        return withTierWarn(
             <div
                 className="compute-mirror-health compute-mirror-health-green"
-                title={`${state.count24h} delivery events in last 24h`}
+                title={`${state.count24h} delivery events in last 24h (rev-0.6 + rev-0.5 combined)`}
             >
-                Delivered {formatAge(state.ageSecs)} ago ({state.count24h}/24h)
-            </div>
+                Both legs delivered {formatAge(state.ageSecs)} ago ({state.count24h}/24h)
+            </div>,
+        );
+    }
+    if (state.kind === "in-flight") {
+        const waitingOn = state.leg === "content" ? "settlement" : "content";
+        return withTierWarn(
+            <div
+                className="compute-mirror-health compute-mirror-health-neutral"
+                title={`${state.leg} leg delivered ${formatAge(state.ageSecs)} ago; ${waitingOn} leg still in flight.`}
+            >
+                In flight — {state.leg} delivered, awaiting {waitingOn}
+            </div>,
         );
     }
     if (state.kind === "retrying") {
-        return (
+        return withTierWarn(
             <div
                 className="compute-mirror-health compute-mirror-health-yellow"
-                title="Transient delivery failures (5xx, network) in the last hour"
+                title="Transient leg-attempt failures (5xx, network) in the last hour across content + settlement"
             >
-                Delivery retrying — {state.attemptFailedCount} attempt(s) failed in last hour
-            </div>
+                Delivery retrying — {state.attemptFailedCount} leg attempt(s) failed in last hour
+            </div>,
+        );
+    }
+    if (state.kind === "content-only") {
+        return withTierWarn(
+            <div
+                className="compute-mirror-health compute-mirror-health-yellow"
+                title={`Settlement leg terminal: ${state.reason}. Content was delivered to the requester ${formatAge(state.ageSecs)} ago.`}
+            >
+                Content delivered, settlement failed — {state.reason}
+            </div>,
+        );
+    }
+    if (state.kind === "settlement-only") {
+        return withTierWarn(
+            <div
+                className="compute-mirror-health compute-mirror-health-yellow"
+                title={`Content leg terminal: ${state.reason}. Settlement was delivered to Wire ${formatAge(state.ageSecs)} ago.`}
+            >
+                Settlement delivered, content failed — {state.reason}
+            </div>,
         );
     }
     if (state.kind === "failed") {
-        return (
+        return withTierWarn(
             <div
                 className="compute-mirror-health compute-mirror-health-red"
                 title={state.reason}
             >
-                Last delivery failed ({formatAge(state.ageSecs)} ago): {state.reason}
-            </div>
+                Delivery failed ({formatAge(state.ageSecs)} ago) — {state.reason}
+            </div>,
+        );
+    }
+    if (state.kind === "cas-lost") {
+        return withTierWarn(
+            <div
+                className="compute-mirror-health compute-mirror-health-red"
+                title={`CAS race on ready→delivered transition: ${state.reason}. Rare under per-leg model; expected-ly transient.`}
+            >
+                Delivery CAS lost ({formatAge(state.ageSecs)} ago) — {state.reason}
+            </div>,
         );
     }
     if (state.kind === "panicked") {
-        return (
+        return withTierWarn(
             <div
                 className="compute-mirror-health compute-mirror-health-red"
                 title={state.message}
             >
                 Delivery task panicked ({formatAge(state.ageSecs)} ago) — supervisor respawned
-            </div>
+            </div>,
         );
     }
-    return (
+    return withTierWarn(
         <div className="compute-mirror-health compute-mirror-health-red">
             Delivery task exited ({formatAge(state.ageSecs)} ago) — restart node
-        </div>
+        </div>,
     );
 }
 
