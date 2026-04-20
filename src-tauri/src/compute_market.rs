@@ -428,6 +428,118 @@ impl ComputeMarketState {
     }
 }
 
+// ── ComputeDeliveryPolicy (Phase 3 rev 0.6.1) ─────────────────────────────
+//
+// Protocol-scoped retry policy for the two-POST provider delivery state
+// machine (content leg to requester, settlement leg to Wire). Parallels
+// `pyramid::market_delivery_policy::MarketDeliveryPolicy` but differs in
+// governance: `MarketDeliveryPolicy` is operator-tunable (per-node
+// contribution YAML, node-authored); `ComputeDeliveryPolicy` is Wire-
+// shipped (per-swarm economic_parameter, Wire-authored) because these
+// knobs govern protocol-level budgets shared by both sides of the
+// two-POST handshake — a node tuning them unilaterally would break
+// Wire's own per-job settlement accounting.
+//
+// **Source:** Wire ships the full `compute_delivery_policy` object on
+// every heartbeat response via the `wire_parameters` keyed map (see
+// contract §6, economic_parameter canonical vocabulary). Node stores
+// the raw `HashMap<String, serde_json::Value>` on `AuthState.wire_parameters`
+// (schema-agnostic bag; see `auth.rs` + `main.rs` heartbeat self-heal).
+// The delivery worker reads with a read-time fallback:
+//
+// ```ignore
+// let dp = ComputeDeliveryPolicy::from_wire_parameters(&auth.wire_parameters)
+//     .unwrap_or_else(ComputeDeliveryPolicy::contract_defaults);
+// ```
+//
+// Pre-rev-2.0 Wire doesn't ship the key at all → `from_wire_parameters`
+// returns `None` → caller falls back to `contract_defaults()`. Zero
+// lockstep with Wire's upgrade.
+//
+// **Defaults** (contract §6 rev 2.0):
+//   - `max_attempts_content`: 5
+//   - `max_attempts_settlement`: 5
+//   - `backoff_schedule_secs`: `[1, 5, 30, 300, 3600]`
+//
+// Per D8 + Q-PROTO-6, legs have independent retry budgets (a flaky
+// requester tunnel burning content-leg attempts MUST NOT exhaust the
+// settlement-leg budget). Backoff schedule is shared — both legs look
+// up `backoff_schedule_secs[attempt-1]` with last-element replication
+// beyond the schedule length (spec line 326).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ComputeDeliveryPolicy {
+    /// Content-leg (provider → requester) retry budget. After this many
+    /// attempts the row terminates with reason `max_attempts_content`.
+    pub max_attempts_content: u32,
+    /// Settlement-leg (provider → Wire) retry budget. After this many
+    /// attempts the row terminates with reason `max_attempts_settlement`.
+    pub max_attempts_settlement: u32,
+    /// Shared backoff schedule. Indexed by attempt# (1-based). Attempts
+    /// beyond the schedule length clamp to the last element (see
+    /// `backoff_for_attempt`).
+    pub backoff_schedule_secs: Vec<u32>,
+}
+
+impl ComputeDeliveryPolicy {
+    /// Contract rev 2.0 §6 defaults. Used as the read-time fallback when
+    /// Wire hasn't shipped `compute_delivery_policy` yet (pre-rev-2.0
+    /// Wire) or when the key parses malformed.
+    pub fn contract_defaults() -> Self {
+        Self {
+            max_attempts_content: 5,
+            max_attempts_settlement: 5,
+            backoff_schedule_secs: vec![1, 5, 30, 300, 3600],
+        }
+    }
+
+    /// Parse a `ComputeDeliveryPolicy` from `AuthState.wire_parameters`.
+    ///
+    /// Returns `None` if:
+    ///   - the `compute_delivery_policy` key is absent (pre-rev-2.0 Wire),
+    ///   - the value is not a JSON object,
+    ///   - the object is missing any required field,
+    ///   - any field has the wrong type (e.g. `backoff_schedule_secs`
+    ///     is not an array of non-negative integers),
+    ///   - deny_unknown_fields triggers on an unexpected nested key.
+    ///
+    /// Callers MUST fall back to `contract_defaults()` on `None`. This
+    /// is intentionally a total parse (all-or-nothing) rather than a
+    /// partial one — a malformed key should surface loudly via the
+    /// fallback, not silently merge halfway-valid Wire state with
+    /// node-side defaults. Matches the Pillar-37 spirit of
+    /// `MarketDeliveryPolicy::from_yaml`.
+    pub fn from_wire_parameters(
+        params: &HashMap<String, serde_json::Value>,
+    ) -> Option<Self> {
+        let value = params.get("compute_delivery_policy")?;
+        serde_json::from_value::<Self>(value.clone()).ok()
+    }
+
+    /// Backoff delay (seconds) for a given attempt number (1-based).
+    ///
+    /// `attempt_number = 1` returns `backoff_schedule_secs[0]`;
+    /// `attempt_number = 2` returns `[1]`; … attempts beyond the schedule
+    /// length clamp to the last element (spec line 326: "last element
+    /// replicated for attempts beyond the schedule length"). If the
+    /// schedule is empty (pathological — contract forbids this, but
+    /// defense-in-depth) returns 0.
+    ///
+    /// Attempt 0 is not a valid caller state (first attempt is 1) and
+    /// is treated as attempt 1 for safety rather than panicking.
+    pub fn backoff_for_attempt(&self, attempt_number: u32) -> u32 {
+        if self.backoff_schedule_secs.is_empty() {
+            return 0;
+        }
+        let idx = attempt_number.saturating_sub(1) as usize;
+        if idx >= self.backoff_schedule_secs.len() {
+            *self.backoff_schedule_secs.last().unwrap()
+        } else {
+            self.backoff_schedule_secs[idx]
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,5 +953,135 @@ mod tests {
             serde_json::to_string(&ComputeJobStatus::Failed).unwrap(),
             "\"failed\""
         );
+    }
+
+    // ── ComputeDeliveryPolicy (Phase 3 rev 0.6.1) ─────────────────────────
+
+    #[test]
+    fn compute_delivery_policy_contract_defaults() {
+        // Contract rev 2.0 §6 — canonical defaults. If Wire renames a key
+        // or changes a default, this test fails loudly and the caller
+        // (delivery worker) behavior diverges from spec — both are bugs.
+        let dp = ComputeDeliveryPolicy::contract_defaults();
+        assert_eq!(dp.max_attempts_content, 5);
+        assert_eq!(dp.max_attempts_settlement, 5);
+        assert_eq!(dp.backoff_schedule_secs, vec![1, 5, 30, 300, 3600]);
+    }
+
+    #[test]
+    fn compute_delivery_policy_from_wire_parameters_full_object() {
+        // Happy path: Wire ships the full structured object on heartbeat.
+        let mut params: HashMap<String, serde_json::Value> = HashMap::new();
+        params.insert(
+            "compute_delivery_policy".into(),
+            serde_json::json!({
+                "max_attempts_content": 7,
+                "max_attempts_settlement": 3,
+                "backoff_schedule_secs": [2, 8, 60]
+            }),
+        );
+        let dp = ComputeDeliveryPolicy::from_wire_parameters(&params)
+            .expect("full object should parse");
+        assert_eq!(dp.max_attempts_content, 7);
+        assert_eq!(dp.max_attempts_settlement, 3);
+        assert_eq!(dp.backoff_schedule_secs, vec![2, 8, 60]);
+    }
+
+    #[test]
+    fn compute_delivery_policy_from_wire_parameters_missing_key_returns_none() {
+        // Pre-rev-2.0 Wire doesn't ship the key at all. Caller falls back
+        // to contract_defaults() on None — zero-lockstep upgrade path.
+        let params: HashMap<String, serde_json::Value> = HashMap::new();
+        assert!(ComputeDeliveryPolicy::from_wire_parameters(&params).is_none());
+
+        // Also: other keys present but ours absent.
+        let mut params2: HashMap<String, serde_json::Value> = HashMap::new();
+        params2.insert(
+            "callback_secret_grace_secs".into(),
+            serde_json::json!(300),
+        );
+        assert!(ComputeDeliveryPolicy::from_wire_parameters(&params2).is_none());
+    }
+
+    #[test]
+    fn compute_delivery_policy_from_wire_parameters_malformed_returns_none() {
+        // Wrong shape variants — each must fail the total parse (not
+        // silently partial-merge) so the read-time fallback kicks in.
+
+        // Not an object at all.
+        let mut p1: HashMap<String, serde_json::Value> = HashMap::new();
+        p1.insert("compute_delivery_policy".into(), serde_json::json!(42));
+        assert!(ComputeDeliveryPolicy::from_wire_parameters(&p1).is_none());
+
+        // Missing required field.
+        let mut p2: HashMap<String, serde_json::Value> = HashMap::new();
+        p2.insert(
+            "compute_delivery_policy".into(),
+            serde_json::json!({
+                "max_attempts_content": 5,
+                "backoff_schedule_secs": [1, 5, 30]
+                // max_attempts_settlement missing
+            }),
+        );
+        assert!(ComputeDeliveryPolicy::from_wire_parameters(&p2).is_none());
+
+        // Wrong type on a scalar field (negative when u32 expected).
+        let mut p3: HashMap<String, serde_json::Value> = HashMap::new();
+        p3.insert(
+            "compute_delivery_policy".into(),
+            serde_json::json!({
+                "max_attempts_content": -1,
+                "max_attempts_settlement": 5,
+                "backoff_schedule_secs": [1, 5, 30]
+            }),
+        );
+        assert!(ComputeDeliveryPolicy::from_wire_parameters(&p3).is_none());
+
+        // Unknown field (deny_unknown_fields guard; operator typos surface loudly).
+        let mut p4: HashMap<String, serde_json::Value> = HashMap::new();
+        p4.insert(
+            "compute_delivery_policy".into(),
+            serde_json::json!({
+                "max_attempts_content": 5,
+                "max_attempts_settlement": 5,
+                "backoff_schedule_secs": [1, 5, 30],
+                "bogus_extra_key": "oops"
+            }),
+        );
+        assert!(ComputeDeliveryPolicy::from_wire_parameters(&p4).is_none());
+    }
+
+    #[test]
+    fn backoff_for_attempt_attempt_1_returns_first_element() {
+        let dp = ComputeDeliveryPolicy::contract_defaults();
+        assert_eq!(dp.backoff_for_attempt(1), 1);
+        assert_eq!(dp.backoff_for_attempt(2), 5);
+        assert_eq!(dp.backoff_for_attempt(3), 30);
+        assert_eq!(dp.backoff_for_attempt(4), 300);
+        assert_eq!(dp.backoff_for_attempt(5), 3600);
+    }
+
+    #[test]
+    fn backoff_for_attempt_clamps_to_last_element() {
+        // Spec line 326: "last element replicated for attempts beyond
+        // the schedule length." Schedule has 5 entries; attempt=10 and
+        // attempt=u32::MAX both clamp to the last element (3600).
+        let dp = ComputeDeliveryPolicy::contract_defaults();
+        assert_eq!(dp.backoff_for_attempt(6), 3600);
+        assert_eq!(dp.backoff_for_attempt(10), 3600);
+        assert_eq!(dp.backoff_for_attempt(u32::MAX), 3600);
+
+        // attempt=0 is not a valid caller state but must not panic —
+        // treated as attempt 1 via saturating_sub.
+        assert_eq!(dp.backoff_for_attempt(0), 1);
+
+        // Empty schedule (contract forbids but defense-in-depth): returns 0.
+        let empty_dp = ComputeDeliveryPolicy {
+            max_attempts_content: 5,
+            max_attempts_settlement: 5,
+            backoff_schedule_secs: vec![],
+        };
+        assert_eq!(empty_dp.backoff_for_attempt(1), 0);
+        assert_eq!(empty_dp.backoff_for_attempt(100), 0);
     }
 }
