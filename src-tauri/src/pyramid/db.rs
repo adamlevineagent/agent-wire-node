@@ -3582,32 +3582,31 @@ pub fn market_outbox_bump_settlement_attempt_with_backoff(
 ///
 /// Same terminal-write semantics as the rev 0.5
 /// `fleet_outbox_mark_delivered_if_ready` — stamps `delivered_at` and resets
-/// `expires_at` (to one year from now — caller can override via a later
-/// helper if retention tuning ships).
+/// `expires_at = now + delivered_retention_secs`. Caller threads
+/// `MarketDeliveryPolicy::delivered_retention_secs` through so operator
+/// tuning (via economic_parameter supersession) takes effect — no hardcoded
+/// retention (Pillar 37: no numbers constraining runtime behavior).
 ///
 /// Spec §Architecture "Two-POST state machine": the row transitions
 /// `ready → delivered` only when both legs are 2xx.
 pub fn market_outbox_check_both_legs_complete_and_mark_delivered(
     conn: &Connection,
     rowid: i64,
+    delivered_retention_secs: u64,
 ) -> Result<bool> {
-    // +1 year retention for delivered rows — same default as the fleet
-    // delivery path. Operators tune via the shared `delivered_retention_secs`
-    // MarketDeliveryPolicy knob when the terminal-retention pass lands
-    // (rev 0.6.1 Wave 2+). Hardcoded here is acceptable because the value
-    // is only "how long do we keep the row for post-mortem visibility."
+    let modifier = format!("+{} seconds", delivered_retention_secs);
     let n = conn.execute(
         "UPDATE fleet_result_outbox
             SET status = 'delivered',
                 delivered_at = datetime('now'),
-                expires_at = datetime('now', '+1 year'),
+                expires_at = datetime('now', ?2),
                 content_lease_until = NULL,
                 settlement_lease_until = NULL
           WHERE rowid = ?1
             AND status = 'ready'
             AND content_posted_ok = 1
             AND settlement_posted_ok = 1",
-        rusqlite::params![rowid],
+        rusqlite::params![rowid, modifier],
     )?;
     Ok(n > 0)
 }
@@ -21188,13 +21187,19 @@ mod rev061_leg_helpers_tests {
         let conn = mem_conn();
         let rowid = ready_market_row(&conn, "mkt-both-legs");
         // Neither leg done → no transition.
-        assert!(!market_outbox_check_both_legs_complete_and_mark_delivered(&conn, rowid).unwrap());
+        assert!(
+            !market_outbox_check_both_legs_complete_and_mark_delivered(&conn, rowid, 3600).unwrap()
+        );
         // Only content done → still no transition.
         market_outbox_mark_content_posted_ok_if_ready(&conn, rowid).unwrap();
-        assert!(!market_outbox_check_both_legs_complete_and_mark_delivered(&conn, rowid).unwrap());
+        assert!(
+            !market_outbox_check_both_legs_complete_and_mark_delivered(&conn, rowid, 3600).unwrap()
+        );
         // Both done → transitions delivered.
         market_outbox_mark_settlement_posted_ok_if_ready(&conn, rowid).unwrap();
-        assert!(market_outbox_check_both_legs_complete_and_mark_delivered(&conn, rowid).unwrap());
+        assert!(
+            market_outbox_check_both_legs_complete_and_mark_delivered(&conn, rowid, 3600).unwrap()
+        );
         let status: String = conn
             .query_row(
                 "SELECT status FROM fleet_result_outbox WHERE rowid = ?1",
@@ -21204,7 +21209,9 @@ mod rev061_leg_helpers_tests {
             .unwrap();
         assert_eq!(status, "delivered");
         // Re-calling is a no-op (CAS gated on status='ready').
-        assert!(!market_outbox_check_both_legs_complete_and_mark_delivered(&conn, rowid).unwrap());
+        assert!(
+            !market_outbox_check_both_legs_complete_and_mark_delivered(&conn, rowid, 3600).unwrap()
+        );
     }
 
     #[test]
