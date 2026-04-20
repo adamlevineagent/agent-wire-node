@@ -2388,6 +2388,86 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
          WHERE callback_kind IN ('MarketStandard', 'Relay');",
     )?;
 
+    // ── Phase 3 rev 0.6.1 (two-POST delivery topology) — per-leg columns ────
+    //
+    // Nine new columns supporting the P2P delivery protocol per contract rev
+    // 2.0 (§2.6 content POST → requester direct; §2.3 settlement POST → Wire).
+    // One outbox row owns BOTH legs; each leg has independent state (posted_ok
+    // flag, lease, backoff, attempt counter, last error).
+    //
+    //   requester_callback_url       — §2.1 rev 2.0 dispatch body field;
+    //                                  stored at admission for content-leg POST.
+    //   requester_delivery_jwt       — §2.6 bearer for content leg (opaque).
+    //
+    //   content_posted_ok            — 0/1 flag. 1 means the content POST has
+    //                                  received a 2xx (terminal-success on
+    //                                  this leg); row can transition to
+    //                                  `delivered` only when BOTH legs are 1.
+    //   content_lease_until          — per-leg lease; blocks concurrent
+    //                                  in-flight content POSTs for the same row.
+    //   content_next_attempt_at      — per-leg backoff gate.
+    //   content_last_error           — per-leg terminal/transient error message.
+    //   (content attempt counter reuses the existing `delivery_attempts`
+    //   column — its semantic was always "delivery attempts" = content-leg;
+    //   rev 0.6.1 repurposes it rather than adding a parallel column per
+    //   spec lines 82-99.)
+    //
+    //   settlement_posted_ok         — mirror for the Wire-bound leg.
+    //   settlement_delivery_attempts — per-leg attempt counter (distinct from
+    //                                  content's; legs do not share budget
+    //                                  per Q-PROTO-6).
+    //   settlement_lease_until       — mirror.
+    //   settlement_next_attempt_at   — mirror.
+    //   settlement_last_error        — mirror.
+    //
+    // The rev 0.5 columns `delivery_lease_until` / `delivery_next_attempt_at`
+    // stay in place — dead per spec line 84 ("documented as 'rev 0.5 unused'")
+    // but SQLite DROP COLUMN is expensive and the columns are harmless.
+    // The rev 0.5 index `idx_fleet_outbox_market_delivery` likewise stays;
+    // rev 0.6.1 adds a new per-leg index below.
+    //
+    // Additive migration; all columns nullable or defaulted; zero breaking
+    // change for fleet or pre-rev-0.6 market rows. Phase 3 rev 0.6.1 spec:
+    // docs/plans/compute-market-phase-3-provider-delivery-spec.md lines 90-106.
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(fleet_result_outbox)")?;
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let want: &[(&str, &str)] = &[
+            ("requester_callback_url", "TEXT"),
+            ("requester_delivery_jwt", "TEXT"),
+            ("content_posted_ok", "INTEGER NOT NULL DEFAULT 0"),
+            ("content_lease_until", "TEXT"),
+            ("content_next_attempt_at", "TEXT"),
+            ("content_last_error", "TEXT"),
+            ("settlement_posted_ok", "INTEGER NOT NULL DEFAULT 0"),
+            ("settlement_delivery_attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("settlement_lease_until", "TEXT"),
+            ("settlement_next_attempt_at", "TEXT"),
+            ("settlement_last_error", "TEXT"),
+        ];
+        for (name, ty) in want {
+            if !cols.iter().any(|c| c == name) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE fleet_result_outbox ADD COLUMN {} {};",
+                    name, ty
+                ))?;
+            }
+        }
+    }
+
+    // Per-leg index (spec lines 115-119). Partial on MarketStandard+Relay rows
+    // so the claim queries' filter combinations are fast even at depth.
+    // The rev 0.5 `idx_fleet_outbox_market_delivery` index stays in place
+    // (SQLite no-op on IF NOT EXISTS; eventually drop in cleanup migration).
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_fleet_outbox_market_delivery_legs
+           ON fleet_result_outbox (status, content_posted_ok, settlement_posted_ok)
+         WHERE callback_kind IN ('MarketStandard', 'Relay');",
+    )?;
+
     // ── Schema version tracking (Phase 3 spec §Callback auth token storage) ─
     //
     // Minimal migration-apply-time tracking so the delivery worker's
@@ -2461,7 +2541,13 @@ const OUTBOX_SELECT_PROJECTION_WHERE_EXPIRED_FLEET: &str = "\
     SELECT dispatcher_node_id, job_id, status, callback_url, result_json, \
            delivery_attempts, last_attempt_at, expires_at, created_at, \
            callback_auth_token, delivery_lease_until, delivery_next_attempt_at, \
-           inference_latency_ms, request_id \
+           inference_latency_ms, request_id, \
+           requester_callback_url, requester_delivery_jwt, \
+           content_posted_ok, content_lease_until, content_next_attempt_at, \
+           content_last_error, \
+           settlement_posted_ok, settlement_delivery_attempts, \
+           settlement_lease_until, settlement_next_attempt_at, \
+           settlement_last_error \
       FROM fleet_result_outbox \
      WHERE expires_at <= datetime('now') \
        AND callback_kind = 'Fleet'";
@@ -2470,7 +2556,13 @@ const OUTBOX_SELECT_PROJECTION_WHERE_READY_FLEET: &str = "\
     SELECT dispatcher_node_id, job_id, status, callback_url, result_json, \
            delivery_attempts, last_attempt_at, expires_at, created_at, \
            callback_auth_token, delivery_lease_until, delivery_next_attempt_at, \
-           inference_latency_ms, request_id \
+           inference_latency_ms, request_id, \
+           requester_callback_url, requester_delivery_jwt, \
+           content_posted_ok, content_lease_until, content_next_attempt_at, \
+           content_last_error, \
+           settlement_posted_ok, settlement_delivery_attempts, \
+           settlement_lease_until, settlement_next_attempt_at, \
+           settlement_last_error \
       FROM fleet_result_outbox \
      WHERE status = 'ready' \
        AND callback_kind = 'Fleet'";
@@ -2479,7 +2571,13 @@ const OUTBOX_SELECT_PROJECTION_WHERE_EXPIRED_MARKET: &str = "\
     SELECT dispatcher_node_id, job_id, status, callback_url, result_json, \
            delivery_attempts, last_attempt_at, expires_at, created_at, \
            callback_auth_token, delivery_lease_until, delivery_next_attempt_at, \
-           inference_latency_ms, request_id \
+           inference_latency_ms, request_id, \
+           requester_callback_url, requester_delivery_jwt, \
+           content_posted_ok, content_lease_until, content_next_attempt_at, \
+           content_last_error, \
+           settlement_posted_ok, settlement_delivery_attempts, \
+           settlement_lease_until, settlement_next_attempt_at, \
+           settlement_last_error \
       FROM fleet_result_outbox \
      WHERE expires_at <= datetime('now') \
        AND callback_kind != 'Fleet'";
@@ -2488,10 +2586,34 @@ const OUTBOX_SELECT_PROJECTION_WHERE_READY_MARKET: &str = "\
     SELECT dispatcher_node_id, job_id, status, callback_url, result_json, \
            delivery_attempts, last_attempt_at, expires_at, created_at, \
            callback_auth_token, delivery_lease_until, delivery_next_attempt_at, \
-           inference_latency_ms, request_id \
+           inference_latency_ms, request_id, \
+           requester_callback_url, requester_delivery_jwt, \
+           content_posted_ok, content_lease_until, content_next_attempt_at, \
+           content_last_error, \
+           settlement_posted_ok, settlement_delivery_attempts, \
+           settlement_lease_until, settlement_next_attempt_at, \
+           settlement_last_error \
       FROM fleet_result_outbox \
      WHERE status = 'ready' \
        AND callback_kind != 'Fleet'";
+
+/// Shared column-list string spliced into `UPDATE ... RETURNING <cols>`
+/// statements in the per-leg claim helpers (rev 0.6.1). Column order matches
+/// `OUTBOX_SELECT_PROJECTION_*` exactly so `map_outbox_row` materializes rows
+/// returned via RETURNING the same as rows from SELECT. Single source of
+/// truth — adding an outbox column means editing this const + the four
+/// SELECT projection consts + the struct + `map_outbox_row` together.
+const OUTBOX_RETURNING_COLUMNS: &str = "\
+    dispatcher_node_id, job_id, status, callback_url, result_json, \
+    delivery_attempts, last_attempt_at, expires_at, created_at, \
+    callback_auth_token, delivery_lease_until, delivery_next_attempt_at, \
+    inference_latency_ms, request_id, \
+    requester_callback_url, requester_delivery_jwt, \
+    content_posted_ok, content_lease_until, content_next_attempt_at, \
+    content_last_error, \
+    settlement_posted_ok, settlement_delivery_attempts, \
+    settlement_lease_until, settlement_next_attempt_at, \
+    settlement_last_error";
 
 /// Maps a row from any of the OUTBOX_SELECT_PROJECTION_* queries into an
 /// `OutboxRow`. Column indices correspond to `OUTBOX_SELECT_COLUMNS` order.
@@ -2511,6 +2633,17 @@ fn map_outbox_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
         delivery_next_attempt_at: r.get(11)?,
         inference_latency_ms: r.get(12)?,
         request_id: r.get(13)?,
+        requester_callback_url: r.get(14)?,
+        requester_delivery_jwt: r.get(15)?,
+        content_posted_ok: r.get(16)?,
+        content_lease_until: r.get(17)?,
+        content_next_attempt_at: r.get(18)?,
+        content_last_error: r.get(19)?,
+        settlement_posted_ok: r.get(20)?,
+        settlement_delivery_attempts: r.get(21)?,
+        settlement_lease_until: r.get(22)?,
+        settlement_next_attempt_at: r.get(23)?,
+        settlement_last_error: r.get(24)?,
     })
 }
 
@@ -2554,6 +2687,48 @@ pub struct OutboxRow {
     /// (contract §10.1). Threaded into every chronicle event's metadata for
     /// cross-system trace correlation. NULL if dispatch didn't include it.
     pub request_id: Option<String>,
+    /// Phase 3 rev 0.6.1 (§2.1): requester's callback URL for the content
+    /// leg's direct P2P POST per §2.6. Stored at admission. NULL on fleet
+    /// rows and on any pre-rev-0.6.1 row (orphaned-by-migration handling
+    /// lives in the delivery worker).
+    pub requester_callback_url: Option<String>,
+    /// Phase 3 rev 0.6.1 (§3.4): opaque Bearer the provider echoes on the
+    /// content-leg POST. Verified by the requester, not by the provider.
+    /// NULL on fleet rows / pre-rev-0.6.1 rows. Never logged (custom Debug
+    /// redaction on the `MarketDispatchRequest` field + truncate + no-`{:?}`
+    /// discipline).
+    pub requester_delivery_jwt: Option<String>,
+    /// Phase 3 rev 0.6.1: 1 iff the content leg's POST has received a 2xx
+    /// response. Set by `market_outbox_mark_content_posted_ok_if_ready`.
+    /// When both this AND `settlement_posted_ok` are 1, a final CAS flips
+    /// the row to `delivered`.
+    pub content_posted_ok: i64,
+    /// Phase 3 rev 0.6.1: per-leg lease — stamped by the content-leg claim
+    /// CAS, blocks concurrent content POSTs for this row until it lapses.
+    /// Cleared on terminal (success or exhaustion).
+    pub content_lease_until: Option<String>,
+    /// Phase 3 rev 0.6.1: per-leg backoff gate — content leg eligible to
+    /// claim only when this is NULL or `<= now`.
+    pub content_next_attempt_at: Option<String>,
+    /// Phase 3 rev 0.6.1: last content-leg error message. Truncated to
+    /// `max_error_message_chars` at write time.
+    pub content_last_error: Option<String>,
+    /// Phase 3 rev 0.6.1: mirror of `content_posted_ok` for the settlement
+    /// leg (provider → Wire POST per §2.3).
+    pub settlement_posted_ok: i64,
+    /// Phase 3 rev 0.6.1: settlement-leg attempt counter. Distinct from
+    /// `delivery_attempts` (which is repurposed as the content-leg counter
+    /// per spec lines 82-99) — legs do not share retry budget per Q-PROTO-6.
+    pub settlement_delivery_attempts: i64,
+    /// Phase 3 rev 0.6.1: mirror of `content_lease_until` for the
+    /// settlement leg.
+    pub settlement_lease_until: Option<String>,
+    /// Phase 3 rev 0.6.1: mirror of `content_next_attempt_at` for the
+    /// settlement leg.
+    pub settlement_next_attempt_at: Option<String>,
+    /// Phase 3 rev 0.6.1: mirror of `content_last_error` for the
+    /// settlement leg.
+    pub settlement_last_error: Option<String>,
 }
 
 /// Insert a new outbox row in `pending` state. Uses INSERT OR IGNORE so repeat
@@ -2682,12 +2857,15 @@ pub fn market_outbox_insert_or_ignore(
     expires_at: &str,
     callback_auth_token: Option<&str>,
     request_id: Option<&str>,
+    requester_callback_url: Option<&str>,
+    requester_delivery_jwt: Option<&str>,
 ) -> Result<usize> {
     let n = conn.execute(
         "INSERT OR IGNORE INTO fleet_result_outbox
             (dispatcher_node_id, job_id, callback_url, callback_kind, status,
-             expires_at, callback_auth_token, request_id)
-         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7)",
+             expires_at, callback_auth_token, request_id,
+             requester_callback_url, requester_delivery_jwt)
+         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             crate::fleet::WIRE_PLATFORM_DISPATCHER,
             job_id,
@@ -2696,6 +2874,8 @@ pub fn market_outbox_insert_or_ignore(
             expires_at,
             callback_auth_token,
             request_id,
+            requester_callback_url,
+            requester_delivery_jwt,
         ],
     )?;
     Ok(n)
@@ -3098,10 +3278,7 @@ pub fn market_outbox_claim_ready_for_delivery(
         RETURNING {}",
         // Same column order as OUTBOX_SELECT_PROJECTION_* consts so the
         // shared map_outbox_row helper materializes rows unchanged.
-        "dispatcher_node_id, job_id, status, callback_url, result_json, \
-         delivery_attempts, last_attempt_at, expires_at, created_at, \
-         callback_auth_token, delivery_lease_until, delivery_next_attempt_at, \
-         inference_latency_ms, request_id"
+        OUTBOX_RETURNING_COLUMNS
     );
     let mut stmt = conn.prepare(&sql)?;
     let max_i64: i64 = max_concurrent_deliveries.min(i64::MAX as u64) as i64;
@@ -3191,6 +3368,271 @@ pub fn market_outbox_delivery_startup_recovery(conn: &Connection) -> Result<usiz
           WHERE status = 'ready'
             AND callback_kind IN ('MarketStandard', 'Relay')
             AND delivery_lease_until IS NOT NULL",
+        [],
+    )?;
+    Ok(n)
+}
+
+// ── Phase 3 rev 0.6.1 — per-leg DB helpers (two-POST topology) ──────────────
+//
+// Per-leg CAS helpers for the rev 0.6.1 P2P delivery topology: one outbox
+// row, two independent POST legs (content → requester §2.6, settlement →
+// Wire §2.3). Mirrors the rev 0.5 single-leg helpers above but splits into
+// content-leg + settlement-leg variants. State transitions:
+//
+//   ready + content_posted_ok=0 + settlement_posted_ok=0 (fresh row)
+//     │
+//     ├── content POST 2xx → content_posted_ok=1
+//     └── settlement POST 2xx → settlement_posted_ok=1
+//     │
+//     └── both flags 1 → CAS ready → delivered (via
+//         market_outbox_check_both_legs_complete_and_mark_delivered).
+//
+// All UPDATEs are CAS-guarded on `status='ready'` per the same discipline
+// as the rev 0.5 helpers — the caller MUST check the returned bool to know
+// whether the CAS won or lost (lost means a concurrent sweep or the other
+// leg's success already promoted the row past `ready`).
+//
+// Spec: docs/plans/compute-market-phase-3-provider-delivery-spec.md
+// §"Claim query (rev 0.6 shape)" + §"Per-leg DB helpers".
+
+/// Content-leg claim: acquire `content_lease_until` atomically on up to
+/// `limit` `ready` MarketStandard rows that are eligible for a content POST.
+/// Eligibility per spec lines 125-130:
+///   - status = 'ready'
+///   - callback_kind = 'MarketStandard'
+///   - content_posted_ok = 0 (leg not already done)
+///   - content_lease_until IS NULL OR < now (not currently in-flight)
+///   - content_next_attempt_at IS NULL OR <= now (backoff satisfied)
+///
+/// UPDATE ... RETURNING * is atomic — no TOCTOU window between selecting
+/// eligible rows and stamping the lease.
+pub fn market_outbox_claim_content_for_delivery(
+    conn: &Connection,
+    lease_secs: u64,
+    limit: u64,
+) -> Result<Vec<OutboxRow>> {
+    let lease_mod = format!("+{} seconds", lease_secs);
+    let sql = format!(
+        "UPDATE fleet_result_outbox
+            SET content_lease_until = datetime('now', ?1)
+          WHERE rowid IN (
+              SELECT rowid FROM fleet_result_outbox
+               WHERE status = 'ready'
+                 AND callback_kind = 'MarketStandard'
+                 AND content_posted_ok = 0
+                 AND (content_lease_until IS NULL
+                      OR content_lease_until < datetime('now'))
+                 AND (content_next_attempt_at IS NULL
+                      OR content_next_attempt_at <= datetime('now'))
+               ORDER BY created_at ASC
+               LIMIT ?2
+          )
+        RETURNING {}",
+        OUTBOX_RETURNING_COLUMNS
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let limit_i64: i64 = limit.min(i64::MAX as u64) as i64;
+    let rows = stmt
+        .query_map(rusqlite::params![lease_mod, limit_i64], map_outbox_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Settlement-leg claim: identical shape to
+/// [`market_outbox_claim_content_for_delivery`] but swaps the `content_*`
+/// predicate columns for `settlement_*`. See spec line 151 — "Settlement-leg
+/// claim is identical, swapping `content_*` → `settlement_*`."
+pub fn market_outbox_claim_settlement_for_delivery(
+    conn: &Connection,
+    lease_secs: u64,
+    limit: u64,
+) -> Result<Vec<OutboxRow>> {
+    let lease_mod = format!("+{} seconds", lease_secs);
+    let sql = format!(
+        "UPDATE fleet_result_outbox
+            SET settlement_lease_until = datetime('now', ?1)
+          WHERE rowid IN (
+              SELECT rowid FROM fleet_result_outbox
+               WHERE status = 'ready'
+                 AND callback_kind = 'MarketStandard'
+                 AND settlement_posted_ok = 0
+                 AND (settlement_lease_until IS NULL
+                      OR settlement_lease_until < datetime('now'))
+                 AND (settlement_next_attempt_at IS NULL
+                      OR settlement_next_attempt_at <= datetime('now'))
+               ORDER BY created_at ASC
+               LIMIT ?2
+          )
+        RETURNING {}",
+        OUTBOX_RETURNING_COLUMNS
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let limit_i64: i64 = limit.min(i64::MAX as u64) as i64;
+    let rows = stmt
+        .query_map(rusqlite::params![lease_mod, limit_i64], map_outbox_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Content-leg success CAS: flip `content_posted_ok` from 0 to 1 and clear
+/// the content-leg lease. Gated on `status = 'ready' AND content_posted_ok
+/// = 0` so a concurrent sweep transition or a duplicate success-write doesn't
+/// double-flip the flag. Returns `true` iff the UPDATE affected a row
+/// (semantically, "this caller's success was the one that flipped the bit").
+///
+/// Does NOT flip row status to `delivered` on its own — the caller must
+/// invoke [`market_outbox_check_both_legs_complete_and_mark_delivered`]
+/// afterward, which re-reads the row and does the final CAS iff both legs
+/// are now 1.
+pub fn market_outbox_mark_content_posted_ok_if_ready(
+    conn: &Connection,
+    rowid: i64,
+) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE fleet_result_outbox
+            SET content_posted_ok = 1,
+                content_lease_until = NULL
+          WHERE rowid = ?1
+            AND status = 'ready'
+            AND content_posted_ok = 0",
+        rusqlite::params![rowid],
+    )?;
+    Ok(n > 0)
+}
+
+/// Settlement-leg success CAS: mirror of
+/// [`market_outbox_mark_content_posted_ok_if_ready`] for the settlement leg.
+pub fn market_outbox_mark_settlement_posted_ok_if_ready(
+    conn: &Connection,
+    rowid: i64,
+) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE fleet_result_outbox
+            SET settlement_posted_ok = 1,
+                settlement_lease_until = NULL
+          WHERE rowid = ?1
+            AND status = 'ready'
+            AND settlement_posted_ok = 0",
+        rusqlite::params![rowid],
+    )?;
+    Ok(n > 0)
+}
+
+/// Content-leg transient-failure bookkeeping: increment the content-leg
+/// attempt counter (the existing `delivery_attempts` column, repurposed per
+/// spec lines 82-99), stash `last_error`, clear the content lease so the row
+/// is claimable again after the backoff elapses, and set
+/// `content_next_attempt_at = now + backoff_secs` as the backoff gate.
+///
+/// Gated on `status = 'ready'` so a concurrent terminal transition doesn't
+/// pollute the attempt counter. Rowcount=0 is acceptable (terminal
+/// transition won the race).
+pub fn market_outbox_bump_content_attempt_with_backoff(
+    conn: &Connection,
+    rowid: i64,
+    backoff_secs: u64,
+    error_message: &str,
+) -> Result<()> {
+    let backoff_mod = format!("+{} seconds", backoff_secs);
+    conn.execute(
+        "UPDATE fleet_result_outbox
+            SET delivery_attempts = delivery_attempts + 1,
+                content_last_error = ?3,
+                last_attempt_at = datetime('now'),
+                content_lease_until = NULL,
+                content_next_attempt_at = datetime('now', ?2)
+          WHERE rowid = ?1
+            AND status = 'ready'",
+        rusqlite::params![rowid, backoff_mod, error_message],
+    )?;
+    Ok(())
+}
+
+/// Settlement-leg transient-failure bookkeeping: mirror of
+/// [`market_outbox_bump_content_attempt_with_backoff`] but increments the
+/// settlement-specific `settlement_delivery_attempts` counter (legs do not
+/// share budget per Q-PROTO-6) and writes settlement-specific columns.
+pub fn market_outbox_bump_settlement_attempt_with_backoff(
+    conn: &Connection,
+    rowid: i64,
+    backoff_secs: u64,
+    error_message: &str,
+) -> Result<()> {
+    let backoff_mod = format!("+{} seconds", backoff_secs);
+    conn.execute(
+        "UPDATE fleet_result_outbox
+            SET settlement_delivery_attempts = settlement_delivery_attempts + 1,
+                settlement_last_error = ?3,
+                last_attempt_at = datetime('now'),
+                settlement_lease_until = NULL,
+                settlement_next_attempt_at = datetime('now', ?2)
+          WHERE rowid = ?1
+            AND status = 'ready'",
+        rusqlite::params![rowid, backoff_mod, error_message],
+    )?;
+    Ok(())
+}
+
+/// Both-legs-complete check + terminal CAS. Re-reads the row under a single
+/// statement and flips `status = 'delivered'` iff BOTH `content_posted_ok`
+/// AND `settlement_posted_ok` are 1 AND the row is currently `ready`.
+/// Returns `true` iff this caller's UPDATE flipped the status (`false` means
+/// either the other leg isn't done yet OR a concurrent CAS got there first).
+///
+/// Same terminal-write semantics as the rev 0.5
+/// `fleet_outbox_mark_delivered_if_ready` — stamps `delivered_at` and resets
+/// `expires_at` (to one year from now — caller can override via a later
+/// helper if retention tuning ships).
+///
+/// Spec §Architecture "Two-POST state machine": the row transitions
+/// `ready → delivered` only when both legs are 2xx.
+pub fn market_outbox_check_both_legs_complete_and_mark_delivered(
+    conn: &Connection,
+    rowid: i64,
+) -> Result<bool> {
+    // +1 year retention for delivered rows — same default as the fleet
+    // delivery path. Operators tune via the shared `delivered_retention_secs`
+    // MarketDeliveryPolicy knob when the terminal-retention pass lands
+    // (rev 0.6.1 Wave 2+). Hardcoded here is acceptable because the value
+    // is only "how long do we keep the row for post-mortem visibility."
+    let n = conn.execute(
+        "UPDATE fleet_result_outbox
+            SET status = 'delivered',
+                delivered_at = datetime('now'),
+                expires_at = datetime('now', '+1 year'),
+                content_lease_until = NULL,
+                settlement_lease_until = NULL
+          WHERE rowid = ?1
+            AND status = 'ready'
+            AND content_posted_ok = 1
+            AND settlement_posted_ok = 1",
+        rusqlite::params![rowid],
+    )?;
+    Ok(n > 0)
+}
+
+/// Startup-recovery counterpart of rev 0.5's
+/// [`market_outbox_delivery_startup_recovery`] but clears BOTH legs' leases.
+/// A prior process that died mid-POST on either leg would leave the
+/// corresponding `*_lease_until` stamped; on fresh boot we want immediate
+/// reclaim on both legs. Backoff gates (`*_next_attempt_at`) are left alone
+/// — backoff across restarts is correct behavior (a Wire or requester blip
+/// doesn't resolve just because the node rebooted).
+///
+/// Covers both MarketStandard and Relay callback_kinds for forward-compat
+/// with the deferred relay market per spec §Scope.
+pub fn market_outbox_startup_recovery_clear_leg_leases(
+    conn: &Connection,
+) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE fleet_result_outbox
+            SET content_lease_until = NULL,
+                settlement_lease_until = NULL
+          WHERE status = 'ready'
+            AND callback_kind IN ('MarketStandard', 'Relay')
+            AND (content_lease_until IS NOT NULL
+                 OR settlement_lease_until IS NOT NULL)",
         [],
     )?;
     Ok(n)
@@ -20022,6 +20464,8 @@ mod phase17_tests {
             &expires,
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(n, 1, "fresh insert returns rowcount=1");
@@ -20055,6 +20499,8 @@ mod phase17_tests {
             &expires,
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
         let n = market_outbox_insert_or_ignore(
@@ -20063,6 +20509,8 @@ mod phase17_tests {
             "https://wire.example.com/v1/compute/result-relay",
             "MarketStandard",
             &expires,
+            None,
+            None,
             None,
             None,
         )
@@ -20082,6 +20530,8 @@ mod phase17_tests {
             "https://relay-hop-7.example.com/r/inbound",
             "Relay",
             &expires,
+            None,
+            None,
             None,
             None,
         )
@@ -20110,11 +20560,11 @@ mod phase17_tests {
         fleet_outbox_insert_or_ignore(&conn, "dispA", "fleet-j2", "https://x/cb", &expires)
             .unwrap();
         // Two MarketStandard + one Relay row.
-        market_outbox_insert_or_ignore(&conn, "mkt-j1", "https://w/cb", "MarketStandard", &expires, None, None)
+        market_outbox_insert_or_ignore(&conn, "mkt-j1", "https://w/cb", "MarketStandard", &expires, None, None, None, None)
             .unwrap();
-        market_outbox_insert_or_ignore(&conn, "mkt-j2", "https://w/cb", "MarketStandard", &expires, None, None)
+        market_outbox_insert_or_ignore(&conn, "mkt-j2", "https://w/cb", "MarketStandard", &expires, None, None, None, None)
             .unwrap();
-        market_outbox_insert_or_ignore(&conn, "rly-j1", "https://r/cb", "Relay", &expires, None, None)
+        market_outbox_insert_or_ignore(&conn, "rly-j1", "https://r/cb", "Relay", &expires, None, None, None, None)
             .unwrap();
         // Excluding mkt-j1 — count should see mkt-j2 + rly-j1 = 2.
         let n = market_outbox_count_inflight_excluding(
@@ -20142,11 +20592,11 @@ mod phase17_tests {
         // consume the admission budget.
         let conn = outbox_conn();
         let expires = future_expires();
-        market_outbox_insert_or_ignore(&conn, "mkt-j1", "https://w/cb", "MarketStandard", &expires, None, None)
+        market_outbox_insert_or_ignore(&conn, "mkt-j1", "https://w/cb", "MarketStandard", &expires, None, None, None, None)
             .unwrap();
-        market_outbox_insert_or_ignore(&conn, "mkt-j2", "https://w/cb", "MarketStandard", &expires, None, None)
+        market_outbox_insert_or_ignore(&conn, "mkt-j2", "https://w/cb", "MarketStandard", &expires, None, None, None, None)
             .unwrap();
-        market_outbox_insert_or_ignore(&conn, "mkt-j3", "https://w/cb", "MarketStandard", &expires, None, None)
+        market_outbox_insert_or_ignore(&conn, "mkt-j3", "https://w/cb", "MarketStandard", &expires, None, None, None, None)
             .unwrap();
         // Promote one to delivered, one to failed.
         conn.execute(
@@ -20202,6 +20652,8 @@ mod phase17_tests {
             &expires,
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -20247,6 +20699,8 @@ mod phase17_tests {
             "1970-01-01 00:00:00",
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
         market_outbox_insert_or_ignore(
@@ -20255,6 +20709,8 @@ mod phase17_tests {
             "https://r/cb",
             "Relay",
             "1970-01-01 00:00:00",
+            None,
+            None,
             None,
             None,
         )
@@ -20266,6 +20722,8 @@ mod phase17_tests {
             "https://w/cb",
             "MarketStandard",
             "9999-12-31 23:59:59",
+            None,
+            None,
             None,
             None,
         )
@@ -20302,7 +20760,7 @@ mod phase17_tests {
             rusqlite::params![&expires],
         )
         .unwrap();
-        market_outbox_insert_or_ignore(&conn, "mkt-row", "https://w/cb", "MarketStandard", &expires, None, None)
+        market_outbox_insert_or_ignore(&conn, "mkt-row", "https://w/cb", "MarketStandard", &expires, None, None, None, None)
             .unwrap();
         conn.execute(
             "UPDATE fleet_result_outbox
@@ -20351,7 +20809,7 @@ mod phase17_tests {
         // past. A row at 4 with max=5 remains untouched.
         let conn = outbox_conn();
         let expires = future_expires();
-        market_outbox_insert_or_ignore(&conn, "mkt-below", "https://w/cb", "MarketStandard", &expires, None, None)
+        market_outbox_insert_or_ignore(&conn, "mkt-below", "https://w/cb", "MarketStandard", &expires, None, None, None, None)
             .unwrap();
         conn.execute(
             "UPDATE fleet_result_outbox
@@ -20386,7 +20844,7 @@ mod phase17_tests {
         fleet_outbox_insert_or_ignore(&conn, "dispA", "fleet-ready", "https://x/cb", &expires).unwrap();
         fleet_outbox_promote_ready_if_pending(&conn, "dispA", "fleet-ready", "{}", 60).unwrap();
         // Ready Market row — MUST be returned.
-        market_outbox_insert_or_ignore(&conn, "mkt-ready", "https://w/cb", "MarketStandard", &expires, None, None)
+        market_outbox_insert_or_ignore(&conn, "mkt-ready", "https://w/cb", "MarketStandard", &expires, None, None, None, None)
             .unwrap();
         conn.execute(
             "UPDATE fleet_result_outbox
@@ -20398,7 +20856,7 @@ mod phase17_tests {
         )
         .unwrap();
         // Pending market row — must NOT be returned (only ready).
-        market_outbox_insert_or_ignore(&conn, "mkt-pending", "https://w/cb", "MarketStandard", &expires, None, None)
+        market_outbox_insert_or_ignore(&conn, "mkt-pending", "https://w/cb", "MarketStandard", &expires, None, None, None, None)
             .unwrap();
 
         let rows = market_outbox_retry_candidates(&conn).unwrap();
@@ -20454,6 +20912,341 @@ mod phase17_tests {
         assert!(
             !by_source_sql.contains("'fleet_returned'"),
             "v_compute_by_source must not reference the old event_type 'fleet_returned'"
+        );
+    }
+}
+
+// ── Phase 3 rev 0.6.1 — per-leg helper tests ───────────────────────────────
+#[cfg(test)]
+mod rev061_leg_helpers_tests {
+    //! Unit-test coverage for the Wave 1 per-leg DB helpers. Every helper
+    //! gets a happy-path + at least one guard-case so schema drift or CAS
+    //! predicate changes are caught here rather than downstream.
+    use super::*;
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        conn
+    }
+
+    fn ready_market_row(conn: &Connection, job_id: &str) -> i64 {
+        // Fresh MarketStandard row, promoted straight to `ready` so the
+        // claim helpers see it.
+        market_outbox_insert_or_ignore(
+            conn,
+            job_id,
+            "https://wire.example.com/v1/compute/settle/x",
+            "MarketStandard",
+            "9999-12-31 23:59:59",
+            Some("opaque-settlement-token"),
+            None,
+            Some("https://newsbleach.com/api/v1/compute/callback/x"),
+            Some("opaque-requester-jwt"),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE fleet_result_outbox
+                SET status = 'ready',
+                    result_json = '{\"kind\":\"Success\",\"data\":{}}',
+                    ready_at = datetime('now')
+              WHERE job_id = ?1",
+            rusqlite::params![job_id],
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT rowid FROM fleet_result_outbox WHERE job_id = ?1",
+            rusqlite::params![job_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn schema_has_new_rev_0_6_1_columns() {
+        // Belt-and-suspenders: the ALTER block must actually add every
+        // column the spec mandates.
+        let conn = mem_conn();
+        let mut stmt = conn.prepare("PRAGMA table_info(fleet_result_outbox)").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for required in &[
+            "requester_callback_url",
+            "requester_delivery_jwt",
+            "content_posted_ok",
+            "content_lease_until",
+            "content_next_attempt_at",
+            "content_last_error",
+            "settlement_posted_ok",
+            "settlement_delivery_attempts",
+            "settlement_lease_until",
+            "settlement_next_attempt_at",
+            "settlement_last_error",
+        ] {
+            assert!(
+                cols.iter().any(|c| c == *required),
+                "fleet_result_outbox must have column {required}; got {cols:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn per_leg_index_exists() {
+        let conn = mem_conn();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type='index' AND name='idx_fleet_outbox_market_delivery_legs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "per-leg index must be created by init_pyramid_db");
+    }
+
+    #[test]
+    fn insert_or_ignore_persists_rev_0_6_1_fields() {
+        let conn = mem_conn();
+        market_outbox_insert_or_ignore(
+            &conn,
+            "job-with-new-fields",
+            "https://wire.example/v1/compute/settle/x",
+            "MarketStandard",
+            "9999-12-31 23:59:59",
+            Some("settle-tok"),
+            None,
+            Some("https://newsbleach.example/cb"),
+            Some("requester-jwt-opaque"),
+        )
+        .unwrap();
+        let (url, jwt): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT requester_callback_url, requester_delivery_jwt
+                   FROM fleet_result_outbox WHERE job_id = ?1",
+                rusqlite::params!["job-with-new-fields"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(url.as_deref(), Some("https://newsbleach.example/cb"));
+        assert_eq!(jwt.as_deref(), Some("requester-jwt-opaque"));
+    }
+
+    #[test]
+    fn claim_content_for_delivery_stamps_lease_and_returns_row() {
+        let conn = mem_conn();
+        let _rowid = ready_market_row(&conn, "mkt-claim-content");
+        let claimed = market_outbox_claim_content_for_delivery(&conn, 60, 10).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].job_id, "mkt-claim-content");
+        // Lease stamped.
+        assert!(
+            claimed[0].content_lease_until.is_some(),
+            "claim must stamp content_lease_until"
+        );
+        // Settlement lease NOT stamped (independent leg).
+        assert!(
+            claimed[0].settlement_lease_until.is_none(),
+            "content-leg claim must not touch settlement lease"
+        );
+        // Re-claim: same row is not returned (lease blocks it).
+        let again = market_outbox_claim_content_for_delivery(&conn, 60, 10).unwrap();
+        assert!(again.is_empty(), "active lease must block re-claim");
+    }
+
+    #[test]
+    fn claim_settlement_for_delivery_is_independent_of_content() {
+        let conn = mem_conn();
+        let _rowid = ready_market_row(&conn, "mkt-claim-settlement");
+        // Stamp only the settlement lease via the helper.
+        let claimed = market_outbox_claim_settlement_for_delivery(&conn, 60, 10).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert!(claimed[0].settlement_lease_until.is_some());
+        assert!(
+            claimed[0].content_lease_until.is_none(),
+            "settlement-leg claim must not touch content lease"
+        );
+        // Content leg still claimable (independent).
+        let content_claim = market_outbox_claim_content_for_delivery(&conn, 60, 10).unwrap();
+        assert_eq!(
+            content_claim.len(),
+            1,
+            "legs are independent — settlement lease must not block content claim"
+        );
+    }
+
+    #[test]
+    fn claim_skips_rows_where_leg_already_posted_ok() {
+        let conn = mem_conn();
+        let rowid = ready_market_row(&conn, "mkt-posted-ok");
+        // Flip content_posted_ok=1 → content leg no longer eligible to claim.
+        assert!(market_outbox_mark_content_posted_ok_if_ready(&conn, rowid).unwrap());
+        let claimed = market_outbox_claim_content_for_delivery(&conn, 60, 10).unwrap();
+        assert!(claimed.is_empty(), "posted_ok=1 rows must not be claimed");
+        // But settlement leg still claimable.
+        let s_claimed = market_outbox_claim_settlement_for_delivery(&conn, 60, 10).unwrap();
+        assert_eq!(s_claimed.len(), 1);
+    }
+
+    #[test]
+    fn mark_content_posted_ok_if_ready_clears_lease() {
+        let conn = mem_conn();
+        let rowid = ready_market_row(&conn, "mkt-content-ok");
+        // Stamp a lease first (simulating in-flight POST).
+        let _ = market_outbox_claim_content_for_delivery(&conn, 60, 10).unwrap();
+        let flipped = market_outbox_mark_content_posted_ok_if_ready(&conn, rowid).unwrap();
+        assert!(flipped);
+        let (posted_ok, lease): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT content_posted_ok, content_lease_until
+                   FROM fleet_result_outbox WHERE rowid = ?1",
+                rusqlite::params![rowid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(posted_ok, 1);
+        assert!(lease.is_none(), "success CAS must clear content_lease_until");
+        // Re-calling the helper is a no-op (CAS gated on posted_ok=0).
+        let again = market_outbox_mark_content_posted_ok_if_ready(&conn, rowid).unwrap();
+        assert!(!again, "second success CAS must return false (no-op)");
+    }
+
+    #[test]
+    fn mark_settlement_posted_ok_if_ready_mirrors_content() {
+        let conn = mem_conn();
+        let rowid = ready_market_row(&conn, "mkt-settle-ok");
+        let _ = market_outbox_claim_settlement_for_delivery(&conn, 60, 10).unwrap();
+        let flipped = market_outbox_mark_settlement_posted_ok_if_ready(&conn, rowid).unwrap();
+        assert!(flipped);
+        let (posted_ok, lease): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT settlement_posted_ok, settlement_lease_until
+                   FROM fleet_result_outbox WHERE rowid = ?1",
+                rusqlite::params![rowid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(posted_ok, 1);
+        assert!(lease.is_none());
+    }
+
+    #[test]
+    fn bump_content_attempt_with_backoff_uses_existing_counter() {
+        // Spec lines 82-99: the existing `delivery_attempts` column is
+        // REPURPOSED as the content-leg counter. Bumping content must
+        // increment that column (not a parallel one).
+        let conn = mem_conn();
+        let rowid = ready_market_row(&conn, "mkt-bump-content");
+        market_outbox_bump_content_attempt_with_backoff(&conn, rowid, 5, "timeout").unwrap();
+        let (attempts, err, next_at, lease): (
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT delivery_attempts, content_last_error, content_next_attempt_at,
+                        content_lease_until
+                   FROM fleet_result_outbox WHERE rowid = ?1",
+                rusqlite::params![rowid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(attempts, 1, "content-leg attempts increments delivery_attempts");
+        assert_eq!(err.as_deref(), Some("timeout"));
+        assert!(next_at.is_some(), "content_next_attempt_at must be set");
+        assert!(lease.is_none(), "bump must clear content_lease_until");
+    }
+
+    #[test]
+    fn bump_settlement_attempt_uses_its_own_counter() {
+        // Q-PROTO-6: legs do not share retry budget. Settlement uses
+        // settlement_delivery_attempts, not the repurposed delivery_attempts.
+        let conn = mem_conn();
+        let rowid = ready_market_row(&conn, "mkt-bump-settle");
+        market_outbox_bump_settlement_attempt_with_backoff(&conn, rowid, 5, "wire-503").unwrap();
+        let (content_cnt, settle_cnt, err): (i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT delivery_attempts, settlement_delivery_attempts, settlement_last_error
+                   FROM fleet_result_outbox WHERE rowid = ?1",
+                rusqlite::params![rowid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            content_cnt, 0,
+            "settlement-leg bump must NOT touch the content-leg counter"
+        );
+        assert_eq!(settle_cnt, 1);
+        assert_eq!(err.as_deref(), Some("wire-503"));
+    }
+
+    #[test]
+    fn check_both_legs_complete_is_false_until_both_ok() {
+        let conn = mem_conn();
+        let rowid = ready_market_row(&conn, "mkt-both-legs");
+        // Neither leg done → no transition.
+        assert!(!market_outbox_check_both_legs_complete_and_mark_delivered(&conn, rowid).unwrap());
+        // Only content done → still no transition.
+        market_outbox_mark_content_posted_ok_if_ready(&conn, rowid).unwrap();
+        assert!(!market_outbox_check_both_legs_complete_and_mark_delivered(&conn, rowid).unwrap());
+        // Both done → transitions delivered.
+        market_outbox_mark_settlement_posted_ok_if_ready(&conn, rowid).unwrap();
+        assert!(market_outbox_check_both_legs_complete_and_mark_delivered(&conn, rowid).unwrap());
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM fleet_result_outbox WHERE rowid = ?1",
+                rusqlite::params![rowid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "delivered");
+        // Re-calling is a no-op (CAS gated on status='ready').
+        assert!(!market_outbox_check_both_legs_complete_and_mark_delivered(&conn, rowid).unwrap());
+    }
+
+    #[test]
+    fn startup_recovery_clears_both_leg_leases_independent_of_backoff() {
+        let conn = mem_conn();
+        let rowid = ready_market_row(&conn, "mkt-startup");
+        // Stamp both leases + backoff gates as if a prior process died mid-POST.
+        conn.execute(
+            "UPDATE fleet_result_outbox
+                SET content_lease_until = datetime('now', '+5 minutes'),
+                    settlement_lease_until = datetime('now', '+5 minutes'),
+                    content_next_attempt_at = datetime('now', '+2 minutes'),
+                    settlement_next_attempt_at = datetime('now', '+2 minutes')
+              WHERE rowid = ?1",
+            rusqlite::params![rowid],
+        )
+        .unwrap();
+        let n = market_outbox_startup_recovery_clear_leg_leases(&conn).unwrap();
+        assert_eq!(n, 1);
+        let (cl, sl, cn, sn): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT content_lease_until, settlement_lease_until,
+                        content_next_attempt_at, settlement_next_attempt_at
+                   FROM fleet_result_outbox WHERE rowid = ?1",
+                rusqlite::params![rowid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert!(cl.is_none(), "content_lease_until must be cleared");
+        assert!(sl.is_none(), "settlement_lease_until must be cleared");
+        assert!(
+            cn.is_some(),
+            "content_next_attempt_at must NOT be cleared by startup recovery"
+        );
+        assert!(
+            sn.is_some(),
+            "settlement_next_attempt_at must NOT be cleared by startup recovery"
         );
     }
 }

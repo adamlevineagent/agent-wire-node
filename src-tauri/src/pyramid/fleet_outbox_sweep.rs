@@ -716,6 +716,17 @@ mod tests {
             delivery_next_attempt_at: None,
             inference_latency_ms: None,
             request_id: None,
+            requester_callback_url: None,
+            requester_delivery_jwt: None,
+            content_posted_ok: 0,
+            content_lease_until: None,
+            content_next_attempt_at: None,
+            content_last_error: None,
+            settlement_posted_ok: 0,
+            settlement_delivery_attempts: 0,
+            settlement_lease_until: None,
+            settlement_next_attempt_at: None,
+            settlement_last_error: None,
         }
     }
 
@@ -793,6 +804,17 @@ mod tests {
             delivery_next_attempt_at: None,
             inference_latency_ms: None,
             request_id: None,
+            requester_callback_url: None,
+            requester_delivery_jwt: None,
+            content_posted_ok: 0,
+            content_lease_until: None,
+            content_next_attempt_at: None,
+            content_last_error: None,
+            settlement_posted_ok: 0,
+            settlement_delivery_attempts: 0,
+            settlement_lease_until: None,
+            settlement_next_attempt_at: None,
+            settlement_last_error: None,
         };
         assert_eq!(market_job_path_for(&row), "market-recv:abc-123");
         // Note: parallel `job_path_for` (fleet) uses the pattern
@@ -819,6 +841,8 @@ mod tests {
             "https://wire.example.com/v1/compute/result-relay",
             "MarketStandard",
             "1970-01-01 00:00:00",
+            None,
+            None,
             None,
             None,
         )
@@ -877,6 +901,8 @@ mod tests {
             "1970-01-01 00:00:00",
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
         drop(conn);
@@ -927,6 +953,8 @@ mod tests {
             "https://wire/x",
             "MarketStandard",
             far_future,
+            None,
+            None,
             None,
             None,
         )

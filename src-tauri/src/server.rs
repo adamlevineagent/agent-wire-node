@@ -3234,6 +3234,12 @@ async fn handle_market_dispatch(
             &expires_at,
             Some(&callback_auth_token_tx),
             request_id_tx.as_deref(),
+            // Wave 1 scope: rev 0.6.1 dispatch body fields plumb through
+            // in Wave 2. Pass None here — the admission handler's body
+            // parsing + TunnelUrl extraction lands alongside the
+            // MarketDispatchRequest consumer change.
+            None,
+            None,
         ) {
             Ok(n) => n,
             Err(e) => return MarketAdmissionOutcome::DbError(e.to_string()),

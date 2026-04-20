@@ -932,6 +932,17 @@ mod tests {
             delivery_next_attempt_at: None,
             inference_latency_ms: Some(450),
             request_id: Some("req-abc-123".into()),
+            requester_callback_url: None,
+            requester_delivery_jwt: None,
+            content_posted_ok: 0,
+            content_lease_until: None,
+            content_next_attempt_at: None,
+            content_last_error: None,
+            settlement_posted_ok: 0,
+            settlement_delivery_attempts: 0,
+            settlement_lease_until: None,
+            settlement_next_attempt_at: None,
+            settlement_last_error: None,
         }
     }
 

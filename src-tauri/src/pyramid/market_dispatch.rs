@@ -152,6 +152,31 @@ pub struct MarketDispatchRequest {
     /// + `token` as opaque and echoes `token` verbatim.
     pub callback_auth: CallbackAuth,
 
+    /// Contract rev 2.0 §2.1 / §2.6: the requester's direct-POST URL for
+    /// the content leg of the two-POST delivery topology. Provider POSTs
+    /// `MarketAsyncResultEnvelope` here with `Authorization: Bearer
+    /// <requester_delivery_jwt>`. Distinct from `callback_url` above, which
+    /// is the settlement-leg (Wire) URL.
+    ///
+    /// Required field — pre-rev-2.0 Wire dispatches (which lacked this
+    /// field) fail serde's required-field validation and surface at the
+    /// admission handler as a visible 400 `requester_callback_url_missing_or_invalid`.
+    /// Zero-lockstep fail-loud posture consistent with the outer struct's
+    /// `deny_unknown_fields` (§2.1 rev 2.0).
+    pub requester_callback_url: TunnelUrl,
+
+    /// Contract rev 2.0 §3.4: opaque Bearer the provider echoes on the
+    /// content-leg POST. Minted by Wire at match time with
+    /// `aud="requester-delivery"`, `sub=<uuid_job_id>`,
+    /// `rid=<requester_operator_id>`, `exp=now + requester_delivery_jwt_ttl_secs`.
+    /// Provider treats as an opaque string — verification happens on the
+    /// requester side (sibling of `verify_market_identity`).
+    ///
+    /// Required field — same serde-enforced required-field validation as
+    /// `requester_callback_url` above; pre-rev-2.0 dispatches 400 at
+    /// admission.
+    pub requester_delivery_jwt: String,
+
     /// Privacy tier string — currently `"standard"`, `"direct"`, or
     /// `"bootstrap-relay"`. Warn-don't-reject on unknown values per
     /// contract Q-PROTO-3. Carried through the dispatch → settlement
@@ -458,6 +483,11 @@ mod tests {
                 kind: "bearer".into(),
                 token: "opaque-token".into(),
             },
+            requester_callback_url: TunnelUrl::parse(
+                "https://newsbleach.com/api/v1/compute/callback/job-abc",
+            )
+            .unwrap(),
+            requester_delivery_jwt: "opaque-requester-jwt".into(),
             privacy_tier: "standard".into(),
             timeout_ms: 5000,
             extensions: std::collections::HashMap::new(),
@@ -498,8 +528,10 @@ mod tests {
             "offer_id": "playful/106/1",
             "matched_multiplier_bps": 10000,
             "privacy_tier": "bootstrap-relay",
-            "callback_url": "https://newsbleach.com/api/v1/compute/callback/b8d98b7b-0ba0-4f8a-ac6e-d0a9c1c62a3c",
+            "callback_url": "https://wire.example.com/api/v1/compute/settle/b8d98b7b-0ba0-4f8a-ac6e-d0a9c1c62a3c",
             "callback_auth": {"type": "bearer", "token": "zOpYp-4-o8EQsX4pDEFzKGrEcJGNsoH5Y39E0VTHV9Q"},
+            "requester_callback_url": "https://newsbleach.com/api/v1/compute/callback/b8d98b7b-0ba0-4f8a-ac6e-d0a9c1c62a3c",
+            "requester_delivery_jwt": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.opaque.signature",
             "max_tokens": 2048,
             "messages": [
                 {"role": "system", "content": "Be concise."},
@@ -537,6 +569,8 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "callback_url": "https://wire.example.com/v1/compute/result-relay",
             "callback_auth": {"type": "bearer", "token": "t"},
+            "requester_callback_url": "https://newsbleach.com/api/v1/compute/callback/job-abc",
+            "requester_delivery_jwt": "opaque",
             "privacy_tier": "standard",
             "timeout_ms": 5000,
             "priority": "urgent"
@@ -567,6 +601,11 @@ mod tests {
                 kind: "bearer".into(),
                 token: "some-opaque-token".into(),
             },
+            requester_callback_url: TunnelUrl::parse(
+                "https://newsbleach.com/api/v1/compute/callback/job-xyz",
+            )
+            .unwrap(),
+            requester_delivery_jwt: "opaque-requester-jwt-full".into(),
             privacy_tier: "cloud_relay".into(),
             timeout_ms: 7000,
             extensions: std::collections::HashMap::new(),
