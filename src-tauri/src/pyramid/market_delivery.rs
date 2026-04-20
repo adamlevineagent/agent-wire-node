@@ -589,6 +589,17 @@ async fn tick(ctx: &DeliveryContext) {
     let delivery_policy =
         ComputeDeliveryPolicy::from_wire_parameters(&wire_parameters)
             .unwrap_or_else(ComputeDeliveryPolicy::contract_defaults);
+    // `requester_delivery_jwt_ttl_secs` is a scalar (not part of
+    // `compute_delivery_policy`) shipped via heartbeat `wire_parameters`.
+    // Default per contract rev 2.0 §3.4 = fill_job_ttl_secs = 1800s. Used
+    // by the content-leg 401 heuristic to distinguish
+    // `terminal_http_401_likely_jwt_expired` from a plain 401 (cf. Pillar
+    // 37 — semantic coupling to `ready_retention_secs` was a proxy hack;
+    // reading the dedicated scalar removes it).
+    let requester_delivery_jwt_ttl_secs = wire_parameters
+        .get("requester_delivery_jwt_ttl_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1800);
 
     // Two claim queries — one per leg. Each asks for up to max_concurrent;
     // the combined stream is then bounded-parallel at max_concurrent at the
@@ -697,9 +708,10 @@ async fn tick(ctx: &DeliveryContext) {
             let p = Arc::clone(&p_arc);
             let dp = Arc::clone(&dp_arc);
             let ctx = ctx;
+            let jwt_ttl = requester_delivery_jwt_ttl_secs;
             async move {
                 match rowid {
-                    Some(rid) => deliver_leg(ctx, row, leg, rid, &p, &dp).await,
+                    Some(rid) => deliver_leg(ctx, row, leg, rid, &p, &dp, jwt_ttl).await,
                     None => {
                         tracing::warn!(
                             job_id = %row.job_id,
@@ -715,6 +727,13 @@ async fn tick(ctx: &DeliveryContext) {
 
 /// Per-leg POST flow. Pure per-leg function; called twice per row (once
 /// for each leg, from the `tick` unified stream). See spec lines 158-211.
+///
+/// `requester_delivery_jwt_ttl_secs` is the scalar from
+/// `wire_parameters` (snapshot at tick start) used by the content-leg
+/// 401 heuristic to distinguish `terminal_http_401_likely_jwt_expired`
+/// from a plain `terminal_http_401`. Default = 1800 when Wire hasn't
+/// shipped it yet (pre-rev-2.0).
+#[allow(clippy::too_many_arguments)]
 async fn deliver_leg(
     ctx: &DeliveryContext,
     row: crate::pyramid::db::OutboxRow,
@@ -722,6 +741,7 @@ async fn deliver_leg(
     rowid: i64,
     p: &MarketDeliveryPolicy,
     dp: &ComputeDeliveryPolicy,
+    requester_delivery_jwt_ttl_secs: u64,
 ) {
     // 1. Result parse — bare MarketAsyncResult. Malformed is terminal
     //    (code bug, no retry). Both legs see the same parse failure
@@ -942,7 +962,8 @@ async fn deliver_leg(
     match decision {
         RetryDecision::Terminal { source } => {
             let code = status.as_u16();
-            let reason = leg_terminal_http_reason(leg, code, &row, p);
+            let reason =
+                leg_terminal_http_reason(leg, code, &row, p, requester_delivery_jwt_ttl_secs);
             let err = truncate(&format!("terminal http {code}"), p.max_error_message_chars);
             terminal_leg_fail_with_extra(
                 ctx,
@@ -997,33 +1018,49 @@ async fn leg_success(
 ) {
     let db_path = ctx.db_path.clone();
     let delivered_retention = p.delivered_retention_secs;
-    // Flip leg + check both-complete in a single blocking hop.
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(bool, bool)> {
-        let conn = rusqlite::Connection::open(&db_path)?;
-        let flipped = match leg {
-            Leg::Content => {
-                crate::pyramid::db::market_outbox_mark_content_posted_ok_if_ready(&conn, rowid)?
-            }
-            Leg::Settlement => {
-                crate::pyramid::db::market_outbox_mark_settlement_posted_ok_if_ready(
-                    &conn, rowid,
-                )?
-            }
-        };
-        // Even if we didn't flip (double-success race), re-check whether
-        // both legs are now done — the other leg may have raced ahead and
-        // we still want to flip the row if so.
-        let both_done = crate::pyramid::db::market_outbox_check_both_legs_complete_and_mark_delivered(
-            &conn,
-            rowid,
-            delivered_retention,
-        )?;
-        Ok((flipped, both_done))
-    })
+    // Flip leg + check both-complete in a single blocking hop. We ALSO
+    // re-read the post-flip per-leg state so we can detect the
+    // leg-succeeds-after-other-leg-already-terminal case (row must
+    // transition to `failed` + emit failed_*_only summary — otherwise
+    // the row rots in `ready` forever with one leg dead).
+    let result = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(bool, bool, (Option<String>, Option<String>, i64, i64))> {
+            let conn = rusqlite::Connection::open(&db_path)?;
+            let flipped = match leg {
+                Leg::Content => {
+                    crate::pyramid::db::market_outbox_mark_content_posted_ok_if_ready(&conn, rowid)?
+                }
+                Leg::Settlement => {
+                    crate::pyramid::db::market_outbox_mark_settlement_posted_ok_if_ready(
+                        &conn, rowid,
+                    )?
+                }
+            };
+            // Even if we didn't flip (double-success race), re-check whether
+            // both legs are now done — the other leg may have raced ahead and
+            // we still want to flip the row if so.
+            let both_done =
+                crate::pyramid::db::market_outbox_check_both_legs_complete_and_mark_delivered(
+                    &conn,
+                    rowid,
+                    delivered_retention,
+                )?;
+            // Snapshot per-leg state AFTER both-done CAS. Drives the
+            // leg-succeeds-after-other-terminal detection below.
+            let leg_state: (Option<String>, Option<String>, i64, i64) = conn.query_row(
+                "SELECT content_last_error, settlement_last_error,
+                        content_posted_ok, settlement_posted_ok
+                   FROM fleet_result_outbox WHERE rowid = ?1",
+                rusqlite::params![rowid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            Ok((flipped, both_done, leg_state))
+        },
+    )
     .await;
 
-    let (flipped, both_done) = match result {
-        Ok(Ok(pair)) => pair,
+    let (flipped, both_done, leg_state) = match result {
+        Ok(Ok(triple)) => triple,
         Ok(Err(e)) => {
             tracing::warn!(err = %e, leg = leg.label(),
                 "delivery: leg_success CAS failed");
@@ -1080,8 +1117,81 @@ async fn leg_success(
             }),
         )
         .await;
-    } else {
-        // Per-leg success — the other leg is still in flight (or terminal).
+        return;
+    }
+
+    // Not both-done. Two sub-cases:
+    //   (a) Other leg is still in flight — normal per-leg success chronicle,
+    //       row stays in `ready` waiting for the other leg.
+    //   (b) Other leg is ALREADY terminal (has `*_last_error` stamped by a
+    //       prior terminal_leg_fail call AND `*_posted_ok=0`). In this case
+    //       the row must transition to `failed` with delivery_status
+    //       `failed_content_only` or `failed_settlement_only` — otherwise it
+    //       rots in `ready` forever because the dead leg's
+    //       `*_next_attempt_at` is a 10-year-future sentinel.
+    let (content_last_error, settlement_last_error, content_ok, settlement_ok) = leg_state;
+    let other_leg_terminal = match leg {
+        Leg::Content => settlement_last_error.is_some() && settlement_ok == 0,
+        Leg::Settlement => content_last_error.is_some() && content_ok == 0,
+    };
+
+    if other_leg_terminal {
+        // Row-level terminal composition: this leg succeeded, other leg
+        // terminal-failed earlier. Flip row to `failed` with the correct
+        // failed_*_only delivery_status.
+        let terminal_status = match leg {
+            Leg::Content => "failed_settlement_only",
+            Leg::Settlement => "failed_content_only",
+        };
+        let other_error_text = match leg {
+            Leg::Content => settlement_last_error.clone().unwrap_or_default(),
+            Leg::Settlement => content_last_error.clone().unwrap_or_default(),
+        };
+        let last_err = truncate(
+            &format!("{}: {}", terminal_status, other_error_text),
+            p.max_error_message_chars,
+        );
+        let db_path = ctx.db_path.clone();
+        let dispatcher = row.dispatcher_node_id.clone();
+        let job_id = row.job_id.clone();
+        let retention = p.failed_retention_secs;
+        let cas = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = rusqlite::Connection::open(&db_path)?;
+            Ok(crate::pyramid::db::market_outbox_mark_failed_with_error_cas(
+                &conn,
+                &dispatcher,
+                &job_id,
+                &last_err,
+                retention,
+            )?)
+        })
+        .await;
+        if let Ok(Ok(n)) = cas {
+            if n >= 1 {
+                emit(
+                    ctx,
+                    row,
+                    EVENT_MARKET_RESULT_DELIVERY_FAILED,
+                    json!({
+                        "job_id": row.job_id,
+                        "request_id": row.request_id,
+                        "delivery_status": terminal_status,
+                        "terminal_leg": match leg {
+                            Leg::Content => Leg::Settlement.label(),
+                            Leg::Settlement => Leg::Content.label(),
+                        },
+                        "content_error": content_last_error,
+                        "settlement_error": settlement_last_error,
+                        "final_error": other_error_text,
+                        "succeeded_leg": leg.label(),
+                    }),
+                )
+                .await;
+            }
+        }
+        // Still emit the per-leg success — the leg did succeed, and
+        // dashboards should surface that the content was delivered even
+        // if the other leg is dead.
         let event = match leg {
             Leg::Content => EVENT_MARKET_CONTENT_LEG_SUCCEEDED,
             Leg::Settlement => EVENT_MARKET_SETTLEMENT_LEG_SUCCEEDED,
@@ -1104,18 +1214,50 @@ async fn leg_success(
             }),
         )
         .await;
+        return;
     }
+
+    // Other leg is still in flight — normal per-leg success chronicle.
+    let event = match leg {
+        Leg::Content => EVENT_MARKET_CONTENT_LEG_SUCCEEDED,
+        Leg::Settlement => EVENT_MARKET_SETTLEMENT_LEG_SUCCEEDED,
+    };
+    let attempts = match leg {
+        Leg::Content => row.delivery_attempts + 1,
+        Leg::Settlement => row.settlement_delivery_attempts + 1,
+    };
+    emit(
+        ctx,
+        row,
+        event,
+        json!({
+            "job_id": row.job_id,
+            "request_id": row.request_id,
+            "leg": leg.label(),
+            "attempts": attempts,
+            "duration_ms": post_duration_ms,
+            "latency_ms_source": latency_ms_source,
+        }),
+    )
+    .await;
 }
 
 /// Terminal HTTP reason helper. Distinguishes the 401-likely-secret-expired
 /// (settlement) / 401-likely-jwt-expired (content) cases from a plain
 /// `terminal_http_401`, using the row's `created_at` + the relevant TTL
-/// knob from policy.
+/// knob.
+///
+/// Content leg reads the dedicated `requester_delivery_jwt_ttl_secs`
+/// scalar from `wire_parameters` (§3.4; default 1800s). Settlement leg
+/// uses `MarketDeliveryPolicy::ready_retention_secs` as the expiry proxy
+/// per rev 0.5 semantics (Wire's callback_secret rotation is bounded by
+/// the same retention horizon).
 fn leg_terminal_http_reason(
     leg: Leg,
     code: u16,
     row: &crate::pyramid::db::OutboxRow,
     p: &MarketDeliveryPolicy,
+    requester_delivery_jwt_ttl_secs: u64,
 ) -> String {
     if code != 401 {
         return format!("terminal_http_{code}");
@@ -1130,13 +1272,12 @@ fn leg_terminal_http_reason(
             }
         }
         Leg::Content => {
-            // The requester_delivery_jwt TTL is shipped separately via
-            // wire_parameters (`requester_delivery_jwt_ttl_secs`; §3.4
-            // default = fill_job_ttl_secs = 1800s). We don't plumb it
-            // through MarketDeliveryPolicy — use ready_retention_secs
-            // as a conservative proxy (same default value), same as
-            // settlement leg's heuristic.
-            if row_age_secs > p.ready_retention_secs as i64 {
+            // Wire ships `requester_delivery_jwt_ttl_secs` as a scalar in
+            // `wire_parameters` (contract §3.4; default =
+            // fill_job_ttl_secs = 1800s when the key is absent). Use the
+            // live value, not a proxy — operator tuning via
+            // economic_parameter supersession takes effect immediately.
+            if row_age_secs > requester_delivery_jwt_ttl_secs as i64 {
                 "terminal_http_401_likely_jwt_expired".to_string()
             } else {
                 "terminal_http_401".to_string()
@@ -1809,7 +1950,7 @@ mod tests {
         // Fake old row — created far in the past so age > ready_retention.
         row.created_at = "2020-01-01 00:00:00".into();
         let p = MarketDeliveryPolicy::default();
-        let reason = leg_terminal_http_reason(Leg::Settlement, 401, &row, &p);
+        let reason = leg_terminal_http_reason(Leg::Settlement, 401, &row, &p, 1800);
         assert_eq!(reason, "terminal_http_401_likely_secret_expired");
     }
 
@@ -1818,7 +1959,7 @@ mod tests {
         let mut row = sample_row();
         row.created_at = "2020-01-01 00:00:00".into();
         let p = MarketDeliveryPolicy::default();
-        let reason = leg_terminal_http_reason(Leg::Content, 401, &row, &p);
+        let reason = leg_terminal_http_reason(Leg::Content, 401, &row, &p, 1800);
         assert_eq!(reason, "terminal_http_401_likely_jwt_expired");
     }
 
@@ -1832,7 +1973,7 @@ mod tests {
         // ready_retention to avoid flakiness.
         let mut p2 = p.clone();
         p2.ready_retention_secs = 24 * 60 * 60 * 365 * 100; // 100y → any row is "fresh"
-        let reason = leg_terminal_http_reason(Leg::Settlement, 401, &row, &p2);
+        let reason = leg_terminal_http_reason(Leg::Settlement, 401, &row, &p2, 1800);
         assert_eq!(reason, "terminal_http_401");
     }
 
@@ -1841,12 +1982,43 @@ mod tests {
         let row = sample_row();
         let p = MarketDeliveryPolicy::default();
         assert_eq!(
-            leg_terminal_http_reason(Leg::Content, 404, &row, &p),
+            leg_terminal_http_reason(Leg::Content, 404, &row, &p, 1800),
             "terminal_http_404"
         );
         assert_eq!(
-            leg_terminal_http_reason(Leg::Settlement, 413, &row, &p),
+            leg_terminal_http_reason(Leg::Settlement, 413, &row, &p, 1800),
             "terminal_http_413"
+        );
+    }
+
+    #[test]
+    fn leg_terminal_http_reason_content_uses_jwt_ttl_scalar_not_ready_retention() {
+        // Pillar 37 check: the content-leg 401 heuristic must consume
+        // `requester_delivery_jwt_ttl_secs` (scalar from wire_parameters),
+        // NOT piggyback on `ready_retention_secs` (which covers a different
+        // semantic). Row is 10 minutes old; jwt_ttl=5min → should classify
+        // as `likely_jwt_expired`. With jwt_ttl=60min (same row) → plain 401.
+        // This test would FAIL under the rev-0.6.1-wave-2A proxy-via-
+        // ready_retention_secs implementation (both cases would have
+        // returned the same answer).
+        let mut row = sample_row();
+        let now = chrono::Utc::now();
+        let ten_min_ago = now - chrono::Duration::minutes(10);
+        row.created_at = ten_min_ago.format("%Y-%m-%d %H:%M:%S").to_string();
+        let p = MarketDeliveryPolicy::default();
+
+        // jwt_ttl = 5min (300s); row age ~= 10min → age > ttl → likely_expired.
+        let reason_short = leg_terminal_http_reason(Leg::Content, 401, &row, &p, 300);
+        assert_eq!(
+            reason_short, "terminal_http_401_likely_jwt_expired",
+            "age > ttl must classify as jwt-expired"
+        );
+
+        // jwt_ttl = 60min (3600s); row age ~= 10min → age < ttl → plain 401.
+        let reason_long = leg_terminal_http_reason(Leg::Content, 401, &row, &p, 3600);
+        assert_eq!(
+            reason_long, "terminal_http_401",
+            "age < ttl must classify as plain 401"
         );
     }
 }
