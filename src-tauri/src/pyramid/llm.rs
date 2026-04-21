@@ -461,6 +461,78 @@ fn emit_network_balance_exhausted_once(
     emit_network_balance_exhausted(need, have, &step_ctx.build_id, step_ctx, config);
 }
 
+// ── Walker chronicle emitters (Walker Re-Plan Wire 2.1 §5) ──────────────────
+//
+// Per-entry walker events. Source label is derived from the call's
+// `DispatchOrigin::source_label()` so queue-replayed dispatches record
+// under their true origin instead of hardcoding `"network"`.
+//
+// All emitters are fire-and-forget: they do not block the walker on DB
+// write, matching the existing `emit_network_*` pattern.
+
+fn walker_chronicle_db_path(
+    ctx: Option<&StepContext>,
+    config: &LlmConfig,
+) -> Option<String> {
+    ctx.map(|c| c.db_path.clone())
+        .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()))
+}
+
+fn walker_resolved_model(
+    ctx: Option<&StepContext>,
+    config: &LlmConfig,
+) -> String {
+    ctx.and_then(|c| c.resolved_model_id.clone())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| config.primary_model.clone())
+}
+
+fn emit_walker_chronicle(
+    ctx: Option<&StepContext>,
+    config: &LlmConfig,
+    event_type: &'static str,
+    source: &str,
+    entry_provider_id: &str,
+    metadata: serde_json::Value,
+) {
+    let Some(db_path) = walker_chronicle_db_path(ctx, config) else {
+        return;
+    };
+    let model_id = walker_resolved_model(ctx, config);
+    let job_path = super::compute_chronicle::generate_job_path(
+        ctx, None, &model_id, source,
+    );
+    let source_owned = source.to_string();
+    let entry_owned = entry_provider_id.to_string();
+    let chronicle_ctx = if let Some(sc) = ctx {
+        super::compute_chronicle::ChronicleEventContext::from_step_ctx(
+            sc, &job_path, event_type, &source_owned,
+        )
+    } else {
+        super::compute_chronicle::ChronicleEventContext::minimal(
+            &job_path, event_type, &source_owned,
+        )
+        .with_model_id(model_id.clone())
+    };
+    // Merge entry_provider_id + model_id into metadata so queries can filter
+    // by either without every call site duplicating those fields.
+    let mut meta = metadata;
+    if let Some(obj) = meta.as_object_mut() {
+        obj.insert(
+            "entry_provider_id".to_string(),
+            serde_json::Value::String(entry_owned),
+        );
+        obj.entry("model_id".to_string())
+            .or_insert_with(|| serde_json::Value::String(model_id.clone()));
+    }
+    let chronicle_ctx = chronicle_ctx.with_metadata(meta);
+    tokio::task::spawn_blocking(move || {
+        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+            let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
+        }
+    });
+}
+
 /// Minimal snapshot of `/match` + `/fill` response data needed to
 /// build a `network_helped_build` chronicle row. Passed by value into
 /// `emit_network_helped_build` so the call site does not have to hold
@@ -2363,614 +2435,854 @@ pub async fn call_model_unified_with_audit_and_ctx(
 
     let call_started = std::time::Instant::now();
 
-    // Phase D: pool acquire with timeout-based provider escalation.
-    // When a dispatch route exists, try each provider in the preference
-    // chain with escalation_timeout_secs per hop. On the last provider
-    // in the chain, wait up to max_wait_secs. When no route exists,
-    // fall back to the single-provider acquire.
-    let (_escalation_permit, effective_provider_id) = if let (Some(pools), Some(route)) = (&config.provider_pools, &resolved_route) {
-        if route.bypass_pool {
-            (None::<tokio::sync::OwnedSemaphorePermit>, provider_id.clone())
-        } else if route.providers.is_empty() {
-            // No providers in route — use default provider, no pool
-            (None, provider_id.clone())
-        } else {
-            // Try providers in order with escalation timeout
-            let mut acquired: Option<tokio::sync::OwnedSemaphorePermit> = None;
-            let mut eff_provider = provider_id.clone();
-            for (i, entry) in route.providers.iter().enumerate() {
-                let is_last = i == route.providers.len() - 1;
-                let timeout_secs = if is_last {
-                    route.max_wait_secs
-                } else {
-                    route.escalation_timeout_secs
-                };
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(timeout_secs),
-                    pools.acquire(&entry.provider_id),
-                ).await {
-                    Ok(Ok(permit)) => {
-                        acquired = Some(permit);
-                        eff_provider = entry.provider_id.clone();
-                        break;
-                    }
-                    Ok(Err(_)) => continue, // provider not in pools
-                    Err(_) => {
-                        tracing::info!(
-                            provider = %entry.provider_id,
-                            "Escalating: pool acquire timed out after {}s, trying next provider",
-                            timeout_secs,
-                        );
-                        continue; // timeout, try next
-                    }
-                }
-            }
-            (acquired, eff_provider)
-        }
-    } else if let Some(pools) = &config.provider_pools {
-        // Pools exist but no route — use default provider
-        let permit = pools.acquire(&provider_id).await.ok();
-        (permit, provider_id.clone())
-    } else {
-        (None, provider_id.clone())
-    };
+    // Suppress unused-var warnings on the former Phase D's mutable bindings.
+    // `provider_impl`, `secret`, and `provider_type` were mutable because
+    // Phase D re-instantiated them on escalation. The walker re-instantiates
+    // per entry inside the pool branch, so the outer bindings are now pure
+    // fallback state when no route exists.
+    let _ = (&mut provider_impl, &mut secret, &mut provider_type);
 
-    // Phase D: when escalation changed the provider, re-instantiate the
-    // provider impl (different URL, different headers, different auth).
-    // Also pick up the route entry's model_id override if set.
-    let mut escalation_model_override: Option<String> = None;
-    if effective_provider_id != provider_id {
-        if let Some(registry) = &config.provider_registry {
-            let provider_row = registry.get_provider(&effective_provider_id)
-                .ok_or_else(|| anyhow!("escalated provider '{}' not registered", effective_provider_id))?;
-            let (impl_box, sec) = registry.instantiate_provider(&provider_row)?;
-            provider_type = provider_row.provider_type;
-            provider_impl = impl_box;
-            secret = sec;
-        }
-        // Check if the matched route entry specifies a model override
-        if let Some(route) = &resolved_route {
-            for entry in &route.providers {
-                if entry.provider_id == effective_provider_id {
-                    if let Some(ref model) = entry.model_id {
-                        escalation_model_override = Some(model.clone());
-                    }
-                    break;
-                }
-            }
-        }
-    }
+    // ── Walker loop (Walker Re-Plan Wire 2.1 §3) ─────────────────────
+    //
+    // Per-entry walker over `route.providers`. Every entry obeys the
+    // same contract: runtime-gate → try_acquire (saturation advances) →
+    // dispatch → three-tier EntryError (Retryable/RouteSkipped advance;
+    // CallTerminal bubbles).
+    //
+    // Wave 1 scope: pool-provider entries go through the walker with
+    // the full HTTP retry loop inlined. `"fleet"` and `"market"` entries
+    // are handled by the legacy Phase A/B pre-loop blocks BEFORE the
+    // walker runs (Wave 2/3 will inline them); when the walker meets
+    // them here it emits `network_route_skipped reason="wave1_not_implemented"`
+    // and advances.
+    //
+    // `escalation_timeout_secs` retired (plan §2). `try_acquire_owned`
+    // is non-blocking — saturation advances immediately rather than
+    // waiting N seconds for a specific pool to drain.
 
-    // Phase 11 wanderer fix: provider_id used for the health hook. Use
-    // the effective provider (may differ from initial after escalation).
-    let health_provider_id = effective_provider_id.clone();
-
-    // Model selection based on INPUT size only — max_tokens (output budget) is
-    // irrelevant to whether the prompt fits in the model's context window.
+    // Estimate input tokens once — same prompts across all entries.
     let est_input_tokens = estimate_tokens_llm(system_prompt, user_prompt).await;
 
-    let mut use_model = if let Some(ref model) = escalation_model_override {
-        // Phase D: escalated route entry specified a model — use it
-        info!("[escalation->{}]", short_name(model));
-        model.clone()
-    } else if est_input_tokens > config.fallback_1_context_limit {
-        info!("[fallback->{}]", short_name(&config.fallback_model_2));
-        config.fallback_model_2.clone()
-    } else if est_input_tokens > config.primary_context_limit {
-        info!("[fallback->{}]", short_name(&config.fallback_model_1));
-        config.fallback_model_1.clone()
-    } else {
-        config.primary_model.clone()
+    // Precompute cache key (used by every attempt's LlmCallStarted).
+    let cache_key_for_event = cache_lookup
+        .as_ref()
+        .map(|l| l.cache_key.clone())
+        .unwrap_or_default();
+
+    // Synthetic entry list: when no route or route is empty, fall back to
+    // a single-entry walker over the default provider (preserves pre-walker
+    // behavior for tests + pre-init callers). When route.bypass_pool is
+    // true, suppress `try_acquire_owned` for this walker invocation.
+    let (walker_entries, walker_bypass_pool): (
+        Vec<crate::pyramid::dispatch_policy::RouteEntry>,
+        bool,
+    ) = match resolved_route.as_ref() {
+        Some(r) if !r.providers.is_empty() => (r.providers.clone(), r.bypass_pool),
+        _ => (
+            vec![crate::pyramid::dispatch_policy::RouteEntry {
+                provider_id: provider_id.clone(),
+                model_id: None,
+                tier_name: None,
+                is_local: provider_type == ProviderType::OpenaiCompat,
+            }],
+            false,
+        ),
     };
 
-    let client = &*HTTP_CLIENT;
-    let url = provider_impl.chat_completions_url();
-    let built_headers = provider_impl.prepare_headers(secret.as_ref())?;
+    let walker_started = std::time::Instant::now();
+    // `last_attempted_provider_id` is written whenever the walker enters
+    // a pool branch (before HTTP dispatch). On `CallTerminal` the audit
+    // row stamps this value so downstream debugging can see which entry
+    // rejected. The initial `None` is intentional (no entry attempted
+    // yet); warnings about "value assigned never read" would fire if we
+    // remove the init — leave the #[allow] here.
+    #[allow(unused_assignments)]
+    let mut last_attempted_provider_id: Option<String> = None;
+    let mut skip_reasons: Vec<String> = Vec::new();
+    let walker_source_label = options.dispatch_origin.source_label().to_string();
 
-    // Scale timeout with prompt size: base + increment_secs per chars_per_increment, capped at max.
-    // Local providers (Ollama) get a 5x base timeout since large models on
-    // consumer hardware are slower than cloud APIs. The semaphore already
-    // serializes calls, so longer timeouts don't cause contention.
-    let prompt_chars = system_prompt.len() + user_prompt.len();
-    let local_timeout_scale = if provider_type == ProviderType::OpenaiCompat { 5 } else { 1 };
-    let timeout = compute_timeout(
-        prompt_chars,
-        &options,
-        config.base_timeout_secs * local_timeout_scale,
-        config.max_timeout_secs * local_timeout_scale,
-        config.timeout_chars_per_increment,
-        config.timeout_increment_secs,
-    );
+    let walker_entries_total = walker_entries.len();
+    for (entry_idx, entry) in walker_entries.iter().enumerate() {
+        let branch = classify_branch(&entry.provider_id);
 
-    for attempt in 0..config.max_retries {
-        // Compute effective max_tokens: model context limit minus input, capped at 48K output.
-        // Works around OpenRouter counting max_tokens as reserved space.
-        let model_limit = resolve_context_limit(&use_model, config);
-        let effective_max_tokens = model_limit
-            .saturating_sub(est_input_tokens)
-            .min(48_000)
-            .max(1024);
-
-        let mut body = serde_json::json!({
-            "model": use_model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "temperature": temperature,
-            "max_tokens": effective_max_tokens
-        });
-        if let Some(rf) = response_format {
-            body.as_object_mut()
-                .unwrap()
-                .insert("response_format".to_string(), rf.clone());
-        }
-
-        // Phase 11: build RequestMetadata from the StepContext so the
-        // provider's augment_request_body hook receives build_id /
-        // slug / step_name / depth / chunk_index. When ctx is None
-        // (legacy callers) we fall back to RequestMetadata::default
-        // so the OpenRouter trace object is empty — still valid,
-        // just uncorrelated at the broadcast webhook.
-        let metadata = ctx
-            .map(RequestMetadata::from_step_context)
-            .unwrap_or_default();
-        provider_impl.augment_request_body(&mut body, &metadata);
-
-        // Rate limit: when provider pools are configured, rate limiting is
-        // handled per-pool inside pools.acquire(). Otherwise fall back to the
-        // global sliding-window limiter.
-        if config.provider_pools.is_none() {
-            rate_limit_wait(config.rate_limit_max_requests, config.rate_limit_window_secs).await;
-        }
-
-        // Phase 13: emit LlmCallStarted once per HTTP dispatch. We
-        // emit inside the retry loop so every attempt gets its own
-        // timeline entry — the UI can render a "retrying" status
-        // without guessing. The cache_key may be absent for legacy
-        // call sites without a cache-usable ctx; in that case we
-        // pass an empty string so the event is still emitted but the
-        // correlation key is empty.
-        let cache_key_for_event = cache_lookup
-            .as_ref()
-            .map(|l| l.cache_key.clone())
-            .unwrap_or_default();
-        emit_llm_call_started(ctx, &use_model, &cache_key_for_event);
-
-        // Phase D: the per-provider pool permit is now acquired BEFORE the
-        // retry loop via the escalation path (`_escalation_permit`). It is
-        // held across all retry attempts so we don't re-enter the escalation
-        // chain on each retry. The global semaphore fallback remains for the
-        // no-pools / no-escalation-permit case (tests, pre-init).
-        //
-        // Phase 1 compute queue: when skip_concurrency_gate is true (GPU
-        // loop execution), skip ALL concurrency gates — the queue already
-        // serialized access.
-        let _local_permit = if options.skip_concurrency_gate {
-            None
-        } else if _escalation_permit.is_none() && provider_type == ProviderType::OpenaiCompat {
-            Some(LOCAL_PROVIDER_SEMAPHORE.acquire().await.map_err(|e| anyhow!("local provider semaphore closed: {e}"))?)
-        } else {
-            None
-        };
-
-        let mut request = client.post(&url).timeout(timeout);
-        for (k, v) in &built_headers {
-            request = request.header(k, v);
-        }
-        let resp = request.json(&body).send().await;
-        // Drop local permit after the HTTP call completes (before response
-        // parsing) so the next caller can proceed. The escalation permit
-        // is dropped at function exit (after all retries are exhausted or
-        // the call succeeds).
-        drop(_local_permit);
-
-        let resp = match resp {
-            Ok(r) => r,
-            Err(e) => {
-                if attempt + 1 < config.max_retries {
-                    info!(
-                        "  request error (timeout={}s, err={}), retry {}...",
-                        timeout.as_secs(),
-                        e,
-                        attempt + 1
-                    );
-                    // Phase 13: per-attempt retry event.
-                    let backoff_ms = (config.retry_base_sleep_secs as i64) * 1000;
-                    emit_step_retry(
-                        ctx,
-                        attempt as i64,
-                        config.max_retries as i64,
-                        &format!("request error: {}", e),
-                        backoff_ms,
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
-                    continue;
-                }
-                // Phase 11 wanderer fix: feed the provider health state
-                // machine so the oversight page reflects the outage.
-                // Connection failure is a single-occurrence `down`
-                // signal per `provider_health::record_provider_error`.
-                maybe_record_provider_error(
-                    ctx,
-                    &health_provider_id,
-                    super::provider_health::ProviderErrorKind::ConnectionFailure,
-                );
-                // Phase 13: terminal error event so the UI can flip
-                // the step row to `failed`.
-                let err_msg = format!(
-                    "Request failed after {} attempts (timeout={}s): {}",
-                    config.max_retries,
-                    timeout.as_secs(),
-                    e
-                );
-                emit_step_error(ctx, &err_msg);
-                maybe_fail_audit(audit, audit_id, &err_msg).await;
-                return Err(anyhow!(err_msg));
-            }
-        };
-
-        let status = resp.status().as_u16();
-
-        // HTTP 400: read body, only cascade on context-exceeded errors
-        if status == 400 {
-            let body_400 = resp.text().await.unwrap_or_default();
-            warn!(
-                "[LLM] HTTP 400 from {} — body: {}",
-                short_name(&use_model),
-                &body_400[..body_400.len().min(500)],
-            );
-
-            let body_lower = body_400.to_lowercase();
-            let is_context_exceeded = body_lower.contains("context")
-                || body_lower.contains("too many tokens")
-                || body_lower.contains("token limit");
-
-            if is_context_exceeded && use_model != config.fallback_model_2 {
-                let prev_model = use_model.clone();
-                if use_model == config.primary_model {
-                    use_model = config.fallback_model_1.clone();
-                } else {
-                    use_model = config.fallback_model_2.clone();
-                }
-                if response_format.is_some() {
-                    warn!(
-                        "[LLM] Context exceeded with response_format set — cascading from {} to {} (structured output may not be supported on fallback model)",
-                        short_name(&prev_model),
-                        short_name(&use_model),
-                    );
-                } else {
-                    warn!(
-                        "[LLM] Context exceeded on {}, cascading to {}",
-                        short_name(&prev_model),
-                        short_name(&use_model),
-                    );
-                }
-                continue;
-            } else {
-                // Not context-related 400 — fall through to retry/backoff on same model
-                warn!(
-                    "[LLM] HTTP 400 (not context-exceeded) from {}: retrying on same model",
-                    short_name(&use_model),
-                );
-                if attempt + 1 < config.max_retries {
-                    let wait = config.retry_base_sleep_secs * 2u64.pow(attempt + 1);
-                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                    continue;
-                }
-                let err_msg = format!(
-                    "HTTP 400 (not context-exceeded) after {} attempts: {}",
-                    config.max_retries,
-                    &body_400[..body_400.len().min(500)],
-                );
-                maybe_fail_audit(audit, audit_id, &err_msg).await;
-                return Err(anyhow!(err_msg));
-            }
-        }
-
-        // Retryable HTTP errors with exponential backoff (status codes from config)
-        if config.retryable_status_codes.contains(&status) {
-            let wait = config.retry_base_sleep_secs * 2u64.pow(attempt + 1);
-            info!("  HTTP {}, waiting {}s...", status, wait);
-            // Phase 11 wanderer fix: feed the provider health state
-            // machine on every 5xx observation, even when the call is
-            // about to retry. The state machine itself handles the
-            // threshold-based degrade decision so individual blips
-            // don't flap the health flag.
-            if status >= 500 {
-                maybe_record_provider_error(
-                    ctx,
-                    &health_provider_id,
-                    super::provider_health::ProviderErrorKind::Http5xx,
-                );
-            }
-            // Phase 13: step retry event.
-            emit_step_retry(
-                ctx,
-                attempt as i64,
-                config.max_retries as i64,
-                &format!("HTTP {} retry", status),
-                (wait as i64) * 1000,
-            );
-            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        // 1) Runtime gate — origin-based default (§2.5.2).
+        if !branch_allowed(branch, options.dispatch_origin) {
+            // Structural — log-only, NOT chronicle. See plan §3 — queue
+            // replays would flood `pyramid_compute_events`.
+            tracing::debug!(entry = %entry.provider_id, "walker: replay_guard skip");
+            skip_reasons.push(format!("{}:replay_guard", entry.provider_id));
             continue;
         }
 
-        // Other non-success status
-        if !resp.status().is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            if attempt + 1 < config.max_retries {
-                info!("  HTTP {}, retry {}...", status, attempt + 1);
-                // Phase 13: step retry event.
-                emit_step_retry(
-                    ctx,
-                    attempt as i64,
-                    config.max_retries as i64,
-                    &format!("HTTP {} retry", status),
-                    (config.retry_base_sleep_secs as i64) * 1000,
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
-                continue;
-            }
-            // Phase 11 wanderer fix: record the terminal 5xx so the
-            // health state machine sees it. Non-5xx final errors
-            // (401/403/404) are NOT fed into the health hook — they
-            // indicate auth/config mistakes, not provider failure.
-            if status >= 500 {
-                maybe_record_provider_error(
-                    ctx,
-                    &health_provider_id,
-                    super::provider_health::ProviderErrorKind::Http5xx,
-                );
-            }
-            let err_msg = format!(
-                "HTTP {} after {} attempts: {}",
-                status,
-                config.max_retries,
-                &body_text[..body_text.len().min(200)]
+        // Wave 1: fleet + market are handled by legacy Phase A/B earlier;
+        // walker advances past them. Waves 2+3 inline them.
+        if matches!(branch, RouteBranch::Fleet | RouteBranch::Market) {
+            emit_walker_chronicle(
+                ctx,
+                config,
+                super::compute_chronicle::EVENT_NETWORK_ROUTE_SKIPPED,
+                &walker_source_label,
+                &entry.provider_id,
+                serde_json::json!({
+                    "reason": "wave1_not_implemented",
+                    "branch": match branch {
+                        RouteBranch::Fleet => "fleet",
+                        RouteBranch::Market => "market",
+                        RouteBranch::Pool => "pool",
+                    },
+                }),
             );
-            emit_step_error(ctx, &err_msg);
-            maybe_fail_audit(audit, audit_id, &err_msg).await;
-            return Err(anyhow!(err_msg));
+            skip_reasons.push(format!("{}:wave1_not_implemented", entry.provider_id));
+            continue;
         }
 
-        let body_text = match resp.text().await {
-            Ok(text) => text,
-            Err(e) => {
-                if attempt + 1 < config.max_retries {
-                    info!(
-                        "  response-read error (timeout={}s, err={}), retry {}...",
-                        timeout.as_secs(),
-                        e,
-                        attempt + 1
-                    );
-                    emit_step_retry(
+        // Pool branch — this entry is a registered provider (openrouter,
+        // ollama-local, custom). Wave 1 scope.
+        last_attempted_provider_id = Some(entry.provider_id.clone());
+
+        // 2) Re-instantiate provider impl + credential for this entry.
+        //
+        // Registry path is preferred. When absent (tests / pre-init), the
+        // only entry the walker will see is the synthetic default — use
+        // the outer `provider_impl` + `secret` + `provider_type` state
+        // that `build_call_provider` already populated. We have to move
+        // those values out of the outer bindings, but they live across
+        // iterations, so clone via rebuild on each iteration.
+        let (entry_provider_impl, entry_secret, entry_provider_type): (
+            Box<dyn LlmProvider>,
+            Option<ResolvedSecret>,
+            ProviderType,
+        ) = if let Some(registry) = &config.provider_registry {
+            match registry.get_provider(&entry.provider_id) {
+                Some(row) => match registry.instantiate_provider(&row) {
+                    Ok((impl_box, sec)) => (impl_box, sec, row.provider_type),
+                    Err(e) => {
+                        // Credentials substitution failed — treat as
+                        // AcquireError::Unavailable("credentials_missing")
+                        // per plan §4.3. Advance.
+                        tracing::debug!(
+                            entry = %entry.provider_id,
+                            error = %e,
+                            "walker: credentials_missing",
+                        );
+                        emit_walker_chronicle(
+                            ctx,
+                            config,
+                            super::compute_chronicle::EVENT_NETWORK_ROUTE_UNAVAILABLE,
+                            &walker_source_label,
+                            &entry.provider_id,
+                            serde_json::json!({ "reason": "credentials_missing" }),
+                        );
+                        skip_reasons
+                            .push(format!("{}:credentials_missing", entry.provider_id));
+                        continue;
+                    }
+                },
+                None => {
+                    emit_walker_chronicle(
                         ctx,
-                        attempt as i64,
-                        config.max_retries as i64,
-                        &format!("response read error: {}", e),
-                        (config.retry_base_sleep_secs as i64) * 1000,
+                        config,
+                        super::compute_chronicle::EVENT_NETWORK_ROUTE_UNAVAILABLE,
+                        &walker_source_label,
+                        &entry.provider_id,
+                        serde_json::json!({ "reason": "provider_not_registered" }),
                     );
-                    tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
+                    skip_reasons
+                        .push(format!("{}:provider_not_registered", entry.provider_id));
                     continue;
                 }
-                let err_msg = format!(
-                    "Failed to read response after {} attempts: {}",
-                    config.max_retries, e
-                );
-                emit_step_error(ctx, &err_msg);
-                maybe_fail_audit(audit, audit_id, &err_msg).await;
-                return Err(anyhow!(err_msg));
+            }
+        } else {
+            // No registry path — fall back to a fresh build_call_provider
+            // instantiation. This path only triggers in tests / pre-init
+            // where route.providers was synthesized from the default.
+            match build_call_provider(config) {
+                Ok((b, s, pt, _pid)) => (b, s, pt),
+                Err(e) => {
+                    tracing::debug!(
+                        entry = %entry.provider_id,
+                        error = %e,
+                        "walker: build_call_provider failed (no registry)",
+                    );
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_NETWORK_ROUTE_UNAVAILABLE,
+                        &walker_source_label,
+                        &entry.provider_id,
+                        serde_json::json!({ "reason": "provider_build_failed" }),
+                    );
+                    skip_reasons
+                        .push(format!("{}:provider_build_failed", entry.provider_id));
+                    continue;
+                }
             }
         };
 
-        // Delegate to the provider trait for response parsing. Every
-        // provider returns the same `ParsedLlmResponse` shape so the
-        // retry + debug-logging branches below are provider-agnostic.
-        let parsed: ParsedLlmResponse = match provider_impl.parse_response(&body_text) {
-            Ok(p) => p,
+        // 3) Try acquire capacity. Non-blocking per plan §2 / §7.
+        //    Saturation / Unavailable → advance.
+        //    Skipped when `options.skip_concurrency_gate` (GPU queue replay)
+        //    or when the resolved route is bypass_pool.
+        let _entry_permit: Option<tokio::sync::OwnedSemaphorePermit> =
+            if options.skip_concurrency_gate || walker_bypass_pool {
+                None
+            } else if let Some(pools) = &config.provider_pools {
+                match pools.try_acquire_owned(&entry.provider_id) {
+                    Ok(permit) => Some(permit),
+                    Err(crate::pyramid::provider_pools::AcquireError::Saturated) => {
+                        emit_walker_chronicle(
+                            ctx,
+                            config,
+                            super::compute_chronicle::EVENT_NETWORK_ROUTE_SATURATED,
+                            &walker_source_label,
+                            &entry.provider_id,
+                            serde_json::json!({ "capacity_kind": "pool_semaphore" }),
+                        );
+                        skip_reasons.push(format!("{}:saturated", entry.provider_id));
+                        continue;
+                    }
+                    Err(crate::pyramid::provider_pools::AcquireError::Unavailable(reason)) => {
+                        emit_walker_chronicle(
+                            ctx,
+                            config,
+                            super::compute_chronicle::EVENT_NETWORK_ROUTE_UNAVAILABLE,
+                            &walker_source_label,
+                            &entry.provider_id,
+                            serde_json::json!({ "reason": reason }),
+                        );
+                        skip_reasons
+                            .push(format!("{}:unavailable({})", entry.provider_id, reason));
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
+        // 4) Dispatch — HTTP retry loop relocated from former Phase D.
+        let health_provider_id = entry.provider_id.clone();
+
+        // Model selection: entry.model_id wins over default context-cascade
+        // selection (the entry's choice is the operator's explicit route).
+        let entry_model_override = entry.model_id.clone();
+        let mut use_model = if let Some(ref model) = entry_model_override {
+            info!("[entry-model->{}]", short_name(model));
+            model.clone()
+        } else if est_input_tokens > config.fallback_1_context_limit {
+            info!("[fallback->{}]", short_name(&config.fallback_model_2));
+            config.fallback_model_2.clone()
+        } else if est_input_tokens > config.primary_context_limit {
+            info!("[fallback->{}]", short_name(&config.fallback_model_1));
+            config.fallback_model_1.clone()
+        } else {
+            config.primary_model.clone()
+        };
+
+        let client = &*HTTP_CLIENT;
+        let url = entry_provider_impl.chat_completions_url();
+        let built_headers = match entry_provider_impl.prepare_headers(entry_secret.as_ref()) {
+            Ok(h) => h,
             Err(e) => {
-                warn!(
-                    "[LLM] response envelope parse failed on {} attempt {}: {}",
-                    short_name(&use_model),
-                    attempt + 1,
-                    e
+                // Header prep failure is config-level — advance with
+                // RouteSkipped semantic. (Classified as unavailable in
+                // chronicle for operator clarity.)
+                tracing::debug!(
+                    entry = %entry.provider_id,
+                    error = %e,
+                    "walker: prepare_headers failed",
                 );
-                if config.llm_debug_logging {
-                    let preview_len = body_text.len().min(2000);
-                    warn!(
-                        "[LLM-DEBUG] Raw response body that failed envelope parse (model={}, len={}):\n{}",
-                        short_name(&use_model),
-                        body_text.len(),
-                        &body_text[..preview_len],
-                    );
-                }
-                if attempt + 1 < config.max_retries {
-                    info!("  parse error, retry {}...", attempt + 1);
-                    emit_step_retry(
-                        ctx,
-                        attempt as i64,
-                        config.max_retries as i64,
-                        &format!("parse error: {}", e),
-                        (config.retry_base_sleep_secs as i64) * 1000,
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
-                    continue;
-                }
-                let err_msg = format!(
-                    "Failed to parse response after {} attempts: {}",
-                    config.max_retries, e
+                emit_walker_chronicle(
+                    ctx,
+                    config,
+                    super::compute_chronicle::EVENT_NETWORK_ROUTE_UNAVAILABLE,
+                    &walker_source_label,
+                    &entry.provider_id,
+                    serde_json::json!({ "reason": "prepare_headers_failed" }),
                 );
-                emit_step_error(ctx, &err_msg);
-                maybe_fail_audit(audit, audit_id, &err_msg).await;
-                return Err(anyhow!(err_msg));
+                skip_reasons
+                    .push(format!("{}:prepare_headers_failed", entry.provider_id));
+                continue;
             }
         };
 
-        let usage = parsed.usage.clone();
-        let generation_id = parsed.generation_id.clone();
-        let finish_reason_str = parsed
-            .finish_reason
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-
-        // Always log finish_reason so it shows up in normal tracing
-        info!(
-            "[LLM] provider={} model={} finish_reason={} prompt_tokens={} completion_tokens={}",
-            provider_type.as_str(),
-            short_name(&use_model),
-            finish_reason_str,
-            usage.prompt_tokens,
-            usage.completion_tokens,
+        let prompt_chars = system_prompt.len() + user_prompt.len();
+        let local_timeout_scale = if entry_provider_type == ProviderType::OpenaiCompat {
+            5
+        } else {
+            1
+        };
+        let timeout = compute_timeout(
+            prompt_chars,
+            &options,
+            config.base_timeout_secs * local_timeout_scale,
+            config.max_timeout_secs * local_timeout_scale,
+            config.timeout_chars_per_increment,
+            config.timeout_increment_secs,
         );
 
-        if config.llm_debug_logging {
-            let content_len = parsed.content.len();
-            if finish_reason_str != "stop" || content_len > 20_000 {
-                let preview = &parsed.content[..parsed.content.len().min(2000)];
-                warn!(
-                    "[LLM-DEBUG] Abnormal response (model={}, finish_reason={}, content_len={}, prompt_tokens={}, completion_tokens={}):\n{}",
+        // HTTP retry loop — produces either a success LlmResponse or an
+        // EntryError. Relocated verbatim from the former Phase D block
+        // (lines 2485-2830) with the two behavioral changes per plan §4.3:
+        //   - Terminal-for-this-entry 4xx now emit EntryError::RouteSkipped
+        //     or CallTerminal rather than bubbling with `return Err`.
+        //   - Retries exhausted on retryable statuses → EntryError::Retryable.
+        // Context-exceeded cascade (mutates `use_model`) stays as-is.
+        let http_outcome: std::result::Result<LlmResponse, EntryError> = 'http: {
+            let mut attempt = 0u32;
+            loop {
+                if attempt >= config.max_retries {
+                    break 'http Err(EntryError::Retryable {
+                        reason: "max_retries_exceeded".into(),
+                    });
+                }
+                // Compute effective max_tokens.
+                let model_limit = resolve_context_limit(&use_model, config);
+                let effective_max_tokens = model_limit
+                    .saturating_sub(est_input_tokens)
+                    .min(48_000)
+                    .max(1024);
+
+                let mut body = serde_json::json!({
+                    "model": use_model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": effective_max_tokens
+                });
+                if let Some(rf) = response_format {
+                    body.as_object_mut()
+                        .unwrap()
+                        .insert("response_format".to_string(), rf.clone());
+                }
+
+                let metadata = ctx
+                    .map(RequestMetadata::from_step_context)
+                    .unwrap_or_default();
+                entry_provider_impl.augment_request_body(&mut body, &metadata);
+
+                if config.provider_pools.is_none() {
+                    rate_limit_wait(
+                        config.rate_limit_max_requests,
+                        config.rate_limit_window_secs,
+                    )
+                    .await;
+                }
+
+                emit_llm_call_started(ctx, &use_model, &cache_key_for_event);
+
+                // Local-provider global fallback semaphore kept for the
+                // no-pools / no-permit case.
+                let _local_permit = if options.skip_concurrency_gate {
+                    None
+                } else if _entry_permit.is_none()
+                    && entry_provider_type == ProviderType::OpenaiCompat
+                {
+                    match LOCAL_PROVIDER_SEMAPHORE.acquire().await {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            break 'http Err(EntryError::Retryable {
+                                reason: format!("local_provider_semaphore_closed: {e}"),
+                            });
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let mut request = client.post(&url).timeout(timeout);
+                for (k, v) in &built_headers {
+                    request = request.header(k, v);
+                }
+                let resp = request.json(&body).send().await;
+                drop(_local_permit);
+
+                let resp = match resp {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if attempt + 1 < config.max_retries {
+                            info!(
+                                "  request error (timeout={}s, err={}), retry {}...",
+                                timeout.as_secs(),
+                                e,
+                                attempt + 1
+                            );
+                            let backoff_ms = (config.retry_base_sleep_secs as i64) * 1000;
+                            emit_step_retry(
+                                ctx,
+                                attempt as i64,
+                                config.max_retries as i64,
+                                &format!("request error: {}", e),
+                                backoff_ms,
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(
+                                config.retry_base_sleep_secs,
+                            ))
+                            .await;
+                            attempt += 1;
+                            continue;
+                        }
+                        maybe_record_provider_error(
+                            ctx,
+                            &health_provider_id,
+                            super::provider_health::ProviderErrorKind::ConnectionFailure,
+                        );
+                        break 'http Err(EntryError::Retryable {
+                            reason: format!(
+                                "request failed after {} attempts (timeout={}s): {}",
+                                config.max_retries,
+                                timeout.as_secs(),
+                                e
+                            ),
+                        });
+                    }
+                };
+
+                let status = resp.status().as_u16();
+
+                // HTTP 400: cascade on context-exceeded, otherwise retry
+                // on same entry/model a few times then CallTerminal.
+                if status == 400 {
+                    let body_400 = resp.text().await.unwrap_or_default();
+                    warn!(
+                        "[LLM] HTTP 400 from {} — body: {}",
+                        short_name(&use_model),
+                        &body_400[..body_400.len().min(500)],
+                    );
+
+                    let body_lower = body_400.to_lowercase();
+                    let is_context_exceeded = body_lower.contains("context")
+                        || body_lower.contains("too many tokens")
+                        || body_lower.contains("token limit");
+
+                    if is_context_exceeded && use_model != config.fallback_model_2 {
+                        let prev_model = use_model.clone();
+                        if use_model == config.primary_model {
+                            use_model = config.fallback_model_1.clone();
+                        } else {
+                            use_model = config.fallback_model_2.clone();
+                        }
+                        warn!(
+                            "[LLM] Context exceeded on {}, cascading to {}",
+                            short_name(&prev_model),
+                            short_name(&use_model),
+                        );
+                        attempt += 1;
+                        continue;
+                    } else if attempt + 1 < config.max_retries {
+                        let wait = config.retry_base_sleep_secs * 2u64.pow(attempt + 1);
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                        attempt += 1;
+                        continue;
+                    } else {
+                        // Exhausted — plan §4.3: 400 non-context terminal =
+                        // CallTerminal (other routes would fail the same way).
+                        break 'http Err(EntryError::CallTerminal {
+                            reason: format!(
+                                "HTTP 400 (not context-exceeded) after {} attempts: {}",
+                                config.max_retries,
+                                &body_400[..body_400.len().min(500)],
+                            ),
+                        });
+                    }
+                }
+
+                // Retryable status codes — exponential backoff on same entry.
+                if config.retryable_status_codes.contains(&status) {
+                    let wait = config.retry_base_sleep_secs * 2u64.pow(attempt + 1);
+                    info!("  HTTP {}, waiting {}s...", status, wait);
+                    if status >= 500 {
+                        maybe_record_provider_error(
+                            ctx,
+                            &health_provider_id,
+                            super::provider_health::ProviderErrorKind::Http5xx,
+                        );
+                    }
+                    emit_step_retry(
+                        ctx,
+                        attempt as i64,
+                        config.max_retries as i64,
+                        &format!("HTTP {} retry", status),
+                        (wait as i64) * 1000,
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    attempt += 1;
+                    continue;
+                }
+
+                // Other non-success status — retry a few times then classify.
+                if !resp.status().is_success() {
+                    let body_text = resp.text().await.unwrap_or_default();
+                    if attempt + 1 < config.max_retries {
+                        info!("  HTTP {}, retry {}...", status, attempt + 1);
+                        emit_step_retry(
+                            ctx,
+                            attempt as i64,
+                            config.max_retries as i64,
+                            &format!("HTTP {} retry", status),
+                            (config.retry_base_sleep_secs as i64) * 1000,
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            config.retry_base_sleep_secs,
+                        ))
+                        .await;
+                        attempt += 1;
+                        continue;
+                    }
+                    if status >= 500 {
+                        maybe_record_provider_error(
+                            ctx,
+                            &health_provider_id,
+                            super::provider_health::ProviderErrorKind::Http5xx,
+                        );
+                    }
+                    // Plan §4.3: 401/403 = RouteSkipped (credentials stale
+                    // for THIS provider; other routes still viable).
+                    // 404 = CallTerminal (model not found — structural).
+                    // Other non-success = Retryable (walker advances).
+                    let err_msg = format!(
+                        "HTTP {} after {} attempts: {}",
+                        status,
+                        config.max_retries,
+                        &body_text[..body_text.len().min(200)]
+                    );
+                    let classified = match status {
+                        401 | 403 => EntryError::RouteSkipped {
+                            reason: format!("credentials_stale: {err_msg}"),
+                        },
+                        404 => EntryError::CallTerminal {
+                            reason: format!("model_not_found: {err_msg}"),
+                        },
+                        _ => EntryError::Retryable { reason: err_msg },
+                    };
+                    break 'http Err(classified);
+                }
+
+                let body_text = match resp.text().await {
+                    Ok(text) => text,
+                    Err(e) => {
+                        if attempt + 1 < config.max_retries {
+                            info!(
+                                "  response-read error (timeout={}s, err={}), retry {}...",
+                                timeout.as_secs(),
+                                e,
+                                attempt + 1
+                            );
+                            emit_step_retry(
+                                ctx,
+                                attempt as i64,
+                                config.max_retries as i64,
+                                &format!("response read error: {}", e),
+                                (config.retry_base_sleep_secs as i64) * 1000,
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(
+                                config.retry_base_sleep_secs,
+                            ))
+                            .await;
+                            attempt += 1;
+                            continue;
+                        }
+                        break 'http Err(EntryError::Retryable {
+                            reason: format!(
+                                "failed to read response after {} attempts: {}",
+                                config.max_retries, e
+                            ),
+                        });
+                    }
+                };
+
+                let parsed: ParsedLlmResponse =
+                    match entry_provider_impl.parse_response(&body_text) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!(
+                                "[LLM] response envelope parse failed on {} attempt {}: {}",
+                                short_name(&use_model),
+                                attempt + 1,
+                                e
+                            );
+                            if config.llm_debug_logging {
+                                let preview_len = body_text.len().min(2000);
+                                warn!(
+                                    "[LLM-DEBUG] Raw response body that failed envelope parse (model={}, len={}):\n{}",
+                                    short_name(&use_model),
+                                    body_text.len(),
+                                    &body_text[..preview_len],
+                                );
+                            }
+                            if attempt + 1 < config.max_retries {
+                                info!("  parse error, retry {}...", attempt + 1);
+                                emit_step_retry(
+                                    ctx,
+                                    attempt as i64,
+                                    config.max_retries as i64,
+                                    &format!("parse error: {}", e),
+                                    (config.retry_base_sleep_secs as i64) * 1000,
+                                );
+                                tokio::time::sleep(std::time::Duration::from_secs(
+                                    config.retry_base_sleep_secs,
+                                ))
+                                .await;
+                                attempt += 1;
+                                continue;
+                            }
+                            break 'http Err(EntryError::Retryable {
+                                reason: format!(
+                                    "failed to parse response after {} attempts: {}",
+                                    config.max_retries, e
+                                ),
+                            });
+                        }
+                    };
+
+                let usage = parsed.usage.clone();
+                let generation_id = parsed.generation_id.clone();
+                let finish_reason_str = parsed
+                    .finish_reason
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                info!(
+                    "[LLM] provider={} model={} finish_reason={} prompt_tokens={} completion_tokens={}",
+                    entry_provider_type.as_str(),
                     short_name(&use_model),
                     finish_reason_str,
-                    content_len,
                     usage.prompt_tokens,
                     usage.completion_tokens,
-                    preview,
                 );
-            }
-        }
 
-        if parsed.content.is_empty() {
-            if attempt + 1 < config.max_retries {
-                info!("  empty content, retry {}...", attempt + 1);
-                emit_step_retry(
+                if config.llm_debug_logging {
+                    let content_len = parsed.content.len();
+                    if finish_reason_str != "stop" || content_len > 20_000 {
+                        let preview = &parsed.content[..parsed.content.len().min(2000)];
+                        warn!(
+                            "[LLM-DEBUG] Abnormal response (model={}, finish_reason={}, content_len={}, prompt_tokens={}, completion_tokens={}):\n{}",
+                            short_name(&use_model),
+                            finish_reason_str,
+                            content_len,
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                            preview,
+                        );
+                    }
+                }
+
+                if parsed.content.is_empty() {
+                    if attempt + 1 < config.max_retries {
+                        info!("  empty content, retry {}...", attempt + 1);
+                        emit_step_retry(
+                            ctx,
+                            attempt as i64,
+                            config.max_retries as i64,
+                            "empty content",
+                            (config.retry_base_sleep_secs as i64) * 1000,
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            config.retry_base_sleep_secs,
+                        ))
+                        .await;
+                        attempt += 1;
+                        continue;
+                    }
+                    break 'http Err(EntryError::Retryable {
+                        reason: format!(
+                            "model returned empty content after {} attempts",
+                            config.max_retries
+                        ),
+                    });
+                }
+
+                let response = LlmResponse {
+                    content: parsed.content,
+                    usage,
+                    generation_id,
+                    actual_cost_usd: parsed.actual_cost_usd,
+                    provider_id: Some(entry_provider_type.as_str().to_string()),
+                    fleet_peer_id: None,
+                    fleet_peer_model: None,
+                };
+
+                // Cache store on success.
+                try_cache_store(ctx, cache_lookup.as_ref(), &response, call_started);
+
+                let cost_usd = response
+                    .actual_cost_usd
+                    .unwrap_or_else(|| super::config_helper::estimate_cost(&response.usage));
+                let latency_ms = call_started.elapsed().as_millis() as i64;
+                emit_llm_call_completed(
                     ctx,
-                    attempt as i64,
-                    config.max_retries as i64,
-                    "empty content",
-                    (config.retry_base_sleep_secs as i64) * 1000,
+                    &use_model,
+                    &cache_key_for_event,
+                    &response.usage,
+                    cost_usd,
+                    latency_ms,
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
-                continue;
-            }
-            let err_msg = format!(
-                "Model returned empty content after {} attempts",
-                config.max_retries
-            );
-            emit_step_error(ctx, &err_msg);
-            maybe_fail_audit(audit, audit_id, &err_msg).await;
-            return Err(anyhow!(err_msg));
-        }
 
-        let response = LlmResponse {
-            content: parsed.content,
-            usage,
-            generation_id,
-            actual_cost_usd: parsed.actual_cost_usd,
-            // Legacy path without a provider registry: tag the row as
-            // coming from the provider impl's type so the webhook
-            // correlator has a non-null grouping key for the leak
-            // sweep. Phase 11's registry path (below) sets a real
-            // provider_id from the resolved registry row.
-            provider_id: Some(provider_type.as_str().to_string()),
-            fleet_peer_id: None,
-            fleet_peer_model: None,
+                // WP-8 cloud_returned chronicle (unchanged).
+                if entry_provider_type == ProviderType::Openrouter {
+                    let cloud_job_path =
+                        saved_chronicle_job_path.clone().unwrap_or_else(|| {
+                            super::compute_chronicle::generate_job_path(
+                                ctx, None, &use_model, "cloud",
+                            )
+                        });
+                    let chronicle_ctx = if let Some(sc) = ctx {
+                        super::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                            sc,
+                            &cloud_job_path,
+                            "cloud_returned",
+                            "cloud",
+                        )
+                    } else {
+                        super::compute_chronicle::ChronicleEventContext::minimal(
+                            &cloud_job_path,
+                            "cloud_returned",
+                            "cloud",
+                        )
+                        .with_model_id(use_model.clone())
+                    };
+                    let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
+                        "provider_id": response.provider_id,
+                        "latency_ms": latency_ms,
+                        "tokens_prompt": response.usage.prompt_tokens,
+                        "tokens_completion": response.usage.completion_tokens,
+                        "cost_usd": cost_usd,
+                        "generation_id": response.generation_id,
+                        "actual_cost_usd": response.actual_cost_usd,
+                    }));
+                    let db_path = ctx
+                        .map(|c| c.db_path.clone())
+                        .or_else(|| {
+                            config.cache_access.as_ref().map(|ca| ca.db_path.to_string())
+                        });
+                    if let Some(db_path) = db_path {
+                        tokio::task::spawn_blocking(move || {
+                            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                                let _ = super::compute_chronicle::record_event(
+                                    &conn,
+                                    &chronicle_ctx,
+                                );
+                            }
+                        });
+                    }
+                }
+
+                break 'http Ok(response);
+            }
         };
 
-        // ── Phase 6: Cache store path ──────────────────────────────
-        //
-        // Delegated to `try_cache_store`. No-op when no ctx was
-        // attached or when the lookup phase didn't compute a key.
-        try_cache_store(ctx, cache_lookup.as_ref(), &response, call_started);
+        // Drop entry permit before the outcome handling so subsequent
+        // walker iterations (or waiters on the same pool) can proceed.
+        drop(_entry_permit);
 
-        // Phase 13: emit LlmCallCompleted on the success exit. The
-        // actual cost from OpenRouter is preferred when present;
-        // otherwise we fall back to a heuristic estimate based on
-        // token counts so the running total is never empty.
-        let cost_usd = response
-            .actual_cost_usd
-            .unwrap_or_else(|| super::config_helper::estimate_cost(&response.usage));
-        let latency_ms = call_started.elapsed().as_millis() as i64;
-        emit_llm_call_completed(
-            ctx,
-            &use_model,
-            &cache_key_for_event,
-            &response.usage,
-            cost_usd,
-            latency_ms,
-        );
+        match http_outcome {
+            Ok(response) => {
+                let latency_ms = call_started.elapsed().as_millis() as i64;
+                let walker_ms = walker_started.elapsed().as_millis() as i64;
 
-        // WP-8: Chronicle cloud_returned event.
-        // Cloud detection: ProviderType::Openrouter is cloud (not local).
-        // ProviderType::OpenaiCompat is local (Ollama).
-        if provider_type == ProviderType::Openrouter {
-            let cloud_job_path = saved_chronicle_job_path.clone().unwrap_or_else(|| {
-                super::compute_chronicle::generate_job_path(
-                    ctx, None, &use_model, "cloud",
-                )
-            });
-            let chronicle_ctx = if let Some(sc) = ctx {
-                super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-                    sc, &cloud_job_path, "cloud_returned", "cloud",
-                )
-            } else {
-                super::compute_chronicle::ChronicleEventContext::minimal(
-                    &cloud_job_path, "cloud_returned", "cloud",
-                )
-                .with_model_id(use_model.clone())
-            };
-            let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
-                "provider_id": response.provider_id,
-                "latency_ms": latency_ms,
-                "tokens_prompt": response.usage.prompt_tokens,
-                "tokens_completion": response.usage.completion_tokens,
-                "cost_usd": cost_usd,
-                "generation_id": response.generation_id,
-                "actual_cost_usd": response.actual_cost_usd,
-            }));
-            let db_path = ctx
-                .map(|c| c.db_path.clone())
-                .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
-            if let Some(db_path) = db_path {
-                tokio::task::spawn_blocking(move || {
-                    if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                        let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
-                    }
-                });
+                // Audit complete row — stamp winning entry's provider_id.
+                if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
+                    let conn = audit_ctx.conn.lock().await;
+                    let _ = super::db::complete_llm_audit(
+                        &conn,
+                        id,
+                        &response.content,
+                        true,
+                        response.usage.prompt_tokens,
+                        response.usage.completion_tokens,
+                        latency_ms,
+                        response.generation_id.as_deref(),
+                        Some(entry.provider_id.as_str()),
+                    );
+                }
+
+                // walker_resolved chronicle.
+                emit_walker_chronicle(
+                    ctx,
+                    config,
+                    super::compute_chronicle::EVENT_WALKER_RESOLVED,
+                    &walker_source_label,
+                    &entry.provider_id,
+                    serde_json::json!({
+                        "latency_ms": latency_ms,
+                        "total_walker_ms": walker_ms,
+                        "attempts": entry_idx + 1,
+                    }),
+                );
+
+                return Ok(response);
+            }
+            Err(EntryError::Retryable { reason }) => {
+                emit_walker_chronicle(
+                    ctx,
+                    config,
+                    super::compute_chronicle::EVENT_NETWORK_ROUTE_RETRYABLE_FAIL,
+                    &walker_source_label,
+                    &entry.provider_id,
+                    serde_json::json!({ "reason": reason }),
+                );
+                skip_reasons.push(format!("{}:retryable({})", entry.provider_id, reason));
+                continue;
+            }
+            Err(EntryError::RouteSkipped { reason }) => {
+                emit_walker_chronicle(
+                    ctx,
+                    config,
+                    super::compute_chronicle::EVENT_NETWORK_ROUTE_SKIPPED,
+                    &walker_source_label,
+                    &entry.provider_id,
+                    serde_json::json!({ "reason": reason }),
+                );
+                skip_reasons.push(format!("{}:route_skipped({})", entry.provider_id, reason));
+                continue;
+            }
+            Err(EntryError::CallTerminal { reason }) => {
+                emit_walker_chronicle(
+                    ctx,
+                    config,
+                    super::compute_chronicle::EVENT_NETWORK_ROUTE_TERMINAL_FAIL,
+                    &walker_source_label,
+                    &entry.provider_id,
+                    serde_json::json!({ "reason": reason.clone() }),
+                );
+                if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
+                    let conn = audit_ctx.conn.lock().await;
+                    let _ = super::db::fail_llm_audit(
+                        &conn,
+                        id,
+                        &reason,
+                        last_attempted_provider_id.as_deref(),
+                    );
+                }
+                emit_step_error(ctx, &reason);
+                return Err(anyhow!(reason));
             }
         }
-
-        // ── Phase 18b: Audit complete row write ──────────────────────
-        //
-        // Update the pending row inserted at the top of the function with
-        // the response, parsed_ok=true, token usage, latency, and the
-        // generation_id. No-op when no AuditContext was supplied. The
-        // row was inserted with `cache_hit = 0` (default) so the
-        // wire-call vs cache-hit distinction stays correct.
-        if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
-            let conn = audit_ctx.conn.lock().await;
-            let _ = super::db::complete_llm_audit(
-                &conn,
-                id,
-                &response.content,
-                true,
-                response.usage.prompt_tokens,
-                response.usage.completion_tokens,
-                latency_ms,
-                response.generation_id.as_deref(),
-                // Walker Re-Plan Wire 2.1 Wave 1 task 11: legacy (pre-walker)
-                // call site — provider_id stamping is the walker's job in
-                // Wave 1 tasks 8-10. Pre-walker rows keep provider_id NULL.
-                None,
-            );
-        }
-
-        return Ok(response);
     }
 
-    let err_msg = "Max retries exceeded".to_string();
+    // Walker exhausted — no entry produced a viable dispatch.
+    emit_walker_chronicle(
+        ctx,
+        config,
+        super::compute_chronicle::EVENT_WALKER_EXHAUSTED,
+        &walker_source_label,
+        // entry_provider_id slot carries a summary marker for this event.
+        "(exhausted)",
+        serde_json::json!({
+            "entries_tried": walker_entries_total,
+            "skip_reasons": skip_reasons,
+        }),
+    );
+    let err_msg = format!(
+        "no viable route — all {} entries exhausted",
+        walker_entries_total
+    );
+    if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
+        let conn = audit_ctx.conn.lock().await;
+        let _ = super::db::fail_llm_audit(&conn, id, "no viable route", None);
+    }
     emit_step_error(ctx, &err_msg);
-    maybe_fail_audit(audit, audit_id, &err_msg).await;
     Err(anyhow!(err_msg))
 }
 
@@ -2979,6 +3291,13 @@ pub async fn call_model_unified_with_audit_and_ctx(
 /// flips it to `status = 'failed'` so the audit trail isn't left with
 /// a dangling pending row. Acquires the audit conn lock for the
 /// duration of the UPDATE.
+///
+/// Walker Re-Plan Wire 2.1 Wave 1: walker now writes audit outcomes
+/// inline and knows the winning / last-attempted provider_id, so this
+/// helper's only caller moved. Kept `#[allow(dead_code)]` because
+/// Waves 2-3 inline the fleet + market branches and may reintroduce
+/// the helper for their bubble paths.
+#[allow(dead_code)]
 async fn maybe_fail_audit(
     audit: Option<&AuditContext>,
     audit_id: Option<i64>,
