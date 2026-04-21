@@ -33,6 +33,14 @@ Entry template:
 **Cargo test:** `cargo test --lib provider_pools` — 11/11 pass (3 pre-existing + 8 new).
 **Deviation:** Plan §7 pseudocode used `Result<OwnedSemaphorePermit, AcquireError>` (bare `Result`) — used fully-qualified `std::result::Result` in the impl signature to avoid shadowing issues against the module's `anyhow::Result` import. Semantic identical.
 
+## 2026-04-21 04:15 — verifier pass (no code changes)
+
+**Plan task:** Wave 0 task 7 serial verifier — `ProviderPools::try_acquire_owned` + `SlidingWindowLimiter::try_acquire`.
+**Changed:** Nothing. Audit confirmed: `AcquireError` exposes exactly the two variants walker needs (`Unavailable(String)` + `Saturated`) with `Display` + `std::error::Error` impls; `try_acquire_owned` runs rate-limiter check before semaphore CAS (cheaper-first, correct); `SlidingWindowLimiter::try_acquire` evicts expired entries before the capacity check (lines 125-131); lock-contention → false is conservative-saturation and matches the walker's cheap-advance contract; `max_requests == 0` early-return mirrors `wait()`'s disable-semantic; signature uses fully-qualified `std::result::Result` to sidestep the module-top `anyhow::Result` import; test coverage hits all three limiter states (under-limit, at-limit, disabled) and all four acquire outcomes (Ok, Unavailable, Saturated-semaphore, Saturated-rate-limiter); no lingering `.acquire()` sites require migration per plan §7 ("existing acquire stays").
+**Cargo check:** clean (default target). 70 pre-existing warnings unchanged.
+**Cargo test:** `cargo test --lib provider_pools` — 11/11 pass. `cargo test --lib` — 1746 passed / 15 failed, matching the known pre-existing friction-log set exactly (no new failures from this commit).
+**Deviation:** Prior impl-log entry at 03:40 reports "3 pre-existing + 8 new" tests; actual count is 4 pre-existing + 7 new = 11 total. Commit message carries the same miscount. No functional impact — 11/11 pass either way. Noted in friction log.
+
 ## 2026-04-21 03:20 — verifier pass (no code changes)
 
 **Plan task:** Wave 0 task 4 serial verifier.

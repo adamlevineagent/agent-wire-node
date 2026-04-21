@@ -20,6 +20,14 @@ Entry template:
 **Flag:** plan error / doc staleness / spec ambiguity / Wire-side bug / learning moment
 -->
 
+## 2026-04-21 04:15 — Wave 0 task 7 — test-count miscount in commit message + impl-log entry
+
+**Context:** Serial-verifier audit of `ProviderPools::try_acquire_owned` at commit b3777d6.
+**Surprise:** Commit message and prior impl-log entry both say "8 new unit tests" / "3 pre-existing + 8 new" — actual file has 4 pre-existing tests (`test_pools_created_from_policy`, `test_sequencer_created_for_sequential_rules`, `test_acquire_known_provider`, `test_acquire_unknown_provider_errors`) and 7 new tests (3 for `SlidingWindowLimiter::try_acquire` + 4 for `ProviderPools::try_acquire_owned`). Total matches the 11/11 passing run either way.
+**Root cause:** Off-by-one in narrative authorship; not a code issue. The `_errors` pre-existing test likely uncounted when narrator wrote "3 pre-existing".
+**Workaround:** Left commit history untouched (fix would be amend, violating "create new commits" rule). Flagged in verifier impl-log entry so downstream readers aren't confused.
+**Flag:** learning moment — narrate test deltas by reading the file, not by counting your own additions.
+
 ## 2026-04-21 03:10 — Wave 0 task 4 — plan §8 vs §2.5.1 contradiction on prepare_for_replay origin behavior
 
 **Context:** Implementing `LlmConfig::prepare_for_replay(origin)` per plan §2.5.1 + §8 Wave 0 task 4.
