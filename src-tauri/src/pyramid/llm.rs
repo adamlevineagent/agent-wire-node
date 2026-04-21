@@ -1290,6 +1290,90 @@ impl std::fmt::Display for EntryError {
 
 impl std::error::Error for EntryError {}
 
+/// Truncate a string to at most `max` BYTES while respecting UTF-8 char
+/// boundaries. Returns an owned String. Never panics on multi-byte input.
+fn truncate_utf8(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    // Walk back from max until we land on a char boundary.
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+/// Classify a pool-branch HTTP 400 response body into the three-tier
+/// EntryError taxonomy (plan §4.3).
+///
+/// - Provider-level model rejection (OpenRouter / OpenAI-compat style
+///   messages like `"gemma4:26b is not a valid model ID"`, `"model not
+///   found"`, `"unsupported model"`, `"invalid model"`) → `RouteSkipped`.
+///   Other routes with a different model_id could still succeed.
+/// - Feature-unsupported (`"not supported"`, `"unsupported"`) →
+///   `RouteSkipped`. Same reasoning — a different provider or a different
+///   model may support the feature.
+/// - Otherwise (malformed JSON, multi-system-turns, schema violations) →
+///   `CallTerminal`. Every route would reject the same way.
+///
+/// The check is case-insensitive on the body text. Defensive empty-body
+/// behavior: classify as `CallTerminal` (nothing to inspect, can't prove
+/// another route would fare differently, and bubbling the exhaustion is
+/// the conservative default).
+pub(crate) fn classify_pool_400(body: &str) -> EntryError {
+    let body_lower = body.to_lowercase();
+    let truncated = truncate_utf8(body, 200);
+
+    let is_provider_model_rejection = body_lower.contains("not a valid model")
+        || body_lower.contains("model not found")
+        || body_lower.contains("unsupported model")
+        || body_lower.contains("invalid model");
+    if is_provider_model_rejection {
+        return EntryError::RouteSkipped {
+            reason: format!("provider_rejected_model: {truncated}"),
+        };
+    }
+
+    let is_feature_unsupported =
+        body_lower.contains("not supported") || body_lower.contains("unsupported");
+    if is_feature_unsupported {
+        return EntryError::RouteSkipped {
+            reason: format!("provider_feature_unsupported: {truncated}"),
+        };
+    }
+
+    EntryError::CallTerminal {
+        reason: format!("body_shape_error: {truncated}"),
+    }
+}
+
+/// Classify a pool-branch HTTP 404 response body. 404 on pool providers
+/// is most commonly "model not found" (OpenRouter returns 404 for an
+/// unknown slug) — same argument as the 400 path: a sibling route with a
+/// different model could still succeed. Fall through to `CallTerminal`
+/// for genuinely structural 404s (unknown route path, etc.).
+pub(crate) fn classify_pool_404(body: &str) -> EntryError {
+    let body_lower = body.to_lowercase();
+    let truncated = truncate_utf8(body, 200);
+
+    if body_lower.contains("not a valid model")
+        || body_lower.contains("model not found")
+        || body_lower.contains("no such model")
+        || body_lower.contains("unknown model")
+        || body_lower.contains("unsupported model")
+        || body_lower.contains("invalid model")
+    {
+        return EntryError::RouteSkipped {
+            reason: format!("provider_rejected_model: {truncated}"),
+        };
+    }
+
+    EntryError::CallTerminal {
+        reason: format!("model_not_found: {truncated}"),
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LlmCallOptions {
     pub min_timeout_secs: Option<u64>,
@@ -2759,15 +2843,34 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         attempt += 1;
                         continue;
                     } else {
-                        // Exhausted — plan §4.3: 400 non-context terminal =
-                        // CallTerminal (other routes would fail the same way).
-                        break 'http Err(EntryError::CallTerminal {
-                            reason: format!(
-                                "HTTP 400 (not context-exceeded) after {} attempts: {}",
-                                config.max_retries,
-                                &body_400[..body_400.len().min(500)],
-                            ),
-                        });
+                        // Exhausted — plan §4.3: nuanced 400 classification.
+                        // Provider-level model rejections (OpenRouter
+                        // "not a valid model ID", "model not found", etc.)
+                        // become RouteSkipped so the walker advances to
+                        // the next route entry with a different model_id.
+                        // Feature-unsupported likewise. Genuine body-shape
+                        // errors (malformed JSON, multi-system-turns,
+                        // schema violations) become CallTerminal because
+                        // every route would fail the same way.
+                        let classified = classify_pool_400(&body_400);
+                        let prefix = format!(
+                            "HTTP 400 (not context-exceeded) after {} attempts",
+                            config.max_retries,
+                        );
+                        let wrapped = match classified {
+                            EntryError::RouteSkipped { reason } => EntryError::RouteSkipped {
+                                reason: format!("{prefix}: {reason}"),
+                            },
+                            EntryError::CallTerminal { reason } => EntryError::CallTerminal {
+                                reason: format!("{prefix}: {reason}"),
+                            },
+                            // classify_pool_400 never returns Retryable, but
+                            // stay total over the enum defensively.
+                            EntryError::Retryable { reason } => EntryError::Retryable {
+                                reason: format!("{prefix}: {reason}"),
+                            },
+                        };
+                        break 'http Err(wrapped);
                     }
                 }
 
@@ -2834,9 +2937,22 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         401 | 403 => EntryError::RouteSkipped {
                             reason: format!("credentials_stale: {err_msg}"),
                         },
-                        404 => EntryError::CallTerminal {
-                            reason: format!("model_not_found: {err_msg}"),
-                        },
+                        404 => {
+                            // Plan §4.3: 404 is ambiguous — "model not
+                            // found" bodies become RouteSkipped so a
+                            // sibling route with a different model can
+                            // still succeed; genuinely structural 404s
+                            // fall through to CallTerminal.
+                            let inner = classify_pool_404(&body_text);
+                            match inner {
+                                EntryError::RouteSkipped { reason } => EntryError::RouteSkipped {
+                                    reason: format!("{err_msg} [{reason}]"),
+                                },
+                                _ => EntryError::CallTerminal {
+                                    reason: format!("model_not_found: {err_msg}"),
+                                },
+                            }
+                        }
                         _ => EntryError::Retryable { reason: err_msg },
                     };
                     break 'http Err(classified);
