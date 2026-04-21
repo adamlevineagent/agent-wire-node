@@ -6822,6 +6822,269 @@ routing_rules:
         );
     }
 
+    /// Spawn a fake GPU loop against a ComputeQueueHandle that pops the
+    /// first entry and fires `result_tx.send(Ok(canned_response))`.
+    /// Returns the JoinHandle so the test can await it / drop it at end.
+    fn spawn_fake_gpu_loop(
+        handle: crate::compute_queue::ComputeQueueHandle,
+        canned_content: &'static str,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                handle.notify.notified().await;
+                let entry_opt = {
+                    let mut q = handle.queue.lock().await;
+                    q.dequeue_next()
+                };
+                if let Some(entry) = entry_opt {
+                    let response = LlmResponse {
+                        content: canned_content.to_string(),
+                        usage: super::super::types::TokenUsage {
+                            prompt_tokens: 1,
+                            completion_tokens: 1,
+                        },
+                        generation_id: None,
+                        actual_cost_usd: None,
+                        provider_id: Some("ollama-local".into()),
+                        fleet_peer_id: None,
+                        fleet_peer_model: None,
+                    };
+                    let _ = entry.result_tx.send(Ok(response));
+                    return;
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn walker_cascades_through_market_fleet_openrouter_to_local_queue() {
+        // Cascade-through-all-branches: route = [market, fleet,
+        // openrouter(mockito 400), ollama-local(fake GPU loop)].
+        //
+        // Exact rev-2.1 slug reproduction (`no_offer_for_model`,
+        // `no_fleet_peer`, `provider_rejected_model`) would require
+        // mockito for Wire /quote + a configured fleet roster; that's
+        // separate test infrastructure. This test exercises the cascade
+        // end-to-end through all four branch types with the simpler
+        // skip reasons that fall out of missing contexts — still catches
+        // any future regression that reintroduces a pre-walker
+        // short-circuit across the branch set.
+        //
+        // Expected chronicle ordering (by timestamp):
+        //   1. market → network_route_unavailable(no_market_context)
+        //   2. fleet → network_route_unavailable(fleet_ctx_missing)
+        //   3. openrouter → network_route_skipped(provider_rejected_model)
+        //   4. ollama-local → enqueued + walker_resolved
+        use crate::pyramid::credentials::CredentialStore;
+        use crate::pyramid::provider::{Provider, ProviderRegistry, ProviderType};
+        use std::sync::Arc;
+
+        // Mockito for the openrouter 400.
+        let mut or_server = mockito::Server::new_async().await;
+        let _or_mock = or_server
+            .mock("POST", "/chat/completions")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":{"message":"foo is not a valid model ID"}}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        // Credential store + provider registry.
+        let cred_tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(CredentialStore::load(cred_tmp.path()).unwrap());
+        store.set("OR_KEY", "sk-or-test").unwrap();
+        std::mem::forget(cred_tmp);
+
+        let reg_conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&reg_conn).unwrap();
+        let registry = Arc::new(ProviderRegistry::new(store));
+        registry
+            .save_provider(
+                &reg_conn,
+                Provider {
+                    id: "openrouter".into(),
+                    display_name: "OpenRouter (cascade test)".into(),
+                    provider_type: ProviderType::Openrouter,
+                    base_url: or_server.url(),
+                    api_key_ref: Some("OR_KEY".into()),
+                    auto_detect_context: false,
+                    supports_broadcast: false,
+                    broadcast_config_json: None,
+                    config_json: "{}".into(),
+                    enabled: true,
+                },
+            )
+            .unwrap();
+        registry
+            .save_provider(
+                &reg_conn,
+                Provider {
+                    id: "ollama-local".into(),
+                    display_name: "Ollama (cascade test)".into(),
+                    provider_type: ProviderType::OpenaiCompat,
+                    // base_url is irrelevant — fake GPU loop never
+                    // actually calls provider HTTP.
+                    base_url: "http://127.0.0.1:1".into(),
+                    api_key_ref: None,
+                    auto_detect_context: false,
+                    supports_broadcast: false,
+                    broadcast_config_json: None,
+                    config_json: "{}".into(),
+                    enabled: true,
+                },
+            )
+            .unwrap();
+
+        // Build route with all four branch types.
+        use crate::pyramid::dispatch_policy::*;
+        let mut pool_configs = std::collections::BTreeMap::new();
+        pool_configs.insert(
+            "openrouter".into(),
+            ProviderPoolConfig {
+                concurrency: 1,
+                rate_limit: None,
+            },
+        );
+        pool_configs.insert(
+            "ollama-local".into(),
+            ProviderPoolConfig {
+                concurrency: 1,
+                rate_limit: None,
+            },
+        );
+        let policy = Arc::new(DispatchPolicy {
+            rules: vec![RoutingRule {
+                name: "cascade_all_branches".into(),
+                match_config: MatchConfig {
+                    work_type: None,
+                    min_depth: None,
+                    step_pattern: None,
+                },
+                route_to: vec![
+                    RouteEntry {
+                        provider_id: "market".into(),
+                        model_id: None,
+                        tier_name: None,
+                        is_local: false,
+                        max_budget_credits: None,
+                    },
+                    RouteEntry {
+                        provider_id: "fleet".into(),
+                        model_id: None,
+                        tier_name: None,
+                        is_local: false,
+                        max_budget_credits: None,
+                    },
+                    RouteEntry {
+                        provider_id: "openrouter".into(),
+                        model_id: Some("openai/gpt-4o-mini".into()),
+                        tier_name: None,
+                        is_local: false,
+                        max_budget_credits: None,
+                    },
+                    RouteEntry {
+                        provider_id: "ollama-local".into(),
+                        model_id: Some("gemma4:26b".into()),
+                        tier_name: None,
+                        is_local: true,
+                        max_budget_credits: None,
+                    },
+                ],
+                bypass_pool: false,
+                sequential: false,
+            }],
+            escalation: EscalationConfig::default(),
+            build_coordination: BuildCoordinationConfig::default(),
+            pool_configs,
+            max_batch_cost_usd: None,
+            max_daily_cost_usd: None,
+        });
+        let pools = Arc::new(
+            crate::pyramid::provider_pools::ProviderPools::new(policy.as_ref()),
+        );
+
+        // Tempdir DB for chronicle observation.
+        let db_file = temp_pyramid_db_with_slug("walker-cascade-test");
+        let db_path: Arc<str> = db_file.path().to_string_lossy().to_string().into();
+        let db_path_str = db_file.path().to_string_lossy().to_string();
+
+        // Fake GPU loop.
+        let queue = crate::compute_queue::ComputeQueueHandle::new();
+        let _gpu_handle = spawn_fake_gpu_loop(queue.clone(), "cascade ok from fake gpu");
+
+        let config = LlmConfig {
+            api_key: "sk-or-test".into(),
+            auth_token: String::new(),
+            primary_model: "openai/gpt-4o-mini".into(),
+            fallback_model_1: "openai/gpt-4o-mini".into(),
+            fallback_model_2: "openai/gpt-4o-mini".into(),
+            provider_registry: Some(registry.clone()),
+            dispatch_policy: Some(policy),
+            provider_pools: Some(pools),
+            compute_queue: Some(queue),
+            cache_access: Some(CacheAccess {
+                slug: "walker-cascade-test".into(),
+                build_id: "build-cascade".into(),
+                db_path,
+                bus: None,
+                chain_name: None,
+                content_type: None,
+            }),
+            max_retries: 1,
+            retry_base_sleep_secs: 0,
+            ..Default::default()
+        };
+
+        let result = call_model_unified_with_audit_and_ctx(
+            &config,
+            None,
+            None,
+            "sys",
+            "usr",
+            0.0,
+            16,
+            None,
+            LlmCallOptions::default(),
+        )
+        .await;
+
+        let resp = result.expect("walker must resolve via ollama-local after cascading through market+fleet+openrouter");
+        assert!(
+            resp.content.contains("cascade ok from fake gpu"),
+            "expected fake GPU loop response content, got: {:?}",
+            resp.content,
+        );
+
+        // Let the fire-and-forget spawn_blocking chronicle writes flush.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Verify chronicle trail. Order by timestamp (see
+        // walker_market_runs_before_local_pool_enqueue for why id won't
+        // do — spawn_blocking writes race on the SQLite lock).
+        let rows = read_chronicle_trail(&db_path_str);
+
+        let find = |want_event: &str, want_tag: &str| -> Option<usize> {
+            rows.iter().position(|(_, ev, tag)| ev == want_event && tag == want_tag)
+        };
+
+        let market_i = find("network_route_unavailable", "market")
+            .expect(&format!("market route_unavailable missing — trail={rows:?}"));
+        let fleet_i = find("network_route_unavailable", "fleet")
+            .expect(&format!("fleet route_unavailable missing — trail={rows:?}"));
+        let openrouter_i = find("network_route_skipped", "openrouter")
+            .expect(&format!("openrouter route_skipped missing — trail={rows:?}"));
+        let resolved_i = find("walker_resolved", "ollama-local")
+            .expect(&format!("walker_resolved for ollama-local missing — trail={rows:?}"));
+
+        assert!(
+            market_i < fleet_i && fleet_i < openrouter_i && openrouter_i < resolved_i,
+            "expected cascade ordering market<fleet<openrouter<resolved; got \
+             market={market_i}, fleet={fleet_i}, openrouter={openrouter_i}, \
+             resolved={resolved_i}; trail={rows:?}",
+        );
+    }
+
     #[tokio::test]
     async fn walker_production_shape_outer_call_reaches_market_branch() {
         // Guard against future regressions re-introducing the pre-walker
