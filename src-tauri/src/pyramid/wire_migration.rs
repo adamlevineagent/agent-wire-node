@@ -1180,6 +1180,7 @@ fn consolidate_bundled_versions(conn: &Connection) -> Result<()> {
 /// produces the same YAML output, so the UPDATE is a no-op.
 /// Contributions with source='bundled' are skipped entirely — they're
 /// already canonical via `bundled_contributions.json`.
+#[allow(deprecated)] // reads deprecated ComputeParticipationPolicy fields for serde-compat pass-through; Wave 5 removes.
 fn canonicalize_legacy_participation_policy(conn: &Connection) -> Result<()> {
     use crate::pyramid::local_mode::ComputeParticipationPolicy;
 

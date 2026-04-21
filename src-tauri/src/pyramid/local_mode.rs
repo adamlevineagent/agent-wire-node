@@ -1797,6 +1797,11 @@ pub struct ComputeParticipationPolicy {
     /// faster. Raise if the requester is willing to wait for a cheap
     /// quote. 0 disables the gate (accept any queue position).
     #[serde(default = "default_market_dispatch_threshold_queue_depth")]
+    #[deprecated(
+        note = "retired in walker-re-plan-wire-2.1 Wave 3b — queue-depth-as-proxy was a \
+                pre-walker workaround. /quote is now the authoritative viability check. \
+                Removal scheduled for Wave 5. Field kept for serde-compat with legacy YAML."
+    )]
     pub market_dispatch_threshold_queue_depth: u32,
 
     /// Wall-clock budget for a single market dispatch end-to-end
@@ -1817,6 +1822,12 @@ pub struct ComputeParticipationPolicy {
     /// Testers opt into eager mode explicitly; the default is
     /// conservative.
     #[serde(default)]
+    #[deprecated(
+        note = "retired in walker-re-plan-wire-2.1 Wave 3b — walker market branch always \
+                attempts /quote when a market entry is in the route; eager-vs-overflow \
+                posture is expressed by route ordering, not by a boolean on policy. \
+                Removal scheduled for Wave 5. Field kept for serde-compat with legacy YAML."
+    )]
     pub market_dispatch_eager: bool,
 }
 
@@ -1846,8 +1857,16 @@ pub struct EffectiveParticipationPolicy {
     // Phase 3 operational knobs — passed through unchanged from the
     // raw policy (no projection). See `ComputeParticipationPolicy`
     // for per-field semantics.
+    #[deprecated(
+        note = "see ComputeParticipationPolicy::market_dispatch_threshold_queue_depth. \
+                Retired in walker-re-plan-wire-2.1 Wave 3b; Wave 5 removes."
+    )]
     pub market_dispatch_threshold_queue_depth: u32,
     pub market_dispatch_max_wait_ms: u64,
+    #[deprecated(
+        note = "see ComputeParticipationPolicy::market_dispatch_eager. \
+                Retired in walker-re-plan-wire-2.1 Wave 3b; Wave 5 removes."
+    )]
     pub market_dispatch_eager: bool,
 }
 
@@ -1895,6 +1914,7 @@ impl ComputeParticipationPolicy {
     /// projectable fields: explicit `Some(v)` wins; `None` takes the
     /// mode's projection. `allow_serving_while_degraded` is copied
     /// through unchanged.
+    #[allow(deprecated)] // internal projection — fields themselves deprecated
     pub fn effective_booleans(&self) -> EffectiveParticipationPolicy {
         let (fd, fs, md, mv, sp, sh, ru, rs) = project_mode(self.mode);
         EffectiveParticipationPolicy {
@@ -1933,6 +1953,7 @@ impl Default for ComputeParticipationPolicy {
     /// Coordinator projection applies naturally. Operators who pick
     /// Worker mode later in Settings get worker semantics without re-
     /// persisting every toggle.
+    #[allow(deprecated)] // serde-compat shape for legacy YAML; Wave 5 removes.
     fn default() -> Self {
         Self {
             schema_type: "compute_participation_policy".to_string(),
@@ -2110,6 +2131,7 @@ pub async fn rebuild_cascade_from_registry(pyramid: &std::sync::Arc<super::Pyram
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(deprecated)] // tests exercise serde shape incl. deprecated fields.
 mod tests {
     use super::*;
     use serde_json::json;
