@@ -30,7 +30,7 @@ use super::credentials::{CredentialStore, ResolvedSecret};
 use super::event_bus::{TaggedBuildEvent, TaggedKind};
 use super::provider::{
     LlmProvider, OpenRouterProvider, ParsedLlmResponse, ProviderRegistry, ProviderType,
-    RequestMetadata, ResolvedTier,
+    RequestMetadata,
 };
 use super::step_context::{
     compute_cache_key, compute_inputs_hash, verify_cache_hit, CacheEntry, CacheHitResult,
@@ -1136,9 +1136,9 @@ pub async fn call_model_unified_with_audit_and_ctx(
 
     // ── Phase 6: Cache lookup path ──────────────────────────────────
     //
-    // Delegated to `try_cache_lookup_or_key`, which is shared with
-    // `call_model_via_registry`. When it returns `CacheProbeOutcome::Hit`
-    // the cached response short-circuits the HTTP path entirely.
+    // Delegated to `try_cache_lookup_or_key`. When it returns
+    // `CacheProbeOutcome::Hit` the cached response short-circuits the
+    // HTTP path entirely.
     //
     // Phase 18b: cache hits still write an audit row stamped as such
     // (when an AuditContext is supplied) so the audit trail remains
@@ -2706,9 +2706,8 @@ pub async fn call_model_unified_with_audit_and_ctx(
 
         // ── Phase 6: Cache store path ──────────────────────────────
         //
-        // Delegated to `try_cache_store`, which is shared with
-        // `call_model_via_registry`. No-op when no ctx was attached or
-        // when the lookup phase didn't compute a key.
+        // Delegated to `try_cache_store`. No-op when no ctx was
+        // attached or when the lookup phase didn't compute a key.
         try_cache_store(ctx, cache_lookup.as_ref(), &response, call_started);
 
         // Phase 13: emit LlmCallCompleted on the success exit. The
@@ -3024,9 +3023,8 @@ enum CacheProbeOutcome {
     MissOrBypass(Option<CacheLookupResult>),
 }
 
-/// Shared cache probe path used by both `call_model_unified_with_options_and_ctx`
-/// and `call_model_via_registry` (Phase 6 fix pass). Keeps the cache
-/// hook point exactly once regardless of which HTTP retry loop is
+/// Shared cache probe path (Phase 6 fix pass). Keeps the cache hook
+/// point exactly once regardless of which HTTP retry loop is
 /// upstream of it.
 ///
 /// Behavior:
@@ -3239,8 +3237,7 @@ fn try_cache_lookup_or_key(
     }
 }
 
-/// Shared cache store path used by both
-/// `call_model_unified_with_options_and_ctx` and `call_model_via_registry`.
+/// Shared cache store path.
 /// No-op when either ctx or lookup is absent (which means the caller
 /// did not opt into the cache on this request).
 ///
@@ -3453,426 +3450,6 @@ pub async fn call_model_unified_and_ctx(
     .await
 }
 
-// ── Registry-aware call path (Phase 3) ─────────────────────────────────────
-
-/// Call the LLM via the provider registry: resolve a `tier_name` to
-/// a provider + model, then issue the request with rich observability
-/// metadata. This is the spec's preferred entry point for
-/// chain-executor callers that have `(slug, chain_id, step_name)` in
-/// scope and want per-step overrides to apply.
-///
-/// The `tier_name` is resolved against `pyramid_tier_routing`, with
-/// a per-step override lookup in `pyramid_step_overrides` if
-/// `slug`/`chain_id`/`step_name` are provided. The caller still
-/// passes `system_prompt` / `user_prompt` / `temperature` /
-/// `max_tokens` because those are per-call decisions (Phase 4/6 will
-/// move them into contributions).
-///
-/// Errors:
-/// * `tier <name> is not defined in pyramid_tier_routing` — user
-///   needs to add the tier via Settings → Model Routing.
-/// * `config references credential ${...}` — the provider's
-///   `api_key_ref` resolves to a variable that isn't in the
-///   credentials file. Points the user at Settings → Credentials.
-///
-/// Phase 6 fix pass: accepts `Option<&StepContext>` and performs the
-/// same cache lookup / write that `call_model_unified_with_options_and_ctx`
-/// does via the shared `try_cache_lookup_or_key` / `try_cache_store`
-/// helpers. When the caller threads a cache-usable ctx, the
-/// content-addressable cache short-circuits the HTTP path on a hit and
-/// writes a new row on a miss. When `ctx` is `None` (or not
-/// cache-usable) this function behaves exactly like the pre-Phase-6
-/// registry path.
-#[allow(clippy::too_many_arguments)]
-pub async fn call_model_via_registry(
-    config: &LlmConfig,
-    ctx: Option<&StepContext>,
-    tier_name: &str,
-    system_prompt: &str,
-    user_prompt: &str,
-    temperature: f32,
-    max_tokens: usize,
-    response_format: Option<&serde_json::Value>,
-    metadata: RequestMetadata,
-) -> Result<LlmResponse> {
-    // ── Phase 6 (fix pass): Cache lookup path ───────────────────────
-    //
-    // Identical entry point to `call_model_unified_with_options_and_ctx`
-    // so the two HTTP paths share a single cache hook. A valid hit
-    // short-circuits and never touches the registry or the HTTP path.
-    let cache_lookup = match try_cache_lookup_or_key(ctx, system_prompt, user_prompt) {
-        CacheProbeOutcome::Hit(response) => return Ok(response),
-        CacheProbeOutcome::MissOrBypass(lookup) => lookup,
-    };
-
-    let call_started = std::time::Instant::now();
-
-    let registry = config
-        .provider_registry
-        .as_ref()
-        .ok_or_else(|| anyhow!("call_model_via_registry requires an LlmConfig with a provider_registry attached"))?;
-
-    let resolved: ResolvedTier = registry.resolve_tier(
-        tier_name,
-        metadata.slug.as_deref(),
-        metadata.chain_id.as_deref(),
-        metadata.step_name.as_deref(),
-    )?;
-
-    let (provider_impl, secret) = registry.instantiate_provider(&resolved.provider)?;
-    let provider_type = resolved.provider.provider_type;
-    let url = provider_impl.chat_completions_url();
-    let headers = provider_impl.prepare_headers(secret.as_ref())?;
-    let client = &*HTTP_CLIENT;
-
-    let est_input_tokens = estimate_tokens_llm(system_prompt, user_prompt).await;
-    let context_limit = resolved
-        .tier
-        .context_limit
-        .unwrap_or(config.primary_context_limit);
-    // Output budget is the smaller of (context - input), the tier's
-    // max_completion_tokens cap (if specified), and a sane 48K ceiling.
-    let mut effective_max_tokens = context_limit
-        .saturating_sub(est_input_tokens)
-        .min(48_000)
-        .max(1024);
-    if let Some(cap) = resolved.tier.max_completion_tokens {
-        effective_max_tokens = effective_max_tokens.min(cap);
-    }
-    // Honor the caller's explicit max_tokens if it's smaller (i.e., the
-    // caller is asking for a short response even though the model can
-    // produce more). Never raise it above effective_max_tokens.
-    if max_tokens > 0 && max_tokens < effective_max_tokens {
-        effective_max_tokens = max_tokens;
-    }
-
-    let prompt_chars = system_prompt.len() + user_prompt.len();
-    let local_timeout_scale = if provider_type == ProviderType::OpenaiCompat { 5 } else { 1 };
-    let timeout = compute_timeout(
-        prompt_chars,
-        &LlmCallOptions::default(),
-        config.base_timeout_secs * local_timeout_scale,
-        config.max_timeout_secs * local_timeout_scale,
-        config.timeout_chars_per_increment,
-        config.timeout_increment_secs,
-    );
-
-    let cache_key_for_event = cache_lookup
-        .as_ref()
-        .map(|l| l.cache_key.clone())
-        .unwrap_or_default();
-
-    for attempt in 0..config.max_retries {
-        let mut body = serde_json::json!({
-            "model": resolved.tier.model_id,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "temperature": temperature,
-            "max_tokens": effective_max_tokens
-        });
-        if let Some(rf) = response_format {
-            if provider_impl.supports_response_format() && resolved.tier.supports_response_format() {
-                body.as_object_mut()
-                    .unwrap()
-                    .insert("response_format".to_string(), rf.clone());
-            }
-        }
-        provider_impl.augment_request_body(&mut body, &metadata);
-
-        // Rate limiting: per-pool when available, global fallback otherwise.
-        if config.provider_pools.is_none() {
-            rate_limit_wait(config.rate_limit_max_requests, config.rate_limit_window_secs).await;
-        }
-
-        // Phase 13: emit LlmCallStarted once per HTTP dispatch.
-        emit_llm_call_started(ctx, &resolved.tier.model_id, &cache_key_for_event);
-
-        // Per-provider concurrency pool (Phase A dispatch).
-        let _pool_permit: Option<tokio::sync::OwnedSemaphorePermit> = if let Some(pools) = &config.provider_pools {
-            pools.acquire(&resolved.provider.id).await.ok()
-        } else {
-            None
-        };
-        // Global semaphore fallback (for tests/pre-init without pools)
-        let _local_permit = if _pool_permit.is_none() && provider_type == ProviderType::OpenaiCompat {
-            Some(LOCAL_PROVIDER_SEMAPHORE.acquire().await.map_err(|e| anyhow!("local provider semaphore closed: {e}"))?)
-        } else {
-            None
-        };
-
-        let mut request = client.post(&url).timeout(timeout);
-        for (k, v) in &headers {
-            request = request.header(k, v);
-        }
-        let resp = match request.json(&body).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                if attempt + 1 < config.max_retries {
-                    info!(
-                        "  [via-registry:{}] request error (timeout={}s, err={}), retry {}...",
-                        tier_name,
-                        timeout.as_secs(),
-                        e,
-                        attempt + 1
-                    );
-                    emit_step_retry(
-                        ctx,
-                        attempt as i64,
-                        config.max_retries as i64,
-                        &format!("request error: {}", e),
-                        (config.retry_base_sleep_secs as i64) * 1000,
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        config.retry_base_sleep_secs,
-                    ))
-                    .await;
-                    continue;
-                }
-                // Phase 11: connection failure → provider health state
-                // machine sees it as a hard `down` signal on a single
-                // occurrence. Fire-and-forget: we don't block the
-                // caller on the DB write.
-                maybe_record_provider_error(
-                    ctx,
-                    &resolved.provider.id,
-                    super::provider_health::ProviderErrorKind::ConnectionFailure,
-                );
-                let err_msg = format!(
-                    "Request to tier `{}` failed after {} attempts: {}",
-                    tier_name, config.max_retries, e
-                );
-                emit_step_error(ctx, &err_msg);
-                return Err(anyhow!(err_msg));
-            }
-        };
-        // Release permits before response parsing.
-        drop(_pool_permit);
-        drop(_local_permit);
-
-        let status = resp.status().as_u16();
-        if config.retryable_status_codes.contains(&status) {
-            let wait = config.retry_base_sleep_secs * 2u64.pow(attempt + 1);
-            info!(
-                "  [via-registry:{}] HTTP {}, waiting {}s...",
-                tier_name, status, wait
-            );
-            // Phase 11: HTTP 5xx is a provider-side failure signal
-            // even when the call will retry. Degrades only after
-            // the count-within-window threshold, so single blips
-            // don't trigger an alert.
-            if status >= 500 {
-                maybe_record_provider_error(
-                    ctx,
-                    &resolved.provider.id,
-                    super::provider_health::ProviderErrorKind::Http5xx,
-                );
-            }
-            emit_step_retry(
-                ctx,
-                attempt as i64,
-                config.max_retries as i64,
-                &format!("HTTP {} retry", status),
-                (wait as i64) * 1000,
-            );
-            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-            continue;
-        }
-        // Phase C fix: HTTP 400 context-exceeded cascade.
-        // If the 400 body mentions context/token limits, try the next
-        // provider in the dispatch policy's route_to chain (if available).
-        if status == 400 {
-            let body_400 = resp.text().await.unwrap_or_default();
-            warn!(
-                "[via-registry:{}] HTTP 400 — body: {}",
-                tier_name,
-                &body_400[..body_400.len().min(500)],
-            );
-            let body_lower = body_400.to_lowercase();
-            let is_context_exceeded = body_lower.contains("context")
-                || body_lower.contains("too many tokens")
-                || body_lower.contains("token limit");
-
-            if is_context_exceeded {
-                // Check if the dispatch policy has additional providers to try.
-                if let Some(ref policy) = config.dispatch_policy {
-                    use crate::pyramid::dispatch_policy::WorkType;
-                    let route = policy.resolve_route(
-                        WorkType::Build,
-                        tier_name,
-                        metadata.step_name.as_deref().unwrap_or(""),
-                        ctx.map(|c| c.depth),
-                    );
-                    // Find the current provider in the route and try the next one.
-                    if let Some(pos) = route
-                        .providers
-                        .iter()
-                        .position(|r| r.provider_id == resolved.provider.id)
-                    {
-                        if pos + 1 < route.providers.len() {
-                            let next = &route.providers[pos + 1];
-                            warn!(
-                                "[via-registry:{}] context exceeded on provider {}, cascading to {}",
-                                tier_name, resolved.provider.id, next.provider_id,
-                            );
-                            // Attempt the next provider via a recursive call is
-                            // not feasible here (different resolved tier). Log
-                            // the cascade and return the error so the caller can
-                            // handle retry at a higher level.
-                        }
-                    }
-                }
-                let err_msg = format!(
-                    "HTTP 400 context-exceeded from tier `{}` (provider={}): {}",
-                    tier_name,
-                    provider_type.as_str(),
-                    &body_400[..body_400.len().min(200)]
-                );
-                emit_step_error(ctx, &err_msg);
-                return Err(anyhow!(err_msg));
-            }
-
-            // Non-context 400: fall through to generic error handling.
-            let err_msg = format!(
-                "HTTP {} from tier `{}` (provider={}): {}",
-                status,
-                tier_name,
-                provider_type.as_str(),
-                &body_400[..body_400.len().min(200)]
-            );
-            emit_step_error(ctx, &err_msg);
-            return Err(anyhow!(err_msg));
-        }
-        if !resp.status().is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            if status >= 500 {
-                maybe_record_provider_error(
-                    ctx,
-                    &resolved.provider.id,
-                    super::provider_health::ProviderErrorKind::Http5xx,
-                );
-            }
-            let err_msg = format!(
-                "HTTP {} from tier `{}` (provider={}): {}",
-                status,
-                tier_name,
-                provider_type.as_str(),
-                &body_text[..body_text.len().min(200)]
-            );
-            emit_step_error(ctx, &err_msg);
-            return Err(anyhow!(err_msg));
-        }
-
-        let body_text = resp.text().await?;
-        let parsed = provider_impl.parse_response(&body_text)?;
-
-        if parsed.content.is_empty() {
-            if attempt + 1 < config.max_retries {
-                info!(
-                    "  [via-registry:{}] empty content, retry {}...",
-                    tier_name,
-                    attempt + 1
-                );
-                emit_step_retry(
-                    ctx,
-                    attempt as i64,
-                    config.max_retries as i64,
-                    "empty content",
-                    (config.retry_base_sleep_secs as i64) * 1000,
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs))
-                    .await;
-                continue;
-            }
-            let err_msg = format!(
-                "tier `{}` returned empty content after {} attempts",
-                tier_name, config.max_retries
-            );
-            emit_step_error(ctx, &err_msg);
-            return Err(anyhow!(err_msg));
-        }
-
-        info!(
-            "[LLM-TIER] tier={} provider={} model={} prompt_tokens={} completion_tokens={} cost={:?}",
-            tier_name,
-            provider_type.as_str(),
-            resolved.tier.model_id,
-            parsed.usage.prompt_tokens,
-            parsed.usage.completion_tokens,
-            parsed.actual_cost_usd,
-        );
-
-        let response = LlmResponse {
-            content: parsed.content,
-            usage: parsed.usage,
-            generation_id: parsed.generation_id,
-            actual_cost_usd: parsed.actual_cost_usd,
-            provider_id: Some(resolved.provider.id.clone()),
-            fleet_peer_id: None,
-            fleet_peer_model: None,
-        };
-
-        // ── Phase 6 (fix pass): Cache store path ───────────────────
-        try_cache_store(ctx, cache_lookup.as_ref(), &response, call_started);
-
-        // Phase 13: emit LlmCallCompleted on success.
-        let cost_usd = response
-            .actual_cost_usd
-            .unwrap_or_else(|| super::config_helper::estimate_cost(&response.usage));
-        let latency_ms = call_started.elapsed().as_millis() as i64;
-        emit_llm_call_completed(
-            ctx,
-            &resolved.tier.model_id,
-            &cache_key_for_event,
-            &response.usage,
-            cost_usd,
-            latency_ms,
-        );
-
-        // WP-8 (registry path): Chronicle cloud_returned event.
-        if provider_type == ProviderType::Openrouter {
-            let cloud_job_path = super::compute_chronicle::generate_job_path(
-                ctx, None, &resolved.tier.model_id, "cloud",
-            );
-            let chronicle_ctx = if let Some(sc) = ctx {
-                super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-                    sc, &cloud_job_path, "cloud_returned", "cloud",
-                )
-            } else {
-                super::compute_chronicle::ChronicleEventContext::minimal(
-                    &cloud_job_path, "cloud_returned", "cloud",
-                )
-                .with_model_id(resolved.tier.model_id.clone())
-            };
-            let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
-                "provider_id": response.provider_id,
-                "latency_ms": latency_ms,
-                "tokens_prompt": response.usage.prompt_tokens,
-                "tokens_completion": response.usage.completion_tokens,
-                "cost_usd": cost_usd,
-                "generation_id": response.generation_id,
-                "actual_cost_usd": response.actual_cost_usd,
-            }));
-            let db_path = ctx
-                .map(|c| c.db_path.clone())
-                .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
-            if let Some(db_path) = db_path {
-                tokio::task::spawn_blocking(move || {
-                    if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                        let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
-                    }
-                });
-            }
-        }
-
-        return Ok(response);
-    }
-
-    let err_msg = format!("Max retries exceeded for tier `{}`", tier_name);
-    emit_step_error(ctx, &err_msg);
-    Err(anyhow!(err_msg))
-}
 
 /// Call OpenRouter with structured output enforcement via JSON schema.
 ///

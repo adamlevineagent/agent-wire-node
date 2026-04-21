@@ -529,10 +529,9 @@ pub fn make_step_context_from_slug(
 /// The `resolved_model_id` is taken from `config.primary_model` —
 /// this is the simplest consistent choice since every retrofit site
 /// that calls `call_model` implicitly uses whatever model the config
-/// routes to. For sites that use `call_model_via_registry` or
-/// `call_model_unified_with_options_and_ctx` with an explicit
-/// tier, the direct construction path (`StepContext::new` +
-/// `with_model_resolution`) remains available.
+/// routes to. For sites that use `call_model_unified_with_options_and_ctx`
+/// with an explicit tier, the direct construction path
+/// (`StepContext::new` + `with_model_resolution`) remains available.
 pub fn make_step_ctx_from_llm_config(
     config: &LlmConfig,
     step_name: &str,
