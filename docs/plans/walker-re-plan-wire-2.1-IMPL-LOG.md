@@ -21,7 +21,7 @@ Entry template:
 **Deviation:** None / <rationale if any>
 -->
 
-## 2026-04-21 — commit 297d474 (branch walker-re-plan-wire-2.1)
+## 2026-04-21 — commit eda0dde (branch walker-re-plan-wire-2.1)
 
 **Plan task:** Wave 0 task 2 — `sync_dispatch_policy_to_operational` helper in `wire_migration.rs`.
 **Changed:** Added `sync_dispatch_policy_to_operational(conn)` at `src-tauri/src/pyramid/wire_migration.rs` right after `sync_chain_assignments_to_operational`, mirroring `sync_chain_defaults_to_operational` (schema_type = `dispatch_policy`, status = `active`, ORDER BY accepted_at DESC LIMIT 1). Parses YAML into `dispatch_policy::DispatchPolicyYaml` for validation (surfaces malformed YAML at boot) then calls `db::upsert_dispatch_policy(conn, &None, &yaml_content, &contribution_id)` — the operational table stores raw YAML for hot-reload, parsed struct is discarded. Wired peer call into `walk_bundled_contributions_manifest` alongside `sync_chain_defaults_to_operational` + `sync_chain_assignments_to_operational` (line 1441). Added one in-module test `sync_dispatch_policy_to_operational_hydrates_row` using the existing `insert_active_row` + `mem_conn` fixtures: inserts an active `dispatch_policy` contribution, runs the helper, asserts the operational row holds the YAML and contribution_id.
