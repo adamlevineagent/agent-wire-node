@@ -9,6 +9,107 @@ Append-only log of what's done. Newest at top. Updated at every commit.
 
 ---
 
+## 2026-04-21 — commits 22f0f9f + e2f22aa + c714770 + dd0a35e (branch walker-re-plan-wire-2.1)
+
+**Plan tasks:** Wave 5 tasks 35 + 36 + 37 + 38 — cleanup + deprecation enforcement.
+
+### 22f0f9f — task 35: remove market_dispatch_eager + threshold_queue_depth
+
+**Changed:** Deleted both retired knobs from `ComputeParticipationPolicy` +
+`EffectiveParticipationPolicy` + `Default` impl + `effective_booleans` + every
+test fixture that constructed them. Removed `#[serde(deny_unknown_fields)]` on
+the struct as the single migration-compat arm so legacy YAML rows still
+deserialize silently; added `policy_yaml_silently_absorbs_retired_walker_knobs`
+test. Stripped the fields from the bundled default seed YAML and the TS mirror
+interface + default object in `src/components/Settings.tsx`. Updated
+`canonicalize_legacy_participation_policy` in `wire_migration.rs` so it no
+longer carries the fields through on canonical rewrite.
+**Cargo check:** clean (default target).
+**Cargo test:** `cargo test --lib compute_participation + policy_yaml` — 6/6 pass.
+**Deviation:** Plan §8 task 35 said the fields "force stragglers to compile-fail";
+the actual need was softer — the struct had `deny_unknown_fields` which would
+reject legacy persisted YAML rows, so the migration arm flipped that attribute
+off rather than a one-shot rename shim. Documented in the commit message and in
+the struct-level comment.
+
+### e2f22aa — task 36: delete compute_requester.rs
+
+**Changed:** Removed `src-tauri/src/pyramid/compute_requester.rs` (921 LOC) and
+its `pub mod` declaration. The sole live caller was the
+`POST /pyramid/compute/market-call` smoke-test handler in `routes_operator.rs`
+(a pre-walker CLI primitive that exposed the rev-2.0 match/fill flow directly);
+deleted `MarketCallBody`, `handle_compute_market_call`, seven `default_*` helpers,
+and removed the route from the warp composition. Updated stale doc comments in
+`server.rs`, `pending_jobs.rs`, `compute_quote_flow.rs`, `compute_market_ctx.rs`,
+and `llm.rs` to reflect the deletion.
+**Cargo check:** clean (default target).
+**Cargo test:** `cargo test --lib` — 1755 pass / 15 pre-existing fail (net -14 from
+baseline; those were internal `compute_requester.rs` unit tests, removed with
+the module).
+**Deviation:** Plan task 36 says "Grep compute_requester in src/ must be empty
+post-delete." Interpreted as "no live code references" — five comments/doc-blocks
+remain referencing the deletion historically, which the task spec explicitly
+permits. The stale `compute-market-call` CLI entry in `mcp-server/src/cli.ts`
+remains in place; it will dead-link against the deleted route. Out of scope for
+task 36 (which covers src + src-tauri/src only); flagged for a follow-up CLI
+clean.
+
+### c714770 — task 37: string-match audit
+
+**Changed:** Audited every string-match site on `"fleet"` for a parallel
+`"market"` handling. Findings:
+
+1. `dispatch_policy.rs:260-278 resolve_local_for_rule` — ALREADY filters BOTH
+   sentinels (Wave 2 landed this). Verified, no change.
+2. `fleet.rs:1035 derive_serving_rules` (called by `fleet_mps.rs:319
+   derive_service_descriptor`) — had `if entry.provider_id == "fleet" { continue; }`
+   with no market parallel. Added the market sentinel to the same filter for
+   parallelism with `resolve_local_for_rule`. In practice the `is_local` check
+   below excludes both sentinels by convention; the explicit continue is
+   belt-and-suspenders.
+3. `resolve_tier` paths — grepped every call site; none string-match on
+   "fleet"/"market". `resolve_tier` looks up tier rows in `ProviderRegistry`
+   which has no knowledge of walker sentinels. No parallel needed.
+4. `fleet.rs:1393 callback_kind_from_str` test — discriminator for the
+   `CallbackKind` enum (Fleet/MarketStandard/Relay delivery kinds), unrelated
+   to sentinel routing strings. No change.
+
+**Cargo check:** clean.
+**Cargo test:** `cargo test --lib fleet_mps` — 23/23 pass.
+**Deviation:** None.
+
+### dd0a35e — task 38: permit-release test
+
+**Changed:** Added `test_try_acquire_owned_releases_permit_on_drop` to
+`provider_pools.rs` tests. On a concurrency=1 pool: acquire a permit; confirm
+a second try reports `Saturated` while held; drop the first permit; confirm
+the next try succeeds. Locks in the walker's pool-branch `Drop`-semantics
+invariant — a Retryable/RouteSkipped failure must return capacity so the next
+iteration can acquire on the same pool.
+**Cargo check:** clean.
+**Cargo test:** 1/1 pass for the new test.
+**Deviation:** None.
+
+### Task 39 pre-flight verification (by this cleanup agent, not the final wanderer)
+
+- `cargo check` default target: clean.
+- `cargo test --lib` full suite: 1756 pass / 15 pre-existing fail (same 15 as
+  the Wave 0 baseline per the 2026-04-21 03:10 log entry).
+- `npm run build`: clean.
+- Grep `compute_requester src src-tauri/src`: returns only 5 comment/doc-block
+  references to the deletion. No live code.
+- Grep `market_dispatch_eager` / `market_dispatch_threshold_queue_depth`: only
+  comments, plus a single migration-compat test string in
+  `local_mode.rs:2644-2645` (the test that verifies legacy YAML still
+  deserializes). All read sites gone.
+- Grep `escalation_timeout_secs`: struct field on `ResolvedRoute` + the two
+  populate-from-`EscalationConfig` assignments in `from_yaml`. NO live reads in
+  a routing-decision branch. Clean per plan §2 retirement.
+
+Final wanderer still to be fired separately by orchestrator.
+
+---
+
 ## 2026-04-21 — commit 272f171 (branch walker-re-plan-wire-2.1)
 
 **Plan task:** Wave 4 task 32 — invisibility copy audit.

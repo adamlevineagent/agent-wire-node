@@ -8,6 +8,58 @@ Real-time record of surprises, workarounds, and "this bit me" moments. Newest at
 
 ---
 
+## 2026-04-21 — Wave 5 cleanup (tasks 35-38)
+
+**`deny_unknown_fields` forces a forward-compat tradeoff on field removal.**
+Task 35 removes `market_dispatch_eager` + `market_dispatch_threshold_queue_depth`
+from `ComputeParticipationPolicy`. The struct had `#[serde(deny_unknown_fields)]`
+as a typo-catcher (a prior test `policy_yaml_rejects_unknown_fields` specifically
+asserted that e.g. `allow_market_visiblity` would blow up rather than silently
+no-op). Removing fields while keeping `deny_unknown_fields` would reject every
+legacy persisted YAML row that still carries the retired keys — a hard rollout
+break for anyone whose contribution was written before Wave 5 ships.
+
+Options considered:
+1. Keep the fields with `#[serde(skip_serializing)]` + a private stub. Awkward
+   API surface; fields would still show in struct destructuring and fixtures.
+2. Custom `Deserialize` impl that strips the two keys pre-parse. ~40 LOC of
+   hand-rolled visitor for one-time migration compat; not worth it.
+3. Remove `deny_unknown_fields` entirely with a prominent comment referencing
+   Wave 5 as the reason. Tradeoff: loses the typo-catch on other fields, but
+   those now silently no-op instead of erroring.
+
+Went with #3. The struct's `Default` impl and the canonical `Settings.tsx` mirror
+make typos much harder to sneak past than they used to be (every projectable
+field is explicitly listed in both), and the walker gives us a second safety net
+at config-read time. Documented the tradeoff in the struct-level comment and
+replaced the typo-rejection test with a `silently_absorbs_retired_walker_knobs`
+test that asserts the new forward-compat contract.
+
+**Task 36: compute_requester had a surprise live caller.** Expected pure dead
+code. Found `routes_operator.rs` still registering `POST /pyramid/compute/market-call`
+— a pre-walker one-shot smoke-test route invoking `compute_requester::call_market`
+directly. Not listed in the plan's task 36 prose (which spoke of re-exports and
+internal imports). Judgment call: the route's entire purpose was to expose the
+rev-2.0 match/fill flow to CLI testers; the walker now does that work natively,
+and keeping a second path would just be another surface to maintain. Deleted
+the route + handler + `MarketCallBody` + seven `default_*` helpers together with
+the module. The matching `compute-market-call` CLI shortcut in
+`mcp-server/src/cli.ts` now dead-links; flagged as a follow-up CLI-surface
+cleanup (task 36 scope was explicitly src + src-tauri/src).
+
+**Task 37: "fleet"/"market" string-match sites were genuinely three, not many.**
+Audited every string-match on `"fleet"` and `"market"` in src-tauri/src.
+`dispatch_policy.rs:resolve_local_for_rule` already handles both (Wave 2 landed
+this). `fleet.rs:derive_serving_rules` had `"fleet"` only — added `"market"` for
+parallelism even though the `is_local` check below already excludes both
+sentinels by convention. Every `resolve_tier` path goes through `ProviderRegistry`
+which has no knowledge of walker sentinels — so `resolve_tier` needs no parallel.
+Net change: one two-line edit. Smaller than the plan made it sound; confirms the
+plan's audit pessimism wasn't warranted but also validates that running the audit
+actually catches the one remaining site rather than leaving it asymmetric.
+
+---
+
 ## 2026-04-21 — Wave 4 residuals (tasks 29 / 30-subbullets / 32 / 34)
 
 **Task 29 IPC snapshot shape: plan said less, brief said more.** Plan §8 task 29 spells out `{model_id, active_offers}`; the session brief specifies `{model_id, active_offers, rate_in_per_m, rate_out_per_m, last_updated_at}`. Went with the brief shape — Discovery section is visibly dead without rates, and the extra fields are cheap to flatten from the already-cached `MarketSurfaceModel.price` triples. Noted the widening in the commit + impl-log; if future consumers want the minimal shape they can project on the client.
