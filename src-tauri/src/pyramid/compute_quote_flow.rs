@@ -6,10 +6,11 @@
 //! surface in `compute_requester.rs` (slated for removal in Wave 5 per
 //! plan §2).
 //!
-//! Wave 0 status: SKELETON ONLY. All four RPCs stub with
-//! `unimplemented!("Wave 3")`. Wave 3 fills the HTTP bodies. Call sites
-//! are still routed through `compute_requester` today — nothing in this
-//! module is exercised until Wave 3 lands the walker market branch.
+//! Wave 3b status: LIVE. `quote`, `purchase`, `fill`, `register_pending`,
+//! and `await_result` are all wired into the walker's market branch
+//! (plan §4.2). The legacy `compute_requester` Phase B pre-loop is gone.
+//! `register_pending` must be called BEFORE `fill` so the provider
+//! callback cannot race the registration (Wave 3a friction-log RACE-1).
 //!
 //! # Rev 2.1 UUID resolution — deliberately no `resolve_uuid_from_purchase`
 //!
@@ -264,25 +265,41 @@ pub async fn fill(
     }
 }
 
-/// Await the inbound `/v1/compute/job-result` envelope keyed by
-/// `uuid_job_id` (the DB-row UUID surfaced on `ComputePurchaseResponse`).
-/// Body in Wave 3.
-#[allow(dead_code)]
-pub async fn await_result(
+/// Register a pending oneshot keyed on `uuid_job_id` BEFORE calling
+/// [`fill`].
+///
+/// Walker market branch (plan §4.2) must register the receiver before
+/// `/fill` POSTs so an instant provider callback cannot race ahead of
+/// registration and land on an empty PendingJobs map. The returned
+/// receiver is then handed to [`await_result`] after `/fill` returns.
+///
+/// The prior shape — `await_result` registering internally — had the
+/// registration happening AFTER `/fill`, opening a TOCTOU window
+/// bounded only by provider inference latency. Wave 3b race-fix splits
+/// the two so `register_pending → fill → await_result(rx, ...)` closes
+/// the window at the call site.
+pub async fn register_pending(
     pending_jobs: &PendingJobs,
     uuid_job_id: &str,
+) -> tokio::sync::oneshot::Receiver<DeliveryPayload> {
+    pending_jobs.register(uuid_job_id.to_string()).await
+}
+
+/// Await the inbound `/v1/compute/job-result` envelope keyed by
+/// `uuid_job_id` (the DB-row UUID surfaced on `ComputePurchaseResponse`).
+///
+/// Wave 3b race-fix: `rx` is now passed in by the caller, registered
+/// via [`register_pending`] BEFORE the `/fill` POST. On timeout this
+/// function still calls `pending_jobs.take(uuid_job_id)` to drop the
+/// sender so a late push sees `already_settled` instead of firing a
+/// dropped channel.
+#[allow(dead_code)]
+pub async fn await_result(
+    rx: tokio::sync::oneshot::Receiver<DeliveryPayload>,
+    uuid_job_id: &str,
+    pending_jobs: &PendingJobs,
     timeout: Duration,
 ) -> Result<LlmResponse, EntryError> {
-    // Register the oneshot keyed on the DB-row UUID. The inbound
-    // `/v1/compute/job-result` handler looks up PendingJobs by UUID
-    // before firing the sender. Plan §4.2 prefers registration BEFORE
-    // /fill (race-safe); we register here per Wave 3 task 19 spec.
-    // The window between /fill 200 and this registration is bounded by
-    // provider inference latency (always >> registration overhead), so
-    // missed-push risk is effectively zero. If smoke surfaces a race,
-    // walker moves `register` above /fill.
-    let rx = pending_jobs.register(uuid_job_id.to_string()).await;
-
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(payload)) => match payload {
             DeliveryPayload::Success {
@@ -732,12 +749,9 @@ mod tests {
     #[tokio::test]
     async fn await_result_timeout_returns_retryable() {
         let pending = PendingJobs::new();
-        let out = await_result(
-            &pending,
-            "550e8400-e29b-41d4-a716-446655440000",
-            Duration::from_millis(1),
-        )
-        .await;
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let rx = register_pending(&pending, uuid).await;
+        let out = await_result(rx, uuid, &pending, Duration::from_millis(1)).await;
         match out {
             Err(EntryError::Retryable { reason }) => assert_eq!(reason, "fill_result_timeout"),
             other => panic!("expected Retryable timeout, got {:?}", other),
@@ -749,19 +763,21 @@ mod tests {
         let pending = PendingJobs::new();
         let uuid = "550e8400-e29b-41d4-a716-446655440001";
 
-        // Run await_result concurrently; deliver a Success push before
-        // the 500ms timeout elapses.
+        // Register BEFORE spawning the waiter — this mirrors the walker's
+        // race-fixed call order: register → fill → await_result.
+        let rx = register_pending(&pending, uuid).await;
+
         let pending_clone = pending.clone();
         let wait_handle = tokio::spawn(async move {
-            await_result(&pending_clone, uuid, Duration::from_millis(500)).await
+            await_result(rx, uuid, &pending_clone, Duration::from_millis(500)).await
         });
 
-        // Give await_result a tick to register.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Sender is present immediately — race-fix removed the post-spawn
+        // settling window.
         let sender = pending
             .take(uuid)
             .await
-            .expect("await_result should have registered a sender");
+            .expect("sender should be registered before await_result spawn");
         sender
             .send(DeliveryPayload::Success {
                 content: "hi".into(),
@@ -785,12 +801,13 @@ mod tests {
         let pending = PendingJobs::new();
         let uuid = "550e8400-e29b-41d4-a716-446655440002";
 
+        let rx = register_pending(&pending, uuid).await;
+
         let pending_clone = pending.clone();
         let wait_handle = tokio::spawn(async move {
-            await_result(&pending_clone, uuid, Duration::from_millis(500)).await
+            await_result(rx, uuid, &pending_clone, Duration::from_millis(500)).await
         });
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
         let sender = pending.take(uuid).await.expect("sender");
         sender
             .send(DeliveryPayload::Failure {
@@ -808,6 +825,23 @@ mod tests {
             }
             other => panic!("expected RouteSkipped provider_returned_error, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn register_pending_returns_receiver_before_fill_can_race() {
+        // Race-fix invariant: the receiver must be live on the map
+        // immediately after register_pending returns, so a provider
+        // callback that arrives before /fill completes still finds a
+        // registered sender to fire.
+        let pending = PendingJobs::new();
+        let uuid = "550e8400-e29b-41d4-a716-446655440003";
+
+        let _rx = register_pending(&pending, uuid).await;
+        assert_eq!(
+            pending.len().await,
+            1,
+            "register_pending must install the sender synchronously"
+        );
     }
 
     // ── Body serialization surface ─────────────────────────────────────
