@@ -21,7 +21,7 @@ Entry template:
 **Deviation:** None / <rationale if any>
 -->
 
-## 2026-04-21 03:30 — commit <SHA_TASK_7> (branch walker-re-plan-wire-2.1)
+## 2026-04-21 03:30 — commit b3777d6 (branch walker-re-plan-wire-2.1)
 
 **Plan task:** Wave 0 task 7 — `ProviderPools::try_acquire_owned` + `SlidingWindowLimiter::try_acquire` non-blocking helpers.
 **Changed:** `src-tauri/src/pyramid/provider_pools.rs`:
