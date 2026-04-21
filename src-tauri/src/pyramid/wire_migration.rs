@@ -1249,6 +1249,8 @@ fn canonicalize_legacy_participation_policy(conn: &Connection) -> Result<()> {
             // rows that still carry them are silently absorbed by the
             // struct deserializer and then dropped on canonical rewrite.
             market_dispatch_max_wait_ms: eff.market_dispatch_max_wait_ms,
+            // Rev 2.1.1 saturation-backoff patience — carry through.
+            market_saturation_patience_secs: eff.market_saturation_patience_secs,
         };
         let new_yaml = match serde_yaml::to_string(&canonical) {
             Ok(y) => y,

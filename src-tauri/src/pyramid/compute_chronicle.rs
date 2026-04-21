@@ -220,6 +220,19 @@ pub const EVENT_NETWORK_BALANCE_INSUFFICIENT_FOR_MARKET: &str =
 #[allow(dead_code)]
 pub const EVENT_NETWORK_AUTH_EXPIRED: &str = "network_auth_expired";
 
+/// Rev 2.1.1 saturation-backoff visibility. Emitted by walker between
+/// successive retries of a market entry while `all_offers_saturated_for_model`
+/// keeps firing. Gives operators live feedback during queue-drain waits:
+///   - next_attempt_at (RFC 3339 UTC)
+///   - min_expected_drain_ms (from Wire's AllOffersSaturatedDetail)
+///   - elapsed_secs_in_backoff_loop (cumulative walker wait for this chunk)
+///   - patience_budget_secs (compute_participation_policy value)
+///
+/// Operators expect slow-and-steady throughput on large corpora; this
+/// event is what makes "walker is waiting, not stuck" legible in the UI.
+#[allow(dead_code)]
+pub const EVENT_MARKET_BACKOFF_WAITING: &str = "market_backoff_waiting";
+
 #[allow(dead_code)]
 pub const EVENT_DISPATCH_POLICY_SUPERSEDED: &str = "dispatch_policy_superseded";
 

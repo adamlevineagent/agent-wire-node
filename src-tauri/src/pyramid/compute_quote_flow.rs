@@ -115,41 +115,34 @@ pub struct ComputeFillBody {
 }
 
 /// Detail payload carried on `all_offers_saturated_for_model` (P0410, 409)
-/// responses from Wire's `plan_compute_match`. Populated by Wire when the
-/// candidate CTE finds offers for a model but ALL are at their
-/// `max_queue_depth` ceiling. Walker consumes this for intelligent
-/// backoff: `min_expected_drain_ms` is the floor for "when does the next
-/// slot open somewhere in the cohort."
+/// responses from Wire's `plan_compute_match` (rev 2.1.1). Shape MATCHES
+/// `agent_wire_contracts::AllOffersSaturatedDetail` verbatim — declared
+/// locally because the contracts crate rev pinned in `Cargo.toml`
+/// (a9e356d3) was cut before the rev 2.1.1 type landed. Swap to
+/// `pub use agent_wire_contracts::AllOffersSaturatedDetail;` as soon
+/// as the contracts crate rev bumps (same pattern as ComputeFillBody).
 ///
-/// Shape per Wire's bilateral rev 2.1.1 spec (compute-market-saturation-
-/// fix-rev-2.1.1-2026-04-21). Declared locally because the
-/// agent-wire-contracts crate has not yet exported this type; swap to a
-/// `pub use` once it does (same pattern as ComputeFillBody).
-///
-/// Field semantics:
+/// Field semantics (per bilateral decision doc
+/// compute-market-saturation-decisions-2026-04-21.md):
 /// - `offer_count`: size of the saturated cohort.
-/// - `min_current_queue_depth`: shortest queue in the cohort (lower
-///   bound on how-many-ahead-of-me the next-to-reserve would be).
-/// - `max_queue_depth_across_offers`: largest max_queue_depth of any
-///   offer in the cohort (informational ceiling on waiting-room).
-/// - `min_expected_drain_ms`: Wire-computed
-///   `min(typical_serve_ms_p50)` across the cohort — the shortest
-///   head-of-queue completion time. Walker uses as backoff FLOOR (the
-///   soonest any slot opens). Conservative: assumes nothing about
-///   elapsed-time on in-flight jobs.
-/// - `median_typical_serve_ms_p50`: cohort median serve time, for
-///   walker's own horizon math (optional; may be absent for sparse
-///   cohorts). Walker degrades to `min_expected_drain_ms` alone when
-///   this is None.
-#[derive(Debug, Clone, Deserialize)]
+/// - `min_current_queue_depth`: shortest queue in the cohort.
+/// - `max_queue_depth_across_offers`: largest max_queue_depth in the
+///   cohort (informational ceiling on waiting-room).
+/// - `min_expected_drain_ms`: Wire-computed `min(typical_serve_ms_p50)`
+///   across the cohort — shortest head-of-queue completion time.
+///   Walker uses as backoff FLOOR. Option-typed: `None` when the cohort
+///   lacks observations (fresh offers, <10 settled jobs). Walker falls
+///   back to a policy-local default in that case.
+/// - `median_typical_serve_ms_p50`: cohort median serve time for
+///   walker's own horizon math. Option-typed for the same reason.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AllOffersSaturatedDetail {
     pub model_id: String,
-    pub offer_count: u32,
-    pub min_current_queue_depth: u32,
-    pub max_queue_depth_across_offers: u32,
-    pub min_expected_drain_ms: u64,
-    #[serde(default)]
-    pub median_typical_serve_ms_p50: Option<u64>,
+    pub offer_count: i64,
+    pub min_current_queue_depth: i64,
+    pub max_queue_depth_across_offers: i64,
+    pub min_expected_drain_ms: Option<f64>,
+    pub median_typical_serve_ms_p50: Option<f64>,
 }
 
 /// Walker-side bundling of the wire body plus the two fields the walker
@@ -1296,30 +1289,35 @@ mod tests {
     }
 
     #[test]
-    fn all_offers_saturated_detail_deserializes_with_and_without_median() {
-        // Full shape — all fields present.
+    fn all_offers_saturated_detail_deserializes_from_contracts_crate() {
+        // Shape pinned to agent-wire-contracts::AllOffersSaturatedDetail
+        // (rev 2.1.1). Walker treats `min_expected_drain_ms` as
+        // Option<f64> — NULL when Wire's cohort has no observations.
         let full = serde_json::json!({
             "model_id": "gemma4:26b",
             "offer_count": 3,
             "min_current_queue_depth": 7,
             "max_queue_depth_across_offers": 8,
-            "min_expected_drain_ms": 12000,
-            "median_typical_serve_ms_p50": 15000
+            "min_expected_drain_ms": 12000.0,
+            "median_typical_serve_ms_p50": 15000.0
         });
         let detail: AllOffersSaturatedDetail = serde_json::from_value(full).unwrap();
         assert_eq!(detail.model_id, "gemma4:26b");
-        assert_eq!(detail.min_expected_drain_ms, 12000);
-        assert_eq!(detail.median_typical_serve_ms_p50, Some(15000));
+        assert_eq!(detail.min_expected_drain_ms, Some(12000.0));
+        assert_eq!(detail.median_typical_serve_ms_p50, Some(15000.0));
 
-        // Sparse-cohort shape — median absent. Walker must tolerate.
+        // Cohort-lacks-observations shape — min_expected_drain_ms null.
+        // Walker falls back to a policy-defined floor when absent.
         let sparse = serde_json::json!({
             "model_id": "gemma4:26b",
             "offer_count": 1,
             "min_current_queue_depth": 8,
             "max_queue_depth_across_offers": 8,
-            "min_expected_drain_ms": 15000
+            "min_expected_drain_ms": null,
+            "median_typical_serve_ms_p50": null
         });
         let detail: AllOffersSaturatedDetail = serde_json::from_value(sparse).unwrap();
+        assert_eq!(detail.min_expected_drain_ms, None);
         assert_eq!(detail.median_typical_serve_ms_p50, None);
     }
 }

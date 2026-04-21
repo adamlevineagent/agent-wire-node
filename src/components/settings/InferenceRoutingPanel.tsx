@@ -56,6 +56,7 @@ interface PyramidMarketModel {
  *  (we never write this contribution from this panel). */
 interface ComputeParticipationPolicyShape {
     market_dispatch_max_wait_ms?: number;
+    market_saturation_patience_secs?: number;
     [key: string]: unknown;
 }
 

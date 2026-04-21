@@ -578,7 +578,21 @@ struct MarketDispatchArgs<'a> {
     market_ctx: &'a crate::pyramid::compute_market_ctx::ComputeMarketRequesterContext,
     model_id: String,
     max_budget: i64,
+    /// Safety-rail timeout for the /fill await when Wire's
+    /// `dispatch_deadline_at` can't be parsed (should never happen in
+    /// practice; defensive fallback only). Canonical path uses
+    /// `purchase_resp.dispatch_deadline_at + small grace` — see
+    /// [compute-market-saturation-decisions-2026-04-21.md D3]: the
+    /// deadline is a load-bearing economic contract, not a node-local
+    /// timer.
     max_wait_ms: u64,
+    /// Wall-clock patience budget per chunk for the saturation-retry
+    /// loop. Drawn from
+    /// `compute_participation_policy.market_saturation_patience_secs`.
+    /// When the cumulative backoff across retries exceeds this,
+    /// `dispatch_market_entry` bubbles RouteSkipped with reason
+    /// `market_saturation_patience_exhausted` and the cascade advances.
+    market_saturation_patience_secs: u64,
     max_tokens: i64,
     temperature: f32,
     input_tokens_est: i64,
@@ -587,6 +601,118 @@ struct MarketDispatchArgs<'a> {
     callback_url: String,
     walker_source_label: &'a str,
     entry_provider_id: &'a str,
+}
+
+/// Fallback backoff when Wire returns `all_offers_saturated_for_model`
+/// but `min_expected_drain_ms` is absent from the detail (cohort has no
+/// observations yet — fresh offers, <10 settled jobs). 15s mirrors a
+/// representative single-GPU LLM serve time; chosen to be "short enough
+/// that a fresh-offer cohort drains within a few retries, long enough
+/// not to hammer Wire."
+const SATURATION_BACKOFF_FALLBACK_MS: u64 = 15_000;
+
+/// Grace appended to Wire's `dispatch_deadline_at` when computing
+/// walker's /fill-await tokio timeout. Covers clock skew + callback
+/// transit latency between provider → Wire → requester tunnel.
+const DISPATCH_DEADLINE_GRACE_SECS: u64 = 10;
+
+/// If `err` is `all_offers_saturated_for_model` (per body.error slug),
+/// return Some(Duration) to back off before re-quoting. Walker should
+/// sleep that long then re-enter the /quote → /purchase loop for the
+/// same market entry.
+///
+/// Backoff derivation (in order):
+/// 1. `detail.min_expected_drain_ms` from Wire's structured detail
+///    (the cohort-shortest head-of-queue completion — "when next slot
+///    opens somewhere"). Authoritative.
+/// 2. `SATURATION_BACKOFF_FALLBACK_MS` when detail is absent or the
+///    field is None (cohort lacks observations).
+///
+/// Returns None for every other error slug — caller falls through to
+/// standard classification.
+fn saturation_backoff_from_api_err(
+    err: &crate::http_utils::ApiErrorWithHints,
+) -> Option<std::time::Duration> {
+    use crate::pyramid::compute_quote_flow::AllOffersSaturatedDetail;
+
+    // The slug check is a belt-and-suspenders against header-stripping
+    // proxies. Under the canonical Wire path, X-Wire-Retry: transient
+    // also pairs with the slug; either signal alone is enough here.
+    let slug = err
+        .body
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if slug != "all_offers_saturated_for_model" {
+        return None;
+    }
+
+    // Parse the structured detail for min_expected_drain_ms.
+    let detail_value = err.body.get("detail")?;
+    let detail: Option<AllOffersSaturatedDetail> =
+        serde_json::from_value(detail_value.clone()).ok();
+    let drain_ms = detail
+        .and_then(|d| d.min_expected_drain_ms)
+        .map(|ms| ms.max(0.0) as u64)
+        .unwrap_or(SATURATION_BACKOFF_FALLBACK_MS);
+    Some(std::time::Duration::from_millis(
+        drain_ms.max(1_000), // floor at 1s so we never hammer
+    ))
+}
+
+/// Emit the `market_backoff_waiting` chronicle event and sleep for the
+/// backoff duration, IF the wait would still leave us under the
+/// patience deadline. Returns true if the sleep completed and walker
+/// should retry; false if patience is exhausted (walker should give up
+/// on market for this chunk and advance the cascade).
+async fn apply_saturation_backoff(
+    ctx: Option<&StepContext>,
+    config: &LlmConfig,
+    walker_source_label: &str,
+    entry_provider_id: &str,
+    attempt: u32,
+    backoff: std::time::Duration,
+    patience_deadline: std::time::Instant,
+    min_expected_drain_ms: Option<u64>,
+) -> bool {
+    let now = std::time::Instant::now();
+    let next_attempt_at = now + backoff;
+    if next_attempt_at > patience_deadline {
+        // Retry would land past patience — concede now.
+        return false;
+    }
+    let next_attempt_utc =
+        chrono::Utc::now() + chrono::Duration::from_std(backoff).unwrap_or_default();
+    emit_walker_chronicle(
+        ctx,
+        config,
+        super::compute_chronicle::EVENT_MARKET_BACKOFF_WAITING,
+        walker_source_label,
+        entry_provider_id,
+        serde_json::json!({
+            "attempt": attempt,
+            "backoff_ms": backoff.as_millis() as u64,
+            "next_attempt_at": next_attempt_utc.to_rfc3339(),
+            "min_expected_drain_ms": min_expected_drain_ms,
+            "branch": "market",
+        }),
+    );
+    tokio::time::sleep(backoff).await;
+    true
+}
+
+/// Parse Wire's `dispatch_deadline_at` (RFC 3339 UTC) into a Duration
+/// from now. Returns None on parse failure or if the deadline is
+/// already in the past; caller falls back to the safety-rail
+/// max_wait_ms.
+fn duration_until_deadline(dispatch_deadline_at: &str) -> Option<std::time::Duration> {
+    let deadline = chrono::DateTime::parse_from_rfc3339(dispatch_deadline_at).ok()?;
+    let now = chrono::Utc::now();
+    let delta = deadline.with_timezone(&chrono::Utc).signed_duration_since(now);
+    if delta.num_milliseconds() <= 0 {
+        return None;
+    }
+    delta.to_std().ok()
 }
 
 async fn dispatch_market_entry(
@@ -601,6 +727,7 @@ async fn dispatch_market_entry(
         model_id,
         max_budget,
         max_wait_ms,
+        market_saturation_patience_secs,
         max_tokens,
         temperature,
         input_tokens_est,
@@ -610,6 +737,15 @@ async fn dispatch_market_entry(
         walker_source_label,
         entry_provider_id,
     } = args;
+
+    // Saturation-retry loop patience budget. Drawn from
+    // compute_participation_policy; walker accumulates elapsed backoff
+    // across /quote → saturation → sleep → re-quote iterations. When
+    // the next scheduled sleep would land past this deadline, walker
+    // concedes market for this chunk and the cascade advances.
+    let patience_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(market_saturation_patience_secs);
+    let mut saturation_attempt: u32 = 0;
 
     // Snapshot node_id from AuthState — canonical runtime identity,
     // populated at registration and kept live via heartbeat/session.
@@ -631,51 +767,150 @@ async fn dispatch_market_entry(
         }
     };
 
-    // ── /quote ────────────────────────────────────────────────────────
-    let quote_body = cqf::ComputeQuoteBody {
-        model_id: model_id.clone(),
-        input_tokens_est,
-        max_tokens,
-        latency_preference: cqf::LatencyPreference::BestPrice,
-        max_budget,
-        // Always present (belt + suspenders — Wire auto-infers when
-        // operator owns 1 node, requires explicit value when >1).
-        requester_node_id: Some(requester_node_id),
-    };
+    // ── Saturation-retry loop ────────────────────────────────────────
+    //
+    // Canonical market posture (per bilateral decision D2 + D4 in
+    // compute-market-saturation-decisions-2026-04-21.md): saturation
+    // means "busy, come back later" — NOT unavailable. Walker MUST
+    // retry the same entry while patience allows; fallback only fires
+    // on true unavailability (`no_offer_for_model` — 404 /
+    // X-Wire-Retry: never / CallTerminal).
+    //
+    // Loop iterations do the /quote → /purchase handshake. On
+    // `all_offers_saturated_for_model` at either step, walker backs
+    // off for `min_expected_drain_ms` (from Wire's structured detail)
+    // and re-enters the loop. /fill and onward are post-loop — once
+    // we've successfully /purchased, the job is reserved and
+    // execution proceeds.
+    let (quote_resp, purchase_resp) = loop {
+        // ── /quote ────────────────────────────────────────────────────
+        let quote_body = cqf::ComputeQuoteBody {
+            model_id: model_id.clone(),
+            input_tokens_est,
+            max_tokens,
+            latency_preference: cqf::LatencyPreference::BestPrice,
+            max_budget,
+            // Always present (belt + suspenders — Wire auto-infers
+            // when operator owns 1 node, requires explicit value
+            // when >1).
+            requester_node_id: Some(requester_node_id.clone()),
+        };
 
-    let quote_resp = cqf::quote(&market_ctx.auth, &market_ctx.config, quote_body)
+        let quote_resp = match cqf::quote(&market_ctx.auth, &market_ctx.config, quote_body).await {
+            Ok(r) => r,
+            Err(api_err) => {
+                if let Some(backoff) = saturation_backoff_from_api_err(&api_err) {
+                    saturation_attempt += 1;
+                    let min_drain_ms = api_err
+                        .body
+                        .get("detail")
+                        .and_then(|d| d.get("min_expected_drain_ms"))
+                        .and_then(|v| v.as_f64())
+                        .map(|ms| ms as u64);
+                    if !apply_saturation_backoff(
+                        ctx,
+                        config,
+                        walker_source_label,
+                        entry_provider_id,
+                        saturation_attempt,
+                        backoff,
+                        patience_deadline,
+                        min_drain_ms,
+                    )
+                    .await
+                    {
+                        return Err(EntryError::RouteSkipped {
+                            reason: "market_saturation_patience_exhausted".into(),
+                        });
+                    }
+                    continue;
+                }
+                return Err(cqf::classify_wire_error(&api_err, "quote"));
+            }
+        };
+
+        // network_quoted chronicle (on successful /quote only).
+        emit_walker_chronicle(
+            ctx,
+            config,
+            super::compute_chronicle::EVENT_NETWORK_QUOTED,
+            walker_source_label,
+            entry_provider_id,
+            serde_json::json!({
+                "quote_id": quote_resp.quote_id,
+                "rate_in_per_m": quote_resp.price_breakdown.matched_rate_in_per_m,
+                "rate_out_per_m": quote_resp.price_breakdown.matched_rate_out_per_m,
+                "reservation_fee": quote_resp.price_breakdown.reservation_fee,
+                "estimated_total": quote_resp.price_breakdown.estimated_total,
+                "queue_position": quote_resp.price_breakdown.queue_position,
+                "model_id": model_id,
+            }),
+        );
+
+        // TODO (Wire rev 2.1.1 pre-gate): once the contracts crate
+        // surfaces `typical_serve_ms_p50_7d` on the offer row + the
+        // market-surface cache, compare
+        // `queue_position × typical_serve_ms_p50_7d` against
+        // `compute_purchase_dispatch_window_s - margin` and skip this
+        // offer (treat as saturation: sleep `min_expected_drain_ms`
+        // then re-quote) when the head-of-queue wait would exceed the
+        // dispatch window. Walker never pays a reservation fee on a
+        // purchase it can't rationally hit. This is D3 in the
+        // bilateral decision doc — the economic contract of a static
+        // deadline is what keeps reservation-fee speculation rational.
+        // Implementing the pre-gate without these data sources would
+        // either over-skip (false negatives) or be a no-op. Dormant
+        // scaffolding until Wire's rev lands.
+
+        // ── /purchase ─────────────────────────────────────────────────
+        let purchase_body = cqf::ComputePurchaseBody {
+            quote_jwt: quote_resp.quote_jwt.clone(),
+            trigger: cqf::ComputePurchaseTrigger::Immediate,
+            idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
+        };
+
+        let purchase_resp = match cqf::purchase(
+            &market_ctx.auth,
+            &market_ctx.config,
+            &quote_resp.quote_jwt,
+            purchase_body,
+        )
         .await
-        .map_err(|api_err| cqf::classify_wire_error(&api_err, "quote"))?;
+        {
+            Ok(r) => r,
+            Err(api_err) => {
+                if let Some(backoff) = saturation_backoff_from_api_err(&api_err) {
+                    saturation_attempt += 1;
+                    let min_drain_ms = api_err
+                        .body
+                        .get("detail")
+                        .and_then(|d| d.get("min_expected_drain_ms"))
+                        .and_then(|v| v.as_f64())
+                        .map(|ms| ms as u64);
+                    if !apply_saturation_backoff(
+                        ctx,
+                        config,
+                        walker_source_label,
+                        entry_provider_id,
+                        saturation_attempt,
+                        backoff,
+                        patience_deadline,
+                        min_drain_ms,
+                    )
+                    .await
+                    {
+                        return Err(EntryError::RouteSkipped {
+                            reason: "market_saturation_patience_exhausted".into(),
+                        });
+                    }
+                    continue;
+                }
+                return Err(cqf::classify_wire_error(&api_err, "purchase"));
+            }
+        };
 
-    // network_quoted chronicle (on success only).
-    emit_walker_chronicle(
-        ctx,
-        config,
-        super::compute_chronicle::EVENT_NETWORK_QUOTED,
-        walker_source_label,
-        entry_provider_id,
-        serde_json::json!({
-            "quote_id": quote_resp.quote_id,
-            "rate_in_per_m": quote_resp.price_breakdown.matched_rate_in_per_m,
-            "rate_out_per_m": quote_resp.price_breakdown.matched_rate_out_per_m,
-            "reservation_fee": quote_resp.price_breakdown.reservation_fee,
-            "estimated_total": quote_resp.price_breakdown.estimated_total,
-            "queue_position": quote_resp.price_breakdown.queue_position,
-            "model_id": model_id,
-        }),
-    );
-
-    // ── /purchase ─────────────────────────────────────────────────────
-    let purchase_body = cqf::ComputePurchaseBody {
-        quote_jwt: quote_resp.quote_jwt.clone(),
-        trigger: cqf::ComputePurchaseTrigger::Immediate,
-        idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
+        break (quote_resp, purchase_resp);
     };
-
-    let purchase_resp =
-        cqf::purchase(&market_ctx.auth, &market_ctx.config, &quote_resp.quote_jwt, purchase_body)
-            .await
-            .map_err(|api_err| cqf::classify_wire_error(&api_err, "purchase"))?;
 
     emit_walker_chronicle(
         ctx,
@@ -732,7 +967,27 @@ async fn dispatch_market_entry(
     }
 
     // ── Await oneshot ────────────────────────────────────────────────
-    let timeout = std::time::Duration::from_millis(max_wait_ms);
+    //
+    // Canonical deadline (per D3): parse Wire's
+    // `purchase_resp.dispatch_deadline_at` (RFC 3339) and await until
+    // that + a small grace (DISPATCH_DEADLINE_GRACE_SECS). Wire owns
+    // the deadline; walker has no independent timer.
+    //
+    // Fallback: if the deadline string fails to parse (shouldn't
+    // happen in practice — Wire always emits RFC 3339 UTC — but we're
+    // defensive), use the legacy `max_wait_ms` safety rail so the
+    // await doesn't become unbounded. A parse failure also logs a
+    // warning so operators notice the contract drift.
+    let timeout = match duration_until_deadline(&purchase_resp.dispatch_deadline_at) {
+        Some(d) => d + std::time::Duration::from_secs(DISPATCH_DEADLINE_GRACE_SECS),
+        None => {
+            tracing::warn!(
+                dispatch_deadline_at = %purchase_resp.dispatch_deadline_at,
+                "dispatch_deadline_at parse failed or already elapsed; falling back to max_wait_ms safety rail",
+            );
+            std::time::Duration::from_millis(max_wait_ms)
+        }
+    };
     cqf::await_result(rx, &purchase_resp.uuid_job_id, &market_ctx.pending_jobs, timeout).await
 }
 
@@ -1958,7 +2213,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
             // out of the DB once per market entry. On any failure we fall
             // back to the default (60s) — absence of a policy row means
             // "use defaults", not "block market".
-            let market_max_wait_ms: u64 = {
+            let (market_max_wait_ms, market_saturation_patience_secs): (u64, u64) = {
                 let db_path = ctx
                     .map(|c| c.db_path.clone())
                     .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
@@ -1970,13 +2225,19 @@ pub async fn call_model_unified_with_audit_and_ctx(
                                 crate::pyramid::local_mode::get_compute_participation_policy(&conn)
                                     .ok()
                             })
-                            .map(|p| p.effective_booleans().market_dispatch_max_wait_ms)
+                            .map(|p| {
+                                let eff = p.effective_booleans();
+                                (
+                                    eff.market_dispatch_max_wait_ms,
+                                    eff.market_saturation_patience_secs,
+                                )
+                            })
                     })
                     .await
                     .ok()
                     .flatten()
-                    .unwrap_or(60_000),
-                    None => 60_000,
+                    .unwrap_or((900_000, 3600)),
+                    None => (900_000, 3600),
                 }
             };
 
@@ -2008,6 +2269,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 model_id: market_model_id.clone(),
                 max_budget,
                 max_wait_ms: market_max_wait_ms,
+                market_saturation_patience_secs,
                 max_tokens: max_tokens_i64,
                 temperature,
                 input_tokens_est: est_input_tokens as i64,
@@ -5104,6 +5366,7 @@ routing_rules:
             model_id: "test-model".into(),
             max_budget: (1i64 << 53) - 1,
             max_wait_ms: 60_000,
+            market_saturation_patience_secs: 3600,
             max_tokens: 0,
             temperature: 0.0,
             input_tokens_est: 0,

@@ -67,6 +67,16 @@ interface ComputeParticipationPolicy {
     // Legacy payloads that still carry them are silently absorbed by the
     // Rust deserializer (deny_unknown_fields removed for this struct).
     market_dispatch_max_wait_ms?: number;
+    /**
+     * Rev 2.1.1 saturation-retry patience budget (seconds, NOT ms —
+     * different quantity from max_wait_ms above). Walker accumulates
+     * elapsed backoff across `all_offers_saturated_for_model` retries;
+     * when cumulative wait exceeds this, cascade advances to fallback.
+     * Default 3600 (batch posture). Operators building interactive
+     * workflows should supersede to ~60 so users don't wait an hour
+     * on a full market queue.
+     */
+    market_saturation_patience_secs?: number;
 }
 
 // Conservative default matching the Rust `Default` impl + bundled
@@ -86,6 +96,7 @@ const defaultComputeParticipationPolicy: ComputeParticipationPolicy = {
     allow_relay_serving: false,
     allow_serving_while_degraded: false,
     market_dispatch_max_wait_ms: 900_000,
+    market_saturation_patience_secs: 3600,
 };
 
 const roleDescriptions: Record<ComputeParticipationMode, { label: string; description: string }> = {

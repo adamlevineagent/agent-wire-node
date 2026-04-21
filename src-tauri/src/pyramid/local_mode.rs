@@ -1867,10 +1867,37 @@ pub struct ComputeParticipationPolicy {
     /// so Wire owns the deadline and walker has no independent timer.
     #[serde(default = "default_market_dispatch_max_wait_ms")]
     pub market_dispatch_max_wait_ms: u64,
+
+    /// Wall-clock patience budget per chunk for market saturation
+    /// backoff. When Wire returns `all_offers_saturated_for_model` and
+    /// walker enters its saturation-retry loop, it accumulates elapsed
+    /// backoff time; if the accumulated wait exceeds this value, walker
+    /// concedes market for THIS chunk and advances the cascade to
+    /// fleet/openrouter/ollama-local (treating saturation as
+    /// RouteSkipped at the entry level only after patience exhaustion).
+    ///
+    /// Default is 3600s (1 hour) — sized for batch corpus builds where
+    /// slow-and-steady through the market is the canonical behavior
+    /// (10,000-chunk pyramid served by one 15s/chunk provider is a
+    /// ~42-hour job by design). Operators building interactive tools
+    /// should supersede to a much lower value (e.g. 60s) — when a user
+    /// is waiting for an answer, falling back to a faster provider is
+    /// preferable to a long queue wait.
+    ///
+    /// Units are SECONDS (not milliseconds), unlike
+    /// `market_dispatch_max_wait_ms` above. Different quantities —
+    /// `max_wait_ms` is a single-dispatch safety rail, this is the
+    /// cumulative patience across a retry loop.
+    #[serde(default = "default_market_saturation_patience_secs")]
+    pub market_saturation_patience_secs: u64,
 }
 
 fn default_market_dispatch_max_wait_ms() -> u64 {
     900_000
+}
+
+fn default_market_saturation_patience_secs() -> u64 {
+    3600
 }
 
 /// Resolved booleans after applying mode projection + explicit overrides.
@@ -1893,6 +1920,13 @@ pub struct EffectiveParticipationPolicy {
     // raw policy (no projection). See `ComputeParticipationPolicy`
     // for semantics.
     pub market_dispatch_max_wait_ms: u64,
+
+    /// Rev 2.1.1 operational knob — wall-clock cumulative backoff
+    /// budget per chunk when Wire returns `all_offers_saturated_for_model`.
+    /// Walker's saturation-retry loop gives up and advances the cascade
+    /// once accumulated backoff wait exceeds this value. See
+    /// `ComputeParticipationPolicy.market_saturation_patience_secs`.
+    pub market_saturation_patience_secs: u64,
 }
 
 /// Per DD-I: compute the 8 projectable booleans implied by a mode preset.
@@ -1953,6 +1987,7 @@ impl ComputeParticipationPolicy {
             allow_relay_serving: self.allow_relay_serving.unwrap_or(rs),
             allow_serving_while_degraded: self.allow_serving_while_degraded,
             market_dispatch_max_wait_ms: self.market_dispatch_max_wait_ms,
+            market_saturation_patience_secs: self.market_saturation_patience_secs,
         }
     }
 }
@@ -1999,6 +2034,9 @@ impl Default for ComputeParticipationPolicy {
             allow_serving_while_degraded: false,
             // Phase 3 dispatch wall-clock.
             market_dispatch_max_wait_ms: default_market_dispatch_max_wait_ms(),
+            // Rev 2.1.1 saturation-backoff patience (cumulative wall-clock
+            // across a chunk's retry loop; see field doc).
+            market_saturation_patience_secs: default_market_saturation_patience_secs(),
         }
     }
 }
@@ -2574,6 +2612,7 @@ mod tests {
             allow_relay_serving: None,
             allow_serving_while_degraded: false,
             market_dispatch_max_wait_ms: 60_000,
+            market_saturation_patience_secs: 3600,
         };
         let eff = p.effective_booleans();
         assert!(eff.allow_fleet_dispatch, "explicit true must win over worker projection");
@@ -2605,6 +2644,7 @@ mod tests {
                 allow_relay_serving: None,
                 allow_serving_while_degraded: false,
                 market_dispatch_max_wait_ms: 60_000,
+                market_saturation_patience_secs: 3600,
             };
             let eff = p.effective_booleans();
             let (fd, fs, md, mv, sp, sh, ru, rs) = project_mode(mode);
@@ -2639,6 +2679,7 @@ mod tests {
             allow_relay_serving: None,
             allow_serving_while_degraded: true,
             market_dispatch_max_wait_ms: 60_000,
+            market_saturation_patience_secs: 3600,
         };
         let yaml = serde_yaml::to_string(&p).unwrap();
         // None fields are absent — no stray `null` or `~`.
