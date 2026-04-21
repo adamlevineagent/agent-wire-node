@@ -1017,6 +1017,14 @@ pub struct LlmConfig {
     /// acquisition. See
     /// `docs/plans/call-model-unified-market-integration.md` §3.5.
     pub compute_market_context: Option<crate::pyramid::compute_market_ctx::ComputeMarketRequesterContext>,
+    /// Rev 2.1 `/api/v1/compute/market-surface` cache (Wave 3).
+    /// Walker consults this on the `"market"` branch as an advisory
+    /// pre-filter — `/quote` remains the authoritative viability check.
+    /// Populated by a Tokio polling task spawned from `main.rs` at boot
+    /// (60s cadence aligned with Wire's `Cache-Control: max-age=60`).
+    /// `None` in tests / pre-init — walker treats a missing cache as
+    /// "cold" and advances silently per plan §5.1.
+    pub market_surface_cache: Option<std::sync::Arc<crate::pyramid::market_surface_cache::MarketSurfaceCache>>,
 }
 
 /// Phase 12: cache plumbing that lives on an LlmConfig so every call
@@ -1112,6 +1120,10 @@ impl std::fmt::Debug for LlmConfig {
                 "compute_market_context",
                 &self.compute_market_context.as_ref().map(|_| "<compute_market_context>"),
             )
+            .field(
+                "market_surface_cache",
+                &self.market_surface_cache.as_ref().map(|_| "<market_surface_cache>"),
+            )
             .finish()
     }
 }
@@ -1146,6 +1158,7 @@ impl Default for LlmConfig {
             fleet_roster: None,
             fleet_dispatch: None,
             compute_market_context: None,
+            market_surface_cache: None,
         }
     }
 }

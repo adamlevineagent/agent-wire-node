@@ -707,6 +707,7 @@ impl PyramidConfig {
             fleet_roster: None,
             fleet_dispatch: None,
             compute_market_context: None,
+            market_surface_cache: None,
         }
     }
 
