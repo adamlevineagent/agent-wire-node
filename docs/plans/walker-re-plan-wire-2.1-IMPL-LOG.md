@@ -21,6 +21,28 @@ Entry template:
 **Deviation:** None / <rationale if any>
 -->
 
+## 2026-04-21 — commit da67787 (branch walker-re-plan-wire-2.1)
+
+**Plan task:** Wave 1 task 11 — `pyramid_llm_audit.provider_id` schema migration + `complete_llm_audit` + `fail_llm_audit` signature extension.
+
+**Changed:**
+- `src-tauri/src/pyramid/db.rs` — idempotent `pragma_table_info` ALTER adds `provider_id TEXT` (nullable, no CHECK), mirroring the cache_hit pattern at :1038-1049. `complete_llm_audit` + `fail_llm_audit` gain a final `provider_id: Option<&str>` parameter; UPDATE statements write `provider_id = ?N`. `get_node_audit_records` + `get_llm_audit_by_id` SELECTs now project a 21st `provider_id` column; `parse_llm_audit_row` reads it into `LlmAuditRecord`. Three new tests appended to the first `tests` mod (`test_provider_id_none_legacy`, `test_provider_id_walker_style`, `test_provider_id_migration_idempotent`).
+- `src-tauri/src/pyramid/llm.rs:2952,2985` — two legacy call sites updated to pass `None` (walker stamping lands in Wave 1 tasks 8-10).
+- `src-tauri/src/pyramid/types.rs` — `LlmAuditRecord` gains `pub provider_id: Option<String>` with `#[serde(default)]` for backward-compat JSON.
+- `src-tauri/src/main.rs` — `get_build_chronicle_events` `pyramid_llm_audit` SELECT extended to project `provider_id`; emitted in the JSON row so the chronicle UI can surface routing analytics (fleet/market/pool) alongside `model`.
+- `src/components/theatre/types.ts` — TS `LlmAuditRecord` gains `provider_id?: string | null` to mirror the Rust record.
+
+**Cargo check:** clean (default target, `cargo check` from `src-tauri/`). 70 warnings total (69 lib + 1 bin), unchanged from Wave 0 baseline.
+**Cargo test:** `cargo test --lib pyramid::db::tests::test_provider_id` — 3/3 pass. Full suite `cargo test --lib` — 1758 passed, 15 failed. Delta vs Wave 0 baseline (1755 + 15): +3 new tests, zero regressions. The 15 pre-existing failures are untouched.
+
+**Downstream-projection decisions:**
+- *Extended:* Oversight/Inspector (`get_node_audit_records`, `get_llm_audit_by_id`, `LlmAuditRecord` on both sides) + chronicle (`get_build_chronicle_events`). These are the consumer paths the plan specifically calls out ("Oversight page … queries keyed on this table").
+- *Deferred to Wave 5:* `src-tauri/src/pyramid/cost_model.rs::recompute_from_audit`. The current SQL groups by `(step_name, model)`; adding `provider_id` to the projection would require either (a) adding it to GROUP BY — which changes cost-model semantics and could double-bucket walker-vs-direct calls — or (b) introducing MAX(provider_id) / DISTINCT-pair aggregation, which is a design call about how routing-aware cost models should work. Plan §15 explicitly defers audit-row schema cleanup past walker; cost-model routing-aware recompute belongs in Wave 5. Behavior preserved intact for now.
+
+**Deviation:** None.
+
+---
+
 ## 2026-04-21 06:30 — Wave 0 wave-level verifier pass (no code changes)
 
 **Plan task:** Wave 0 wave-level verification — fresh eyes across tasks 1-9 as an integrated whole.
