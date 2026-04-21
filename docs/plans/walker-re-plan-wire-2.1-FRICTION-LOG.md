@@ -8,6 +8,26 @@ Real-time record of surprises, workarounds, and "this bit me" moments. Newest at
 
 ---
 
+## 2026-04-21 — Wave 4 task 30 (InferenceRoutingPanel)
+
+**Surprise: No React test infra.** `package.json` has no Jest/Vitest/RTL. Wave 4 plan expected component tests but the codebase has never shipped them. Deferred per task 30 in-prompt fallback ("defer and note in friction log"). Recommend a separate task to add Vitest + @testing-library/react + jsdom, then backfill InferenceRoutingPanel + a couple of other high-churn components (Settings.tsx participation-policy handlers, ContributionDetailDrawer).
+
+**No backend change needed.** Plan §8 task 30 specifies `pyramid_active_config_contribution` + `pyramid_supersede_config` as the load/save surface. Grep confirmed both IPCs already exist at main.rs:9475 + 9430 and are used by `ToolsMode.tsx` for other contribution types. Panel mirrors that invocation pattern; zero Rust edits this commit.
+
+**TypeScript type placement.** `src/types/` has `configContributions.ts` but no `dispatchPolicy.ts`. Declared the shapes adjacent to the component because there's only one consumer today. Promote to `src/types/dispatchPolicy.ts` when a second consumer appears.
+
+**`DispatchPolicyYaml` unknown-fields round-trip.** Rust side doesn't `deny_unknown_fields`. Added `[key: string]: unknown` so `yaml.load → yaml.dump` round-trip preserves fields we don't touch.
+
+**`structuredClone` availability.** Safe on macOS WKWebView + Tauri 2.x WebView2. If a future Linux target hits an older-WebKitGTK regression, fall back to `JSON.parse(JSON.stringify(...))`.
+
+**`max_budget_credits` UX copy.** Labeled "Max budget (credits) — leave blank for no cap." Kept explicit because the `None → NO_BUDGET_CAP` sentinel is easy to misread as "0 means no cap" (opposite of reality).
+
+**Mount-point ordering.** Placed above "Local LLM (Ollama)" section at Settings.tsx:871 per plan task 31. Pre-Wave-4 comment at Settings.tsx:60 can be removed in Wave 5 cleanup.
+
+**Out-of-scope but noted.** Plan task 30 sub-bullets (Discovery section reading MarketSurfaceCache, Market-row `max_wait_ms` readonly display) require task 28 (MarketSurfaceCache polling) + task 29 (`pyramid_market_models` IPC) first. Held for the Wave 4 successor agent.
+
+---
+
 <!--
 Entry template:
 

@@ -9,6 +9,32 @@ Append-only log of what's done. Newest at top. Updated at every commit.
 
 ---
 
+## 2026-04-21 — commits f9895db + 8b7a4ea (branch walker-re-plan-wire-2.1)
+
+**Plan tasks:** Wave 4 tasks 30 + 31 + 33 (Inference Routing Settings panel + mount + debounced save). Tasks 28 (MarketSurfaceCache polling), 29 (pyramid_market_models IPC), 32 (invisibility copy audit), 34 (verifier pass) remain for subsequent Wave 4 work.
+
+**Changed:**
+- `src/components/settings/InferenceRoutingPanel.tsx` (new, 589 LOC) — React component that loads active `dispatch_policy` via `pyramid_active_config_contribution`, parses YAML with `js-yaml`, offers RouteEntry editor (provider_id / model_id / tier_name / is_local / max_budget_credits), up/down reorder buttons, add/delete, dirty-state indicator, note-required Apply (throttled to 1/sec), Reset.
+- `src/components/Settings.tsx` — 2 insertions: import + `<InferenceRoutingPanel />` mount above the Local LLM (Ollama) section at line 871 (the anchor referenced by the pre-Wave-4 comment at line 60).
+
+**Scope decisions (land-your-judgment per handoff §"What plan does NOT specify"):**
+- Edits the DEFAULT rule only (first rule named `default`, else `routing_rules[0]`) — minimum viable per plan. Other rules shown read-only in collapsible summary with pointer at the Tools-tab raw YAML editor for multi-rule edits.
+- Up/down buttons over native drag-drop (plan forbids drag-drop lib).
+- Apply-only save with 1000ms throttle — no save-on-blur per field; operator explicitly Applies. Prevents supersession flood that would hot-reload `provider_pools`.
+- `max_budget_credits` input is `type="number"` with blank = `null` (= NO_BUDGET_CAP sentinel server-side). Non-integer / negative reject at Apply time with clear error.
+- Provider validation is local-only: `provider_id` non-empty required; no roundtrip to a known-provider catalog (deferred per plan).
+
+**No new IPC/HTTP surface:** the existing `pyramid_active_config_contribution` (main.rs:9475) + `pyramid_supersede_config` (main.rs:9430) handle load + save. Mirrored `ToolsMode.tsx:447-492` pattern for the load call.
+
+**TypeScript/Rust mirror types:** declared `RouteEntry`, `RoutingRuleShape`, `MatchConfigShape`, `DispatchPolicyYaml` adjacent to the component (not in `src/types/`). These mirror `src-tauri/src/pyramid/dispatch_policy.rs`. Deferred a shared `src/types/dispatchPolicy.ts` until a second consumer appears. `DispatchPolicyYaml` uses `[key: string]: unknown` to round-trip unknown fields unchanged (Rust side doesn't `deny_unknown_fields`).
+
+**Build:** `npm run build` (tsc + vite) — clean, 178 modules. `cargo check` default target — clean (no backend change). No new Rust tests; backend untouched.
+
+**Deviation:** None from Wave 4 scope. Tasks 28/29/32/34 intentionally out-of-scope for this commit set per the focused Wave 4 prompt.
+
+**Dev-smoke:** Flag for Adam's morning review — open Settings, scroll to "Inference Routing" above "Local LLM (Ollama)". Expect to see current policy's default rule entries editable, move buttons functional, Apply disabled until note entered + dirty.
+
+
 ## 2026-04-21 — Wave 3 post-verifier — per-slug chronicle events wired (commits 429d71c, a39e786)
 
 **Plan task:** Wave 3 verifier fix — 7 per-slug chronicle event constants declared in `compute_chronicle.rs:208-221` but un-emitted from live walker market branch. Operator telemetry keyed on `network_quote_expired` / `network_purchase_recovered` / `network_rate_above_budget` / `network_dispatch_deadline_missed` / `network_provider_saturated` / `network_balance_insufficient_for_market` / `network_auth_expired` was silent.
