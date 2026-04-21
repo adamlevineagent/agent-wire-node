@@ -21,6 +21,14 @@ Entry template:
 **Deviation:** None / <rationale if any>
 -->
 
+## 2026-04-21 06:00 — commit <PENDING> (branch walker-re-plan-wire-2.1)
+
+**Plan task:** Wave 0 task 8 — `compute_quote_flow` skeleton module.
+**Changed:** New file `src-tauri/src/pyramid/compute_quote_flow.rs` (~266 LOC). `pub mod compute_quote_flow;` inserted between `compute_market_ops` and `compute_requester` in `src-tauri/src/pyramid/mod.rs`. Re-exports `ComputeQuoteBody`, `ComputeQuoteResponse`, `ComputeQuotePriceBreakdown`, `ComputePurchaseBody`, `ComputePurchaseResponse`, `ComputePurchaseTrigger`, `LatencyPreference` from `agent_wire_contracts` (rev `a9e356d3` — `uuid_job_id` already present on `ComputePurchaseResponse` per Q5). `ComputeFillBody` declared locally (contracts crate does not yet export it); fields match Wire-dev's Q4 answer + spec §1.8 including optional `max_tokens`. Four public stubs: `quote()`, `purchase(quote_jwt, body)`, `fill()`, `await_result()` — all `unimplemented!("Wave 3")`. Private `classify_rev21_slug()` maps all §4.2 slugs to three-tier `EntryError` with per-arm rationale doc-comments; unknown-slug default is `RouteSkipped` (conservative advance). **No `resolve_uuid_from_purchase`** — rev-2.1 `/purchase` response carries `uuid_job_id` directly. Module-doc banner forbids reintroduction.
+**Cargo check:** clean (default target). 69 lib warnings (same baseline).
+**Cargo test:** `cargo test --lib compute_quote_flow` — 1/1 pass (`classify_rev21_slug_maps_insufficient_balance_to_route_skipped`).
+**Deviation:** None. Bodies pending Wave 3 per plan §8 task 8 ("stubs returning `unimplemented!(\"Wave 3\")` — body goes in Wave 3").
+
 ## 2026-04-21 05:00 — commit 80c962a (branch walker-re-plan-wire-2.1)
 
 **Plan task:** Wave 0 task 9 — `MarketSurfaceCache` skeleton module.
