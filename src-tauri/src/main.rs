@@ -9471,6 +9471,26 @@ async fn pyramid_supersede_config(
     Ok(SupersedeConfigResponse { new_contribution_id })
 }
 
+/// Wave 4 task 29 (walker-re-plan-wire-2.1 §8): flattened UI view of
+/// the `MarketSurfaceCache` snapshot. Returns `[]` on cold cache (pre-
+/// tunnel fresh install, or first 60s after boot before the initial
+/// poll lands) — callers treat `[]` as "not yet populated" not "no
+/// models exist on the network". Shape defined by `PyramidMarketModel`
+/// in `market_surface_cache.rs`.
+#[tauri::command]
+async fn pyramid_market_models(
+    state: tauri::State<'_, SharedState>,
+) -> Result<Vec<wire_node_lib::pyramid::market_surface_cache::PyramidMarketModel>, String> {
+    let cache_opt = {
+        let cfg = state.pyramid.config.read().await;
+        cfg.market_surface_cache.clone()
+    };
+    match cache_opt {
+        Some(cache) => Ok(cache.snapshot_ui_models().await),
+        None => Ok(Vec::new()),
+    }
+}
+
 #[tauri::command]
 async fn pyramid_active_config_contribution(
     state: tauri::State<'_, SharedState>,
@@ -14122,6 +14142,7 @@ fn main() {
             pyramid_create_config_contribution,
             pyramid_supersede_config,
             pyramid_active_config_contribution,
+            pyramid_market_models,
             pyramid_config_version_history,
             pyramid_get_config_history,
             pyramid_propose_config,

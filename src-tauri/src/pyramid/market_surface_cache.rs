@@ -25,10 +25,34 @@ use anyhow::anyhow;
 use tokio::sync::RwLock;
 
 use agent_wire_contracts::{MarketSurfaceMarket, MarketSurfaceModel, MarketSurfaceResponse};
+use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthState;
 use crate::http_utils::send_api_request;
 use crate::WireNodeConfig;
+
+/// UI-facing flattened model row. Returned by `pyramid_market_models`
+/// IPC (Wave 4 task 29) and consumed by the Settings panel's Discovery
+/// section + provider/model autocomplete.
+///
+/// Shape deliberately narrower than `MarketSurfaceModel` — the frontend
+/// only needs identity, liquidity, and median pricing. Timestamp is the
+/// `market.last_updated_at` from the last successful refresh (not
+/// per-model — Wire's `last_offer_update_at` is per-model but optional;
+/// aggregate staleness is more honest for a UI badge).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PyramidMarketModel {
+    pub model_id: String,
+    pub active_offers: i64,
+    /// Median of Wire-reported rate_per_m_input, in credits. `None` when
+    /// Wire couldn't compute a median (e.g. every offer has a null rate).
+    pub rate_in_per_m: Option<i64>,
+    /// Median of Wire-reported rate_per_m_output, in credits.
+    pub rate_out_per_m: Option<i64>,
+    /// RFC-3339 timestamp from `market.last_updated_at` at the last
+    /// successful refresh. Same value across all rows in one snapshot.
+    pub last_updated_at: String,
+}
 
 /// Snapshot of the last successful `/api/v1/compute/market-surface` response.
 ///
@@ -117,6 +141,36 @@ impl MarketSurfaceCache {
         guard
             .as_ref()
             .and_then(|d| d.models.get(model_id).cloned())
+    }
+
+    /// Flattened read-only snapshot of the current cache state for
+    /// UI consumption. Returns `[]` when cold (no poll has landed yet).
+    /// Each entry carries the fields the Settings panel + autocomplete
+    /// need without leaking the full `MarketSurfaceModel` shape to the
+    /// frontend. Rates use the median of the Wire-reported triple; a
+    /// missing median surfaces as `None`.
+    ///
+    /// Wave 4 task 29. See `docs/plans/walker-re-plan-wire-2.1.md` §8.
+    pub async fn snapshot_ui_models(&self) -> Vec<PyramidMarketModel> {
+        let guard = self.data.read().await;
+        let Some(data) = guard.as_ref() else {
+            return Vec::new();
+        };
+        let last_updated_at = data.market.last_updated_at.clone();
+        let mut out: Vec<PyramidMarketModel> = data
+            .models
+            .values()
+            .map(|m| PyramidMarketModel {
+                model_id: m.model_id.clone(),
+                active_offers: m.active_offers,
+                rate_in_per_m: m.price.rate_per_m_input.median,
+                rate_out_per_m: m.price.rate_per_m_output.median,
+                last_updated_at: last_updated_at.clone(),
+            })
+            .collect();
+        // Stable alphabetical order so the UI doesn't reflow on refresh.
+        out.sort_by(|a, b| a.model_id.cmp(&b.model_id));
+        out
     }
 
     /// Trigger an out-of-band refresh — used by the walker as a hint
@@ -367,6 +421,82 @@ mod tests {
             cache.get_model("unknown/model").await.is_none(),
             "absent slug should miss"
         );
+    }
+
+    /// `snapshot_ui_models` on cold cache returns an empty Vec, not a
+    /// panic or error. The IPC contract promises `[]` for pre-tunnel +
+    /// pre-first-poll nodes.
+    #[tokio::test]
+    async fn snapshot_ui_models_cold_cache_is_empty() {
+        // Construct with no data at all — the only way to reach the
+        // `None` branch of `self.data` without a test-mode helper.
+        // We use with_test_data but with an empty models map; the
+        // `snapshot_ui_models` fn returns `[]` for both `None` and
+        // `Some(empty)` which is the invariant we're asserting.
+        let cache = MarketSurfaceCache::with_test_data(CacheData {
+            market: test_market(),
+            models: HashMap::new(),
+            generated_at: chrono::Utc::now(),
+        });
+        let snap = cache.snapshot_ui_models().await;
+        assert!(snap.is_empty(), "empty cache must produce empty snapshot");
+    }
+
+    /// Warm cache with two models: snapshot returns both rows in stable
+    /// alphabetical order; median rates flow through from the price
+    /// triple; last_updated_at mirrors `market.last_updated_at`.
+    #[tokio::test]
+    async fn snapshot_ui_models_warm_cache_shape() {
+        // Build a market with a known last_updated_at distinct from the
+        // default fixture so we can assert the passthrough.
+        let mut market = test_market();
+        market.last_updated_at = "2026-04-21T10:00:00Z".to_string();
+
+        // Model A: both medians populated. Model B: medians absent.
+        let model_a: MarketSurfaceModel = serde_json::from_value(serde_json::json!({
+            "model_id": "provider/model-a",
+            "provider_count": 2,
+            "active_offers": 5,
+            "price": {
+                "rate_per_m_input": { "min": 100, "median": 150, "max": 200 },
+                "rate_per_m_output": { "min": 300, "median": 400, "max": 500 },
+            },
+            "queue": { "total_capacity": 0, "current_depth": 0, "unbounded_offers": 0 },
+            "performance": {
+                "p50_latency_ms": null, "p95_latency_ms": null,
+                "median_tps": null, "success_rate_7d": null,
+            },
+            "top_of_book": { "cheapest_with_headroom": null },
+            "demand_24h": { "jobs_matched": 0, "jobs_settled": 0, "queue_fill_events": 0 },
+            "last_offer_update_at": null,
+        })).expect("fixture shape");
+
+        let model_b = test_model("provider/model-b", 2);
+
+        let mut models = HashMap::new();
+        // Insert in reverse sorted order so we can detect the sort.
+        models.insert(model_b.model_id.clone(), model_b);
+        models.insert(model_a.model_id.clone(), model_a);
+
+        let cache = MarketSurfaceCache::with_test_data(CacheData {
+            market,
+            models,
+            generated_at: chrono::Utc::now(),
+        });
+
+        let snap = cache.snapshot_ui_models().await;
+        assert_eq!(snap.len(), 2);
+        // Alphabetical: model-a < model-b.
+        assert_eq!(snap[0].model_id, "provider/model-a");
+        assert_eq!(snap[0].active_offers, 5);
+        assert_eq!(snap[0].rate_in_per_m, Some(150));
+        assert_eq!(snap[0].rate_out_per_m, Some(400));
+        assert_eq!(snap[0].last_updated_at, "2026-04-21T10:00:00Z");
+
+        assert_eq!(snap[1].model_id, "provider/model-b");
+        assert_eq!(snap[1].active_offers, 2);
+        assert_eq!(snap[1].rate_in_per_m, None);
+        assert_eq!(snap[1].rate_out_per_m, None);
     }
 
     /// `refresh_now` on a test-only instance (no auth/config handles)
