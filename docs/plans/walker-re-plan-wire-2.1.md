@@ -859,6 +859,18 @@ Most of my initial questions were answerable from reading `wire-node-compute-mar
 
 - **rev 0.1 (this rev)** — fresh plan against Wire rev 2.1; superseded cascade plan marked obsolete. Needs one clean blind audit before implementation.
 
+### Post-ship finding — 2026-04-21
+
+**Local Mode disable path wrote walker-incompatible dispatch_policy YAML** — caught by Mac post-ship smoke. Plan's Wave 2 task 17 updated the READ side of `local_mode.rs` (`resolve_local_for_rule` filters `"market"` alongside `"fleet"`) but did NOT audit the WRITE side. The disable fallback at `local_mode.rs:1074-1094` (`restore_dispatch_policy_contribution_id IS NULL` branch) hardcoded a stub YAML with empty `provider_pools` and NO `routing_rules`. Walker's `resolve_route` returned `ResolvedRoute { providers: [] }` → walker iterated zero entries → `fail_audit("no viable route")` → every build failed `0m 0s | 0/0 steps`, chronicle blank.
+
+**Repro class:** DBs where `restore_dispatch_policy_contribution_id` was never populated — Local Mode toggled ENABLE before the walker's bundled seed shipped. Pre-walker installs + any Local-Mode toggle history are affected.
+
+**Plan scope gap:** Wave 5 "string-match audit" (task 37) covered call sites reading `"fleet"`/`"market"` sentinels but did not extend to "audit any hardcoded dispatch_policy YAML written by operational handlers." Future plan retros should widen the scope of "string-match audit" to include schema-writer handlers that construct YAML blobs inline — a stripped-stub handler that predates the bundled seed is the same class of bug.
+
+**Fix:** fallback reads `bundled-dispatch_policy-default-v1` from `pyramid_config_contributions` (shipped Wave 0 task 1) instead of hardcoding a stub; raises `anyhow!` if the bundled seed is missing rather than silently writing broken YAML. Regression guard test at `local_mode.rs::tests::bundled_dispatch_policy_seed_has_routing_rules_with_providers` asserts the bundled seed ships with non-empty `routing_rules` + `route_to` — this test would have caught the regression at unit-test time. Shipped on branch `fix/local-mode-disable-gutted-dispatch-policy`.
+
+**Follow-up chip:** `local_mode.rs:832-853` (enable path) still hardcodes a dispatch_policy YAML. Pre-existing `TODO` comment flags Pillar 37 violation. Now feasible to fix via the bundled seed + Local-Mode overrides (ollama-only routing chain, concurrency=1). Not walker-blocking.
+
 ---
 
 ## 14. Open items / backlog for post-ship retro

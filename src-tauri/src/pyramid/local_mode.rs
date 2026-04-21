@@ -1072,17 +1072,40 @@ pub fn commit_disable_local_mode(
             }
         }
     } else {
-        // No prior dispatch_policy — supersede the current one with a
-        // minimal default that restores the "no policy" state.
+        // No prior dispatch_policy to restore — fall back to the bundled
+        // default contribution's YAML so the walker has routing_rules to
+        // iterate. The old fallback hardcoded a stripped-down YAML with
+        // an EMPTY provider_pools and NO routing_rules, which gutts the
+        // walker: `resolve_route` returns a ResolvedRoute with zero
+        // providers → walker iterates zero entries → fail_audit("no
+        // viable route") → every build fails 0m 0s | 0/0 steps.
+        //
+        // This only bit DBs where restore_dispatch_policy_contribution_id
+        // was never populated (Local Mode toggled ENABLE before the
+        // walker's bundled seed shipped). Post-walker fresh installs seed
+        // the bundled policy on boot, so restore_* captures it on the
+        // first enable and the `if` branch above handles disable cleanly.
+        //
+        // Raise error rather than write a stub if the bundled seed is
+        // missing — that's a boot-hydration invariant violation that
+        // should surface rather than silently paper over.
         if let Some(active_now) =
             load_active_config_contribution(conn, "dispatch_policy", None)?
         {
-            let default_yaml = "schema_type: dispatch_policy\nversion: 1\nprovider_pools: {}\nbuild_coordination:\n  defer_maintenance_during_build: false\n";
+            let fallback = load_contribution_by_id(conn, "bundled-dispatch_policy-default-v1")?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "local-mode disable: bundled-dispatch_policy-default-v1 seed missing from \
+                         pyramid_config_contributions — cannot restore default routing. This is a \
+                         boot-hydration invariant violation; confirm bundled_contributions.json \
+                         is ingested correctly."
+                    )
+                })?;
             let new_id = supersede_config_contribution(
                 conn,
                 &active_now.contribution_id,
-                default_yaml,
-                "local mode disabled — restoring default dispatch_policy",
+                &fallback.yaml_content,
+                "local mode disabled — restoring bundled default dispatch_policy",
                 "local_mode_toggle",
                 Some("user"),
             )?;
@@ -2697,6 +2720,64 @@ mod tests {
         assert!(eff.allow_market_dispatch);
         assert!(eff.allow_storage_hosting);
         assert!(eff.allow_relay_serving);
+    }
+
+    #[test]
+    fn bundled_dispatch_policy_seed_has_routing_rules_with_providers() {
+        // Regression guard: local_mode disable path falls back to
+        // bundled-dispatch_policy-default-v1 when no prior policy was
+        // captured. That fallback must contain `routing_rules` with a
+        // non-empty `route_to` — otherwise the walker's resolve_route
+        // returns zero providers and every subsequent build fails
+        // "no viable route" (0m 0s | 0/0 steps).
+        //
+        // The old hardcoded fallback YAML was gutted (empty
+        // provider_pools, no routing_rules) — this test would have
+        // caught that regression at unit-test time.
+        let manifest = crate::pyramid::wire_migration::load_bundled_manifest().unwrap();
+        let seed = manifest
+            .contributions
+            .iter()
+            .find(|e| e.contribution_id == "bundled-dispatch_policy-default-v1")
+            .expect("bundled manifest must contain dispatch_policy-default-v1");
+
+        // Raw YAML check: the two tokens the walker needs.
+        assert!(
+            seed.yaml_content.contains("routing_rules:"),
+            "bundled dispatch_policy seed is missing `routing_rules:` — walker will \
+             resolve an empty route and every build will fail"
+        );
+        assert!(
+            seed.yaml_content.contains("route_to:"),
+            "bundled dispatch_policy seed is missing `route_to:` — walker has no \
+             entries to iterate"
+        );
+
+        // Structural check: parse + confirm route_to is non-empty.
+        let parsed: crate::pyramid::dispatch_policy::DispatchPolicyYaml =
+            serde_yaml::from_str(&seed.yaml_content).expect("bundled seed must be valid YAML");
+        assert!(
+            !parsed.routing_rules.is_empty(),
+            "bundled seed must ship with at least one routing_rule"
+        );
+        let default_rule = parsed
+            .routing_rules
+            .iter()
+            .find(|r| r.name == "default")
+            .expect("bundled seed must have a `default` routing rule");
+        assert!(
+            !default_rule.route_to.is_empty(),
+            "bundled seed's default rule must have at least one route_to entry"
+        );
+
+        // Constructor check: the full pipeline used by
+        // sync_config_to_operational must build a DispatchPolicy with
+        // non-empty rules.
+        let policy = crate::pyramid::dispatch_policy::DispatchPolicy::from_yaml(&parsed);
+        assert!(
+            !policy.rules.is_empty(),
+            "constructed DispatchPolicy must have rules the walker can resolve"
+        );
     }
 
     #[test]
