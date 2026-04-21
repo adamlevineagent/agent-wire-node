@@ -5760,5 +5760,131 @@ routing_rules:
         };
         assert_eq!(e.to_string(), "route_skipped: insufficient_balance");
     }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Per-slug chronicle event mapping — covers the 7 market-specific event
+    // constants declared in compute_chronicle.rs and wired in the walker
+    // market branch.
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn map_market_slug_quote_jwt_expired_is_quote_expired_event() {
+        assert_eq!(
+            map_market_slug_to_specific_event("quote_jwt_expired"),
+            Some(super::super::compute_chronicle::EVENT_NETWORK_QUOTE_EXPIRED),
+        );
+    }
+
+    #[test]
+    fn map_market_slug_bare_quote_expired_is_quote_expired_event() {
+        assert_eq!(
+            map_market_slug_to_specific_event("quote_expired"),
+            Some(super::super::compute_chronicle::EVENT_NETWORK_QUOTE_EXPIRED),
+        );
+    }
+
+    #[test]
+    fn map_market_slug_quote_already_purchased_is_purchase_recovered() {
+        assert_eq!(
+            map_market_slug_to_specific_event("quote_already_purchased"),
+            Some(super::super::compute_chronicle::EVENT_NETWORK_PURCHASE_RECOVERED),
+        );
+    }
+
+    #[test]
+    fn map_market_slug_budget_exceeded_is_rate_above_budget() {
+        assert_eq!(
+            map_market_slug_to_specific_event("budget_exceeded"),
+            Some(super::super::compute_chronicle::EVENT_NETWORK_RATE_ABOVE_BUDGET),
+        );
+    }
+
+    #[test]
+    fn map_market_slug_dispatch_deadline_exceeded_is_deadline_missed() {
+        assert_eq!(
+            map_market_slug_to_specific_event("dispatch_deadline_exceeded"),
+            Some(super::super::compute_chronicle::EVENT_NETWORK_DISPATCH_DEADLINE_MISSED),
+        );
+    }
+
+    #[test]
+    fn map_market_slug_provider_queue_full_is_provider_saturated() {
+        assert_eq!(
+            map_market_slug_to_specific_event("provider_queue_full"),
+            Some(super::super::compute_chronicle::EVENT_NETWORK_PROVIDER_SATURATED),
+        );
+    }
+
+    #[test]
+    fn map_market_slug_provider_depth_exceeded_is_provider_saturated() {
+        // /fill-stage saturation aliases to the same operator-facing event
+        // as /purchase-stage `provider_queue_full` — both mean "provider
+        // can't take any more right now."
+        assert_eq!(
+            map_market_slug_to_specific_event("provider_depth_exceeded"),
+            Some(super::super::compute_chronicle::EVENT_NETWORK_PROVIDER_SATURATED),
+        );
+    }
+
+    #[test]
+    fn map_market_slug_insufficient_balance_is_balance_insufficient() {
+        assert_eq!(
+            map_market_slug_to_specific_event("insufficient_balance"),
+            Some(
+                super::super::compute_chronicle::EVENT_NETWORK_BALANCE_INSUFFICIENT_FOR_MARKET,
+            ),
+        );
+    }
+
+    #[test]
+    fn map_market_slug_balance_depleted_is_balance_insufficient() {
+        assert_eq!(
+            map_market_slug_to_specific_event("balance_depleted"),
+            Some(
+                super::super::compute_chronicle::EVENT_NETWORK_BALANCE_INSUFFICIENT_FOR_MARKET,
+            ),
+        );
+    }
+
+    #[test]
+    fn map_market_slug_stage_auth_failures_are_auth_expired() {
+        for reason in [
+            "quote_auth_failed",
+            "purchase_auth_failed",
+            "fill_auth_failed",
+            "unauthorized",
+        ] {
+            assert_eq!(
+                map_market_slug_to_specific_event(reason),
+                Some(super::super::compute_chronicle::EVENT_NETWORK_AUTH_EXPIRED),
+                "reason `{}` should map to network_auth_expired",
+                reason,
+            );
+        }
+    }
+
+    #[test]
+    fn map_market_slug_unknown_returns_none() {
+        assert_eq!(map_market_slug_to_specific_event("totally_new_slug"), None);
+        assert_eq!(map_market_slug_to_specific_event(""), None);
+    }
+
+    #[test]
+    fn map_market_slug_leading_token_match_handles_wrapped_reasons() {
+        // classify_rev21_slug wraps unknown slugs as "unknown_slug:<raw>".
+        // Primary-token match drops the suffix and keys on the first token,
+        // so a future Wire slug we happen to recognize still fires.
+        assert_eq!(
+            map_market_slug_to_specific_event("budget_exceeded:extra_detail"),
+            Some(super::super::compute_chronicle::EVENT_NETWORK_RATE_ABOVE_BUDGET),
+        );
+        // And the skip_reasons format pattern `retryable(reason)` — the
+        // helper is called with the inner reason directly in live code,
+        // but test the leading-paren cut too for defense-in-depth.
+        assert_eq!(
+            map_market_slug_to_specific_event("quote_jwt_expired(context)"),
+            Some(super::super::compute_chronicle::EVENT_NETWORK_QUOTE_EXPIRED),
+        );
+    }
 }
 
