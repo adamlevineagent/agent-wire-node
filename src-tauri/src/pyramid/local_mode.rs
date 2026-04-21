@@ -1745,8 +1745,14 @@ pub enum ComputeParticipationMode {
 /// "operator explicitly overrode this field." That distinction matters
 /// for `set_compute_participation_policy` roundtrips and for legacy YAML
 /// canonicalization — it should NOT leak into gating code.
+// NOTE: deny_unknown_fields was removed in walker-re-plan-wire-2.1 Wave 5 task 35.
+// Two Phase-3 knobs (`market_dispatch_threshold_queue_depth`, `market_dispatch_eager`)
+// were removed from the struct when the walker retired them. Legacy YAML rows that
+// still carry those keys must silently deserialize — the fields are no longer read,
+// but rejecting them would break rollout for any operator whose persisted contribution
+// was written before Wave 5. Any other unknown field is a caller bug we'd like to catch,
+// but deny_unknown_fields can't distinguish the two cases. Tradeoff accepted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct ComputeParticipationPolicy {
     pub schema_type: String,
     pub mode: ComputeParticipationMode,
@@ -1788,22 +1794,6 @@ pub struct ComputeParticipationPolicy {
     // `effective_booleans` via a parallel struct access pattern (see
     // MarketDispatchKnobs below).
 
-    /// Max acceptable `queue_position` value returned by Wire's
-    /// `/match` endpoint before the node decides the market isn't
-    /// worth waiting for and falls back to local inference.
-    ///
-    /// 10 is the shipped default — tuned for tester networks where
-    /// depth >10 suggests the market is saturated and local will be
-    /// faster. Raise if the requester is willing to wait for a cheap
-    /// quote. 0 disables the gate (accept any queue position).
-    #[serde(default = "default_market_dispatch_threshold_queue_depth")]
-    #[deprecated(
-        note = "retired in walker-re-plan-wire-2.1 Wave 3b — queue-depth-as-proxy was a \
-                pre-walker workaround. /quote is now the authoritative viability check. \
-                Removal scheduled for Wave 5. Field kept for serde-compat with legacy YAML."
-    )]
-    pub market_dispatch_threshold_queue_depth: u32,
-
     /// Wall-clock budget for a single market dispatch end-to-end
     /// (match + fill + await-push + fallback-poll-on-timeout). On
     /// timeout, the node falls back to local inference.
@@ -1813,27 +1803,8 @@ pub struct ComputeParticipationPolicy {
     /// tolerate longer provider inference windows.
     #[serde(default = "default_market_dispatch_max_wait_ms")]
     pub market_dispatch_max_wait_ms: u64,
-
-    /// When true, try market first for every eligible call. When
-    /// false (default), try market only when local would be
-    /// serialized (the existing `compute_queue` indicates a local
-    /// queue) — a "market for overflow" posture.
-    ///
-    /// Testers opt into eager mode explicitly; the default is
-    /// conservative.
-    #[serde(default)]
-    #[deprecated(
-        note = "retired in walker-re-plan-wire-2.1 Wave 3b — walker market branch always \
-                attempts /quote when a market entry is in the route; eager-vs-overflow \
-                posture is expressed by route ordering, not by a boolean on policy. \
-                Removal scheduled for Wave 5. Field kept for serde-compat with legacy YAML."
-    )]
-    pub market_dispatch_eager: bool,
 }
 
-fn default_market_dispatch_threshold_queue_depth() -> u32 {
-    10
-}
 fn default_market_dispatch_max_wait_ms() -> u64 {
     60_000
 }
@@ -1854,20 +1825,10 @@ pub struct EffectiveParticipationPolicy {
     pub allow_relay_serving: bool,
     pub allow_serving_while_degraded: bool,
 
-    // Phase 3 operational knobs — passed through unchanged from the
+    // Phase 3 operational knob — passed through unchanged from the
     // raw policy (no projection). See `ComputeParticipationPolicy`
-    // for per-field semantics.
-    #[deprecated(
-        note = "see ComputeParticipationPolicy::market_dispatch_threshold_queue_depth. \
-                Retired in walker-re-plan-wire-2.1 Wave 3b; Wave 5 removes."
-    )]
-    pub market_dispatch_threshold_queue_depth: u32,
+    // for semantics.
     pub market_dispatch_max_wait_ms: u64,
-    #[deprecated(
-        note = "see ComputeParticipationPolicy::market_dispatch_eager. \
-                Retired in walker-re-plan-wire-2.1 Wave 3b; Wave 5 removes."
-    )]
-    pub market_dispatch_eager: bool,
 }
 
 /// Per DD-I: compute the 8 projectable booleans implied by a mode preset.
@@ -1914,7 +1875,6 @@ impl ComputeParticipationPolicy {
     /// projectable fields: explicit `Some(v)` wins; `None` takes the
     /// mode's projection. `allow_serving_while_degraded` is copied
     /// through unchanged.
-    #[allow(deprecated)] // internal projection — fields themselves deprecated
     pub fn effective_booleans(&self) -> EffectiveParticipationPolicy {
         let (fd, fs, md, mv, sp, sh, ru, rs) = project_mode(self.mode);
         EffectiveParticipationPolicy {
@@ -1928,9 +1888,7 @@ impl ComputeParticipationPolicy {
             allow_relay_usage: self.allow_relay_usage.unwrap_or(ru),
             allow_relay_serving: self.allow_relay_serving.unwrap_or(rs),
             allow_serving_while_degraded: self.allow_serving_while_degraded,
-            market_dispatch_threshold_queue_depth: self.market_dispatch_threshold_queue_depth,
             market_dispatch_max_wait_ms: self.market_dispatch_max_wait_ms,
-            market_dispatch_eager: self.market_dispatch_eager,
         }
     }
 }
@@ -1953,7 +1911,6 @@ impl Default for ComputeParticipationPolicy {
     /// Coordinator projection applies naturally. Operators who pick
     /// Worker mode later in Settings get worker semantics without re-
     /// persisting every toggle.
-    #[allow(deprecated)] // serde-compat shape for legacy YAML; Wave 5 removes.
     fn default() -> Self {
         Self {
             schema_type: "compute_participation_policy".to_string(),
@@ -1976,13 +1933,8 @@ impl Default for ComputeParticipationPolicy {
             allow_relay_serving: Some(false),
             // Operational safety: off by default.
             allow_serving_while_degraded: false,
-            // Phase 3 knobs — eager-on default so GPU-less testers get
-            // market dispatch on their FIRST call rather than after the
-            // local queue saturates. Operators with a local GPU can
-            // flip to lazy via Settings → Advanced.
-            market_dispatch_threshold_queue_depth: default_market_dispatch_threshold_queue_depth(),
+            // Phase 3 dispatch wall-clock.
             market_dispatch_max_wait_ms: default_market_dispatch_max_wait_ms(),
-            market_dispatch_eager: true,
         }
     }
 }
@@ -2483,9 +2435,6 @@ mod tests {
         assert_eq!(p.allow_relay_usage, Some(false));
         assert_eq!(p.allow_relay_serving, Some(false));
         assert!(!p.allow_serving_while_degraded);
-        // Phase 3 knobs — eager-on so the GPU-less tester's first call
-        // reaches the market rather than waiting for queue saturation.
-        assert!(p.market_dispatch_eager);
     }
 
     #[test]
@@ -2498,8 +2447,6 @@ mod tests {
         let eff = p.effective_booleans();
         assert!(eff.allow_market_dispatch,
             "fresh install must have market dispatch ENABLED by default (purpose lock)");
-        assert!(eff.market_dispatch_eager,
-            "fresh install must have eager-dispatch ENABLED so first call reaches market");
     }
 
     #[test]
@@ -2562,9 +2509,7 @@ mod tests {
             allow_relay_usage: None,
             allow_relay_serving: None,
             allow_serving_while_degraded: false,
-            market_dispatch_threshold_queue_depth: 10,
             market_dispatch_max_wait_ms: 60_000,
-            market_dispatch_eager: false,
         };
         let eff = p.effective_booleans();
         assert!(eff.allow_fleet_dispatch, "explicit true must win over worker projection");
@@ -2595,9 +2540,7 @@ mod tests {
                 allow_relay_usage: None,
                 allow_relay_serving: None,
                 allow_serving_while_degraded: false,
-                market_dispatch_threshold_queue_depth: 10,
                 market_dispatch_max_wait_ms: 60_000,
-                market_dispatch_eager: false,
             };
             let eff = p.effective_booleans();
             let (fd, fs, md, mv, sp, sh, ru, rs) = project_mode(mode);
@@ -2631,9 +2574,7 @@ mod tests {
             allow_relay_usage: None,
             allow_relay_serving: None,
             allow_serving_while_degraded: true,
-            market_dispatch_threshold_queue_depth: 10,
             market_dispatch_max_wait_ms: 60_000,
-            market_dispatch_eager: false,
         };
         let yaml = serde_yaml::to_string(&p).unwrap();
         // None fields are absent — no stray `null` or `~`.
@@ -2690,27 +2631,23 @@ mod tests {
     }
 
     #[test]
-    fn policy_yaml_rejects_unknown_fields() {
-        // With `#[serde(deny_unknown_fields)]`, a typo like
-        // `allow_market_visiblity` (missing an 'i') that serde-default
-        // would have silently dropped must now fail loudly at parse
-        // time. This catches frontend/IPC payload typos at the boundary
-        // instead of letting them silently revert to the projection.
-        let typo_yaml = "schema_type: compute_participation_policy\n\
-                         mode: hybrid\n\
-                         allow_market_visiblity: false\n";
-        assert!(
-            serde_yaml::from_str::<ComputeParticipationPolicy>(typo_yaml).is_err(),
-            "typo'd field must be rejected by deny_unknown_fields"
-        );
-
-        let unknown_yaml = "schema_type: compute_participation_policy\n\
-                            mode: hybrid\n\
-                            allow_bitcoin_mining: true\n";
-        assert!(
-            serde_yaml::from_str::<ComputeParticipationPolicy>(unknown_yaml).is_err(),
-            "completely-unknown field must be rejected by deny_unknown_fields"
-        );
+    fn policy_yaml_silently_absorbs_retired_walker_knobs() {
+        // Walker Wave 5 removed `market_dispatch_threshold_queue_depth` and
+        // `market_dispatch_eager` from the struct. Legacy persisted rows
+        // still carry those keys and must deserialize cleanly — rejecting
+        // them would break rollout for any operator whose policy was
+        // written before Wave 5. `deny_unknown_fields` was removed on the
+        // struct to permit this; the tradeoff is that typos like
+        // `allow_market_visiblity` now silently no-op instead of erroring.
+        let legacy_walker_yaml = "schema_type: compute_participation_policy\n\
+                                  mode: hybrid\n\
+                                  market_dispatch_threshold_queue_depth: 10\n\
+                                  market_dispatch_eager: true\n\
+                                  market_dispatch_max_wait_ms: 60000\n";
+        let p: ComputeParticipationPolicy =
+            serde_yaml::from_str(legacy_walker_yaml).expect("retired knobs absorb silently");
+        assert_eq!(p.mode, ComputeParticipationMode::Hybrid);
+        assert_eq!(p.market_dispatch_max_wait_ms, 60_000);
     }
 
     #[test]

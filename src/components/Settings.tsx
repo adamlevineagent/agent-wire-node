@@ -57,29 +57,22 @@ interface ComputeParticipationPolicy {
     allow_relay_usage?: boolean;
     allow_relay_serving?: boolean;
     allow_serving_while_degraded: boolean;
-    // Market-dispatch runtime knobs. Not editable from Settings today —
-    // the Inference Routing panel (separate plan) owns them. Declared
-    // here so round-trip through `policyForMode(...)` preserves any
-    // values set by backend defaults, CLI edits, or future UI. Without
-    // this declaration, the save path would still functionally preserve
-    // via property spread, but TypeScript's view of the object would be
-    // lossy and any explicit-construction path (e.g. fresh defaults)
-    // would silently drop the fields, forcing Rust serde to re-default
-    // them on the other side.
-    market_dispatch_threshold_queue_depth?: number;
+    // Market-dispatch wall-clock. Not editable from Settings today —
+    // the Inference Routing panel (separate plan) surfaces it readonly.
+    // Declared here so round-trip through `policyForMode(...)` preserves
+    // any value set by backend defaults or CLI edits.
+    //
+    // The two retired walker knobs (market_dispatch_threshold_queue_depth,
+    // market_dispatch_eager) were removed in walker-re-plan-wire-2.1 Wave 5.
+    // Legacy payloads that still carry them are silently absorbed by the
+    // Rust deserializer (deny_unknown_fields removed for this struct).
     market_dispatch_max_wait_ms?: number;
-    market_dispatch_eager?: boolean;
 }
 
 // Conservative default matching the Rust `Default` impl + bundled
 // default YAML: hybrid mode, fleet on, every market off until the
-// operator opts in.
-// The three market_dispatch_* knobs mirror Rust's defaults
-// (`default_market_dispatch_threshold_queue_depth` = 10,
-// `default_market_dispatch_max_wait_ms` = 60_000,
-// `market_dispatch_eager` = true per struct Default). Values listed
-// explicitly so fresh-install policyForMode() saves don't drop them
-// into serde-re-default territory.
+// operator opts in. `market_dispatch_max_wait_ms` mirrors Rust's
+// `default_market_dispatch_max_wait_ms()` = 60_000.
 const defaultComputeParticipationPolicy: ComputeParticipationPolicy = {
     schema_type: "compute_participation_policy",
     mode: "hybrid",
@@ -92,9 +85,7 @@ const defaultComputeParticipationPolicy: ComputeParticipationPolicy = {
     allow_relay_usage: false,
     allow_relay_serving: false,
     allow_serving_while_degraded: false,
-    market_dispatch_threshold_queue_depth: 10,
     market_dispatch_max_wait_ms: 60_000,
-    market_dispatch_eager: true,
 };
 
 const roleDescriptions: Record<ComputeParticipationMode, { label: string; description: string }> = {

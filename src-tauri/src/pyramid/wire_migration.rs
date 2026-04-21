@@ -1243,14 +1243,12 @@ fn canonicalize_legacy_participation_policy(conn: &Connection) -> Result<()> {
             allow_relay_usage: Some(eff.allow_relay_usage),
             allow_relay_serving: Some(eff.allow_relay_serving),
             allow_serving_while_degraded: eff.allow_serving_while_degraded,
-            // Phase 3 knobs — carry through unchanged. For legacy
-            // YAMLs that predate these fields, `effective_booleans()`
-            // picks up the `serde(default)` values, so this
-            // canonicalization writes the defaults explicitly rather
-            // than silently omitting them. Operator intent preserved.
-            market_dispatch_threshold_queue_depth: eff.market_dispatch_threshold_queue_depth,
+            // Phase 3 dispatch wall-clock — carry through unchanged.
+            // The two retired knobs (`market_dispatch_threshold_queue_depth`,
+            // `market_dispatch_eager`) were deleted in Wave 5; legacy
+            // rows that still carry them are silently absorbed by the
+            // struct deserializer and then dropped on canonical rewrite.
             market_dispatch_max_wait_ms: eff.market_dispatch_max_wait_ms,
-            market_dispatch_eager: eff.market_dispatch_eager,
         };
         let new_yaml = match serde_yaml::to_string(&canonical) {
             Ok(y) => y,
