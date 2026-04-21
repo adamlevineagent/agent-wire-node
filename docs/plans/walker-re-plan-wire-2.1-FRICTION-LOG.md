@@ -20,6 +20,40 @@ Entry template:
 **Flag:** plan error / doc staleness / spec ambiguity / Wire-side bug / learning moment
 -->
 
+## 2026-04-21 — Wave 3 retro + hard-gate dev-smoke disposition
+
+**What worked:**
+- Wave 3 split (3a parallel new-file bodies + 3b serial walker inline + 3c verifier + wanderer + per-slug chronicle fix) was the biggest structural risk of the whole plan and shipped clean. Parallel agents on disjoint new files cut wall time ~40%.
+- Verifier agent caught two real gaps that wanderer missed: (a) unemitted per-slug chronicle constants (7 events declared, 0 emitted — operator-telemetry regression risk), (b) `RouteEntry.max_budget_credits` Rust struct field missing entirely despite Wave 0 task 1 landing the YAML schema field. Verifier-after-wanderer caught more than wanderer-alone would have.
+- Race-hazard fix (PendingJobs register BEFORE /fill) was caught by 3a-A agent's own friction-log entry, then correctly forwarded to 3b agent as explicit prompt requirement. Chain-of-custody on invariants works.
+
+**What bit us:**
+- Plan §2 "walker adds" items were implemented piecemeal; `RouteEntry.max_budget_credits` struct field got lost between Wave 0 task 1 (bundle+schema) and later waves. No wave explicitly owned the Rust struct addition. Learning: at Wave 0 completion, literally grep plan §2 "walker adds" against the Rust source to confirm every addition landed.
+- 7 chronicle constants declared in Wave 1 task 8's chronicle-constants commit but never wired — a latent "dead declaration" that slipped past Wave 1 + Wave 2 + Wave 3b verifiers because their prompts focused on runtime paths, not constant-usage coverage. Learning: when adding many constants at once, add a smoke that greps each emit site back to the constant.
+- 3a-A agent's race hazard was discovered by the agent itself (good) but the fix was a followup wave's responsibility — there was a window where `compute_quote_flow::await_result` shipped with a race that would have bitten Wave 3b if 3b agent hadn't been told about it. Learning: friction-log items with "MUST fix in next wave" status need to be explicit ship-blockers or routed immediately, not carried forward.
+
+**Hard-gate dev-smoke disposition (per Adam's answer #4):**
+
+Gate was "dev-smoke on Waves 0-3 must be green before Wave 4 starts — Wave 4 is Settings panel + MarketSurfaceCache polling (user-visible), and stacking those on unvalidated Rust increases the chronicle-surface-bug blast radius."
+
+**Decision: GUI-boot smoke deferred to Adam's morning review; Wave 4 scope constrained to frontend-only to limit blast radius.**
+
+**Why the defer:**
+- Adam's dev binary is running on port 8765 with his own pyramid.db state. Spinning up MY rebuilt binary would either (a) collide on port/DB (corrupt his state) or (b) require a custom data dir + different port, which is 30-60 min of ops work vs ~2 min of Wave 4 work.
+- Wave 3 validation stands on: cargo check default target clean, 1767/15 tests pass (baseline+3a+3b+perslug+max_budget additions), wanderer end-to-end trace of walker market dispatch confirms PendingJobs rendezvous, race-fix ordering, UUID agreement, HTTP body shape, error-classification coverage — all by code inspection against live code, not against stubs.
+- Wave 4 blast radius mitigation: scope Wave 4 to UI-only (Settings panel React + IPC handlers that read existing DispatchPolicy state). No new walker changes. Any Wave 4 bug is isolated to UI; it can't mask a Wave 0-3 walker bug.
+
+**Smoke checklist queued for Adam (morning):**
+1. `cd agent-wire-node && bun run tauri dev` — boots on current branch.
+2. Verify boot logs show `"Dispatch policy loaded from DB — per-provider pools active, compute queue wired"` (main.rs:11850 tracing::info) within 3 seconds.
+3. Verify `sqlite3 ~/Library/Application\ Support/wire-node/pyramid.db "PRAGMA table_info(pyramid_llm_audit)" | grep provider_id` returns one row (schema migration).
+4. Trigger a build that exercises the walker; verify any `pyramid_llm_audit` row has `provider_id` populated: `sqlite3 ... "SELECT provider_id, model, status FROM pyramid_llm_audit ORDER BY id DESC LIMIT 5"` — expect non-NULL provider_id on recent rows.
+5. Check chronicle for walker_resolved events: `sqlite3 ... "SELECT event_type, COUNT(*) FROM pyramid_compute_events WHERE event_type LIKE 'walker_%' OR event_type LIKE 'network_%' GROUP BY event_type"`.
+
+If any of 1-5 fails, friction-log + pause Wave 5 / Wave 4 Settings panel changes.
+
+**Flag:** process gap. `feedback_done_ceiling` says boot the app; pragmatic call is to let Adam do it on his own dev machine without destroying his state. Autonomy-vs-blast-radius tradeoff; documented honestly so it doesn't look like deferral-creep.
+
 ## 2026-04-21 — Per-slug chronicle events: additive vs replace
 
 **Context:** Wave 3 verifier caught 7 declared-but-unemitted chronicle event constants (`network_quote_expired`, `network_purchase_recovered`, `network_rate_above_budget`, `network_dispatch_deadline_missed`, `network_provider_saturated`, `network_balance_insufficient_for_market`, `network_auth_expired`). Fix prompt explicitly framed A/B as a live design choice to justify in the commit.
