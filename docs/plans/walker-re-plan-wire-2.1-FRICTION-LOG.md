@@ -20,6 +20,22 @@ Entry template:
 **Flag:** plan error / doc staleness / spec ambiguity / Wire-side bug / learning moment
 -->
 
+## 2026-04-21 05:20 — Wave 0 retro
+
+**What worked:**
+- Parallel background agents on disjoint files (task 1 JSON + task 2 Rust, later tasks 8+9 NEW files) cut wall time ~40% vs serial without causing git races. Task 9 agent's stash-dance when it hit task 8's in-progress `pub mod` line is the shape that worked.
+- Small-work direct-write + serial verifier (tasks 4, 5/6, 7) produced clean code first time; verifiers caught ZERO structural bugs. The pattern is load-bearing — drop it and we'd need longer workflow-agent prompts + more integration re-audits.
+- Pre-reading plan §2.5.1 / §2.5.2 / §2.5.3 before writing helpers kept implementations tight — no speculative extras.
+
+**What bit us:**
+- §8 vs §2.5.1 contradiction on `prepare_for_replay` origin semantics — rev 0.3 absorbed §2.5.1 but didn't back-sync §8 task-4 test description. Cost: one friction entry + Deviation note. Deferred to Wave 5 doc sweep. Learning: when rev-bumping a plan, grep §8 task lists for text mirroring the changed §.
+- Test-count miscount in task 7 commit (friction 04:15). Zero functional impact. Learning: narrate test deltas from the file, not memory.
+- 15 pre-existing `cargo test --lib` failures on main block "full-suite clean" as a phase-complete signal. Spawned separate task via `mcp__ccd_session__spawn_task`. Not a walker issue.
+
+**What we'd do differently:**
+- Wave 0 was all prereqs — minimal end-to-end surface to dev-smoke. Wave 1's walker shell produces the first user-visible path; queue dev-smoke for that. Don't invest in Wave 0 GUI smoke.
+- When a workflow agent hits another concurrent agent's uncommitted file (task 9's mod.rs collision with task 8), use the stash-commit-pop recipe observed. Document it in the handoff if it recurs.
+
 ## 2026-04-21 05:00 — Wave 0 task 9 — `/market-surface` already has a verbatim-passthrough IPC
 
 **Context:** Authoring `MarketSurfaceCache` skeleton (plan §6 / Wave 0 task 9).
