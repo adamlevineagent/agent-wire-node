@@ -181,12 +181,14 @@ pub async fn quote(
     auth: &Arc<RwLock<AuthState>>,
     config: &Arc<RwLock<WireNodeConfig>>,
     body: ComputeQuoteBody,
-) -> Result<ComputeQuoteResponse, EntryError> {
-    let (api_url, token) = read_api_creds(auth, config, "quote").await?;
-    let body_json = serde_json::to_value(&body).map_err(|e| EntryError::CallTerminal {
-        reason: format!("quote_body_serialize:{e}"),
+) -> Result<ComputeQuoteResponse, ApiErrorWithHints> {
+    let (api_url, token) = read_api_creds_raw(auth, config, "quote").await?;
+    let body_json = serde_json::to_value(&body).map_err(|e| ApiErrorWithHints {
+        status: 0,
+        body: serde_json::json!({ "error": "quote_body_serialize", "detail": e.to_string() }),
+        hints: Default::default(),
     })?;
-    match send_api_request_with_hints(
+    let (_status, resp) = send_api_request_with_hints(
         &api_url,
         "POST",
         "/api/v1/compute/quote",
@@ -194,15 +196,16 @@ pub async fn quote(
         Some(&body_json),
         None,
     )
-    .await
-    {
-        Ok((_status, resp)) => {
-            serde_json::from_value(resp.clone()).map_err(|e| EntryError::CallTerminal {
-                reason: format!("quote_response_parse:{e}:{resp}"),
-            })
-        }
-        Err(api_err) => Err(classify_wire_error(&api_err, "quote")),
-    }
+    .await?;
+    serde_json::from_value(resp.clone()).map_err(|e| ApiErrorWithHints {
+        status: 0,
+        body: serde_json::json!({
+            "error": "quote_response_parse",
+            "detail": e.to_string(),
+            "raw": resp,
+        }),
+        hints: Default::default(),
+    })
 }
 
 /// POST `/api/v1/compute/purchase`. Commits a `quote_jwt` into a reserved
@@ -220,8 +223,8 @@ pub async fn purchase(
     config: &Arc<RwLock<WireNodeConfig>>,
     quote_jwt: &str,
     body: ComputePurchaseBody,
-) -> Result<ComputePurchaseResponse, EntryError> {
-    let (api_url, token) = read_api_creds(auth, config, "purchase").await?;
+) -> Result<ComputePurchaseResponse, ApiErrorWithHints> {
+    let (api_url, token) = read_api_creds_raw(auth, config, "purchase").await?;
 
     // Honor the `quote_jwt` param as authoritative (prompt) — overwrite
     // whatever the caller placed in `body.quote_jwt` so the param is the
@@ -237,8 +240,10 @@ pub async fn purchase(
         .clone()
         .expect("idempotency_key set just above");
 
-    let body_json = serde_json::to_value(&body).map_err(|e| EntryError::CallTerminal {
-        reason: format!("purchase_body_serialize:{e}"),
+    let body_json = serde_json::to_value(&body).map_err(|e| ApiErrorWithHints {
+        status: 0,
+        body: serde_json::json!({ "error": "purchase_body_serialize", "detail": e.to_string() }),
+        hints: Default::default(),
     })?;
 
     // HTTP header: spec §2.2 keeps `idempotency_key` as a body field; we
@@ -248,7 +253,7 @@ pub async fn purchase(
     let mut headers = HashMap::new();
     headers.insert("Idempotency-Key".to_string(), idem_key);
 
-    match send_api_request_with_hints(
+    let (_status, resp) = send_api_request_with_hints(
         &api_url,
         "POST",
         "/api/v1/compute/purchase",
@@ -256,27 +261,20 @@ pub async fn purchase(
         Some(&body_json),
         Some(&headers),
     )
-    .await
-    {
-        Ok((_status, resp)) => {
-            serde_json::from_value(resp.clone()).map_err(|e| EntryError::CallTerminal {
-                reason: format!("purchase_response_parse:{e}:{resp}"),
-            })
-        }
-        Err(api_err) => {
-            // Idempotent-replay with matching key: Wire returns cached 200
-            // (spec §2.2). That path hits `Ok` above, not here. Here we
-            // classify the genuine error path: the 409
-            // `quote_already_purchased` case with a mismatched key
-            // advances (RouteSkipped via slug classifier).
-            //
-            // Post rev 2.1.1: saturation (all_offers_saturated_for_model)
-            // arrives here as 409 + X-Wire-Retry: transient + structured
-            // detail; classifier pipes it to Retryable for walker's
-            // saturation backoff loop.
-            Err(classify_wire_error(&api_err, "purchase"))
-        }
-    }
+    .await?;
+    // Idempotent-replay with matching key: Wire returns cached 200
+    // (spec §2.2). That path hits Ok here. The error path is classified
+    // by the caller (dispatch_market_entry) via classify_wire_error — it
+    // also owns saturation-backoff peek logic for `all_offers_saturated_for_model`.
+    serde_json::from_value(resp.clone()).map_err(|e| ApiErrorWithHints {
+        status: 0,
+        body: serde_json::json!({
+            "error": "purchase_response_parse",
+            "detail": e.to_string(),
+            "raw": resp,
+        }),
+        hints: Default::default(),
+    })
 }
 
 /// POST `/api/v1/compute/fill`. Dispatches the ChatML messages + callback
@@ -290,8 +288,8 @@ pub async fn fill(
     auth: &Arc<RwLock<AuthState>>,
     config: &Arc<RwLock<WireNodeConfig>>,
     request: ComputeFillRequest,
-) -> Result<(), EntryError> {
-    let (api_url, token) = read_api_creds(auth, config, "fill").await?;
+) -> Result<(), ApiErrorWithHints> {
+    let (api_url, token) = read_api_creds_raw(auth, config, "fill").await?;
 
     // `/fill` idempotency is sent ONLY as the `Idempotency-Key` HTTP header.
     // Wire's allowed-field whitelist rejects an `idempotency_key` key in the
@@ -304,8 +302,10 @@ pub async fn fill(
         request.idempotency_key.clone(),
     );
 
-    let body_json = serde_json::to_value(&request.body).map_err(|e| EntryError::CallTerminal {
-        reason: format!("fill_body_serialize:{e}"),
+    let body_json = serde_json::to_value(&request.body).map_err(|e| ApiErrorWithHints {
+        status: 0,
+        body: serde_json::json!({ "error": "fill_body_serialize", "detail": e.to_string() }),
+        hints: Default::default(),
     })?;
 
     match send_api_request_with_hints(
@@ -324,10 +324,12 @@ pub async fn fill(
             // replay — provider already accepted an earlier /fill with
             // the same request_id). Provider will deliver the result via
             // the existing pending-job oneshot; treat as Ok.
-            if extract_error_slug_from_body(&api_err.body).as_deref() == Some("fill_already_submitted") {
+            if extract_error_slug_from_body(&api_err.body).as_deref()
+                == Some("fill_already_submitted")
+            {
                 return Ok(());
             }
-            Err(classify_wire_error(&api_err, "fill"))
+            Err(api_err)
         }
     }
 }
@@ -441,6 +443,34 @@ async fn read_api_creds(
     Ok((cfg.api_url.clone(), token))
 }
 
+/// ApiErrorWithHints variant of `read_api_creds` — used by the three
+/// rev 2.1 RPC functions (quote, purchase, fill) which return
+/// `Result<_, ApiErrorWithHints>` so `dispatch_market_entry` can classify
+/// AND peek at the raw body for structured detail (saturation-retry
+/// backoff inputs). Semantics identical to `read_api_creds`; only the
+/// Err shape differs.
+async fn read_api_creds_raw(
+    auth: &Arc<RwLock<AuthState>>,
+    config: &Arc<RwLock<WireNodeConfig>>,
+    stage: &str,
+) -> Result<(String, String), ApiErrorWithHints> {
+    let cfg = config.read().await;
+    let auth_r = auth.read().await;
+    let token = auth_r
+        .api_token
+        .clone()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| ApiErrorWithHints {
+            status: 401,
+            body: serde_json::json!({
+                "error": format!("{stage}_auth_failed"),
+                "detail": "no_api_token"
+            }),
+            hints: Default::default(),
+        })?;
+    Ok((cfg.api_url.clone(), token))
+}
+
 /// Extract the `error` slug from a parsed JSON body (ApiErrorWithHints.body
 /// shape). Returns None when the body doesn't carry `error` as a
 /// non-empty string.
@@ -475,7 +505,7 @@ fn extract_error_slug_from_body(body: &serde_json::Value) -> Option<String> {
 /// `X-Retriable: true` (the orthogonal legacy header) is not consulted
 /// directly here; Wire always pairs it with `X-Wire-Retry: transient`
 /// so the intent is the same through this function.
-fn classify_wire_error(err: &ApiErrorWithHints, stage: &str) -> EntryError {
+pub(crate) fn classify_wire_error(err: &ApiErrorWithHints, stage: &str) -> EntryError {
     // 1. Honor X-Wire-Retry header with precedence.
     if let Some(hint) = err.hints.x_wire_retry.as_deref() {
         match hint {

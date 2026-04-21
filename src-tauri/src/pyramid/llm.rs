@@ -643,7 +643,9 @@ async fn dispatch_market_entry(
         requester_node_id: Some(requester_node_id),
     };
 
-    let quote_resp = cqf::quote(&market_ctx.auth, &market_ctx.config, quote_body).await?;
+    let quote_resp = cqf::quote(&market_ctx.auth, &market_ctx.config, quote_body)
+        .await
+        .map_err(|api_err| cqf::classify_wire_error(&api_err, "quote"))?;
 
     // network_quoted chronicle (on success only).
     emit_walker_chronicle(
@@ -672,7 +674,8 @@ async fn dispatch_market_entry(
 
     let purchase_resp =
         cqf::purchase(&market_ctx.auth, &market_ctx.config, &quote_resp.quote_jwt, purchase_body)
-            .await?;
+            .await
+            .map_err(|api_err| cqf::classify_wire_error(&api_err, "purchase"))?;
 
     emit_walker_chronicle(
         ctx,
@@ -723,9 +726,9 @@ async fn dispatch_market_entry(
     // returns (we also explicitly take() below for timeouts inside
     // await_result). If /fill errors, clean up the pending entry so a
     // late push hits already_settled.
-    if let Err(e) = cqf::fill(&market_ctx.auth, &market_ctx.config, fill_request).await {
+    if let Err(api_err) = cqf::fill(&market_ctx.auth, &market_ctx.config, fill_request).await {
         let _ = market_ctx.pending_jobs.take(&purchase_resp.uuid_job_id).await;
-        return Err(e);
+        return Err(cqf::classify_wire_error(&api_err, "fill"));
     }
 
     // ── Await oneshot ────────────────────────────────────────────────
