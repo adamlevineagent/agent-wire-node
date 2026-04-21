@@ -2037,6 +2037,7 @@ fn spawn_fleet_worker(
         let options = crate::pyramid::llm::LlmCallOptions {
             skip_fleet_dispatch: true,
             chronicle_job_path: Some(chronicle_job_path.clone()),
+            dispatch_origin: crate::pyramid::llm::DispatchOrigin::FleetReceived,
             ..Default::default()
         };
 
@@ -3965,6 +3966,7 @@ fn spawn_market_worker(
         let options = crate::pyramid::llm::LlmCallOptions {
             skip_fleet_dispatch: true,
             chronicle_job_path: Some(chronicle_job_path.clone()),
+            dispatch_origin: crate::pyramid::llm::DispatchOrigin::MarketReceived,
             ..Default::default()
         };
 

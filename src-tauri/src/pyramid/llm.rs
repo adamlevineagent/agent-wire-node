@@ -853,6 +853,35 @@ impl LlmConfig {
     }
 }
 
+/// Origin classifier for a dispatch that arrived at this node from
+/// elsewhere. Used for chronicle `source` labeling so that market-
+/// received and fleet-received jobs don't both end up tagged
+/// `fleet_received` when they flow through the compute-queue path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DispatchOrigin {
+    /// Own build (this operator initiated the call from a chain).
+    #[default]
+    Local,
+    /// Received from a fleet peer via the fleet-dispatch JWT path.
+    FleetReceived,
+    /// Received from the Wire compute market (handle_market_dispatch).
+    MarketReceived,
+}
+
+impl DispatchOrigin {
+    /// The chronicle `source` label used on pyramid_compute_events rows
+    /// emitted from this entry point. Matches the constants in
+    /// `compute_chronicle.rs` (`SOURCE_LOCAL`, `SOURCE_FLEET_RECEIVED`,
+    /// `SOURCE_MARKET_RECEIVED`).
+    pub fn source_label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::FleetReceived => "fleet_received",
+            Self::MarketReceived => "market_received",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LlmCallOptions {
     pub min_timeout_secs: Option<u64>,
@@ -866,6 +895,12 @@ pub struct LlmCallOptions {
     /// When Some, WP-8 uses this value instead of generating a new path,
     /// preserving lifecycle grouping with queue events.
     pub chronicle_job_path: Option<String>,
+    /// Where this dispatch came from. Set by `handle_fleet_dispatch`
+    /// and `handle_market_dispatch` when they invoke the unified call
+    /// on behalf of a remote requester. Drives the chronicle `source`
+    /// label on the compute-queue entry so provider-side history
+    /// distinguishes market-received from fleet-received jobs.
+    pub dispatch_origin: DispatchOrigin,
 }
 
 // ── Provider synthesis (Phase 3 bridge) ──────────────────────────────────────
@@ -2074,11 +2109,14 @@ pub async fn call_model_unified_with_audit_and_ctx(
             // Set skip flags on the forwarded options so the GPU loop
             // performs the local execution directly rather than treating
             // replay as a second routing decision point.
-            let entry_source = if options.skip_fleet_dispatch && options.chronicle_job_path.is_some() {
-                "fleet_received".to_string()
-            } else {
-                "local".to_string()
-            };
+            // Label the queue-entry source so downstream chronicle
+            // emitters attribute the job to its true origin. Pre-fix,
+            // this was a binary fleet_received-vs-local sniff keyed on
+            // `skip_fleet_dispatch && chronicle_job_path.is_some()`,
+            // which mislabeled market-received jobs as fleet_received
+            // because both set those flags identically. Now driven by
+            // the explicit DispatchOrigin the upstream handler sets.
+            let entry_source = options.dispatch_origin.source_label().to_string();
             let chronicle_job_path_val = options.chronicle_job_path.clone().unwrap_or_else(|| {
                 super::compute_chronicle::generate_job_path(ctx, None, &queue_model_id, &entry_source)
             });

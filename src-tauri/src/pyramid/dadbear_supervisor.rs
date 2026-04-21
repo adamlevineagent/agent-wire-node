@@ -572,6 +572,7 @@ impl DadbearSupervisor {
                 skip_concurrency_gate: true,
                 skip_fleet_dispatch: false,
                 chronicle_job_path: None,
+                dispatch_origin: Default::default(),
             },
             step_ctx: Some(step_ctx),
             model_id: model_id.clone(),
