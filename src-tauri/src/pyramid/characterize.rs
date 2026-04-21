@@ -18,7 +18,7 @@ use tracing::{info, warn};
 
 use super::llm::{self, LlmConfig};
 use super::question_decomposition;
-use super::step_context::make_step_ctx_from_llm_config;
+use super::step_context::{compute_prompt_hash, StepContext};
 use super::types::CharacterizationResult;
 use super::Tier1Config;
 
@@ -135,26 +135,91 @@ Analyze this material and produce the characterization."#,
     );
 
     // ── 3. Call LLM ────────────────────────────────────────────────────────
-    // Model selection is controlled by YAML chain definitions, not Rust overrides.
-    // See Inviolable #4: "YAML is the single source of truth for model selection."
-
+    // Characterize is a judgment call (see docstring at top of file) — the
+    // "max" tier is the declared intent. Resolve that tier through the
+    // provider registry before dispatch so the walker sees a provider-valid
+    // model id instead of whatever `primary_model` happens to carry (which
+    // can be an Ollama tag from a prior Local Mode session and will crash
+    // an OpenRouter-served route).
     let temperature = tier1.characterize_temperature;
     let max_tokens = tier1.characterize_max_tokens;
+
+    let (resolved_tier_name, resolved_model_id, resolved_provider_id, call_config): (
+        &'static str,
+        String,
+        Option<String>,
+        LlmConfig,
+    ) = match llm_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("max", None, None, None).ok())
+    {
+        Some(resolved) => {
+            let model_id = resolved.tier.model_id.clone();
+            let provider_id = resolved.provider.id.clone();
+            let context_limit = resolved.tier.context_limit;
+            let mut cloned = llm_config.clone();
+            cloned.primary_model = model_id.clone();
+            if let Some(ctx_limit) = context_limit {
+                cloned.primary_context_limit = ctx_limit;
+            }
+            ("max", model_id, Some(provider_id), cloned)
+        }
+        None => {
+            warn!(
+                "characterize: provider registry unavailable — falling back to \
+                 llm_config.primary_model='{}' (declared intent was max-tier). \
+                 This will fail on any route whose provider does not accept that model id.",
+                llm_config.primary_model,
+            );
+            (
+                "primary",
+                llm_config.primary_model.clone(),
+                None,
+                llm_config.clone(),
+            )
+        }
+    };
 
     // Try up to 2 times on parse failure (same pattern as decomposition)
     for attempt in 0..2u32 {
         let temp = if attempt == 0 { temperature } else { 0.1 };
 
-        let cache_ctx = make_step_ctx_from_llm_config(
-            llm_config,
-            "characterize",
-            "characterize",
-            0,
-            None,
-            &system_prompt,
-        );
+        // Build StepContext inline so the resolved tier + model id are
+        // stamped correctly. The retrofit helper labels everything as
+        // tier="primary" with model=primary_model, which is the hardwiring
+        // this fix exists to bypass.
+        let cache_ctx: Option<StepContext> = call_config.cache_access.as_ref().and_then(|cache| {
+            if system_prompt.is_empty() {
+                return None;
+            }
+            let prompt_hash = compute_prompt_hash(&system_prompt);
+            let mut ctx = StepContext::new(
+                cache.slug.clone(),
+                cache.build_id.clone(),
+                "characterize",
+                "characterize",
+                0,
+                None,
+                cache.db_path.to_string(),
+            )
+            .with_model_resolution(resolved_tier_name, resolved_model_id.clone())
+            .with_prompt_hash(prompt_hash);
+            if let Some(ref pid) = resolved_provider_id {
+                ctx = ctx.with_provider(pid.clone());
+            }
+            if let Some(ref bus) = cache.bus {
+                ctx = ctx.with_bus(bus.clone());
+            }
+            if let Some(ref cn) = cache.chain_name {
+                let ct = cache.content_type.as_deref().unwrap_or("");
+                ctx = ctx.with_chain_context(cn.clone(), ct.to_string());
+            }
+            Some(ctx)
+        });
+
         let response = llm::call_model_unified_and_ctx(
-            llm_config,
+            &call_config,
             cache_ctx.as_ref(),
             &system_prompt,
             &user_prompt,
