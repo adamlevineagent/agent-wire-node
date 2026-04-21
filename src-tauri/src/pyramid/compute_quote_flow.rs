@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::auth::AuthState;
-use crate::http_utils::send_api_request;
+use crate::http_utils::{send_api_request, send_api_request_with_hints, ApiErrorWithHints};
 use crate::pyramid::llm::{EntryError, LlmResponse};
 use crate::pyramid::pending_jobs::{DeliveryPayload, PendingJobs};
 use crate::pyramid::types::TokenUsage;
@@ -114,6 +114,44 @@ pub struct ComputeFillBody {
     pub requester_callback_url: String,
 }
 
+/// Detail payload carried on `all_offers_saturated_for_model` (P0410, 409)
+/// responses from Wire's `plan_compute_match`. Populated by Wire when the
+/// candidate CTE finds offers for a model but ALL are at their
+/// `max_queue_depth` ceiling. Walker consumes this for intelligent
+/// backoff: `min_expected_drain_ms` is the floor for "when does the next
+/// slot open somewhere in the cohort."
+///
+/// Shape per Wire's bilateral rev 2.1.1 spec (compute-market-saturation-
+/// fix-rev-2.1.1-2026-04-21). Declared locally because the
+/// agent-wire-contracts crate has not yet exported this type; swap to a
+/// `pub use` once it does (same pattern as ComputeFillBody).
+///
+/// Field semantics:
+/// - `offer_count`: size of the saturated cohort.
+/// - `min_current_queue_depth`: shortest queue in the cohort (lower
+///   bound on how-many-ahead-of-me the next-to-reserve would be).
+/// - `max_queue_depth_across_offers`: largest max_queue_depth of any
+///   offer in the cohort (informational ceiling on waiting-room).
+/// - `min_expected_drain_ms`: Wire-computed
+///   `min(typical_serve_ms_p50)` across the cohort — the shortest
+///   head-of-queue completion time. Walker uses as backoff FLOOR (the
+///   soonest any slot opens). Conservative: assumes nothing about
+///   elapsed-time on in-flight jobs.
+/// - `median_typical_serve_ms_p50`: cohort median serve time, for
+///   walker's own horizon math (optional; may be absent for sparse
+///   cohorts). Walker degrades to `min_expected_drain_ms` alone when
+///   this is None.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AllOffersSaturatedDetail {
+    pub model_id: String,
+    pub offer_count: u32,
+    pub min_current_queue_depth: u32,
+    pub max_queue_depth_across_offers: u32,
+    pub min_expected_drain_ms: u64,
+    #[serde(default)]
+    pub median_typical_serve_ms_p50: Option<u64>,
+}
+
 /// Walker-side bundling of the wire body plus the two fields the walker
 /// needs but Wire does NOT accept in the body:
 ///
@@ -148,7 +186,7 @@ pub async fn quote(
     let body_json = serde_json::to_value(&body).map_err(|e| EntryError::CallTerminal {
         reason: format!("quote_body_serialize:{e}"),
     })?;
-    match send_api_request(
+    match send_api_request_with_hints(
         &api_url,
         "POST",
         "/api/v1/compute/quote",
@@ -163,7 +201,7 @@ pub async fn quote(
                 reason: format!("quote_response_parse:{e}:{resp}"),
             })
         }
-        Err(err_str) => Err(classify_rev21_http_error(&err_str, "quote")),
+        Err(api_err) => Err(classify_wire_error(&api_err, "quote")),
     }
 }
 
@@ -210,7 +248,7 @@ pub async fn purchase(
     let mut headers = HashMap::new();
     headers.insert("Idempotency-Key".to_string(), idem_key);
 
-    match send_api_request(
+    match send_api_request_with_hints(
         &api_url,
         "POST",
         "/api/v1/compute/purchase",
@@ -225,13 +263,18 @@ pub async fn purchase(
                 reason: format!("purchase_response_parse:{e}:{resp}"),
             })
         }
-        Err(err_str) => {
+        Err(api_err) => {
             // Idempotent-replay with matching key: Wire returns cached 200
             // (spec §2.2). That path hits `Ok` above, not here. Here we
             // classify the genuine error path: the 409
             // `quote_already_purchased` case with a mismatched key
             // advances (RouteSkipped via slug classifier).
-            Err(classify_rev21_http_error(&err_str, "purchase"))
+            //
+            // Post rev 2.1.1: saturation (all_offers_saturated_for_model)
+            // arrives here as 409 + X-Wire-Retry: transient + structured
+            // detail; classifier pipes it to Retryable for walker's
+            // saturation backoff loop.
+            Err(classify_wire_error(&api_err, "purchase"))
         }
     }
 }
@@ -265,7 +308,7 @@ pub async fn fill(
         reason: format!("fill_body_serialize:{e}"),
     })?;
 
-    match send_api_request(
+    match send_api_request_with_hints(
         &api_url,
         "POST",
         "/api/v1/compute/fill",
@@ -276,17 +319,15 @@ pub async fn fill(
     .await
     {
         Ok((_status, _resp)) => Ok(()),
-        Err(err_str) => {
+        Err(api_err) => {
             // Special-case 409 `fill_already_submitted` (idempotency
             // replay — provider already accepted an earlier /fill with
             // the same request_id). Provider will deliver the result via
             // the existing pending-job oneshot; treat as Ok.
-            if let Some(slug) = extract_slug_from_http_error(&err_str) {
-                if slug == "fill_already_submitted" {
-                    return Ok(());
-                }
+            if extract_error_slug_from_body(&api_err.body).as_deref() == Some("fill_already_submitted") {
+                return Ok(());
             }
-            Err(classify_rev21_http_error(&err_str, "fill"))
+            Err(classify_wire_error(&api_err, "fill"))
         }
     }
 }
@@ -398,6 +439,74 @@ async fn read_api_creds(
             reason: format!("{stage}_auth_failed:no_api_token"),
         })?;
     Ok((cfg.api_url.clone(), token))
+}
+
+/// Extract the `error` slug from a parsed JSON body (ApiErrorWithHints.body
+/// shape). Returns None when the body doesn't carry `error` as a
+/// non-empty string.
+fn extract_error_slug_from_body(body: &serde_json::Value) -> Option<String> {
+    body.get("error")
+        .and_then(|e| e.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Classify an `ApiErrorWithHints` from a Wire compute RPC call.
+///
+/// Consults `X-Wire-Retry` header FIRST, per Wire's WS4-commented
+/// contract (compute-errors.ts top-of-file): node's classify_retry reads
+/// the header with precedence over HTTP code / slug heuristics. Falls
+/// through to slug-based classification (`classify_rev21_slug`) only
+/// when the header is absent or carries an unrecognized value.
+///
+/// Header semantics:
+/// - `never` → CallTerminal. Wire has declared "do not retry"; walker
+///   bubbles rather than burning cascade entries.
+/// - `transient` → Retryable. Condition expected to clear imminently
+///   (e.g., `all_offers_saturated_for_model`, FOR-UPDATE race on
+///   `provider_queue_full`). Walker's saturation-retry loop (in
+///   `call_model_unified`) decides backoff.
+/// - `backoff` → Retryable. Same as `transient` from classification
+///   perspective; the distinction is operational (Wire hinting at
+///   longer-than-immediate retry). Walker's retry loop honors backoff
+///   inputs from the structured detail.
+/// - Absent or unrecognized → fall through to slug-based classifier.
+///
+/// `X-Retriable: true` (the orthogonal legacy header) is not consulted
+/// directly here; Wire always pairs it with `X-Wire-Retry: transient`
+/// so the intent is the same through this function.
+fn classify_wire_error(err: &ApiErrorWithHints, stage: &str) -> EntryError {
+    // 1. Honor X-Wire-Retry header with precedence.
+    if let Some(hint) = err.hints.x_wire_retry.as_deref() {
+        match hint {
+            "never" => {
+                // Wire said "do not retry" — CallTerminal.
+                // Preserve slug in the reason for telemetry.
+                let slug =
+                    extract_error_slug_from_body(&err.body).unwrap_or_else(|| stage.to_string());
+                return EntryError::CallTerminal { reason: slug };
+            }
+            "transient" | "backoff" => {
+                // Retryable — walker's entry-level retry loop decides
+                // how to honor it. Preserve slug so the loop can match
+                // on `all_offers_saturated_for_model` specifically and
+                // parse the structured detail for backoff inputs.
+                let slug = extract_error_slug_from_body(&err.body)
+                    .unwrap_or_else(|| format!("{stage}_transient"));
+                return EntryError::Retryable { reason: slug };
+            }
+            _ => {
+                // Unrecognized hint value — fall through to
+                // slug/HTTP-code classification (defensive: Wire may
+                // ship a new hint value before node knows about it).
+            }
+        }
+    }
+
+    // 2. No header hint (or unrecognized value) — fall through to the
+    //    existing slug-then-HTTP-code classification ladder.
+    let err_str = err.to_string();
+    classify_rev21_http_error(&err_str, stage)
 }
 
 /// Parse `send_api_request`'s error string (format: `"API error {code}: {body}"`)
@@ -519,6 +628,17 @@ fn classify_rev21_slug(slug: &str) -> EntryError {
         // Walker built a malformed body — same bug would fire on every
         // route that routes through Wire. Bubble.
         "invalid_body" => EntryError::CallTerminal { reason },
+        // New slug (rev 2.1.1): market has offers for this model but ALL
+        // are at/above their `max_queue_depth`. Wire pairs with
+        // X-Wire-Retry: transient so classify_wire_error will normally
+        // route this through the header path. This arm covers the
+        // slug-only path (e.g., future proxies that strip headers) and
+        // the fall-through case. Retryable — walker's saturation-retry
+        // loop in call_model_unified reads the structured detail (via
+        // AllOffersSaturatedDetail) for backoff inputs. Distinct from
+        // `no_offer_for_model` (404, X-Wire-Retry: never, CallTerminal):
+        // saturation means busy, absence means unavailable.
+        "all_offers_saturated_for_model" => EntryError::Retryable { reason },
         // Wire-identity-binding errors are MARKET-SPECIFIC: fleet / openrouter /
         // ollama-local dispatches never touch Wire's node or agent registration,
         // so a 400 on requester_node_id or agent binding doesn't doom them.
@@ -1019,5 +1139,157 @@ mod tests {
         // Walker-side fields must still be reachable on the wrapper.
         assert_eq!(request.request_id, "req-uuid-walker-only");
         assert_eq!(request.idempotency_key, "req-uuid-walker-only");
+    }
+
+    // ── X-Wire-Retry header precedence + all_offers_saturated_for_model ──
+
+    use crate::http_utils::RetryHints;
+
+    fn make_api_err(
+        status: u16,
+        body: serde_json::Value,
+        x_wire_retry: Option<&str>,
+        x_retriable: Option<bool>,
+    ) -> ApiErrorWithHints {
+        ApiErrorWithHints {
+            status,
+            body,
+            hints: RetryHints {
+                x_wire_retry: x_wire_retry.map(|s| s.to_string()),
+                x_retriable,
+            },
+        }
+    }
+
+    #[test]
+    fn classify_wire_error_x_wire_retry_never_forces_call_terminal() {
+        // Wire said "do not retry" — even if the slug would normally
+        // RouteSkip or even Retry, X-Wire-Retry: never wins. The slug is
+        // preserved in the reason for telemetry.
+        let err = make_api_err(
+            404,
+            serde_json::json!({ "error": "no_offer_for_model" }),
+            Some("never"),
+            None,
+        );
+        match classify_wire_error(&err, "quote") {
+            EntryError::CallTerminal { reason } => assert_eq!(reason, "no_offer_for_model"),
+            other => panic!("expected CallTerminal on X-Wire-Retry: never, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_wire_error_x_wire_retry_transient_is_retryable() {
+        // Transient = retry. Walker's entry-level retry loop decides
+        // backoff from the structured detail. This is the saturation
+        // path's happy case (Wire pairs 409 with X-Wire-Retry: transient).
+        let err = make_api_err(
+            409,
+            serde_json::json!({
+                "error": "all_offers_saturated_for_model",
+                "detail": {
+                    "model_id": "gemma4:26b",
+                    "offer_count": 1,
+                    "min_current_queue_depth": 8,
+                    "max_queue_depth_across_offers": 8,
+                    "min_expected_drain_ms": 15000,
+                    "median_typical_serve_ms_p50": 15000
+                }
+            }),
+            Some("transient"),
+            Some(true),
+        );
+        match classify_wire_error(&err, "purchase") {
+            EntryError::Retryable { reason } => {
+                assert_eq!(reason, "all_offers_saturated_for_model")
+            }
+            other => panic!("expected Retryable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_wire_error_x_wire_retry_backoff_is_retryable() {
+        let err = make_api_err(
+            503,
+            serde_json::json!({ "error": "platform_unavailable" }),
+            Some("backoff"),
+            None,
+        );
+        assert!(matches!(
+            classify_wire_error(&err, "quote"),
+            EntryError::Retryable { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_wire_error_no_hint_falls_through_to_slug() {
+        // No X-Wire-Retry header — classifier uses the existing slug
+        // path. `max_tokens_exceeds_quote` is CallTerminal per the slug
+        // table; verify the fall-through reaches it.
+        let err = make_api_err(
+            400,
+            serde_json::json!({ "error": "max_tokens_exceeds_quote" }),
+            None,
+            None,
+        );
+        assert!(matches!(
+            classify_wire_error(&err, "fill"),
+            EntryError::CallTerminal { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_wire_error_unrecognized_hint_falls_through_to_slug() {
+        // Forward-compat: Wire ships an unexpected hint string. Walker
+        // doesn't crash; falls through to slug classification.
+        let err = make_api_err(
+            409,
+            serde_json::json!({ "error": "insufficient_balance" }),
+            Some("some_new_hint_we_dont_know"),
+            None,
+        );
+        assert!(matches!(
+            classify_wire_error(&err, "quote"),
+            EntryError::RouteSkipped { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_rev21_slug_all_offers_saturated_is_retryable() {
+        // Slug-only path (no header) — the new saturation slug still
+        // classifies correctly when routed through the slug classifier
+        // (defensive path: proxies that strip headers, tests).
+        assert!(matches!(
+            classify_rev21_slug("all_offers_saturated_for_model"),
+            EntryError::Retryable { .. }
+        ));
+    }
+
+    #[test]
+    fn all_offers_saturated_detail_deserializes_with_and_without_median() {
+        // Full shape — all fields present.
+        let full = serde_json::json!({
+            "model_id": "gemma4:26b",
+            "offer_count": 3,
+            "min_current_queue_depth": 7,
+            "max_queue_depth_across_offers": 8,
+            "min_expected_drain_ms": 12000,
+            "median_typical_serve_ms_p50": 15000
+        });
+        let detail: AllOffersSaturatedDetail = serde_json::from_value(full).unwrap();
+        assert_eq!(detail.model_id, "gemma4:26b");
+        assert_eq!(detail.min_expected_drain_ms, 12000);
+        assert_eq!(detail.median_typical_serve_ms_p50, Some(15000));
+
+        // Sparse-cohort shape — median absent. Walker must tolerate.
+        let sparse = serde_json::json!({
+            "model_id": "gemma4:26b",
+            "offer_count": 1,
+            "min_current_queue_depth": 8,
+            "max_queue_depth_across_offers": 8,
+            "min_expected_drain_ms": 15000
+        });
+        let detail: AllOffersSaturatedDetail = serde_json::from_value(sparse).unwrap();
+        assert_eq!(detail.median_typical_serve_ms_p50, None);
     }
 }
