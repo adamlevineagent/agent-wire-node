@@ -6587,5 +6587,279 @@ routing_rules:
             resp.content
         );
     }
+
+    // ── Post-ship: walker queue short-circuit regression guard ──────────
+    //
+    // The pre-walker compute_queue block (deleted in this commit) fired
+    // whenever `config.compute_queue.is_some()` + any route entry had
+    // `is_local: true`. Production bundled seed has ollama-local at
+    // position 4 with is_local:true, so every outer dispatch short-
+    // circuited to the queue and the market + fleet branches above it
+    // in the route were never walked. These tests pin the fix: market
+    // runs before a local pool enqueue when both appear in the route.
+
+    /// Helper: DispatchPolicy with a production-shape route that
+    /// includes `is_local: true` on a pool entry. Mirrors the bundled
+    /// seed's shape so the regression is exercised against a real-world
+    /// configuration rather than the convenient `[market, unknown-pool]`
+    /// shape existing walker tests used.
+    fn walker_test_policy_with_local_pool(
+        pool_concurrency: usize,
+        route_entries: Vec<(&str, bool)>,
+    ) -> std::sync::Arc<crate::pyramid::dispatch_policy::DispatchPolicy> {
+        use crate::pyramid::dispatch_policy::*;
+        let mut pool_configs = std::collections::BTreeMap::new();
+        for (pid, _) in &route_entries {
+            if !matches!(*pid, "market" | "fleet") {
+                pool_configs.insert(
+                    (*pid).to_string(),
+                    ProviderPoolConfig {
+                        concurrency: pool_concurrency,
+                        rate_limit: None,
+                    },
+                );
+            }
+        }
+        let route_to = route_entries
+            .into_iter()
+            .map(|(pid, is_local)| RouteEntry {
+                provider_id: pid.to_string(),
+                model_id: None,
+                tier_name: None,
+                is_local,
+                max_budget_credits: None,
+            })
+            .collect();
+        let policy = DispatchPolicy {
+            rules: vec![RoutingRule {
+                name: "walker_test_prod_shape".into(),
+                match_config: MatchConfig {
+                    work_type: None,
+                    min_depth: None,
+                    step_pattern: None,
+                },
+                route_to,
+                bypass_pool: false,
+                sequential: false,
+            }],
+            escalation: EscalationConfig::default(),
+            build_coordination: BuildCoordinationConfig::default(),
+            pool_configs,
+            max_batch_cost_usd: None,
+            max_daily_cost_usd: None,
+        };
+        std::sync::Arc::new(policy)
+    }
+
+    /// Query pyramid_compute_events for (id, event_type, entry_provider_id)
+    /// triples in rowid order. `entry_provider_id` is extracted from the
+    /// JSON metadata blob `emit_walker_chronicle` writes. `enqueued` events
+    /// written by the local-queue path don't go through `emit_walker_chronicle`
+    /// — they use ChronicleEventContext directly — so `model_id` is used to
+    /// distinguish them.
+    fn read_chronicle_trail(db_path: &str) -> Vec<(i64, String, String)> {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, event_type, COALESCE(model_id, ''), COALESCE(metadata, '')
+                 FROM pyramid_compute_events ORDER BY timestamp ASC, id ASC",
+            )
+            .unwrap();
+        let rows: Vec<(i64, String, String)> = stmt
+            .query_map([], |r| {
+                let id: i64 = r.get(0)?;
+                let ev: String = r.get(1)?;
+                let model: String = r.get(2)?;
+                let meta: String = r.get(3)?;
+                // Pull `entry_provider_id` out of the metadata JSON when
+                // present; fall back to model_id so the test has SOMETHING
+                // to key on for the direct-chronicle `enqueued` rows.
+                let tag = serde_json::from_str::<serde_json::Value>(&meta)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("entry_provider_id")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or(model);
+                Ok((id, ev, tag))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    }
+
+    /// Helper: build an LlmConfig against a tempdir-backed pyramid DB so
+    /// walker chronicle events land on disk and the test can read them
+    /// back in rowid order. Returns (config, db_file) — the NamedTempFile
+    /// must live for the duration of the test.
+    fn walker_test_config_with_queue(
+        policy: std::sync::Arc<crate::pyramid::dispatch_policy::DispatchPolicy>,
+    ) -> (LlmConfig, tempfile::NamedTempFile) {
+        use std::sync::Arc;
+        let db = temp_pyramid_db_with_slug("walker-short-circuit-test");
+        let db_path: Arc<str> = db.path().to_string_lossy().to_string().into();
+
+        let pools = Arc::new(
+            crate::pyramid::provider_pools::ProviderPools::new(policy.as_ref()),
+        );
+        let queue = crate::compute_queue::ComputeQueueHandle::new();
+
+        let config = LlmConfig {
+            api_key: String::new(),
+            auth_token: String::new(),
+            primary_model: "walker-short-circuit/test-model".into(),
+            fallback_model_1: "fallback1".into(),
+            fallback_model_2: "fallback2".into(),
+            dispatch_policy: Some(policy),
+            provider_pools: Some(pools),
+            compute_queue: Some(queue),
+            cache_access: Some(CacheAccess {
+                slug: "walker-short-circuit-test".into(),
+                build_id: "build-1".into(),
+                db_path,
+                bus: None,
+                chain_name: None,
+                content_type: None,
+            }),
+            max_retries: 1,
+            ..Default::default()
+        };
+        (config, db)
+    }
+
+    #[tokio::test]
+    async fn walker_market_runs_before_local_pool_enqueue() {
+        // Production-shape regression — route `[market, ollama-local(is_local:true)]`
+        // with compute_queue attached and `compute_market_context = None`.
+        //
+        // Pre-fix behavior: the pre-walker block saw `any(is_local) &&
+        // compute_queue.is_some()` and enqueued IMMEDIATELY; market was
+        // never walked. The `enqueued` chronicle row was the ONLY row.
+        //
+        // Post-fix behavior: walker iterates the route. Market runs
+        // first, emits `network_route_unavailable` with
+        // reason=`no_market_context`, then advances. Local pool entry
+        // reaches the new in-walker gate and enqueues. Both rows are
+        // present and the market row comes FIRST.
+        //
+        // No GPU loop is consuming the queue, so the call hangs on
+        // `rx.await`. We wrap in `tokio::time::timeout` and allow the
+        // timeout to fire after the chronicle events have been emitted
+        // (spawn_blocking → DB flush).
+
+        let policy = walker_test_policy_with_local_pool(
+            1,
+            vec![("market", false), ("ollama-local", true)],
+        );
+        let (config, db) = walker_test_config_with_queue(policy);
+        let db_path = db.path().to_string_lossy().to_string();
+
+        let call_fut = call_model_unified_with_audit_and_ctx(
+            &config,
+            None,
+            None,
+            "sys",
+            "usr",
+            0.0,
+            16,
+            None,
+            LlmCallOptions::default(),
+        );
+
+        // The queue enqueue blocks forever without a GPU loop. Time out
+        // after a short grace period — by then the market branch has
+        // emitted its chronicle event and the enqueue has written its
+        // `enqueued` row.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(400), call_fut).await;
+
+        // spawn_blocking DB writes may still be in flight. Drain.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let rows = read_chronicle_trail(&db_path);
+        assert!(
+            !rows.is_empty(),
+            "expected chronicle events in the trail, got none",
+        );
+
+        // Find the market route-unavailable row and the enqueued row.
+        let market_idx = rows.iter().position(|(_, ev, tag)| {
+            ev == "network_route_unavailable" && tag == "market"
+        });
+        let enqueued_idx = rows.iter().position(|(_, ev, _)| ev == "enqueued");
+
+        let market_idx = market_idx.expect(
+            "expected a `network_route_unavailable` event for the market entry \
+             — pre-fix this row is absent because the pre-walker short-circuit \
+             enqueued before market ran. Trail: {rows:?}",
+        );
+        let enqueued_idx = enqueued_idx
+            .expect("expected an `enqueued` event for the local pool entry");
+
+        assert!(
+            market_idx < enqueued_idx,
+            "expected market route_unavailable BEFORE enqueued; got market_idx={market_idx}, \
+             enqueued_idx={enqueued_idx}; trail={rows:?}",
+        );
+
+        // Tie-down: market row's reason is specifically `no_market_context`.
+        // Re-read raw metadata to assert the classification slug.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let meta: String = conn
+            .query_row(
+                "SELECT metadata FROM pyramid_compute_events
+                 WHERE event_type = 'network_route_unavailable' AND id = ?1",
+                rusqlite::params![rows[market_idx].0],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let meta_json: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        assert_eq!(
+            meta_json.get("reason").and_then(|v| v.as_str()),
+            Some("no_market_context"),
+            "expected reason=no_market_context on market row; got {meta}",
+        );
+    }
+
+    #[tokio::test]
+    async fn walker_production_shape_outer_call_reaches_market_branch() {
+        // Guard against future regressions re-introducing the pre-walker
+        // short-circuit. This test asserts the OUTER walker — not a
+        // queue-replay inner walker — reaches the market branch when
+        // the route has both a market entry and a local pool entry.
+        //
+        // Complements the `prepare_for_replay` tests that already cover
+        // the inner-walker case (replay clears compute_market_context +
+        // skip_concurrency_gate: true, so market's `no_market_context`
+        // emit is the expected inner behavior; outer behavior is
+        // "market runs").
+
+        let policy = walker_test_policy_with_local_pool(
+            1,
+            vec![("market", false), ("ollama-local", true)],
+        );
+        let (config, db) = walker_test_config_with_queue(policy);
+        let db_path = db.path().to_string_lossy().to_string();
+
+        let mut options = LlmCallOptions::default();
+        options.dispatch_origin = DispatchOrigin::Local; // outer call
+
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(400),
+            call_model_unified_with_audit_and_ctx(
+                &config, None, None, "sys", "usr", 0.0, 16, None, options,
+            ),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let rows = read_chronicle_trail(&db_path);
+        assert!(
+            rows.iter()
+                .any(|(_, ev, tag)| ev == "network_route_unavailable" && tag == "market"),
+            "outer walker must reach market branch — trail={rows:?}",
+        );
+    }
 }
 
