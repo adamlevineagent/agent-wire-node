@@ -28,7 +28,7 @@ serde_yaml = "0.9"
 # enum, SQLSTATE taxonomy). Pinned to the Wire commit that introduced
 # the shared crate + the structural fix landing in this cycle.
 # Bump `rev` whenever Wire's contract shape changes on the Wire side.
-agent-wire-contracts = { git = "https://github.com/adamlevineagent/GoodNewsEveryone", rev = "307cc226" }
+agent-wire-contracts = { git = "https://github.com/adamlevineagent/GoodNewsEveryone", rev = "1adb3f20" }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["full"] }
 sha2 = "0.10"

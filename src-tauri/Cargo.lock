@@ -11,7 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "agent-wire-contracts"
 version = "0.1.0"
-source = "git+https://github.com/adamlevineagent/GoodNewsEveryone?rev=307cc226#307cc22682004dff50a1c9a55d9735252ae99972"
+source = "git+https://github.com/adamlevineagent/GoodNewsEveryone?rev=1adb3f20#1adb3f206c2c9db2d6f1727bfb9a1cb3537d6799"
 dependencies = [
  "serde",
  "serde_json",
