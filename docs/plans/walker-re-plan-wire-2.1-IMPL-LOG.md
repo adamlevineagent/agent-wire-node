@@ -7,6 +7,27 @@ Append-only log of what's done. Newest at top. Updated at every commit.
 **Branch:** `walker-re-plan-wire-2.1`
 **Started:** 2026-04-21 (template commit; Wave 0 task 1 lands next)
 
+## 2026-04-21 — commits fa0dc41, e026bc2, 19c2729 (branch fix/walker-queue-short-circuit-bypass)
+
+**Plan task:** Post-ship finding (3) — walker pre-loop compute-queue short-circuit bypasses market + fleet branches for any production route containing `is_local: true` (bundled seed has it at position 4). See plan §13 entry "2026-04-21: walker pre-loop short-circuit bypasses market + fleet."
+
+**fa0dc41 — refactor(llm): move compute_queue enqueue into walker pool branch (plan §4.4)**
+Deleted the pre-walker block at `llm.rs:1774-1878`. Inserted equivalent enqueue logic inside the Pool branch of the walker for-loop, gated per-entry on `entry.is_local && config.compute_queue.is_some() && !options.skip_concurrency_gate && !walker_bypass_pool`. GPU-loop Err classified as `CallTerminal` on the outer walker (the replay guard prevents other route entries from re-trying the local path, so bubbling matches reality). Deleted the now-unused `should_enqueue_local_execution` + `queue_model_id_for_local_execution` helpers — inlined model resolution matches the §4.3 per-route model-resolution pattern (entry.model_id → ctx.resolved_model_id → config.primary_model).
+
+**e026bc2 — test(llm): production-route-shape regression — market runs before local pool enqueue**
+New `walker_test_policy_with_local_pool` helper (mirrors bundled seed shape). `walker_market_runs_before_local_pool_enqueue` asserts the market `network_route_unavailable(no_market_context)` chronicle row precedes the ollama-local `enqueued` row when the route is `[market, ollama-local(is_local:true)]`. Chronicle events are ordered by `timestamp` not `id` because `emit_walker_chronicle` uses `spawn_blocking` which races on the SQLite write lock. `walker_production_shape_outer_call_reaches_market_branch` is a future-regression guard on the outer walker's reach.
+
+**19c2729 — test(llm): cascade-through-all-branches chronicle ordering**
+New `spawn_fake_gpu_loop` helper: pops first queue entry and fires `result_tx.send(Ok(canned_response))`. `walker_cascades_through_market_fleet_openrouter_to_local_queue` exercises route = `[market, fleet, openrouter(mockito 400), ollama-local(fake GPU loop)]`; asserts chronicle ordering market route_unavailable → fleet route_unavailable → openrouter route_skipped → walker_resolved on ollama-local.
+
+**Cargo check:** clean (default target). 70 pre-existing warnings unchanged. No new warnings.
+**Cargo test:** `cargo test --lib walker_market_runs_before_local_pool_enqueue` → pass; `cargo test --lib walker_cascades_through_market_fleet_openrouter_to_local_queue` → pass; `cargo test --lib walker_production_shape_outer_call_reaches_market_branch` → pass.
+**Grep post-conditions:**
+- `should_enqueue_local_execution` — absent from `src-tauri/src/pyramid/llm.rs` (only references in docs/plans/*.md historical retros).
+- `config.compute_queue.is_some()` — only live call site is inside the walker's Pool branch (per-entry gate), not before the walker loop.
+**Deviation:** Cascade test (b) uses the simpler skip-reason slugs that fall out of absent contexts (`no_market_context`, `fleet_ctx_missing`) instead of the exact rev-2.1 slugs the plan spec calls out (`no_offer_for_model`, `no_fleet_peer`). Reproducing the exact slugs requires Wire /quote mockito + fleet roster setup — separate test infrastructure. The branch-type cascade is what this regression guard needs; exact-slug unit tests can ride on the Wire mocking infra when that gets pulled in for other reasons.
+
+
 ---
 
 ## 2026-04-21 — post-ship W1 + C1 fix (branch fix/walker-pool-400-classification, off main at fc4a55e)

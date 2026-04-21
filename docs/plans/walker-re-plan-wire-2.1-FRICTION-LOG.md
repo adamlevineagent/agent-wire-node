@@ -8,6 +8,20 @@ Real-time record of surprises, workarounds, and "this bit me" moments. Newest at
 
 ---
 
+## 2026-04-21 — post-ship walker queue short-circuit bypass (branch `fix/walker-queue-short-circuit-bypass`)
+
+**What happened.** The pre-walker compute-queue block at `llm.rs:1774-1878` (plan §4.4 said "enqueue INSIDE the walker's pool branch"; impl put it BEFORE the walker loop) gated on `should_enqueue_local_execution → route.providers.iter().any(|e| e.is_local)`. That predicate fires for ANY route containing `is_local: true`. The bundled seed's ollama-local sits at route position 4 with `is_local: true`, so every outer dispatch short-circuited into the queue before the walker's for-loop ran. Market + fleet + openrouter entries that preceded ollama-local in the route were unreachable: the inner walker (GPU-loop replay) uses `prepare_for_replay(Local)` which clears `compute_market_context`, so market always emitted `no_market_context` and advanced. Walker's `walker_resolved` still fired (from the inner replay's ollama-local dispatch), which made the symptom invisible in integration tests — SOME entry resolved, so tests passed, but the route was effectively `[ollama-local]`.
+
+**Why the gap existed.** Unit tests in `llm.rs` used the convenient route shape `['market', 'unknown-pool']` — `unknown-pool` had `is_local: false` by default in `walker_test_policy` (the helper just iterated `pid` strings with no is_local flag). That shape NEVER trips the pre-walker short-circuit. Production route shape (four entries including `is_local: true` at position 4) went untested. Wave 1 verifier + Wave 3 wanderer both saw `walker_resolved` fire and signed off. Acceptance criteria were "walker resolves a call against a route" not "walker walks every branch its route specifies." The short-circuit was upstream of the walker loop, so the walker APPEARED correct even though market + fleet were dead code in production.
+
+**Fix.** Deleted the pre-walker block. Moved the enqueue into the walker's Pool branch, gated per-entry on `entry.is_local && config.compute_queue.is_some() && !options.skip_concurrency_gate && !walker_bypass_pool`. Three regression tests added: production-shape chronicle ordering, cascade-through-all-branches, outer-call-reaches-market guard. New `walker_test_policy_with_local_pool` helper mirrors bundled seed shape for future tests.
+
+**Subtler lesson — ordering chronicle rows.** First try at the regression test ordered events by SQLite `id`, got them out of order: `enqueued` id=1, market id=2. Cause: `emit_walker_chronicle` and the enqueue chronicle block both use `tokio::task::spawn_blocking`, fire-and-forget, racing on the SQLite write lock. Row `id` (AUTOINCREMENT) reflects write-commit order, not emit order. Switched ordering to `timestamp ASC, id ASC` — timestamps are set at `ChronicleEventContext` construction (before `spawn_blocking`), so they reflect actual emit order with rfc3339 sub-second resolution. Generic: any test asserting chronicle event order should sort by timestamp.
+
+**Systemic frame.** `walker_resolved` firing confirms SOME entry resolved — not that the walker walked the route. A route-walking test needs per-branch chronicle assertions, not a terminal-event assertion. The wanderer brief for walker rebuilds should list per-branch chronicle events as acceptance signals. A terminal "works" signal is a ceiling on correctness, not a floor.
+
+---
+
 ## 2026-04-21 — post-ship W1 + C1 chain (branch `fix/walker-pool-400-classification`)
 
 **What happened.** Mac post-ship smoke, first launch after the local-mode disable fix (fc4a55e). Walker crashed a pool-branch cascade with `CallTerminal` from OpenRouter HTTP 400 body `{"error":{"message":"gemma4:26b is not a valid model ID"}}`. Two bugs chained: the walker sent an Ollama format name to OpenRouter (C1: per-entry model resolution missing — `config.primary_model` was broadcast across every route), and OpenRouter's 400 rejection body triggered the blunt "400 non-context → CallTerminal" rule in §4.3 (W1: classification too aggressive). Either fix alone would have papered over the live symptom; neither alone is systemic.
