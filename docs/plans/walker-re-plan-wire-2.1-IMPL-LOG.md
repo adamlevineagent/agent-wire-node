@@ -21,6 +21,30 @@ Entry template:
 **Deviation:** None / <rationale if any>
 -->
 
+## 2026-04-21 06:30 — Wave 0 wave-level verifier pass (no code changes)
+
+**Plan task:** Wave 0 wave-level verification — fresh eyes across tasks 1-9 as an integrated whole.
+**Changed:** Nothing. Audit scope covered boot-path integration, module wiring, test inventory cross-check, friction-log accuracy, cross-commit cleanup, and a dev-smoke deferral decision.
+
+**Boot-path integration — OK.** Call ordering in `walk_bundled_contributions_manifest` (`wire_migration.rs:1317-1444`) is correct for a fresh DB: (1) `insert_bundled_contribution` loop writes the four `bundled-*dispatch_policy*` rows to `pyramid_config_contributions` (lines 1341-1359); (2) `consolidate_bundled_versions` runs; (3) `sync_chain_defaults_to_operational` + `sync_chain_assignments_to_operational` + `sync_dispatch_policy_to_operational` fire (lines 1439-1441) — the dispatch-policy sync reads the active `dispatch_policy` contribution written in step (1) and writes the operational row. Main.rs:11829 then uses `open_pyramid_connection` (pragmas only, no re-init) and `read_dispatch_policy` returns the freshly-seeded YAML → `LlmConfig.dispatch_policy` + `.provider_pools` + `compute_queue` + `fleet_roster` + `fleet_dispatch` + `compute_market_context` all populated, `tracing::info!("Dispatch policy loaded from DB — per-provider pools active, compute queue wired")` emits at line 11850. No off-by-one. Dispatcher arm at `config_contributions.rs:780` correctly routes the schema_type to `db::upsert_dispatch_policy`.
+
+**Module integration — OK.** `pub mod compute_quote_flow;` at `pyramid/mod.rs:29`, `pub mod market_surface_cache;` at line 133. `compute_quote_flow.rs:45` imports `EntryError` + `LlmResponse` from `crate::pyramid::llm` with no circular dependency. `DispatchOrigin`, `RouteBranch`, `classify_branch`, `branch_allowed`, `EntryError` all `pub` per `llm.rs:886`/`918`/`929`/`947`/`983` — Wave 1 walker body can consume them.
+
+**Test inventory — OK.** All 20 new Wave 0 tests present and pass:
+- `cargo test --lib -- prepare_for_replay classify_branch branch_allowed entry_error compute_quote_flow market_surface_cache sync_dispatch_policy_to_operational` → 13/13 pass.
+- `cargo test --lib provider_pools` → 11/11 pass (4 pre-existing + 7 new).
+- Full suite `cargo test --lib` → 1755 pass / 15 fail. 15 failures match the friction-log 03:05 pre-existing set exactly — zero new regressions from Wave 0.
+
+**Friction log — still accurate.** All four entries (03:05 pre-existing failures, 03:10 §8-vs-§2.5.1 staleness, 04:15 test-count miscount, 05:00 `/market-surface` verbatim passthrough) remain load-bearing. No new surprises from the wave-level vantage.
+
+**Cross-commit cleanup — clean.** Grepped for inline `compute_queue = None` / `fleet_dispatch = None` / `fleet_roster = None` / `compute_market_context = None` in non-test code — only four hits, all inside `prepare_for_replay` at `llm.rs:873-876`. Every prior inline clear migrated. `resolve_uuid_from_handle` + `NetworkHandleInfo` still live in `llm.rs` and `compute_requester.rs` (rev 2.0 walker body) as expected — plan §2 schedules deletion in Wave 5. Nothing NEW in Wave 0 depends on them; `compute_quote_flow.rs` references them only in doc-comments that explicitly forbid reintroduction.
+
+**Dev-smoke — deferred.** Wave 0 commits are all stubs or pre-walker-body helpers; no functional path to exercise end-to-end yet. Running the Tauri GUI in this sandbox is not viable (tier-"read" on browsers, tier-"click" on terminals — the dev bundle boot requires display). Per plan §8 Wave 0 success criteria ("compiles; tests pass; main.rs hydration verified by code-reading"), boot smoke is legitimately not in scope for Wave 0. Wave 1 (walker body landing) is the first functional smoke opportunity.
+
+**Cargo check:** clean (default target). 69 lib warnings + 1 bin warning — matches pre-Wave-0 baseline.
+**Cargo test:** 1755 pass / 15 fail (same pre-existing set; zero new failures).
+**Deviation:** None. Wave 0 is verifier-clean; Wave 1 is unblocked.
+
 ## 2026-04-21 06:00 — commit e813720 (branch walker-re-plan-wire-2.1)
 
 **Plan task:** Wave 0 task 8 — `compute_quote_flow` skeleton module.
