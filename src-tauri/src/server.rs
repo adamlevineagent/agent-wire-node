@@ -66,6 +66,26 @@ pub struct ServerState {
     /// `/v1/compute/job-result` handler (fires + removes). See
     /// `pyramid::pending_jobs` for semantics.
     pub pending_market_jobs: crate::pyramid::pending_jobs::PendingJobs,
+    /// Rev 2.1.1 provider-side engine-serialization gate. A bounded
+    /// semaphore around the inference call in `spawn_market_worker`;
+    /// permits = declared `execution_concurrency` for this node's
+    /// offers. Ensures the engine (Ollama / vLLM / etc.) only sees one
+    /// (or N, for batch-capable runtimes) job at a time, with the
+    /// overflow buffering inside this Rust process rather than inside
+    /// the engine's (dumb FIFO) queue.
+    ///
+    /// Bilateral decision compute-market-saturation-decisions-2026-04-21.md
+    /// §D3 + §D4 + provider conformance paragraph: "Providers MUST
+    /// serialize dispatches at the engine according to declared
+    /// execution_concurrency. Wire's queue-drain estimation assumes
+    /// execution_concurrency / typical_serve_ms."
+    ///
+    /// Defaults to `Semaphore::new(1)` at boot — matches
+    /// single-GPU-single-engine operators (BEHEM, llama.cpp, Ollama,
+    /// vanilla HF). Batch-capable operators (vLLM continuous-batching,
+    /// bridges to managed APIs) will supersede via their offer's
+    /// `execution_concurrency` field once Wire's rev 2.1.1 surfaces it.
+    pub engine_dispatch_permits: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Serialize)]
@@ -447,6 +467,16 @@ pub async fn start_server(
     work_stats: Arc<RwLock<crate::work::WorkStats>>,
     pending_market_jobs: crate::pyramid::pending_jobs::PendingJobs,
 ) {
+    // Rev 2.1.1 provider-side engine serialization. Default: one
+    // permit, matching single-GPU-single-engine operators. When the
+    // contracts crate surfaces `execution_concurrency` on the offer row
+    // (Wire rev 2.1.1 D4), this will be sized from the operator's
+    // per-offer declaration. Until then, 1 matches the canonical
+    // batch-not-capable default the provider-conformance paragraph
+    // says should apply to Ollama / llama.cpp / vanilla HF / MLX-LM
+    // runtimes.
+    let engine_dispatch_permits = Arc::new(tokio::sync::Semaphore::new(1));
+
     let state = ServerState {
         cache_dir,
         credits,
@@ -465,6 +495,7 @@ pub async fn start_server(
         compute_market_dispatch,
         compute_market_state,
         pending_market_jobs,
+        engine_dispatch_permits,
     };
 
     // Phase 7: Initialize stale engines for auto-update pyramids (background)
@@ -4040,16 +4071,50 @@ fn spawn_market_worker(
             }
         };
 
-        let inference = crate::pyramid::llm::call_model_unified_with_options_and_ctx(
-            &worker_config,
-            None,
-            &system_prompt,
-            &user_prompt,
-            temperature,
-            max_tokens,
-            response_format.as_ref(),
-            options,
-        );
+        // Rev 2.1.1 provider-side serialization: gate the inference call
+        // through the engine-dispatch semaphore. One permit = one
+        // concurrent inference against the engine; overflow queues here
+        // in tokio's task scheduler rather than inside the engine's
+        // (dumb FIFO) queue. This is what makes Wire's queue-external
+        // scheduling semantic actually work — without this, multiple
+        // workers call Ollama concurrently and thrash.
+        //
+        // The permit is held across the entire inference call and
+        // released when the returned future drops (either completion
+        // or the heartbeat-sweep race below cancels it). Cancellation
+        // releases the permit immediately; no leaks.
+        //
+        // Queued-at-permit jobs sit in `ComputeJobStatus::Executing`
+        // from the walker's perspective (we transitioned at line 3983
+        // above, before acquiring), so peer_queue_depth = Queued +
+        // Executing still reflects the bilateral-agreed
+        // "buffer + engine_occupancy" semantic.
+        let permits_handle = state.engine_dispatch_permits.clone();
+        let inference = async move {
+            // .acquire_owned() consumes an Arc clone so the permit
+            // outlives the scope of this async block (held until the
+            // returned Permit drops at the end of the inference future).
+            let _permit = match permits_handle.acquire_owned().await {
+                Ok(p) => p,
+                Err(_closed) => {
+                    // Semaphore closed — only happens at shutdown. Surface
+                    // as a generic failure; the outbox retry / sweep path
+                    // handles orderly cleanup.
+                    return Err(anyhow::anyhow!("engine_dispatch_permits_closed"));
+                }
+            };
+            crate::pyramid::llm::call_model_unified_with_options_and_ctx(
+                &worker_config,
+                None,
+                &system_prompt,
+                &user_prompt,
+                temperature,
+                max_tokens,
+                response_format.as_ref(),
+                options,
+            )
+            .await
+        };
 
         // Race inference against heartbeat exit. If the heartbeat exits
         // first, the sweep claimed the row — drop the inference result.
