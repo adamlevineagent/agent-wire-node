@@ -8,6 +8,29 @@ Real-time record of surprises, workarounds, and "this bit me" moments. Newest at
 
 ---
 
+## 2026-04-21 — post-ship W1 + C1 chain (branch `fix/walker-pool-400-classification`)
+
+**What happened.** Mac post-ship smoke, first launch after the local-mode disable fix (fc4a55e). Walker crashed a pool-branch cascade with `CallTerminal` from OpenRouter HTTP 400 body `{"error":{"message":"gemma4:26b is not a valid model ID"}}`. Two bugs chained: the walker sent an Ollama format name to OpenRouter (C1: per-entry model resolution missing — `config.primary_model` was broadcast across every route), and OpenRouter's 400 rejection body triggered the blunt "400 non-context → CallTerminal" rule in §4.3 (W1: classification too aggressive). Either fix alone would have papered over the live symptom; neither alone is systemic.
+
+**Decision — systemic solve.** Adam's direction was explicit: pick the proper solve that lasts. Option C hybrid for C1 (entry.model_id → tier_routing[tier_name] → primary_model fallback) and body-text splitting for W1 (provider-level model rejection + feature-unsupported → RouteSkipped; body-shape errors → CallTerminal). Both changes absorb cleanly into the existing three-tier `EntryError` taxonomy — no architectural surgery, no `config.primary_model` refactor, no new ctx threading.
+
+**Invasiveness tradeoff — none.** The tier_routing lookup was a single `.and_then` chain at the walker's existing model-pick site. `ProviderRegistry::get_tier` already lives on `config.provider_registry` and is hit across the codebase; the walker just had to ask it. Full Option C shipped, not the A+manual-C fallback the brief hedged for.
+
+**Seed default chosen — `openai/gpt-4o-mini`.** Pinned on the bundled `bundled-dispatch_policy-default-v1` openrouter entry. Currently-cheap baseline; operator overrides via Settings → Inference Routing. If a different "fresh install first-hit" slug is preferred, it's a single-line change in `bundled_contributions.json`.
+
+**Gotchas.**
+1. **tier_routing FK on provider_id.** The `resolve_route_model_priority_2_*` unit tests hit a FOREIGN KEY error when they inserted a tier row without first inserting the backing provider row. Real-world paths upsert providers before tiers; tests had to do the same. Simple once spotted — flagging it so the next test writer doesn't re-debug for 5 minutes.
+2. **cargo test CLI doesn't accept multiple TESTNAME positionals.** `cargo test --lib foo bar` errors; must be `cargo test --lib -- foo bar`. Trivial but annoying.
+3. **mockito's `Server::new_async().await` is the right constructor for tokio tests.** Zero prior use in the node codebase — mockito was declared in Cargo.toml but unused in src/. The integration test is the first consumer; straightforward pattern going forward.
+
+**Plan-retro gap.** Rev 0.3 audits covered §4.3 classification for *logical shape* (three-tier taxonomy, cascade-vs-skip, retry counting) but not for *real-world OpenRouter 400 body text*. Future audits on documented error-classification tables should construct real-world error-body fixtures for every branch and assert the classifier's output. The W1 bug was a coverage gap, not a design flaw — the three-tier taxonomy absorbed the fix cleanly, which is the sign the taxonomy was right.
+
+**Flagged-not-fixed.** P0-1 `resolve_ir_model` at `chain_dispatch.rs:1198` (same class of "one model across providers"; chain-dispatch reach rather than pool-walker reach) and `project_provider_model_coupling_bug` (full `config.primary_model` → `HashMap<ProviderId, ModelId>` refactor; 25+ call sites) — separate plans.
+
+**Scorecard.** 5 atomic commits, 1770 pass / 15 fail (baseline 1757/15; +13 new tests, 0 regressions). Cargo check default target clean.
+
+---
+
 ## 2026-04-21 — Final retro (all 6 waves shipped)
 
 **Shipped:** 6 waves, ~60 commits, branch `walker-re-plan-wire-2.1` at `28e0e6d`. Final wanderer confirmed "walker plan actually works; ready for ship." All §12 acceptance criteria satisfied. 97 walker-related tests pass. Cargo check default target clean. npm build clean.

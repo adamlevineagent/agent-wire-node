@@ -401,12 +401,17 @@ let result = await_result(rx, &auth, &config, pending_jobs, wait_ms).await?;
 **Error classification (three-tier per §2.5.3):**
 - 200 with non-empty content → Ok.
 - 400 context-exceeded → retry same entry with next fallback model (existing cascade). Not a tier decision.
-- 400 non-context + retries exhausted → `CallTerminal` (body shape bug; other routes would fail the same way).
+- 400 non-context, retries exhausted, body matches provider-level model rejection ("not a valid model", "model not found", "unsupported model", "invalid model") → `RouteSkipped` (**post-ship W1 correction**). A sibling route entry with a different `model_id` can still succeed; the blunt old rule ("all 400 non-context = CallTerminal") bubbled OpenRouter's "gemma4:26b is not a valid model ID" and crashed fresh-install cascades. Implemented via `classify_pool_400` in `src-tauri/src/pyramid/llm.rs`.
+- 400 non-context, retries exhausted, body matches feature-unsupported ("not supported", "unsupported") → `RouteSkipped`. A different provider / model may support the feature.
+- 400 non-context + retries exhausted, body matches neither → `CallTerminal` (body shape bug: malformed JSON, multi-system-turns, schema violations; other routes would fail the same way).
 - 401 / 403 + retries exhausted → `RouteSkipped` (this provider's credentials are stale/missing — openrouter-specific, not call-level). *Rationale: 401 on openrouter shouldn't bubble; ollama-local is still viable. If it truly is call-level, all routes will return 401 and the walker's "no viable route" exhaustion bubbles.*
-- 404 + retries exhausted → `CallTerminal` (model not found is structural; same everywhere).
+- 404 + retries exhausted, body matches "model not found" / "no such model" / "unknown model" / "unsupported model" / "invalid model" → `RouteSkipped` (**post-ship W1 correction**; same argument as 400). Implemented via `classify_pool_404`.
+- 404 + retries exhausted, body matches neither → `CallTerminal` (genuinely structural — unknown route path, deleted deployment).
 - Configured retryable status → retry same entry up to `config.max_retries`.
 - Retries exhausted on retryable status → `Retryable` (walker advances).
 - Network/IO error → retry same entry; exhausted → `Retryable`.
+
+**Per-route model resolution (post-ship C1 correction):** Entry `use_model` picks in order `entry.model_id` → `tier_routing[entry.tier_name]` (row's `provider_id` must match `entry.provider_id`) → context-cascade on `config.primary_model`. The walker previously shoveled `config.primary_model` across every entry, which leaked Ollama format names (e.g. `gemma4:26b`) onto the OpenRouter route and tripped its validator. See `resolve_route_model` helper.
 
 ### 4.4 compute_queue interaction
 
@@ -870,6 +875,28 @@ Most of my initial questions were answerable from reading `wire-node-compute-mar
 **Fix:** fallback reads `bundled-dispatch_policy-default-v1` from `pyramid_config_contributions` (shipped Wave 0 task 1) instead of hardcoding a stub; raises `anyhow!` if the bundled seed is missing rather than silently writing broken YAML. Regression guard test at `local_mode.rs::tests::bundled_dispatch_policy_seed_has_routing_rules_with_providers` asserts the bundled seed ships with non-empty `routing_rules` + `route_to` — this test would have caught the regression at unit-test time. Shipped on branch `fix/local-mode-disable-gutted-dispatch-policy`.
 
 **Follow-up chip:** `local_mode.rs:832-853` (enable path) still hardcodes a dispatch_policy YAML. Pre-existing `TODO` comment flags Pillar 37 violation. Now feasible to fix via the bundled seed + Local-Mode overrides (ollama-only routing chain, concurrency=1). Not walker-blocking.
+
+### Post-ship finding (2) — 2026-04-21: walker pool-branch 400 + per-route model resolution
+
+Two chained bugs caught by Mac post-ship smoke immediately after the local-mode fix above shipped.
+
+**W1 — pool-branch 400 classification over-aggressive.** Plan §4.3 (this rev) classified *any* non-context 400 with retries exhausted as `CallTerminal`. OpenRouter returned HTTP 400 with body `{"error":{"message":"gemma4:26b is not a valid model ID"}}` when the walker sent an Ollama format name to OpenRouter's `/chat/completions`. Old rule bubbled the error out of the walker instead of letting it try ollama-local, which was ready to succeed.
+
+**C1 — per-route model resolution missing.** Walker broadcast `config.primary_model` to every pool-branch route entry. The openrouter entry inherited whatever slug the operator had set as primary (Ollama format `gemma4:26b` in Adam's case), and OpenRouter's model validator rejected it — triggering the W1 400 body. Two-bug chain: C1 caused the bad slug to leak, W1 made the resulting 400 terminal instead of skippable.
+
+**Systemic fix (branch `fix/walker-pool-400-classification`, this rev):**
+
+1. `classify_pool_400` + `classify_pool_404` helpers on `EntryError` in `src-tauri/src/pyramid/llm.rs`. Case-insensitive body-text matching splits the 400/404 path three ways: provider-level model rejection → `RouteSkipped`; feature-unsupported → `RouteSkipped`; everything else → `CallTerminal`. UTF-8-safe `truncate_utf8` helper.
+2. Per-route model resolution — Option C hybrid: `entry.model_id` → `tier_routing[entry.tier_name]` (row's `provider_id` must match entry's; regression guard against cross-provider smuggling) → `config.primary_model` fallback. Exposed as `resolve_route_model` for tests; inlined in the walker dispatch loop for the single `info!` log tag.
+3. Bundled `bundled-dispatch_policy-default-v1` seed pins `model_id: openai/gpt-4o-mini` on the openrouter entry so fresh installs cascade cleanly.
+4. 13 new unit + integration tests including `walker_advances_past_openrouter_400_model_rejection_to_ollama_local` (mockito, exact 400 body from Mac smoke).
+
+**Scope-gap note:** rev 0.3 audits reviewed §4.3 classification for *logical shape* — three-tier taxonomy, cascade-vs-skip boundaries, retry counting — but did not exercise the classification against *real-world OpenRouter 400 body text*. Future audits on documented error-classification tables should construct real-world error-body fixtures for every branch (status code × body category) and assert the classifier's output. The W1 bug was a plain test-coverage gap, not a design flaw — the three-tier taxonomy absorbed the fix cleanly.
+
+**Flagged for separate work (NOT fixed in this branch):**
+
+- Punch list P0-1 at `chain_dispatch.rs:1198` `resolve_ir_model` — same class of "one model across providers" bug; walker-reachable only via chain dispatch rather than the pool loop. Separate task.
+- Project memory `project_provider_model_coupling_bug` (2026-04-12) — full refactor of `config.primary_model: String` into `HashMap<ProviderId, ModelId>` is a 25+-call-site change. Not this fix; flagged for its own plan.
 
 ---
 

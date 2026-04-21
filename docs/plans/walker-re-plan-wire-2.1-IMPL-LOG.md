@@ -9,6 +9,38 @@ Append-only log of what's done. Newest at top. Updated at every commit.
 
 ---
 
+## 2026-04-21 — post-ship W1 + C1 fix (branch fix/walker-pool-400-classification, off main at fc4a55e)
+
+**Plan task:** Post-ship finding (2) in §13 — W1 pool-branch 400 classification + C1 per-route model resolution. Mac post-ship smoke caught an OpenRouter 400 body ("gemma4:26b is not a valid model ID") bubbling as CallTerminal instead of advancing to ollama-local. Root cause chain: C1 leaked primary_model onto openrouter; W1 bubbled the resulting 400.
+
+### 3a96a17 — feat(llm): classify_pool_400 — route-skipped on provider model rejection
+
+**Changed:** Added `classify_pool_400` + `classify_pool_404` + `truncate_utf8` helpers in `src-tauri/src/pyramid/llm.rs`. Replaced blunt 400 non-context `CallTerminal` in walker pool-branch loop with nuanced classification: provider-level model rejection and feature-unsupported → `RouteSkipped`; body-shape errors → `CallTerminal`. Same split applied to 404.
+**Cargo check:** clean. **Cargo test:** not yet (deferred to test commit).
+
+### d509a1e — feat(llm): per-route model resolution — entry → tier_routing → primary_model
+
+**Changed:** Added `resolve_route_model` helper and inlined Option C hybrid resolution in walker dispatch loop: priority 1 `entry.model_id` → priority 2 `tier_routing[entry.tier_name]` (row provider must match entry provider) → priority 3 `config.primary_model` context-cascade. Full Option C shipped (not A+manual-C fallback); tier_routing plumbing was a one-line `.and_then` chain since `ProviderRegistry::get_tier` already lives on `config.provider_registry`.
+**Cargo check:** clean. **Cargo test:** not yet.
+
+### 2c1dbd2 — feat(bundled): openrouter route gets default model_id to avoid cascade crash
+
+**Changed:** Pinned `model_id: "openai/gpt-4o-mini"` on the openrouter route entry in `bundled-dispatch_policy-default-v1` at `src-tauri/assets/bundled_contributions.json` so fresh installs don't inherit primary_model's Ollama format. Operators override in Settings.
+**Cargo check:** N/A (JSON only). **JSON validity:** verified.
+
+### b50e014 — test(llm): pool 400 classification + per-route model resolution + cascade-crossing integration
+
+**Changed:** 13 new tests covering classifier branches (6), truncate_utf8 (2), resolve_route_model priorities (4), and a mockito integration test that reproduces the exact cascade-crossing bug (openrouter 400 with "not a valid model ID" body → walker advances → ollama-local mockito succeeds).
+**Cargo check:** clean. **Cargo test:** 1770 pass / 15 fail (baseline was 1757/15; +13 new tests, 0 regressions).
+
+### (commit 5 — docs) — docs(plan): §4.3 + §13 retro for post-ship walker classification gap
+
+**Changed:** §4.3 error-classification table split 400 non-context into three rows (provider-model-rejection + feature-unsupported → RouteSkipped; body-shape → CallTerminal); same split for 404. Added per-route model resolution paragraph. §13 added "Post-ship finding (2)" entry with scope-gap note ("rev 0.3 audits reviewed §4.3 for logical shape, not real-world OpenRouter 400 body text"). IMPL + friction logs updated.
+
+**Summary:** 5 atomic commits; full Option C for model resolution; 13 tests including the exact cascade-crossing regression guard Adam asked for. No regressions (1770 pass / 15 pre-existing fails unchanged).
+
+---
+
 ## 2026-04-21 — commits 22f0f9f + e2f22aa + c714770 + dd0a35e (branch walker-re-plan-wire-2.1)
 
 **Plan tasks:** Wave 5 tasks 35 + 36 + 37 + 38 — cleanup + deprecation enforcement.
