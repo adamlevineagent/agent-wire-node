@@ -2,10 +2,11 @@
 //! `LlmConfig` so `call_model_unified` can attempt a Phase B market
 //! dispatch without taking new parameters.
 //!
-//! Lives in a module separate from `compute_requester.rs` to avoid the
-//! cyclic import that would otherwise bind `llm.rs` and the requester
-//! together (llm.rs depends on this context; compute_requester depends
-//! on `LlmProvider` traits transitively via `llm.rs`).
+//! Historical note: this module was split out from the former
+//! `compute_requester.rs` (removed in Wave 5) to avoid a cyclic import
+//! that would otherwise bind `llm.rs` and the requester together — the
+//! split is preserved because the walker's market branch still reads
+//! these runtime handles off `LlmConfig`.
 //!
 //! See `docs/plans/call-model-unified-market-integration.md` §3.5.
 

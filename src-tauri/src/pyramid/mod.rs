@@ -27,7 +27,6 @@ pub mod compute_chronicle;
 pub mod compute_market_ctx;
 pub mod compute_market_ops;
 pub mod compute_quote_flow;
-pub mod compute_requester;
 pub mod config_contributions;
 pub mod config_helper;
 pub mod prompt_cache;

@@ -8,7 +8,7 @@
 //! receiver. The inbound handler looks up the entry, fires the sender,
 //! and removes the key.
 //!
-//! Timeout semantics: `await_result` in `compute_requester` owns the
+//! Timeout semantics: `await_result` in `compute_quote_flow` owns the
 //! timeout; on expiry it `remove`s its own entry to prevent a late
 //! push from firing a channel whose receiver has been dropped. A
 //! late push that finds no entry returns a 2xx `already_settled`

@@ -1801,8 +1801,8 @@ pub async fn call_model_unified_with_audit_and_ctx(
     // CallTerminal bubbles).
     //
     // Wave 3b scope: pool + fleet + market all inline in the walker.
-    // Phase B market pre-loop deleted; compute_requester::dispatch_market
-    // deprecated (Wave 5 removes the module). Market branch uses
+    // Phase B market pre-loop deleted; the rev-2.0 `compute_requester`
+    // module was removed in Wave 5. Market branch uses
     // compute_quote_flow::{quote, purchase, register_pending, fill,
     // await_result} — register-BEFORE-fill closes the Wave 3a race.
     //

@@ -1,14 +1,13 @@
 //! Rev 2.1 three-RPC compute-market client: `/quote` → `/purchase` → `/fill`.
 //!
 //! Walker's market branch (plan §4.2) invokes these four public entry points
-//! back-to-back. This module replaces the rev-2.0 `dispatch_market` /
+//! back-to-back. This module replaced the rev-2.0 `dispatch_market` /
 //! `call_market` / `call_match` / `call_fill` / `resolve_uuid_from_handle`
-//! surface in `compute_requester.rs` (slated for removal in Wave 5 per
-//! plan §2).
+//! surface (the `compute_requester` module was deleted in Wave 5).
 //!
 //! Wave 3b status: LIVE. `quote`, `purchase`, `fill`, `register_pending`,
 //! and `await_result` are all wired into the walker's market branch
-//! (plan §4.2). The legacy `compute_requester` Phase B pre-loop is gone.
+//! (plan §4.2). The legacy Phase B pre-loop is gone.
 //! `register_pending` must be called BEFORE `fill` so the provider
 //! callback cannot race the registration (Wave 3a friction-log RACE-1).
 //!

@@ -62,7 +62,7 @@ pub struct ServerState {
     /// agent observability.
     pub work_stats: Arc<RwLock<crate::work::WorkStats>>,
     /// Phase 3 requester-side pending jobs registry — shared between
-    /// the compute_requester client (inserts) and the inbound
+    /// the `compute_quote_flow` walker (inserts) and the inbound
     /// `/v1/compute/job-result` handler (fires + removes). See
     /// `pyramid::pending_jobs` for semantics.
     pub pending_market_jobs: crate::pyramid::pending_jobs::PendingJobs,
