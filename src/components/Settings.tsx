@@ -100,11 +100,11 @@ const defaultComputeParticipationPolicy: ComputeParticipationPolicy = {
 const roleDescriptions: Record<ComputeParticipationMode, { label: string; description: string }> = {
     coordinator: {
         label: "Coordinator",
-        description: "Dispatches work out (to fleet peers, market, storage, relay) but does not serve any inbound requests.",
+        description: "Dispatches work out (to fleet peers, network compute, storage, relay) but does not serve any inbound requests.",
     },
     hybrid: {
         label: "Hybrid",
-        description: "Full participation — dispatches out AND serves across fleet, compute, storage, and relay markets.",
+        description: "Full participation — dispatches out AND serves across fleet, compute, storage, and relay networks.",
     },
     worker: {
         label: "Worker",
