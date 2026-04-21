@@ -11890,6 +11890,21 @@ fn main() {
                     },
                 );
             }
+            // Walker rev 2.1: MarketSurfaceCache polls /api/v1/compute/market-surface
+            // every 60s; walker consults it on the "market" branch as an advisory
+            // pre-filter. `/quote` remains the authoritative viability check.
+            if cfg.market_surface_cache.is_none() {
+                let cache = std::sync::Arc::new(
+                    wire_node_lib::pyramid::market_surface_cache::MarketSurfaceCache::new(
+                        shared_auth.clone(),
+                        shared_config.clone(),
+                    ),
+                );
+                wire_node_lib::pyramid::market_surface_cache::MarketSurfaceCache::spawn_poller(
+                    cache.clone(),
+                );
+                cfg.market_surface_cache = Some(cache);
+            }
         }
     }
 
