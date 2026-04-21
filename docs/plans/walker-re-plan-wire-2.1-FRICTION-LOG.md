@@ -20,6 +20,22 @@ Entry template:
 **Flag:** plan error / doc staleness / spec ambiguity / Wire-side bug / learning moment
 -->
 
+## 2026-04-21 — Wave 1 retro
+
+**What worked:**
+- Serializing task 11 (sig extension) before the walker-body agent meant the walker consumer hit stable `complete_llm_audit` / `fail_llm_audit` signatures without a rebase. Workflow agent shipped 4 atomic commits (constants / refactor / tests / impl-log) — easy to review.
+- Walker-body agent's `'http: { loop { ... } }` named-block pattern for HTTP retry carry-over turned out clean. `break 'http Err(EntryError::...)` reads as a state machine.
+- Wanderer after verifier caught nothing new — which is actually the signal. Verifier found the two tightening fixes (kill no-op, kill dead helper); wanderer confirmed end-to-end wiring. When wanderers come back empty, the per-task + verifier gates did their job.
+
+**What bit us:**
+- Initial walker-body agent shipped a `let _ = (&mut provider_impl, &mut secret, &mut provider_type);` warning-silencer. Verifier traced the warning to `mut` qualifiers that were Phase D vestiges — drop `mut`, warnings die. Learning: when an agent leaves an ugly no-op, it's often a missed refactor upstream. Default to understanding the warning source before silencing.
+- `maybe_fail_audit` helper got `#[allow(dead_code)]`-tagged with a "reuse in Wave 2-3" note, but verifier correctly killed it: Waves 2-3 inline fleet+market INTO the walker where `fail_llm_audit` is already called inline with `provider_id`. Ambiguous deferrals become permanent dead code. Learning: either reuse path is concrete or the helper dies — don't defer without a specific call site name.
+- Dev-smoke deferred to Wave 4 gate per plan. Adam's running binary on 8765 is a different branch; clobbering would lose his dev state. Cargo-green + wanderer is Wave-1 ship signal.
+
+**What we'd do differently:**
+- Wave 2 extracts Phase A fleet into the walker. The walker-body agent already had to reason about Phase A/B staying untouched; Wave 2 removes one of those constraints. Keep the same "workflow agent → serial verifier → wanderer" cadence; Wave 2 LOC target is 400 and localized, so same shape as Wave 1.
+- If a wave's agent tags anything `#[allow(dead_code)]` or `#[allow(unused_*)]`, ensure the comment names a specific follow-up task + why. Verifier should reject any allow without both.
+
 ## 2026-04-21 — Wave 1 verifier pass — hoisted provider bindings are genuine fallback
 
 **Context:** Verifier inspecting the Wave 1 walker-body diff; agent had written `let _ = (&mut provider_impl, &mut secret, &mut provider_type);` at llm.rs:2443 as a warning-silencer.
