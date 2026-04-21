@@ -168,6 +168,61 @@ pub const EVENT_NETWORK_LATE_ARRIVAL: &str = "network_late_arrival";
 pub const EVENT_NETWORK_BALANCE_EXHAUSTED: &str = "network_balance_exhausted";
 pub const EVENT_BUILD_NETWORK_CONTRIBUTION: &str = "build_network_contribution";
 
+// ── Walker lifecycle events (rev 2.1 compute dispatch walker) ───────────
+//
+// Walker Re-Plan Wire 2.1 — plan §5 chronicle vocabulary. Emitted from
+// the per-entry walker loop in `call_model_unified_with_audit_and_ctx`
+// (llm.rs). Wave 1 emits a subset (`walker_resolved`, `walker_exhausted`,
+// `network_route_skipped`, `network_route_saturated`,
+// `network_route_unavailable`, `network_route_retryable_fail`,
+// `network_route_terminal_fail`); the remaining constants land now so
+// Waves 2-4 don't re-introduce them piecemeal. `#[allow(dead_code)]`
+// until their emission sites wire up.
+#[allow(dead_code)]
+pub const EVENT_WALKER_RESOLVED: &str = "walker_resolved";
+#[allow(dead_code)]
+pub const EVENT_WALKER_EXHAUSTED: &str = "walker_exhausted";
+#[allow(dead_code)]
+pub const EVENT_WALKER_PATH_DISTRIBUTION: &str = "walker_path_distribution";
+#[allow(dead_code)]
+pub const EVENT_WALKER_QUOTE_RACE_STATS: &str = "walker_quote_race_stats";
+
+#[allow(dead_code)]
+pub const EVENT_NETWORK_ROUTE_SKIPPED: &str = "network_route_skipped";
+#[allow(dead_code)]
+pub const EVENT_NETWORK_ROUTE_SATURATED: &str = "network_route_saturated";
+#[allow(dead_code)]
+pub const EVENT_NETWORK_ROUTE_UNAVAILABLE: &str = "network_route_unavailable";
+#[allow(dead_code)]
+pub const EVENT_NETWORK_ROUTE_RETRYABLE_FAIL: &str = "network_route_retryable_fail";
+#[allow(dead_code)]
+pub const EVENT_NETWORK_ROUTE_TERMINAL_FAIL: &str = "network_route_terminal_fail";
+#[allow(dead_code)]
+pub const EVENT_NETWORK_MODEL_UNAVAILABLE: &str = "network_model_unavailable";
+
+#[allow(dead_code)]
+pub const EVENT_NETWORK_QUOTED: &str = "network_quoted";
+#[allow(dead_code)]
+pub const EVENT_NETWORK_PURCHASED: &str = "network_purchased";
+#[allow(dead_code)]
+pub const EVENT_NETWORK_QUOTE_EXPIRED: &str = "network_quote_expired";
+#[allow(dead_code)]
+pub const EVENT_NETWORK_PURCHASE_RECOVERED: &str = "network_purchase_recovered";
+#[allow(dead_code)]
+pub const EVENT_NETWORK_RATE_ABOVE_BUDGET: &str = "network_rate_above_budget";
+#[allow(dead_code)]
+pub const EVENT_NETWORK_DISPATCH_DEADLINE_MISSED: &str = "network_dispatch_deadline_missed";
+#[allow(dead_code)]
+pub const EVENT_NETWORK_PROVIDER_SATURATED: &str = "network_provider_saturated";
+#[allow(dead_code)]
+pub const EVENT_NETWORK_BALANCE_INSUFFICIENT_FOR_MARKET: &str =
+    "network_balance_insufficient_for_market";
+#[allow(dead_code)]
+pub const EVENT_NETWORK_AUTH_EXPIRED: &str = "network_auth_expired";
+
+#[allow(dead_code)]
+pub const EVENT_DISPATCH_POLICY_SUPERSEDED: &str = "dispatch_policy_superseded";
+
 // ── Event context ─────────────────────────────────────────────────────────
 
 /// All context needed to record a chronicle event.
