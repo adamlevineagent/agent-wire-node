@@ -21,7 +21,7 @@ Entry template:
 **Deviation:** None / <rationale if any>
 -->
 
-## 2026-04-21 02:30 — commit <SHA> (branch walker-re-plan-wire-2.1)
+## 2026-04-21 02:30 — commit e18261d (branch walker-re-plan-wire-2.1)
 
 **Plan task:** Wave 0 task 1 — bundle `dispatch_policy-default-v1` contribution family (4 entries).
 **Changed:** `src-tauri/assets/bundled_contributions.json` gains four entries directly after the `evidence_policy` family: `bundled-skill-generation-dispatch_policy-v1` (intent→YAML generation prompt), `bundled-schema_definition-dispatch_policy-v1` (JSON Schema covering version / provider_pools / routing_rules — including optional `max_budget_credits` on `RouteEntry` per plan §2 — plus escalation / build_coordination / max_batch_cost_usd / max_daily_cost_usd), `bundled-schema_annotation-dispatch_policy-v1` (Tools wizard field annotations), and `bundled-dispatch_policy-default-v1` (default seed with `market → fleet → openrouter → ollama-local` chain, seed YAML verbatim from plan §8 Wave 0 task 1). Default seed deliberately omits `max_budget_credits` so absent → None → NO_BUDGET_CAP sentinel at read time. Schema-definition JSON round-trips through `jq .` and `json.loads`; seed YAML round-trips through `jq -r` with correct provider chain. Dispatcher arm at `config_contributions.rs:780` already routes `dispatch_policy` contributions to `db::upsert_dispatch_policy`, so the seed lands in the operational table via the existing path.
