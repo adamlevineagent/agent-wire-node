@@ -9,6 +9,93 @@ Append-only log of what's done. Newest at top. Updated at every commit.
 
 ---
 
+## 2026-04-21 — Wave 3b — walker market branch inline + Phase B delete (commits d410add, 1a2ba11, 884a910, 79efb13)
+
+**Plan tasks:** §8 Wave 3 tasks 21-24 + Wave 3a friction-log RACE-1.
+
+**Commits (in order):**
+
+1. `d410add refactor(compute_quote_flow): split await_result — register before /fill (race fix)`
+   Race-fix only. `await_result` no longer registers PendingJobs internally.
+   New `register_pending(pending_jobs, uuid) -> oneshot::Receiver` helper;
+   refactored `await_result(rx, uuid_job_id, pending_jobs, timeout)` takes the
+   receiver by value. Existing tests updated to construct + pass the receiver
+   externally; new test `register_pending_returns_receiver_before_fill_can_race`
+   asserts the sender is installed synchronously so a racing `take()` cannot
+   miss it.
+
+2. `1a2ba11 refactor(llm): walker market branch + delete Phase B pre-loop`
+   Main surgery (+440, -1124):
+   - Phase B market pre-loop deleted (~350 LOC, formerly llm.rs:1587-1937).
+   - Walker's `wave2_market_not_implemented` stub replaced with the real market
+     branch: runtime gate (compute_market_context + tunnel Connected + URL) →
+     advisory MarketSurfaceCache consult (cache-miss proceeds; active_offers==0
+     advances with `network_model_unavailable`) → `dispatch_market_entry`
+     helper → three-tier EntryError classification → complete_llm_audit on
+     success + `walker_resolved` chronicle (branch="market").
+   - New `dispatch_market_entry` helper with race-safe call order:
+     quote → purchase → register_pending → fill → await_result.
+   - Deleted dead helpers: `should_try_market`, `TunnelSnapshot`,
+     `model_tier_market_eligible`, `classify_soft_fail_reason`,
+     `sanitize_wire_slug`, `emit_network_helped_build`,
+     `emit_network_fell_back_local`, `emit_network_balance_exhausted`,
+     `emit_network_balance_exhausted_once`, `NetworkHandleInfo`,
+     `LlmResponse::from_market_result`.
+   - Deleted `market_integration_tests` module (~360 LOC) — tested only
+     deleted helpers.
+   - Stale doc-comments in compute_market_ctx.rs updated.
+
+3. `884a910 feat(llm): deprecate market_dispatch_eager + threshold_queue_depth`
+   Plan §2 "walker removes" retires two queue-depth-as-proxy knobs on
+   `ComputeParticipationPolicy` + `EffectiveParticipationPolicy`. Fields
+   marked `#[deprecated]` with Wave 5 removal note — serde-compat shape
+   preserved. Internal pass-through sites (projection, Default impl,
+   wire_migration canonicalizer) scoped `#[allow(deprecated)]`. Tests
+   mod-level `#[allow(deprecated)]` for serde fixture construction.
+
+4. `79efb13 test(llm): walker market branch — race-fix + error taxonomy + runtime-gate paths`
+   Four new walker tests:
+   - `walker_market_branch_advances_when_no_market_context`
+   - `walker_market_branch_respects_branch_allowed_on_replay`
+   - `walker_market_branch_advances_on_tunnel_disconnected`
+   - `walker_market_dispatch_args_struct_compiles` (compile-time shape)
+
+**Cargo check:** clean (default target). 69 lib warnings baseline unchanged.
+
+**Cargo test --lib:** 1755 pass, 15 pre-existing failures unchanged.
+   - +4 new walker market tests (all pass).
+   - +1 new compute_quote_flow race-fix test.
+   - −36 tests from deleted `market_integration_tests` module (pre-surgery
+     baseline 1787 → post 1755 — nets to +5 new ∕ −36 deleted ∕ −1 stub test
+     removed in walker body).
+
+**Grep invariants:**
+   - `// Phase B` in live code: ZERO (only in git history).
+   - `should_try_market` / `classify_soft_fail_reason` / `sanitize_wire_slug` /
+     `NetworkHandleInfo` in live code: ZERO.
+   - `wave2_market_not_implemented` in live code: ZERO.
+   - `register_pending` in compute_quote_flow.rs: ONE (the new helper).
+
+**Deviations:**
+   - `RouteEntry.max_budget_credits` field not yet on the struct (that's a
+     Wave 0/1 task not landed at Wave 3a time). Walker uses the
+     NO_BUDGET_CAP sentinel `(1i64 << 53) - 1` directly for the `/quote`
+     `max_budget` until the field lands. Wire's 409 `budget_exceeded`
+     remains authoritative.
+   - No mock-trait indirection introduced for compute_quote_flow. Walker
+     tests cover runtime-gate paths only; the three-RPC success path is
+     covered at the compute_quote_flow layer (race-fix + timeout/close/
+     success/failure envelope tests). Full end-to-end HTTP-mocked
+     walker-market success path deferred to Wave 4+ integration coverage
+     per plan §8. Compile-time shape assertion on `MarketDispatchArgs`
+     stands in for struct-refactor detection.
+   - `compute_requester.rs` NOT `#[deprecated]`-marked in this wave —
+     Wave 5 tracks module-level deletion per plan §8. `dispatch_market`
+     / `call_market` / `await_result` are no longer called from llm.rs,
+     but the module stays on disk.
+
+---
+
 <!--
 Entry template:
 
