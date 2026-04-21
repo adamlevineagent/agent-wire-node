@@ -9,6 +9,37 @@ Append-only log of what's done. Newest at top. Updated at every commit.
 
 ---
 
+## 2026-04-21 — commit 272f171 (branch walker-re-plan-wire-2.1)
+
+**Plan task:** Wave 4 task 32 — invisibility copy audit.
+**Changed:** `src/components/Settings.tsx` roleDescriptions for Coordinator + Hybrid — "market" in operator-facing mode descriptions replaced with "network compute" / "networks". InferenceRoutingPanel's own operator-facing strings (desc paragraph, change-note placeholder) were touched up in commit 2fd9e6c alongside the feature edits. Intentionally out of scope: type/const/state names containing "market"; CSS class names; `MarketView.tsx` / `MarketDashboard.tsx` / CommandCenter "Market" tab label (those are THE network-compute dashboards — re-branding the tab itself is a separate invisibility pass); `<code>market</code>` sentinel literals in the routing panel (operators must type that exact string).
+**Build:** `npm run build` clean.
+**Cargo:** no Rust changes.
+**Deviation:** None. Documented the retained "Market" tab identity + the sentinel-literal rationale directly in the commit message so a future reviewer doesn't re-open the question.
+
+## 2026-04-21 — commit 2fd9e6c (branch walker-re-plan-wire-2.1)
+
+**Plan task:** Wave 4 task 30 sub-bullets — Discovery section + Market row max_wait_ms display in `InferenceRoutingPanel.tsx`.
+**Changed:**
+- Discovery section: collapsible `<details>` under the routing-rules editor. Invokes `pyramid_market_models` on mount + on explicit Refresh. Renders model_id / available offers / median input+output rates / snapshot timestamp. `inferenceRouting.lastReviewedMarketModels` localStorage bookmark flags new-since-review rows; "Mark all reviewed" button writes the current set into the bookmark. Graceful empty-state for pre-tunnel / pre-first-refresh.
+- Market row sub-panel: rendered as a full-width row directly under any route entry whose `provider_id == "market"`. Shows readonly `max_wait_ms` pulled from the active `compute_participation_policy` contribution via the existing `pyramid_active_config_contribution` IPC (new fetch effect on mount), plus a link to `/ops` (new tab) — link only, no embed.
+- Invisibility copy updates inline on the panel's own strings (desc paragraph "route through your fleet" / "route through network compute"; change-note placeholder "before network compute"). Kept `<code>market</code>` as the sentinel-value literal operators must type.
+**Build:** `npm run build` clean.
+**Cargo:** no Rust changes.
+**Deviation:** Market row sub-panel is a full-width table row rather than an inline expander — cleaner given the row layout.
+
+## 2026-04-21 — commit 85d18c5 (branch walker-re-plan-wire-2.1)
+
+**Plan task:** Wave 4 task 29 — `pyramid_market_models` IPC.
+**Changed:**
+- `src-tauri/src/pyramid/market_surface_cache.rs`: added `PyramidMarketModel` serializable UI-facing type (`{ model_id, active_offers, rate_in_per_m, rate_out_per_m, last_updated_at }`); added `pub async fn snapshot_ui_models()` returning the flattened vec, sorted alphabetically by model_id for UI stability. Median rates are read from `price.rate_per_m_input.median` / `price.rate_per_m_output.median` — `None` when Wire couldn't compute a median. Two new unit tests (cold and warm cache shapes).
+- `src-tauri/src/main.rs`: new `pyramid_market_models` Tauri command reading the cache handle off `state.pyramid.config.market_surface_cache` (clone-out-of-lock pattern to avoid holding the config read lock across an async cache read). Registered in `invoke_handler!`. Cold-cache contract: returns `[]` when `market_surface_cache` is `None` (pre-tunnel fresh install) or when the cache itself has no data yet (pre-first-poll).
+**Cargo check:** clean (default target; 70 pre-existing warnings unchanged, 1 pre-existing warning in bin unchanged).
+**Cargo test:** `cargo test --lib market_surface_cache` — 5 passed (3 pre-existing + 2 new: `snapshot_ui_models_cold_cache_is_empty`, `snapshot_ui_models_warm_cache_shape`).
+**Deviation:** Plan §8 task 29 signature called for `{model_id, active_offers}`; task-brief signature called for `{model_id, active_offers, rate_in_per_m, rate_out_per_m, last_updated_at}`. Honored the richer brief shape — Discovery section needs the rates to be useful.
+
+---
+
 ## 2026-04-21 — commits f9895db + 8b7a4ea (branch walker-re-plan-wire-2.1)
 
 **Plan tasks:** Wave 4 tasks 30 + 31 + 33 (Inference Routing Settings panel + mount + debounced save). Tasks 28 (MarketSurfaceCache polling), 29 (pyramid_market_models IPC), 32 (invisibility copy audit), 34 (verifier pass) remain for subsequent Wave 4 work.

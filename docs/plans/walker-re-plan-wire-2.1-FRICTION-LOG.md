@@ -8,6 +8,24 @@ Real-time record of surprises, workarounds, and "this bit me" moments. Newest at
 
 ---
 
+## 2026-04-21 — Wave 4 residuals (tasks 29 / 30-subbullets / 32 / 34)
+
+**Task 29 IPC snapshot shape: plan said less, brief said more.** Plan §8 task 29 spells out `{model_id, active_offers}`; the session brief specifies `{model_id, active_offers, rate_in_per_m, rate_out_per_m, last_updated_at}`. Went with the brief shape — Discovery section is visibly dead without rates, and the extra fields are cheap to flatten from the already-cached `MarketSurfaceModel.price` triples. Noted the widening in the commit + impl-log; if future consumers want the minimal shape they can project on the client.
+
+**`PriceTriple.median` is `Option<i64>`, not a scalar.** Wire returns `{min, median, max}` with all three nullable. UI row renders `—` when median is absent. Alternative (mean of min/max) was considered and rejected — Wire's "median" is the authoritative display value; synthesizing our own summary stat would drift the node off Wire's telemetry.
+
+**Config-lock / cache-lock ordering.** The `market_surface_cache` handle lives inside `LlmConfig` behind an `RwLock`. Holding the config read lock across an `await` on `cache.snapshot_ui_models()` would serialize all IPC reads against any config writer. Cloned the `Arc<MarketSurfaceCache>` out of the lock first, dropped the config guard, then awaited on the cache — the canonical pattern used elsewhere in main.rs for `compute_queue` / `fleet_roster` handles.
+
+**Market sub-panel placement inside a `<table>`.** Keeping the row layout meant the sub-panel had to be a `<tr>` with `colSpan` rather than a block below the table. Used a React fragment array `[mainRow, subRow]` returned from `.map(...)` with string keys (`${idx}-row` / `${idx}-sub`) so React diffing stays stable across reorders. Avoided restructuring the table into a `<div>`-grid this session; the row-pair pattern ships cleanly.
+
+**`compute_participation_policy` read path.** Plan hinted "load via existing IPC if handy". `pyramid_active_config_contribution` with `schemaType: "compute_participation_policy", slug: null` returns the row whose `yaml_content` parses straight into a `ComputeParticipationPolicyShape` with `market_dispatch_max_wait_ms`. No plumbing new IPCs. Best-effort: errors silently flip the readonly field to a "(loading…)" hint — it's an informational display, not a gating check.
+
+**Invisibility audit scoping pain.** Clean sweep inside the InferenceRoutingPanel was easy; the tangled decision was `MarketView.tsx` + `MarketDashboard.tsx` + the CommandCenter "Market" tab. Those are THE operator-facing network-compute dashboards; their own tab identity is "Market". Task brief's "skip: type names / const names / fields operators don't see" guidance didn't fully cover "the tab's IDENTITY is the word we're replacing". Documented as intentionally out of scope — a rename of those surfaces is a separate invisibility pass with its own blast radius (routes, bookmarks, muscle memory).
+
+**Sentinel-literal vs label.** The routing-rule `provider_id` field accepts the literal string `"market"` as one of its three operator-typed sentinels (`fleet` / `market` / concrete provider). Keeping `<code>market</code>` in the description + placeholder is correct — operators need to know the exact string. Task 32's "never 'market' in operator-facing labels" doesn't apply to literals-operators-must-type. Documented the distinction in commit 272f171.
+
+---
+
 ## 2026-04-21 — Wave 4 task 30 (InferenceRoutingPanel)
 
 **Surprise: No React test infra.** `package.json` has no Jest/Vitest/RTL. Wave 4 plan expected component tests but the codebase has never shipped them. Deferred per task 30 in-prompt fallback ("defer and note in friction log"). Recommend a separate task to add Vitest + @testing-library/react + jsdom, then backfill InferenceRoutingPanel + a couple of other high-churn components (Settings.tsx participation-policy handlers, ContributionDetailDrawer).
