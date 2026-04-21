@@ -492,8 +492,18 @@ fn classify_rev21_slug(slug: &str) -> EntryError {
         // Walker built a malformed body — same bug would fire on every
         // route that routes through Wire. Bubble.
         "invalid_body" => EntryError::CallTerminal { reason },
-        "multiple_nodes_require_explicit_node_id" => EntryError::CallTerminal { reason },
-        "no_node_for_agent" => EntryError::CallTerminal { reason },
+        // Wire-identity-binding errors are MARKET-SPECIFIC: fleet / openrouter /
+        // ollama-local dispatches never touch Wire's node or agent registration,
+        // so a 400 on requester_node_id or agent binding doesn't doom them.
+        // Same reasoning as `unauthorized` below — advance, let other routes
+        // serve, operator telemetry carries the raw slug for diagnosis.
+        //
+        // (The real fix is walker always injecting `requester_node_id` into
+        // `/quote` bodies; tracked as a chip. Until then, RouteSkipped keeps
+        // the cascade productive instead of killing builds on multi-node
+        // operator accounts.)
+        "multiple_nodes_require_explicit_node_id" => EntryError::RouteSkipped { reason },
+        "no_node_for_agent" => EntryError::RouteSkipped { reason },
         // Operator consent not granted. No alternate route will satisfy
         // Wire until operator fixes the agent binding. Bubble.
         "agent_unconfirmed" => EntryError::CallTerminal { reason },
