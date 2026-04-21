@@ -8,6 +8,41 @@ Real-time record of surprises, workarounds, and "this bit me" moments. Newest at
 
 ---
 
+## 2026-04-21 — Final retro (all 6 waves shipped)
+
+**Shipped:** 6 waves, ~60 commits, branch `walker-re-plan-wire-2.1` at `28e0e6d`. Final wanderer confirmed "walker plan actually works; ready for ship." All §12 acceptance criteria satisfied. 97 walker-related tests pass. Cargo check default target clean. npm build clean.
+
+**What worked (project-level):**
+- **Small-work direct-write + serial verifier** (Waves 0, 2 tests, 4 tests) produced clean code the first time. Verifier agents caught zero structural bugs in those cases.
+- **Workflow agent → serial verifier → wanderer pattern** for big surgeries (Waves 1, 3a, 3b, 4, 5) caught the issues no single agent would have: race hazards, declared-but-unwired chronicle constants, missing Rust struct fields despite schema landings. Verifier-after-wanderer outperforms wanderer-alone.
+- **Parallel agents on disjoint files** (Wave 0 tasks 1+2, Wave 3a compute_quote_flow + market_surface_cache): ~40% wall-time savings without git races. Task 9 agent's stash-dance when it hit task 8's in-progress `pub mod` line is the canonical recovery recipe.
+- **Friction log carrying invariants forward.** The 3a-A race-hazard find was flagged in the agent's own friction entry, explicitly picked up as a prompt requirement for 3b, and fixed there. Chain-of-custody worked.
+- **Plan §4.2 error-classification table** was load-bearing for every walker branch. Tier debates happened at plan time, not at agent time.
+- **Retro per wave** paid off — this final retro took five minutes to compose because accumulated friction entries were already written.
+
+**What bit us:**
+- **Piecemeal "walker adds" items** — Plan §2 Rust struct additions (`RouteEntry.max_budget_credits`) landed in schema but not in the struct. No wave owned the Rust struct work explicitly. Caught near end of Wave 3 by me tracing a `NO_BUDGET_CAP` local const comment. Learning: at Wave 0 completion, grep plan §2 "walker adds" against live Rust source line-by-line.
+- **Declared-but-unemitted chronicle constants** — 7 event constants shipped in Wave 1 but never wired from walker. Caught by Wave 3 verifier. Learning: when adding N constants, add a smoke that greps each emit site back to the constant.
+- **Plan/spec/contract-crate drift** — plan §6 `CacheData` shape, plan §4.2 tier classifications, spec §2.2 response shapes vs contracts crate all diverged in ways agents had to reconcile at build time. Documented in Wave 3 divergence entry.
+- **Hard-gate GUI-boot dev-smoke deferred.** Walker's correctness is provable by the wanderer's end-to-end code trace + 97 tests + cargo-green + npm-build-green, but actual boot of the rebuilt binary on Adam's machine was not done to avoid clobbering his running dev state. Documented in Wave 3 retro with 5-step morning checklist. Per final wanderer's verdict: not shipstopper.
+
+**What we'd do differently next plan:**
+- Bake a "Rust struct/field audit" task into Wave 0 completion — `rg "walker adds" docs/plans/<plan>.md` diffed against live struct definitions.
+- Chronicle-constant audit as a structural task, not an emergent verifier find.
+- If hard-gate GUI-boot smoke is a ship-blocker, orchestrator runs it on a dedicated isolated data dir (not operator's live state) before the gate; skip the deferral dance.
+- Single-agent Wave 3b shipped ~1000 LOC of diff — still manageable but at the ceiling. Anything bigger splits.
+
+**Ship status:**
+- Per Adam's answer #2: "fast-forward-merge after Wave 5 wanderer clean. Single operator, no PR review needed. Push the merge yourself." → final wanderer clean → merging to `main`.
+- Morning smoke checklist (5 steps from Wave 3 retro) remains Adam's responsibility to exercise on wake. If any step fails, branch can be reverted via `git revert <merge-sha>` on main.
+- Remaining follow-ups (not walker-correctness-blocking):
+  - 15 pre-existing `cargo test --lib` failures — separate spawned task chip.
+  - `mcp-server/src/cli.ts compute-market-call` CLI entry is a dead link post-Wave-5 route deletion — follow-up CLI surface cleanup.
+  - Plan doc sweep: §8 task 4 wording vs §2.5.1, §4.2 tier reconciliations, §6 field shape vs contracts — for any future plan rev.
+  - React test infra (Vitest + RTL) never existed; InferenceRoutingPanel tests deferred.
+
+---
+
 ## 2026-04-21 — Wave 5 cleanup (tasks 35-38)
 
 **`deny_unknown_fields` forces a forward-compat tradeoff on field removal.**
