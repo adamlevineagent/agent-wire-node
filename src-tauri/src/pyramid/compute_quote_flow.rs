@@ -890,6 +890,50 @@ mod tests {
     }
 
     #[test]
+    fn compute_quote_body_serializes_requester_node_id_when_present() {
+        // Walker always injects requester_node_id from auth.node_id so
+        // Wire's /quote cannot 400 with
+        // `multiple_nodes_require_explicit_node_id` for operators who
+        // own >1 node (contract §3.2). Verifies the serialized body
+        // carries the exact field name and value Wire expects.
+        let body = ComputeQuoteBody {
+            model_id: "gemma4:26b".into(),
+            input_tokens_est: 512,
+            max_tokens: 200,
+            latency_preference: LatencyPreference::BestPrice,
+            max_budget: 5000,
+            requester_node_id: Some("node-uuid-abc123".into()),
+        };
+        let v = serde_json::to_value(&body).expect("serialize");
+        assert_eq!(
+            v.get("requester_node_id").and_then(|s| s.as_str()),
+            Some("node-uuid-abc123"),
+            "requester_node_id must be in the /quote body verbatim"
+        );
+    }
+
+    #[test]
+    fn compute_quote_body_omits_requester_node_id_when_none() {
+        // Serde `skip_serializing_if` on the contracts-crate field means
+        // None drops the field entirely (Wire's Zod `.strict()` rejects
+        // `null`). Walker should never send None in production, but the
+        // type-level contract still matters for forward compat.
+        let body = ComputeQuoteBody {
+            model_id: "x".into(),
+            input_tokens_est: 1,
+            max_tokens: 1,
+            latency_preference: LatencyPreference::BestPrice,
+            max_budget: 1,
+            requester_node_id: None,
+        };
+        let v = serde_json::to_value(&body).expect("serialize");
+        assert!(
+            v.get("requester_node_id").is_none(),
+            "requester_node_id must be omitted when None"
+        );
+    }
+
+    #[test]
     fn compute_fill_body_emits_max_tokens_when_set() {
         let body = ComputeFillBody {
             job_id: "h".into(),

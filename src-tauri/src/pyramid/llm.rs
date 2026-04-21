@@ -611,10 +611,24 @@ async fn dispatch_market_entry(
         entry_provider_id,
     } = args;
 
-    // Snapshot node_id for the /quote requester_node_id field.
+    // Snapshot node_id from AuthState — canonical runtime identity,
+    // populated at registration and kept live via heartbeat/session.
+    // WireNodeConfig.node_id is a static-config surface that is rarely
+    // populated in the running state (other surfaces like fleet announce
+    // also read from auth.node_id). Without this field Wire 400s with
+    // `multiple_nodes_require_explicit_node_id` for any operator who
+    // owns more than one node, so we always send it.
     let requester_node_id = {
-        let cfg = market_ctx.config.read().await;
-        cfg.node_id.clone()
+        let auth = market_ctx.auth.read().await;
+        auth.node_id.clone().filter(|s| !s.is_empty())
+    };
+    let requester_node_id = match requester_node_id {
+        Some(id) => id,
+        None => {
+            return Err(EntryError::RouteSkipped {
+                reason: "requester_node_id_unavailable".into(),
+            });
+        }
     };
 
     // ── /quote ────────────────────────────────────────────────────────
@@ -624,11 +638,9 @@ async fn dispatch_market_entry(
         max_tokens,
         latency_preference: cqf::LatencyPreference::BestPrice,
         max_budget,
-        requester_node_id: if requester_node_id.is_empty() {
-            None
-        } else {
-            Some(requester_node_id)
-        },
+        // Always present (belt + suspenders — Wire auto-infers when
+        // operator owns 1 node, requires explicit value when >1).
+        requester_node_id: Some(requester_node_id),
     };
 
     let quote_resp = cqf::quote(&market_ctx.auth, &market_ctx.config, quote_body).await?;
