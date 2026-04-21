@@ -11920,9 +11920,12 @@ fn main() {
                         shared_config.clone(),
                     ),
                 );
-                wire_node_lib::pyramid::market_surface_cache::MarketSurfaceCache::spawn_poller(
-                    cache.clone(),
-                );
+                let cache_for_poller = cache.clone();
+                tauri::async_runtime::spawn(async move {
+                    wire_node_lib::pyramid::market_surface_cache::MarketSurfaceCache::spawn_poller(
+                        cache_for_poller,
+                    );
+                });
                 cfg.market_surface_cache = Some(cache);
             }
         }
