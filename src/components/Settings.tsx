@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useLocalMode, type OllamaProbeResult, type OllamaModelInfo, type ConfigHistoryEntry, type ExperimentalTerritory } from "../hooks/useLocalMode";
 import { AccordionSection } from "./AccordionSection";
+import { InferenceRoutingPanel } from "./settings/InferenceRoutingPanel";
 import type { TaggedBuildEvent } from "../hooks/useBuildRowState";
 import { invokeOrNull } from "../utils/invokeSafe";
 
@@ -865,6 +866,9 @@ export function Settings() {
                                     : "Loading participation policy…"}
                 </div>
             </div>
+
+            {/* --- Wave 4 (walker-re-plan-wire-2.1 §8): Inference Routing - */}
+            <InferenceRoutingPanel />
 
             {/* --- Phase 18a (L1): Local LLM (Ollama) -------------------- */}
             <div className="settings-section">
