@@ -20,6 +20,19 @@ Entry template:
 **Flag:** plan error / doc staleness / spec ambiguity / Wire-side bug / learning moment
 -->
 
+## 2026-04-21 — Wave 2 retro
+
+**What worked:**
+- Single workflow agent cleanly handled the full Phase A extraction + walker fleet branch + delete + resolve_local filter update in one session. LOC moved was ~491 (bigger than Wave 1's Phase D replacement) but the extraction-into-helper pattern (`dispatch_fleet_entry` + `FleetDispatchArgs`) was a structural fit — no improvisation needed.
+- Plan §4.1 error-classification table was load-bearing: agent consulted it directly for every fleet failure mode (timeout → Retryable, orphaned → Retryable, POST failures → RouteSkipped, etc.). No CallTerminal tier from fleet; walker's defensive CallTerminal arm stayed for symmetry with pool.
+- Verifier came back zero-find for the second wave running. The workflow-agent → verifier cadence is proving reliable for well-scoped surgery.
+
+**What bit us:**
+- Nothing significant. The wave1→wave2 stub rename (entry count 2→3 because fleet now walks instead of being pre-filtered) was the only cross-wave test touch. Learning confirmed: test names should describe behavior, not wave numbers. Wave 3 will need a third rename (wave2→wave3) when market joins; consider renaming to something stable like `walker_skips_inline_stubbed_branches` if this pattern repeats.
+
+**What we'd do differently:**
+- Wave 3 splits per Adam's answer #8 into 3a (parallel new-file bodies) + 3b (serial walker market inline) + 3c (tests + wanderer). Respect the split; don't try to one-shot Wave 3.
+
 ## 2026-04-21 — Wave 1 retro
 
 **What worked:**
