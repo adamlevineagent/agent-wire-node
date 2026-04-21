@@ -238,6 +238,75 @@ pub struct ResolvedRoute {
     pub max_wait_secs: u64,
 }
 
+// ── Local Mode overlay ──────────────────────────────────────────────────────
+
+/// Apply the Local Mode overlay to a parsed dispatch_policy YAML.
+///
+/// Local Mode is a runtime toggle, not a config substitution: the operator's
+/// authored `dispatch_policy` contribution is never mutated. When enabled, we
+/// derive a filtered view at load time by keeping only `is_local: true`
+/// entries in each rule's `route_to` list, dropping rules that become empty,
+/// and pinning `build_coordination.defer_maintenance_during_build = true`.
+/// When disabled, this is a no-op and returns the YAML unchanged.
+///
+/// Why here and not in the walker: the walker iterates `route.providers`
+/// once per LLM call and is out of scope for this fix (see the PR description
+/// for the scope fence). The ConfigSynced listener loads dispatch_policy into
+/// `cfg.dispatch_policy` on boot and on every contribution update — applying
+/// the overlay at that single choke point means every downstream reader
+/// (walker, fleet serving-rule derivation, /status UI) sees the effective
+/// policy with zero additional code.
+pub fn apply_local_mode_overlay(
+    yaml: DispatchPolicyYaml,
+    local_mode_enabled: bool,
+) -> DispatchPolicyYaml {
+    if !local_mode_enabled {
+        return yaml;
+    }
+
+    let DispatchPolicyYaml {
+        version,
+        provider_pools,
+        routing_rules,
+        escalation,
+        build_coordination,
+        max_batch_cost_usd,
+        max_daily_cost_usd,
+    } = yaml;
+
+    let filtered_rules: Vec<RoutingRule> = routing_rules
+        .into_iter()
+        .filter_map(|mut rule| {
+            rule.route_to.retain(|entry| entry.is_local);
+            if rule.route_to.is_empty() {
+                None
+            } else {
+                Some(rule)
+            }
+        })
+        .collect();
+
+    // Force defer_maintenance_during_build = true when Local Mode is on:
+    // a single local GPU cannot share cycles with background stale checks
+    // without starving the focused build. Other build_coordination fields
+    // carry through unchanged.
+    let coordination = {
+        let mut c = build_coordination.unwrap_or_default();
+        c.defer_maintenance_during_build = true;
+        Some(c)
+    };
+
+    DispatchPolicyYaml {
+        version,
+        provider_pools,
+        routing_rules: filtered_rules,
+        escalation,
+        build_coordination: coordination,
+        max_batch_cost_usd,
+        max_daily_cost_usd,
+    }
+}
+
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl DispatchPolicy {
@@ -551,5 +620,126 @@ mod tests {
 
         let route = policy.resolve_route(WorkType::Interactive, "primary", "chat", None);
         assert!(route.providers.is_empty());
+    }
+
+    // ── Local Mode overlay tests ────────────────────────────────────────────
+
+    fn sample_authored_yaml() -> DispatchPolicyYaml {
+        // Mirrors bundled-dispatch_policy-default-v1 — market → fleet →
+        // openrouter → ollama-local. Only ollama-local has is_local: true.
+        serde_yaml::from_str(
+            r#"
+version: 1
+provider_pools:
+  openrouter: { concurrency: 20 }
+  ollama-local: { concurrency: 1 }
+routing_rules:
+  - name: default
+    match_config: {}
+    route_to:
+      - { provider_id: market }
+      - { provider_id: fleet }
+      - { provider_id: openrouter, model_id: "openai/gpt-4o-mini" }
+      - { provider_id: ollama-local, is_local: true }
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn local_mode_overlay_disabled_is_identity() {
+        let original = sample_authored_yaml();
+        let out = apply_local_mode_overlay(original.clone(), false);
+        // Same rule count, same route_to list, same length.
+        assert_eq!(out.routing_rules.len(), 1);
+        assert_eq!(out.routing_rules[0].route_to.len(), 4);
+        // build_coordination untouched when disabled.
+        assert!(out.build_coordination.is_none());
+    }
+
+    #[test]
+    fn local_mode_overlay_filters_to_local_only() {
+        let out = apply_local_mode_overlay(sample_authored_yaml(), true);
+        // One rule, one entry (ollama-local).
+        assert_eq!(out.routing_rules.len(), 1);
+        assert_eq!(out.routing_rules[0].route_to.len(), 1);
+        assert_eq!(out.routing_rules[0].route_to[0].provider_id, "ollama-local");
+        assert!(out.routing_rules[0].route_to[0].is_local);
+    }
+
+    #[test]
+    fn local_mode_overlay_drops_rules_with_no_local_entries() {
+        let mut yaml = sample_authored_yaml();
+        // Replace the single rule's route_to with no local entries.
+        yaml.routing_rules[0].route_to = vec![
+            RouteEntry {
+                provider_id: "market".into(),
+                ..Default::default()
+            },
+            RouteEntry {
+                provider_id: "openrouter".into(),
+                ..Default::default()
+            },
+        ];
+        let out = apply_local_mode_overlay(yaml, true);
+        assert!(out.routing_rules.is_empty());
+    }
+
+    #[test]
+    fn local_mode_overlay_preserves_authored_pools_and_budgets() {
+        // Pool configs and cost caps aren't runtime-routing — they should
+        // carry through the overlay so operator tuning isn't silently lost
+        // while the toggle is on.
+        let original = sample_authored_yaml();
+        let out = apply_local_mode_overlay(original.clone(), true);
+        assert_eq!(out.provider_pools.len(), original.provider_pools.len());
+        assert_eq!(out.max_batch_cost_usd, original.max_batch_cost_usd);
+        assert_eq!(out.max_daily_cost_usd, original.max_daily_cost_usd);
+    }
+
+    #[test]
+    fn local_mode_overlay_forces_defer_maintenance() {
+        // Even if the authored contribution opts out of defer_maintenance,
+        // Local Mode pins it on — a single local GPU cannot share cycles
+        // with background stale checks without starving the focused build.
+        let mut yaml = sample_authored_yaml();
+        yaml.build_coordination = Some(BuildCoordinationConfig {
+            folder_builds_sequential: false,
+            defer_maintenance_during_build: false,
+            defer_dadbear_during_build: false,
+        });
+        let out = apply_local_mode_overlay(yaml, true);
+        assert!(out.build_coordination.unwrap().defer_maintenance_during_build);
+    }
+
+    #[test]
+    fn local_mode_overlay_preserves_multiple_rules_independently() {
+        // Per-rule filter: rules that retain local entries survive; rules
+        // that don't, drop out. Ordering is preserved among survivors.
+        let yaml: DispatchPolicyYaml = serde_yaml::from_str(
+            r#"
+version: 1
+routing_rules:
+  - name: build
+    match_config: { work_type: build }
+    route_to:
+      - { provider_id: market }
+      - { provider_id: ollama-local, is_local: true }
+  - name: interactive
+    match_config: { work_type: interactive }
+    route_to:
+      - { provider_id: openrouter }
+  - name: fallback
+    match_config: {}
+    route_to:
+      - { provider_id: fleet }
+      - { provider_id: ollama-local, is_local: true }
+"#,
+        )
+        .unwrap();
+        let out = apply_local_mode_overlay(yaml, true);
+        assert_eq!(out.routing_rules.len(), 2);
+        assert_eq!(out.routing_rules[0].name, "build");
+        assert_eq!(out.routing_rules[1].name, "fallback");
     }
 }

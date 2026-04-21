@@ -1,9 +1,33 @@
-// pyramid/local_mode.rs — Phase 18a: Local Mode toggle implementation.
+// pyramid/local_mode.rs — Local Mode toggle implementation.
 //
 // Per `docs/specs/provider-registry.md` §382-395 and ledger entries
 // L1/L5 in `docs/plans/deferral-ledger.md`. The Local Mode toggle is
 // the user-facing single switch that says "route every model tier
 // through a local Ollama instance instead of OpenRouter".
+//
+// ── Pillar 37 / derived-view design (2026-04-21) ────────────────────
+//
+// Local Mode is a RUNTIME TOGGLE. The operator's authored
+// `dispatch_policy` contribution is never superseded by enable/disable.
+// The effective `route_to` list is computed per-reload by
+// `dispatch_policy::apply_local_mode_overlay`, which filters non-local
+// entries out of the authored policy when
+// `pyramid_local_mode_state.enabled = true` and pins
+// `defer_maintenance_during_build` on.
+//
+// This replaces the earlier design that wrote a hardcoded
+// `[fleet, ollama-local]` dispatch_policy YAML on enable and a
+// reversal YAML on disable. That design violated Pillar 37 (hardcoded
+// operational parameters in Rust), erased the operator's authored
+// cascade (e.g. `[market, fleet, openrouter, ollama-local]`), hid the
+// real route from operators when routing bugs surfaced, and produced
+// a restore-chain landmine (bug fc4a55e, 2026-04-21).
+//
+// `tier_routing` and `build_strategy` are still superseded on enable
+// because those are semantic operator-facing changes (force all tiers
+// to ollama-local; force concurrency=1 on a single local GPU) that
+// legitimately flow through contributions with a proper restore-id
+// chain on disable. They are orthogonal to this fix.
 //
 // Enable flow:
 //   1. Validate base_url + reachability check via `GET /api/tags`.
@@ -23,6 +47,10 @@
 //      on both `initial_build` and `maintenance` (per spec §391:
 //      "set concurrency to 1 — home hardware constraint"), then
 //      supersede the active build_strategy contribution.
+//   8. Emit a synthetic `ConfigSynced { schema_type: "dispatch_policy" }`
+//      event so the `main.rs` listener re-parses the authored
+//      `dispatch_policy` and applies the overlay with the now-true
+//      `enabled` flag — no shadow write.
 //
 // Disable flow:
 //   1. Read `pyramid_local_mode_state`. If `enabled = false`, no-op.
@@ -34,6 +62,9 @@
 //   3. Flip `enabled = false` in the state row but keep the
 //      `ollama_base_url` / `ollama_model` so the next enable starts
 //      from the user's last picks.
+//   4. Emit a synthetic `ConfigSynced { schema_type: "dispatch_policy" }`
+//      event so the overlay drops off and the authored
+//      `dispatch_policy` becomes the effective runtime policy again.
 //
 // Status flow:
 //   1. Read the state row.
@@ -45,7 +76,16 @@
 // Reversibility is the load-bearing property: a half-restored state
 // where the provider row exists but the tier_routing was reset to
 // defaults is a bug. The state row's two restore columns plus the
-// supersession history together form the rollback chain.
+// supersession history together form the rollback chain for
+// tier_routing + build_strategy. `dispatch_policy` needs no restore
+// chain — the authored contribution is never mutated, so "restoring"
+// it is just stopping the overlay.
+//
+// Note on `restore_dispatch_policy_contribution_id`: kept in the
+// `pyramid_local_mode_state` row for backward compat with pre-fix DBs
+// (where it may hold a pointer into a shadow supersession chain) but
+// written `None` and never read post-fix. Dropping the column would
+// require a migration and buys nothing.
 
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::Connection;
@@ -610,6 +650,47 @@ pub async fn enable_local_mode(
     load_status_snapshot(conn)
 }
 
+/// Force the live `cfg.dispatch_policy` to reload from the operational
+/// table so the Local Mode overlay picks up the current state-row
+/// `enabled` flag. Does NOT modify any contribution — the operator's
+/// authored `dispatch_policy` is left exactly as they wrote it.
+///
+/// Implementation: emit a synthetic `ConfigSynced { schema_type:
+/// "dispatch_policy", ... }` event. The `dispatch_policy` listener in
+/// `main.rs` re-reads the YAML from `pyramid_dispatch_policy`, runs
+/// `apply_local_mode_overlay` with the latest `pyramid_local_mode_state.
+/// enabled`, and writes the filtered runtime policy onto the live
+/// `LlmConfig`. Because this is not a real contribution sync, the
+/// `contribution_id` field carries a synthetic `local_mode_refresh`
+/// marker — consumers that care about prior/next contribution IDs
+/// (none today for dispatch_policy) can filter on it.
+fn refresh_dispatch_policy_for_local_mode(
+    conn: &Connection,
+    bus: &Arc<BuildEventBus>,
+) -> Result<()> {
+    // Load the currently-active authored dispatch_policy contribution
+    // to stamp its id onto the event. If none exists (fresh install
+    // before bundled seed), emit the event anyway with an empty id —
+    // the listener's DB read will find nothing and leave the live
+    // cfg.dispatch_policy untouched.
+    let active = load_active_config_contribution(conn, "dispatch_policy", None)?;
+    let contribution_id = active
+        .as_ref()
+        .map(|c| c.contribution_id.clone())
+        .unwrap_or_default();
+
+    let _ = bus.tx.send(crate::pyramid::event_bus::TaggedBuildEvent {
+        slug: String::new(),
+        kind: crate::pyramid::event_bus::TaggedKind::ConfigSynced {
+            slug: None,
+            schema_type: "dispatch_policy".to_string(),
+            contribution_id,
+            prior_contribution_id: None,
+        },
+    });
+    Ok(())
+}
+
 /// Sync commit phase: take the plan produced by
 /// `prepare_enable_local_mode` and write every row. This is plain
 /// `fn`, not `async fn`, so the caller's Tauri command future stays
@@ -754,7 +835,7 @@ pub fn commit_enable_local_mode(
                 .map(|c| c.contribution_id.clone()),
             context_override: pre_existing_row.context_override,
             concurrency_override: pre_existing_row.concurrency_override,
-            restore_dispatch_policy_contribution_id: None, // filled by dispatch_policy step below
+            restore_dispatch_policy_contribution_id: None, // post-fix: never written; overlay replaces shadow
             updated_at: String::new(),
         },
     )?;
@@ -829,72 +910,39 @@ pub fn commit_enable_local_mode(
     // contribution. See `docs/plans/pyramid-folders-model-routing-friction-log.md`
     // for the carry-forward note.
 
-    // Step 10 (AD-8 Part 1): create a dispatch_policy contribution with
-    // provider_pools for ollama-local and build_coordination deferral.
-    // This wires the per-provider semaphore so Ollama calls route through
-    // ProviderPools instead of the global LOCAL_PROVIDER_SEMAPHORE fallback.
+    // Step 10 (Pillar 37 / everything-is-a-contribution fix):
     //
-    // TODO: This hardcoded dispatch policy YAML violates Law 3 (one contribution
-    // store) and Pillar 37 (no hardcoded operational parameters in code).
-    // It should be a proper contribution YAML in chains/defaults/ or
-    // assets/bundled_contributions.json, managed via the generative config system.
+    // Local Mode used to supersede the operator's `dispatch_policy`
+    // contribution with a hardcoded YAML fragment — erasing the authored
+    // `[market, fleet, openrouter, ollama-local]` cascade and replacing
+    // it with a stripped-down `[fleet, ollama-local]` chain. That violated
+    // Pillar 37 (hardcoded operational parameters in Rust), hid the real
+    // route from the operator when routing bugs surfaced (they'd see a
+    // substituted policy and couldn't tell what was their config vs.
+    // Local Mode's substitution), and its restore path was the landmine
+    // behind bug fc4a55e.
     //
-    // Additionally, `provider_id: fleet` should NOT be unconditionally included.
-    // Whether a node dispatches outward (client mode) vs only serves incoming
-    // fleet requests (server mode) is an operator choice per node. GPU rigs
-    // should serve fleet but not dispatch — their stale engine / DADBEAR work
-    // should stay local. Laptops / orchestrators dispatch to fleet. This needs
-    // a fleet_dispatch_enabled toggle in the node config UI, not a hardcoded
-    // fleet entry in every dispatch policy.
-    let dispatch_policy_yaml = "schema_type: dispatch_policy\n\
-                                version: 1\n\
-                                provider_pools:\n  ollama-local:\n    concurrency: 1\n\
-                                routing_rules:\n  - name: ollama-catchall\n    match_config: {}\n    route_to:\n      - provider_id: fleet\n      - provider_id: ollama-local\n        is_local: true\n\
-                                build_coordination:\n  defer_maintenance_during_build: true\n";
-    let prior_dispatch_policy =
-        load_active_config_contribution(conn, "dispatch_policy", None)?;
-    let new_dp_id = if let Some(prior_dp) = &prior_dispatch_policy {
-        supersede_config_contribution(
-            conn,
-            &prior_dp.contribution_id,
-            dispatch_policy_yaml,
-            "local mode enabled — ollama-local pool + build deferral",
-            "local_mode_toggle",
-            Some("user"),
-        )?
-    } else {
-        create_config_contribution(
-            conn,
-            "dispatch_policy",
-            None,
-            dispatch_policy_yaml,
-            Some("local mode enabled — ollama-local pool + build deferral"),
-            "local_mode_toggle",
-            Some("user"),
-            "active",
-        )?
-    };
-    let new_dp_contribution = load_contribution_by_id(conn, &new_dp_id)?
-        .ok_or_else(|| anyhow!("local-mode dispatch_policy contribution missing after create/supersede"))?;
-    sync_config_to_operational(conn, bus, &new_dp_contribution)?;
+    // The replacement is a derived view: the operator's authored
+    // `dispatch_policy` contribution stays untouched, and
+    // `dispatch_policy::apply_local_mode_overlay` filters non-local
+    // `route_to` entries at the ConfigSynced load point in `main.rs`.
+    // Disable is trivially reversible — the next ConfigSynced reload
+    // simply stops filtering.
+    //
+    // We still trigger a ConfigSynced refresh here so the live
+    // `cfg.dispatch_policy` flips to the local-only view without
+    // waiting for an unrelated contribution write. The authored
+    // contribution is re-loaded from DB and overlaid with the now-true
+    // `local_mode_enabled`; no shadow write happens.
+    refresh_dispatch_policy_for_local_mode(conn, bus)?;
 
-    // Update the state row with the restore_dispatch_policy_contribution_id.
-    // Read-modify-write: preserve all fields, only update the dispatch_policy restore ID.
-    let current_row = load_local_mode_state(conn)?;
-    save_local_mode_state(
-        conn,
-        &LocalModeStateRow {
-            restore_dispatch_policy_contribution_id: prior_dispatch_policy
-                .as_ref()
-                .map(|c| c.contribution_id.clone()),
-            ..current_row
-        },
-    )?;
-
-    // Step 11: re-apply concurrency override if it was set before disable.
-    // The enable path hardcodes concurrency=1 in build_strategy and
-    // dispatch_policy. If the user had a concurrency override, we need
-    // to re-apply it now so the contributions match the state row.
+    // Step 11: re-apply concurrency override if the user had set one
+    // before a prior disable. The enable path pinned concurrency=1 on
+    // build_strategy above, so without this step a returning user would
+    // see concurrency revert to 1. dispatch_policy is now derived-view
+    // (no shadow write), so `set_concurrency_override` edits the
+    // authored `provider_pools.ollama-local.concurrency` directly — the
+    // operator's explicit pool setting persists across toggle cycles.
     let current_row = load_local_mode_state(conn)?;
     if let Some(c) = current_row.concurrency_override {
         if c > 1 {
@@ -1028,6 +1076,34 @@ pub fn commit_disable_local_mode(
         // The active local-mode contribution remains in place.
     }
 
+    // Pre-fix DB compatibility: pre-2026-04-21 enable paths wrote a
+    // shadow `dispatch_policy` contribution and stashed the authored
+    // one in `restore_dispatch_policy_contribution_id`. Post-fix, that
+    // column is never written, but DBs upgraded mid-toggle may still
+    // hold a pointer to a pre-fix-stashed authored policy. Honor it
+    // once, collapse back to the authored contribution, and clear the
+    // column so subsequent toggles go through the clean overlay path.
+    if let Some(restore_id) = row.restore_dispatch_policy_contribution_id.as_deref() {
+        if let Some(restore) = load_contribution_by_id(conn, restore_id)? {
+            if let Some(active_now) =
+                load_active_config_contribution(conn, "dispatch_policy", None)?
+            {
+                let new_id = supersede_config_contribution(
+                    conn,
+                    &active_now.contribution_id,
+                    &restore.yaml_content,
+                    "local mode disabled — one-time restore of pre-fix shadow dispatch_policy",
+                    "local_mode_toggle",
+                    Some("user"),
+                )?;
+                let new_contribution = load_contribution_by_id(conn, &new_id)?.ok_or_else(|| {
+                    anyhow!("restored dispatch_policy contribution missing after supersede")
+                })?;
+                sync_config_to_operational(conn, bus, &new_contribution)?;
+            }
+        }
+    }
+
     // Restore build_strategy.
     if let Some(restore_id) = row.restore_build_strategy_contribution_id.as_deref() {
         if let Some(restore) = load_contribution_by_id(conn, restore_id)? {
@@ -1050,72 +1126,6 @@ pub fn commit_disable_local_mode(
         }
     }
 
-    // Restore dispatch_policy (AD-8 Part 1 disable path).
-    if let Some(restore_id) = row.restore_dispatch_policy_contribution_id.as_deref() {
-        // Prior dispatch_policy exists — restore it.
-        if let Some(restore) = load_contribution_by_id(conn, restore_id)? {
-            if let Some(active_now) =
-                load_active_config_contribution(conn, "dispatch_policy", None)?
-            {
-                let new_id = supersede_config_contribution(
-                    conn,
-                    &active_now.contribution_id,
-                    &restore.yaml_content,
-                    "local mode disabled — restoring prior dispatch_policy",
-                    "local_mode_toggle",
-                    Some("user"),
-                )?;
-                let new_contribution = load_contribution_by_id(conn, &new_id)?.ok_or_else(|| {
-                    anyhow!("restored dispatch_policy contribution missing after supersede")
-                })?;
-                sync_config_to_operational(conn, bus, &new_contribution)?;
-            }
-        }
-    } else {
-        // No prior dispatch_policy to restore — fall back to the bundled
-        // default contribution's YAML so the walker has routing_rules to
-        // iterate. The old fallback hardcoded a stripped-down YAML with
-        // an EMPTY provider_pools and NO routing_rules, which gutts the
-        // walker: `resolve_route` returns a ResolvedRoute with zero
-        // providers → walker iterates zero entries → fail_audit("no
-        // viable route") → every build fails 0m 0s | 0/0 steps.
-        //
-        // This only bit DBs where restore_dispatch_policy_contribution_id
-        // was never populated (Local Mode toggled ENABLE before the
-        // walker's bundled seed shipped). Post-walker fresh installs seed
-        // the bundled policy on boot, so restore_* captures it on the
-        // first enable and the `if` branch above handles disable cleanly.
-        //
-        // Raise error rather than write a stub if the bundled seed is
-        // missing — that's a boot-hydration invariant violation that
-        // should surface rather than silently paper over.
-        if let Some(active_now) =
-            load_active_config_contribution(conn, "dispatch_policy", None)?
-        {
-            let fallback = load_contribution_by_id(conn, "bundled-dispatch_policy-default-v1")?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "local-mode disable: bundled-dispatch_policy-default-v1 seed missing from \
-                         pyramid_config_contributions — cannot restore default routing. This is a \
-                         boot-hydration invariant violation; confirm bundled_contributions.json \
-                         is ingested correctly."
-                    )
-                })?;
-            let new_id = supersede_config_contribution(
-                conn,
-                &active_now.contribution_id,
-                &fallback.yaml_content,
-                "local mode disabled — restoring bundled default dispatch_policy",
-                "local_mode_toggle",
-                Some("user"),
-            )?;
-            let new_contribution = load_contribution_by_id(conn, &new_id)?.ok_or_else(|| {
-                anyhow!("default dispatch_policy contribution missing after supersede")
-            })?;
-            sync_config_to_operational(conn, bus, &new_contribution)?;
-        }
-    }
-
     // Disable the local provider so active_provider_id() falls back to
     // openrouter. Without this, the provider row stays enabled and all
     // LLM calls continue routing to Ollama after the user toggles off.
@@ -1134,6 +1144,12 @@ pub fn commit_disable_local_mode(
     // next enable starts from the user's last picks. Clear the
     // restore IDs because they no longer apply to the current state.
     // Preserve context_override + concurrency_override (AD-4 persistence rule).
+    //
+    // Order matters: the dispatch_policy refresh below reads
+    // `pyramid_local_mode_state.enabled` to decide whether to apply the
+    // overlay. Flipping to `enabled: false` must happen BEFORE the
+    // refresh so the overlay drops off and the live cfg.dispatch_policy
+    // returns to the authored view.
     save_local_mode_state(
         conn,
         &LocalModeStateRow {
@@ -1149,6 +1165,20 @@ pub fn commit_disable_local_mode(
             updated_at: String::new(),
         },
     )?;
+
+    // Pillar 37 fix: dispatch_policy is never superseded by Local Mode,
+    // so disable is a no-op for the contribution itself. We just trigger
+    // a ConfigSynced refresh so the live `cfg.dispatch_policy` flips
+    // from the filtered view back to the authored view. The overlay
+    // reads the state-row flag we flipped above.
+    //
+    // Note: the `restore_dispatch_policy_contribution_id` state column
+    // is kept for backward compat with pre-fix DBs but never written
+    // post-fix (see enable path). Pre-fix DBs that had a shadow
+    // supersession chain are already handled by an earlier fix
+    // (fc4a55e); once disabled cleanly post-fix, those chains collapse
+    // to the authored contribution and stay there.
+    refresh_dispatch_policy_for_local_mode(conn, bus)?;
 
     Ok(())
 }
@@ -2777,6 +2807,110 @@ mod tests {
         assert!(
             !policy.rules.is_empty(),
             "constructed DispatchPolicy must have rules the walker can resolve"
+        );
+    }
+
+    #[test]
+    fn enable_disable_cycle_preserves_authored_dispatch_policy() {
+        // Pillar 37 regression guard (2026-04-21): the enable/disable
+        // cycle must NEVER supersede the authored `dispatch_policy`
+        // contribution. Local Mode is a runtime toggle; the effective
+        // policy is derived by `apply_local_mode_overlay` at the
+        // ConfigSynced load point, not by writing a shadow contribution.
+        //
+        // Test: seed a custom dispatch_policy, commit enable, commit
+        // disable, then read the active dispatch_policy contribution
+        // back and assert its id + yaml are byte-identical to the
+        // authored seed.
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+        let bus = Arc::new(crate::pyramid::event_bus::BuildEventBus::new());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(
+            crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+        );
+        std::mem::forget(tmp);
+        let registry = ProviderRegistry::new(store);
+
+        // Seed an authored dispatch_policy that mirrors the production
+        // bundled seed: market → fleet → openrouter → ollama-local.
+        let authored_yaml = "version: 1\n\
+                             provider_pools:\n  openrouter: { concurrency: 20 }\n  ollama-local: { concurrency: 1 }\n\
+                             routing_rules:\n  - name: default\n    match_config: {}\n    route_to:\n      - { provider_id: market }\n      - { provider_id: fleet }\n      - { provider_id: openrouter, model_id: \"openai/gpt-4o-mini\" }\n      - { provider_id: ollama-local, is_local: true }\n";
+        let authored_id = crate::pyramid::config_contributions::create_config_contribution(
+            &conn,
+            "dispatch_policy",
+            None,
+            authored_yaml,
+            Some("authored by operator"),
+            "test",
+            Some("user"),
+            "active",
+        )
+        .unwrap();
+
+        // Also seed a tier_routing so commit_enable_local_mode's
+        // prior_tier_contribution read succeeds. Minimal shape.
+        crate::pyramid::config_contributions::create_config_contribution(
+            &conn,
+            "tier_routing",
+            None,
+            "schema_type: tier_routing\nentries:\n  - tier_name: mid\n    provider_id: openrouter\n    model_id: x\n",
+            None,
+            "test",
+            Some("user"),
+            "active",
+        )
+        .unwrap();
+
+        registry.load_from_db(&conn).unwrap();
+
+        // Commit enable with a synthetic plan (skips the /api/tags probe).
+        let plan = EnableLocalModePlan {
+            base_url: "http://localhost:11434/v1".into(),
+            chosen_model: "llama3".into(),
+            detected_context: 32_000,
+            available_models: vec!["llama3".into()],
+        };
+        commit_enable_local_mode(&mut conn, &bus, &registry, plan).unwrap();
+
+        // Post-enable: state flipped, authored dispatch_policy still
+        // the active contribution with unchanged yaml.
+        let row_after_enable = load_local_mode_state(&conn).unwrap();
+        assert!(row_after_enable.enabled, "enable did not flip state");
+        let dp_after_enable =
+            load_active_config_contribution(&conn, "dispatch_policy", None)
+                .unwrap()
+                .expect("authored dispatch_policy still active after enable");
+        assert_eq!(
+            dp_after_enable.contribution_id, authored_id,
+            "enable must not supersede the authored dispatch_policy"
+        );
+        assert_eq!(
+            dp_after_enable.yaml_content.trim(),
+            authored_yaml.trim(),
+            "authored dispatch_policy YAML must be byte-identical after enable"
+        );
+
+        // Commit disable.
+        commit_disable_local_mode(&mut conn, &bus, &registry).unwrap();
+
+        // Post-disable: state flipped back, authored dispatch_policy
+        // STILL the active contribution with unchanged yaml.
+        let row_after_disable = load_local_mode_state(&conn).unwrap();
+        assert!(!row_after_disable.enabled, "disable did not flip state");
+        let dp_after_disable =
+            load_active_config_contribution(&conn, "dispatch_policy", None)
+                .unwrap()
+                .expect("authored dispatch_policy still active after disable");
+        assert_eq!(
+            dp_after_disable.contribution_id, authored_id,
+            "disable must leave the authored dispatch_policy as-is"
+        );
+        assert_eq!(
+            dp_after_disable.yaml_content.trim(),
+            authored_yaml.trim(),
+            "authored dispatch_policy YAML must survive the full toggle cycle"
         );
     }
 

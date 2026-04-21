@@ -11852,13 +11852,28 @@ fn main() {
     // Uses a one-shot connection (same pattern as registry/schema hydration
     // above). When a policy exists, the per-provider pools replace the
     // global LOCAL_PROVIDER_SEMAPHORE and global rate_limit_wait.
+    //
+    // Pillar 37 / Local Mode toggle fix (2026-04-21): the authored YAML
+    // is read unchanged, then `apply_local_mode_overlay` filters non-local
+    // `route_to` entries when `pyramid_local_mode_state.enabled = true`.
+    // The operator's authored `dispatch_policy` contribution is never
+    // superseded by Local Mode.
     {
         match wire_node_lib::pyramid::db::open_pyramid_connection(&pyramid_db_path) {
             Ok(conn) => {
                 if let Ok(Some(yaml_str)) = wire_node_lib::pyramid::db::read_dispatch_policy(&conn) {
                     match serde_yaml::from_str::<wire_node_lib::pyramid::dispatch_policy::DispatchPolicyYaml>(&yaml_str) {
                         Ok(yaml) => {
-                            let policy = wire_node_lib::pyramid::dispatch_policy::DispatchPolicy::from_yaml(&yaml);
+                            let local_mode_enabled =
+                                wire_node_lib::pyramid::db::load_local_mode_state(&conn)
+                                    .map(|row| row.enabled)
+                                    .unwrap_or(false);
+                            let effective_yaml =
+                                wire_node_lib::pyramid::dispatch_policy::apply_local_mode_overlay(
+                                    yaml,
+                                    local_mode_enabled,
+                                );
+                            let policy = wire_node_lib::pyramid::dispatch_policy::DispatchPolicy::from_yaml(&effective_yaml);
                             let pools = wire_node_lib::pyramid::provider_pools::ProviderPools::new(&policy);
                             let mut cfg = pyramid_state.config.blocking_write();
                             cfg.dispatch_policy = Some(std::sync::Arc::new(policy));
@@ -11972,6 +11987,24 @@ fn main() {
                                 if let Some(yaml_str) = yaml_opt {
                                     match serde_yaml::from_str::<wire_node_lib::pyramid::dispatch_policy::DispatchPolicyYaml>(&yaml_str) {
                                         Ok(yaml) => {
+                                            // Pillar 37 / Local Mode toggle fix: apply the
+                                            // derived-view overlay before constructing the
+                                            // runtime policy. When `pyramid_local_mode_state.
+                                            // enabled = true`, non-local `route_to` entries
+                                            // are filtered out and `defer_maintenance_during_
+                                            // build` is pinned on. The authored contribution
+                                            // YAML (re-read above from the operational table)
+                                            // is never mutated by Local Mode.
+                                            let local_mode_enabled = {
+                                                let reader = ps.reader.lock().await;
+                                                wire_node_lib::pyramid::db::load_local_mode_state(&reader)
+                                                    .map(|row| row.enabled)
+                                                    .unwrap_or(false)
+                                            };
+                                            let yaml = wire_node_lib::pyramid::dispatch_policy::apply_local_mode_overlay(
+                                                yaml,
+                                                local_mode_enabled,
+                                            );
                                             let policy = wire_node_lib::pyramid::dispatch_policy::DispatchPolicy::from_yaml(&yaml);
                                             let pools = wire_node_lib::pyramid::provider_pools::ProviderPools::new(&policy);
 
