@@ -33,10 +33,35 @@
 //     plan says defer).
 //   - `max_budget_credits` is optional; blank = no cap.
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import yaml from "js-yaml";
 import type { ConfigContribution } from "../../types/configContributions";
+
+// ── IPC types ───────────────────────────────────────────────────────────
+
+/** Mirrors Rust `PyramidMarketModel` in
+ *  `src-tauri/src/pyramid/market_surface_cache.rs`. Returned by the
+ *  `pyramid_market_models` IPC (Wave 4 task 29). */
+interface PyramidMarketModel {
+    model_id: string;
+    active_offers: number;
+    rate_in_per_m: number | null;
+    rate_out_per_m: number | null;
+    last_updated_at: string;
+}
+
+/** Subset of `compute_participation_policy` YAML we read for the
+ *  network-compute sub-panel. Other fields round-trip untouched
+ *  (we never write this contribution from this panel). */
+interface ComputeParticipationPolicyShape {
+    market_dispatch_max_wait_ms?: number;
+    [key: string]: unknown;
+}
+
+// ── localStorage keys ───────────────────────────────────────────────────
+
+const DISCOVERY_BOOKMARK_KEY = "inferenceRouting.lastReviewedMarketModels";
 
 // ── Types mirroring src-tauri/src/pyramid/dispatch_policy.rs ────────────
 
@@ -99,6 +124,25 @@ export function InferenceRoutingPanel() {
     const [note, setNote] = useState("");
     const lastSaveAtRef = useRef<number>(0);
 
+    // ── Discovery section state (network compute models) ────────────────
+    const [networkModels, setNetworkModels] = useState<PyramidMarketModel[]>([]);
+    const [networkModelsError, setNetworkModelsError] = useState<string | null>(null);
+    const [networkExpanded, setNetworkExpanded] = useState(false);
+    const [reviewedBookmark, setReviewedBookmark] = useState<Set<string>>(() => {
+        try {
+            const raw = localStorage.getItem(DISCOVERY_BOOKMARK_KEY);
+            if (!raw) return new Set();
+            const parsed = JSON.parse(raw);
+            return Array.isArray(parsed) ? new Set(parsed.map(String)) : new Set();
+        } catch {
+            return new Set();
+        }
+    });
+
+    // ── Compute participation policy (for max_wait_ms readonly display) ─
+    const [participationPolicy, setParticipationPolicy] =
+        useState<ComputeParticipationPolicyShape | null>(null);
+
     // ── Load active dispatch_policy on mount ─────────────────────────────
     const reload = useCallback(async () => {
         setLoading(true);
@@ -137,6 +181,78 @@ export function InferenceRoutingPanel() {
     useEffect(() => {
         void reload();
     }, [reload]);
+
+    // ── Network-compute models fetch (IPC pyramid_market_models) ─────────
+    // Polled once per mount + on explicit refresh. The backend cache
+    // itself polls every 60s; another layer of client polling is
+    // unnecessary churn.
+    const reloadNetworkModels = useCallback(async () => {
+        setNetworkModelsError(null);
+        try {
+            const rows = await invoke<PyramidMarketModel[]>("pyramid_market_models");
+            setNetworkModels(Array.isArray(rows) ? rows : []);
+        } catch (err) {
+            setNetworkModelsError(String(err));
+            setNetworkModels([]);
+        }
+    }, []);
+
+    useEffect(() => {
+        void reloadNetworkModels();
+    }, [reloadNetworkModels]);
+
+    // ── Participation policy fetch (for max_wait_ms readonly display) ───
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            try {
+                const row = await invoke<ConfigContribution | null>(
+                    "pyramid_active_config_contribution",
+                    { schemaType: "compute_participation_policy", slug: null },
+                );
+                if (cancelled) return;
+                if (!row) {
+                    setParticipationPolicy(null);
+                    return;
+                }
+                try {
+                    const doc = yaml.load(row.yaml_content) as ComputeParticipationPolicyShape;
+                    if (doc && typeof doc === "object") {
+                        setParticipationPolicy(doc);
+                    } else {
+                        setParticipationPolicy(null);
+                    }
+                } catch {
+                    setParticipationPolicy(null);
+                }
+            } catch {
+                if (!cancelled) setParticipationPolicy(null);
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, []);
+
+    // Set of model_ids new since last review (Discovery highlight).
+    const newSinceReview = useMemo(() => {
+        const s = new Set<string>();
+        for (const m of networkModels) {
+            if (!reviewedBookmark.has(m.model_id)) s.add(m.model_id);
+        }
+        return s;
+    }, [networkModels, reviewedBookmark]);
+
+    const markAllReviewed = useCallback(() => {
+        const ids = networkModels.map((m) => m.model_id);
+        try {
+            localStorage.setItem(DISCOVERY_BOOKMARK_KEY, JSON.stringify(ids));
+        } catch {
+            // Quota errors are non-fatal — the bookmark is purely a UI
+            // convenience, not load-bearing state.
+        }
+        setReviewedBookmark(new Set(ids));
+    }, [networkModels]);
 
     // ── Identify "the default rule" index ────────────────────────────────
     // Minimum-viable MVP per plan: we edit the first rule whose name is
@@ -360,9 +476,10 @@ export function InferenceRoutingPanel() {
             <p className="settings-section-desc">
                 Controls the order in which providers are tried for each LLM call.
                 Edits apply to the <strong>{defaultRule.name}</strong> routing rule.
-                Use <code>fleet</code> or <code>market</code> to route through
-                your fleet or the network; any other value is a direct provider
-                (e.g. <code>openrouter</code>, <code>ollama</code>).
+                Use <code>fleet</code> to route through your fleet, or{" "}
+                <code>market</code> to route through network compute; any other
+                value is a direct provider (e.g. <code>openrouter</code>,{" "}
+                <code>ollama</code>).
             </p>
 
             <div style={{ marginBottom: 12, fontSize: "0.85em", opacity: 0.75 }}>
@@ -418,8 +535,8 @@ export function InferenceRoutingPanel() {
                     </tr>
                 </thead>
                 <tbody>
-                    {entries.map((entry, idx) => (
-                        <tr key={idx} data-testid={`route-entry-${idx}`}>
+                    {entries.map((entry, idx) => [
+                        <tr key={`${idx}-row`} data-testid={`route-entry-${idx}`}>
                             <td>{idx + 1}</td>
                             <td>
                                 <input
@@ -513,8 +630,57 @@ export function InferenceRoutingPanel() {
                                     ✕
                                 </button>
                             </td>
-                        </tr>
-                    ))}
+                        </tr>,
+                        // Sub-panel for network-compute rows (provider_id == "market").
+                        // Shows the readonly `max_wait_ms` pulled from the active
+                        // compute_participation_policy + a link to the Wire-side
+                        // observability dashboard. Rendered as a full-width row under
+                        // the main row — avoids restructuring the table layout.
+                        entry.provider_id === "market" ? (
+                            <tr
+                                key={`${idx}-sub`}
+                                data-testid={`route-entry-${idx}-network-subpanel`}
+                            >
+                                <td></td>
+                                <td colSpan={7} style={{ paddingBottom: 12 }}>
+                                    <div
+                                        style={{
+                                            fontSize: "0.85em",
+                                            background: "var(--panel-alt, rgba(0,0,0,0.03))",
+                                            padding: 8,
+                                            borderRadius: 4,
+                                        }}
+                                    >
+                                        <div style={{ marginBottom: 4 }}>
+                                            <strong>Max wait before giving up</strong>:{" "}
+                                            {participationPolicy?.market_dispatch_max_wait_ms != null ? (
+                                                <code>
+                                                    {participationPolicy.market_dispatch_max_wait_ms} ms
+                                                </code>
+                                            ) : (
+                                                <span style={{ opacity: 0.6 }}>
+                                                    (loading from participation policy…)
+                                                </span>
+                                            )}{" "}
+                                            <span style={{ opacity: 0.7 }}>
+                                                — edit via Compute Participation settings.
+                                            </span>
+                                        </div>
+                                        <div>
+                                            <a
+                                                href="/ops"
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                data-testid={`network-dashboard-link-${idx}`}
+                                            >
+                                                Observability dashboard →
+                                            </a>
+                                        </div>
+                                    </div>
+                                </td>
+                            </tr>
+                        ) : null,
+                    ])}
                     {entries.length === 0 && (
                         <tr>
                             <td colSpan={8} style={{ padding: 12, opacity: 0.7 }}>
@@ -548,7 +714,7 @@ export function InferenceRoutingPanel() {
                     type="text"
                     value={note}
                     onChange={(e) => setNote(e.target.value)}
-                    placeholder="e.g. prefer fleet before market for evidence work"
+                    placeholder="e.g. prefer fleet before network compute for evidence work"
                     disabled={!isDirty}
                     style={{ width: "100%" }}
                 />
@@ -584,6 +750,144 @@ export function InferenceRoutingPanel() {
                     </span>
                 )}
             </div>
+
+            {/* Discovery: network compute models available through the
+                 tunnel. Collapsible — kept out of the default view so the
+                 primary routing-rules editor isn't visually crowded. New
+                 model_ids (not in the "reviewed" bookmark) are flagged. */}
+            <details
+                style={{ marginTop: 20 }}
+                open={networkExpanded}
+                onToggle={(e) =>
+                    setNetworkExpanded((e.target as HTMLDetailsElement).open)
+                }
+                data-testid="network-discovery-section"
+            >
+                <summary style={{ cursor: "pointer", fontWeight: 500 }}>
+                    Network compute discovery
+                    {networkModels.length > 0 && (
+                        <span style={{ opacity: 0.7, marginLeft: 8, fontWeight: 400 }}>
+                            ({networkModels.length} models available
+                            {newSinceReview.size > 0
+                                ? `, ${newSinceReview.size} new since last review`
+                                : ""})
+                        </span>
+                    )}
+                </summary>
+
+                <div style={{ marginTop: 12 }}>
+                    {networkModelsError && (
+                        <p style={{ color: "var(--error, #c00)", fontSize: "0.9em" }}>
+                            {networkModelsError}
+                        </p>
+                    )}
+                    {!networkModelsError && networkModels.length === 0 && (
+                        <p style={{ fontSize: "0.9em", opacity: 0.7 }}>
+                            No models available yet. Either the tunnel hasn't
+                            connected or the first refresh hasn't landed (checks
+                            every 60s).
+                        </p>
+                    )}
+                    {networkModels.length > 0 && (
+                        <>
+                            <table
+                                style={{
+                                    width: "100%",
+                                    borderCollapse: "collapse",
+                                    fontSize: "0.9em",
+                                }}
+                                data-testid="network-discovery-table"
+                            >
+                                <thead>
+                                    <tr>
+                                        <th style={{ textAlign: "left" }}>Model</th>
+                                        <th style={{ textAlign: "right" }}>
+                                            Available
+                                        </th>
+                                        <th style={{ textAlign: "right" }}>
+                                            Input / M (credits)
+                                        </th>
+                                        <th style={{ textAlign: "right" }}>
+                                            Output / M (credits)
+                                        </th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {networkModels.map((m) => {
+                                        const isNew = newSinceReview.has(m.model_id);
+                                        return (
+                                            <tr
+                                                key={m.model_id}
+                                                data-testid={`network-model-row-${m.model_id}`}
+                                                style={{
+                                                    background: isNew
+                                                        ? "var(--highlight, rgba(255, 220, 100, 0.15))"
+                                                        : undefined,
+                                                }}
+                                            >
+                                                <td>
+                                                    {isNew && (
+                                                        <span
+                                                            title="New since last review"
+                                                            style={{
+                                                                marginRight: 4,
+                                                                color: "var(--warning, #b80)",
+                                                            }}
+                                                        >
+                                                            ●
+                                                        </span>
+                                                    )}
+                                                    <code>{m.model_id}</code>
+                                                </td>
+                                                <td style={{ textAlign: "right" }}>
+                                                    {m.active_offers}
+                                                </td>
+                                                <td style={{ textAlign: "right" }}>
+                                                    {m.rate_in_per_m ?? "—"}
+                                                </td>
+                                                <td style={{ textAlign: "right" }}>
+                                                    {m.rate_out_per_m ?? "—"}
+                                                </td>
+                                            </tr>
+                                        );
+                                    })}
+                                </tbody>
+                            </table>
+                            <div
+                                style={{
+                                    marginTop: 8,
+                                    display: "flex",
+                                    gap: 8,
+                                    alignItems: "center",
+                                    fontSize: "0.85em",
+                                }}
+                            >
+                                <button
+                                    type="button"
+                                    onClick={markAllReviewed}
+                                    disabled={newSinceReview.size === 0}
+                                    data-testid="mark-reviewed-btn"
+                                >
+                                    Mark all reviewed
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => void reloadNetworkModels()}
+                                    data-testid="refresh-network-models-btn"
+                                >
+                                    Refresh
+                                </button>
+                                {networkModels[0]?.last_updated_at && (
+                                    <span style={{ opacity: 0.7 }}>
+                                        snapshot{" "}
+                                        {networkModels[0].last_updated_at}
+                                    </span>
+                                )}
+                            </div>
+                        </>
+                    )}
+                </div>
+            </details>
         </div>
     );
 }
