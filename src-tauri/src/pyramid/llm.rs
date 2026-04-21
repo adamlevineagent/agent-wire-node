@@ -1826,7 +1826,12 @@ pub async fn call_model_unified_with_audit_and_ctx(
 
                     let req = crate::pyramid::compute_requester::MarketInferenceRequest {
                         model_id: model_for_market.clone(),
-                        max_budget: i64::MAX,
+                        // `(1i64 << 53) - 1` = JS MAX_SAFE_INTEGER = 9_007_199_254_740_991.
+                        // Still a "no cap / solvent assumed" sentinel (orders of magnitude
+                        // above any realistic estimated_cost), but round-trips cleanly
+                        // through any f64 JSON parser — i64::MAX lossy-converts in JS/f64
+                        // to a value > Postgres BIGINT max and 500s the /match handler.
+                        max_budget: (1i64 << 53) - 1,
                         input_tokens: 0,
                         latency_preference:
                             crate::pyramid::compute_requester::LatencyPreference::BestPrice,
