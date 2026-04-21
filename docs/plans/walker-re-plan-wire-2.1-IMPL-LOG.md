@@ -21,6 +21,28 @@ Entry template:
 **Deviation:** None / <rationale if any>
 -->
 
+## 2026-04-21 — Wave 1 tasks 8-10 verifier pass — commit 37ff562 (branch walker-re-plan-wire-2.1)
+
+**Plan task:** Wave 1 verifier pass — walker body correctness audit + hygiene fixes.
+**Verified clean:**
+- Phase A (fleet pre-loop ~1433-1725) and Phase B (market pre-loop ~1732-2082) left UNTOUCHED by Wave 1 diff (`git diff da67787 42b5366 -- llm.rs` hunks start at line 2363).
+- Compute_queue enqueue still runs before walker. `escalation_timeout_secs` struct field stays on `dispatch_policy` but is never dereferenced in runtime code (only one remaining use is the comment at llm.rs:2459). No `tokio::time::timeout(...pools.acquire...)` wraps anywhere.
+- All 12 `emit_walker_chronicle` call sites use `&walker_source_label` (from `options.dispatch_origin.source_label()`) — no hardcoded "local" / "network" strings. All 7 Wave 1 events fire: `EVENT_WALKER_RESOLVED`, `EVENT_WALKER_EXHAUSTED`, `EVENT_NETWORK_ROUTE_{SKIPPED,SATURATED,UNAVAILABLE,RETRYABLE_FAIL,TERMINAL_FAIL}`.
+- Three audit exit outcomes per plan §8 task 11 land correctly: Success → `complete_llm_audit(..., Some(winning_entry.provider_id))`; CallTerminal → `fail_llm_audit(audit_id, reason, last_attempted_provider_id.as_deref())`; Exhaustion → `fail_llm_audit(audit_id, "no viable route", None)`. `last_attempted_provider_id` is ONLY written after the fleet/market skip branch advances + pool classify_branch confirmed (line 2541), so wave1_not_implemented skips correctly do NOT pollute it.
+- HTTP retry loop relocation intact: per-request timeout scaling (local_timeout_scale=5 for OpenaiCompat), exponential backoff on retryable statuses, context-exceeded 400 cascade (primary → fallback_1 → fallback_2) loops on SAME entry via `attempt += 1; continue`, `augment_request_body` + `parse_response` + provider-health hooks + cache store on success all present. Terminal-code classification: 401/403 → RouteSkipped, 404 → CallTerminal, 400 non-context exhausted → CallTerminal, 5xx exhausted → Retryable.
+- Test coverage: `walker_exhausts_when_no_entry_viable`, `walker_skips_fleet_and_market_entries_in_wave1`, `walker_advances_on_pool_saturation` all exercise the real walker body (no mocks); saturated test uses `concurrency=0` real `ProviderPools`; exhaustion test asserts "no viable route" reaches caller.
+
+**Fix-in-place changes (commit 37ff562):**
+1. Removed cryptic `let _ = (&mut provider_impl, &mut secret, &mut provider_type);` no-op at llm.rs:2443. The outer bindings are never reassigned after `build_call_provider` returns — the `mut` qualifiers were vestigial from Phase D. Dropped `mut`, dropped the no-op; prefixed `_provider_impl` + `_secret` so the reader sees at a glance that only `provider_type` + `provider_id` are still read (by Phase A + queue-enqueue `should_enqueue_local_execution` check at line 871).
+2. Deleted `maybe_fail_audit` (was `#[allow(dead_code)]` with a "reuse in Waves 2-3" comment). Waves 2-3 inline fleet + market INTO the walker, which calls `fail_llm_audit` directly with `last_attempted_provider_id`. The helper's provider-id-less signature doesn't match what the walker needs. Killing now rather than ambiguously deferring.
+3. Tightened comment on `last_attempted_provider_id`'s `#[allow(unused_assignments)]` — the allow IS needed (confirmed by removing it and seeing the warning re-fire) because the walker can exhaust without any pool attempt (fleet/market-only routes) in which case the write-before-exhaust is never read.
+
+**Cargo check:** clean (default target, `cargo check` — includes main.rs per `feedback_cargo_check_lib_insufficient_for_binary`). Lib warnings 71 → 69 after hygiene fixes (two `unused variable` warnings dropped via underscore prefix).
+**Cargo test:** `cargo test --lib` — 1761 pass / 15 fail (pre-existing set exactly, no regression). `cargo test --lib walker` — 6/6 pass.
+**Deviation:** None. One audit-level observation moved to friction log: the hoisted `_provider_impl` + `_secret` outer bindings are genuine fallback-only code; they can be deleted entirely once Wave 5 kills the `resolved_route = None` path (plan §5 deprecation enforcement). Low priority, not structural.
+
+Wave 1 verifier clean; wanderer unblocked.
+
 ## 2026-04-21 — commits 6b83a86 + 42b5366 + ef51f7a (branch walker-re-plan-wire-2.1)
 
 **Plan task:** Wave 1 tasks 8 + 9 + 10 — walker loop replaces Phase D; HTTP retry relocated into pool-provider branch; `try_acquire_owned` abstraction with plan §3 error taxonomy.

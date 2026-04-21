@@ -20,6 +20,14 @@ Entry template:
 **Flag:** plan error / doc staleness / spec ambiguity / Wire-side bug / learning moment
 -->
 
+## 2026-04-21 — Wave 1 verifier pass — hoisted provider bindings are genuine fallback
+
+**Context:** Verifier inspecting the Wave 1 walker-body diff; agent had written `let _ = (&mut provider_impl, &mut secret, &mut provider_type);` at llm.rs:2443 as a warning-silencer.
+**Surprise:** The ugly no-op read "smells" like dead code waiting to be deleted, but grep showed `provider_type` is still used by `should_enqueue_local_execution` (llm.rs:871) in the queue-enqueue gate, AND `_provider_impl` / `_secret` are the fallback values the walker's pool branch reaches for when `config.provider_registry` is absent (tests / pre-init). So the destructure as a whole can't be deleted.
+**Root cause:** Waves 2-3 remove Phase A / Phase B (which don't read these either); once Wave 5 deprecates the `resolved_route = None` fallback path the outer destructure is deletable entirely. Today they're pure pre-init scaffolding.
+**Workaround:** Drop `mut` qualifiers (never reassigned), prefix unused bindings with `_`, drop the no-op. Warnings die, code reads honestly. Full deletion deferred to Wave 5 cleanup.
+**Flag:** learning moment — `#[allow(unused_assignments)]` on `last_attempted_provider_id` is the other "is this needed" case: verified by removing it and watching the warning fire (walker can exhaust without any pool attempt, leaving the write unread). Allow stays; comment updated to explain WHY.
+
 ## 2026-04-21 05:20 — Wave 0 retro
 
 **What worked:**
