@@ -44,7 +44,7 @@ use crate::pyramid::dadbear_preview::{
 };
 use crate::pyramid::dispatch_policy::DispatchPolicy;
 use crate::pyramid::event_bus::{BuildEventBus, TaggedBuildEvent, TaggedKind};
-use crate::pyramid::llm::{LlmCallOptions, LlmConfig, LlmResponse};
+use crate::pyramid::llm::{DispatchOrigin, LlmCallOptions, LlmConfig, LlmResponse};
 use crate::pyramid::lock_manager::LockManager;
 use crate::pyramid::observation_events;
 use crate::pyramid::step_context::StepContext;
@@ -525,13 +525,19 @@ impl DadbearSupervisor {
         let wi_id = item.id.clone();
         let slug = item.slug.clone();
 
-        // (a) Create work attempt row.
+        // (a) Create work attempt row. DADBEAR always dispatches as
+        // `DispatchOrigin::Local` (see `prepare_for_replay` below — fleet and
+        // market contexts are cleared so this entry flows through the local
+        // compute-queue + pool-branch walker path only). The origin seeds
+        // `routing`; `complete_attempt` later overwrites it with the actual
+        // provider that served the call.
+        let dispatch_origin = DispatchOrigin::Local;
         let attempt_id = {
             let db_path = db_path.clone();
             let wi_id = wi_id.clone();
             tokio::task::spawn_blocking(move || -> Result<String> {
                 let conn = Connection::open(&db_path)?;
-                create_work_attempt(&conn, &wi_id)
+                create_work_attempt(&conn, &wi_id, dispatch_origin)
             })
             .await
             .context("spawn_blocking join error")??
@@ -803,6 +809,7 @@ impl DadbearSupervisor {
                 let cost_usd = response.actual_cost_usd;
                 let tokens_in = response.usage.prompt_tokens as i64;
                 let tokens_out = response.usage.completion_tokens as i64;
+                let provider_id = response.provider_id.clone();
 
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let conn = Connection::open(&db_path)?;
@@ -814,6 +821,7 @@ impl DadbearSupervisor {
                         tokens_in,
                         tokens_out,
                         latency_ms,
+                        provider_id.as_deref(),
                     )
                 })
                 .await
@@ -1691,7 +1699,18 @@ fn is_preview_still_valid(conn: &Connection, preview_id: &str) -> Result<bool> {
 }
 
 /// Create a work attempt row. Returns the attempt_id.
-fn create_work_attempt(conn: &Connection, work_item_id: &str) -> Result<String> {
+///
+/// `origin` records the dispatch origin of this attempt (see
+/// `DispatchOrigin::source_label`). `routing` is seeded with that label and
+/// later overwritten by `complete_attempt` with the actual provider that
+/// served the call — so a successful attempt's `routing` reflects e.g.
+/// `openrouter` / `ollama-local` while in-flight or failed attempts retain
+/// the origin label.
+fn create_work_attempt(
+    conn: &Connection,
+    work_item_id: &str,
+    origin: DispatchOrigin,
+) -> Result<String> {
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     // Count existing attempts to determine attempt_number.
@@ -1706,15 +1725,16 @@ fn create_work_attempt(conn: &Connection, work_item_id: &str) -> Result<String> 
 
     let attempt_id = dadbear_compiler::attempt_id(work_item_id, attempt_number);
 
-    // Read model_id and routing from the work item.
-    let (model_id, routing): (String, String) = conn
+    // Read model_id from the work item; routing is seeded from origin.
+    let routing = origin.source_label().to_string();
+    let model_id: String = conn
         .query_row(
-            "SELECT COALESCE(resolved_model_id, model_tier), 'local'
+            "SELECT COALESCE(resolved_model_id, model_tier)
              FROM dadbear_work_items WHERE id = ?1",
             params![work_item_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
-        .unwrap_or_else(|_| ("unknown".to_string(), "local".to_string()));
+        .unwrap_or_else(|_| "unknown".to_string());
 
     conn.execute(
         "INSERT INTO dadbear_work_attempts
@@ -1727,6 +1747,11 @@ fn create_work_attempt(conn: &Connection, work_item_id: &str) -> Result<String> 
 }
 
 /// Complete a work attempt with a successful result.
+///
+/// `provider_id` is the provider that actually served the call (e.g.
+/// `openrouter`, `ollama-local`), surfaced from `LlmResponse::provider_id`.
+/// When present it overwrites the origin-seeded `routing` label so operator
+/// telemetry reflects the real compute lane rather than the dispatch origin.
 fn complete_attempt(
     conn: &Connection,
     attempt_id: &str,
@@ -1735,6 +1760,7 @@ fn complete_attempt(
     tokens_in: i64,
     tokens_out: i64,
     latency_ms: i64,
+    provider_id: Option<&str>,
 ) -> Result<()> {
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
@@ -1746,9 +1772,19 @@ fn complete_attempt(
              tokens_in = ?3,
              tokens_out = ?4,
              latency_ms = ?5,
-             completed_at = ?6
-         WHERE id = ?7 AND status = 'pending'",
-        params![result_json, cost_usd, tokens_in, tokens_out, latency_ms, now, attempt_id],
+             completed_at = ?6,
+             routing = COALESCE(?7, routing)
+         WHERE id = ?8 AND status = 'pending'",
+        params![
+            result_json,
+            cost_usd,
+            tokens_in,
+            tokens_out,
+            latency_ms,
+            now,
+            provider_id,
+            attempt_id,
+        ],
     )?;
 
     Ok(())
