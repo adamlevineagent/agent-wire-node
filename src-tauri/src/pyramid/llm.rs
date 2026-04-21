@@ -6078,5 +6078,442 @@ routing_rules:
             Some(super::super::compute_chronicle::EVENT_NETWORK_QUOTE_EXPIRED),
         );
     }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Post-ship walker bug fixes (W1 + C1) — classify_pool_400 +
+    // resolve_route_model + cascade-crossing regression guard.
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn classify_pool_400_openrouter_model_rejection_is_route_skipped() {
+        // The exact body shape OpenRouter returned in Mac post-ship smoke.
+        let body = r#"{"error":{"message":"gemma4:26b is not a valid model ID"}}"#;
+        match classify_pool_400(body) {
+            EntryError::RouteSkipped { reason } => {
+                assert!(
+                    reason.contains("provider_rejected_model"),
+                    "reason should tag provider_rejected_model, got: {reason}"
+                );
+            }
+            other => panic!("expected RouteSkipped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_pool_400_model_not_found_is_route_skipped() {
+        let body = r#"{"error":"model not found: gpt-x"}"#;
+        match classify_pool_400(body) {
+            EntryError::RouteSkipped { reason } => {
+                assert!(reason.contains("provider_rejected_model"), "got: {reason}");
+            }
+            other => panic!("expected RouteSkipped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_pool_400_feature_unsupported_is_route_skipped() {
+        let body = r#"{"error":{"message":"response_format not supported by this model"}}"#;
+        match classify_pool_400(body) {
+            EntryError::RouteSkipped { reason } => {
+                assert!(
+                    reason.contains("provider_feature_unsupported"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected RouteSkipped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_pool_400_bad_json_is_call_terminal() {
+        let body = "Bad JSON: unexpected token at position 42";
+        match classify_pool_400(body) {
+            EntryError::CallTerminal { reason } => {
+                assert!(reason.contains("body_shape_error"), "got: {reason}");
+            }
+            other => panic!("expected CallTerminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_pool_400_empty_body_is_call_terminal() {
+        match classify_pool_400("") {
+            EntryError::CallTerminal { reason } => {
+                assert!(reason.contains("body_shape_error"), "got: {reason}");
+            }
+            other => panic!("expected CallTerminal on empty body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncate_utf8_respects_char_boundary_no_panic() {
+        // Four-byte scalar ("💥" = U+1F4A5) placed so a naive byte-slice
+        // at max=2 would cut through the middle of it.
+        let s = "💥abc";
+        assert_eq!(s.len(), 7); // 4 + 3
+        let out = truncate_utf8(s, 2);
+        // Must not panic; must not return an invalid-UTF8 byte string.
+        // The walk-back lands on byte 0 (no char boundary up to 2).
+        assert!(out.is_empty() || out == "💥");
+        // Longer truncation past the scalar keeps it intact.
+        let out2 = truncate_utf8(s, 5);
+        assert!(out2.starts_with('💥'));
+    }
+
+    #[test]
+    fn truncate_utf8_under_max_returns_as_is() {
+        assert_eq!(truncate_utf8("short", 200), "short");
+    }
+
+    #[test]
+    fn classify_pool_400_truncates_long_bodies_without_utf8_panic() {
+        // Build a long body whose first 200 bytes end mid-scalar.
+        let mut body = String::new();
+        for _ in 0..100 {
+            body.push('💥');
+        }
+        // "not a valid model" appears early so it routes to RouteSkipped,
+        // but the truncation still has to not panic on the long tail.
+        let body = format!("not a valid model: {body}");
+        let _ = classify_pool_400(&body); // no panic
+    }
+
+    #[test]
+    fn resolve_route_model_priority_1_explicit_entry_model_id() {
+        use crate::pyramid::dispatch_policy::RouteEntry;
+        let entry = RouteEntry {
+            provider_id: "openrouter".into(),
+            model_id: Some("explicit/model".into()),
+            tier_name: Some("some_tier".into()),
+            is_local: false,
+            max_budget_credits: None,
+        };
+        // Registry passed as None — explicit override must win regardless.
+        let got = resolve_route_model(&entry, None, "stale/primary");
+        assert_eq!(got, "explicit/model");
+    }
+
+    #[test]
+    fn resolve_route_model_priority_2_tier_routing_match() {
+        use crate::pyramid::dispatch_policy::RouteEntry;
+        use crate::pyramid::provider::{Provider, ProviderRegistry, ProviderType, TierRoutingEntry};
+        use crate::pyramid::credentials::CredentialStore;
+        use std::sync::Arc;
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(CredentialStore::load(tmp.path()).unwrap());
+        std::mem::forget(tmp);
+
+        let registry = Arc::new(ProviderRegistry::new(store));
+        // tier_routing has FK → provider_id; ensure provider row exists.
+        registry
+            .save_provider(
+                &conn,
+                Provider {
+                    id: "openrouter".into(),
+                    display_name: "OR".into(),
+                    provider_type: ProviderType::Openrouter,
+                    base_url: "https://openrouter.ai/api/v1".into(),
+                    api_key_ref: Some("OPENROUTER_KEY".into()),
+                    auto_detect_context: false,
+                    supports_broadcast: false,
+                    broadcast_config_json: None,
+                    config_json: "{}".into(),
+                    enabled: true,
+                },
+            )
+            .unwrap();
+        registry
+            .save_tier_routing(
+                &conn,
+                TierRoutingEntry {
+                    tier_name: "my_tier".into(),
+                    provider_id: "openrouter".into(),
+                    model_id: "tier/model-from-routing".into(),
+                    context_limit: Some(128_000),
+                    max_completion_tokens: None,
+                    pricing_json: "{}".into(),
+                    supported_parameters_json: None,
+                    notes: None,
+                },
+            )
+            .unwrap();
+
+        let entry = RouteEntry {
+            provider_id: "openrouter".into(),
+            model_id: None,
+            tier_name: Some("my_tier".into()),
+            is_local: false,
+            max_budget_credits: None,
+        };
+        let got = resolve_route_model(&entry, Some(&registry), "stale/primary");
+        assert_eq!(got, "tier/model-from-routing");
+    }
+
+    #[test]
+    fn resolve_route_model_priority_2_skips_when_tier_provider_mismatch() {
+        // Tier routing row is for a DIFFERENT provider than the route
+        // entry. Resolver must NOT cross-provider an incompatible slug —
+        // it falls through to the primary_model fallback. This is the
+        // regression guard for the original C1 bug.
+        use crate::pyramid::dispatch_policy::RouteEntry;
+        use crate::pyramid::provider::{Provider, ProviderRegistry, ProviderType, TierRoutingEntry};
+        use crate::pyramid::credentials::CredentialStore;
+        use std::sync::Arc;
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(CredentialStore::load(tmp.path()).unwrap());
+        std::mem::forget(tmp);
+
+        let registry = Arc::new(ProviderRegistry::new(store));
+        registry
+            .save_provider(
+                &conn,
+                Provider {
+                    id: "ollama-local".into(),
+                    display_name: "Ollama".into(),
+                    provider_type: ProviderType::OpenaiCompat,
+                    base_url: "http://127.0.0.1:11434/v1".into(),
+                    api_key_ref: None,
+                    auto_detect_context: false,
+                    supports_broadcast: false,
+                    broadcast_config_json: None,
+                    config_json: "{}".into(),
+                    enabled: true,
+                },
+            )
+            .unwrap();
+        registry
+            .save_tier_routing(
+                &conn,
+                TierRoutingEntry {
+                    tier_name: "local_tier".into(),
+                    provider_id: "ollama-local".into(),
+                    model_id: "gemma4:26b".into(),
+                    context_limit: Some(32_000),
+                    max_completion_tokens: None,
+                    pricing_json: "{}".into(),
+                    supported_parameters_json: None,
+                    notes: None,
+                },
+            )
+            .unwrap();
+
+        let entry = RouteEntry {
+            provider_id: "openrouter".into(),
+            model_id: None,
+            tier_name: Some("local_tier".into()),
+            is_local: false,
+            max_budget_credits: None,
+        };
+        let got = resolve_route_model(&entry, Some(&registry), "fallback/primary");
+        // Must fall through — NOT "gemma4:26b".
+        assert_eq!(got, "fallback/primary");
+    }
+
+    #[test]
+    fn resolve_route_model_priority_3_primary_fallback() {
+        use crate::pyramid::dispatch_policy::RouteEntry;
+        let entry = RouteEntry {
+            provider_id: "openrouter".into(),
+            model_id: None,
+            tier_name: None,
+            is_local: false,
+            max_budget_credits: None,
+        };
+        let got = resolve_route_model(&entry, None, "fallback/primary");
+        assert_eq!(got, "fallback/primary");
+    }
+
+    #[tokio::test]
+    async fn walker_advances_past_openrouter_400_model_rejection_to_ollama_local() {
+        // Integration-style regression guard for the cascade-crossing
+        // bug Adam caught. Two pool entries:
+        //   - openrouter (mockito 400 with "not a valid model ID" body)
+        //   - ollama-local (mockito 200 with a valid chat-completions body)
+        // Walker must classify the 400 as RouteSkipped (W1) and advance
+        // to ollama-local, which succeeds.
+        use crate::pyramid::credentials::CredentialStore;
+        use crate::pyramid::dispatch_policy::{
+            BuildCoordinationConfig, DispatchPolicy, EscalationConfig, MatchConfig,
+            ProviderPoolConfig, RouteEntry, RoutingRule,
+        };
+        use crate::pyramid::provider::{Provider, ProviderRegistry, ProviderType};
+        use std::sync::Arc;
+
+        // Spin up mockito servers. Server::new_async is the recommended
+        // constructor for tokio tests.
+        let mut or_server = mockito::Server::new_async().await;
+        let mut ol_server = mockito::Server::new_async().await;
+
+        let _or_mock = or_server
+            .mock("POST", "/chat/completions")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"error":{"message":"gemma4:26b is not a valid model ID"}}"#,
+            )
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let ol_body = r#"{
+            "id":"resp-1",
+            "model":"gemma4:26b",
+            "choices":[{
+                "index":0,
+                "message":{"role":"assistant","content":"hello from ollama"},
+                "finish_reason":"stop"
+            }],
+            "usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}
+        }"#;
+        let _ol_mock = ol_server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(ol_body)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(CredentialStore::load(tmp.path()).unwrap());
+        store.set("OPENROUTER_KEY", "sk-or-v1-test").unwrap();
+        std::mem::forget(tmp);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+
+        let registry = Arc::new(ProviderRegistry::new(store));
+        // OpenRouter-style provider pointing at mock 1.
+        registry
+            .save_provider(
+                &conn,
+                Provider {
+                    id: "openrouter".into(),
+                    display_name: "OpenRouter (test)".into(),
+                    provider_type: ProviderType::Openrouter,
+                    base_url: or_server.url(),
+                    api_key_ref: Some("OPENROUTER_KEY".into()),
+                    auto_detect_context: false,
+                    supports_broadcast: false,
+                    broadcast_config_json: None,
+                    config_json: "{}".into(),
+                    enabled: true,
+                },
+            )
+            .unwrap();
+        // OpenAI-compat provider pointing at mock 2 (ollama-local shape).
+        registry
+            .save_provider(
+                &conn,
+                Provider {
+                    id: "ollama-local".into(),
+                    display_name: "Ollama (test)".into(),
+                    provider_type: ProviderType::OpenaiCompat,
+                    base_url: ol_server.url(),
+                    api_key_ref: None,
+                    auto_detect_context: false,
+                    supports_broadcast: false,
+                    broadcast_config_json: None,
+                    config_json: "{}".into(),
+                    enabled: true,
+                },
+            )
+            .unwrap();
+
+        // DispatchPolicy with both entries + pools configured.
+        let mut pool_configs = std::collections::BTreeMap::new();
+        pool_configs.insert(
+            "openrouter".into(),
+            ProviderPoolConfig {
+                concurrency: 1,
+                rate_limit: None,
+            },
+        );
+        pool_configs.insert(
+            "ollama-local".into(),
+            ProviderPoolConfig {
+                concurrency: 1,
+                rate_limit: None,
+            },
+        );
+        let policy = Arc::new(DispatchPolicy {
+            rules: vec![RoutingRule {
+                name: "cascade_test".into(),
+                match_config: MatchConfig {
+                    work_type: None,
+                    min_depth: None,
+                    step_pattern: None,
+                },
+                route_to: vec![
+                    RouteEntry {
+                        provider_id: "openrouter".into(),
+                        model_id: Some("openai/gpt-4o-mini".into()),
+                        tier_name: None,
+                        is_local: false,
+                        max_budget_credits: None,
+                    },
+                    RouteEntry {
+                        provider_id: "ollama-local".into(),
+                        model_id: Some("gemma4:26b".into()),
+                        tier_name: None,
+                        is_local: true,
+                        max_budget_credits: None,
+                    },
+                ],
+                bypass_pool: false,
+                sequential: false,
+            }],
+            escalation: EscalationConfig::default(),
+            build_coordination: BuildCoordinationConfig::default(),
+            pool_configs,
+            max_batch_cost_usd: None,
+            max_daily_cost_usd: None,
+        });
+        let pools = Arc::new(
+            crate::pyramid::provider_pools::ProviderPools::new(policy.as_ref()),
+        );
+
+        let config = LlmConfig {
+            api_key: "sk-or-v1-test".into(),
+            auth_token: String::new(),
+            primary_model: "openai/gpt-4o-mini".into(),
+            fallback_model_1: "openai/gpt-4o-mini".into(),
+            fallback_model_2: "openai/gpt-4o-mini".into(),
+            provider_registry: Some(registry.clone()),
+            dispatch_policy: Some(policy),
+            provider_pools: Some(pools),
+            max_retries: 1,
+            retry_base_sleep_secs: 0,
+            ..Default::default()
+        };
+
+        let result = call_model_unified_with_audit_and_ctx(
+            &config,
+            None,
+            None,
+            "sys",
+            "usr",
+            0.0,
+            16,
+            None,
+            LlmCallOptions::default(),
+        )
+        .await;
+
+        let resp = result.expect(
+            "walker must advance past openrouter 400 (W1) and succeed on ollama-local (C1)",
+        );
+        assert!(
+            resp.content.contains("hello from ollama"),
+            "expected ollama-local response content, got: {:?}",
+            resp.content
+        );
+    }
 }
 
