@@ -25,8 +25,21 @@ pub enum WorkType {
 
 // ── Route entry ─────────────────────────────────────────────────────────────
 
+/// Effective "no budget cap" sentinel for [`RouteEntry::max_budget_credits`].
+///
+/// Value: `2^53 - 1` = `Number.MAX_SAFE_INTEGER`. f64-safe round-trip through
+/// JSON — Wire's `/quote` handler (TypeScript) parses `max_budget` as Number,
+/// which tops out at this value without precision loss. Larger i64 values
+/// corrupt on deserialize.
+///
+/// `estimated_total = input_tokens * rate_in_per_m / 1M + output_tokens * rate_out_per_m / 1M`
+/// is bounded well under this sentinel for any realistic call. Wire's 409
+/// `budget_exceeded` thus never fires when `max_budget` is set to this value
+/// — by design: the sentinel means "no operator-imposed cap."
+pub const NO_BUDGET_CAP: i64 = (1i64 << 53) - 1;
+
 /// A single provider+model in a routing preference chain.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteEntry {
     pub provider_id: String,
     /// If set, overrides the provider's default model for this route.
@@ -39,6 +52,13 @@ pub struct RouteEntry {
     /// Used by fleet to determine which rules this node can serve.
     #[serde(default)]
     pub is_local: bool,
+    /// Optional per-entry credit ceiling fed to Wire's `/quote` `max_budget`
+    /// field. `None` → use [`NO_BUDGET_CAP`] (no operator-imposed cap; Wire's
+    /// 409 `budget_exceeded` won't fire for this entry). `Some(n)` → Wire
+    /// rejects the quote if its estimated total exceeds n, walker advances.
+    /// Settings panel (Wave 4) exposes this as "optional credit ceiling."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_budget_credits: Option<i64>,
 }
 
 // ── Match config ────────────────────────────────────────────────────────────
@@ -366,18 +386,21 @@ mod tests {
                     model_id: None,
                     tier_name: None,
                     is_local: true,
+                    max_budget_credits: None,
                 },
                 RouteEntry {
                     provider_id: "market".into(),
                     model_id: Some("some-model".into()),
                     tier_name: None,
                     is_local: true,
+                    max_budget_credits: None,
                 },
                 RouteEntry {
                     provider_id: "ollama-local".into(),
                     model_id: Some("llama3".into()),
                     tier_name: None,
                     is_local: true,
+                    max_budget_credits: None,
                 },
             ],
             bypass_pool: false,
@@ -459,6 +482,7 @@ mod tests {
                         model_id: None,
                         tier_name: None,
                         is_local: false,
+                        max_budget_credits: None,
                     }],
                     bypass_pool: false,
                     sequential: true,
@@ -475,6 +499,7 @@ mod tests {
                         model_id: None,
                         tier_name: None,
                         is_local: false,
+                        max_budget_credits: None,
                     }],
                     bypass_pool: false,
                     sequential: false,
@@ -512,6 +537,7 @@ mod tests {
                     model_id: None,
                     tier_name: None,
                     is_local: false,
+                    max_budget_credits: None,
                 }],
                 bypass_pool: false,
                 sequential: false,

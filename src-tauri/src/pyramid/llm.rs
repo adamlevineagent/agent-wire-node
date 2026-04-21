@@ -1834,6 +1834,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 model_id: None,
                 tier_name: None,
                 is_local: provider_type == ProviderType::OpenaiCompat,
+                max_budget_credits: None,
             }],
             false,
         ),
@@ -1994,14 +1995,16 @@ pub async fn call_model_unified_with_audit_and_ctx(
 
             // ── Dispatch via helper ──────────────────────────────────
             //
-            // NO_BUDGET_CAP sentinel: `(1i64 << 53) - 1` = JS
-            // MAX_SAFE_INTEGER. Effectively "no cap / solvent assumed";
-            // round-trips cleanly through any f64 JSON parser. Wire's
-            // 409 budget_exceeded is the authoritative ceiling check.
-            // Per-entry `max_budget_credits` is a Wave 0/1 RouteEntry
-            // addition not yet on the struct; for now sentinel is used.
-            const NO_BUDGET_CAP: i64 = (1i64 << 53) - 1;
-            let max_budget = NO_BUDGET_CAP;
+            // Per-entry `max_budget_credits` cap fed into Wire's /quote
+            // `max_budget` field. Absent → NO_BUDGET_CAP sentinel
+            // (2^53 - 1, JS Number.MAX_SAFE_INTEGER; round-trips f64
+            // cleanly). Wire's 409 budget_exceeded fires when the
+            // estimated total exceeds this — walker advances via
+            // EntryError::RouteSkipped, network_rate_above_budget
+            // chronicle, next entry tried.
+            let max_budget = entry
+                .max_budget_credits
+                .unwrap_or(crate::pyramid::dispatch_policy::NO_BUDGET_CAP);
 
             let max_tokens_i64 = if _max_tokens == 0 {
                 0i64
@@ -4400,6 +4403,7 @@ routing_rules:
                 model_id: None,
                 tier_name: None,
                 is_local: false,
+                max_budget_credits: None,
             })
             .collect();
         let policy = DispatchPolicy {
