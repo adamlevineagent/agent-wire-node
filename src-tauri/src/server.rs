@@ -2021,15 +2021,17 @@ fn spawn_fleet_worker(
     response_format: Option<serde_json::Value>,
 ) {
     tokio::spawn(async move {
-        // Build worker config with fleet recursion bypass fields zeroed.
+        // Derive worker config via prepare_for_replay — the node is
+        // fulfilling a fleet-received job, so dispatch contexts
+        // (compute_queue, fleet, market) must all be cleared to prevent
+        // recursive outbound dispatch. Then override the model to the
+        // requested one.
         let fleet_config = {
             let cfg = state.pyramid.config.read().await;
-            let mut fc = cfg.clone();
+            let mut fc = cfg.prepare_for_replay(crate::pyramid::llm::DispatchOrigin::FleetReceived);
             fc.primary_model = resolved_model.clone();
             fc.fallback_model_1 = resolved_model.clone();
             fc.fallback_model_2 = resolved_model.clone();
-            fc.fleet_dispatch = None; // prevent Phase A re-entry
-            fc.fleet_roster = None;   // belt-and-suspenders — no peer candidates
             fc
         };
 
@@ -3948,17 +3950,17 @@ fn spawn_market_worker(
     credit_rate_out_per_m: i64,
 ) {
     tokio::spawn(async move {
-        // Build worker config. Override model to the market-requested
-        // model; zero fleet_dispatch + fleet_roster so the unified call
-        // path cannot recursively re-dispatch this job.
+        // Derive worker config via prepare_for_replay — the node is
+        // fulfilling a market-received job, so dispatch contexts
+        // (compute_queue, fleet, market) must all be cleared to prevent
+        // recursive outbound dispatch. Then override the model to the
+        // market-requested one.
         let worker_config = {
             let cfg = state.pyramid.config.read().await;
-            let mut wc = cfg.clone();
+            let mut wc = cfg.prepare_for_replay(crate::pyramid::llm::DispatchOrigin::MarketReceived);
             wc.primary_model = model_id.clone();
             wc.fallback_model_1 = model_id.clone();
             wc.fallback_model_2 = model_id.clone();
-            wc.fleet_dispatch = None;
-            wc.fleet_roster = None;
             wc
         };
 

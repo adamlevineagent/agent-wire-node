@@ -543,10 +543,12 @@ impl DadbearSupervisor {
         // Build a StepContext from the work item (Law 4).
         let step_ctx = reconstruct_step_context(item, &self.db_path, &self.event_bus);
 
-        // Build LlmConfig for the queue entry — with compute_queue: None
-        // to prevent re-enqueue when the GPU loop processes this entry.
-        let mut queue_config = config.clone();
-        queue_config.compute_queue = None;
+        // Derive LlmConfig for the queue entry via prepare_for_replay —
+        // clears compute_queue (re-enqueue guard) + fleet + market
+        // contexts so the GPU loop processes this entry as a pool-only
+        // local call. See impl LlmConfig::prepare_for_replay for the
+        // single-source-of-truth rationale.
+        let queue_config = config.prepare_for_replay(crate::pyramid::llm::DispatchOrigin::Local);
 
         let response_format = item.response_format_json.as_ref().and_then(|json_str| {
             serde_json::from_str::<serde_json::Value>(json_str).ok()

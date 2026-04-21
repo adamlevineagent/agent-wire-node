@@ -851,6 +851,31 @@ impl LlmConfig {
         }
         self
     }
+
+    /// Derive a replay config from this config. Single source of truth for
+    /// which dispatch-routing fields are cleared. The key insight: whenever
+    /// `prepare_for_replay` is called, the OUTER dispatch decision has
+    /// already been made. The inner (replayed) call should be pool-only —
+    /// it has no business re-dispatching to fleet or market.
+    ///
+    /// Origin-independent by design: for `Local` (compute_queue replay from
+    /// the outer walker), the outer walker already tried fleet + market
+    /// before the enqueue decision. For `FleetReceived` / `MarketReceived`
+    /// (inbound-job worker spawn), the node is the provider fulfilling
+    /// someone else's work — no outbound dispatch should happen.
+    ///
+    /// Takes `origin` for observability (emitted via `tracing::debug` at each
+    /// call) and for future use if an origin-specific carve-out becomes
+    /// necessary. Call-site intent is explicit.
+    pub fn prepare_for_replay(&self, origin: DispatchOrigin) -> Self {
+        tracing::debug!(?origin, "preparing replay config");
+        let mut cfg = self.clone();
+        cfg.compute_queue = None;
+        cfg.fleet_dispatch = None;
+        cfg.fleet_roster = None;
+        cfg.compute_market_context = None;
+        cfg
+    }
 }
 
 /// Origin classifier for a dispatch that arrived at this node from
@@ -2093,18 +2118,12 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 queue_model_id_for_local_execution(config, ctx, resolved_route.as_ref());
             let (tx, rx) = tokio::sync::oneshot::channel();
 
-            // Clone config WITHOUT queue handle (prevents re-enqueue loop),
-            // WITHOUT fleet roster, and WITHOUT fleet_dispatch context.
-            // Queue replay is a pure local execution path: fleet dispatch
-            // already had its chance. Stripping fleet_dispatch is
-            // belt-and-suspenders — `skip_fleet_dispatch = true` below is
-            // the authoritative guard against Phase A re-entry, but zeroing
-            // the context removes the possibility entirely and matches the
-            // spawn_fleet_worker pattern in server.rs::spawn_fleet_worker.
-            let mut gpu_config = config.clone();
-            gpu_config.compute_queue = None;
-            gpu_config.fleet_roster = None;
-            gpu_config.fleet_dispatch = None;
+            // Derive replay config via prepare_for_replay — clears
+            // compute_queue (re-enqueue guard) + fleet + market contexts
+            // so the GPU loop processes this entry as a pool-only local
+            // call. See impl LlmConfig::prepare_for_replay for the
+            // single-source-of-truth rationale.
+            let gpu_config = config.prepare_for_replay(options.dispatch_origin);
 
             // Set skip flags on the forwarded options so the GPU loop
             // performs the local execution directly rather than treating
@@ -4761,6 +4780,119 @@ routing_rules:
 
         // No audit rows landed because audit was None.
         assert_eq!(count_audit_rows(db.path(), "p18b-l8-noaudit", None), 0);
+    }
+
+    // ── prepare_for_replay tests ─────────────────────────────────────────────
+    //
+    // Walker re-plan Wire 2.1 §2.5.1: prepare_for_replay is the single
+    // source of truth for which dispatch-routing fields get cleared before
+    // a replay or inbound-job worker runs. Origin-independent: all three
+    // origins clear compute_queue + fleet_dispatch + fleet_roster +
+    // compute_market_context so the inner (replayed) call is pool-only.
+
+    fn build_live_config_with_all_dispatch_handles_for_test() -> LlmConfig {
+        let policy_yaml: crate::pyramid::dispatch_policy::DispatchPolicyYaml =
+            serde_yaml::from_str(
+                r#"
+version: 1
+provider_pools:
+  openrouter:
+    concurrency: 1
+routing_rules:
+  - name: default
+    match_config: {}
+    route_to:
+      - provider_id: openrouter
+"#,
+            )
+            .unwrap();
+        let dispatch_policy = std::sync::Arc::new(
+            crate::pyramid::dispatch_policy::DispatchPolicy::from_yaml(&policy_yaml),
+        );
+        let provider_pools = std::sync::Arc::new(
+            crate::pyramid::provider_pools::ProviderPools::new(dispatch_policy.as_ref()),
+        );
+        let compute_queue = crate::compute_queue::ComputeQueueHandle::new();
+        let fleet_roster = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::fleet::FleetRoster::default(),
+        ));
+        let tunnel_state = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::tunnel::TunnelState::default(),
+        ));
+        let fleet_dispatch = std::sync::Arc::new(crate::fleet::FleetDispatchContext {
+            tunnel_state: tunnel_state.clone(),
+            fleet_roster: fleet_roster.clone(),
+            pending: std::sync::Arc::new(crate::fleet::PendingFleetJobs::new()),
+            policy: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::pyramid::fleet_delivery_policy::FleetDeliveryPolicy::default(),
+            )),
+        });
+        let auth = std::sync::Arc::new(tokio::sync::RwLock::new(crate::auth::AuthState::default()));
+        let node_config = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::WireNodeConfig::default(),
+        ));
+        let pending_jobs = crate::pyramid::pending_jobs::PendingJobs::new();
+        let compute_market_context = crate::pyramid::compute_market_ctx::ComputeMarketRequesterContext {
+            auth,
+            config: node_config,
+            pending_jobs,
+            tunnel_state,
+        };
+
+        LlmConfig {
+            dispatch_policy: Some(dispatch_policy),
+            provider_pools: Some(provider_pools),
+            compute_queue: Some(compute_queue),
+            fleet_roster: Some(fleet_roster),
+            fleet_dispatch: Some(fleet_dispatch),
+            compute_market_context: Some(compute_market_context),
+            ..Default::default()
+        }
+    }
+
+    fn assert_all_dispatch_handles_cleared(cfg: &LlmConfig) {
+        assert!(cfg.compute_queue.is_none(), "compute_queue must be cleared");
+        assert!(cfg.fleet_dispatch.is_none(), "fleet_dispatch must be cleared");
+        assert!(cfg.fleet_roster.is_none(), "fleet_roster must be cleared");
+        assert!(
+            cfg.compute_market_context.is_none(),
+            "compute_market_context must be cleared"
+        );
+    }
+
+    fn assert_durable_fields_preserved(live: &LlmConfig, replay: &LlmConfig) {
+        assert!(std::sync::Arc::ptr_eq(
+            replay.dispatch_policy.as_ref().unwrap(),
+            live.dispatch_policy.as_ref().unwrap(),
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            replay.provider_pools.as_ref().unwrap(),
+            live.provider_pools.as_ref().unwrap(),
+        ));
+    }
+
+    #[test]
+    fn prepare_for_replay_local_clears_all_dispatch_handles() {
+        let live = build_live_config_with_all_dispatch_handles_for_test();
+        let replay = live.prepare_for_replay(DispatchOrigin::Local);
+        assert_all_dispatch_handles_cleared(&replay);
+        assert_durable_fields_preserved(&live, &replay);
+    }
+
+    #[test]
+    fn prepare_for_replay_fleet_received_clears_all_dispatch_handles() {
+        let live = build_live_config_with_all_dispatch_handles_for_test();
+        let replay = live.prepare_for_replay(DispatchOrigin::FleetReceived);
+        assert_all_dispatch_handles_cleared(&replay);
+        assert_durable_fields_preserved(&live, &replay);
+    }
+
+    #[test]
+    fn prepare_for_replay_market_received_clears_all_dispatch_handles() {
+        let live = build_live_config_with_all_dispatch_handles_for_test();
+        let replay = live.prepare_for_replay(DispatchOrigin::MarketReceived);
+        assert_all_dispatch_handles_cleared(&replay);
+        assert_durable_fields_preserved(&live, &replay);
     }
 }
 

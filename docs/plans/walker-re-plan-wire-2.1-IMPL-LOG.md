@@ -21,6 +21,34 @@ Entry template:
 **Deviation:** None / <rationale if any>
 -->
 
+## 2026-04-21 03:10 — commit <SHA_TASK_4> (branch walker-re-plan-wire-2.1)
+
+**Plan task:** Wave 0 task 4 — `LlmConfig::prepare_for_replay(origin)` helper + 4 call sites.
+**Changed:** Added `prepare_for_replay` method to `impl LlmConfig` at `src-tauri/src/pyramid/llm.rs:854-879` — clears `compute_queue`, `fleet_dispatch`, `fleet_roster`, `compute_market_context` (origin-independent), emits `tracing::debug!` with origin for observability. Updated all four call sites:
+  - `src-tauri/src/pyramid/llm.rs:2099` (Local/queue-enqueue replay; was missing compute_market_context clear — latent bug now closed).
+  - `src-tauri/src/server.rs:2030` (FleetReceived inbound worker; was missing compute_queue + compute_market_context — latent bug closed).
+  - `src-tauri/src/server.rs:3958` (MarketReceived inbound worker; was missing compute_queue + compute_market_context — latent bug closed).
+  - `src-tauri/src/pyramid/dadbear_supervisor.rs:548` (DADBEAR queue entry; was only clearing compute_queue — latent bug closed).
+Added three unit tests in `llm.rs` `mod tests`: `prepare_for_replay_local_clears_all_dispatch_handles`, `prepare_for_replay_fleet_received_clears_all_dispatch_handles`, `prepare_for_replay_market_received_clears_all_dispatch_handles`. Shared fixture `build_live_config_with_all_dispatch_handles_for_test` populates all six runtime handles (including `compute_market_context`, which the pre-existing `with_runtime_overlays` fixture omits).
+**Cargo check:** clean (default target). Same 69+1 pre-existing warnings, no new warnings from task 4.
+**Cargo test:** `cargo test --lib prepare_for_replay` — 3/3 pass. Full-suite `cargo test --lib` — 1739 pass / 15 pre-existing fail (friction log 2026-04-21 03:05 entry confirms all 15 also fail on main WITHOUT my changes; NOT caused by task 4).
+**Deviation:** Plan §8 Wave 0 task 4 test-description says "Local-origin only clears compute_queue" — this contradicts plan §2.5.1's explicit "origin-independent by design: clear all four unconditionally." Implemented per §2.5.1 (newer + detailed authority). Friction-log entry filed flagging §8 text as stale relative to §2.5.1.
+
+## 2026-04-21 02:55 — no commit (task 3 verification-only)
+
+**Plan task:** Wave 0 task 3 — verify main.rs boot hydration reads dispatch_policy.
+**Changed:** Nothing. Verified `src-tauri/src/main.rs:11829-11887` already:
+  - Opens the pyramid DB connection.
+  - Calls `db::read_dispatch_policy` to fetch YAML.
+  - Parses into `DispatchPolicyYaml` → `DispatchPolicy::from_yaml`.
+  - Builds `ProviderPools::new(&policy)`.
+  - Writes `LlmConfig.dispatch_policy` + `LlmConfig.provider_pools` + `compute_queue` + `fleet_roster` + `fleet_dispatch` + `compute_market_context`.
+  - Emits `tracing::info!("Dispatch policy loaded from DB — per-provider pools active, compute queue wired")` at line 11850.
+  - ConfigSynced listener at 11889+ rebuilds on contribution update (AD-8 Part 1 comment).
+**Cargo check:** N/A.
+**Cargo test:** N/A.
+**Deviation:** None.
+
 ## 2026-04-21 — commit eda0dde (branch walker-re-plan-wire-2.1)
 
 **Plan task:** Wave 0 task 2 — `sync_dispatch_policy_to_operational` helper in `wire_migration.rs`.
