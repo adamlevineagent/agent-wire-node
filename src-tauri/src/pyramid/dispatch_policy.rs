@@ -234,16 +234,21 @@ impl DispatchPolicy {
     }
 
     /// Resolve by rule name (for fleet dispatch receiving).
-    /// Returns the first non-fleet local provider's (provider_id, model_id).
+    /// Returns the first local provider's (provider_id, model_id),
+    /// excluding the walker sentinels `"fleet"` and `"market"` — neither
+    /// is a real local handler.
     pub fn resolve_local_for_rule(&self, rule_name: &str) -> Option<(String, Option<String>)> {
         for rule in &self.rules {
             if rule.name == rule_name {
-                // Find the first non-fleet provider with is_local == true.
+                // Find the first non-sentinel provider with is_local == true.
                 // No fallback to cloud providers — if no local provider
                 // is found, return None so the fleet handler returns an
                 // error (prevents surprise cloud billing on fleet jobs).
                 for entry in &rule.route_to {
-                    if entry.provider_id != "fleet" && entry.is_local {
+                    if entry.provider_id != "fleet"
+                        && entry.provider_id != "market"
+                        && entry.is_local
+                    {
                         return Some((entry.provider_id.clone(), entry.model_id.clone()));
                     }
                 }
@@ -342,6 +347,57 @@ fn glob_match_simple(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_local_for_rule_filters_market_sentinel() {
+        // Wave 2 task 17: `resolve_local_for_rule` must filter both walker
+        // sentinels (`fleet` and `market`). Route = [fleet, market,
+        // ollama-local]; only ollama-local should resolve.
+        let rule = RoutingRule {
+            name: "test-rule".into(),
+            match_config: MatchConfig {
+                work_type: None,
+                min_depth: None,
+                step_pattern: None,
+            },
+            route_to: vec![
+                RouteEntry {
+                    provider_id: "fleet".into(),
+                    model_id: None,
+                    tier_name: None,
+                    is_local: true,
+                },
+                RouteEntry {
+                    provider_id: "market".into(),
+                    model_id: Some("some-model".into()),
+                    tier_name: None,
+                    is_local: true,
+                },
+                RouteEntry {
+                    provider_id: "ollama-local".into(),
+                    model_id: Some("llama3".into()),
+                    tier_name: None,
+                    is_local: true,
+                },
+            ],
+            bypass_pool: false,
+            sequential: false,
+        };
+        let policy = DispatchPolicy {
+            rules: vec![rule],
+            escalation: EscalationConfig::default(),
+            build_coordination: BuildCoordinationConfig::default(),
+            pool_configs: Default::default(),
+            max_batch_cost_usd: None,
+            max_daily_cost_usd: None,
+        };
+        let resolved = policy.resolve_local_for_rule("test-rule");
+        assert_eq!(
+            resolved,
+            Some(("ollama-local".to_string(), Some("llama3".to_string()))),
+            "market sentinel must be filtered alongside fleet",
+        );
+    }
 
     #[test]
     fn test_glob_match_simple() {
