@@ -157,6 +157,67 @@ fn walker_resolved_model(
         .unwrap_or_else(|| config.primary_model.clone())
 }
 
+/// Map a walker-market classified `reason` slug to its specific
+/// per-slug chronicle event constant, when one exists. Additive
+/// emission — the caller still emits the generic walker chronicle
+/// event on top of whatever this returns. Operator telemetry that
+/// keys on the specific event name (e.g. `network_quote_expired`)
+/// sees its row; dashboards keying on generic walker events
+/// (`network_route_skipped` / `network_route_retryable_fail`)
+/// keep working. See plan §4.2 + `feedback_no_integrity_demotion`:
+/// we don't silently demote one channel because another exists.
+///
+/// Covers the seven market-branch slugs declared in
+/// `compute_chronicle.rs` but previously un-emitted from live code.
+/// Unknown / unmapped slugs return `None` — caller just emits the
+/// generic event in that case.
+fn map_market_slug_to_specific_event(reason: &str) -> Option<&'static str> {
+    // Reason strings classified from Wire slugs in
+    // `compute_quote_flow::classify_rev21_slug` plus the stage-tagged
+    // auth reasons produced by `read_api_creds` on 401. Match on the
+    // leading token so reasons carrying extra context (e.g.
+    // "unknown_slug:foo") still match the primary slug.
+    let primary = reason.split(|c: char| c == ':' || c == '(').next().unwrap_or(reason);
+    match primary {
+        // /purchase 401 `quote_jwt_expired` (or bare `quote_expired`).
+        "quote_jwt_expired" | "quote_expired" => {
+            Some(super::compute_chronicle::EVENT_NETWORK_QUOTE_EXPIRED)
+        }
+        // /purchase 409 `quote_already_purchased` — idempotent replay.
+        "quote_already_purchased" => {
+            Some(super::compute_chronicle::EVENT_NETWORK_PURCHASE_RECOVERED)
+        }
+        // /quote 409 `budget_exceeded`. Also emitted from the
+        // MarketSurfaceCache pre-quote rate check when that gains a
+        // per-entry `max_budget_credits` to compare against.
+        "budget_exceeded" => {
+            Some(super::compute_chronicle::EVENT_NETWORK_RATE_ABOVE_BUDGET)
+        }
+        // /fill 409 `dispatch_deadline_exceeded` — reservation expired.
+        "dispatch_deadline_exceeded" => {
+            Some(super::compute_chronicle::EVENT_NETWORK_DISPATCH_DEADLINE_MISSED)
+        }
+        // /purchase 409 `provider_queue_full` or /fill
+        // `provider_depth_exceeded` — both mean "provider saturated".
+        "provider_queue_full" | "provider_depth_exceeded" => {
+            Some(super::compute_chronicle::EVENT_NETWORK_PROVIDER_SATURATED)
+        }
+        // /quote 409 `insufficient_balance` or /purchase 409
+        // `balance_depleted` — Wire balance below reservation.
+        "insufficient_balance" | "balance_depleted" => {
+            Some(super::compute_chronicle::EVENT_NETWORK_BALANCE_INSUFFICIENT_FOR_MARKET)
+        }
+        // Any 401-level auth failure across the three stages —
+        // stage-tagged reasons from `read_api_creds` plus Wire's
+        // explicit 401 slug `unauthorized`.
+        "quote_auth_failed"
+        | "purchase_auth_failed"
+        | "fill_auth_failed"
+        | "unauthorized" => Some(super::compute_chronicle::EVENT_NETWORK_AUTH_EXPIRED),
+        _ => None,
+    }
+}
+
 fn emit_walker_chronicle(
     ctx: Option<&StepContext>,
     config: &LlmConfig,
@@ -2006,6 +2067,25 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     return Ok(response);
                 }
                 Err(EntryError::Retryable { reason }) => {
+                    // Per-slug specific event FIRST (additive) so
+                    // operator telemetry keyed on e.g.
+                    // `network_quote_expired` lights up; generic
+                    // `network_route_retryable_fail` follows for
+                    // dashboards keyed on the walker frame-of-reference.
+                    if let Some(specific) = map_market_slug_to_specific_event(&reason) {
+                        emit_walker_chronicle(
+                            ctx,
+                            config,
+                            specific,
+                            &walker_source_label,
+                            &entry.provider_id,
+                            serde_json::json!({
+                                "reason": reason,
+                                "branch": "market",
+                                "classification": "retryable",
+                            }),
+                        );
+                    }
                     emit_walker_chronicle(
                         ctx,
                         config,
@@ -2019,6 +2099,20 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     continue;
                 }
                 Err(EntryError::RouteSkipped { reason }) => {
+                    if let Some(specific) = map_market_slug_to_specific_event(&reason) {
+                        emit_walker_chronicle(
+                            ctx,
+                            config,
+                            specific,
+                            &walker_source_label,
+                            &entry.provider_id,
+                            serde_json::json!({
+                                "reason": reason,
+                                "branch": "market",
+                                "classification": "route_skipped",
+                            }),
+                        );
+                    }
                     emit_walker_chronicle(
                         ctx,
                         config,
@@ -2032,6 +2126,25 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     continue;
                 }
                 Err(EntryError::CallTerminal { reason }) => {
+                    // CallTerminal also covers stage-tagged auth
+                    // reasons (`quote_auth_failed` / `fill_auth_failed`)
+                    // that should surface as `network_auth_expired` for
+                    // operator telemetry before the generic terminal
+                    // event + step-error bubble.
+                    if let Some(specific) = map_market_slug_to_specific_event(&reason) {
+                        emit_walker_chronicle(
+                            ctx,
+                            config,
+                            specific,
+                            &walker_source_label,
+                            &entry.provider_id,
+                            serde_json::json!({
+                                "reason": reason.clone(),
+                                "branch": "market",
+                                "classification": "call_terminal",
+                            }),
+                        );
+                    }
                     emit_walker_chronicle(
                         ctx,
                         config,
