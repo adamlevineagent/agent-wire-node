@@ -1438,6 +1438,7 @@ pub fn walk_bundled_contributions_manifest(
     // idempotent (DELETE + re-INSERT) and fast (handful of rows).
     sync_chain_defaults_to_operational(conn);
     sync_chain_assignments_to_operational(conn);
+    sync_dispatch_policy_to_operational(conn);
 
     Ok(report)
 }
@@ -1558,6 +1559,82 @@ fn sync_chain_assignments_to_operational(conn: &Connection) {
 
     if replayed > 0 {
         debug!(count = replayed, "boot sync: chain_assignments replayed");
+    }
+}
+
+/// Read the active `dispatch_policy` contribution and sync its YAML
+/// body to the singleton `pyramid_dispatch_policy` operational table.
+/// No-op if no active contribution exists (pre-bundled-seed state).
+///
+/// Mirrors `sync_chain_defaults_to_operational` at :1449 — same
+/// rationale: the contribution-insert path in
+/// `insert_bundled_contribution` writes to `pyramid_config_contributions`
+/// but cannot dispatch through `sync_config_to_operational` at migration
+/// time (no BuildEventBus). `pyramid_dispatch_policy` has no legacy seed,
+/// so without this helper the operational row stays empty on fresh-DB
+/// boot and `LlmConfig.dispatch_policy` hydration at main.rs:11824-11887
+/// falls through to the hardcoded fallback instead of the bundled
+/// dispatch_policy seed.
+///
+/// Called from `walk_bundled_contributions_manifest` alongside the other
+/// boot-sync helpers (Wave 0 task 2, walker re-plan wire 2.1).
+fn sync_dispatch_policy_to_operational(conn: &Connection) {
+    let row: Option<(String, String)> = conn
+        .prepare(
+            "SELECT contribution_id, yaml_content
+             FROM pyramid_config_contributions
+             WHERE schema_type = 'dispatch_policy'
+               AND status = 'active'
+             ORDER BY accepted_at DESC
+             LIMIT 1",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_row([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .optional()
+        })
+        .unwrap_or_else(|e| {
+            warn!(
+                error = %e,
+                "boot sync: failed to query active dispatch_policy contribution"
+            );
+            None
+        });
+
+    if let Some((contribution_id, yaml_content)) = row {
+        // Parse for validation — surfaces malformed YAML at boot rather
+        // than at first dispatch. Parsed struct is discarded; the
+        // operational table stores the raw YAML for hot-reload.
+        match serde_yaml::from_str::<crate::pyramid::dispatch_policy::DispatchPolicyYaml>(
+            &yaml_content,
+        ) {
+            Ok(_) => {
+                if let Err(e) = crate::pyramid::db::upsert_dispatch_policy(
+                    conn,
+                    &None,
+                    &yaml_content,
+                    &contribution_id,
+                ) {
+                    warn!(
+                        error = %e,
+                        "boot sync: failed to upsert dispatch_policy to operational table"
+                    );
+                } else {
+                    debug!(
+                        contribution_id = %contribution_id,
+                        "boot sync: dispatch_policy operational table hydrated"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    contribution_id = %contribution_id,
+                    "boot sync: failed to parse dispatch_policy YAML"
+                );
+            }
+        }
     }
 }
 
@@ -2637,5 +2714,34 @@ fields:
             report.marker_written,
             "marker should be written when only schemas land"
         );
+    }
+
+    #[test]
+    fn sync_dispatch_policy_to_operational_hydrates_row() {
+        // Walker re-plan wire 2.1 Wave 0 task 2 — mirrors
+        // sync_chain_defaults_to_operational. Active dispatch_policy
+        // contribution → operational pyramid_dispatch_policy row.
+        let conn = mem_conn();
+        let yaml = "version: 1\nprovider_pools:\n  openrouter: { concurrency: 4 }\nrouting_rules: []\n";
+        insert_active_row(
+            &conn,
+            "test-dispatch-policy-v1",
+            "dispatch_policy",
+            None,
+            "local",
+            yaml,
+        );
+
+        sync_dispatch_policy_to_operational(&conn);
+
+        let (content, contrib_id): (String, String) = conn
+            .query_row(
+                "SELECT yaml_content, contribution_id FROM pyramid_dispatch_policy WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(content, yaml);
+        assert_eq!(contrib_id, "test-dispatch-policy-v1");
     }
 }

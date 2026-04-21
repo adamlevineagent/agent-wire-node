@@ -21,6 +21,14 @@ Entry template:
 **Deviation:** None / <rationale if any>
 -->
 
+## 2026-04-21 — commit 297d474 (branch walker-re-plan-wire-2.1)
+
+**Plan task:** Wave 0 task 2 — `sync_dispatch_policy_to_operational` helper in `wire_migration.rs`.
+**Changed:** Added `sync_dispatch_policy_to_operational(conn)` at `src-tauri/src/pyramid/wire_migration.rs` right after `sync_chain_assignments_to_operational`, mirroring `sync_chain_defaults_to_operational` (schema_type = `dispatch_policy`, status = `active`, ORDER BY accepted_at DESC LIMIT 1). Parses YAML into `dispatch_policy::DispatchPolicyYaml` for validation (surfaces malformed YAML at boot) then calls `db::upsert_dispatch_policy(conn, &None, &yaml_content, &contribution_id)` — the operational table stores raw YAML for hot-reload, parsed struct is discarded. Wired peer call into `walk_bundled_contributions_manifest` alongside `sync_chain_defaults_to_operational` + `sync_chain_assignments_to_operational` (line 1441). Added one in-module test `sync_dispatch_policy_to_operational_hydrates_row` using the existing `insert_active_row` + `mem_conn` fixtures: inserts an active `dispatch_policy` contribution, runs the helper, asserts the operational row holds the YAML and contribution_id.
+**Cargo check:** clean (default target — `cargo check` from `src-tauri/`). Only pre-existing dead-code / deprecated-API warnings, all unrelated to this change.
+**Cargo test:** `cargo test --lib wire_migration` — 27/27 pass. New test `sync_dispatch_policy_to_operational_hydrates_row` included.
+**Deviation:** None. Plan §8 Wave 0 task 2 says "parses YAML → calls db::upsert_dispatch_policy"; `upsert_dispatch_policy` takes raw YAML string, so parsing is validation-only (same information-preserving pattern as the chain-defaults mirror, which parses to `ChainDefaultsYaml` then passes mappings — here the operational table takes raw YAML, so the parse surfaces errors at boot and the raw string is handed through).
+
 ## 2026-04-21 02:30 — commit e18261d (branch walker-re-plan-wire-2.1)
 
 **Plan task:** Wave 0 task 1 — bundle `dispatch_policy-default-v1` contribution family (4 entries).
