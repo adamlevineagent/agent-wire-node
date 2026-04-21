@@ -20,6 +20,26 @@ Entry template:
 **Flag:** plan error / doc staleness / spec ambiguity / Wire-side bug / learning moment
 -->
 
+## 2026-04-21 — Wave 3a divergences (agent findings)
+
+**Context:** Parallel agents for compute_quote_flow bodies (3a-A) + market_surface_cache polling (3a-B) shipped cleanly. Both flagged plan/contract/spec drift worth surfacing for Wave 3b and Wire-dev.
+
+**3a-A (compute_quote_flow) findings — 5 divergences:**
+
+1. **Spec §2.2 missing `uuid_job_id` in response shape.** Wire-dev commit `a9e356d3` shipped Q5 (added to contracts), but the spec doc still shows `{job_id, request_id, dispatch_deadline_at}` without uuid_job_id. Walker code uses `purchase_response.uuid_job_id` directly (correct). **Action:** Wire-dev should sync the spec doc to match contracts.
+
+2. **`X-Quote-Token` header on /purchase — divergence between prompt and spec §2.2.** Spec keeps `quote_jwt` exclusively in the body. Agent followed spec (no header). Walker code OK. **Action:** none unless Wire-side ever wants the header.
+
+3. **Tier classifications: plan §4.2 says `Retryable` for `platform_unavailable` + `economic_parameter_missing`; prompt said `RouteSkipped` + `CallTerminal`.** Agent followed prompt. Rationale: walker v1 advances rather than sleeps on transient platform outages (RouteSkipped), and operator-level config-missing is walk-bug-category (CallTerminal bubbles). Plan §4.2 could be reconciled in Wave 5 doc sweep; current behavior is more walker-friendly.
+
+4. **`purchase()` signature param order (plan §4.2 vs skeleton).** Skeleton/prompt: `purchase(auth, config, quote_jwt, body)`; plan §4.2: `purchase(purchase_body, auth, config)` with quote_jwt in body. Implementation honors prompt signature; separate `quote_jwt` param overwrites `body.quote_jwt` before send. Harmless divergence.
+
+5. **🔴 PendingJobs registration timing — race hazard.** Plan §4.2 registers the oneshot BEFORE `/fill` (race-safe: provider can only deliver after we've registered). Prompt directed registration inside `await_result` which runs AFTER `/fill`. Agent followed prompt + added a doc-comment flagging the race. **Action — Wave 3b (walker market-branch inline) MUST fix this:** walker calls `purchase`, gets `uuid_job_id`, registers the oneshot with PendingJobs, THEN calls `fill`. `await_result` should take an already-registered `oneshot::Receiver` rather than registering internally. Alternatively: expose a `pub fn register(pending_jobs, uuid) -> Receiver` helper in compute_quote_flow and have walker call it between purchase and fill. This is a correctness bug that must not ship.
+
+**3a-B (market_surface_cache) findings — 1 divergence:**
+
+6. **Plan §6.1 `CacheData` shape vs contracts crate `MarketSurfaceResponse`.** Plan declares `CacheData { market, models, generated_at: DateTime<Utc> }`. Contracts crate has `market`, `models`, `catalog` — NO top-level `generated_at`. Agent used `market.last_updated_at: String` parsed as RFC-3339 (fallback `Utc::now()` on parse failure). Also multiple field-name divergences in nested types (FloatPool/Queue/Performance/Demand24h) — plan §6 prose has an older schema; tests written against real contracts shapes. **Action:** Wave 4/5 doc sweep should re-sync plan §6 prose with contracts crate reality.
+
 ## 2026-04-21 — Wave 2 retro
 
 **What worked:**
