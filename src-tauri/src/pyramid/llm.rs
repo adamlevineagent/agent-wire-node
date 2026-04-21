@@ -1374,6 +1374,41 @@ pub(crate) fn classify_pool_404(body: &str) -> EntryError {
     }
 }
 
+/// Resolve the model string for a single walker route entry (Option C
+/// hybrid — post-ship C1 fix).
+///
+/// Priority:
+///   1. `entry.model_id` — explicit per-route operator override.
+///   2. Tier-routing lookup — `entry.tier_name` → TierRoutingEntry; the
+///      row's `provider_id` MUST match `entry.provider_id` or we fall
+///      through (never cross-provider a mismatched slug).
+///   3. `primary_model_fallback` — caller passes the legacy
+///      `config.primary_model` (or whatever context-cascade value the
+///      walker settled on); used when neither 1 nor 2 produced a model.
+///
+/// Exposed as `pub(crate)` for unit tests. The walker inlines this same
+/// logic in the dispatch loop to keep the single log line about which
+/// priority fired, but the resolver here is the authoritative spec.
+pub(crate) fn resolve_route_model(
+    entry: &crate::pyramid::dispatch_policy::RouteEntry,
+    registry: Option<&std::sync::Arc<crate::pyramid::provider::ProviderRegistry>>,
+    primary_model_fallback: &str,
+) -> String {
+    if let Some(ref explicit) = entry.model_id {
+        return explicit.clone();
+    }
+    if let Some(tier_name) = entry.tier_name.as_deref() {
+        if let Some(reg) = registry {
+            if let Some(tier_row) = reg.get_tier(tier_name) {
+                if tier_row.provider_id == entry.provider_id {
+                    return tier_row.model_id;
+                }
+            }
+        }
+    }
+    primary_model_fallback.to_string()
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LlmCallOptions {
     pub min_timeout_secs: Option<u64>,
@@ -2629,11 +2664,48 @@ pub async fn call_model_unified_with_audit_and_ctx(
         // 4) Dispatch — HTTP retry loop relocated from former Phase D.
         let health_provider_id = entry.provider_id.clone();
 
-        // Model selection: entry.model_id wins over default context-cascade
-        // selection (the entry's choice is the operator's explicit route).
+        // Model selection — Option C hybrid (post-ship C1 fix):
+        //   1. `entry.model_id` — explicit per-route operator override.
+        //   2. `tier_routing(entry.tier_name)` — keyed on tier_name; we
+        //      additionally require the tier row's provider_id to match
+        //      `entry.provider_id` so we never smuggle an openrouter slug
+        //      into an ollama-local route (the original C1 bug).
+        //   3. Context-cascade on `config.primary_model` / fallbacks —
+        //      legacy fallback preserved for backward compat.
+        //
+        // The resolved model drives the HTTP body, context-limit lookup,
+        // and every downstream audit/chronicle emit for this entry.
         let entry_model_override = entry.model_id.clone();
+        let tier_routed_model: Option<String> = if entry_model_override.is_some() {
+            None
+        } else {
+            entry.tier_name.as_deref().and_then(|tier_name| {
+                config.provider_registry.as_ref().and_then(|reg| {
+                    reg.get_tier(tier_name).and_then(|tier_row| {
+                        if tier_row.provider_id == entry.provider_id {
+                            Some(tier_row.model_id)
+                        } else {
+                            // Tier row exists but is for a different
+                            // provider — treat as "no tier override for
+                            // this entry" rather than cross-providering
+                            // an incompatible slug (C1 regression guard).
+                            tracing::debug!(
+                                entry_provider = %entry.provider_id,
+                                tier = %tier_name,
+                                tier_provider = %tier_row.provider_id,
+                                "walker: tier_routing row does not match entry provider; ignoring",
+                            );
+                            None
+                        }
+                    })
+                })
+            })
+        };
         let mut use_model = if let Some(ref model) = entry_model_override {
             info!("[entry-model->{}]", short_name(model));
+            model.clone()
+        } else if let Some(ref model) = tier_routed_model {
+            info!("[tier-model->{}]", short_name(model));
             model.clone()
         } else if est_input_tokens > config.fallback_1_context_limit {
             info!("[fallback->{}]", short_name(&config.fallback_model_2));
