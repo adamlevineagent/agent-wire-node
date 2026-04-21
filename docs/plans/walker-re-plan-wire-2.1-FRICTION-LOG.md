@@ -20,6 +20,20 @@ Entry template:
 **Flag:** plan error / doc staleness / spec ambiguity / Wire-side bug / learning moment
 -->
 
+## 2026-04-21 — Per-slug chronicle events: additive vs replace
+
+**Context:** Wave 3 verifier caught 7 declared-but-unemitted chronicle event constants (`network_quote_expired`, `network_purchase_recovered`, `network_rate_above_budget`, `network_dispatch_deadline_missed`, `network_provider_saturated`, `network_balance_insufficient_for_market`, `network_auth_expired`). Fix prompt explicitly framed A/B as a live design choice to justify in the commit.
+
+**Ambiguity:** Option A (additive — specific event AND generic walker event) doubles chronicle row volume on matched failure paths. Option B (replace — specific event INSTEAD of generic) keeps volume flat but silences any operator dashboard keying on the generic name for these 7 slugs. No dashboards exist today, so neither choice breaks anything yet.
+
+**Call:** Option A (additive).
+
+**Rationale:** `feedback_no_integrity_demotion` — don't silently drop a channel because another exists. Generic `network_route_skipped` is the walker's frame-of-reference ("we advanced past this entry"); specific `network_quote_expired` is the WHY. Both carry orthogonal information. If a future dashboard authors keys on generics and another keys on specifics, both should work without coordination. Row-volume cost (~2x on failure paths only — success paths emit only `network_walker_resolved`) is acceptable relative to the risk of silently breaking a future consumer of generic events.
+
+**Flag:** learning moment — when declared chronicle constants aren't wired, verifier catching it is the right place to catch it. The A/B ambiguity would have been smaller if the plan itself had stated the additive policy.
+
+---
+
 ## 2026-04-21 — Wave 3a divergences (agent findings)
 
 **Context:** Parallel agents for compute_quote_flow bodies (3a-A) + market_surface_cache polling (3a-B) shipped cleanly. Both flagged plan/contract/spec drift worth surfacing for Wave 3b and Wire-dev.

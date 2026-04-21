@@ -9,6 +9,31 @@ Append-only log of what's done. Newest at top. Updated at every commit.
 
 ---
 
+## 2026-04-21 — Wave 3 post-verifier — per-slug chronicle events wired (commits 429d71c, a39e786)
+
+**Plan task:** Wave 3 verifier fix — 7 per-slug chronicle event constants declared in `compute_chronicle.rs:208-221` but un-emitted from live walker market branch. Operator telemetry keyed on `network_quote_expired` / `network_purchase_recovered` / `network_rate_above_budget` / `network_dispatch_deadline_missed` / `network_provider_saturated` / `network_balance_insufficient_for_market` / `network_auth_expired` was silent.
+
+**Commit 429d71c — feat(llm): emit per-slug chronicle events in walker market branch.**
+- New `map_market_slug_to_specific_event(reason: &str) -> Option<&'static str>` helper at `src-tauri/src/pyramid/llm.rs:160` (near `emit_walker_chronicle`). Leading-token match so wrapped reasons (`unknown_slug:foo`, `reason(ctx)`) still key correctly.
+- Three market-branch match arms at `llm.rs:2008-2107` (Retryable / RouteSkipped / CallTerminal under `RouteBranch::Market`) now emit the specific event FIRST, then the existing generic walker event.
+- Design choice: **(A) additive** — specific + generic both fire. Rationale per `feedback_no_integrity_demotion`: don't silently drop one channel because another exists. Specific event = WHY; generic event = walker advanced past entry. Dashboards may key on either. Cost: 2x chronicle rows on matched failure paths only. Genuine ambiguity between A/B was weighed; noted in friction log.
+- Fleet + pool branches untouched (Wave 3 scope = market only).
+- MarketSurfaceCache pre-quote rate check not wired: `RouteEntry.max_budget_credits` does not exist yet (see `NO_BUDGET_CAP` sentinel comment in llm.rs); no meaningful per-entry rate comparison available at cache-consult site. Slug still fires correctly from authoritative `/quote` 409 `budget_exceeded` path.
+
+**Commit a39e786 — test(llm): per-slug chronicle event mapping coverage.**
+- 12 unit tests in existing `mod tests`: one per event constant, plus unknown-slug→None, leading-token-match defensive cases, and auth-failure cluster covering all four `*_auth_failed` / `unauthorized` reasons.
+
+**Cargo check:** clean (default target). 69 pre-existing dead-code warnings + 1 deprecated shell-open warning unchanged.
+**Cargo test --lib map_market_slug:** 12 passed / 0 failed.
+**Cargo test --lib walker_market:** 4 passed / 0 failed (unchanged).
+**Cargo test --lib (full):** 1767 passed / 15 pre-existing failures unchanged (was 1755 + 12 new tests).
+
+**Grep verification:** 7 event constants now referenced from live code in `llm.rs` (declaration in chronicle + live emit in helper/match arms + tests). Previously: declared-only.
+
+**Deviation:** None.
+
+---
+
 ## 2026-04-21 — Wave 3b — walker market branch inline + Phase B delete (commits d410add, 1a2ba11, 884a910, 79efb13)
 
 **Plan tasks:** §8 Wave 3 tasks 21-24 + Wave 3a friction-log RACE-1.
