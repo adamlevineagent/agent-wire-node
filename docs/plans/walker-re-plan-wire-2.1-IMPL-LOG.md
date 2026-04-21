@@ -21,6 +21,83 @@ Entry template:
 **Deviation:** None / <rationale if any>
 -->
 
+## 2026-04-21 — Wave 2 tasks 13-17 — commits df08ab9 + b99302b (branch walker-re-plan-wire-2.1)
+
+**Plan task:** Wave 2 tasks 13-17 — fleet branch inlined.
+**Changed:**
+- `src-tauri/src/pyramid/llm.rs` (commit df08ab9, +721/-537):
+  - New `dispatch_fleet_entry` helper + `FleetDispatchArgs` bundle
+    (~280 LOC). Takes already-validated fleet_ctx / policy_snap /
+    callback_url / roster_handle / peer / jwt / rule_name /
+    job_wait_secs; returns `Result<LlmResponse, EntryError>`.
+    Three-tier classification per §4.1: Success → Ok; peer-ran-and-
+    failed → RouteSkipped; timeout / orphaned → Retryable; dispatch
+    POST is_peer_dead / 503 / other → RouteSkipped. Fleet never
+    returns CallTerminal — failures never doom a call.
+  - Walker fleet branch: runtime gate (branch_allowed +
+    !skip_fleet_dispatch + rule_name + fleet_ctx + tunnel Connected
+    + fleet_roster), non-blocking peer lookup, dispatch via helper,
+    Ok path writes audit + EVENT_WALKER_RESOLVED with
+    `options.dispatch_origin.source_label()` — same source-label
+    feed as pool branch.
+  - Deleted Phase A pre-loop (llm.rs 1776-2266) + `fleet_filter`
+    retain. Market still has wave2_market_not_implemented stub.
+  - `skip_fleet_dispatch` downgraded to secondary override (reason
+    slug `fleet_replay_guard`); primary is `branch_allowed(Fleet)`.
+  - Wave 1 fleet+market test renamed to wave2 variant; asserts all
+    3 entries exhaust (fleet walks now instead of being pre-filtered).
+  - 3 new fleet-branch tests:
+    walker_fleet_branch_advances_on_no_peer,
+    walker_fleet_branch_respects_skip_fleet_dispatch,
+    walker_fleet_branch_respects_branch_allowed.
+  - Dropped `mut` from `resolved_route` (the retain was the only
+    mutation).
+
+- `src-tauri/src/pyramid/dispatch_policy.rs` (commit b99302b,
+  +59/-3): `resolve_local_for_rule` now filters both walker
+  sentinels (fleet + market). New test
+  `resolve_local_for_rule_filters_market_sentinel` (route [fleet,
+  market, ollama-local] → only ollama-local resolves).
+
+**Cargo check:** clean (default target). 72 warnings, identical to
+  pre-Wave-2 baseline (pre-existing dead code in dadbear_* + deprecated
+  tauri_plugin_shell::Shell::open).
+**Cargo test:** `cargo test --lib` — 1765 pass / 15 fail (pre-existing).
+  +4 net passes (3 walker fleet tests + 1 dispatch_policy test),
+  0 new failures. Wave 1 test renamed + assertion flipped from
+  "2 entries" to "3 entries"; still green.
+**Deviation:** Merged Wave 2 plan suggested-commits 1+2 into a single
+  refactor commit. Running the helper extraction as a separate commit
+  would have left the helper dead-code transient between commits
+  because Phase A pre-loop stayed untouched in the plan's incremental
+  sequence; combining lets the walker call the helper and lets Phase A
+  die in the same atomic change. Plan acceptance note explicitly
+  permits this ("OR combine the first two if the incremental split
+  creates transient dead code").
+
+  Reason-slug classifications: timeout → Retryable (plan table says
+  Retryable but notes "OR RouteSkipped" with walker-friendly default;
+  chose Retryable to honor the plan's default slug + for distinct
+  chronicle telemetry). Orphaned → Retryable (same rationale — walker
+  advances regardless). peer_dead / 503 / other-dispatch-POST-fail →
+  RouteSkipped (fleet failures never doom the call). JWT empty →
+  RouteSkipped with reason `jwt_unavailable`. All tier decisions match
+  the §4.1 error classification table; walker behavior is identical
+  either way (both Retryable and RouteSkipped → advance).
+
+  Helpers/vestiges: no Phase A-only helper became dead. The helper
+  closures (`spawn_chronicle`) are new-local. No standalone functions
+  in llm.rs were exclusive to Phase A. The old Phase A chronicle
+  events (fleet_dispatched_async, fleet_result_received,
+  fleet_result_failed, fleet_dispatch_timeout, fleet_dispatch_failed,
+  fleet_peer_overloaded) all still fire from `dispatch_fleet_entry`;
+  Wave 5 will sweep the fleet_* vs network_* vocabulary.
+
+  Phase A grep: `Phase A` now appears only in test comments + unrelated
+  modules (main.rs, server.rs, dadbear_*, public_html/*) where it
+  references their own local phases — no live llm.rs references after
+  the deletion.
+
 ## 2026-04-21 — Wave 1 tasks 8-10 verifier pass — commit 37ff562 (branch walker-re-plan-wire-2.1)
 
 **Plan task:** Wave 1 verifier pass — walker body correctness audit + hygiene fixes.
