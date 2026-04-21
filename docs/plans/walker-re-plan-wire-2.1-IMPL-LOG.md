@@ -21,7 +21,7 @@ Entry template:
 **Deviation:** None / <rationale if any>
 -->
 
-## 2026-04-21 04:30 — commit <SHA_TASK_5_6> (branch walker-re-plan-wire-2.1)
+## 2026-04-21 04:30 — commit f88dec3 (branch walker-re-plan-wire-2.1)
 
 **Plan task:** Wave 0 tasks 5 + 6 — `RouteBranch` + `classify_branch` + `branch_allowed` + `EntryError` taxonomy.
 **Changed:** `src-tauri/src/pyramid/llm.rs`, inserted right after the `DispatchOrigin` impl block (plan §2.5.2 + §2.5.3):
