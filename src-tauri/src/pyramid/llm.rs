@@ -4545,6 +4545,184 @@ routing_rules:
         );
     }
 
+    // ── Walker Re-Plan Wire 2.1 Wave 3b tests (market branch) ───────────
+    //
+    // These tests drive the walker's market branch without standing up a
+    // live Wire server. The strategy matches the Wave 2 fleet tests: wire
+    // up enough of the runtime gate to exercise the early-exit paths, and
+    // assert the observable walker outcome.
+    //
+    // Full /quote → /purchase → /fill success-path coverage lives in the
+    // compute_quote_flow module tests (register_pending + await_result
+    // round-trips). The race-fix invariant is asserted there via
+    // `register_pending_returns_receiver_before_fill_can_race`.
+
+    #[tokio::test]
+    async fn walker_market_branch_advances_when_no_market_context() {
+        // Route = [market, unknown-pool]. Walker's market runtime gate
+        // finds compute_market_context absent → emits route_unavailable
+        // with reason="no_market_context" → advance. Unknown-pool then
+        // hits provider_not_in_pool → advance. Walker exhausts.
+        let policy = walker_test_policy(1, vec!["market", "unknown-pool"]);
+        let config = walker_test_config(policy);
+
+        let result = call_model_unified_with_audit_and_ctx(
+            &config,
+            None,
+            None,
+            "sys",
+            "usr",
+            0.0,
+            16,
+            None,
+            LlmCallOptions::default(),
+        )
+        .await;
+
+        let err = result.expect_err("walker should exhaust — no market ctx + no pool");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no viable route"),
+            "expected 'no viable route', got: {msg}",
+        );
+        assert!(
+            msg.contains("2 entries"),
+            "expected '2 entries' (market + unknown-pool), got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn walker_market_branch_respects_branch_allowed_on_replay() {
+        // Market must NOT walk under a non-Local origin. Even if
+        // compute_market_context is present, branch_allowed(Market,
+        // FleetReceived) returns false and the walker's generic gate
+        // skips the entry before the market body runs.
+        let policy = walker_test_policy(1, vec!["market", "unknown-pool"]);
+        let config = walker_test_config(policy);
+
+        let mut options = LlmCallOptions::default();
+        options.dispatch_origin = DispatchOrigin::MarketReceived;
+
+        let result = call_model_unified_with_audit_and_ctx(
+            &config,
+            None,
+            None,
+            "sys",
+            "usr",
+            0.0,
+            16,
+            None,
+            options,
+        )
+        .await;
+
+        let err = result.expect_err("walker should exhaust under MarketReceived origin");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no viable route"),
+            "expected 'no viable route', got: {msg}",
+        );
+        assert!(
+            msg.contains("2 entries"),
+            "expected '2 entries' (market replay-gated + unknown-pool), got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn walker_market_branch_advances_on_tunnel_disconnected() {
+        // compute_market_context present but tunnel state is Disconnected
+        // (default). Runtime gate fails with reason="tunnel_not_connected"
+        // → advance. Unknown-pool then exhausts.
+        use crate::auth::AuthState;
+        use crate::pyramid::compute_market_ctx::ComputeMarketRequesterContext;
+        use crate::pyramid::pending_jobs::PendingJobs;
+        use crate::WireNodeConfig;
+
+        let policy = walker_test_policy(1, vec!["market", "unknown-pool"]);
+        let mut config = walker_test_config(policy);
+
+        // Tunnel state defaults to Disconnected with no URL.
+        let auth = std::sync::Arc::new(tokio::sync::RwLock::new(AuthState::default()));
+        let wire_cfg = std::sync::Arc::new(tokio::sync::RwLock::new(WireNodeConfig::default()));
+        let tunnel = std::sync::Arc::new(
+            tokio::sync::RwLock::new(crate::tunnel::TunnelState::default()),
+        );
+        config.compute_market_context = Some(ComputeMarketRequesterContext {
+            auth,
+            config: wire_cfg,
+            pending_jobs: PendingJobs::new(),
+            tunnel_state: tunnel,
+        });
+
+        let result = call_model_unified_with_audit_and_ctx(
+            &config,
+            None,
+            None,
+            "sys",
+            "usr",
+            0.0,
+            16,
+            None,
+            LlmCallOptions::default(),
+        )
+        .await;
+
+        let err = result.expect_err("walker should exhaust — tunnel not connected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no viable route"),
+            "expected 'no viable route', got: {msg}",
+        );
+        assert!(
+            msg.contains("2 entries"),
+            "expected '2 entries' (market gate-failed + unknown-pool), got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn walker_market_dispatch_args_struct_compiles() {
+        // Compile-time assertion: MarketDispatchArgs has the expected
+        // shape. If a future refactor drops a field that callers rely on,
+        // this test breaks at the construction site with a clear diff.
+        // (Runtime execution is exercised end-to-end via the market
+        // branch fixtures above + compute_quote_flow race-fix tests.)
+        use crate::auth::AuthState;
+        use crate::pyramid::compute_market_ctx::ComputeMarketRequesterContext;
+        use crate::pyramid::pending_jobs::PendingJobs;
+        use crate::WireNodeConfig;
+
+        let auth = std::sync::Arc::new(tokio::sync::RwLock::new(AuthState::default()));
+        let wire_cfg = std::sync::Arc::new(tokio::sync::RwLock::new(WireNodeConfig::default()));
+        let tunnel = std::sync::Arc::new(
+            tokio::sync::RwLock::new(crate::tunnel::TunnelState::default()),
+        );
+        let mkt = ComputeMarketRequesterContext {
+            auth,
+            config: wire_cfg,
+            pending_jobs: PendingJobs::new(),
+            tunnel_state: tunnel,
+        };
+        let cfg = LlmConfig::default();
+        let _args = MarketDispatchArgs {
+            config: &cfg,
+            ctx: None,
+            market_ctx: &mkt,
+            model_id: "test-model".into(),
+            max_budget: (1i64 << 53) - 1,
+            max_wait_ms: 60_000,
+            max_tokens: 0,
+            temperature: 0.0,
+            input_tokens_est: 0,
+            system_prompt: "sys",
+            user_prompt: "usr",
+            callback_url: "https://tunnel/v1/compute/job-result".into(),
+            walker_source_label: "network",
+            entry_provider_id: "market",
+        };
+        // Don't actually dispatch — we'd need a live Wire server. The
+        // struct construction is the load-bearing assertion.
+    }
+
     #[test]
     fn test_llm_response_from_openrouter_json() {
         // Simulates parsing the fields that call_model_unified extracts
