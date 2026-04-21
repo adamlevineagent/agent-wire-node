@@ -21,6 +21,14 @@ Entry template:
 **Deviation:** None / <rationale if any>
 -->
 
+## 2026-04-21 05:00 — commit <pending> (branch walker-re-plan-wire-2.1)
+
+**Plan task:** Wave 0 task 9 — `MarketSurfaceCache` skeleton module.
+**Changed:** New file `src-tauri/src/pyramid/market_surface_cache.rs` (~120 LOC). `pub mod market_surface_cache;` inserted alphabetically between `market_mirror` and `pending_jobs` in `src-tauri/src/pyramid/mod.rs`. Types: local `CacheData { market: MarketSurfaceMarket, models: HashMap<String, MarketSurfaceModel>, generated_at: DateTime<Utc> }` + `MarketSurfaceCache { data: Arc<RwLock<Option<CacheData>>>, last_refresh_at: Arc<RwLock<Instant>> }`. Methods: `new()` (live), `get_model(model_id)` (live read path — returns `None` on cold cache), `refresh_now()` (`unimplemented!("Wave 4")`), `spawn_poller(auth, config, cache)` (logs stub + returns — Wave 4 replaces body). `MarketSurfaceMarket` and `MarketSurfaceModel` reused from `agent-wire-contracts` rev `a9e356d3`; no local type declarations needed for the Wire-side schema. The `HashMap`-indexed `models` field diverges from the contracts crate's `Vec<MarketSurfaceModel>` — walker needs O(1) lookup, so Wave 4 poller will index on refresh.
+**Cargo check:** clean (default target). 69 lib warnings (below existing 70 baseline — `#[allow(dead_code)]` on `last_refresh_at` until Wave 4 wires it).
+**Cargo test:** `cargo test --lib market_surface_cache` — 1/1 pass (`cold_cache_get_model_returns_none`).
+**Deviation:** None structurally. Spec §6.1 shows `last_refresh_at: Arc<RwLock<Instant>>` alongside `data`; kept verbatim even though Wave 0 doesn't touch it, so Wave 4 poller doesn't need a struct-shape change. `Default` impl added (trivial) for ergonomics.
+
 ## 2026-04-21 04:30 — commit f88dec3 (branch walker-re-plan-wire-2.1)
 
 **Plan task:** Wave 0 tasks 5 + 6 — `RouteBranch` + `classify_branch` + `branch_allowed` + `EntryError` taxonomy.

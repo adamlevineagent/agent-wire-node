@@ -20,6 +20,14 @@ Entry template:
 **Flag:** plan error / doc staleness / spec ambiguity / Wire-side bug / learning moment
 -->
 
+## 2026-04-21 05:00 — Wave 0 task 9 — `/market-surface` already has a verbatim-passthrough IPC
+
+**Context:** Authoring `MarketSurfaceCache` skeleton (plan §6 / Wave 0 task 9).
+**Surprise:** `compute_market_ops::market_surface` (`src-tauri/src/pyramid/compute_market_ops.rs:498-518`) already calls `/api/v1/compute/market-surface` and returns the raw `serde_json::Value` to whichever IPC consumer hit it. Separate from the cache; doesn't parse into the contracts crate types.
+**Root cause:** Pre-rev-2.1 Settings/compute-market UI wired a direct fetch through the ops layer. Pre-dates the rev 2.1 `MarketSurfaceResponse` contracts types landing.
+**Workaround:** Leave it alone for Wave 0. Wave 4 should decide: (a) keep it as a verbatim escape hatch for UI that wants the raw JSON, or (b) route it through `MarketSurfaceCache::get_cached_json()` so UI reads the same snapshot walker does and we don't double-poll. Prefer (b) — flagged here so Wave 4 doesn't re-discover independently.
+**Flag:** learning moment (not plan error; §6.4 already hints at "cache consumers are walker + Settings panel" which is the right endpoint).
+
 ## 2026-04-21 04:15 — Wave 0 task 7 — test-count miscount in commit message + impl-log entry
 
 **Context:** Serial-verifier audit of `ProviderPools::try_acquire_owned` at commit b3777d6.
