@@ -21,6 +21,26 @@ Entry template:
 **Deviation:** None / <rationale if any>
 -->
 
+## 2026-04-21 03:30 — commit <SHA_TASK_7> (branch walker-re-plan-wire-2.1)
+
+**Plan task:** Wave 0 task 7 — `ProviderPools::try_acquire_owned` + `SlidingWindowLimiter::try_acquire` non-blocking helpers.
+**Changed:** `src-tauri/src/pyramid/provider_pools.rs`:
+  - New `AcquireError` enum with `Unavailable(String)` + `Saturated` variants plus `Display` + `std::error::Error` impls. Walker discriminates these for chronicle labeling (`network_route_unavailable` vs `network_route_saturated`, plan §4.3).
+  - New `SlidingWindowLimiter::try_acquire(&self) -> bool` — uses `TokioMutex::try_lock()` to stay sync; contention treated as conservative saturation. `max_requests == 0` (disabled) always returns true. Mirrors the eviction logic of `wait()` but never sleeps.
+  - New `ProviderPools::try_acquire_owned(&self, provider_id: &str) -> Result<OwnedSemaphorePermit, AcquireError>` — rate-limiter check first (cheaper); `semaphore.clone().try_acquire_owned()` second; both failures map to `Saturated`, unknown provider maps to `Unavailable("provider_not_in_pool")`.
+  - 7 new unit tests covering: known-provider ok, unknown-provider unavailable, semaphore-exhausted saturated, rate-limiter-full saturated, limiter under-limit accepts 3/3, limiter at-limit refuses 3rd, limiter disabled (max_requests=0) always accepts.
+**Cargo check:** clean (default target). No new warnings.
+**Cargo test:** `cargo test --lib provider_pools` — 11/11 pass (3 pre-existing + 8 new).
+**Deviation:** Plan §7 pseudocode used `Result<OwnedSemaphorePermit, AcquireError>` (bare `Result`) — used fully-qualified `std::result::Result` in the impl signature to avoid shadowing issues against the module's `anyhow::Result` import. Semantic identical.
+
+## 2026-04-21 03:20 — verifier pass (no code changes)
+
+**Plan task:** Wave 0 task 4 serial verifier.
+**Changed:** Nothing. Audit confirmed: `prepare_for_replay` matches §2.5.1 contract; all four call sites correctly migrated; tests cover all three origin variants with durable-field preservation; no lingering hand-clears; `DispatchOrigin` has `Copy` so the `options.dispatch_origin` pass at llm.rs:2126 works without explicit clone; §8-vs-§2.5.1 doc-rot acknowledged and deferred to Wave 5 doc-sweep.
+**Cargo check:** clean (default target).
+**Cargo test:** `cargo test --lib prepare_for_replay` — 3/3 pass.
+**Deviation:** None.
+
 ## 2026-04-21 03:10 — commit f0ebeb0 (branch walker-re-plan-wire-2.1)
 
 **Plan task:** Wave 0 task 4 — `LlmConfig::prepare_for_replay(origin)` helper + 4 call sites.
