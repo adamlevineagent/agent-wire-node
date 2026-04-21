@@ -2958,6 +2958,10 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 response.usage.completion_tokens,
                 latency_ms,
                 response.generation_id.as_deref(),
+                // Walker Re-Plan Wire 2.1 Wave 1 task 11: legacy (pre-walker)
+                // call site — provider_id stamping is the walker's job in
+                // Wave 1 tasks 8-10. Pre-walker rows keep provider_id NULL.
+                None,
             );
         }
 
@@ -2982,7 +2986,10 @@ async fn maybe_fail_audit(
 ) {
     if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
         let conn = audit_ctx.conn.lock().await;
-        let _ = super::db::fail_llm_audit(&conn, id, error_message);
+        // Walker Re-Plan Wire 2.1 Wave 1 task 11: legacy (pre-walker) call
+        // site — provider_id stamping is the walker's job in Wave 1 tasks
+        // 8-10. Pre-walker failures keep provider_id NULL.
+        let _ = super::db::fail_llm_audit(&conn, id, error_message, None);
     }
 }
 

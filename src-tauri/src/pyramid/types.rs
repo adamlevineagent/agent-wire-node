@@ -506,6 +506,14 @@ pub struct LlmAuditRecord {
     /// savings without losing audit-completeness.
     #[serde(default)]
     pub cache_hit: bool,
+    /// Walker Re-Plan Wire 2.1 Wave 1 task 11: carries the WINNING entry's
+    /// provider_id on success or the LAST-ATTEMPTED entry's provider_id on
+    /// CallTerminal. Values include `"fleet"` / `"market"` (routing
+    /// sentinels) or any registered provider row's id. NULL on legacy /
+    /// pre-walker rows. `model` is preserved separately as the canonical
+    /// model name and is never overwritten by a routing sentinel.
+    #[serde(default)]
+    pub provider_id: Option<String>,
 }
 
 /// Lightweight node info for the Theatre's live spatial view.

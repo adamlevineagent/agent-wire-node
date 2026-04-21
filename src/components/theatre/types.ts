@@ -69,6 +69,13 @@ export interface LlmAuditRecord {
     created_at: string;
     completed_at: string | null;
     cache_hit: boolean;
+    /**
+     * Walker Re-Plan Wire 2.1 Wave 1 task 11: WINNING entry's provider_id on
+     * success, LAST-ATTEMPTED entry's provider_id on CallTerminal. Values
+     * include "fleet" / "market" (routing sentinels) or any registered
+     * provider's id. `null` on legacy / pre-walker rows.
+     */
+    provider_id?: string | null;
 }
 
 /** Spatial node for canvas rendering */

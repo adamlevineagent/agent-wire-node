@@ -11027,8 +11027,13 @@ async fn pyramid_get_build_chronicle(
     {
         let mut stmt = conn
             .prepare(
+                // Walker Re-Plan Wire 2.1 Wave 1 task 11: `provider_id`
+                // projected alongside `model` so the chronicle can surface
+                // routing analytics (which branch served the call: fleet /
+                // market / pool). Legacy rows read NULL.
                 "SELECT created_at, model, prompt_tokens, completion_tokens,
-                        latency_ms, step_name, status, node_id, call_purpose, cache_hit
+                        latency_ms, step_name, status, node_id, call_purpose, cache_hit,
+                        provider_id
                  FROM pyramid_llm_audit
                  WHERE slug = ?1 AND build_id = ?2
                  ORDER BY created_at ASC
@@ -11047,6 +11052,7 @@ async fn pyramid_get_build_chronicle(
                 let node_id: Option<String> = row.get(7)?;
                 let call_purpose: String = row.get(8)?;
                 let cache_hit: i64 = row.get::<_, Option<i64>>(9)?.unwrap_or(0);
+                let provider_id: Option<String> = row.get::<_, Option<String>>(10)?;
                 let total_tokens = prompt_tokens + completion_tokens;
                 let headline = if cache_hit == 1 {
                     format!("Cache hit: {} ({})", step_name, call_purpose)
@@ -11073,6 +11079,7 @@ async fn pyramid_get_build_chronicle(
                         if cache_hit == 1 { " (cache hit)" } else { "" }
                     ),
                     "node_id": node_id,
+                    "provider_id": provider_id,
                 }))
             })
             .map_err(|e| e.to_string())?;

@@ -1049,6 +1049,27 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         }
     }
 
+    // Walker Re-Plan Wire 2.1 Wave 1 task 11: idempotent migration adding the
+    // `provider_id` column to pyramid_llm_audit. The walker stamps the WINNING
+    // entry's provider_id on success and the LAST-ATTEMPTED entry's provider_id
+    // on CallTerminal. `model` is preserved as the canonical model name and
+    // MUST NEVER be overwritten with a routing sentinel (`"fleet"` / `"market"`).
+    // Legacy / pre-walker rows remain NULL. Nullable TEXT, no CHECK constraint —
+    // accepts `"market"`, `"fleet"`, or any registered provider row's id.
+    {
+        let has_provider_id: bool = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('pyramid_llm_audit') WHERE name = 'provider_id'",
+            )?
+            .exists([])?;
+        if !has_provider_id {
+            conn.execute(
+                "ALTER TABLE pyramid_llm_audit ADD COLUMN provider_id TEXT",
+                [],
+            )?;
+        }
+    }
+
     // ── Phase 6: LLM output cache (pyramid_step_cache) ─────────────────────
     //
     // Content-addressable cache for LLM outputs, keyed on
@@ -8036,6 +8057,13 @@ fn prompt_hash(text: &str) -> String {
 }
 
 /// Complete an audit row AFTER the LLM call returns.
+///
+/// Walker Re-Plan Wire 2.1 Wave 1 task 11: `provider_id` carries the WINNING
+/// entry's provider_id (the one that produced the successful response). Legacy
+/// pre-walker callers pass `None`. The `model` column is preserved and MUST
+/// NEVER be overwritten by a routing sentinel — `provider_id` is the sole
+/// column that carries `"fleet"` / `"market"` / any registered provider id.
+#[allow(clippy::too_many_arguments)]
 pub fn complete_llm_audit(
     conn: &Connection,
     audit_id: i64,
@@ -8045,34 +8073,42 @@ pub fn complete_llm_audit(
     completion_tokens: i64,
     latency_ms: i64,
     generation_id: Option<&str>,
+    provider_id: Option<&str>,
 ) -> Result<()> {
     conn.execute(
         "UPDATE pyramid_llm_audit SET
          raw_response = ?1, parsed_ok = ?2,
          prompt_tokens = ?3, completion_tokens = ?4,
          latency_ms = ?5, generation_id = ?6,
+         provider_id = ?7,
          status = 'complete', completed_at = datetime('now')
-         WHERE id = ?7",
+         WHERE id = ?8",
         rusqlite::params![
             raw_response, parsed_ok as i32,
             prompt_tokens, completion_tokens,
-            latency_ms, generation_id, audit_id,
+            latency_ms, generation_id, provider_id, audit_id,
         ],
     )?;
     Ok(())
 }
 
 /// Mark an audit row as failed (LLM error).
+///
+/// Walker Re-Plan Wire 2.1 Wave 1 task 11: `provider_id` carries the
+/// LAST-ATTEMPTED entry's provider_id on CallTerminal (useful for debugging
+/// which branch rejected). Legacy pre-walker callers pass `None`.
 pub fn fail_llm_audit(
     conn: &Connection,
     audit_id: i64,
     error_message: &str,
+    provider_id: Option<&str>,
 ) -> Result<()> {
     conn.execute(
         "UPDATE pyramid_llm_audit SET
-         raw_response = ?1, status = 'failed', completed_at = datetime('now')
-         WHERE id = ?2",
-        rusqlite::params![error_message, audit_id],
+         raw_response = ?1, provider_id = ?2,
+         status = 'failed', completed_at = datetime('now')
+         WHERE id = ?3",
+        rusqlite::params![error_message, provider_id, audit_id],
     )?;
     Ok(())
 }
@@ -8140,7 +8176,7 @@ pub fn get_node_audit_records(
         "SELECT id, slug, build_id, node_id, step_name, call_purpose, depth, model,
                 system_prompt, user_prompt, raw_response, parsed_ok,
                 prompt_tokens, completion_tokens, latency_ms, generation_id,
-                status, created_at, completed_at, cache_hit
+                status, created_at, completed_at, cache_hit, provider_id
          FROM pyramid_llm_audit
          WHERE slug = ?1 AND node_id = ?2
          ORDER BY id ASC",
@@ -8163,7 +8199,7 @@ pub fn get_llm_audit_by_id(
         "SELECT id, slug, build_id, node_id, step_name, call_purpose, depth, model,
                 system_prompt, user_prompt, raw_response, parsed_ok,
                 prompt_tokens, completion_tokens, latency_ms, generation_id,
-                status, created_at, completed_at, cache_hit
+                status, created_at, completed_at, cache_hit, provider_id
          FROM pyramid_llm_audit WHERE id = ?1",
     )?;
     let mut rows: Vec<LlmAuditRecord> = stmt
@@ -8254,6 +8290,11 @@ fn parse_llm_audit_row(row: &rusqlite::Row) -> rusqlite::Result<LlmAuditRecord> 
         // (the migration is idempotent + run on init, but defensively
         // handle row.get errors with `unwrap_or(0)`).
         cache_hit: row.get::<_, i32>(19).unwrap_or(0) != 0,
+        // Walker Re-Plan Wire 2.1 Wave 1 task 11: provider_id is the 21st
+        // column. Nullable TEXT; legacy rows (pre-walker, pre-migration)
+        // read as None. Defensive `unwrap_or(None)` in case the migration
+        // hasn't run for some reason.
+        provider_id: row.get::<_, Option<String>>(20).unwrap_or(None),
     })
 }
 
@@ -12419,6 +12460,151 @@ mod tests {
         };
         let err = save_provisional_node(&conn, &bad_node, sid, None);
         assert!(err.is_err(), "save_provisional_node should reject non-provisional node");
+    }
+
+    // ── Walker Re-Plan Wire 2.1 Wave 1 task 11: provider_id audit column ─────
+
+    /// Legacy (pre-walker) callers pass `None` for provider_id. Verifies the
+    /// column is writeable as NULL on both complete + fail paths and that the
+    /// `model` column is preserved verbatim (never overwritten by a routing
+    /// sentinel).
+    #[test]
+    fn test_provider_id_none_legacy() {
+        let conn = test_conn();
+
+        // Complete path: legacy caller, provider_id = None
+        let id_ok = insert_llm_audit_pending(
+            &conn, "s", "b1", Some("n1"),
+            "step_a", "distill", Some(0),
+            "anthropic/claude-3.5-sonnet",
+            "you are helpful", "do the thing",
+        ).unwrap();
+        complete_llm_audit(
+            &conn, id_ok,
+            "{\"ok\":true}", true,
+            100, 50, 1234,
+            Some("gen-abc"),
+            None, // legacy caller
+        ).unwrap();
+
+        let (model, provider_id, status): (String, Option<String>, String) = conn
+            .query_row(
+                "SELECT model, provider_id, status FROM pyramid_llm_audit WHERE id = ?1",
+                rusqlite::params![id_ok],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(model, "anthropic/claude-3.5-sonnet", "model preserved");
+        assert_eq!(provider_id, None, "legacy provider_id = NULL");
+        assert_eq!(status, "complete");
+
+        // Fail path: legacy caller, provider_id = None
+        let id_fail = insert_llm_audit_pending(
+            &conn, "s", "b1", Some("n2"),
+            "step_b", "distill", Some(0),
+            "anthropic/claude-3.5-sonnet",
+            "sys", "user",
+        ).unwrap();
+        fail_llm_audit(&conn, id_fail, "timeout", None).unwrap();
+
+        let (model_f, provider_id_f, status_f): (String, Option<String>, String) = conn
+            .query_row(
+                "SELECT model, provider_id, status FROM pyramid_llm_audit WHERE id = ?1",
+                rusqlite::params![id_fail],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(model_f, "anthropic/claude-3.5-sonnet", "model preserved on fail");
+        assert_eq!(provider_id_f, None, "legacy fail provider_id = NULL");
+        assert_eq!(status_f, "failed");
+    }
+
+    /// Walker-style caller passes `Some(provider_id)`. Verifies the column
+    /// captures the routing sentinel / provider id on BOTH success and
+    /// CallTerminal paths, while `model` remains the canonical model name
+    /// (never overwritten by "fleet" / "market" / etc).
+    #[test]
+    fn test_provider_id_walker_style() {
+        let conn = test_conn();
+
+        // Success path: walker stamps the WINNING entry's provider_id.
+        let id_ok = insert_llm_audit_pending(
+            &conn, "s", "b1", Some("n1"),
+            "step_a", "distill", Some(0),
+            "anthropic/claude-3.5-sonnet",
+            "sys", "user",
+        ).unwrap();
+        complete_llm_audit(
+            &conn, id_ok,
+            "{\"ok\":true}", true,
+            100, 50, 1234,
+            Some("gen-abc"),
+            Some("openrouter"), // WINNING entry provider_id
+        ).unwrap();
+
+        let (model, provider_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT model, provider_id FROM pyramid_llm_audit WHERE id = ?1",
+                rusqlite::params![id_ok],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(model, "anthropic/claude-3.5-sonnet",
+                   "model must NEVER be overwritten by provider_id");
+        assert_eq!(provider_id.as_deref(), Some("openrouter"),
+                   "walker success stamps WINNING entry provider_id");
+
+        // CallTerminal path: walker stamps LAST-ATTEMPTED entry's provider_id.
+        // Also verifies routing sentinels ("fleet" / "market") are accepted
+        // as values — column is nullable TEXT, no CHECK constraint.
+        let id_fail = insert_llm_audit_pending(
+            &conn, "s", "b1", Some("n2"),
+            "step_b", "distill", Some(0),
+            "anthropic/claude-3.5-sonnet",
+            "sys", "user",
+        ).unwrap();
+        fail_llm_audit(&conn, id_fail, "terminal", Some("market")).unwrap();
+
+        let (model_f, provider_id_f): (String, Option<String>) = conn
+            .query_row(
+                "SELECT model, provider_id FROM pyramid_llm_audit WHERE id = ?1",
+                rusqlite::params![id_fail],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(model_f, "anthropic/claude-3.5-sonnet",
+                   "model must NEVER be overwritten by routing sentinel");
+        assert_eq!(provider_id_f.as_deref(), Some("market"),
+                   "walker CallTerminal stamps LAST-ATTEMPTED provider_id");
+
+        // parse_llm_audit_row round-trip: the record projection reads
+        // provider_id back through get_llm_audit_by_id.
+        let rec = get_llm_audit_by_id(&conn, id_ok).unwrap().unwrap();
+        assert_eq!(rec.provider_id.as_deref(), Some("openrouter"));
+        assert_eq!(rec.model, "anthropic/claude-3.5-sonnet");
+        let rec_fail = get_llm_audit_by_id(&conn, id_fail).unwrap().unwrap();
+        assert_eq!(rec_fail.provider_id.as_deref(), Some("market"));
+    }
+
+    /// Migration idempotency: calling `init_pyramid_db` a second time on the
+    /// same connection must NOT error even though the provider_id column
+    /// already exists from the first init. Mirrors the cache_hit migration
+    /// pattern.
+    #[test]
+    fn test_provider_id_migration_idempotent() {
+        let conn = test_conn(); // runs init_pyramid_db once
+        // Second init — must not re-add the column or error.
+        init_pyramid_db(&conn).expect("second init_pyramid_db should be a no-op");
+
+        // Confirm column exists (exactly one row per column in pragma_table_info).
+        let n_provider_id: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pyramid_llm_audit') WHERE name = 'provider_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_provider_id, 1, "provider_id column exists exactly once after double-init");
     }
 }
 
