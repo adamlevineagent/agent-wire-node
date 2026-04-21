@@ -66,7 +66,7 @@
       "contribution_id": "bundled-dispatch_policy-default-v1",
       "schema_type": "dispatch_policy",
       "slug": null,
-      "yaml_content": "version: 1\nprovider_pools:\n  openrouter: { concurrency: 20, rate_limit: { max_requests: 60, window_secs: 60 } }\n  ollama-local: { concurrency: 1 }\nrouting_rules:\n  - name: default\n    match_config: {}\n    route_to:\n      - { provider_id: market }\n      - { provider_id: fleet }\n      - { provider_id: openrouter }\n      - { provider_id: ollama-local, is_local: true }\n    sequential: false\n# escalation/wait fields retired — walker never awaits capacity (§4.5).\n# max_wait_secs per-entry work-await is sourced from compute_participation_policy.market_dispatch_max_wait_ms.\n",
+      "yaml_content": "version: 1\nprovider_pools:\n  openrouter: { concurrency: 20, rate_limit: { max_requests: 60, window_secs: 60 } }\n  ollama-local: { concurrency: 1 }\nrouting_rules:\n  - name: default\n    match_config: {}\n    route_to:\n      - { provider_id: market }\n      - { provider_id: fleet }\n      # Explicit openrouter model_id so fresh installs don't inherit an\n      # Ollama format name from primary_model and trip OpenRouter's model\n      # validator (post-ship C1 guard). Operator can override in Settings.\n      - { provider_id: openrouter, model_id: \"openai/gpt-4o-mini\" }\n      - { provider_id: ollama-local, is_local: true }\n    sequential: false\n# escalation/wait fields retired — walker never awaits capacity (§4.5).\n# max_wait_secs per-entry work-await is sourced from compute_participation_policy.market_dispatch_max_wait_ms.\n",
       "triggering_note": "Bundled default dispatch_policy (wire-node v0.2.0)"
     },
     {
