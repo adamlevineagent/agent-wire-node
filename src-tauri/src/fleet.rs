@@ -1032,8 +1032,15 @@ pub fn derive_serving_rules(
     let mut serving = Vec::new();
     for rule in &dispatch_policy.rules {
         for entry in &rule.route_to {
-            if entry.provider_id == "fleet" {
-                continue; // skip fleet entries
+            if entry.provider_id == "fleet" || entry.provider_id == "market" {
+                // Skip walker sentinel entries. Neither "fleet" nor "market"
+                // is a real local handler — both dispatch out to the network.
+                // The `is_local` check below would already exclude them by
+                // convention (both sentinels carry `is_local: false`), but we
+                // filter explicitly for parallelism with `resolve_local_for_rule`
+                // and to protect against a misconfigured `is_local: true` on a
+                // sentinel slipping through. See plan §8 Wave 5 task 37.
+                continue;
             }
             if entry.is_local {
                 let model_match = match &entry.model_id {
