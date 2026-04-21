@@ -21,6 +21,20 @@ Entry template:
 **Deviation:** None / <rationale if any>
 -->
 
+## 2026-04-21 04:30 — commit <SHA_TASK_5_6> (branch walker-re-plan-wire-2.1)
+
+**Plan task:** Wave 0 tasks 5 + 6 — `RouteBranch` + `classify_branch` + `branch_allowed` + `EntryError` taxonomy.
+**Changed:** `src-tauri/src/pyramid/llm.rs`, inserted right after the `DispatchOrigin` impl block (plan §2.5.2 + §2.5.3):
+  - `pub enum RouteBranch { Fleet, Market, Pool }` with `Debug/Clone/Copy/PartialEq/Eq` derives.
+  - `pub fn classify_branch(provider_id: &str) -> RouteBranch` — maps `"fleet"` / `"market"` sentinels to the walker branches; everything else is `Pool`.
+  - `pub fn branch_allowed(branch: RouteBranch, origin: DispatchOrigin) -> bool` — Pool always allowed; Fleet + Market allowed only for `Local` origin per the "inbound jobs don't re-dispatch" invariant.
+  - `pub enum EntryError { Retryable { reason }, RouteSkipped { reason }, CallTerminal { reason } }` with `Debug` derive plus `Display` + `std::error::Error` impls and `variant_tag()` + `reason()` accessors. Doc-comments pin the walker semantic: first two advance, third bubbles to caller.
+  - 7 new unit tests in `mod tests`: `classify_branch_maps_sentinels_to_walker_branches`, `branch_allowed_pool_always_ok`, `branch_allowed_fleet_only_from_local`, `branch_allowed_market_only_from_local`, `entry_error_variant_tags_match_chronicle_vocab`, `entry_error_reason_accessor_uniform_across_variants`, `entry_error_display_matches_variant_tag_colon_reason`. Together they cover all 3×3 branch×origin pairs and all three EntryError variants.
+  - No call sites yet — walker body in Wave 1 consumes these.
+**Cargo check:** clean (default target). No new warnings.
+**Cargo test:** `cargo test --lib -- classify_branch branch_allowed entry_error` — 7/7 pass.
+**Deviation:** Added two small ergonomic methods to `EntryError` beyond the plan's bare enum: `variant_tag()` (short chronicle tag) + `reason()` (uniform accessor) + a `Display` impl. Not structural — the walker in Wave 1 will consume both. Trivially reversible if they prove unused.
+
 ## 2026-04-21 03:30 — commit b3777d6 (branch walker-re-plan-wire-2.1)
 
 **Plan task:** Wave 0 task 7 — `ProviderPools::try_acquire_owned` + `SlidingWindowLimiter::try_acquire` non-blocking helpers.

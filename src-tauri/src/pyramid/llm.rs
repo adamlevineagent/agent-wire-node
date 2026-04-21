@@ -907,6 +907,122 @@ impl DispatchOrigin {
     }
 }
 
+// ── Walker route-branch classification (§2.5.2) ─────────────────────────────
+
+/// Walker's three-way classification of a `RouteEntry.provider_id`. Walker
+/// dispatch behavior branches on this: `Fleet` goes through fleet peer
+/// lookup + JWT dispatch; `Market` goes through the Wire compute market
+/// three-RPC flow; `Pool` goes through the provider pool + HTTP retry
+/// path that today handles openrouter, ollama-local, etc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteBranch {
+    Fleet,
+    Market,
+    Pool,
+}
+
+/// Classify a route entry's `provider_id` into a [`RouteBranch`].
+///
+/// `"fleet"` and `"market"` are walker sentinel ids (plan §2 — "walker adds
+/// new"); every other id is a real provider pool (openrouter, ollama-local,
+/// remote-5090, etc.) that lives in `ProviderPools`.
+pub fn classify_branch(provider_id: &str) -> RouteBranch {
+    match provider_id {
+        "fleet" => RouteBranch::Fleet,
+        "market" => RouteBranch::Market,
+        _ => RouteBranch::Pool,
+    }
+}
+
+/// Decides whether a route branch is allowed for an execution context with
+/// the given [`DispatchOrigin`]. Single source of truth for the "inbound
+/// jobs don't re-dispatch" invariant — an operator fulfilling a fleet- or
+/// market-received job must not recursively re-dispatch that call to
+/// another peer or back out to the market.
+///
+/// `Pool` is always allowed: even inbound jobs need local execution to
+/// produce a response. `Fleet` and `Market` branches are only taken when
+/// the dispatch originated locally on this operator (`Local`); inbound
+/// contexts (`FleetReceived`, `MarketReceived`) skip them.
+pub fn branch_allowed(branch: RouteBranch, origin: DispatchOrigin) -> bool {
+    match (branch, origin) {
+        (RouteBranch::Pool, _) => true,
+        (RouteBranch::Fleet | RouteBranch::Market, DispatchOrigin::Local) => true,
+        (
+            RouteBranch::Fleet | RouteBranch::Market,
+            DispatchOrigin::FleetReceived | DispatchOrigin::MarketReceived,
+        ) => false,
+    }
+}
+
+// ── Walker entry-error taxonomy (§2.5.3) ────────────────────────────────────
+
+/// Three-tier failure taxonomy a single walker entry can produce. Plan's
+/// earlier "Retryable vs Terminal" split conflated two different terminal
+/// semantics; `RouteSkipped` carves out the "wrong resource for this call,
+/// try the next one" case so that e.g. a market `insufficient_balance`
+/// rejection doesn't bubble to the caller while fleet + openrouter are
+/// still untried.
+///
+/// Walker semantics:
+/// - [`Retryable`](EntryError::Retryable) and
+///   [`RouteSkipped`](EntryError::RouteSkipped) both cause the walker to
+///   advance to the next `RouteEntry`. They emit distinct chronicle events
+///   so operators can tell transient retry pressure apart from "this
+///   resource can't help with this call."
+/// - [`CallTerminal`](EntryError::CallTerminal) bubbles to the caller:
+///   the walker writes `network_route_terminal_fail` + `fail_audit` and
+///   returns an `Err`. Reserved for failures that would fail on every
+///   route identically (walker bugs, caller-config bugs, auth/operator
+///   failures).
+///
+/// Not `Clone` / `Copy` — carried by value through the walker result path
+/// and dropped on success. Each variant has a `reason` string for
+/// chronicle-event metadata.
+#[derive(Debug)]
+pub enum EntryError {
+    /// Same route class, retry-after-delay kind of failure. Rare at walker
+    /// scope — walker usually advances rather than sleeping.
+    Retryable { reason: String },
+    /// This route branch can't serve this call — advance to next entry.
+    /// Examples: market `insufficient_balance`, missing openrouter key,
+    /// fleet peer dead, dispatch-deadline missed.
+    RouteSkipped { reason: String },
+    /// This entire call is doomed regardless of route. Bubble to caller.
+    /// Examples: `max_tokens_exceeds_quote` (walker bug), 400
+    /// `multi_system_messages` (caller bug), `/fill` 401
+    /// (auth/operator bug), any walker internal invariant violation.
+    CallTerminal { reason: String },
+}
+
+impl EntryError {
+    /// Short variant tag used in chronicle event metadata.
+    pub fn variant_tag(&self) -> &'static str {
+        match self {
+            EntryError::Retryable { .. } => "retryable",
+            EntryError::RouteSkipped { .. } => "route_skipped",
+            EntryError::CallTerminal { .. } => "call_terminal",
+        }
+    }
+
+    /// Access the reason string without destructuring.
+    pub fn reason(&self) -> &str {
+        match self {
+            EntryError::Retryable { reason }
+            | EntryError::RouteSkipped { reason }
+            | EntryError::CallTerminal { reason } => reason,
+        }
+    }
+}
+
+impl std::fmt::Display for EntryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.variant_tag(), self.reason())
+    }
+}
+
+impl std::error::Error for EntryError {}
+
 #[derive(Debug, Clone, Default)]
 pub struct LlmCallOptions {
     pub min_timeout_secs: Option<u64>,
@@ -4893,6 +5009,103 @@ routing_rules:
         let replay = live.prepare_for_replay(DispatchOrigin::MarketReceived);
         assert_all_dispatch_handles_cleared(&replay);
         assert_durable_fields_preserved(&live, &replay);
+    }
+
+    // ── classify_branch + branch_allowed (§2.5.2) ────────────────────────────
+
+    #[test]
+    fn classify_branch_maps_sentinels_to_walker_branches() {
+        assert_eq!(classify_branch("fleet"), RouteBranch::Fleet);
+        assert_eq!(classify_branch("market"), RouteBranch::Market);
+        assert_eq!(classify_branch("openrouter"), RouteBranch::Pool);
+        assert_eq!(classify_branch("ollama-local"), RouteBranch::Pool);
+        assert_eq!(classify_branch("remote-5090"), RouteBranch::Pool);
+        assert_eq!(classify_branch(""), RouteBranch::Pool);
+    }
+
+    #[test]
+    fn branch_allowed_pool_always_ok() {
+        assert!(branch_allowed(RouteBranch::Pool, DispatchOrigin::Local));
+        assert!(branch_allowed(RouteBranch::Pool, DispatchOrigin::FleetReceived));
+        assert!(branch_allowed(RouteBranch::Pool, DispatchOrigin::MarketReceived));
+    }
+
+    #[test]
+    fn branch_allowed_fleet_only_from_local() {
+        assert!(branch_allowed(RouteBranch::Fleet, DispatchOrigin::Local));
+        assert!(!branch_allowed(
+            RouteBranch::Fleet,
+            DispatchOrigin::FleetReceived
+        ));
+        assert!(!branch_allowed(
+            RouteBranch::Fleet,
+            DispatchOrigin::MarketReceived
+        ));
+    }
+
+    #[test]
+    fn branch_allowed_market_only_from_local() {
+        assert!(branch_allowed(RouteBranch::Market, DispatchOrigin::Local));
+        assert!(!branch_allowed(
+            RouteBranch::Market,
+            DispatchOrigin::FleetReceived
+        ));
+        assert!(!branch_allowed(
+            RouteBranch::Market,
+            DispatchOrigin::MarketReceived
+        ));
+    }
+
+    // ── EntryError taxonomy (§2.5.3) ─────────────────────────────────────────
+
+    #[test]
+    fn entry_error_variant_tags_match_chronicle_vocab() {
+        let r = EntryError::Retryable {
+            reason: "transient 503".into(),
+        };
+        let s = EntryError::RouteSkipped {
+            reason: "insufficient_balance".into(),
+        };
+        let t = EntryError::CallTerminal {
+            reason: "multi_system_messages".into(),
+        };
+
+        assert_eq!(r.variant_tag(), "retryable");
+        assert_eq!(s.variant_tag(), "route_skipped");
+        assert_eq!(t.variant_tag(), "call_terminal");
+    }
+
+    #[test]
+    fn entry_error_reason_accessor_uniform_across_variants() {
+        assert_eq!(
+            EntryError::Retryable {
+                reason: "r".into()
+            }
+            .reason(),
+            "r"
+        );
+        assert_eq!(
+            EntryError::RouteSkipped {
+                reason: "s".into()
+            }
+            .reason(),
+            "s"
+        );
+        assert_eq!(
+            EntryError::CallTerminal {
+                reason: "t".into()
+            }
+            .reason(),
+            "t"
+        );
+    }
+
+    #[test]
+    fn entry_error_display_matches_variant_tag_colon_reason() {
+        let e = EntryError::RouteSkipped {
+            reason: "insufficient_balance".into(),
+        };
+        assert_eq!(e.to_string(), "route_skipped: insufficient_balance");
     }
 }
 
