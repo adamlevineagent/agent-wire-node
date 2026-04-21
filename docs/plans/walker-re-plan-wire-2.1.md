@@ -90,10 +90,11 @@ impl LlmConfig {
     /// (inbound-job worker spawn), the node is the provider fulfilling
     /// someone else's work — no outbound dispatch should happen.
     ///
-    /// Takes `_origin` only for symmetry with call-site intent (explicit
-    /// is better than implicit) and for future use if an origin-specific
-    /// carve-out becomes necessary.
-    pub fn prepare_for_replay(&self, _origin: DispatchOrigin) -> Self {
+    /// Takes `origin` for observability (emitted via tracing::debug at each
+    /// call) and for future use if an origin-specific carve-out becomes
+    /// necessary. Call-site intent is explicit.
+    pub fn prepare_for_replay(&self, origin: DispatchOrigin) -> Self {
+        tracing::debug!(?origin, "preparing replay config");
         let mut cfg = self.clone();
         cfg.compute_queue = None;             // prevents re-enqueue loop
         cfg.fleet_dispatch = None;            // no fleet re-dispatch
@@ -636,11 +637,15 @@ Sized to a serial implementer pattern (one agent per wave; audit after Wave 1, v
 
 11. **Audit row schema + exit lifecycle (schema migration).** Today's `pyramid_llm_audit` (db.rs:997-1018) has columns `id, slug, build_id, node_id, step_name, call_purpose, depth, model, system_prompt, user_prompt, raw_response, parsed_ok, prompt_tokens, completion_tokens, latency_ms, generation_id, status, created_at, completed_at, cache_hit`. **No `provider_id` column exists.**
     - **Schema migration** — ADD COLUMN `provider_id TEXT` (nullable; legacy rows stay NULL). Follow the idempotent `pragma_table_info` pattern at db.rs:1038-1049 (used for `cache_hit` addition).
-    - **Extend `complete_llm_audit` signature** — `complete_llm_audit(conn, audit_id, raw_response, parsed_ok, prompt_tokens, completion_tokens, latency_ms, generation_id, provider_id: Option<&str>)`. UPDATE statement adds `provider_id = ?N`. Legacy callers (tests, pre-walker paths) pass None.
-    - **Walker invocation** — on `Ok(response)`, walker calls `complete_llm_audit(..., Some(entry.provider_id.as_str()))` with the WINNING entry's `provider_id`.
+    - **Extend BOTH `complete_llm_audit` and `fail_llm_audit` signatures** — add `provider_id: Option<&str>` as final parameter. UPDATE statements both add `provider_id = ?N`. Legacy callers (tests, pre-walker paths) pass None.
+    - **Walker invocation — three outcomes:**
+      - Success: `complete_llm_audit(..., Some(winning_entry.provider_id.as_str()))` with the WINNING entry's provider_id (the one that produced the successful response).
+      - CallTerminal: `fail_llm_audit(..., error_message, Some(last_attempted_entry.provider_id.as_str()))` with the LAST-ATTEMPTED entry's provider_id (the one that raised CallTerminal — useful for debugging which branch rejected).
+      - Exhaustion (`no viable route`): `fail_llm_audit(..., "no viable route", None)` — no entry produced a terminal outcome; walker iterated all.
     - **`model` column preservation** — NEVER overwrite `model` with a routing sentinel (`"fleet"` / `"market"`). `model` is the canonical model name (preserved from insert); `provider_id` is new and carries the routing sentinel.
     - **DB column constraints** — `provider_id` is nullable TEXT with no CHECK. Accepts `"market"`, `"fleet"`, or any registered provider row's id.
     - **Downstream consumers** — audit the Oversight page, cost reconciliation, and any query keyed on this table. Add `provider_id` to projections that currently expose `model` for routing analytics.
+    - **Multi-attempt tracking (NOT in this wave)** — walker writes ONE row per call (winning entry or terminal entry). Multi-entry attempts live in `pyramid_compute_events` chronicle, joined on `(slug, build_id, step_name, timestamp-window)`. Full split into parent+attempts tables is deferred post-walker per §15.
 
 12. **Verifier pass** — confirms pool-provider path works through walker (fresh build on Playful node; cargo check + cargo test --lib clean).
 

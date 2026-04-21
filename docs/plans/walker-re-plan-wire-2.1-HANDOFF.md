@@ -317,4 +317,72 @@ Don't read the cascade plan unless you're chasing retro lessons. The rev 0.3 aud
 
 ---
 
+## Pre-flight Q&A (answered by planning thread)
+
+### Scope / process
+
+1. **Branch name:** `walker-re-plan-wire-2.1` confirmed. Keep.
+2. **End-state:** fast-forward-merge to main after Wave 5 wanderer clean. No PR review needed (single operator).
+3. **Push cadence:** per-commit to `origin/walker-re-plan-wire-2.1`. Safer for cold-resume; cost is zero.
+4. **Dev-smoke without Adam:** proceed through Waves 0-3 on cargo-check+test-green; queue dev-smoke checklist entries in impl-log for Adam at wake. **HARD GATE:** dev-smoke on Wave 0-3 must be green before Wave 4 starts (user-visible surfaces).
+5. **Wipe-and-fresh-install:** Adam wipes Playful's DB at ship, not during dev. No schema version bump / DADBEAR marker needed from you — the ALTER TABLE uses idempotent `pragma_table_info` pattern. Operator step only at rollout.
+6. **Retro cadence:** short retro note in friction-log at end of EACH wave (1-3 sentences). Full retro after Wave 5 using accumulated friction-log.
+
+### Orchestration judgment
+
+7. **Small-work pattern:** direct write + serial verifier only — SKIP workflow agent on <500 LOC well-specified work. Wave 0 tasks 4/5/6/7 all qualify. Workflow agents for Wave 0 task 1 (bundled JSON authoring), task 2 (sync helper), task 8 (compute_quote_flow skeleton).
+8. **Wave 3 parallelism:** allowed for disjoint files. Split Wave 3 into:
+   - **Wave 3a (PARALLEL):** author `compute_quote_flow.rs` RPC bodies + author `market_surface_cache.rs` polling loop. Two concurrent workflow agents on new files.
+   - **Wave 3b (SERIAL, after 3a):** inline market branch into `llm.rs`, remove Phase B pre-loop. llm.rs is single-threaded (shared file).
+   - **Wave 3c (SERIAL, after 3b):** error-taxonomy tests + chronicle emission tests + wanderer.
+   
+   Wave 2 (fleet extract in llm.rs) and Wave 3b (market extract in llm.rs) are strictly serial to each other (overlapping llm.rs regions).
+9. **Wave 5 string-match audit:** fix in-scope during Wave 5 if related to walker's flat-string sentinels. Unrelated bugs surfacing in the sweep: friction-log + fix in same PR if <100 LOC, otherwise `mcp__ccd_session__spawn_task` for separate handling.
+10. **Unrelated latent bugs during any wave:** fix inline per `feedback_fix_all_bugs`. Exception: multi-file bugs needing their own design doc → friction-log + spawn_task.
+
+### Plan ambiguities
+
+11. **`NO_BUDGET_CAP` sentinel:** add as `pub const NO_BUDGET_CAP: i64 = (1i64 << 53) - 1;` in `dispatch_policy.rs`. Walker reads `entry.max_budget_credits.unwrap_or(NO_BUDGET_CAP)`. Doc-comment the rationale (JS Number.MAX_SAFE_INTEGER, f64 round-trip safety, effectively-no-cap semantic).
+12. **`prepare_for_replay(&self, origin: DispatchOrigin)`:** origin named (not underscored). Use it inside the fn via `tracing::debug!(?origin, "preparing replay config")` — gives per-call observability of replay-config derivation AND suppresses unused-variable warnings. Plan §2.5.1 snippet updated to reflect this.
+13. **Wave 1 task 11 audit-row:** ONLY `provider_id TEXT` column + extend `complete_llm_audit` AND `fail_llm_audit` signatures with `Option<&str>`. NO `attempt_index` — multi-entry attempt tracking lives in `pyramid_compute_events` chronicle (queryable by slug+build_id+step_name+timestamp-window). Full parent+attempts schema split is post-walker.
+14. **Chronicle event naming:** `pub const EVENT_<DOMAIN>_<ACTION>: &str = "<domain_action>";` per existing compute_chronicle.rs pattern. All snake_case. Full list of walker-added constants in the HANDOFF's "Chronicle event constants to add" block below.
+15. **CallTerminal audit row:** record the LAST-ATTEMPTED entry's `provider_id`, not "winning" — CallTerminal isn't a win. Plan Wave 1 task 11 revised: Success → `complete_llm_audit(..., Some(winner.provider_id))`; CallTerminal → `fail_llm_audit(..., Some(last_attempted.provider_id))`; Exhaustion → `fail_llm_audit(..., None)`.
+
+---
+
+## Chronicle event constants to add to `src-tauri/src/pyramid/compute_chronicle.rs`
+
+Add near the existing EVENT_NETWORK_* constants (line 164-169 today):
+
+```rust
+// ── Walker lifecycle events (rev 2.1 compute dispatch walker) ───────────
+pub const EVENT_WALKER_RESOLVED: &str = "walker_resolved";
+pub const EVENT_WALKER_EXHAUSTED: &str = "walker_exhausted";
+pub const EVENT_WALKER_PATH_DISTRIBUTION: &str = "walker_path_distribution";
+pub const EVENT_WALKER_QUOTE_RACE_STATS: &str = "walker_quote_race_stats";
+
+pub const EVENT_NETWORK_ROUTE_SKIPPED: &str = "network_route_skipped";
+pub const EVENT_NETWORK_ROUTE_SATURATED: &str = "network_route_saturated";
+pub const EVENT_NETWORK_ROUTE_UNAVAILABLE: &str = "network_route_unavailable";
+pub const EVENT_NETWORK_ROUTE_RETRYABLE_FAIL: &str = "network_route_retryable_fail";
+pub const EVENT_NETWORK_ROUTE_TERMINAL_FAIL: &str = "network_route_terminal_fail";
+pub const EVENT_NETWORK_MODEL_UNAVAILABLE: &str = "network_model_unavailable";
+
+pub const EVENT_NETWORK_QUOTED: &str = "network_quoted";
+pub const EVENT_NETWORK_PURCHASED: &str = "network_purchased";
+pub const EVENT_NETWORK_QUOTE_EXPIRED: &str = "network_quote_expired";
+pub const EVENT_NETWORK_PURCHASE_RECOVERED: &str = "network_purchase_recovered";
+pub const EVENT_NETWORK_RATE_ABOVE_BUDGET: &str = "network_rate_above_budget";
+pub const EVENT_NETWORK_DISPATCH_DEADLINE_MISSED: &str = "network_dispatch_deadline_missed";
+pub const EVENT_NETWORK_PROVIDER_SATURATED: &str = "network_provider_saturated";
+pub const EVENT_NETWORK_BALANCE_INSUFFICIENT_FOR_MARKET: &str = "network_balance_insufficient_for_market";
+pub const EVENT_NETWORK_AUTH_EXPIRED: &str = "network_auth_expired";
+
+pub const EVENT_DISPATCH_POLICY_SUPERSEDED: &str = "dispatch_policy_superseded";
+```
+
+Wave 0 task lands these as dead-code constants (allow-unused until walker emit sites wire them up in Wave 1/3). Prevents typo drift between emission sites and consumers.
+
+---
+
 **Ship it right, not fast. Plan commitment is the deadline, not session timing.**
