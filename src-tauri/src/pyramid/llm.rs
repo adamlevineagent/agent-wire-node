@@ -702,18 +702,20 @@ async fn dispatch_market_entry(
         {"role": "user", "content": user_prompt},
     ]);
 
-    let fill_body = cqf::ComputeFillBody {
-        job_id: purchase_resp.job_id.clone(),
+    let fill_request = cqf::ComputeFillRequest {
+        body: cqf::ComputeFillBody {
+            job_id: purchase_resp.job_id.clone(),
+            messages,
+            // Absence means "use max_tokens_quoted" per rev 2.1 spec §2.3;
+            // we only pass a ceiling when the caller explicitly set one.
+            max_tokens: if max_tokens > 0 { Some(max_tokens) } else { None },
+            temperature,
+            relay_count: 0,
+            privacy_tier: "direct".to_string(),
+            input_token_count: input_tokens_est,
+            requester_callback_url: callback_url,
+        },
         request_id: purchase_resp.request_id.clone(),
-        messages,
-        // Absence means "use max_tokens_quoted" per rev 2.1 spec §2.3;
-        // we only pass a ceiling when the caller explicitly set one.
-        max_tokens: if max_tokens > 0 { Some(max_tokens) } else { None },
-        temperature,
-        relay_count: 0,
-        privacy_tier: "direct".to_string(),
-        input_token_count: input_tokens_est,
-        requester_callback_url: callback_url,
         idempotency_key: purchase_resp.request_id.clone(),
     };
 
@@ -721,7 +723,7 @@ async fn dispatch_market_entry(
     // returns (we also explicitly take() below for timeouts inside
     // await_result). If /fill errors, clean up the pending entry so a
     // late push hits already_settled.
-    if let Err(e) = cqf::fill(&market_ctx.auth, &market_ctx.config, fill_body).await {
+    if let Err(e) = cqf::fill(&market_ctx.auth, &market_ctx.config, fill_request).await {
         let _ = market_ctx.pending_jobs.take(&purchase_resp.uuid_job_id).await;
         return Err(e);
     }

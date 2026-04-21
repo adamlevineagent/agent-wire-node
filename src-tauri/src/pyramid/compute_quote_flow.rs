@@ -87,13 +87,23 @@ pub use agent_wire_contracts::{
 // local struct for a `pub use agent_wire_contracts::ComputeFillBody;`.
 // ---------------------------------------------------------------------------
 
-/// `/api/v1/compute/fill` request body (rev 2.1). Declared locally because
-/// the `agent-wire-contracts` rev pinned in `Cargo.toml` (a9e356d3) does
-/// not yet export this shape.
+/// `/api/v1/compute/fill` request body (rev 2.1) — STRICT wire schema.
+///
+/// Wire's validator at `src/app/api/v1/compute/fill/route.ts:193-198`
+/// whitelists exactly these 8 field names and 400s with `unknown_field`
+/// on any extra top-level key. This struct is the wire-canonical projection:
+/// nothing on it that isn't explicitly allowed by Wire.
+///
+/// Walker-side state (request_id for PendingJobs keying, idempotency_key
+/// for the HTTP header) lives on [`ComputeFillRequest`], which wraps this
+/// body. Callers construct a request; `fill()` serializes `request.body`
+/// for the HTTP body and reads `request.idempotency_key` into the header.
+///
+/// Declared locally because the `agent-wire-contracts` rev pinned in
+/// `Cargo.toml` (a9e356d3) does not yet export this shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComputeFillBody {
     pub job_id: String,
-    pub request_id: String,
     pub messages: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<i64>,
@@ -102,6 +112,23 @@ pub struct ComputeFillBody {
     pub privacy_tier: String,
     pub input_token_count: i64,
     pub requester_callback_url: String,
+}
+
+/// Walker-side bundling of the wire body plus the two fields the walker
+/// needs but Wire does NOT accept in the body:
+///
+/// - `request_id`: PendingJobs keying + dispatch tracking. Wire reads this
+///   from the reserved job record (state from `/purchase`), not the body.
+/// - `idempotency_key`: sent as the `Idempotency-Key` HTTP header by
+///   [`fill()`]; never serialized into the body.
+///
+/// Keeping these on a wrapper (rather than on [`ComputeFillBody`]) is
+/// load-bearing: the body struct must strictly mirror Wire's allowed-field
+/// whitelist or `/fill` returns 400 `unknown_field`.
+#[derive(Debug, Clone)]
+pub struct ComputeFillRequest {
+    pub body: ComputeFillBody,
+    pub request_id: String,
     pub idempotency_key: String,
 }
 
@@ -219,22 +246,22 @@ pub async fn purchase(
 pub async fn fill(
     auth: &Arc<RwLock<AuthState>>,
     config: &Arc<RwLock<WireNodeConfig>>,
-    body: ComputeFillBody,
+    request: ComputeFillRequest,
 ) -> Result<(), EntryError> {
     let (api_url, token) = read_api_creds(auth, config, "fill").await?;
 
-    // `/fill` idempotency is keyed on `request_id` per spec §1.8 +
-    // contract §1.8. Walker reuses `purchase_response.request_id` as
-    // both the body's `request_id` + idempotency token; we surface
-    // `body.idempotency_key` as the HTTP header so a retry of the same
-    // /fill call lands on the existing dispatch record.
+    // `/fill` idempotency is sent ONLY as the `Idempotency-Key` HTTP header.
+    // Wire's allowed-field whitelist rejects an `idempotency_key` key in the
+    // body — hence the split between `ComputeFillRequest` (walker-side
+    // bundle) and `ComputeFillBody` (wire-canonical body). A retry with
+    // the same idempotency key lands on the existing dispatch record.
     let mut headers = HashMap::new();
     headers.insert(
         "Idempotency-Key".to_string(),
-        body.idempotency_key.clone(),
+        request.idempotency_key.clone(),
     );
 
-    let body_json = serde_json::to_value(&body).map_err(|e| EntryError::CallTerminal {
+    let body_json = serde_json::to_value(&request.body).map_err(|e| EntryError::CallTerminal {
         reason: format!("fill_body_serialize:{e}"),
     })?;
 
@@ -856,14 +883,14 @@ mod tests {
     // ── Body serialization surface ─────────────────────────────────────
 
     #[test]
-    fn compute_fill_body_serializes_with_required_fields() {
-        // Strict-allowed-field check on Wire side means every field
-        // must be present (modulo max_tokens Option). Also verifies
-        // max_tokens is omitted when None (spec §2.3: absence means
-        // "use max_tokens_quoted").
+    fn compute_fill_body_serializes_only_wire_allowed_fields() {
+        // Wire's /fill allowed-field whitelist (route.ts:193-198) is
+        // exactly these 8 names. Any extra top-level key 400s with
+        // `unknown_field`. This test pins the struct shape to the
+        // whitelist so a field drift (either direction) fails CI
+        // rather than production /fill.
         let body = ComputeFillBody {
             job_id: "playful/106/42".into(),
-            request_id: "req-uuid".into(),
             messages: serde_json::json!([{"role": "user", "content": "hi"}]),
             max_tokens: None,
             temperature: 0.7,
@@ -871,22 +898,39 @@ mod tests {
             privacy_tier: "direct".into(),
             input_token_count: 12,
             requester_callback_url: "https://tunnel/v1/compute/job-result".into(),
-            idempotency_key: "req-uuid".into(),
         };
         let v = serde_json::to_value(&body).expect("serialize");
-        assert!(v.get("job_id").is_some());
-        assert!(v.get("request_id").is_some());
-        assert!(v.get("messages").is_some());
-        assert!(
-            v.get("max_tokens").is_none(),
-            "max_tokens must be omitted when None per spec §2.3"
-        );
-        assert!(v.get("temperature").is_some());
-        assert!(v.get("relay_count").is_some());
-        assert!(v.get("privacy_tier").is_some());
-        assert!(v.get("input_token_count").is_some());
-        assert!(v.get("requester_callback_url").is_some());
-        assert!(v.get("idempotency_key").is_some());
+        let obj = v.as_object().expect("body must serialize as object");
+
+        // Every wire-allowed field present (except max_tokens, which
+        // spec §2.3 says MUST be omitted when the caller doesn't set a
+        // ceiling so Wire uses `max_tokens_quoted`).
+        assert!(obj.contains_key("job_id"));
+        assert!(obj.contains_key("messages"));
+        assert!(!obj.contains_key("max_tokens"),
+            "max_tokens must be omitted when None per spec §2.3");
+        assert!(obj.contains_key("temperature"));
+        assert!(obj.contains_key("relay_count"));
+        assert!(obj.contains_key("privacy_tier"));
+        assert!(obj.contains_key("input_token_count"));
+        assert!(obj.contains_key("requester_callback_url"));
+
+        // Walker-side fields MUST NOT appear in the wire body — they
+        // live on `ComputeFillRequest`, not `ComputeFillBody`.
+        assert!(!obj.contains_key("request_id"),
+            "request_id is walker-internal; Wire reads it from the reserved job record");
+        assert!(!obj.contains_key("idempotency_key"),
+            "idempotency_key goes in the Idempotency-Key header, never the body");
+
+        // No OTHER top-level keys beyond the whitelist.
+        let allowed = [
+            "job_id", "messages", "max_tokens", "temperature", "relay_count",
+            "privacy_tier", "input_token_count", "requester_callback_url",
+        ];
+        for key in obj.keys() {
+            assert!(allowed.contains(&key.as_str()),
+                "unexpected field in /fill body: {} — Wire's strict validator will 400 unknown_field", key);
+        }
     }
 
     #[test]
@@ -937,7 +981,6 @@ mod tests {
     fn compute_fill_body_emits_max_tokens_when_set() {
         let body = ComputeFillBody {
             job_id: "h".into(),
-            request_id: "r".into(),
             messages: serde_json::json!([]),
             max_tokens: Some(500),
             temperature: 0.0,
@@ -945,9 +988,36 @@ mod tests {
             privacy_tier: "direct".into(),
             input_token_count: 0,
             requester_callback_url: "https://x".into(),
-            idempotency_key: "r".into(),
         };
         let v = serde_json::to_value(&body).expect("serialize");
         assert_eq!(v.get("max_tokens").and_then(|n| n.as_i64()), Some(500));
+    }
+
+    #[test]
+    fn compute_fill_request_carries_walker_state_without_leaking_to_body() {
+        // The wrapper holds request_id + idempotency_key for walker use
+        // (PendingJobs keying + HTTP header construction); neither field
+        // appears in the body's serialization.
+        let request = ComputeFillRequest {
+            body: ComputeFillBody {
+                job_id: "playful/106/42".into(),
+                messages: serde_json::json!([]),
+                max_tokens: None,
+                temperature: 0.0,
+                relay_count: 0,
+                privacy_tier: "direct".into(),
+                input_token_count: 0,
+                requester_callback_url: "https://x".into(),
+            },
+            request_id: "req-uuid-walker-only".into(),
+            idempotency_key: "req-uuid-walker-only".into(),
+        };
+        let body_json = serde_json::to_value(&request.body).expect("serialize body");
+        let obj = body_json.as_object().unwrap();
+        assert!(!obj.contains_key("request_id"));
+        assert!(!obj.contains_key("idempotency_key"));
+        // Walker-side fields must still be reachable on the wrapper.
+        assert_eq!(request.request_id, "req-uuid-walker-only");
+        assert_eq!(request.idempotency_key, "req-uuid-walker-only");
     }
 }
