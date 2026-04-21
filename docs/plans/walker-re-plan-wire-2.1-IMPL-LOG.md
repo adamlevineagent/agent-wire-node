@@ -21,7 +21,7 @@ Entry template:
 **Deviation:** None / <rationale if any>
 -->
 
-## 2026-04-21 03:10 — commit <SHA_TASK_4> (branch walker-re-plan-wire-2.1)
+## 2026-04-21 03:10 — commit f0ebeb0 (branch walker-re-plan-wire-2.1)
 
 **Plan task:** Wave 0 task 4 — `LlmConfig::prepare_for_replay(origin)` helper + 4 call sites.
 **Changed:** Added `prepare_for_replay` method to `impl LlmConfig` at `src-tauri/src/pyramid/llm.rs:854-879` — clears `compute_queue`, `fleet_dispatch`, `fleet_roster`, `compute_market_context` (origin-independent), emits `tracing::debug!` with origin for observability. Updated all four call sites:
