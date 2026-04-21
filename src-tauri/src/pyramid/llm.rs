@@ -533,6 +533,329 @@ fn emit_walker_chronicle(
     });
 }
 
+// ── dispatch_fleet_entry (Wave 2 — walker fleet branch helper) ───────────────
+
+/// Arguments bundle for `dispatch_fleet_entry`.
+///
+/// Every field has already been precondition-validated by the walker's
+/// runtime gate (branch_allowed / skip_fleet_dispatch / tunnel-Connected /
+/// roster-present / jwt-non-empty / peer-found). The helper is the
+/// dispatch half: register pending → POST /v1/fleet/dispatch → two-phase
+/// oneshot await → chronicle by outcome → roster cleanup on peer-dead.
+///
+/// Returns a three-tier `EntryError` so the walker can advance or bubble
+/// per §4.1 of the walker-re-plan. Fleet failures are never `CallTerminal`
+/// — other route entries may still succeed.
+struct FleetDispatchArgs<'a> {
+    config: &'a LlmConfig,
+    ctx: Option<&'a StepContext>,
+    fleet_ctx: std::sync::Arc<crate::fleet::FleetDispatchContext>,
+    policy_snap: crate::pyramid::fleet_delivery_policy::FleetDeliveryPolicy,
+    callback_url: String,
+    roster_handle: Arc<tokio::sync::RwLock<crate::fleet::FleetRoster>>,
+    peer: crate::fleet::FleetPeer,
+    jwt: String,
+    rule_name: String,
+    job_wait_secs: u64,
+    system_prompt: &'a str,
+    user_prompt: &'a str,
+    temperature: f32,
+    max_tokens: usize,
+    response_format: Option<&'a serde_json::Value>,
+}
+
+async fn dispatch_fleet_entry(
+    args: FleetDispatchArgs<'_>,
+) -> std::result::Result<LlmResponse, EntryError> {
+    let FleetDispatchArgs {
+        config,
+        ctx,
+        fleet_ctx,
+        policy_snap,
+        callback_url,
+        roster_handle,
+        peer,
+        jwt,
+        rule_name,
+        job_wait_secs,
+        system_prompt,
+        user_prompt,
+        temperature,
+        max_tokens,
+        response_format,
+    } = args;
+
+    let fleet_job_path = super::compute_chronicle::generate_job_path(
+        ctx, None, &config.primary_model, "fleet",
+    );
+    let fleet_start = std::time::Instant::now();
+    let fleet_db_path = ctx
+        .map(|c| c.db_path.clone())
+        .or_else(|| {
+            config
+                .cache_access
+                .as_ref()
+                .map(|ca| ca.db_path.to_string())
+        });
+
+    // Clamp to at least 1s — a zero would cause the orphan sweep to evict
+    // the entry on its first tick, before the callback can arrive.
+    let expected_timeout = std::time::Duration::from_secs(job_wait_secs.max(1));
+
+    let job_id = uuid::Uuid::new_v4().to_string();
+
+    // Oneshot channel — filled by server.rs /v1/fleet/result handler when
+    // the peer's callback arrives, or dropped by the orphan sweep.
+    let (sender, receiver) =
+        tokio::sync::oneshot::channel::<crate::fleet::FleetAsyncResult>();
+
+    // Register pending entry BEFORE dispatch POST so a very-fast peer
+    // callback cannot beat our registration and produce a spurious orphan.
+    // peer_id MUST be peer.node_id (raw) — the callback authenticates via
+    // fleet JWT whose `nid` claim carries the raw node_id.
+    fleet_ctx.pending.register(
+        job_id.clone(),
+        crate::fleet::PendingFleetJob {
+            sender,
+            dispatched_at: std::time::Instant::now(),
+            peer_id: peer.node_id.clone(),
+            expected_timeout,
+        },
+    );
+
+    let dispatch_result = crate::fleet::fleet_dispatch_by_rule(
+        &peer,
+        &job_id,
+        &callback_url,
+        &rule_name,
+        system_prompt,
+        user_prompt,
+        temperature,
+        max_tokens,
+        response_format,
+        &jwt,
+        policy_snap.dispatch_ack_timeout_secs,
+    )
+    .await;
+
+    let spawn_chronicle =
+        |event_type: &'static str, metadata: serde_json::Value| {
+            if let Some(ref db_path) = fleet_db_path {
+                let db_path = db_path.clone();
+                let chronicle_ctx = if let Some(sc) = ctx {
+                    super::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                        sc, &fleet_job_path, event_type, "fleet",
+                    )
+                } else {
+                    super::compute_chronicle::ChronicleEventContext::minimal(
+                        &fleet_job_path, event_type, "fleet",
+                    )
+                    .with_model_id(config.primary_model.clone())
+                };
+                let chronicle_ctx = chronicle_ctx.with_metadata(metadata);
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                        let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                    }
+                });
+            }
+        };
+
+    match dispatch_result {
+        Ok(ack) => {
+            spawn_chronicle(
+                "fleet_dispatched_async",
+                serde_json::json!({
+                    "peer_id": peer.node_id,
+                    "peer_name": peer.name,
+                    "rule_name": rule_name,
+                    "timeout_secs": job_wait_secs,
+                    "peer_queue_depth": ack.peer_queue_depth,
+                }),
+            );
+
+            // Two-phase await with pinned receiver. `timeout` consumes its
+            // future by value; pin once, then pass `receiver.as_mut()` on
+            // each call.
+            tokio::pin!(receiver);
+            let wait_outcome = match tokio::time::timeout(
+                std::time::Duration::from_secs(job_wait_secs),
+                receiver.as_mut(),
+            )
+            .await
+            {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(_recv_err)) => Err("orphaned"),
+                Err(_elapsed) => {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(policy_snap.timeout_grace_secs),
+                        receiver.as_mut(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(r)) => Ok(r),
+                        _ => Err("timeout"),
+                    }
+                }
+            };
+
+            // Idempotent cleanup — callback or sweep may have already
+            // removed this entry.
+            let _ = fleet_ctx.pending.remove(&job_id);
+
+            match wait_outcome {
+                Ok(crate::fleet::FleetAsyncResult::Success(fleet_resp)) => {
+                    spawn_chronicle(
+                        "fleet_result_received",
+                        serde_json::json!({
+                            "peer_id": peer.node_id,
+                            "peer_name": peer.name,
+                            "peer_model": fleet_resp.peer_model,
+                            "latency_ms": fleet_start.elapsed().as_millis() as u64,
+                            "tokens_prompt": fleet_resp.prompt_tokens.unwrap_or(0),
+                            "tokens_completion": fleet_resp.completion_tokens.unwrap_or(0),
+                        }),
+                    );
+
+                    Ok(LlmResponse {
+                        content: fleet_resp.content,
+                        usage: super::types::TokenUsage {
+                            prompt_tokens: fleet_resp.prompt_tokens.unwrap_or(0),
+                            completion_tokens: fleet_resp.completion_tokens.unwrap_or(0),
+                        },
+                        generation_id: None,
+                        actual_cost_usd: None, // fleet is free (same operator)
+                        provider_id: Some("fleet".to_string()),
+                        fleet_peer_id: Some(
+                            peer.handle_path.clone().unwrap_or_else(|| peer.node_id.clone()),
+                        ),
+                        fleet_peer_model: fleet_resp.peer_model.clone(),
+                    })
+                }
+                Ok(crate::fleet::FleetAsyncResult::Error(err_msg)) => {
+                    // Peer RAN inference and it failed (GPU OOM, model
+                    // mismatch, etc.). RouteSkipped — peer couldn't help.
+                    spawn_chronicle(
+                        "fleet_result_failed",
+                        serde_json::json!({
+                            "peer_id": peer.node_id,
+                            "peer_name": peer.name,
+                            "error": err_msg,
+                        }),
+                    );
+                    warn!(
+                        "Fleet peer {} inference failed, walker advancing: {}",
+                        peer.node_id, err_msg
+                    );
+                    Err(EntryError::RouteSkipped {
+                        reason: "fleet_result_failed".to_string(),
+                    })
+                }
+                Err("timeout") => {
+                    spawn_chronicle(
+                        "fleet_dispatch_timeout",
+                        serde_json::json!({
+                            "peer_id": peer.node_id,
+                            "peer_name": peer.name,
+                            "timeout_secs": job_wait_secs,
+                            "grace_secs": policy_snap.timeout_grace_secs,
+                        }),
+                    );
+                    warn!(
+                        "Fleet dispatch timeout awaiting callback from peer {}, walker advancing",
+                        peer.node_id
+                    );
+                    // Per §4.1: timeout → Retryable per plan. But walker
+                    // advances in all fleet-failure modes anyway; Retryable
+                    // + RouteSkipped are semantically identical from the
+                    // walker's POV. Use Retryable to honor the plan's
+                    // classification (distinct chronicle slug for
+                    // telemetry).
+                    Err(EntryError::Retryable {
+                        reason: "fleet_dispatch_timeout".to_string(),
+                    })
+                }
+                Err(_orphaned) => {
+                    spawn_chronicle(
+                        "fleet_dispatch_failed",
+                        serde_json::json!({
+                            "peer_id": peer.node_id,
+                            "peer_name": peer.name,
+                            "error": "pending entry orphaned by sweep",
+                            "error_kind": "orphaned",
+                            "status_code": serde_json::Value::Null,
+                            "latency_ms": fleet_start.elapsed().as_millis() as u64,
+                        }),
+                    );
+                    warn!(
+                        "Fleet pending entry orphaned for peer {}, walker advancing",
+                        peer.node_id
+                    );
+                    Err(EntryError::Retryable {
+                        reason: "fleet_dispatch_orphaned".to_string(),
+                    })
+                }
+            }
+        }
+        Err(e) => {
+            // Dispatch POST failed — remove pending entry (idempotent) and
+            // chronicle by status_code.
+            let _ = fleet_ctx.pending.remove(&job_id);
+
+            let is_overloaded = e.status_code == Some(503);
+            let event_type = if is_overloaded {
+                "fleet_peer_overloaded"
+            } else {
+                "fleet_dispatch_failed"
+            };
+            let metadata = if is_overloaded {
+                serde_json::json!({
+                    "peer_id": peer.node_id,
+                    "peer_name": peer.name,
+                    "status_code": e.status_code,
+                    "retry_after": policy_snap.admission_retry_after_secs,
+                })
+            } else {
+                serde_json::json!({
+                    "peer_id": peer.node_id,
+                    "peer_name": peer.name,
+                    "error": e.message.clone(),
+                    "error_kind": serde_json::to_value(&e.kind).unwrap_or_default(),
+                    "status_code": e.status_code,
+                    "latency_ms": fleet_start.elapsed().as_millis() as u64,
+                })
+            };
+            spawn_chronicle(event_type, metadata);
+
+            let peer_dead = e.is_peer_dead();
+            if peer_dead {
+                let mut roster_w = roster_handle.write().await;
+                roster_w.remove_peer(&peer.node_id);
+                warn!(
+                    "Fleet dispatch: peer {} removed (transport failure): {}",
+                    peer.node_id, e
+                );
+            } else {
+                warn!(
+                    "Fleet dispatch failed ({:?}), peer stays in roster: {}",
+                    e.kind, e
+                );
+            }
+
+            let reason = if is_overloaded {
+                "fleet_peer_overloaded"
+            } else if peer_dead {
+                "fleet_peer_dead"
+            } else {
+                "fleet_dispatch_failed"
+            };
+            Err(EntryError::RouteSkipped {
+                reason: reason.to_string(),
+            })
+        }
+    }
+}
+
 /// Minimal snapshot of `/match` + `/fill` response data needed to
 /// build a `network_helped_build` chronicle row. Passed by value into
 /// `emit_network_helped_build` so the call site does not have to hold
@@ -1432,16 +1755,15 @@ pub async fn call_model_unified_with_audit_and_ctx(
     // any of that.
     //
     // `_provider_impl` + `_secret` are unused today — the walker re-instantiates
-    // per-entry (Wave 1), and Phase A (fleet) / Phase B (market) dispatch
-    // don't touch them. Kept in the destructure for clarity when Waves 2-3
-    // inline those phases; underscore-prefixed to silence unused-var warnings.
+    // per-entry (Wave 1), and the Phase B market pre-loop (Wave 3 will inline)
+    // does not touch them. Underscore-prefixed to silence unused-var warnings.
     let (_provider_impl, _secret, provider_type, provider_id) = build_call_provider(config)?;
 
     // Phase D: resolve the dispatch route BEFORE the retry loop so we
     // have the provider preference chain for escalation. When no policy
     // is configured the resolved_route is None and we fall through to
     // the legacy single-provider path.
-    let mut resolved_route = config.dispatch_policy.as_ref().map(|policy| {
+    let resolved_route = config.dispatch_policy.as_ref().map(|policy| {
         // Use Build as the default work_type — Phase B work_type tagging
         // will provide the real classification per call site.
         let work_type = crate::pyramid::dispatch_policy::WorkType::Build;
@@ -1450,502 +1772,6 @@ pub async fn call_model_unified_with_audit_and_ctx(
         policy.resolve_route(work_type, "", step_name, depth)
     });
 
-    // ── Phase A: Fleet providers (pre-pool) ──────────────────────────
-    // Fleet is not pool-limited. Try fleet dispatch before the pool
-    // acquisition loop. On success: return immediately with fleet
-    // provenance. On failure: filter fleet from providers, continue.
-    //
-    // TODO: LOAD BALANCING — Currently fleet is "try first, use exclusively."
-    // If a fleet peer is found, we dispatch and return. The local GPU never
-    // gets a turn. The right behavior: compare fleet peer queue depth vs
-    // local queue depth, and route each call to whichever has more capacity.
-    // This turns [fleet, ollama-local] from a priority chain into a load
-    // balancer. Both GPUs should be working simultaneously on a build.
-    // The local queue depth is available from config.compute_queue.
-    // The fleet peer's queue depth is on FleetPeer.total_queue_depth.
-    if let Some(ref route) = resolved_route {
-        if !options.skip_fleet_dispatch && !route.matched_rule_name.is_empty() {
-            let has_fleet = route.providers.iter().any(|e| e.provider_id == "fleet");
-            tracing::info!(
-                has_fleet,
-                rule = %route.matched_rule_name,
-                fleet_roster_present = config.fleet_roster.is_some(),
-                fleet_dispatch_present = config.fleet_dispatch.is_some(),
-                provider_count = route.providers.len(),
-                providers = ?route.providers.iter().map(|p| &p.provider_id).collect::<Vec<_>>(),
-                "Fleet Phase A: entry check"
-            );
-            // Phase 4 async: the dispatch pathway requires a FleetDispatchContext
-            // (pending-job registry, tunnel handle, policy). When absent (tests,
-            // pre-init), fleet is skipped and we fall through to local.
-            // We ALSO snapshot the policy and tunnel URL exactly once here so
-            // the peer-staleness diagnostic, find_peer_for_rule, and the timeout
-            // computations all see consistent values. This eliminates a TOCTOU
-            // race where tunnel_state could transition Connected → Disconnected
-            // between the check and callback URL construction.
-            if has_fleet {
-                // Step 0: snapshot fleet_ctx + policy + callback_url.
-                let phase_a_ready = async {
-                    let fleet_ctx = match config.fleet_dispatch.as_ref() {
-                        Some(c) => c.clone(),
-                        None => {
-                            tracing::warn!(
-                                rule = %route.matched_rule_name,
-                                "Fleet Phase A skipped: FleetDispatchContext not attached"
-                            );
-                            return None;
-                        }
-                    };
-                    let policy_snap = fleet_ctx.policy.read().await.clone();
-                    let callback_url = {
-                        let ts = fleet_ctx.tunnel_state.read().await;
-                        match (&ts.status, ts.tunnel_url.as_ref()) {
-                            // Only Connected is dispatch-valid. Connecting means
-                            // cloudflared hasn't finished announcing the tunnel
-                            // at Cloudflare's edge — callbacks would 404 there.
-                            (crate::tunnel::TunnelConnectionStatus::Connected, Some(u)) => {
-                                u.endpoint("/v1/fleet/result")
-                            }
-                            _ => {
-                                tracing::warn!(
-                                    rule = %route.matched_rule_name,
-                                    status = ?ts.status,
-                                    has_url = ts.tunnel_url.is_some(),
-                                    "Fleet Phase A skipped: tunnel not Connected or URL missing"
-                                );
-                                return None;
-                            }
-                        }
-                    };
-                    Some((fleet_ctx, policy_snap, callback_url))
-                }
-                .await;
-
-                if let Some((fleet_ctx, policy_snap, callback_url)) = phase_a_ready {
-                    if let Some(ref roster_handle) = config.fleet_roster {
-                        let roster = roster_handle.read().await;
-                        // Diagnostic: log fleet routing decision
-                        tracing::info!(
-                            rule = %route.matched_rule_name,
-                            peer_count = roster.peers.len(),
-                            has_jwt = roster.fleet_jwt.is_some(),
-                            peers_with_rules = roster.peers.values()
-                                .filter(|p| !p.serving_rules.is_empty())
-                                .count(),
-                            peer_staleness_secs = policy_snap.peer_staleness_secs,
-                            "Fleet Phase A: checking roster for rule match"
-                        );
-                        for (pid, peer) in &roster.peers {
-                            let age_secs = (chrono::Utc::now() - peer.last_seen).num_seconds();
-                            tracing::info!(
-                                peer_id = %pid,
-                                serving_rules = ?peer.serving_rules,
-                                models = ?peer.models_loaded,
-                                handle = ?peer.handle_path,
-                                stale = age_secs > policy_snap.peer_staleness_secs as i64,
-                                "Fleet peer state"
-                            );
-                        }
-                        if let Some(peer) = roster.find_peer_for_rule(
-                            &route.matched_rule_name,
-                            policy_snap.peer_staleness_secs,
-                        ) {
-                            let jwt = roster.fleet_jwt.clone().unwrap_or_default();
-                            if !jwt.is_empty() {
-                                let peer_clone = peer.clone();
-                                let rule_name = route.matched_rule_name.clone();
-                                // NB: route.max_wait_secs is the JOB wall-clock
-                                // bound on how long we await the callback.
-                                // policy_snap.dispatch_ack_timeout_secs is a
-                                // distinct ACK-phase timeout (how long we wait
-                                // for the 202 HTTP response).
-                                let job_wait_secs = route.max_wait_secs;
-                                // Clamp to at least 1s — a zero would cause the
-                                // orphan sweep to evict the entry on its first
-                                // tick, before the callback can arrive.
-                                let expected_timeout =
-                                    std::time::Duration::from_secs(job_wait_secs.max(1));
-                                drop(roster); // release lock before async
-
-                                let fleet_job_path = super::compute_chronicle::generate_job_path(
-                                    ctx, None, &config.primary_model, "fleet",
-                                );
-                                let fleet_start = std::time::Instant::now();
-                                let fleet_db_path = ctx
-                                    .map(|c| c.db_path.clone())
-                                    .or_else(|| {
-                                        config
-                                            .cache_access
-                                            .as_ref()
-                                            .map(|ca| ca.db_path.to_string())
-                                    });
-
-                                // Step 2: generate UUID for this dispatch.
-                                let job_id = uuid::Uuid::new_v4().to_string();
-
-                                // Step 4: oneshot channel — filled by the
-                                // server.rs /v1/fleet/result handler when the
-                                // peer's callback arrives, or dropped by the
-                                // orphan sweep (producing RecvError here).
-                                let (sender, receiver) =
-                                    tokio::sync::oneshot::channel::<crate::fleet::FleetAsyncResult>();
-
-                                // Step 5: register pending entry BEFORE dispatch
-                                // POST, so a very-fast peer callback cannot beat
-                                // our registration and produce a spurious orphan.
-                                //
-                                // peer_id MUST be peer.node_id (raw) — the
-                                // callback authenticates via fleet JWT whose
-                                // `nid` claim carries the raw node_id.
-                                fleet_ctx.pending.register(
-                                    job_id.clone(),
-                                    crate::fleet::PendingFleetJob {
-                                        sender,
-                                        dispatched_at: std::time::Instant::now(),
-                                        peer_id: peer_clone.node_id.clone(),
-                                        expected_timeout,
-                                    },
-                                );
-
-                                // Step 6: POST dispatch (202 ACK phase).
-                                let dispatch_result = crate::fleet::fleet_dispatch_by_rule(
-                                    &peer_clone,
-                                    &job_id,
-                                    &callback_url,
-                                    &rule_name,
-                                    system_prompt,
-                                    user_prompt,
-                                    temperature,
-                                    _max_tokens,
-                                    response_format,
-                                    &jwt,
-                                    policy_snap.dispatch_ack_timeout_secs,
-                                )
-                                .await;
-
-                                match dispatch_result {
-                                    Ok(ack) => {
-                                        // Step 9: chronicle fleet_dispatched_async
-                                        {
-                                            let chronicle_ctx = if let Some(sc) = ctx {
-                                                super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-                                                    sc, &fleet_job_path, "fleet_dispatched_async", "fleet",
-                                                )
-                                            } else {
-                                                super::compute_chronicle::ChronicleEventContext::minimal(
-                                                    &fleet_job_path, "fleet_dispatched_async", "fleet",
-                                                )
-                                                .with_model_id(config.primary_model.clone())
-                                            };
-                                            let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
-                                                "peer_id": peer_clone.node_id,
-                                                "peer_name": peer_clone.name,
-                                                "rule_name": rule_name,
-                                                "timeout_secs": job_wait_secs,
-                                                "peer_queue_depth": ack.peer_queue_depth,
-                                            }));
-                                            if let Some(ref db_path) = fleet_db_path {
-                                                let db_path = db_path.clone();
-                                                tokio::task::spawn_blocking(move || {
-                                                    if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                                                        let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
-                                                    }
-                                                });
-                                            }
-                                        }
-
-                                        // Step 10: two-phase await with pinned
-                                        // receiver. `timeout` consumes its
-                                        // future by value; pin once, then pass
-                                        // `receiver.as_mut()` on each call —
-                                        // `&mut receiver` would yield
-                                        // `&mut Pin<&mut Receiver>`, not a Future.
-                                        tokio::pin!(receiver);
-                                        let wait_outcome = match tokio::time::timeout(
-                                            std::time::Duration::from_secs(job_wait_secs),
-                                            receiver.as_mut(),
-                                        )
-                                        .await
-                                        {
-                                            Ok(Ok(r)) => Ok(r),
-                                            Ok(Err(_recv_err)) => {
-                                                // Sender dropped — sweep evicted
-                                                // the pending entry. Fall through.
-                                                Err("orphaned")
-                                            }
-                                            Err(_elapsed) => {
-                                                // Primary timeout — grace window
-                                                // for in-flight callbacks.
-                                                match tokio::time::timeout(
-                                                    std::time::Duration::from_secs(
-                                                        policy_snap.timeout_grace_secs,
-                                                    ),
-                                                    receiver.as_mut(),
-                                                )
-                                                .await
-                                                {
-                                                    Ok(Ok(r)) => Ok(r),
-                                                    _ => Err("timeout"),
-                                                }
-                                            }
-                                        };
-
-                                        // Idempotent cleanup — the callback or
-                                        // sweep may have already removed us.
-                                        let _ = fleet_ctx.pending.remove(&job_id);
-
-                                        match wait_outcome {
-                                            Ok(crate::fleet::FleetAsyncResult::Success(fleet_resp)) => {
-                                                // Chronicle fleet_result_received
-                                                {
-                                                    let chronicle_ctx = if let Some(sc) = ctx {
-                                                        super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-                                                            sc, &fleet_job_path, "fleet_result_received", "fleet",
-                                                        )
-                                                    } else {
-                                                        super::compute_chronicle::ChronicleEventContext::minimal(
-                                                            &fleet_job_path, "fleet_result_received", "fleet",
-                                                        )
-                                                        .with_model_id(config.primary_model.clone())
-                                                    };
-                                                    let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
-                                                        "peer_id": peer_clone.node_id,
-                                                        "peer_name": peer_clone.name,
-                                                        "peer_model": fleet_resp.peer_model,
-                                                        "latency_ms": fleet_start.elapsed().as_millis() as u64,
-                                                        "tokens_prompt": fleet_resp.prompt_tokens.unwrap_or(0),
-                                                        "tokens_completion": fleet_resp.completion_tokens.unwrap_or(0),
-                                                    }));
-                                                    if let Some(ref db_path) = fleet_db_path {
-                                                        let db_path = db_path.clone();
-                                                        tokio::task::spawn_blocking(move || {
-                                                            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                                                                let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
-                                                            }
-                                                        });
-                                                    }
-                                                }
-
-                                                return Ok(LlmResponse {
-                                                    content: fleet_resp.content,
-                                                    usage: super::types::TokenUsage {
-                                                        prompt_tokens: fleet_resp.prompt_tokens.unwrap_or(0),
-                                                        completion_tokens: fleet_resp.completion_tokens.unwrap_or(0),
-                                                    },
-                                                    generation_id: None,
-                                                    actual_cost_usd: None, // fleet is free (same operator)
-                                                    provider_id: Some("fleet".to_string()),
-                                                    fleet_peer_id: Some(
-                                                        peer_clone
-                                                            .handle_path
-                                                            .clone()
-                                                            .unwrap_or_else(|| peer_clone.node_id.clone()),
-                                                    ),
-                                                    fleet_peer_model: fleet_resp.peer_model.clone(),
-                                                });
-                                            }
-                                            Ok(crate::fleet::FleetAsyncResult::Error(err_msg)) => {
-                                                // Peer RAN inference and it failed
-                                                // (GPU OOM, model mismatch, etc.).
-                                                // Chronicle and fall through to local.
-                                                let chronicle_ctx = if let Some(sc) = ctx {
-                                                    super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-                                                        sc, &fleet_job_path, "fleet_result_failed", "fleet",
-                                                    )
-                                                } else {
-                                                    super::compute_chronicle::ChronicleEventContext::minimal(
-                                                        &fleet_job_path, "fleet_result_failed", "fleet",
-                                                    )
-                                                    .with_model_id(config.primary_model.clone())
-                                                };
-                                                let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
-                                                    "peer_id": peer_clone.node_id,
-                                                    "peer_name": peer_clone.name,
-                                                    "error": err_msg,
-                                                }));
-                                                if let Some(ref db_path) = fleet_db_path {
-                                                    let db_path = db_path.clone();
-                                                    tokio::task::spawn_blocking(move || {
-                                                        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                                                            let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
-                                                        }
-                                                    });
-                                                }
-                                                warn!(
-                                                    "Fleet peer {} inference failed, falling through to local",
-                                                    peer_clone.node_id
-                                                );
-                                            }
-                                            Err("timeout") => {
-                                                let chronicle_ctx = if let Some(sc) = ctx {
-                                                    super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-                                                        sc, &fleet_job_path, "fleet_dispatch_timeout", "fleet",
-                                                    )
-                                                } else {
-                                                    super::compute_chronicle::ChronicleEventContext::minimal(
-                                                        &fleet_job_path, "fleet_dispatch_timeout", "fleet",
-                                                    )
-                                                    .with_model_id(config.primary_model.clone())
-                                                };
-                                                let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
-                                                    "peer_id": peer_clone.node_id,
-                                                    "peer_name": peer_clone.name,
-                                                    "timeout_secs": job_wait_secs,
-                                                    "grace_secs": policy_snap.timeout_grace_secs,
-                                                }));
-                                                if let Some(ref db_path) = fleet_db_path {
-                                                    let db_path = db_path.clone();
-                                                    tokio::task::spawn_blocking(move || {
-                                                        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                                                            let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
-                                                        }
-                                                    });
-                                                }
-                                                warn!(
-                                                    "Fleet dispatch timeout awaiting callback from peer {}, falling through to local",
-                                                    peer_clone.node_id
-                                                );
-                                            }
-                                            Err(_orphaned) => {
-                                                // Sweep removed the entry before
-                                                // the callback arrived. Chronicle
-                                                // as dispatch_failed (reason=orphaned)
-                                                // so the observability trail does not
-                                                // silently drop this case.
-                                                let chronicle_ctx = if let Some(sc) = ctx {
-                                                    super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-                                                        sc, &fleet_job_path, "fleet_dispatch_failed", "fleet",
-                                                    )
-                                                } else {
-                                                    super::compute_chronicle::ChronicleEventContext::minimal(
-                                                        &fleet_job_path, "fleet_dispatch_failed", "fleet",
-                                                    )
-                                                    .with_model_id(config.primary_model.clone())
-                                                };
-                                                let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
-                                                    "peer_id": peer_clone.node_id,
-                                                    "peer_name": peer_clone.name,
-                                                    "error": "pending entry orphaned by sweep",
-                                                    "error_kind": "orphaned",
-                                                    "status_code": serde_json::Value::Null,
-                                                    "latency_ms": fleet_start.elapsed().as_millis() as u64,
-                                                }));
-                                                if let Some(ref db_path) = fleet_db_path {
-                                                    let db_path = db_path.clone();
-                                                    tokio::task::spawn_blocking(move || {
-                                                        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                                                            let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
-                                                        }
-                                                    });
-                                                }
-                                                warn!(
-                                                    "Fleet pending entry orphaned for peer {}, falling through to local",
-                                                    peer_clone.node_id
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        // Dispatch POST failed — remove entry
-                                        // (idempotent) and chronicle by status_code.
-                                        let _ = fleet_ctx.pending.remove(&job_id);
-
-                                        // 503 = peer overloaded; treat distinctly
-                                        // so analytics can show capacity pressure
-                                        // separately from hard failures.
-                                        let is_overloaded = e.status_code == Some(503);
-                                        let event_type = if is_overloaded {
-                                            "fleet_peer_overloaded"
-                                        } else {
-                                            "fleet_dispatch_failed"
-                                        };
-                                        let chronicle_ctx = if let Some(sc) = ctx {
-                                            super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-                                                sc, &fleet_job_path, event_type, "fleet",
-                                            )
-                                        } else {
-                                            super::compute_chronicle::ChronicleEventContext::minimal(
-                                                &fleet_job_path, event_type, "fleet",
-                                            )
-                                            .with_model_id(config.primary_model.clone())
-                                        };
-                                        let chronicle_ctx = if is_overloaded {
-                                            // Policy-derived retry-after — the
-                                            // peer's own Retry-After header is
-                                            // not parsed here (Phase 4 scope);
-                                            // the policy value is the fleet-wide
-                                            // backoff guidance.
-                                            chronicle_ctx.with_metadata(serde_json::json!({
-                                                "peer_id": peer_clone.node_id,
-                                                "peer_name": peer_clone.name,
-                                                "status_code": e.status_code,
-                                                "retry_after": policy_snap.admission_retry_after_secs,
-                                            }))
-                                        } else {
-                                            chronicle_ctx.with_metadata(serde_json::json!({
-                                                "peer_id": peer_clone.node_id,
-                                                "peer_name": peer_clone.name,
-                                                "error": e.message.clone(),
-                                                "error_kind": serde_json::to_value(&e.kind).unwrap_or_default(),
-                                                "status_code": e.status_code,
-                                                "latency_ms": fleet_start.elapsed().as_millis() as u64,
-                                            }))
-                                        };
-                                        if let Some(ref db_path) = fleet_db_path {
-                                            let db_path = db_path.clone();
-                                            tokio::task::spawn_blocking(move || {
-                                                if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                                                    let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
-                                                }
-                                            });
-                                        }
-
-                                        // Only remove peer from roster if it's
-                                        // actually dead (transport failure).
-                                        // Timeouts (524, client timeout) mean
-                                        // the peer is alive but slow —
-                                        // discovery membership belongs to
-                                        // heartbeat/announce, not dataplane
-                                        // RPC outcomes.
-                                        if e.is_peer_dead() {
-                                            let mut roster_w = roster_handle.write().await;
-                                            roster_w.remove_peer(&peer_clone.node_id);
-                                            warn!(
-                                                "Fleet dispatch: peer {} removed (transport failure): {}",
-                                                peer_clone.node_id, e
-                                            );
-                                        } else {
-                                            warn!(
-                                                "Fleet dispatch failed ({:?}), peer stays in roster: {}",
-                                                e.kind, e
-                                            );
-                                        }
-                                    }
-                                }
-                            } else {
-                                tracing::warn!(
-                                    rule = %route.matched_rule_name,
-                                    "Fleet dispatch skipped: fleet JWT is empty"
-                                );
-                            }
-                        } else {
-                            tracing::warn!(
-                                rule = %route.matched_rule_name,
-                                peer_count = roster.peers.len(),
-                                "Fleet dispatch skipped: no peer serves rule '{}'",
-                                route.matched_rule_name
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Filter "fleet" from providers before pool loop (fleet already tried or skipped)
-    if let Some(ref mut route) = resolved_route {
-        route.providers.retain(|e| e.provider_id != "fleet");
-    }
 
     // ── Phase B: Network (cross-operator peer) dispatch ──────────────
     //
@@ -2440,12 +2266,11 @@ pub async fn call_model_unified_with_audit_and_ctx(
 
     let call_started = std::time::Instant::now();
 
-    // Note: `provider_impl`, `secret`, `provider_type` from `build_call_provider`
-    // above are used only by Phase A (fleet) + Phase B (market) and the
-    // synthetic-entry fallback inside the walker. Former Phase D
-    // re-instantiated them on escalation — the walker re-instantiates per
-    // entry inside the pool branch, so the outer bindings are read-only
-    // now (no `mut` needed).
+    // Note: `provider_type` from `build_call_provider` is used by the
+    // Phase B market pre-loop (Wave 3 will inline) + the synthetic-entry
+    // fallback inside the walker. Former Phase D re-instantiated on
+    // escalation — the walker re-instantiates per entry inside the pool
+    // branch, so the outer bindings are read-only now (no `mut` needed).
 
     // ── Walker loop (Walker Re-Plan Wire 2.1 §3) ─────────────────────
     //
@@ -2454,12 +2279,13 @@ pub async fn call_model_unified_with_audit_and_ctx(
     // dispatch → three-tier EntryError (Retryable/RouteSkipped advance;
     // CallTerminal bubbles).
     //
-    // Wave 1 scope: pool-provider entries go through the walker with
-    // the full HTTP retry loop inlined. `"fleet"` and `"market"` entries
-    // are handled by the legacy Phase A/B pre-loop blocks BEFORE the
-    // walker runs (Wave 2/3 will inline them); when the walker meets
-    // them here it emits `network_route_skipped reason="wave1_not_implemented"`
-    // and advances.
+    // Wave 2 scope: pool + fleet entries go through the walker with
+    // full dispatch inlined. `"market"` entries still have no inline
+    // dispatch (Wave 3 will inline them); the walker emits
+    // `network_route_skipped reason="wave2_market_not_implemented"` and
+    // advances when it meets a market entry. The Phase B market pre-loop
+    // (below this comment block) still runs BEFORE the walker and
+    // handles market dispatch in the interim.
     //
     // `escalation_timeout_secs` retired (plan §2). `try_acquire_owned`
     // is non-blocking — saturation advances immediately rather than
@@ -2519,9 +2345,10 @@ pub async fn call_model_unified_with_audit_and_ctx(
             continue;
         }
 
-        // Wave 1: fleet + market are handled by legacy Phase A/B earlier;
-        // walker advances past them. Waves 2+3 inline them.
-        if matches!(branch, RouteBranch::Fleet | RouteBranch::Market) {
+        // Wave 2: market still handled by legacy Phase B pre-loop (above
+        // the walker); if a market entry reaches the walker, emit a
+        // not-implemented skip and advance. Wave 3 inlines market.
+        if matches!(branch, RouteBranch::Market) {
             emit_walker_chronicle(
                 ctx,
                 config,
@@ -2529,16 +2356,261 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 &walker_source_label,
                 &entry.provider_id,
                 serde_json::json!({
-                    "reason": "wave1_not_implemented",
-                    "branch": match branch {
-                        RouteBranch::Fleet => "fleet",
-                        RouteBranch::Market => "market",
-                        RouteBranch::Pool => "pool",
-                    },
+                    "reason": "wave2_market_not_implemented",
+                    "branch": "market",
                 }),
             );
-            skip_reasons.push(format!("{}:wave1_not_implemented", entry.provider_id));
+            skip_reasons
+                .push(format!("{}:wave2_market_not_implemented", entry.provider_id));
             continue;
+        }
+
+        // Wave 2: fleet branch — origin-gated + skip-fleet-dispatch-gated;
+        // snapshots fleet_ctx + policy + callback_url once (TOCTOU-safe);
+        // finds peer via roster; dispatches via `dispatch_fleet_entry`;
+        // three-tier classification per §4.1.
+        if matches!(branch, RouteBranch::Fleet) {
+            // Explicit per-call override (tests / scheduled replays).
+            // The primary fleet-replay guard is `branch_allowed(Fleet, origin)`
+            // above; this flag stays as a secondary explicit override.
+            if options.skip_fleet_dispatch {
+                tracing::debug!(
+                    entry = %entry.provider_id,
+                    "walker: fleet_replay_guard skip (skip_fleet_dispatch)",
+                );
+                skip_reasons.push(format!("{}:fleet_replay_guard", entry.provider_id));
+                continue;
+            }
+
+            // Rule-scoped by design — fleet serves rule names, not ad-hoc calls.
+            let route_ref = match resolved_route.as_ref() {
+                Some(r) if !r.matched_rule_name.is_empty() => r,
+                _ => {
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_NETWORK_ROUTE_UNAVAILABLE,
+                        &walker_source_label,
+                        &entry.provider_id,
+                        serde_json::json!({ "reason": "no_rule_match" }),
+                    );
+                    skip_reasons.push(format!("{}:no_rule_match", entry.provider_id));
+                    continue;
+                }
+            };
+
+            // Snapshot fleet_ctx + policy + callback_url atomically.
+            let fleet_ctx = match config.fleet_dispatch.as_ref() {
+                Some(c) => c.clone(),
+                None => {
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_NETWORK_ROUTE_UNAVAILABLE,
+                        &walker_source_label,
+                        &entry.provider_id,
+                        serde_json::json!({ "reason": "fleet_ctx_missing" }),
+                    );
+                    skip_reasons
+                        .push(format!("{}:fleet_ctx_missing", entry.provider_id));
+                    continue;
+                }
+            };
+            let policy_snap = fleet_ctx.policy.read().await.clone();
+            let callback_url = {
+                let ts = fleet_ctx.tunnel_state.read().await;
+                match (&ts.status, ts.tunnel_url.as_ref()) {
+                    (crate::tunnel::TunnelConnectionStatus::Connected, Some(u)) => {
+                        Some(u.endpoint("/v1/fleet/result"))
+                    }
+                    _ => None,
+                }
+            };
+            let callback_url = match callback_url {
+                Some(u) => u,
+                None => {
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_NETWORK_ROUTE_UNAVAILABLE,
+                        &walker_source_label,
+                        &entry.provider_id,
+                        serde_json::json!({ "reason": "tunnel_not_connected" }),
+                    );
+                    skip_reasons
+                        .push(format!("{}:tunnel_not_connected", entry.provider_id));
+                    continue;
+                }
+            };
+
+            let roster_handle = match config.fleet_roster.as_ref() {
+                Some(r) => r.clone(),
+                None => {
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_NETWORK_ROUTE_UNAVAILABLE,
+                        &walker_source_label,
+                        &entry.provider_id,
+                        serde_json::json!({ "reason": "fleet_roster_missing" }),
+                    );
+                    skip_reasons
+                        .push(format!("{}:fleet_roster_missing", entry.provider_id));
+                    continue;
+                }
+            };
+
+            // Acquire: non-blocking peer lookup. No permit held — fleet
+            // is not pool-limited.
+            let (peer, jwt) = {
+                let roster = roster_handle.read().await;
+                match roster.find_peer_for_rule(
+                    &route_ref.matched_rule_name,
+                    policy_snap.peer_staleness_secs,
+                ) {
+                    Some(peer) => {
+                        let jwt = roster.fleet_jwt.clone().unwrap_or_default();
+                        (peer.clone(), jwt)
+                    }
+                    None => {
+                        emit_walker_chronicle(
+                            ctx,
+                            config,
+                            super::compute_chronicle::EVENT_NETWORK_ROUTE_SKIPPED,
+                            &walker_source_label,
+                            &entry.provider_id,
+                            serde_json::json!({ "reason": "no_fleet_peer" }),
+                        );
+                        skip_reasons
+                            .push(format!("{}:no_fleet_peer", entry.provider_id));
+                        continue;
+                    }
+                }
+            };
+            if jwt.is_empty() {
+                emit_walker_chronicle(
+                    ctx,
+                    config,
+                    super::compute_chronicle::EVENT_NETWORK_ROUTE_SKIPPED,
+                    &walker_source_label,
+                    &entry.provider_id,
+                    serde_json::json!({ "reason": "jwt_unavailable" }),
+                );
+                skip_reasons.push(format!("{}:jwt_unavailable", entry.provider_id));
+                continue;
+            }
+
+            last_attempted_provider_id = Some(entry.provider_id.clone());
+
+            let rule_name = route_ref.matched_rule_name.clone();
+            let job_wait_secs = route_ref.max_wait_secs;
+
+            let fleet_outcome = dispatch_fleet_entry(FleetDispatchArgs {
+                config,
+                ctx,
+                fleet_ctx,
+                policy_snap,
+                callback_url,
+                roster_handle,
+                peer,
+                jwt,
+                rule_name,
+                job_wait_secs,
+                system_prompt,
+                user_prompt,
+                temperature,
+                max_tokens: _max_tokens,
+                response_format,
+            })
+            .await;
+
+            match fleet_outcome {
+                Ok(response) => {
+                    let latency_ms = call_started.elapsed().as_millis() as i64;
+                    let walker_ms = walker_started.elapsed().as_millis() as i64;
+
+                    if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
+                        let conn = audit_ctx.conn.lock().await;
+                        let _ = super::db::complete_llm_audit(
+                            &conn,
+                            id,
+                            &response.content,
+                            true,
+                            response.usage.prompt_tokens,
+                            response.usage.completion_tokens,
+                            latency_ms,
+                            response.generation_id.as_deref(),
+                            Some(entry.provider_id.as_str()),
+                        );
+                    }
+
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_WALKER_RESOLVED,
+                        &walker_source_label,
+                        &entry.provider_id,
+                        serde_json::json!({
+                            "latency_ms": latency_ms,
+                            "total_walker_ms": walker_ms,
+                            "attempts": entry_idx + 1,
+                        }),
+                    );
+
+                    return Ok(response);
+                }
+                Err(EntryError::Retryable { reason }) => {
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_NETWORK_ROUTE_RETRYABLE_FAIL,
+                        &walker_source_label,
+                        &entry.provider_id,
+                        serde_json::json!({ "reason": reason }),
+                    );
+                    skip_reasons
+                        .push(format!("{}:retryable({})", entry.provider_id, reason));
+                    continue;
+                }
+                Err(EntryError::RouteSkipped { reason }) => {
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_NETWORK_ROUTE_SKIPPED,
+                        &walker_source_label,
+                        &entry.provider_id,
+                        serde_json::json!({ "reason": reason }),
+                    );
+                    skip_reasons.push(format!(
+                        "{}:route_skipped({})",
+                        entry.provider_id, reason
+                    ));
+                    continue;
+                }
+                Err(EntryError::CallTerminal { reason }) => {
+                    // Per §4.1 plan: no fleet branch returns CallTerminal.
+                    // Defensive: bubble for unknown-variant future-proofing.
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_NETWORK_ROUTE_TERMINAL_FAIL,
+                        &walker_source_label,
+                        &entry.provider_id,
+                        serde_json::json!({ "reason": reason.clone() }),
+                    );
+                    if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
+                        let conn = audit_ctx.conn.lock().await;
+                        let _ = super::db::fail_llm_audit(
+                            &conn,
+                            id,
+                            &reason,
+                            last_attempted_provider_id.as_deref(),
+                        );
+                    }
+                    emit_step_error(ctx, &reason);
+                    return Err(anyhow!(reason));
+                }
+            }
         }
 
         // Pool branch — this entry is a registered provider (openrouter,
@@ -4601,18 +4673,15 @@ routing_rules:
     }
 
     #[tokio::test]
-    async fn walker_skips_fleet_and_market_entries_in_wave1() {
-        // Route = [fleet, market, unknown-pool]. In Wave 1 the legacy
-        // Phase A fleet filter at llm.rs:~1869 still runs BEFORE the
-        // walker, so by the time the walker iterates route.providers the
-        // `fleet` entry has been retained-removed by that filter. What
-        // the walker sees:
-        //   - market: branch_allowed(Market, Local) = true, Wave 1 emits
-        //     wave1_not_implemented skip.
+    async fn walker_skips_fleet_and_market_entries_in_wave2() {
+        // Route = [fleet, market, unknown-pool]. Wave 2 deletes the Phase A
+        // fleet pre-loop + fleet_filter, so the walker sees all 3 entries:
+        //   - fleet: runtime gate fails (fleet_ctx missing) → advance with
+        //     fleet_ctx_missing unavailable.
+        //   - market: Wave 2 emits wave2_market_not_implemented skip
+        //     (Wave 3 inlines market).
         //   - unknown-pool: provider_not_in_pool unavailable.
-        // Walker exhausts 2 entries (not 3 — the filter already dropped
-        // fleet). Waves 2+3 move fleet and market INTO the walker, at
-        // which point this count becomes 3.
+        // Walker exhausts 3 entries. Wave 3 will drop the market stub.
         let policy = walker_test_policy(1, vec!["fleet", "market", "unknown-pool"]);
         let config = walker_test_config(policy);
 
@@ -4635,11 +4704,11 @@ routing_rules:
             msg.contains("no viable route"),
             "expected 'no viable route' in error, got: {msg}",
         );
-        // Wave 1: fleet filter runs before walker, so only market +
-        // unknown-pool reach the walker. Wave 2 raises this to 3.
+        // Wave 2: fleet now walks (runtime-gate-fails) instead of
+        // pre-filter dropping. Walker sees all 3 entries.
         assert!(
-            msg.contains("2 entries"),
-            "expected '2 entries' (market + unknown-pool; fleet pre-filtered), got: {msg}",
+            msg.contains("3 entries"),
+            "expected '3 entries' (fleet + market + unknown-pool), got: {msg}",
         );
     }
 
@@ -4669,6 +4738,121 @@ routing_rules:
         assert!(
             msg.contains("no viable route"),
             "expected 'no viable route' in error, got: {msg}",
+        );
+    }
+
+    // ── Wave 2: walker fleet branch tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn walker_fleet_branch_advances_on_no_peer() {
+        // Route = [fleet, unknown-pool]. Fleet context is absent (test
+        // config) so the fleet branch runtime gate emits
+        // `fleet_ctx_missing` and advances; unknown-pool hits
+        // provider_not_in_pool unavailable; walker exhausts 2 entries.
+        //
+        // Compile-time assertion: this test would have failed against
+        // the Phase A pre-loop because the legacy fleet_filter retain
+        // would have removed the fleet entry before the walker saw it,
+        // yielding "1 entries" exhausted. Wave 2 deletes the pre-loop,
+        // so the walker counts all entries.
+        let policy = walker_test_policy(1, vec!["fleet", "unknown-pool"]);
+        let config = walker_test_config(policy);
+
+        let result = call_model_unified_with_audit_and_ctx(
+            &config,
+            None,
+            None,
+            "sys",
+            "usr",
+            0.0,
+            16,
+            None,
+            LlmCallOptions::default(),
+        )
+        .await;
+
+        let err = result.expect_err("walker should exhaust when fleet has no peer");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no viable route"),
+            "expected 'no viable route', got: {msg}",
+        );
+        assert!(
+            msg.contains("2 entries"),
+            "expected '2 entries' (fleet walks + unknown-pool), got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn walker_fleet_branch_respects_skip_fleet_dispatch() {
+        // With skip_fleet_dispatch = true the walker's fleet branch
+        // short-circuits with `fleet_replay_guard` and advances; the
+        // unknown-pool entry then exhausts. Total 2 entries walked.
+        let policy = walker_test_policy(1, vec!["fleet", "unknown-pool"]);
+        let config = walker_test_config(policy);
+
+        let mut options = LlmCallOptions::default();
+        options.skip_fleet_dispatch = true;
+
+        let result = call_model_unified_with_audit_and_ctx(
+            &config,
+            None,
+            None,
+            "sys",
+            "usr",
+            0.0,
+            16,
+            None,
+            options,
+        )
+        .await;
+
+        let err = result.expect_err("walker should exhaust with fleet skipped");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no viable route"),
+            "expected 'no viable route', got: {msg}",
+        );
+        assert!(
+            msg.contains("2 entries"),
+            "expected '2 entries' (fleet skipped + unknown-pool), got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn walker_fleet_branch_respects_branch_allowed() {
+        // dispatch_origin = FleetReceived → branch_allowed(Fleet, _) is
+        // false; the walker's generic runtime-gate skip fires BEFORE
+        // the fleet branch body runs (log-only, no chronicle). The
+        // unknown-pool entry still walks. Walker exhausts 2 entries.
+        let policy = walker_test_policy(1, vec!["fleet", "unknown-pool"]);
+        let config = walker_test_config(policy);
+
+        let mut options = LlmCallOptions::default();
+        options.dispatch_origin = DispatchOrigin::FleetReceived;
+
+        let result = call_model_unified_with_audit_and_ctx(
+            &config,
+            None,
+            None,
+            "sys",
+            "usr",
+            0.0,
+            16,
+            None,
+            options,
+        )
+        .await;
+
+        let err = result.expect_err("walker should exhaust under FleetReceived origin");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no viable route"),
+            "expected 'no viable route', got: {msg}",
+        );
+        assert!(
+            msg.contains("2 entries"),
+            "expected '2 entries' (fleet replay-gated + unknown-pool), got: {msg}",
         );
     }
 
