@@ -424,6 +424,41 @@ mod tests {
     }
 
     #[test]
+    fn test_try_acquire_owned_releases_permit_on_drop() {
+        // Walker-re-plan-wire-2.1 Wave 5 task 38. Confirms the walker's
+        // pool-branch Drop-semantics work: when a pool entry hits
+        // Retryable or RouteSkipped, the OwnedSemaphorePermit is dropped
+        // and the NEXT walker iteration's try_acquire_owned succeeds on
+        // the same pool. Without this, a single retryable failure would
+        // starve subsequent route entries pointing at the same pool.
+        let policy = test_policy();
+        let pools = ProviderPools::new(&policy);
+
+        // Ollama pool has concurrency=1 — easiest to observe the release.
+        let first = pools
+            .try_acquire_owned("ollama")
+            .expect("initial acquire on a fresh concurrency=1 pool");
+
+        // While the permit is held, a second try must fail.
+        let contested = pools.try_acquire_owned("ollama");
+        assert!(
+            matches!(contested, Err(AcquireError::Saturated)),
+            "pool must report saturation while the sole permit is held"
+        );
+
+        // Drop the first permit — walker branch does this implicitly on
+        // error/exit via scope. Capacity must return to the semaphore.
+        drop(first);
+
+        // Now the next try must succeed, confirming the permit really
+        // released on drop (not e.g. leaked into the pool's pending set).
+        let second = pools
+            .try_acquire_owned("ollama")
+            .expect("permit must be available after first was dropped");
+        drop(second);
+    }
+
+    #[test]
     fn test_try_acquire_owned_saturated_when_rate_limiter_full() {
         // Pool with rate_limit max_requests=1 over a long window; first call
         // consumes the quota, second returns Saturated.
