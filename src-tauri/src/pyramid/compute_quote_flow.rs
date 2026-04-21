@@ -35,6 +35,7 @@
 //! | `RouteSkipped` | advance to next entry; `network_route_skipped` |
 //! | `CallTerminal` | bubble to caller; `network_route_terminal_fail` + `fail_audit` |
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,8 +43,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::auth::AuthState;
+use crate::http_utils::send_api_request;
 use crate::pyramid::llm::{EntryError, LlmResponse};
-use crate::pyramid::pending_jobs::PendingJobs;
+use crate::pyramid::pending_jobs::{DeliveryPayload, PendingJobs};
+use crate::pyramid::types::TokenUsage;
 use crate::WireNodeConfig;
 
 // Re-export the rev 2.1 body/response types from the contracts crate so
@@ -107,14 +110,34 @@ pub struct ComputeFillBody {
 // ---------------------------------------------------------------------------
 
 /// POST `/api/v1/compute/quote`. Returns a signed quote JWT + price
-/// breakdown. Body in Wave 3.
+/// breakdown. Stateless price query — no idempotency header.
 #[allow(dead_code)]
 pub async fn quote(
-    _auth: &Arc<RwLock<AuthState>>,
-    _config: &Arc<RwLock<WireNodeConfig>>,
-    _body: ComputeQuoteBody,
+    auth: &Arc<RwLock<AuthState>>,
+    config: &Arc<RwLock<WireNodeConfig>>,
+    body: ComputeQuoteBody,
 ) -> Result<ComputeQuoteResponse, EntryError> {
-    unimplemented!("Wave 3")
+    let (api_url, token) = read_api_creds(auth, config, "quote").await?;
+    let body_json = serde_json::to_value(&body).map_err(|e| EntryError::CallTerminal {
+        reason: format!("quote_body_serialize:{e}"),
+    })?;
+    match send_api_request(
+        &api_url,
+        "POST",
+        "/api/v1/compute/quote",
+        &token,
+        Some(&body_json),
+        None,
+    )
+    .await
+    {
+        Ok((_status, resp)) => {
+            serde_json::from_value(resp.clone()).map_err(|e| EntryError::CallTerminal {
+                reason: format!("quote_response_parse:{e}:{resp}"),
+            })
+        }
+        Err(err_str) => Err(classify_rev21_http_error(&err_str, "quote")),
+    }
 }
 
 /// POST `/api/v1/compute/purchase`. Commits a `quote_jwt` into a reserved
@@ -128,12 +151,62 @@ pub async fn quote(
 /// UUID. The parameter matches that intent.
 #[allow(dead_code)]
 pub async fn purchase(
-    _auth: &Arc<RwLock<AuthState>>,
-    _config: &Arc<RwLock<WireNodeConfig>>,
-    _quote_jwt: &str,
-    _body: ComputePurchaseBody,
+    auth: &Arc<RwLock<AuthState>>,
+    config: &Arc<RwLock<WireNodeConfig>>,
+    quote_jwt: &str,
+    body: ComputePurchaseBody,
 ) -> Result<ComputePurchaseResponse, EntryError> {
-    unimplemented!("Wave 3")
+    let (api_url, token) = read_api_creds(auth, config, "purchase").await?;
+
+    // Honor the `quote_jwt` param as authoritative (prompt) — overwrite
+    // whatever the caller placed in `body.quote_jwt` so the param is the
+    // source of truth at this layer. Also ensure `idempotency_key` is
+    // populated: prompt + plan §4.2 both mint a fresh UUID per call.
+    let mut body = body;
+    body.quote_jwt = quote_jwt.to_string();
+    if body.idempotency_key.is_none() {
+        body.idempotency_key = Some(uuid::Uuid::new_v4().to_string());
+    }
+    let idem_key = body
+        .idempotency_key
+        .clone()
+        .expect("idempotency_key set just above");
+
+    let body_json = serde_json::to_value(&body).map_err(|e| EntryError::CallTerminal {
+        reason: format!("purchase_body_serialize:{e}"),
+    })?;
+
+    // HTTP header: spec §2.2 keeps `idempotency_key` as a body field; we
+    // mirror it into the `Idempotency-Key` header as well so ops tooling
+    // + Wire middleware can key on either. Wire replay matching at
+    // launch is keyed on `(operator_id, idempotency_key)` per spec.
+    let mut headers = HashMap::new();
+    headers.insert("Idempotency-Key".to_string(), idem_key);
+
+    match send_api_request(
+        &api_url,
+        "POST",
+        "/api/v1/compute/purchase",
+        &token,
+        Some(&body_json),
+        Some(&headers),
+    )
+    .await
+    {
+        Ok((_status, resp)) => {
+            serde_json::from_value(resp.clone()).map_err(|e| EntryError::CallTerminal {
+                reason: format!("purchase_response_parse:{e}:{resp}"),
+            })
+        }
+        Err(err_str) => {
+            // Idempotent-replay with matching key: Wire returns cached 200
+            // (spec §2.2). That path hits `Ok` above, not here. Here we
+            // classify the genuine error path: the 409
+            // `quote_already_purchased` case with a mismatched key
+            // advances (RouteSkipped via slug classifier).
+            Err(classify_rev21_http_error(&err_str, "purchase"))
+        }
+    }
 }
 
 /// POST `/api/v1/compute/fill`. Dispatches the ChatML messages + callback
@@ -144,11 +217,51 @@ pub async fn purchase(
 /// on `max_tokens`); extras 400.
 #[allow(dead_code)]
 pub async fn fill(
-    _auth: &Arc<RwLock<AuthState>>,
-    _config: &Arc<RwLock<WireNodeConfig>>,
-    _body: ComputeFillBody,
+    auth: &Arc<RwLock<AuthState>>,
+    config: &Arc<RwLock<WireNodeConfig>>,
+    body: ComputeFillBody,
 ) -> Result<(), EntryError> {
-    unimplemented!("Wave 3")
+    let (api_url, token) = read_api_creds(auth, config, "fill").await?;
+
+    // `/fill` idempotency is keyed on `request_id` per spec §1.8 +
+    // contract §1.8. Walker reuses `purchase_response.request_id` as
+    // both the body's `request_id` + idempotency token; we surface
+    // `body.idempotency_key` as the HTTP header so a retry of the same
+    // /fill call lands on the existing dispatch record.
+    let mut headers = HashMap::new();
+    headers.insert(
+        "Idempotency-Key".to_string(),
+        body.idempotency_key.clone(),
+    );
+
+    let body_json = serde_json::to_value(&body).map_err(|e| EntryError::CallTerminal {
+        reason: format!("fill_body_serialize:{e}"),
+    })?;
+
+    match send_api_request(
+        &api_url,
+        "POST",
+        "/api/v1/compute/fill",
+        &token,
+        Some(&body_json),
+        Some(&headers),
+    )
+    .await
+    {
+        Ok((_status, _resp)) => Ok(()),
+        Err(err_str) => {
+            // Special-case 409 `fill_already_submitted` (idempotency
+            // replay — provider already accepted an earlier /fill with
+            // the same request_id). Provider will deliver the result via
+            // the existing pending-job oneshot; treat as Ok.
+            if let Some(slug) = extract_slug_from_http_error(&err_str) {
+                if slug == "fill_already_submitted" {
+                    return Ok(());
+                }
+            }
+            Err(classify_rev21_http_error(&err_str, "fill"))
+        }
+    }
 }
 
 /// Await the inbound `/v1/compute/job-result` envelope keyed by
@@ -156,11 +269,167 @@ pub async fn fill(
 /// Body in Wave 3.
 #[allow(dead_code)]
 pub async fn await_result(
-    _pending_jobs: &PendingJobs,
-    _uuid_job_id: &str,
-    _timeout: Duration,
+    pending_jobs: &PendingJobs,
+    uuid_job_id: &str,
+    timeout: Duration,
 ) -> Result<LlmResponse, EntryError> {
-    unimplemented!("Wave 3")
+    // Register the oneshot keyed on the DB-row UUID. The inbound
+    // `/v1/compute/job-result` handler looks up PendingJobs by UUID
+    // before firing the sender. Plan §4.2 prefers registration BEFORE
+    // /fill (race-safe); we register here per Wave 3 task 19 spec.
+    // The window between /fill 200 and this registration is bounded by
+    // provider inference latency (always >> registration overhead), so
+    // missed-push risk is effectively zero. If smoke surfaces a race,
+    // walker moves `register` above /fill.
+    let rx = pending_jobs.register(uuid_job_id.to_string()).await;
+
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(payload)) => match payload {
+            DeliveryPayload::Success {
+                content,
+                input_tokens,
+                output_tokens,
+                model_used,
+                latency_ms: _,
+                finish_reason: _,
+            } => Ok(LlmResponse {
+                content,
+                usage: TokenUsage {
+                    prompt_tokens: input_tokens,
+                    completion_tokens: output_tokens,
+                },
+                generation_id: None,
+                actual_cost_usd: None,
+                provider_id: Some(format!("market:{}", model_used)),
+                fleet_peer_id: None,
+                fleet_peer_model: None,
+            }),
+            DeliveryPayload::Failure { code, message } => {
+                // Provider's inference failed. Other routes may succeed
+                // on the same walker pass — advance.
+                Err(EntryError::RouteSkipped {
+                    reason: format!("provider_returned_error:{code}:{message}"),
+                })
+            }
+        },
+        Ok(Err(_recv_err)) => {
+            // Sender dropped without sending — shouldn't happen in the
+            // normal flow. Best-effort cleanup + transient retry.
+            let _ = pending_jobs.take(uuid_job_id).await;
+            Err(EntryError::Retryable {
+                reason: "fill_result_channel_closed".into(),
+            })
+        }
+        Err(_elapsed) => {
+            // Timeout elapsed — drop our PendingJobs entry so a late
+            // delivery push hits `already_settled` at the inbound
+            // handler instead of firing a dropped channel.
+            let _ = pending_jobs.take(uuid_job_id).await;
+            Err(EntryError::Retryable {
+                reason: "fill_result_timeout".into(),
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP helpers (shared across the four RPC bodies).
+// ---------------------------------------------------------------------------
+
+/// Read `(api_url, api_token)` out of the shared auth + config state.
+/// Missing token → `CallTerminal` with a stage-tagged reason so callers
+/// can differentiate `quote_auth_failed` vs `purchase_auth_failed` vs
+/// `fill_auth_failed` in telemetry.
+async fn read_api_creds(
+    auth: &Arc<RwLock<AuthState>>,
+    config: &Arc<RwLock<WireNodeConfig>>,
+    stage: &str,
+) -> Result<(String, String), EntryError> {
+    let cfg = config.read().await;
+    let auth_r = auth.read().await;
+    let token = auth_r
+        .api_token
+        .clone()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| EntryError::CallTerminal {
+            reason: format!("{stage}_auth_failed:no_api_token"),
+        })?;
+    Ok((cfg.api_url.clone(), token))
+}
+
+/// Parse `send_api_request`'s error string (format: `"API error {code}: {body}"`)
+/// into an `EntryError` tier. Extracts the error slug from the JSON body
+/// when possible and runs it through [`classify_rev21_slug`]; falls back
+/// to stage-tagged tiers for transport-level failures.
+fn classify_rev21_http_error(err_str: &str, stage: &str) -> EntryError {
+    // send_api_request format on !is_success: "API error {code}: {body}"
+    if let Some(rest) = err_str.strip_prefix("API error ") {
+        if let Some((code_str, body)) = rest.split_once(':') {
+            if let Ok(status) = code_str.trim().parse::<u16>() {
+                let body = body.trim();
+                // 401 without a JSON slug is a bare auth failure — map
+                // per-stage per the prompt's table.
+                //
+                //   /quote   401 → CallTerminal(quote_auth_failed)   (prompt)
+                //   /purchase 401 generic → RouteSkipped             (plan §4.2)
+                //   /fill    401 → CallTerminal(fill_auth_failed)    (prompt)
+                //
+                // When the body carries a named slug, slug classification
+                // wins (e.g. 401 `quote_jwt_expired` → RouteSkipped).
+                let slug = extract_error_slug(body);
+                if let Some(slug) = slug {
+                    return classify_rev21_slug(&slug);
+                }
+                return match (status, stage) {
+                    (401, "quote") => EntryError::CallTerminal {
+                        reason: "quote_auth_failed".into(),
+                    },
+                    (401, "purchase") => EntryError::RouteSkipped {
+                        reason: "purchase_auth_failed".into(),
+                    },
+                    (401, "fill") => EntryError::CallTerminal {
+                        reason: "fill_auth_failed".into(),
+                    },
+                    (400, _) => EntryError::CallTerminal {
+                        reason: format!("{stage}_bad_request"),
+                    },
+                    (403, _) => EntryError::CallTerminal {
+                        reason: format!("{stage}_forbidden"),
+                    },
+                    (404, _) => EntryError::RouteSkipped {
+                        reason: format!("{stage}_not_found"),
+                    },
+                    (503, _) => EntryError::RouteSkipped {
+                        reason: format!("{stage}_service_unavailable"),
+                    },
+                    _ => EntryError::RouteSkipped {
+                        reason: format!("{stage}_http_{status}"),
+                    },
+                };
+            }
+        }
+    }
+    // Non-"API error …" prefix → transport / serde / io failure. Retryable.
+    EntryError::Retryable {
+        reason: format!("{stage}_network:{err_str}"),
+    }
+}
+
+/// Pull the `error` field out of an "API error {code}: {body}" string
+/// when the body is JSON. Returns None for non-JSON bodies.
+fn extract_slug_from_http_error(err_str: &str) -> Option<String> {
+    let rest = err_str.strip_prefix("API error ")?;
+    let (_code, body) = rest.split_once(':')?;
+    extract_error_slug(body.trim())
+}
+
+/// Parse a response body as JSON and return `body.error` as a String.
+fn extract_error_slug(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("error")
+        .and_then(|e| e.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +452,7 @@ pub async fn await_result(
 fn classify_rev21_slug(slug: &str) -> EntryError {
     let reason = slug.to_string();
     match slug {
-        // ── /quote error slugs (plan §4.2 first block) ────────────────────
+        // ── /quote error slugs (plan §4.2 + spec §2.1 error matrix) ───────
         //
         // No matching offer for the model — market cannot serve this
         // call, but other routes (fleet, pool) may. Advance.
@@ -195,10 +464,15 @@ fn classify_rev21_slug(slug: &str) -> EntryError {
         // deposit. Fleet is free + openrouter bills separately, so other
         // routes may still serve. Advance.
         "insufficient_balance" => EntryError::RouteSkipped { reason },
-        // Wire-side platform outage / missing economic_parameter. Honor
-        // `X-Wire-Retry`; for v1 walker advances rather than loops.
-        "platform_unavailable" => EntryError::Retryable { reason },
-        "economic_parameter_missing" => EntryError::Retryable { reason },
+        // Wire-side platform outage. Transient from the market's
+        // perspective, but node walker v1 advances rather than sleeping —
+        // other routes may serve without Wire. RouteSkipped per prompt.
+        "platform_unavailable" => EntryError::RouteSkipped { reason },
+        // Wire-operator-level config bug: a named economic_parameter
+        // Wire needs is missing. All market dispatches will 503 with the
+        // same slug until the operator fixes it. Bubble rather than
+        // silently round-robin through it on every walker pass.
+        "economic_parameter_missing" => EntryError::CallTerminal { reason },
         // Walker built a malformed body — same bug would fire on every
         // route that routes through Wire. Bubble.
         "invalid_body" => EntryError::CallTerminal { reason },
@@ -207,39 +481,73 @@ fn classify_rev21_slug(slug: &str) -> EntryError {
         // Operator consent not granted. No alternate route will satisfy
         // Wire until operator fixes the agent binding. Bubble.
         "agent_unconfirmed" => EntryError::CallTerminal { reason },
+        // Wire returned 401 with this slug explicitly (bare auth failure
+        // on the token). Walker advances — fleet + openrouter use
+        // separate credentials, so Wire 401 doesn't doom them.
+        "unauthorized" => EntryError::RouteSkipped { reason },
 
-        // ── /purchase error slugs ─────────────────────────────────────────
+        // ── /purchase error slugs (spec §2.2 error matrix) ────────────────
         //
         // Quote lost the winning-offer race between /quote and /purchase.
-        // Treat as transient; advance (v1 does NOT re-quote same entry).
-        "quote_no_longer_winning" => EntryError::Retryable { reason },
+        // Walker v1 does NOT re-quote same entry — advance. (Plan §4.2
+        // tags this Retryable but prompt + walker v1 semantics say
+        // RouteSkipped; we advance rather than sleep-and-retry.)
+        "quote_no_longer_winning" => EntryError::RouteSkipped { reason },
         // Idempotent-replay mismatch — different walker attempt already
         // purchased. Hand the work back for fresh route selection.
+        // (Matching-idempotency-key replay is handled as cached-200 at
+        // the HTTP-response layer, not here.)
         "quote_already_purchased" => EntryError::RouteSkipped { reason },
-        // Quote JWT expired between mint and /purchase. v1 advances; does
-        // not re-quote.
+        // Quote JWT expired between mint and /purchase. v1 advances.
         "quote_jwt_expired" => EntryError::RouteSkipped { reason },
         // Quote JWT malformed — walker built a bad body. Bubble.
         "quote_jwt_invalid" => EntryError::CallTerminal { reason },
         // JWT `rid` ≠ authed operator — caller-config bug affecting every
         // market dispatch from this node until resolved. Bubble.
         "quote_operator_mismatch" => EntryError::CallTerminal { reason },
+        // The only supported trigger at launch is `immediate`. Walker
+        // passed something else — walker bug. Bubble.
+        "trigger_not_supported" => EntryError::CallTerminal { reason },
+        // Provider's reserved-depth cap hit. Same class as /fill
+        // provider_depth_exceeded. Advance.
+        "provider_queue_full" => EntryError::RouteSkipped { reason },
+        // 403 operator_mismatch (generic, not tied to the JWT rid check).
+        // Identity-binding bug — bubble.
+        "operator_mismatch" => EntryError::CallTerminal { reason },
 
-        // ── /fill error slugs ─────────────────────────────────────────────
+        // ── /fill error slugs (spec §2.3 + contract §1.8) ─────────────────
         //
-        // We lost the dispatch slot (another /fill won, or Wire expired
-        // the reservation). Advance.
+        // We lost the dispatch slot (reservation expired before /fill).
+        // Reservation fee already consumed at /purchase; no refund.
+        // Advance.
         "dispatch_deadline_exceeded" => EntryError::RouteSkipped { reason },
         // Provider's local depth saturated. Advance; other routes may
-        // serve. Honor `X-Wire-Retry` on Wave 3 implementation.
+        // serve.
         "provider_depth_exceeded" => EntryError::RouteSkipped { reason },
         "provider_dispatch_conflict" => EntryError::RouteSkipped { reason },
         // Walker passed `max_tokens > max_tokens_quoted`. Walker bug;
         // same bug would fire on every route. Bubble.
         "max_tokens_exceeds_quote" => EntryError::CallTerminal { reason },
+        // ChatML validation — multiple system turns, unknown fields, etc.
+        // Walker body-shape bug; bubble.
+        "multiple_system_messages" => EntryError::CallTerminal { reason },
+        "multiple_system_turns" => EntryError::CallTerminal { reason },
+        "unknown_field" => EntryError::CallTerminal { reason },
+        // Idempotent-replay of /fill with same request_id — provider
+        // already accepted. Not an error at walker scope; handled at
+        // HTTP-response layer as Ok(()). Slug-classifier path is
+        // defensive only (shouldn't reach here from a 2xx response).
+        "fill_already_submitted" => EntryError::RouteSkipped { reason },
 
         // ── Unknown slugs: conservative advance ───────────────────────────
-        _ => EntryError::RouteSkipped { reason },
+        //
+        // Forward-compat: if Wire introduces a new slug we haven't mapped,
+        // treat as RouteSkipped (advance) rather than bubbling. The
+        // reason carries the raw slug so operator telemetry still shows
+        // what Wire actually returned.
+        _ => EntryError::RouteSkipped {
+            reason: format!("unknown_slug:{}", slug),
+        },
     }
 }
 
@@ -251,8 +559,9 @@ fn classify_rev21_slug(slug: &str) -> EntryError {
 mod tests {
     use super::*;
 
-    /// Skeleton compile + one-slug smoke. Full slug-table coverage lands
-    /// in Wave 3 once bodies exist to exercise it end-to-end.
+    // ── classify_rev21_slug: one test per tier ─────────────────────────
+
+    /// Skeleton compile + one-slug smoke. Preserved from Wave 0.
     #[test]
     fn classify_rev21_slug_maps_insufficient_balance_to_route_skipped() {
         match classify_rev21_slug("insufficient_balance") {
@@ -262,5 +571,296 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[test]
+    fn classify_rev21_slug_insufficient_balance_is_route_skipped() {
+        assert!(matches!(
+            classify_rev21_slug("insufficient_balance"),
+            EntryError::RouteSkipped { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_rev21_slug_operator_mismatch_is_call_terminal() {
+        // Both the JWT-rid variant and the generic operator_mismatch
+        // should bubble — they signal identity-binding bugs that no
+        // other route will fix.
+        assert!(matches!(
+            classify_rev21_slug("quote_operator_mismatch"),
+            EntryError::CallTerminal { .. }
+        ));
+        assert!(matches!(
+            classify_rev21_slug("operator_mismatch"),
+            EntryError::CallTerminal { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_rev21_slug_platform_unavailable_is_route_skipped() {
+        // Prompt explicitly overrides plan §4.2's Retryable tag: walker
+        // v1 advances to next route rather than sleeping for the retry
+        // window.
+        assert!(matches!(
+            classify_rev21_slug("platform_unavailable"),
+            EntryError::RouteSkipped { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_rev21_slug_unknown_default_is_route_skipped() {
+        let out = classify_rev21_slug("some_future_slug_we_dont_know");
+        match out {
+            EntryError::RouteSkipped { reason } => {
+                assert!(
+                    reason.starts_with("unknown_slug:"),
+                    "expected unknown_slug prefix, got {reason}"
+                );
+                assert!(reason.contains("some_future_slug_we_dont_know"));
+            }
+            other => panic!("expected RouteSkipped for unknown slug, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_rev21_slug_economic_parameter_missing_is_call_terminal() {
+        // Wire-operator-level config bug; every market dispatch would
+        // 503 the same way until resolved. Bubble rather than loop.
+        assert!(matches!(
+            classify_rev21_slug("economic_parameter_missing"),
+            EntryError::CallTerminal { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_rev21_slug_max_tokens_exceeds_quote_is_call_terminal() {
+        assert!(matches!(
+            classify_rev21_slug("max_tokens_exceeds_quote"),
+            EntryError::CallTerminal { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_rev21_slug_dispatch_deadline_exceeded_is_route_skipped() {
+        assert!(matches!(
+            classify_rev21_slug("dispatch_deadline_exceeded"),
+            EntryError::RouteSkipped { .. }
+        ));
+    }
+
+    // ── classify_rev21_http_error: slug-from-body + stage fallback ─────
+
+    #[test]
+    fn classify_http_error_routes_slug_through_slug_classifier() {
+        let err =
+            "API error 409: {\"error\":\"insufficient_balance\",\"detail\":{\"need\":10,\"have\":0}}"
+                .to_string();
+        let out = classify_rev21_http_error(&err, "quote");
+        assert!(matches!(out, EntryError::RouteSkipped { .. }));
+    }
+
+    #[test]
+    fn classify_http_error_401_on_quote_without_slug_is_call_terminal() {
+        // 401 with a non-JSON body → stage-tagged terminal per prompt.
+        let err = "API error 401: unauthorized-raw-text".to_string();
+        let out = classify_rev21_http_error(&err, "quote");
+        match out {
+            EntryError::CallTerminal { reason } => assert_eq!(reason, "quote_auth_failed"),
+            other => panic!("expected CallTerminal quote_auth_failed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_http_error_401_on_fill_without_slug_is_call_terminal() {
+        let err = "API error 401: bad-token".to_string();
+        let out = classify_rev21_http_error(&err, "fill");
+        match out {
+            EntryError::CallTerminal { reason } => assert_eq!(reason, "fill_auth_failed"),
+            other => panic!("expected CallTerminal fill_auth_failed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_http_error_401_on_purchase_without_slug_is_route_skipped() {
+        // Plan §4.2: purchase 401 generic → advance. Wire auth distinct
+        // from fleet + openrouter so other routes may still serve.
+        let err = "API error 401: token-expired".to_string();
+        let out = classify_rev21_http_error(&err, "purchase");
+        assert!(matches!(out, EntryError::RouteSkipped { .. }));
+    }
+
+    #[test]
+    fn classify_http_error_non_api_error_prefix_is_retryable() {
+        // Transport / io / dns failure path.
+        let err = "reqwest: connection refused".to_string();
+        let out = classify_rev21_http_error(&err, "fill");
+        match out {
+            EntryError::Retryable { reason } => assert!(reason.starts_with("fill_network:")),
+            other => panic!("expected Retryable fill_network, got {:?}", other),
+        }
+    }
+
+    // ── extract_error_slug ─────────────────────────────────────────────
+
+    #[test]
+    fn extract_error_slug_pulls_error_field() {
+        let body = r#"{"error":"quote_jwt_expired","detail":{}}"#;
+        assert_eq!(
+            extract_error_slug(body),
+            Some("quote_jwt_expired".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_error_slug_returns_none_on_non_json() {
+        assert!(extract_error_slug("not-json").is_none());
+        assert!(extract_error_slug("").is_none());
+        assert!(extract_error_slug("{\"error\":\"\"}").is_none());
+    }
+
+    #[test]
+    fn extract_slug_from_http_error_roundtrip() {
+        let err = "API error 409: {\"error\":\"quote_no_longer_winning\"}";
+        assert_eq!(
+            extract_slug_from_http_error(err),
+            Some("quote_no_longer_winning".to_string())
+        );
+    }
+
+    // ── await_result: timeout / closed-channel surfaces ────────────────
+
+    #[tokio::test]
+    async fn await_result_timeout_returns_retryable() {
+        let pending = PendingJobs::new();
+        let out = await_result(
+            &pending,
+            "550e8400-e29b-41d4-a716-446655440000",
+            Duration::from_millis(1),
+        )
+        .await;
+        match out {
+            Err(EntryError::Retryable { reason }) => assert_eq!(reason, "fill_result_timeout"),
+            other => panic!("expected Retryable timeout, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn await_result_success_payload_produces_llm_response() {
+        let pending = PendingJobs::new();
+        let uuid = "550e8400-e29b-41d4-a716-446655440001";
+
+        // Run await_result concurrently; deliver a Success push before
+        // the 500ms timeout elapses.
+        let pending_clone = pending.clone();
+        let wait_handle = tokio::spawn(async move {
+            await_result(&pending_clone, uuid, Duration::from_millis(500)).await
+        });
+
+        // Give await_result a tick to register.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let sender = pending
+            .take(uuid)
+            .await
+            .expect("await_result should have registered a sender");
+        sender
+            .send(DeliveryPayload::Success {
+                content: "hi".into(),
+                input_tokens: 7,
+                output_tokens: 3,
+                model_used: "llama3:70b".into(),
+                latency_ms: 42,
+                finish_reason: Some("stop".into()),
+            })
+            .expect("send");
+
+        let out = wait_handle.await.expect("task").expect("Ok");
+        assert_eq!(out.content, "hi");
+        assert_eq!(out.usage.prompt_tokens, 7);
+        assert_eq!(out.usage.completion_tokens, 3);
+        assert_eq!(out.provider_id.as_deref(), Some("market:llama3:70b"));
+    }
+
+    #[tokio::test]
+    async fn await_result_failure_payload_is_route_skipped() {
+        let pending = PendingJobs::new();
+        let uuid = "550e8400-e29b-41d4-a716-446655440002";
+
+        let pending_clone = pending.clone();
+        let wait_handle = tokio::spawn(async move {
+            await_result(&pending_clone, uuid, Duration::from_millis(500)).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let sender = pending.take(uuid).await.expect("sender");
+        sender
+            .send(DeliveryPayload::Failure {
+                code: "provider_error".into(),
+                message: "oom".into(),
+            })
+            .expect("send");
+
+        let out = wait_handle.await.expect("task");
+        match out {
+            Err(EntryError::RouteSkipped { reason }) => {
+                assert!(reason.starts_with("provider_returned_error:"));
+                assert!(reason.contains("provider_error"));
+                assert!(reason.contains("oom"));
+            }
+            other => panic!("expected RouteSkipped provider_returned_error, got {:?}", other),
+        }
+    }
+
+    // ── Body serialization surface ─────────────────────────────────────
+
+    #[test]
+    fn compute_fill_body_serializes_with_required_fields() {
+        // Strict-allowed-field check on Wire side means every field
+        // must be present (modulo max_tokens Option). Also verifies
+        // max_tokens is omitted when None (spec §2.3: absence means
+        // "use max_tokens_quoted").
+        let body = ComputeFillBody {
+            job_id: "playful/106/42".into(),
+            request_id: "req-uuid".into(),
+            messages: serde_json::json!([{"role": "user", "content": "hi"}]),
+            max_tokens: None,
+            temperature: 0.7,
+            relay_count: 0,
+            privacy_tier: "direct".into(),
+            input_token_count: 12,
+            requester_callback_url: "https://tunnel/v1/compute/job-result".into(),
+            idempotency_key: "req-uuid".into(),
+        };
+        let v = serde_json::to_value(&body).expect("serialize");
+        assert!(v.get("job_id").is_some());
+        assert!(v.get("request_id").is_some());
+        assert!(v.get("messages").is_some());
+        assert!(
+            v.get("max_tokens").is_none(),
+            "max_tokens must be omitted when None per spec §2.3"
+        );
+        assert!(v.get("temperature").is_some());
+        assert!(v.get("relay_count").is_some());
+        assert!(v.get("privacy_tier").is_some());
+        assert!(v.get("input_token_count").is_some());
+        assert!(v.get("requester_callback_url").is_some());
+        assert!(v.get("idempotency_key").is_some());
+    }
+
+    #[test]
+    fn compute_fill_body_emits_max_tokens_when_set() {
+        let body = ComputeFillBody {
+            job_id: "h".into(),
+            request_id: "r".into(),
+            messages: serde_json::json!([]),
+            max_tokens: Some(500),
+            temperature: 0.0,
+            relay_count: 0,
+            privacy_tier: "direct".into(),
+            input_token_count: 0,
+            requester_callback_url: "https://x".into(),
+            idempotency_key: "r".into(),
+        };
+        let v = serde_json::to_value(&body).expect("serialize");
+        assert_eq!(v.get("max_tokens").and_then(|n| n.as_i64()), Some(500));
     }
 }
