@@ -1430,7 +1430,12 @@ pub async fn call_model_unified_with_audit_and_ctx(
     // fields. Either way the resulting `Box<dyn LlmProvider>` owns the
     // URL, headers, and response parser — `llm.rs` no longer encodes
     // any of that.
-    let (mut provider_impl, mut secret, mut provider_type, provider_id) = build_call_provider(config)?;
+    //
+    // `_provider_impl` + `_secret` are unused today — the walker re-instantiates
+    // per-entry (Wave 1), and Phase A (fleet) / Phase B (market) dispatch
+    // don't touch them. Kept in the destructure for clarity when Waves 2-3
+    // inline those phases; underscore-prefixed to silence unused-var warnings.
+    let (_provider_impl, _secret, provider_type, provider_id) = build_call_provider(config)?;
 
     // Phase D: resolve the dispatch route BEFORE the retry loop so we
     // have the provider preference chain for escalation. When no policy
@@ -2435,12 +2440,12 @@ pub async fn call_model_unified_with_audit_and_ctx(
 
     let call_started = std::time::Instant::now();
 
-    // Suppress unused-var warnings on the former Phase D's mutable bindings.
-    // `provider_impl`, `secret`, and `provider_type` were mutable because
-    // Phase D re-instantiated them on escalation. The walker re-instantiates
-    // per entry inside the pool branch, so the outer bindings are now pure
-    // fallback state when no route exists.
-    let _ = (&mut provider_impl, &mut secret, &mut provider_type);
+    // Note: `provider_impl`, `secret`, `provider_type` from `build_call_provider`
+    // above are used only by Phase A (fleet) + Phase B (market) and the
+    // synthetic-entry fallback inside the walker. Former Phase D
+    // re-instantiated them on escalation — the walker re-instantiates per
+    // entry inside the pool branch, so the outer bindings are read-only
+    // now (no `mut` needed).
 
     // ── Walker loop (Walker Re-Plan Wire 2.1 §3) ─────────────────────
     //
@@ -2493,9 +2498,9 @@ pub async fn call_model_unified_with_audit_and_ctx(
     // `last_attempted_provider_id` is written whenever the walker enters
     // a pool branch (before HTTP dispatch). On `CallTerminal` the audit
     // row stamps this value so downstream debugging can see which entry
-    // rejected. The initial `None` is intentional (no entry attempted
-    // yet); warnings about "value assigned never read" would fire if we
-    // remove the init — leave the #[allow] here.
+    // rejected. Compiler warns when the walker exhausts without any pool
+    // attempt (fleet/market-only routes) because the write is then never
+    // read; the #[allow] covers that case.
     #[allow(unused_assignments)]
     let mut last_attempted_provider_id: Option<String> = None;
     let mut skip_reasons: Vec<String> = Vec::new();
@@ -3284,32 +3289,6 @@ pub async fn call_model_unified_with_audit_and_ctx(
     }
     emit_step_error(ctx, &err_msg);
     Err(anyhow!(err_msg))
-}
-
-/// Phase 18b: helper for the inner function's terminal-error sites.
-/// When an audit row was inserted at the top of the function, this
-/// flips it to `status = 'failed'` so the audit trail isn't left with
-/// a dangling pending row. Acquires the audit conn lock for the
-/// duration of the UPDATE.
-///
-/// Walker Re-Plan Wire 2.1 Wave 1: walker now writes audit outcomes
-/// inline and knows the winning / last-attempted provider_id, so this
-/// helper's only caller moved. Kept `#[allow(dead_code)]` because
-/// Waves 2-3 inline the fleet + market branches and may reintroduce
-/// the helper for their bubble paths.
-#[allow(dead_code)]
-async fn maybe_fail_audit(
-    audit: Option<&AuditContext>,
-    audit_id: Option<i64>,
-    error_message: &str,
-) {
-    if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
-        let conn = audit_ctx.conn.lock().await;
-        // Walker Re-Plan Wire 2.1 Wave 1 task 11: legacy (pre-walker) call
-        // site — provider_id stamping is the walker's job in Wave 1 tasks
-        // 8-10. Pre-walker failures keep provider_id NULL.
-        let _ = super::db::fail_llm_audit(&conn, id, error_message, None);
-    }
 }
 
 // ── Phase 6: Cache support types and helpers ────────────────────────────────
