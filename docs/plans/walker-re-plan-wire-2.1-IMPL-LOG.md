@@ -21,6 +21,43 @@ Entry template:
 **Deviation:** None / <rationale if any>
 -->
 
+## 2026-04-21 — commits 6b83a86 + 42b5366 + ef51f7a (branch walker-re-plan-wire-2.1)
+
+**Plan task:** Wave 1 tasks 8 + 9 + 10 — walker loop replaces Phase D; HTTP retry relocated into pool-provider branch; `try_acquire_owned` abstraction with plan §3 error taxonomy.
+
+**Changed (3 atomic commits):**
+- `6b83a86` — `src-tauri/src/pyramid/compute_chronicle.rs`: 19 `EVENT_*` constants per handoff §"Chronicle event constants to add" (`EVENT_WALKER_RESOLVED`, `EVENT_WALKER_EXHAUSTED`, `EVENT_NETWORK_ROUTE_{SKIPPED,SATURATED,UNAVAILABLE,RETRYABLE_FAIL,TERMINAL_FAIL,…}` + 12 more deferred-emission constants). Gated `#[allow(dead_code)]` until Waves 2-4 wire up remaining emitters.
+- `42b5366` — `src-tauri/src/pyramid/llm.rs`: walker loop + helpers. +864 / -545 LOC.
+  - New `emit_walker_chronicle()` + two thin helpers above `struct NetworkHandleInfo` — unified fire-and-forget chronicle emitter for all walker events.
+  - Former Phase D escalation block (~2366-2416) + former shared HTTP retry loop (~2485-2969) collapsed into a per-entry walker over `resolved_route.providers` (or a synthetic single-entry fallback when no route is configured, preserving pre-walker tests + pre-init behavior).
+  - Provider impl re-instantiated per entry from the registry (or `build_call_provider()` fallback); the outer hoisted `provider_impl` / `secret` / `provider_type` from llm.rs:1361 are now only used to seed the synthetic fallback entry. Resolves the ownership conflict the plan flagged (prompt: "per-entry provider-trait instantiation").
+  - `tokio::time::timeout(…, pools.acquire(…))` wrap retired; `try_acquire_owned` is non-blocking and `AcquireError::{Saturated, Unavailable}` advance immediately.
+  - HTTP retry loop wrapped in `'http: { loop { … break 'http Err(EntryError::…) } }` — terminal conditions raise three-tier `EntryError` rather than bubbling with `return Err`. 401/403 = `RouteSkipped`; 404 = `CallTerminal`; 400 non-context-exceeded terminal = `CallTerminal`; other terminal or retry-exhausted = `Retryable`. Context-exceeded 400 cascade still loops SAME entry via `use_model` mutation.
+  - Audit exit per plan §8 task 11: success → `complete_llm_audit(…, Some(winning_entry.provider_id))`; `CallTerminal` → `fail_llm_audit(…, last_attempted_provider_id)`; exhaustion → `fail_llm_audit(…, "no viable route", None)`.
+  - Chronicle source label derived from `options.dispatch_origin.source_label()` — NOT hardcoded `"network"` or `"local"`.
+  - `maybe_fail_audit` helper at llm.rs:~3287 kept with `#[allow(dead_code)]`; its former single caller (the old HTTP retry block) is gone, but Waves 2-3 may reintroduce fleet/market bubble paths that need it.
+- `ef51f7a` — three `#[tokio::test]` walker tests in `pyramid::llm::tests`:
+  - `walker_exhausts_when_no_entry_viable` — one unknown pool entry → Unavailable → exhaustion.
+  - `walker_skips_fleet_and_market_entries_in_wave1` — `[fleet, market, unknown-pool]`; fleet is pre-filtered by the legacy Phase A filter (Wave 1 intermediate state), walker sees 2 entries (market + unknown), both skip/unavailable, exhausts with "2 entries" in the error string. Test doc-comments call out that Wave 2 raises this to 3.
+  - `walker_advances_on_pool_saturation` — pool concurrency=0 → permanently saturated → walker advance → exhaustion.
+
+**Cargo check:** clean (default target, `cargo check` from `src-tauri/`). 72 warnings total (71 lib + 1 bin) — same count as post-chronicle-constants baseline; walker surgery introduced zero new warnings. No `warning:` rows against `src/pyramid/llm.rs` or `src/pyramid/compute_chronicle.rs`.
+
+**Cargo test:** `cargo test --lib walker_` — 3/3 walker-tests pass (plus 3 pre-existing walker-named tests from Wave 0). Full suite `cargo test --lib` — 1761 passed, 15 failed. Delta vs Wave 1 task 11 baseline (1758 + 15): +3 new walker tests, zero regressions on the pre-existing 1758. The 15 pre-existing failures are the same tracked set (yaml_renderer, etc.) untouched by this surgery.
+
+**Deviations from plan:**
+- Plan describes the walker as a simple `for (i, entry) in route.providers.iter()` loop. Implementation materializes `walker_entries: Vec<RouteEntry>` once so the no-route / empty-route case can synthesize a single-entry fallback without duplicating the loop body. The plan's §3 pseudocode assumed `route` was always present; the existing dispatcher supports a no-route path (tests, pre-init) that needs preservation.
+- Plan §4.3 gate order was "branch_allowed → acquire → dispatch." Implementation does provider re-instantiation BEFORE `try_acquire_owned` so that credentials_missing surfaces as an Unavailable-reason before we touch the semaphore. Net walker semantic unchanged (both advance with the same chronicle event); the order swap just avoids holding a permit we don't need.
+- Context-exceeded cascade in the HTTP retry used to `continue` the outer `for attempt` loop; the walker's `loop { … attempt += 1 }` body replicates this by incrementing `attempt` and `continue`-ing. Behavior identical; the explicit counter is because `break 'http` requires named-block syntax over a `loop` not a `for`.
+
+**Known Wave 1 intermediate state** (Waves 2-3 close):
+- Phase A fleet pre-loop (llm.rs:1248-1725) STILL RUNS before the walker — unchanged per Wave 1 contract. Fleet entries are filter-retained out of `route.providers` at llm.rs:1869 before the walker iterates. When Wave 2 lands, fleet becomes a real walker branch and the pre-filter + pre-loop disappear.
+- Phase B market pre-loop (llm.rs:1732-2082) STILL RUNS — unchanged. Market entries in `route.providers` reach the walker and trigger `wave1_not_implemented` skip (but market dispatch already happened via Phase B, so this is a no-op). Wave 3 closes this duplicate.
+- compute_queue enqueue (llm.rs:~2225-2336) UNCHANGED — still sits between Phase B and the walker per plan §4.4.
+- `escalation_timeout_secs` field still on `EscalationConfig` struct (Wave 5 cleanup). Walker no longer reads it; code path that called `tokio::time::timeout(secs, pools.acquire(…))` deleted. Grep confirms only field definition + doc-comments mention it now.
+
+---
+
 ## 2026-04-21 — commit da67787 (branch walker-re-plan-wire-2.1)
 
 **Plan task:** Wave 1 task 11 — `pyramid_llm_audit.provider_id` schema migration + `complete_llm_audit` + `fail_llm_audit` signature extension.
