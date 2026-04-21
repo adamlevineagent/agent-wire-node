@@ -97,40 +97,6 @@ async fn rate_limit_wait(max_requests: usize, window_secs: f64) {
     }
 }
 
-fn should_enqueue_local_execution(
-    resolved_route: Option<&crate::pyramid::dispatch_policy::ResolvedRoute>,
-    provider_type: ProviderType,
-    options: &LlmCallOptions,
-) -> bool {
-    if options.skip_concurrency_gate {
-        return false;
-    }
-
-    match resolved_route {
-        Some(route) if !route.providers.is_empty() => route.providers.iter().any(|entry| entry.is_local),
-        _ => provider_type == ProviderType::OpenaiCompat,
-    }
-}
-
-fn queue_model_id_for_local_execution(
-    config: &LlmConfig,
-    ctx: Option<&StepContext>,
-    resolved_route: Option<&crate::pyramid::dispatch_policy::ResolvedRoute>,
-) -> String {
-    if let Some(model_id) = resolved_route
-        .and_then(|route| route.providers.iter().find(|entry| entry.is_local))
-        .and_then(|entry| entry.model_id.clone())
-        .filter(|model_id| !model_id.is_empty())
-    {
-        return model_id;
-    }
-
-    ctx.and_then(|c| c.resolved_model_id.clone())
-        .filter(|model_id| !model_id.is_empty())
-        .unwrap_or_else(|| config.primary_model.clone())
-}
-
-
 // ── Walker chronicle emitters (Walker Re-Plan Wire 2.1 §5) ──────────────────
 //
 // Per-entry walker events. Source label is derived from the call's
@@ -1765,119 +1731,6 @@ pub async fn call_model_unified_with_audit_and_ctx(
 
 
 
-    // ── Phase 1 Compute Queue: local execution only ────────────────
-    //
-    // Outgoing fleet dispatch must get first shot so calls that can be
-    // served by a peer do not queue behind local GPU work. After fleet
-    // routing has had its chance, enqueue only calls that may execute on
-    // local hardware. Cloud-only routes bypass the queue entirely.
-    if let Some(ref queue_handle) = config.compute_queue {
-        if should_enqueue_local_execution(resolved_route.as_ref(), provider_type, &options) {
-            let queue_model_id =
-                queue_model_id_for_local_execution(config, ctx, resolved_route.as_ref());
-            let (tx, rx) = tokio::sync::oneshot::channel();
-
-            // Derive replay config via prepare_for_replay — clears
-            // compute_queue (re-enqueue guard) + fleet + market contexts
-            // so the GPU loop processes this entry as a pool-only local
-            // call. See impl LlmConfig::prepare_for_replay for the
-            // single-source-of-truth rationale.
-            let gpu_config = config.prepare_for_replay(options.dispatch_origin);
-
-            // Set skip flags on the forwarded options so the GPU loop
-            // performs the local execution directly rather than treating
-            // replay as a second routing decision point.
-            // Label the queue-entry source so downstream chronicle
-            // emitters attribute the job to its true origin. Pre-fix,
-            // this was a binary fleet_received-vs-local sniff keyed on
-            // `skip_fleet_dispatch && chronicle_job_path.is_some()`,
-            // which mislabeled market-received jobs as fleet_received
-            // because both set those flags identically. Now driven by
-            // the explicit DispatchOrigin the upstream handler sets.
-            let entry_source = options.dispatch_origin.source_label().to_string();
-            let chronicle_job_path_val = options.chronicle_job_path.clone().unwrap_or_else(|| {
-                super::compute_chronicle::generate_job_path(ctx, None, &queue_model_id, &entry_source)
-            });
-            let entry_chronicle_jp = options.chronicle_job_path.clone();
-
-            let mut gpu_options = options;
-            gpu_options.skip_concurrency_gate = true;
-            gpu_options.skip_fleet_dispatch = true;
-
-            let depth = {
-                let mut q = queue_handle.queue.lock().await;
-                q.enqueue_local(
-                    &queue_model_id,
-                    crate::compute_queue::QueueEntry {
-                        result_tx: tx,
-                        config: gpu_config,
-                        system_prompt: system_prompt.to_string(),
-                        user_prompt: user_prompt.to_string(),
-                        temperature,
-                        max_tokens: _max_tokens,
-                        response_format: response_format.cloned(),
-                        options: gpu_options,
-                        step_ctx: ctx.cloned(), // Law 4: StepContext flows through
-                        model_id: queue_model_id.clone(),
-                        enqueued_at: std::time::Instant::now(),
-                        work_item_id: None, // Non-DADBEAR path
-                        attempt_id: None,
-                        source: entry_source.clone(),
-                        job_path: chronicle_job_path_val.clone(),
-                        chronicle_job_path: entry_chronicle_jp,
-                    },
-                );
-                q.queue_depth(&queue_model_id)
-            };
-
-            // WP-1: Chronicle enqueue event
-            {
-                let db_path = ctx
-                    .map(|c| c.db_path.clone())
-                    .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
-                let chronicle_ctx = if let Some(sc) = ctx {
-                    super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-                        sc, &chronicle_job_path_val, "enqueued", &entry_source,
-                    )
-                } else {
-                    super::compute_chronicle::ChronicleEventContext::minimal(
-                        &chronicle_job_path_val, "enqueued", &entry_source,
-                    )
-                    .with_model_id(queue_model_id.clone())
-                };
-                let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
-                    "queue_depth": depth,
-                    "queue_model_depth": depth,
-                }));
-                if let Some(db_path) = db_path {
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                            let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
-                        }
-                    });
-                }
-            }
-
-            if let Some(step) = ctx {
-                if let Some(ref bus) = step.bus {
-                    let _ = bus.tx.send(super::event_bus::TaggedBuildEvent {
-                        slug: "__compute__".to_string(),
-                        kind: super::event_bus::TaggedKind::QueueJobEnqueued {
-                            model_id: queue_model_id.clone(),
-                            queue_depth: depth,
-                        },
-                    });
-                }
-            }
-
-            queue_handle.notify.notify_one();
-
-            return rx
-                .await
-                .map_err(|_| anyhow!("compute queue: GPU loop dropped the job"))?;
-        }
-    }
-
     // ── Phase 18b: Audit pending row insert ─────────────────────────
     //
     // Mirror the legacy `call_model_audited` flow: insert a pending row
@@ -2541,6 +2394,225 @@ pub async fn call_model_unified_with_audit_and_ctx(
         // Pool branch — this entry is a registered provider (openrouter,
         // ollama-local, custom). Wave 1 scope.
         last_attempted_provider_id = Some(entry.provider_id.clone());
+
+        // ── Per-entry local-execution gate (walker §4.4, post-ship fix) ─
+        //
+        // When this pool entry is flagged `is_local: true` and a compute
+        // queue is attached, hand the call off to the GPU loop via the
+        // queue rather than running the HTTP retry path inline. This used
+        // to live BEFORE the walker loop, which short-circuited every
+        // production route containing any is_local entry and made the
+        // market + fleet branches unreachable for the bundled seed
+        // (see plan §13 post-ship finding, 2026-04-21).
+        //
+        // Gating: skip_concurrency_gate suppresses re-enqueueing for the
+        // GPU-loop replay (inner walker sets it via prepare_for_replay).
+        // Route.bypass_pool similarly skips the queue hop.
+        if entry.is_local
+            && !options.skip_concurrency_gate
+            && !walker_bypass_pool
+        {
+            if let Some(ref queue_handle) = config.compute_queue {
+                let queue_model_id = entry
+                    .model_id
+                    .clone()
+                    .filter(|m| !m.is_empty())
+                    .or_else(|| ctx.and_then(|c| c.resolved_model_id.clone()))
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or_else(|| config.primary_model.clone());
+
+                let (tx, rx) = tokio::sync::oneshot::channel();
+
+                // Derive replay config via prepare_for_replay — clears
+                // compute_queue (re-enqueue guard) + fleet + market
+                // contexts so the GPU loop processes this entry as a
+                // pool-only local call. See impl LlmConfig::prepare_for_replay.
+                let gpu_config = config.prepare_for_replay(options.dispatch_origin);
+
+                // Label the queue-entry source so downstream chronicle
+                // emitters attribute the job to its true origin.
+                let entry_source = options.dispatch_origin.source_label().to_string();
+                let chronicle_job_path_val = options
+                    .chronicle_job_path
+                    .clone()
+                    .unwrap_or_else(|| {
+                        super::compute_chronicle::generate_job_path(
+                            ctx,
+                            None,
+                            &queue_model_id,
+                            &entry_source,
+                        )
+                    });
+                let entry_chronicle_jp = options.chronicle_job_path.clone();
+
+                // Clone options into the queue entry; walker continues to
+                // use the outer `options` on subsequent iterations if the
+                // GPU-loop replay returns an error we can't recover from.
+                let mut gpu_options = options.clone();
+                gpu_options.skip_concurrency_gate = true;
+                gpu_options.skip_fleet_dispatch = true;
+
+                let depth = {
+                    let mut q = queue_handle.queue.lock().await;
+                    q.enqueue_local(
+                        &queue_model_id,
+                        crate::compute_queue::QueueEntry {
+                            result_tx: tx,
+                            config: gpu_config,
+                            system_prompt: system_prompt.to_string(),
+                            user_prompt: user_prompt.to_string(),
+                            temperature,
+                            max_tokens: _max_tokens,
+                            response_format: response_format.cloned(),
+                            options: gpu_options,
+                            step_ctx: ctx.cloned(), // Law 4: StepContext flows through
+                            model_id: queue_model_id.clone(),
+                            enqueued_at: std::time::Instant::now(),
+                            work_item_id: None, // Non-DADBEAR path
+                            attempt_id: None,
+                            source: entry_source.clone(),
+                            job_path: chronicle_job_path_val.clone(),
+                            chronicle_job_path: entry_chronicle_jp,
+                        },
+                    );
+                    q.queue_depth(&queue_model_id)
+                };
+
+                // WP-1: Chronicle enqueue event
+                {
+                    let db_path = ctx
+                        .map(|c| c.db_path.clone())
+                        .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
+                    let chronicle_ctx = if let Some(sc) = ctx {
+                        super::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                            sc, &chronicle_job_path_val, "enqueued", &entry_source,
+                        )
+                    } else {
+                        super::compute_chronicle::ChronicleEventContext::minimal(
+                            &chronicle_job_path_val, "enqueued", &entry_source,
+                        )
+                        .with_model_id(queue_model_id.clone())
+                    };
+                    let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
+                        "queue_depth": depth,
+                        "queue_model_depth": depth,
+                    }));
+                    if let Some(db_path) = db_path {
+                        tokio::task::spawn_blocking(move || {
+                            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                                let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                            }
+                        });
+                    }
+                }
+
+                if let Some(step) = ctx {
+                    if let Some(ref bus) = step.bus {
+                        let _ = bus.tx.send(super::event_bus::TaggedBuildEvent {
+                            slug: "__compute__".to_string(),
+                            kind: super::event_bus::TaggedKind::QueueJobEnqueued {
+                                model_id: queue_model_id.clone(),
+                                queue_depth: depth,
+                            },
+                        });
+                    }
+                }
+
+                queue_handle.notify.notify_one();
+
+                // Await GPU-loop result. Classification rationale:
+                //   - Ok(response): local pool resolved the call — audit
+                //     complete, emit walker_resolved, return.
+                //   - Err from the GPU loop (or dropped sender): the local
+                //     path has already consumed its one chance; advancing
+                //     the outer walker wouldn't re-try local (the replay
+                //     guard + skip flags prevent it). The inner walker has
+                //     already written terminal chronicle/audit events for
+                //     this job. Classify as CallTerminal so the outer
+                //     walker bubbles the error rather than masking the
+                //     failure behind other route entries that can't help.
+                match rx.await {
+                    Ok(Ok(response)) => {
+                        let latency_ms = call_started.elapsed().as_millis() as i64;
+                        let walker_ms = walker_started.elapsed().as_millis() as i64;
+
+                        if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
+                            let conn = audit_ctx.conn.lock().await;
+                            let _ = super::db::complete_llm_audit(
+                                &conn,
+                                id,
+                                &response.content,
+                                true,
+                                response.usage.prompt_tokens,
+                                response.usage.completion_tokens,
+                                latency_ms,
+                                response.generation_id.as_deref(),
+                                Some(entry.provider_id.as_str()),
+                            );
+                        }
+
+                        emit_walker_chronicle(
+                            ctx,
+                            config,
+                            super::compute_chronicle::EVENT_WALKER_RESOLVED,
+                            &walker_source_label,
+                            &entry.provider_id,
+                            serde_json::json!({
+                                "latency_ms": latency_ms,
+                                "total_walker_ms": walker_ms,
+                                "attempts": entry_idx + 1,
+                            }),
+                        );
+
+                        return Ok(response);
+                    }
+                    Ok(Err(err)) => {
+                        let reason = format!("{err}");
+                        emit_walker_chronicle(
+                            ctx,
+                            config,
+                            super::compute_chronicle::EVENT_NETWORK_ROUTE_TERMINAL_FAIL,
+                            &walker_source_label,
+                            &entry.provider_id,
+                            serde_json::json!({ "reason": reason.clone() }),
+                        );
+                        if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
+                            let conn = audit_ctx.conn.lock().await;
+                            let _ = super::db::fail_llm_audit(
+                                &conn,
+                                id,
+                                &reason,
+                                last_attempted_provider_id.as_deref(),
+                            );
+                        }
+                        emit_step_error(ctx, &reason);
+                        return Err(anyhow!(reason));
+                    }
+                    Err(_) => {
+                        let reason = "compute queue: GPU loop dropped the job".to_string();
+                        emit_walker_chronicle(
+                            ctx,
+                            config,
+                            super::compute_chronicle::EVENT_NETWORK_ROUTE_TERMINAL_FAIL,
+                            &walker_source_label,
+                            &entry.provider_id,
+                            serde_json::json!({ "reason": reason.clone() }),
+                        );
+                        if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
+                            let conn = audit_ctx.conn.lock().await;
+                            let _ = super::db::fail_llm_audit(
+                                &conn,
+                                id,
+                                &reason,
+                                last_attempted_provider_id.as_deref(),
+                            );
+                        }
+                        emit_step_error(ctx, &reason);
+                        return Err(anyhow!(reason));
+                    }
+                }
+            }
+        }
 
         // 2) Re-instantiate provider impl + credential for this entry.
         //
