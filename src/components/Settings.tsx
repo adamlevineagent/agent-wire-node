@@ -85,7 +85,7 @@ const defaultComputeParticipationPolicy: ComputeParticipationPolicy = {
     allow_relay_usage: false,
     allow_relay_serving: false,
     allow_serving_while_degraded: false,
-    market_dispatch_max_wait_ms: 60_000,
+    market_dispatch_max_wait_ms: 900_000,
 };
 
 const roleDescriptions: Record<ComputeParticipationMode, { label: string; description: string }> = {

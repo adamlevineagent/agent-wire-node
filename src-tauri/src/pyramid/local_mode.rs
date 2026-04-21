@@ -1851,15 +1851,26 @@ pub struct ComputeParticipationPolicy {
     /// (match + fill + await-push + fallback-poll-on-timeout). On
     /// timeout, the node falls back to local inference.
     ///
-    /// 60000ms = 60s is sensible for interactive builds. Batch-style
-    /// pyramid L0 fan-outs may raise this to 600000ms (10 min) to
-    /// tolerate longer provider inference windows.
+    /// Default is 900_000ms (15 min) — sized so real cross-node
+    /// inference on a 26B+ local-GPU provider has ample headroom and
+    /// walker doesn't race against Wire's own `dispatch_deadline_at`.
+    /// A 60s default was observed to time out regularly against real
+    /// BEHEM latencies (39-49s observed), causing walker retry loops,
+    /// orphaned `/purchase` deposits, and `job_not_found` on `/fill`
+    /// when the retry raced Wire's `purchase_expiry` cron.
+    ///
+    /// Operators tuning for interactive-only workloads can supersede
+    /// `compute_participation_policy` with a lower value.
+    ///
+    /// TODO (canonical): remove this ceiling entirely in favor of
+    /// awaiting until `purchase_response.dispatch_deadline_at` + grace,
+    /// so Wire owns the deadline and walker has no independent timer.
     #[serde(default = "default_market_dispatch_max_wait_ms")]
     pub market_dispatch_max_wait_ms: u64,
 }
 
 fn default_market_dispatch_max_wait_ms() -> u64 {
-    60_000
+    900_000
 }
 
 /// Resolved booleans after applying mode projection + explicit overrides.
