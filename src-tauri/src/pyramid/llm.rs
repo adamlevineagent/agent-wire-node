@@ -4509,6 +4509,190 @@ routing_rules:
         assert!(rebuilt.cache_access.is_none());
     }
 
+    // ── Walker Re-Plan Wire 2.1 Wave 1 tests (§8 tasks 8-10) ────────────
+    //
+    // Three tests exercise the walker's core advancement paths without
+    // standing up an actual HTTP server. Every test drives the walker
+    // via `call_model_unified_with_audit_and_ctx` with a ResolvedRoute
+    // and asserts the observable outcome: an `Err` with a stable
+    // substring. Chronicle emission is fire-and-forget into SQLite;
+    // tests do not assert on the row (no DB path set).
+    //
+    // Fixture notes:
+    //   - LlmConfig carries a DispatchPolicy sufficient to make the
+    //     walker's entry iteration fire. No `provider_registry` is
+    //     attached → walker's registry-lookup branch returns None and
+    //     the fallback branch fires build_call_provider(), which the
+    //     test drives via an empty api_key so no real HTTP happens.
+    //   - Pool semaphore at concurrency 0 = permanently-saturated.
+
+    fn walker_test_policy(
+        pool_concurrency: usize,
+        route_entries: Vec<&str>,
+    ) -> std::sync::Arc<crate::pyramid::dispatch_policy::DispatchPolicy> {
+        use crate::pyramid::dispatch_policy::*;
+        let mut pool_configs = std::collections::BTreeMap::new();
+        pool_configs.insert(
+            "openrouter-test".into(),
+            ProviderPoolConfig {
+                concurrency: pool_concurrency,
+                rate_limit: None,
+            },
+        );
+        let route_to = route_entries
+            .into_iter()
+            .map(|pid| RouteEntry {
+                provider_id: pid.to_string(),
+                model_id: None,
+                tier_name: None,
+                is_local: false,
+            })
+            .collect();
+        let policy = DispatchPolicy {
+            rules: vec![RoutingRule {
+                name: "walker_test".into(),
+                match_config: MatchConfig {
+                    work_type: None,
+                    min_depth: None,
+                    step_pattern: None,
+                },
+                route_to,
+                bypass_pool: false,
+                sequential: false,
+            }],
+            escalation: EscalationConfig::default(),
+            build_coordination: BuildCoordinationConfig::default(),
+            pool_configs,
+            max_batch_cost_usd: None,
+            max_daily_cost_usd: None,
+        };
+        std::sync::Arc::new(policy)
+    }
+
+    fn walker_test_config(
+        policy: std::sync::Arc<crate::pyramid::dispatch_policy::DispatchPolicy>,
+    ) -> LlmConfig {
+        let pools = std::sync::Arc::new(
+            crate::pyramid::provider_pools::ProviderPools::new(policy.as_ref()),
+        );
+        LlmConfig {
+            api_key: String::new(),
+            auth_token: String::new(),
+            primary_model: "test-primary".into(),
+            fallback_model_1: "test-fallback1".into(),
+            fallback_model_2: "test-fallback2".into(),
+            dispatch_policy: Some(policy),
+            provider_pools: Some(pools),
+            max_retries: 1,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn walker_exhausts_when_no_entry_viable() {
+        // Single pool entry whose provider_id is NOT in pools → walker
+        // hits AcquireError::Unavailable("provider_not_in_pool") and
+        // advances; after one entry the walker exhausts.
+        let policy = walker_test_policy(1, vec!["unknown-provider"]);
+        let config = walker_test_config(policy);
+
+        let result = call_model_unified_with_audit_and_ctx(
+            &config,
+            None,
+            None,
+            "sys",
+            "usr",
+            0.0,
+            16,
+            None,
+            LlmCallOptions::default(),
+        )
+        .await;
+
+        let err = result.expect_err("walker should exhaust — no viable route");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no viable route"),
+            "expected 'no viable route' in error, got: {msg}",
+        );
+        assert!(
+            msg.contains("1 entries"),
+            "expected '1 entries' in error, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn walker_skips_fleet_and_market_entries_in_wave1() {
+        // Route = [fleet, market, unknown-pool]. In Wave 1 the legacy
+        // Phase A fleet filter at llm.rs:~1869 still runs BEFORE the
+        // walker, so by the time the walker iterates route.providers the
+        // `fleet` entry has been retained-removed by that filter. What
+        // the walker sees:
+        //   - market: branch_allowed(Market, Local) = true, Wave 1 emits
+        //     wave1_not_implemented skip.
+        //   - unknown-pool: provider_not_in_pool unavailable.
+        // Walker exhausts 2 entries (not 3 — the filter already dropped
+        // fleet). Waves 2+3 move fleet and market INTO the walker, at
+        // which point this count becomes 3.
+        let policy = walker_test_policy(1, vec!["fleet", "market", "unknown-pool"]);
+        let config = walker_test_config(policy);
+
+        let result = call_model_unified_with_audit_and_ctx(
+            &config,
+            None,
+            None,
+            "sys",
+            "usr",
+            0.0,
+            16,
+            None,
+            LlmCallOptions::default(),
+        )
+        .await;
+
+        let err = result.expect_err("walker should exhaust — no viable route");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no viable route"),
+            "expected 'no viable route' in error, got: {msg}",
+        );
+        // Wave 1: fleet filter runs before walker, so only market +
+        // unknown-pool reach the walker. Wave 2 raises this to 3.
+        assert!(
+            msg.contains("2 entries"),
+            "expected '2 entries' (market + unknown-pool; fleet pre-filtered), got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn walker_advances_on_pool_saturation() {
+        // Pool configured with concurrency=0 → permanently saturated.
+        // Walker's try_acquire_owned → AcquireError::Saturated → advance.
+        // Single-entry route → walker exhausts.
+        let policy = walker_test_policy(0, vec!["openrouter-test"]);
+        let config = walker_test_config(policy);
+
+        let result = call_model_unified_with_audit_and_ctx(
+            &config,
+            None,
+            None,
+            "sys",
+            "usr",
+            0.0,
+            16,
+            None,
+            LlmCallOptions::default(),
+        )
+        .await;
+
+        let err = result.expect_err("walker should exhaust on saturated pool");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no viable route"),
+            "expected 'no viable route' in error, got: {msg}",
+        );
+    }
+
     #[test]
     fn test_llm_response_from_openrouter_json() {
         // Simulates parsing the fields that call_model_unified extracts
