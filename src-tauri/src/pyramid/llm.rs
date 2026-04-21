@@ -130,336 +130,6 @@ fn queue_model_id_for_local_execution(
         .unwrap_or_else(|| config.primary_model.clone())
 }
 
-// ── Phase B market dispatch helpers ──────────────────────────────────────────
-//
-// These back the Phase B market branch in `call_model_unified_with_audit_and_ctx`.
-// See `docs/plans/call-model-unified-market-integration.md` §3.2–§3.4.
-//
-// All language in this block uses cooperative/network framing per the
-// invisibility checklist (§6). Wire's own trader-vocabulary slugs
-// (`market_*`, `offer_*`, etc.) are scrubbed at the boundary by
-// `sanitize_wire_slug` before they hit chronicle metadata.
-
-/// Snapshot of tunnel readiness captured under a short-held read lock
-/// in the Phase B gate. Dropped before any `await` on `call_market` so
-/// the gate never holds a lock across the dispatch round-trip.
-struct TunnelSnapshot {
-    connected: bool,
-    has_url: bool,
-}
-
-/// Return `true` when the current call should attempt a Phase B market
-/// dispatch. The gate is intentionally conservative — every false
-/// branch falls through to the pool path cleanly. Callers MUST pass
-/// the already-captured snapshots (not live locks) so the decision is
-/// consistent for the rest of the branch.
-///
-/// `balance` is the requester's current Wire credit balance in the
-/// smallest integer unit. `i64::MAX` is the documented "balance
-/// unknown / unlimited" sentinel — used when the node has no live
-/// balance wiring yet (the 409 `InsufficientBalance` response still
-/// catches real exhaustion at dispatch time; see §3.4).
-///
-/// `model_tier_eligible` is the tier-eligibility decision made by
-/// the caller using whatever policy surface applies. The gate itself
-/// takes a bool so it stays pure and testable without needing a
-/// ModelTier type in the codebase yet.
-fn should_try_market(
-    policy: &crate::pyramid::local_mode::EffectiveParticipationPolicy,
-    balance: i64,
-    estimated_deposit: i64,
-    model_tier_eligible: bool,
-    tunnel_snap: &TunnelSnapshot,
-    local_queue_depth: usize,
-    compute_market_context_present: bool,
-) -> bool {
-    if !policy.allow_market_dispatch {
-        return false;
-    }
-
-    if !policy.market_dispatch_eager
-        && local_queue_depth < policy.market_dispatch_threshold_queue_depth as usize
-    {
-        return false;
-    }
-
-    if balance < estimated_deposit {
-        return false;
-    }
-
-    if !model_tier_eligible {
-        return false;
-    }
-
-    // Tunnel readiness — GATES feature. Research found start_tunnel_flow
-    // is spawned-not-awaited at boot. Connecting / Disconnected both
-    // mean Wire's delivery worker can't reach us; skip without
-    // attempting /match.
-    if !tunnel_snap.connected {
-        return false;
-    }
-    if !tunnel_snap.has_url {
-        return false;
-    }
-
-    if !compute_market_context_present {
-        return false;
-    }
-
-    true
-}
-
-/// Coarse tier-eligibility decision used by the gate. Model tiers are
-/// carried as strings in the current codebase; this helper keeps the
-/// decision in one place so a future `ModelTier` type can replace it
-/// wholesale without touching call sites.
-///
-/// Policy: any non-empty tier is eligible. Empty string is the "no
-/// tier resolution at the call site" signal and falls back to the
-/// primary — the primary model is the market's canonical offer model
-/// today, so treating unknown tiers as eligible keeps the cascade
-/// opportunistic. If a future policy wants a denylist, extend here.
-fn model_tier_market_eligible(tier: &str) -> bool {
-    !tier.is_empty()
-}
-
-/// Map a `RequesterError` to a stable, invisibility-safe reason slug
-/// for chronicle metadata.
-///
-/// Variants handled here are the soft-fail ones only — `AuthFailed`
-/// and `InsufficientBalance` are handled in the outer match in
-/// `call_model_unified`.
-fn classify_soft_fail_reason(err: &crate::pyramid::compute_requester::RequesterError) -> String {
-    use crate::pyramid::compute_requester::RequesterError as RE;
-    match err {
-        RE::NoMatch { .. } => "no_match".into(),
-        RE::MatchFailed { status, .. } => format!("match_failed_{status}"),
-        RE::FillRejected { reason, .. } => {
-            // Wire's reason slugs may carry trader vocabulary
-            // (`market_serving_disabled`, `offer_depleted`, …).
-            // Sanitize before surfacing to chronicle.
-            format!("fill_rejected_{}", sanitize_wire_slug(reason))
-        }
-        RE::FillFailed { status, .. } => format!("fill_failed_{status}"),
-        RE::DeliveryTimedOut { waited_ms } => format!("delivery_timed_out_{waited_ms}ms"),
-        RE::DeliveryTombstoned { reason } => {
-            format!("delivery_tombstoned_{}", sanitize_wire_slug(reason))
-        }
-        RE::ProviderFailed { code, .. } => format!("provider_failed_{code}"),
-        RE::Internal(_) => "internal".into(),
-        // Handled in outer match arms; pattern-match is exhaustive
-        // via the catch-all below.
-        RE::AuthFailed(_) | RE::InsufficientBalance { .. } | RE::ConfigError { .. } => {
-            "unclassified".into()
-        }
-    }
-}
-
-/// Map Wire's trader-vocabulary slugs to cooperative framing before
-/// they surface in chronicle metadata.
-///
-/// Wire controls its own reason slugs; we can't prevent them from
-/// shipping trader words. This function is forward-compatible:
-/// unknown slugs pass through unchanged (flagged in follow-up if they
-/// turn out to leak). Ordering matters: the longer, more specific
-/// replacements run before the shorter prefix sweeps so
-/// "market_serving_disabled" → "provider_serving_disabled" (not
-/// "network_serving_disabled").
-fn sanitize_wire_slug(slug: &str) -> String {
-    slug.replace("market_serving_disabled", "provider_serving_disabled")
-        .replace("market_", "network_")
-        .replace("offer_depleted", "contribution_depleted")
-        .replace("offer_", "contribution_")
-        .replace("seller", "provider")
-        .replace("buyer", "requester")
-        .replace("earnings", "contributions")
-        .replace("earning", "contributing")
-}
-
-/// Spawn a fire-and-forget blocking task that writes a chronicle row
-/// recording a successful network dispatch. See §4.2.
-fn emit_network_helped_build(
-    result: &crate::pyramid::compute_requester::MarketResult,
-    handle_info: NetworkHandleInfo,
-    ctx: Option<&StepContext>,
-    config: &LlmConfig,
-) {
-    let db_path = ctx
-        .map(|c| c.db_path.clone())
-        .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
-    let Some(db_path) = db_path else { return };
-
-    let job_path = super::compute_chronicle::generate_job_path(
-        ctx,
-        None,
-        &handle_info.model_id,
-        super::compute_chronicle::SOURCE_NETWORK,
-    );
-    let chronicle_ctx = if let Some(sc) = ctx {
-        super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-            sc,
-            &job_path,
-            super::compute_chronicle::EVENT_NETWORK_HELPED_BUILD,
-            super::compute_chronicle::SOURCE_NETWORK,
-        )
-    } else {
-        super::compute_chronicle::ChronicleEventContext::minimal(
-            &job_path,
-            super::compute_chronicle::EVENT_NETWORK_HELPED_BUILD,
-            super::compute_chronicle::SOURCE_NETWORK,
-        )
-        .with_model_id(handle_info.model_id.clone())
-    };
-    let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
-        "job_id": handle_info.job_id_handle_path,
-        "uuid_job_id": handle_info.uuid_job_id,
-        "queue_position": handle_info.queue_position,
-        "processing_cost_in_per_m": handle_info.matched_rate_in_per_m,
-        "processing_cost_out_per_m": handle_info.matched_rate_out_per_m,
-        "provider_node_id": handle_info.provider_node_id,
-        "provider_handle": handle_info.provider_handle,
-        "model_id": handle_info.model_id,
-        "model_used": result.model_used,
-        "reservation_held": handle_info.reservation_held,
-    }));
-
-    tokio::task::spawn_blocking(move || {
-        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-            let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
-        }
-    });
-}
-
-/// Spawn a fire-and-forget blocking task that writes a chronicle row
-/// recording that the network path could not serve this call and the
-/// local pool will handle it. See §4.4.
-fn emit_network_fell_back_local(
-    err: &crate::pyramid::compute_requester::RequesterError,
-    reason: &str,
-    ctx: Option<&StepContext>,
-    config: &LlmConfig,
-) {
-    let db_path = ctx
-        .map(|c| c.db_path.clone())
-        .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
-    let Some(db_path) = db_path else { return };
-
-    let model_id = ctx
-        .and_then(|c| c.resolved_model_id.clone())
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| config.primary_model.clone());
-
-    let job_path = super::compute_chronicle::generate_job_path(
-        ctx,
-        None,
-        &model_id,
-        super::compute_chronicle::SOURCE_NETWORK,
-    );
-
-    let detail = format!("{err}");
-    let reason_owned = reason.to_string();
-    let model_id_for_meta = model_id.clone();
-
-    let chronicle_ctx = if let Some(sc) = ctx {
-        super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-            sc,
-            &job_path,
-            super::compute_chronicle::EVENT_NETWORK_FELL_BACK_LOCAL,
-            super::compute_chronicle::SOURCE_NETWORK,
-        )
-    } else {
-        super::compute_chronicle::ChronicleEventContext::minimal(
-            &job_path,
-            super::compute_chronicle::EVENT_NETWORK_FELL_BACK_LOCAL,
-            super::compute_chronicle::SOURCE_NETWORK,
-        )
-        .with_model_id(model_id.clone())
-    };
-    let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
-        "reason": reason_owned,
-        "detail": detail,
-        "model_id": model_id_for_meta,
-    }));
-
-    tokio::task::spawn_blocking(move || {
-        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-            let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
-        }
-    });
-}
-
-/// Inner helper: writes the `network_balance_exhausted` chronicle row.
-/// Call sites should use `emit_network_balance_exhausted_once` which
-/// first checks the per-build `balance_exhausted_emitted` OnceLock.
-fn emit_network_balance_exhausted(
-    need: i64,
-    have: i64,
-    build_id: &str,
-    ctx: &StepContext,
-    config: &LlmConfig,
-) {
-    let db_path = if !ctx.db_path.is_empty() {
-        ctx.db_path.clone()
-    } else if let Some(ca) = config.cache_access.as_ref() {
-        ca.db_path.to_string()
-    } else {
-        return;
-    };
-
-    let model_id = ctx
-        .resolved_model_id
-        .clone()
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| config.primary_model.clone());
-
-    let job_path = super::compute_chronicle::generate_job_path(
-        Some(ctx),
-        None,
-        &model_id,
-        super::compute_chronicle::SOURCE_NETWORK,
-    );
-
-    let build_id_owned = build_id.to_string();
-    let chronicle_ctx = super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-        ctx,
-        &job_path,
-        super::compute_chronicle::EVENT_NETWORK_BALANCE_EXHAUSTED,
-        super::compute_chronicle::SOURCE_NETWORK,
-    )
-    .with_metadata(serde_json::json!({
-        "need": need,
-        "have": have,
-        "build_id": build_id_owned,
-        "model_id": model_id,
-    }));
-
-    tokio::task::spawn_blocking(move || {
-        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-            let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
-        }
-    });
-}
-
-/// Dedup-aware emit for `network_balance_exhausted`. At most one event
-/// per build_id is recorded regardless of how many calls trip the
-/// balance check — the OnceLock on StepContext enforces this. Skips
-/// emission entirely on non-build inference paths (no build_id, no
-/// dedup scope).
-fn emit_network_balance_exhausted_once(
-    need: i64,
-    have: i64,
-    ctx: Option<&StepContext>,
-    config: &LlmConfig,
-) {
-    let Some(step_ctx) = ctx else { return };
-    if step_ctx.build_id.is_empty() {
-        return;
-    }
-    if step_ctx.balance_exhausted_emitted.set(()).is_err() {
-        return; // already emitted for this build
-    }
-    emit_network_balance_exhausted(need, have, &step_ctx.build_id, step_ctx, config);
-}
 
 // ── Walker chronicle emitters (Walker Re-Plan Wire 2.1 §5) ──────────────────
 //
@@ -856,42 +526,170 @@ async fn dispatch_fleet_entry(
     }
 }
 
-/// Minimal snapshot of `/match` + `/fill` response data needed to
-/// build a `network_helped_build` chronicle row. Passed by value into
-/// `emit_network_helped_build` so the call site does not have to hold
-/// the `MarketResult` borrow open across the fire-and-forget spawn.
-struct NetworkHandleInfo {
-    job_id_handle_path: String,
-    uuid_job_id: String,
-    queue_position: u64,
-    matched_rate_in_per_m: i64,
-    matched_rate_out_per_m: i64,
-    provider_node_id: String,
-    provider_handle: String,
+// ── dispatch_market_entry (Wave 3b — walker market branch helper) ───────────
+//
+// Walker's market branch per plan §4.2 — three-RPC /quote → /purchase → /fill
+// back-to-back, with register-BEFORE-fill race-fix baked into the call order.
+//
+// Runtime gate precondition (verified at the call site in the walker body):
+//   - branch_allowed(Market, origin) passed
+//   - compute_market_context present
+//   - tunnel Connected + tunnel_url set
+//   - optional MarketSurfaceCache consulted upstream (advisory)
+//
+// Chronicle emits inside this helper:
+//   - network_quoted on /quote 200
+//   - network_purchased on /purchase 200
+//   - Route skip / terminal event vocab handled at the walker outer match.
+//
+// Error mapping: returns three-tier EntryError; all three RPC calls already
+// classify via compute_quote_flow::classify_rev21_http_error.
+
+struct MarketDispatchArgs<'a> {
+    config: &'a LlmConfig,
+    ctx: Option<&'a StepContext>,
+    market_ctx: &'a crate::pyramid::compute_market_ctx::ComputeMarketRequesterContext,
     model_id: String,
-    reservation_held: i64,
+    max_budget: i64,
+    max_wait_ms: u64,
+    max_tokens: i64,
+    temperature: f32,
+    input_tokens_est: i64,
+    system_prompt: &'a str,
+    user_prompt: &'a str,
+    callback_url: String,
+    walker_source_label: &'a str,
+    entry_provider_id: &'a str,
 }
 
-impl LlmResponse {
-    /// Build an `LlmResponse` from a successful market dispatch result.
-    /// Provider identity is tagged as `network` so downstream webhook
-    /// correlators + leak-detection sweeps have a stable grouping key.
-    pub(crate) fn from_market_result(
-        result: crate::pyramid::compute_requester::MarketResult,
-    ) -> Self {
-        LlmResponse {
-            content: result.content,
-            usage: crate::pyramid::types::TokenUsage {
-                prompt_tokens: result.input_tokens,
-                completion_tokens: result.output_tokens,
-            },
-            generation_id: None,
-            actual_cost_usd: None,
-            provider_id: Some("network".to_string()),
-            fleet_peer_id: None,
-            fleet_peer_model: Some(result.model_used),
-        }
+async fn dispatch_market_entry(
+    args: MarketDispatchArgs<'_>,
+) -> std::result::Result<LlmResponse, EntryError> {
+    use crate::pyramid::compute_quote_flow as cqf;
+
+    let MarketDispatchArgs {
+        config,
+        ctx,
+        market_ctx,
+        model_id,
+        max_budget,
+        max_wait_ms,
+        max_tokens,
+        temperature,
+        input_tokens_est,
+        system_prompt,
+        user_prompt,
+        callback_url,
+        walker_source_label,
+        entry_provider_id,
+    } = args;
+
+    // Snapshot node_id for the /quote requester_node_id field.
+    let requester_node_id = {
+        let cfg = market_ctx.config.read().await;
+        cfg.node_id.clone()
+    };
+
+    // ── /quote ────────────────────────────────────────────────────────
+    let quote_body = cqf::ComputeQuoteBody {
+        model_id: model_id.clone(),
+        input_tokens_est,
+        max_tokens,
+        latency_preference: cqf::LatencyPreference::BestPrice,
+        max_budget,
+        requester_node_id: if requester_node_id.is_empty() {
+            None
+        } else {
+            Some(requester_node_id)
+        },
+    };
+
+    let quote_resp = cqf::quote(&market_ctx.auth, &market_ctx.config, quote_body).await?;
+
+    // network_quoted chronicle (on success only).
+    emit_walker_chronicle(
+        ctx,
+        config,
+        super::compute_chronicle::EVENT_NETWORK_QUOTED,
+        walker_source_label,
+        entry_provider_id,
+        serde_json::json!({
+            "quote_id": quote_resp.quote_id,
+            "rate_in_per_m": quote_resp.price_breakdown.matched_rate_in_per_m,
+            "rate_out_per_m": quote_resp.price_breakdown.matched_rate_out_per_m,
+            "reservation_fee": quote_resp.price_breakdown.reservation_fee,
+            "estimated_total": quote_resp.price_breakdown.estimated_total,
+            "queue_position": quote_resp.price_breakdown.queue_position,
+            "model_id": model_id,
+        }),
+    );
+
+    // ── /purchase ─────────────────────────────────────────────────────
+    let purchase_body = cqf::ComputePurchaseBody {
+        quote_jwt: quote_resp.quote_jwt.clone(),
+        trigger: cqf::ComputePurchaseTrigger::Immediate,
+        idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
+    };
+
+    let purchase_resp =
+        cqf::purchase(&market_ctx.auth, &market_ctx.config, &quote_resp.quote_jwt, purchase_body)
+            .await?;
+
+    emit_walker_chronicle(
+        ctx,
+        config,
+        super::compute_chronicle::EVENT_NETWORK_PURCHASED,
+        walker_source_label,
+        entry_provider_id,
+        serde_json::json!({
+            "uuid_job_id": purchase_resp.uuid_job_id,
+            "request_id": purchase_resp.request_id,
+            "job_id": purchase_resp.job_id,
+            "dispatch_deadline_at": purchase_resp.dispatch_deadline_at,
+            "model_id": model_id,
+        }),
+    );
+
+    // ── RACE FIX: register PendingJobs entry BEFORE /fill ─────────────
+    //
+    // If we registered inside await_result (former Wave 3a shape), a
+    // fast provider callback could beat registration — sender missing,
+    // payload dropped. Registering here closes the window at call site.
+    let rx = cqf::register_pending(&market_ctx.pending_jobs, &purchase_resp.uuid_job_id).await;
+
+    // ── /fill ─────────────────────────────────────────────────────────
+    let messages = serde_json::json!([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]);
+
+    let fill_body = cqf::ComputeFillBody {
+        job_id: purchase_resp.job_id.clone(),
+        request_id: purchase_resp.request_id.clone(),
+        messages,
+        // Absence means "use max_tokens_quoted" per rev 2.1 spec §2.3;
+        // we only pass a ceiling when the caller explicitly set one.
+        max_tokens: if max_tokens > 0 { Some(max_tokens) } else { None },
+        temperature,
+        relay_count: 0,
+        privacy_tier: "direct".to_string(),
+        input_token_count: input_tokens_est,
+        requester_callback_url: callback_url,
+        idempotency_key: purchase_resp.request_id.clone(),
+    };
+
+    // Fire /fill; on error the registered rx is dropped when this fn
+    // returns (we also explicitly take() below for timeouts inside
+    // await_result). If /fill errors, clean up the pending entry so a
+    // late push hits already_settled.
+    if let Err(e) = cqf::fill(&market_ctx.auth, &market_ctx.config, fill_body).await {
+        let _ = market_ctx.pending_jobs.take(&purchase_resp.uuid_job_id).await;
+        return Err(e);
     }
+
+    // ── Await oneshot ────────────────────────────────────────────────
+    let timeout = std::time::Duration::from_millis(max_wait_ms);
+    cqf::await_result(rx, &purchase_resp.uuid_job_id, &market_ctx.pending_jobs, timeout).await
 }
 
 // ── Response types ───────────────────────────────────────────────────────────
@@ -1786,357 +1584,6 @@ pub async fn call_model_unified_with_audit_and_ctx(
     });
 
 
-    // ── Phase B: Network (cross-operator peer) dispatch ──────────────
-    //
-    // Runs between fleet (Phase A) and local/pool acquisition. The gate
-    // reads the effective compute-participation policy, tunnel state,
-    // and local queue depth once, drops every lock before awaiting, and
-    // attempts a single cross-operator market dispatch. On success:
-    // return with network provenance. On soft-fail: chronicle, fall
-    // through to pool. On hard-fail (auth): bubble a cooperative error.
-    //
-    // See `docs/plans/call-model-unified-market-integration.md` §3.4.
-    if config.compute_market_context.is_some() {
-        // Snapshot tunnel + policy + queue depth under short-held locks.
-        // Each lock is released before the next step so the gate cannot
-        // deadlock against the dispatch path that also touches these.
-        let tunnel_snap = {
-            let market_ctx = config.compute_market_context.as_ref().unwrap();
-            let ts = market_ctx.tunnel_state.read().await;
-            TunnelSnapshot {
-                connected: matches!(
-                    ts.status,
-                    crate::tunnel::TunnelConnectionStatus::Connected
-                ),
-                has_url: ts.tunnel_url.is_some(),
-            }
-        };
-
-        // Effective participation policy. When reading fails (DB gone,
-        // policy row missing), `should_try_market` never runs — we
-        // conservatively skip the market branch by leaving
-        // `policy_opt` as None.
-        let policy_opt: Option<crate::pyramid::local_mode::EffectiveParticipationPolicy> = {
-            let db_path = ctx
-                .map(|c| c.db_path.clone())
-                .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
-            match db_path {
-                Some(db_path) => tokio::task::spawn_blocking(move || {
-                    let conn = rusqlite::Connection::open(&db_path).ok()?;
-                    crate::pyramid::local_mode::get_compute_participation_policy(&conn)
-                        .ok()
-                        .map(|p| p.effective_booleans())
-                })
-                .await
-                .ok()
-                .flatten(),
-                None => None,
-            }
-        };
-
-        if let Some(ref policy_snap) = policy_opt {
-            // Model-tier eligibility — empty string indicates no tier
-            // resolution at the call site; the gate still attempts
-            // market so the dispatch cascade remains opportunistic.
-            let model_tier_eligible = model_tier_market_eligible(
-                ctx.map(|c| c.model_tier.as_str()).unwrap_or(""),
-            );
-
-            // Local queue depth (for non-eager overflow posture).
-            let local_queue_depth = if let Some(queue_handle) = config.compute_queue.as_ref() {
-                let q = queue_handle.queue.lock().await;
-                q.total_depth()
-            } else {
-                0
-            };
-
-            // Balance + estimated_deposit — the codebase does not yet
-            // thread a live credits balance through the LLM config.
-            // Until it does, the gate trusts Wire's 409
-            // InsufficientBalance response to catch real exhaustion at
-            // dispatch time. i64::MAX sentinel means "balance unknown
-            // / assume solvent"; balance == i64::MAX >= estimated means
-            // the gate never short-circuits on balance here. See §3.2
-            // plan note.
-            let balance: i64 = i64::MAX;
-            let estimated_deposit: i64 = 0;
-
-            let market_ctx_present = config.compute_market_context.is_some();
-
-            if should_try_market(
-                policy_snap,
-                balance,
-                estimated_deposit,
-                model_tier_eligible,
-                &tunnel_snap,
-                local_queue_depth,
-                market_ctx_present,
-            ) {
-                let market_ctx = config
-                    .compute_market_context
-                    .as_ref()
-                    .expect("gate guaranteed Some");
-
-                // Build the `MarketInferenceRequest`. Callback URL is
-                // derived from the tunnel state read lock (already
-                // Connected per gate). The messages array is the
-                // {system, user} pair packed into ChatML — Wire rejects
-                // multi-system turns pre-dispatch (DD-C).
-                let callback_url = {
-                    let ts = market_ctx.tunnel_state.read().await;
-                    match ts.tunnel_url.as_ref() {
-                        Some(u) => {
-                            let base = u.as_str().trim_end_matches('/').to_string();
-                            format!("{}/v1/compute/job-result", base)
-                        }
-                        None => {
-                            // Race: tunnel dropped between the gate
-                            // snapshot and this read. Skip market
-                            // cleanly; chronicle a fall-back event
-                            // so the timeline reflects the attempt.
-                            let synthetic = crate::pyramid::compute_requester::RequesterError::Internal(
-                                "tunnel URL missing between gate snapshot and dispatch".into(),
-                            );
-                            emit_network_fell_back_local(&synthetic, "tunnel_url_race", ctx, config);
-                            // Fall through to pool by breaking out of
-                            // this inner block.
-                            String::new()
-                        }
-                    }
-                };
-
-                if !callback_url.is_empty() {
-                    let messages = serde_json::json!([
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ]);
-
-                    let model_for_market = ctx
-                        .and_then(|c| c.resolved_model_id.clone())
-                        .filter(|m| !m.is_empty())
-                        .unwrap_or_else(|| config.primary_model.clone());
-
-                    let req = crate::pyramid::compute_requester::MarketInferenceRequest {
-                        model_id: model_for_market.clone(),
-                        // `(1i64 << 53) - 1` = JS MAX_SAFE_INTEGER = 9_007_199_254_740_991.
-                        // Still a "no cap / solvent assumed" sentinel (orders of magnitude
-                        // above any realistic estimated_cost), but round-trips cleanly
-                        // through any f64 JSON parser — i64::MAX lossy-converts in JS/f64
-                        // to a value > Postgres BIGINT max and 500s the /match handler.
-                        max_budget: (1i64 << 53) - 1,
-                        input_tokens: 0,
-                        latency_preference:
-                            crate::pyramid::compute_requester::LatencyPreference::BestPrice,
-                        messages,
-                        max_tokens: if _max_tokens == 0 { 1024 } else { _max_tokens },
-                        temperature,
-                        privacy_tier: "direct".to_string(),
-                        requester_callback_url: callback_url,
-                    };
-
-                    // `catch_unwind` guards the PendingJobs lifecycle.
-                    // If `dispatch_market` or `await_result` panics
-                    // (malformed Wire response, serde unwrap, etc.) the
-                    // unwinding task would leak its oneshot Sender in
-                    // the pending map. catch_unwind turns the panic
-                    // into an Err arm, the cascade soft-falls to the
-                    // pool, and PendingJobs' own timeout cleanup removes
-                    // the dangling entry.
-                    //
-                    // We split `call_market` into its two halves —
-                    // `dispatch_market` → handle → `await_result` — so
-                    // we can snapshot the handle's rates / reservation /
-                    // provider_node_id / queue_position into
-                    // NetworkHandleInfo for the HELPED_BUILD chronicle.
-                    // `call_market` collapses the handle internally and
-                    // would strand those values.
-                    use futures_util::FutureExt;
-                    let wait_ms = policy_snap.market_dispatch_max_wait_ms;
-
-                    let dispatch_fut = crate::pyramid::compute_requester::dispatch_market(
-                        req,
-                        &market_ctx.auth,
-                        &market_ctx.config,
-                        &market_ctx.pending_jobs,
-                    );
-                    // `panic_handled` tracks whether the panic branch
-                    // already emitted FELL_BACK_LOCAL with
-                    // reason="internal_panic" (plan §3.4). The outer
-                    // match suppresses its own emit in that case so
-                    // the chronicle records exactly one fallback event.
-                    let mut panic_handled = false;
-                    let dispatch_result = match std::panic::AssertUnwindSafe(dispatch_fut)
-                        .catch_unwind()
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(panic_info) => {
-                            let msg = panic_info
-                                .downcast_ref::<&str>()
-                                .map(|s| s.to_string())
-                                .or_else(|| {
-                                    panic_info.downcast_ref::<String>().cloned()
-                                })
-                                .unwrap_or_else(|| "panic in dispatch_market".to_string());
-                            let synthetic =
-                                crate::pyramid::compute_requester::RequesterError::Internal(
-                                    msg.clone(),
-                                );
-                            emit_network_fell_back_local(
-                                &synthetic,
-                                "internal_panic",
-                                ctx,
-                                config,
-                            );
-                            panic_handled = true;
-                            tracing::info!(
-                                panic_msg = %msg,
-                                "network dispatch panicked; local pool handles"
-                            );
-                            Err(synthetic)
-                        }
-                    };
-
-                    // If dispatch failed, short-circuit to the soft/hard
-                    // fail cascade below with no handle snapshot.
-                    let handle_and_fut = match dispatch_result {
-                        Ok(handle) => {
-                            // Snapshot the handle fields BEFORE the
-                            // move into await_result so they survive
-                            // for the HELPED_BUILD chronicle emit.
-                            let snapshot = NetworkHandleInfo {
-                                job_id_handle_path: handle.job_id_handle_path.clone(),
-                                uuid_job_id: handle.uuid_job_id.clone(),
-                                queue_position: handle.queue_position,
-                                matched_rate_in_per_m: handle.matched_rate_in_per_m,
-                                matched_rate_out_per_m: handle.matched_rate_out_per_m,
-                                provider_node_id: handle.provider_node_id.clone(),
-                                provider_handle: String::new(),
-                                model_id: model_for_market.clone(),
-                                reservation_held: handle.deposit_charged,
-                            };
-                            Ok((snapshot, handle))
-                        }
-                        Err(e) => Err(e),
-                    };
-
-                    let result = match handle_and_fut {
-                        Ok((snapshot, handle)) => {
-                            let await_fut = crate::pyramid::compute_requester::await_result(
-                                handle,
-                                &market_ctx.auth,
-                                &market_ctx.config,
-                                &market_ctx.pending_jobs,
-                                wait_ms,
-                            );
-                            let inner = match std::panic::AssertUnwindSafe(await_fut)
-                                .catch_unwind()
-                                .await
-                            {
-                                Ok(r) => r,
-                                Err(panic_info) => {
-                                    let msg = panic_info
-                                        .downcast_ref::<&str>()
-                                        .map(|s| s.to_string())
-                                        .or_else(|| {
-                                            panic_info.downcast_ref::<String>().cloned()
-                                        })
-                                        .unwrap_or_else(|| {
-                                            "panic in await_result".to_string()
-                                        });
-                                    let synthetic = crate::pyramid::compute_requester::RequesterError::Internal(
-                                        msg.clone(),
-                                    );
-                                    emit_network_fell_back_local(
-                                        &synthetic,
-                                        "internal_panic",
-                                        ctx,
-                                        config,
-                                    );
-                                    panic_handled = true;
-                                    tracing::info!(
-                                        panic_msg = %msg,
-                                        "network await panicked; local pool handles"
-                                    );
-                                    Err(synthetic)
-                                }
-                            };
-                            inner.map(|mr| (mr, snapshot))
-                        }
-                        Err(e) => Err(e),
-                    };
-
-                    match result {
-                        Ok((market_result, handle_info)) => {
-                            // Success — chronicle with the real handle
-                            // snapshot (rates, provider_node_id,
-                            // queue_position, reservation) and return.
-                            emit_network_helped_build(
-                                &market_result,
-                                handle_info,
-                                ctx,
-                                config,
-                            );
-                            return Ok(LlmResponse::from_market_result(market_result));
-                        }
-                        Err(crate::pyramid::compute_requester::RequesterError::AuthFailed(
-                            detail,
-                        )) => {
-                            return Err(anyhow!(
-                                "network credentials invalid — session may be expired: {detail}"
-                            ));
-                        }
-                        Err(crate::pyramid::compute_requester::RequesterError::ConfigError {
-                            error_slug,
-                            detail,
-                        }) => {
-                            // Caller-misconfiguration class. MUST NOT
-                            // fall through to the pool — silent rerouting
-                            // is what kept the market broken for weeks
-                            // ("have 0, need 0" masquerade). Surface
-                            // loudly so the operator sees the slug and
-                            // can fix their config.
-                            tracing::error!(
-                                slug = %error_slug,
-                                ?detail,
-                                "network dispatch misconfigured; caller must fix"
-                            );
-                            let detail_str = detail
-                                .as_ref()
-                                .map(|v| format!(" — detail: {v}"))
-                                .unwrap_or_default();
-                            return Err(anyhow!(
-                                "network dispatch misconfigured: {error_slug}{detail_str}"
-                            ));
-                        }
-                        Err(crate::pyramid::compute_requester::RequesterError::InsufficientBalance {
-                            need,
-                            have,
-                        }) => {
-                            emit_network_balance_exhausted_once(need, have, ctx, config);
-                            tracing::info!(
-                                need,
-                                have,
-                                "network credits depleted for this call; local pool handles"
-                            );
-                            // Fall through to pool.
-                        }
-                        Err(other) => {
-                            if !panic_handled {
-                                let reason = classify_soft_fail_reason(&other);
-                                emit_network_fell_back_local(&other, &reason, ctx, config);
-                                tracing::info!(
-                                    reason = %reason,
-                                    "network unavailable; local pool handles"
-                                );
-                            }
-                            // Fall through to pool.
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     // ── Phase 1 Compute Queue: local execution only ────────────────
     //
@@ -2280,10 +1727,10 @@ pub async fn call_model_unified_with_audit_and_ctx(
     let call_started = std::time::Instant::now();
 
     // Note: `provider_type` from `build_call_provider` is used by the
-    // Phase B market pre-loop (Wave 3 will inline) + the synthetic-entry
-    // fallback inside the walker. Former Phase D re-instantiated on
-    // escalation — the walker re-instantiates per entry inside the pool
-    // branch, so the outer bindings are read-only now (no `mut` needed).
+    // synthetic-entry fallback inside the walker (pool branch). Former
+    // Phase D re-instantiated on escalation — the walker re-instantiates
+    // per entry inside the pool branch, so the outer bindings are
+    // read-only now (no `mut` needed).
 
     // ── Walker loop (Walker Re-Plan Wire 2.1 §3) ─────────────────────
     //
@@ -2292,13 +1739,11 @@ pub async fn call_model_unified_with_audit_and_ctx(
     // dispatch → three-tier EntryError (Retryable/RouteSkipped advance;
     // CallTerminal bubbles).
     //
-    // Wave 2 scope: pool + fleet entries go through the walker with
-    // full dispatch inlined. `"market"` entries still have no inline
-    // dispatch (Wave 3 will inline them); the walker emits
-    // `network_route_skipped reason="wave2_market_not_implemented"` and
-    // advances when it meets a market entry. The Phase B market pre-loop
-    // (below this comment block) still runs BEFORE the walker and
-    // handles market dispatch in the interim.
+    // Wave 3b scope: pool + fleet + market all inline in the walker.
+    // Phase B market pre-loop deleted; compute_requester::dispatch_market
+    // deprecated (Wave 5 removes the module). Market branch uses
+    // compute_quote_flow::{quote, purchase, register_pending, fill,
+    // await_result} — register-BEFORE-fill closes the Wave 3a race.
     //
     // `escalation_timeout_secs` retired (plan §2). `try_acquire_owned`
     // is non-blocking — saturation advances immediately rather than
@@ -2358,24 +1803,256 @@ pub async fn call_model_unified_with_audit_and_ctx(
             continue;
         }
 
-        // Wave 2: market still handled by legacy Phase B pre-loop (above
-        // the walker); if a market entry reaches the walker, emit a
-        // not-implemented skip and advance. Wave 3 inlines market.
+        // Wave 3b: market branch — inline three-RPC /quote → /purchase →
+        // /fill per plan §4.2. Runtime gate + advisory cache consult +
+        // dispatch_market_entry (which enforces register-BEFORE-fill).
         if matches!(branch, RouteBranch::Market) {
-            emit_walker_chronicle(
-                ctx,
+            // ── Runtime gate ─────────────────────────────────────────
+            //
+            // branch_allowed(Market, origin) already passed above.
+            // Remaining gate checks per plan §4.2.
+
+            // compute_market_context must be present (Local-origin
+            // replays may still carry it after prepare_for_replay).
+            let market_ctx = match config.compute_market_context.as_ref() {
+                Some(c) => c,
+                None => {
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_NETWORK_ROUTE_UNAVAILABLE,
+                        &walker_source_label,
+                        &entry.provider_id,
+                        serde_json::json!({ "reason": "no_market_context" }),
+                    );
+                    skip_reasons
+                        .push(format!("{}:no_market_context", entry.provider_id));
+                    continue;
+                }
+            };
+
+            // Tunnel readiness — inlined from retired should_try_market.
+            // Connected + tunnel_url Some required before we can advertise
+            // a callback URL to Wire. Callback URL is captured here.
+            let callback_url = {
+                let ts = market_ctx.tunnel_state.read().await;
+                let connected = matches!(
+                    ts.status,
+                    crate::tunnel::TunnelConnectionStatus::Connected
+                );
+                if !connected {
+                    None
+                } else {
+                    ts.tunnel_url.as_ref().map(|u| {
+                        let base = u.as_str().trim_end_matches('/').to_string();
+                        format!("{}/v1/compute/job-result", base)
+                    })
+                }
+            };
+            let callback_url = match callback_url {
+                Some(u) => u,
+                None => {
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_NETWORK_ROUTE_UNAVAILABLE,
+                        &walker_source_label,
+                        &entry.provider_id,
+                        serde_json::json!({ "reason": "tunnel_not_connected" }),
+                    );
+                    skip_reasons
+                        .push(format!("{}:tunnel_not_connected", entry.provider_id));
+                    continue;
+                }
+            };
+
+            // Resolve the canonical model id for this entry.
+            let market_model_id = entry
+                .model_id
+                .clone()
+                .filter(|m| !m.is_empty())
+                .or_else(|| {
+                    ctx.and_then(|c| c.resolved_model_id.clone())
+                        .filter(|m| !m.is_empty())
+                })
+                .unwrap_or_else(|| config.primary_model.clone());
+
+            // Advisory cache pre-check (plan §4.2 "Acquire"). Cache is
+            // advisory only; /quote is authoritative. Missing cache →
+            // proceed (cold-start should not block the only market
+            // path). If cache present AND active_offers == 0 → advance.
+            if let Some(cache) = config.market_surface_cache.as_ref() {
+                if let Some(model_entry) = cache.get_model(&market_model_id).await {
+                    if model_entry.active_offers == 0 {
+                        emit_walker_chronicle(
+                            ctx,
+                            config,
+                            super::compute_chronicle::EVENT_NETWORK_MODEL_UNAVAILABLE,
+                            &walker_source_label,
+                            &entry.provider_id,
+                            serde_json::json!({
+                                "reason": "no_offers_for_model",
+                                "model_id": market_model_id,
+                            }),
+                        );
+                        skip_reasons
+                            .push(format!("{}:no_offers_for_model", entry.provider_id));
+                        continue;
+                    }
+                }
+                // Cache miss / cold → fall through and let /quote speak.
+            }
+
+            // Read the participation policy's market_dispatch_max_wait_ms
+            // out of the DB once per market entry. On any failure we fall
+            // back to the default (60s) — absence of a policy row means
+            // "use defaults", not "block market".
+            let market_max_wait_ms: u64 = {
+                let db_path = ctx
+                    .map(|c| c.db_path.clone())
+                    .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
+                match db_path {
+                    Some(dbp) => tokio::task::spawn_blocking(move || {
+                        rusqlite::Connection::open(&dbp)
+                            .ok()
+                            .and_then(|conn| {
+                                crate::pyramid::local_mode::get_compute_participation_policy(&conn)
+                                    .ok()
+                            })
+                            .map(|p| p.effective_booleans().market_dispatch_max_wait_ms)
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(60_000),
+                    None => 60_000,
+                }
+            };
+
+            last_attempted_provider_id = Some(entry.provider_id.clone());
+
+            // ── Dispatch via helper ──────────────────────────────────
+            //
+            // NO_BUDGET_CAP sentinel: `(1i64 << 53) - 1` = JS
+            // MAX_SAFE_INTEGER. Effectively "no cap / solvent assumed";
+            // round-trips cleanly through any f64 JSON parser. Wire's
+            // 409 budget_exceeded is the authoritative ceiling check.
+            // Per-entry `max_budget_credits` is a Wave 0/1 RouteEntry
+            // addition not yet on the struct; for now sentinel is used.
+            const NO_BUDGET_CAP: i64 = (1i64 << 53) - 1;
+            let max_budget = NO_BUDGET_CAP;
+
+            let max_tokens_i64 = if _max_tokens == 0 {
+                0i64
+            } else {
+                _max_tokens as i64
+            };
+
+            let market_outcome = dispatch_market_entry(MarketDispatchArgs {
                 config,
-                super::compute_chronicle::EVENT_NETWORK_ROUTE_SKIPPED,
-                &walker_source_label,
-                &entry.provider_id,
-                serde_json::json!({
-                    "reason": "wave2_market_not_implemented",
-                    "branch": "market",
-                }),
-            );
-            skip_reasons
-                .push(format!("{}:wave2_market_not_implemented", entry.provider_id));
-            continue;
+                ctx,
+                market_ctx,
+                model_id: market_model_id.clone(),
+                max_budget,
+                max_wait_ms: market_max_wait_ms,
+                max_tokens: max_tokens_i64,
+                temperature,
+                input_tokens_est: est_input_tokens as i64,
+                system_prompt,
+                user_prompt,
+                callback_url,
+                walker_source_label: &walker_source_label,
+                entry_provider_id: &entry.provider_id,
+            })
+            .await;
+
+            match market_outcome {
+                Ok(response) => {
+                    let latency_ms = call_started.elapsed().as_millis() as i64;
+                    let walker_ms = walker_started.elapsed().as_millis() as i64;
+
+                    // Optional cache store on success.
+                    try_cache_store(ctx, cache_lookup.as_ref(), &response, call_started);
+
+                    if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
+                        let conn = audit_ctx.conn.lock().await;
+                        let _ = super::db::complete_llm_audit(
+                            &conn,
+                            id,
+                            &response.content,
+                            true,
+                            response.usage.prompt_tokens,
+                            response.usage.completion_tokens,
+                            latency_ms,
+                            response.generation_id.as_deref(),
+                            Some(entry.provider_id.as_str()),
+                        );
+                    }
+
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_WALKER_RESOLVED,
+                        &walker_source_label,
+                        &entry.provider_id,
+                        serde_json::json!({
+                            "latency_ms": latency_ms,
+                            "total_walker_ms": walker_ms,
+                            "attempts": entry_idx + 1,
+                            "branch": "market",
+                        }),
+                    );
+
+                    return Ok(response);
+                }
+                Err(EntryError::Retryable { reason }) => {
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_NETWORK_ROUTE_RETRYABLE_FAIL,
+                        &walker_source_label,
+                        &entry.provider_id,
+                        serde_json::json!({ "reason": reason, "branch": "market" }),
+                    );
+                    skip_reasons
+                        .push(format!("{}:retryable({})", entry.provider_id, reason));
+                    continue;
+                }
+                Err(EntryError::RouteSkipped { reason }) => {
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_NETWORK_ROUTE_SKIPPED,
+                        &walker_source_label,
+                        &entry.provider_id,
+                        serde_json::json!({ "reason": reason, "branch": "market" }),
+                    );
+                    skip_reasons
+                        .push(format!("{}:route_skipped({})", entry.provider_id, reason));
+                    continue;
+                }
+                Err(EntryError::CallTerminal { reason }) => {
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_NETWORK_ROUTE_TERMINAL_FAIL,
+                        &walker_source_label,
+                        &entry.provider_id,
+                        serde_json::json!({ "reason": reason.clone(), "branch": "market" }),
+                    );
+                    if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
+                        let conn = audit_ctx.conn.lock().await;
+                        let _ = super::db::fail_llm_audit(
+                            &conn,
+                            id,
+                            &reason,
+                            last_attempted_provider_id.as_deref(),
+                        );
+                    }
+                    emit_step_error(ctx, &reason);
+                    return Err(anyhow!(reason));
+                }
+            }
         }
 
         // Wave 2: fleet branch — origin-gated + skip-fleet-dispatch-gated;
@@ -4687,14 +4364,13 @@ routing_rules:
 
     #[tokio::test]
     async fn walker_skips_fleet_and_market_entries_in_wave2() {
-        // Route = [fleet, market, unknown-pool]. Wave 2 deletes the Phase A
-        // fleet pre-loop + fleet_filter, so the walker sees all 3 entries:
+        // Route = [fleet, market, unknown-pool]. Walker sees all 3 entries:
         //   - fleet: runtime gate fails (fleet_ctx missing) → advance with
         //     fleet_ctx_missing unavailable.
-        //   - market: Wave 2 emits wave2_market_not_implemented skip
-        //     (Wave 3 inlines market).
+        //   - market: runtime gate fails (compute_market_context absent in
+        //     test fixture) → advance with no_market_context unavailable.
         //   - unknown-pool: provider_not_in_pool unavailable.
-        // Walker exhausts 3 entries. Wave 3 will drop the market stub.
+        // Walker exhausts 3 entries.
         let policy = walker_test_policy(1, vec!["fleet", "market", "unknown-pool"]);
         let config = walker_test_config(policy);
 
@@ -5795,364 +5471,3 @@ routing_rules:
     }
 }
 
-// ── call_model_unified market integration tests ──────────────────────────────
-//
-// Tests for the Phase B market branch helpers. All pure-function tests
-// so they run fast and require no live DB / tunnel / Wire.
-//
-// See `docs/plans/call-model-unified-market-integration.md` §9.1.
-
-#[cfg(test)]
-mod market_integration_tests {
-    use super::*;
-    use crate::pyramid::compute_requester::RequesterError;
-    use crate::pyramid::local_mode::{
-        ComputeParticipationMode, EffectiveParticipationPolicy,
-    };
-
-    // ── Gate fixture ─────────────────────────────────────────────────
-
-    fn base_policy(eager: bool, threshold: u32) -> EffectiveParticipationPolicy {
-        EffectiveParticipationPolicy {
-            mode: ComputeParticipationMode::Hybrid,
-            allow_fleet_dispatch: true,
-            allow_fleet_serving: true,
-            allow_market_dispatch: true,
-            allow_market_visibility: true,
-            allow_storage_pulling: true,
-            allow_storage_hosting: true,
-            allow_relay_usage: true,
-            allow_relay_serving: true,
-            allow_serving_while_degraded: false,
-            market_dispatch_threshold_queue_depth: threshold,
-            market_dispatch_max_wait_ms: 60_000,
-            market_dispatch_eager: eager,
-        }
-    }
-
-    fn snap_connected() -> TunnelSnapshot {
-        TunnelSnapshot {
-            connected: true,
-            has_url: true,
-        }
-    }
-
-    // ── should_try_market branches (§9.1) ────────────────────────────
-
-    #[test]
-    fn gate_false_when_allow_market_dispatch_false() {
-        let mut p = base_policy(true, 0);
-        p.allow_market_dispatch = false;
-        assert!(!should_try_market(&p, i64::MAX, 0, true, &snap_connected(), 0, true));
-    }
-
-    #[test]
-    fn gate_false_when_non_eager_and_queue_under_threshold() {
-        let p = base_policy(false, 10);
-        assert!(!should_try_market(&p, i64::MAX, 0, true, &snap_connected(), 0, true));
-    }
-
-    #[test]
-    fn gate_true_when_non_eager_and_queue_at_threshold() {
-        let p = base_policy(false, 10);
-        assert!(should_try_market(&p, i64::MAX, 0, true, &snap_connected(), 10, true));
-    }
-
-    #[test]
-    fn gate_true_when_eager_and_queue_zero() {
-        let p = base_policy(true, 10);
-        assert!(should_try_market(&p, i64::MAX, 0, true, &snap_connected(), 0, true));
-    }
-
-    #[test]
-    fn gate_false_when_balance_below_estimated_deposit() {
-        let p = base_policy(true, 0);
-        // balance 100, estimated 1000 → gate rejects.
-        assert!(!should_try_market(&p, 100, 1000, true, &snap_connected(), 0, true));
-    }
-
-    #[test]
-    fn gate_false_when_tier_not_eligible() {
-        let p = base_policy(true, 0);
-        assert!(!should_try_market(&p, i64::MAX, 0, false, &snap_connected(), 0, true));
-    }
-
-    #[test]
-    fn gate_false_when_tunnel_connecting_with_url() {
-        let p = base_policy(true, 0);
-        let snap = TunnelSnapshot { connected: false, has_url: true };
-        assert!(!should_try_market(&p, i64::MAX, 0, true, &snap, 0, true));
-    }
-
-    #[test]
-    fn gate_false_when_tunnel_disconnected() {
-        let p = base_policy(true, 0);
-        let snap = TunnelSnapshot { connected: false, has_url: false };
-        assert!(!should_try_market(&p, i64::MAX, 0, true, &snap, 0, true));
-    }
-
-    #[test]
-    fn gate_false_when_tunnel_url_none() {
-        let p = base_policy(true, 0);
-        let snap = TunnelSnapshot { connected: true, has_url: false };
-        assert!(!should_try_market(&p, i64::MAX, 0, true, &snap, 0, true));
-    }
-
-    #[test]
-    fn gate_false_when_compute_market_context_absent() {
-        let p = base_policy(true, 0);
-        assert!(!should_try_market(&p, i64::MAX, 0, true, &snap_connected(), 0, false));
-    }
-
-    #[test]
-    fn gate_true_end_to_end_positive() {
-        let p = base_policy(true, 0);
-        assert!(should_try_market(&p, i64::MAX, 0, true, &snap_connected(), 0, true));
-    }
-
-    // ── model_tier_market_eligible ───────────────────────────────────
-
-    #[test]
-    fn tier_eligibility_empty_is_not_eligible() {
-        assert!(!model_tier_market_eligible(""));
-    }
-
-    #[test]
-    fn tier_eligibility_non_empty_is_eligible() {
-        assert!(model_tier_market_eligible("fast_extract"));
-        assert!(model_tier_market_eligible("mid"));
-        assert!(model_tier_market_eligible("max"));
-    }
-
-    // ── classify_soft_fail_reason (pure function, §9.1) ──────────────
-
-    #[test]
-    fn classify_no_match() {
-        let err = RequesterError::NoMatch { detail: "no_offer".into() };
-        assert_eq!(classify_soft_fail_reason(&err), "no_match");
-    }
-
-    #[test]
-    fn classify_match_failed_includes_status() {
-        let err = RequesterError::MatchFailed { status: 500, body: "x".into() };
-        assert_eq!(classify_soft_fail_reason(&err), "match_failed_500");
-    }
-
-    #[test]
-    fn classify_fill_rejected_sanitizes_slug() {
-        let err = RequesterError::FillRejected {
-            status: 503,
-            reason: "market_serving_disabled".into(),
-            body: "".into(),
-        };
-        assert_eq!(
-            classify_soft_fail_reason(&err),
-            "fill_rejected_provider_serving_disabled"
-        );
-    }
-
-    #[test]
-    fn classify_fill_failed_includes_status() {
-        let err = RequesterError::FillFailed { status: 425, body: "".into() };
-        assert_eq!(classify_soft_fail_reason(&err), "fill_failed_425");
-    }
-
-    #[test]
-    fn classify_delivery_timed_out_includes_waited_ms() {
-        let err = RequesterError::DeliveryTimedOut { waited_ms: 60_000 };
-        assert_eq!(
-            classify_soft_fail_reason(&err),
-            "delivery_timed_out_60000ms"
-        );
-    }
-
-    #[test]
-    fn classify_delivery_tombstoned_sanitizes_slug() {
-        let err = RequesterError::DeliveryTombstoned {
-            reason: "delivery_retry_exhausted".into(),
-        };
-        assert_eq!(
-            classify_soft_fail_reason(&err),
-            "delivery_tombstoned_delivery_retry_exhausted"
-        );
-    }
-
-    #[test]
-    fn classify_provider_failed_includes_code() {
-        let err = RequesterError::ProviderFailed {
-            code: "oom".into(),
-            message: "gpu oom".into(),
-        };
-        assert_eq!(classify_soft_fail_reason(&err), "provider_failed_oom");
-    }
-
-    #[test]
-    fn classify_internal_is_internal() {
-        let err = RequesterError::Internal("anything".into());
-        assert_eq!(classify_soft_fail_reason(&err), "internal");
-    }
-
-    // ── sanitize_wire_slug (§9.1) ────────────────────────────────────
-
-    #[test]
-    fn sanitize_market_serving_disabled_maps_to_provider_serving_disabled() {
-        assert_eq!(
-            sanitize_wire_slug("market_serving_disabled"),
-            "provider_serving_disabled"
-        );
-    }
-
-    #[test]
-    fn sanitize_generic_market_prefix_becomes_network() {
-        assert_eq!(sanitize_wire_slug("market_foo"), "network_foo");
-    }
-
-    #[test]
-    fn sanitize_offer_depleted_becomes_contribution_depleted() {
-        assert_eq!(
-            sanitize_wire_slug("offer_depleted"),
-            "contribution_depleted"
-        );
-    }
-
-    #[test]
-    fn sanitize_generic_offer_prefix_becomes_contribution() {
-        assert_eq!(sanitize_wire_slug("offer_bar"), "contribution_bar");
-    }
-
-    #[test]
-    fn sanitize_seller_becomes_provider() {
-        assert_eq!(sanitize_wire_slug("seller_mismatch"), "provider_mismatch");
-    }
-
-    #[test]
-    fn sanitize_buyer_becomes_requester() {
-        assert_eq!(sanitize_wire_slug("buyer_rejected"), "requester_rejected");
-    }
-
-    #[test]
-    fn sanitize_earnings_becomes_contributions() {
-        assert_eq!(sanitize_wire_slug("earnings_frozen"), "contributions_frozen");
-    }
-
-    #[test]
-    fn sanitize_unknown_slug_passes_through() {
-        assert_eq!(sanitize_wire_slug("foo_bar"), "foo_bar");
-    }
-
-    // Forward-compat pass-through tests — these slugs are NOT in Wire's
-    // current corpus per compute_requester.rs audit, but the sanitizer
-    // MUST accept unknown input gracefully. If Wire starts emitting any
-    // of these we'll add explicit maps; until then pass-through is OK.
-    #[test]
-    fn sanitize_forward_compat_deposit_required_passes_through() {
-        assert_eq!(
-            sanitize_wire_slug("deposit_required"),
-            "deposit_required"
-        );
-    }
-
-    #[test]
-    fn sanitize_forward_compat_rate_limit_exceeded_passes_through() {
-        assert_eq!(
-            sanitize_wire_slug("rate_limit_exceeded"),
-            "rate_limit_exceeded"
-        );
-    }
-
-    #[test]
-    fn sanitize_forward_compat_trader_banned_passes_through() {
-        assert_eq!(sanitize_wire_slug("trader_banned"), "trader_banned");
-    }
-
-    // ── LlmResponse::from_market_result ──────────────────────────────
-
-    #[test]
-    fn from_market_result_tags_provider_as_network() {
-        let mr = crate::pyramid::compute_requester::MarketResult {
-            content: "hi".into(),
-            input_tokens: 10,
-            output_tokens: 5,
-            model_used: "llama3".into(),
-            latency_ms: 100,
-            finish_reason: Some("stop".into()),
-        };
-        let resp = LlmResponse::from_market_result(mr);
-        assert_eq!(resp.content, "hi");
-        assert_eq!(resp.usage.prompt_tokens, 10);
-        assert_eq!(resp.usage.completion_tokens, 5);
-        assert_eq!(resp.provider_id.as_deref(), Some("network"));
-        assert_eq!(resp.fleet_peer_model.as_deref(), Some("llama3"));
-        assert!(resp.fleet_peer_id.is_none());
-        assert!(resp.generation_id.is_none());
-        assert!(resp.actual_cost_usd.is_none());
-    }
-
-    // ── Balance-exhausted dedup ──────────────────────────────────────
-
-    #[test]
-    fn balance_exhausted_once_skips_non_build_ctx() {
-        // No StepContext → no build_id scope → skip entirely.
-        let cfg = LlmConfig::default();
-        emit_network_balance_exhausted_once(100, 50, None, &cfg);
-        // Nothing observable to assert beyond "no panic".
-    }
-
-    #[test]
-    fn balance_exhausted_once_skips_empty_build_id() {
-        // StepContext present but build_id is empty — sentinel for
-        // "no build context" per §3.4.2.
-        let cfg = LlmConfig::default();
-        let ctx = StepContext::new("s", "", "n", "p", 0, None, "");
-        emit_network_balance_exhausted_once(100, 50, Some(&ctx), &cfg);
-        // OnceLock remains unset because the empty-build_id guard ran
-        // before the set() call. set() is still Ok on a subsequent
-        // emit attempt once build_id is populated.
-        assert!(ctx.balance_exhausted_emitted.get().is_none());
-    }
-
-    #[test]
-    fn balance_exhausted_once_sets_once_lock_and_dedup_works() {
-        // First attempt with a real build_id sets the OnceLock; a
-        // second attempt with the same StepContext returns Err from
-        // set() and skips. No observable chronicle write in either
-        // case because db_path is empty.
-        let cfg = LlmConfig::default();
-        let ctx = StepContext::new("slug-a", "build-1", "n", "p", 0, None, "");
-        emit_network_balance_exhausted_once(100, 50, Some(&ctx), &cfg);
-        assert!(
-            ctx.balance_exhausted_emitted.get().is_some(),
-            "first call must set the OnceLock"
-        );
-        // Second call: set() is Err — guard short-circuits.
-        emit_network_balance_exhausted_once(200, 60, Some(&ctx), &cfg);
-        assert!(
-            ctx.balance_exhausted_emitted.get().is_some(),
-            "OnceLock is still set after dedup no-op"
-        );
-    }
-
-    // ── Panic safety: catch_unwind + PendingJobs lifecycle ───────────
-
-    #[tokio::test]
-    async fn catch_unwind_does_not_leak_pending_jobs_on_panic() {
-        use crate::pyramid::pending_jobs::PendingJobs;
-        let pending = PendingJobs::new();
-
-        // Simulate the Phase B branch's AssertUnwindSafe(call_market).catch_unwind().
-        // Use a plain future that panics — the real call_market has the
-        // same cancellation-safe shape.
-        use futures_util::FutureExt;
-        let result = std::panic::AssertUnwindSafe(async { panic!("simulated call_market panic") })
-            .catch_unwind()
-            .await;
-        assert!(result.is_err());
-
-        // We never registered anything, so the map is empty — this is
-        // the invariant the branch relies on: a panic never leaves a
-        // dangling Sender because the panic happens before register.
-        // If a panic happened AFTER register, PendingJobs' own timeout
-        // cleanup handles the dangling entry.
-        assert_eq!(pending.len().await, 0);
-    }
-}

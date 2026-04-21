@@ -22,8 +22,9 @@ use super::pending_jobs::PendingJobs;
 /// runtime to enable the Phase B market branch in `call_model_unified`.
 ///
 /// `None` in tests and in the narrow pre-init boot window — the market
-/// branch is gated on presence of this context (see `should_try_market`),
-/// so absent means "bypass market, go straight to pool".
+/// branch runtime gate in the walker skips a Market entry when this is
+/// absent (plan §4.2), so absent means "bypass market, advance to next
+/// route entry".
 ///
 /// Cloning is cheap: every field is either an `Arc<RwLock<...>>` clone
 /// (pointer bump) or a `PendingJobs` which is itself self-Arc'd
@@ -41,9 +42,9 @@ pub struct ComputeMarketRequesterContext {
     /// `/v1/compute/job-result` handler's `ServerState`, so a clone
     /// here rendezvouses with the same map.
     pub pending_jobs: PendingJobs,
-    /// Shared tunnel state — read for readiness gating in
-    /// `should_try_market`. Same `Arc<RwLock<TunnelState>>` clone as
-    /// `AppState.tunnel_state`, so the gate observes every live
+    /// Shared tunnel state — read for readiness gating in the walker's
+    /// market branch (plan §4.2). Same `Arc<RwLock<TunnelState>>` clone
+    /// as `AppState.tunnel_state`, so the gate observes every live
     /// transition atomically.
     pub tunnel_state: Arc<RwLock<TunnelState>>,
 }
