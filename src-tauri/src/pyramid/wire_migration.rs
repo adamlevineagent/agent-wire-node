@@ -427,17 +427,24 @@ pub fn migrate_prompts_and_chains_to_contributions(
             && report.chains_skipped_already_present > 0)
     {
         let marker_id = uuid::Uuid::new_v4().to_string();
-        conn.execute(
-            "INSERT INTO pyramid_config_contributions (
-                contribution_id, slug, schema_type, yaml_content,
-                wire_native_metadata_json, wire_publication_state_json,
-                status, source, created_by, accepted_at
-             ) VALUES (
-                ?1, NULL, ?2, '',
-                '{}', '{}',
-                'active', 'migration', 'phase5_bootstrap', datetime('now')
-             )",
-            rusqlite::params![marker_id, PROMPT_MIGRATION_MARKER],
+        crate::pyramid::config_contributions::write_contribution_envelope(
+            conn,
+            crate::pyramid::config_contributions::ContributionEnvelopeInput {
+                contribution_id: marker_id,
+                slug: None,
+                schema_type: PROMPT_MIGRATION_MARKER.to_string(),
+                body: String::new(),
+                wire_native_metadata_json: None,
+                supersedes_id: None,
+                triggering_note: None,
+                status: "active".to_string(),
+                source: "migration".to_string(),
+                wire_contribution_id: None,
+                created_by: Some("phase5_bootstrap".to_string()),
+                accepted_at: crate::pyramid::config_contributions::AcceptedAt::Now,
+                needs_migration: None,
+            },
+            crate::pyramid::config_contributions::TransactionMode::OwnTransaction,
         )?;
         report.marker_written = true;
     }
@@ -968,50 +975,67 @@ fn build_bundled_metadata(entry: &BundledContributionEntry) -> WireNativeMetadat
 /// across app upgrades so the schema registry can reference them by
 /// durable handle.
 ///
-/// Uses `INSERT OR IGNORE` semantics: if a row with this
-/// `contribution_id` already exists (second run, app upgrade, or
-/// user-superseded default), the insert is a no-op. The caller detects
-/// this by inspecting the return value (`Ok(true)` = inserted,
-/// `Ok(false)` = skipped).
+/// Skip-on-conflict semantics: if a row with this `contribution_id`
+/// already exists (second run, app upgrade, or user-superseded
+/// default), the insert is a no-op. The caller detects this by
+/// inspecting the return value (`Ok(true)` = inserted, `Ok(false)` =
+/// skipped).
 ///
 /// **Do NOT use INSERT OR REPLACE here.** A user who has superseded a
 /// bundled default with their own refinement would lose their version
 /// on the next app launch. Skip-on-conflict is the correct behavior.
+///
+/// Phase 0a-1 commit 4: routed through `write_contribution_envelope`
+/// via a pre-check on `contribution_id` uniqueness. The envelope
+/// writer is the single production INSERT site; this function's
+/// role is to decide whether to invoke it at all. Pre-check +
+/// insert is not atomic, but the boot path is single-threaded, and
+/// the prior `INSERT OR IGNORE` was only stronger w.r.t. the
+/// `contribution_id` uniqueness the pre-check already enforces.
 fn insert_bundled_contribution(
     conn: &Connection,
     entry: &BundledContributionEntry,
     metadata: &WireNativeMetadata,
 ) -> Result<bool> {
+    // Pre-check: if contribution_id already exists, mirror the prior
+    // `INSERT OR IGNORE` no-op behavior.
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM pyramid_config_contributions WHERE contribution_id = ?1",
+            rusqlite::params![entry.contribution_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if existing.is_some() {
+        return Ok(false);
+    }
+
     let metadata_json = metadata
         .to_json()
         .map_err(|e| anyhow::anyhow!("failed to serialize wire_native_metadata: {e}"))?;
 
-    // Use INSERT OR IGNORE to skip if the contribution_id already
-    // exists. Returns the number of rows affected — 0 if skipped, 1 if
-    // inserted.
-    let rows = conn.execute(
-        "INSERT OR IGNORE INTO pyramid_config_contributions (
-            contribution_id, slug, schema_type, yaml_content,
-            wire_native_metadata_json, wire_publication_state_json,
-            supersedes_id, superseded_by_id, triggering_note,
-            status, source, wire_contribution_id, created_by, accepted_at
-         ) VALUES (
-            ?1, ?2, ?3, ?4,
-            ?5, '{}',
-            NULL, NULL, ?6,
-            'active', 'bundled', NULL, 'bootstrap', datetime('now')
-         )",
-        rusqlite::params![
-            entry.contribution_id,
-            entry.slug,
-            entry.schema_type,
-            entry.yaml_content,
-            metadata_json,
-            entry.triggering_note,
-        ],
-    )?;
+    crate::pyramid::config_contributions::write_contribution_envelope(
+        conn,
+        crate::pyramid::config_contributions::ContributionEnvelopeInput {
+            contribution_id: entry.contribution_id.clone(),
+            slug: entry.slug.clone(),
+            schema_type: entry.schema_type.clone(),
+            body: entry.yaml_content.clone(),
+            wire_native_metadata_json: Some(metadata_json),
+            supersedes_id: None,
+            triggering_note: Some(entry.triggering_note.clone()),
+            status: "active".to_string(),
+            source: "bundled".to_string(),
+            wire_contribution_id: None,
+            created_by: Some("bootstrap".to_string()),
+            accepted_at: crate::pyramid::config_contributions::AcceptedAt::Now,
+            needs_migration: None,
+        },
+        crate::pyramid::config_contributions::TransactionMode::OwnTransaction,
+    )
+    .map_err(|e| anyhow::anyhow!("write_contribution_envelope: {e}"))?;
 
-    Ok(rows > 0)
+    Ok(true)
 }
 
 /// After the bundled manifest walk, ensure at most one `active` row

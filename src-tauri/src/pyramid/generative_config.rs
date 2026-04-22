@@ -636,27 +636,24 @@ fn create_draft_supersession(
         .map_err(|e| anyhow!("failed to serialize wire_native_metadata: {e}"))?;
 
     let new_id = uuid::Uuid::new_v4().to_string();
-    tx.execute(
-        "INSERT INTO pyramid_config_contributions (
-            contribution_id, slug, schema_type, yaml_content,
-            wire_native_metadata_json, wire_publication_state_json,
-            supersedes_id, superseded_by_id, triggering_note,
-            status, source, wire_contribution_id, created_by, accepted_at
-         ) VALUES (
-            ?1, ?2, ?3, ?4,
-            ?5, '{}',
-            ?6, NULL, ?7,
-            'draft', 'local', NULL, 'generative_config', NULL
-         )",
-        rusqlite::params![
-            new_id,
-            prior.slug,
-            prior.schema_type,
-            new_yaml_content,
-            metadata_json,
-            prior.contribution_id,
-            triggering_note,
-        ],
+    crate::pyramid::config_contributions::write_contribution_envelope(
+        &tx,
+        crate::pyramid::config_contributions::ContributionEnvelopeInput {
+            contribution_id: new_id.clone(),
+            slug: prior.slug.clone(),
+            schema_type: prior.schema_type.clone(),
+            body: new_yaml_content.to_string(),
+            wire_native_metadata_json: Some(metadata_json),
+            supersedes_id: Some(prior.contribution_id.clone()),
+            triggering_note: Some(triggering_note.to_string()),
+            status: "draft".to_string(),
+            source: "local".to_string(),
+            wire_contribution_id: None,
+            created_by: Some("generative_config".to_string()),
+            accepted_at: crate::pyramid::config_contributions::AcceptedAt::Null,
+            needs_migration: None,
+        },
+        crate::pyramid::config_contributions::TransactionMode::JoinAmbient,
     )?;
 
     // Phase 9 wanderer fix: do NOT flip the prior's status here. The
@@ -818,27 +815,24 @@ pub fn accept_config_draft(
             .map_err(|e| anyhow!("failed to serialize wire_native_metadata: {e}"))?;
 
         let new_id = uuid::Uuid::new_v4().to_string();
-        tx.execute(
-            "INSERT INTO pyramid_config_contributions (
-                contribution_id, slug, schema_type, yaml_content,
-                wire_native_metadata_json, wire_publication_state_json,
-                supersedes_id, superseded_by_id, triggering_note,
-                status, source, wire_contribution_id, created_by, accepted_at
-             ) VALUES (
-                ?1, ?2, ?3, ?4,
-                ?5, '{}',
-                ?6, NULL, ?7,
-                'active', 'local', NULL, 'user', datetime('now')
-             )",
-            rusqlite::params![
-                new_id,
-                slug,
-                schema_type,
-                yaml_str,
-                metadata_json,
-                prior_active_id,
-                note,
-            ],
+        crate::pyramid::config_contributions::write_contribution_envelope(
+            &tx,
+            crate::pyramid::config_contributions::ContributionEnvelopeInput {
+                contribution_id: new_id.clone(),
+                slug: slug.clone(),
+                schema_type: schema_type.clone(),
+                body: yaml_str.clone(),
+                wire_native_metadata_json: Some(metadata_json),
+                supersedes_id: prior_active_id.clone(),
+                triggering_note: Some(note.clone()),
+                status: "active".to_string(),
+                source: "local".to_string(),
+                wire_contribution_id: None,
+                created_by: Some("user".to_string()),
+                accepted_at: crate::pyramid::config_contributions::AcceptedAt::Now,
+                needs_migration: None,
+            },
+            crate::pyramid::config_contributions::TransactionMode::JoinAmbient,
         )?;
 
         if let Some(prior_id) = &prior_active_id {

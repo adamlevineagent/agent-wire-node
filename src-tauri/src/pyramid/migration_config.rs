@@ -707,29 +707,24 @@ pub fn persist_migration_proposal(
             "persist_migration_proposal: replaced prior migration drafts"
         );
     }
-    tx.execute(
-        "INSERT INTO pyramid_config_contributions (
-            contribution_id, slug, schema_type, yaml_content,
-            wire_native_metadata_json, wire_publication_state_json,
-            supersedes_id, superseded_by_id, triggering_note,
-            status, source, wire_contribution_id, created_by, accepted_at,
-            needs_migration
-         ) VALUES (
-            ?1, ?2, ?3, ?4,
-            ?5, '{}',
-            ?6, NULL, ?7,
-            'draft', 'migration', NULL, 'migration_proposal', NULL,
-            0
-         )",
-        rusqlite::params![
-            draft_id,
-            inputs.flagged_contribution.slug,
-            inputs.flagged_contribution.schema_type,
-            new_yaml,
-            metadata_json,
-            inputs.flagged_contribution.contribution_id,
-            triggering_note,
-        ],
+    crate::pyramid::config_contributions::write_contribution_envelope(
+        &tx,
+        crate::pyramid::config_contributions::ContributionEnvelopeInput {
+            contribution_id: draft_id.clone(),
+            slug: inputs.flagged_contribution.slug.clone(),
+            schema_type: inputs.flagged_contribution.schema_type.clone(),
+            body: new_yaml.clone(),
+            wire_native_metadata_json: Some(metadata_json),
+            supersedes_id: Some(inputs.flagged_contribution.contribution_id.clone()),
+            triggering_note: Some(triggering_note.to_string()),
+            status: "draft".to_string(),
+            source: "migration".to_string(),
+            wire_contribution_id: None,
+            created_by: Some("migration_proposal".to_string()),
+            accepted_at: crate::pyramid::config_contributions::AcceptedAt::Null,
+            needs_migration: Some(0),
+        },
+        crate::pyramid::config_contributions::TransactionMode::JoinAmbient,
     )?;
     tx.commit()?;
 

@@ -377,29 +377,26 @@ fn commit_pulled_active(
     };
 
     let new_id = uuid::Uuid::new_v4().to_string();
-    tx.execute(
-        "INSERT INTO pyramid_config_contributions (
-            contribution_id, slug, schema_type, yaml_content,
-            wire_native_metadata_json, wire_publication_state_json,
-            supersedes_id, superseded_by_id, triggering_note,
-            status, source, wire_contribution_id, created_by, accepted_at
-         ) VALUES (
-            ?1, ?2, ?3, ?4,
-            ?5, '{}',
-            ?6, NULL, ?7,
-            'active', 'wire', ?8, 'wire-pull', datetime('now')
-         )",
-        rusqlite::params![
-            new_id,
-            slug,
-            schema_type,
-            new_yaml_content,
-            metadata_json,
-            prior_active_id,
-            triggering_note,
-            wire_contribution_id,
-        ],
-    )?;
+    crate::pyramid::config_contributions::write_contribution_envelope(
+        &tx,
+        crate::pyramid::config_contributions::ContributionEnvelopeInput {
+            contribution_id: new_id.clone(),
+            slug: slug.map(|s| s.to_string()),
+            schema_type: schema_type.to_string(),
+            body: new_yaml_content.to_string(),
+            wire_native_metadata_json: Some(metadata_json),
+            supersedes_id: prior_active_id.clone(),
+            triggering_note: Some(triggering_note.to_string()),
+            status: "active".to_string(),
+            source: "wire".to_string(),
+            wire_contribution_id: Some(wire_contribution_id.to_string()),
+            created_by: Some("wire-pull".to_string()),
+            accepted_at: crate::pyramid::config_contributions::AcceptedAt::Now,
+            needs_migration: None,
+        },
+        crate::pyramid::config_contributions::TransactionMode::JoinAmbient,
+    )
+    .map_err(|e| PullError::Other(anyhow!("write_contribution_envelope: {e}")))?;
 
     if let Some(prior_id) = &prior_active_id {
         // Flip the prior to superseded. Predicate includes the

@@ -3805,19 +3805,26 @@ pub fn migrate_legacy_dadbear_to_contributions(conn: &Connection) -> Result<()> 
             .unwrap_or_else(|_| "{}".to_string());
 
         let contribution_id = uuid::Uuid::new_v4().to_string();
-        conn.execute(
-            "INSERT INTO pyramid_config_contributions (
-                contribution_id, slug, schema_type, yaml_content,
-                wire_native_metadata_json, wire_publication_state_json,
-                supersedes_id, superseded_by_id, triggering_note,
-                status, source, wire_contribution_id, created_by, accepted_at
-             ) VALUES (
-                ?1, ?2, 'dadbear_policy', ?3,
-                ?4, '{}',
-                NULL, NULL, 'Migrated from legacy pyramid_dadbear_config',
-                'active', 'migration', NULL, 'dadbear_bootstrap', datetime('now')
-             )",
-            rusqlite::params![contribution_id, cfg.slug, yaml, metadata_json],
+        crate::pyramid::config_contributions::write_contribution_envelope(
+            conn,
+            crate::pyramid::config_contributions::ContributionEnvelopeInput {
+                contribution_id: contribution_id.clone(),
+                slug: Some(cfg.slug.clone()),
+                schema_type: "dadbear_policy".to_string(),
+                body: yaml,
+                wire_native_metadata_json: Some(metadata_json),
+                supersedes_id: None,
+                triggering_note: Some(
+                    "Migrated from legacy pyramid_dadbear_config".to_string(),
+                ),
+                status: "active".to_string(),
+                source: "migration".to_string(),
+                wire_contribution_id: None,
+                created_by: Some("dadbear_bootstrap".to_string()),
+                accepted_at: crate::pyramid::config_contributions::AcceptedAt::Now,
+                needs_migration: None,
+            },
+            crate::pyramid::config_contributions::TransactionMode::OwnTransaction,
         )?;
         conn.execute(
             "UPDATE pyramid_dadbear_config SET contribution_id = ?1 WHERE id = ?2",
@@ -3830,15 +3837,24 @@ pub fn migrate_legacy_dadbear_to_contributions(conn: &Connection) -> Result<()> 
     // identified by the composite of (_migration_marker, migration,
     // dadbear_bootstrap).
     let marker_id = uuid::Uuid::new_v4().to_string();
-    conn.execute(
-        "INSERT INTO pyramid_config_contributions (
-            contribution_id, slug, schema_type, yaml_content,
-            status, source, created_by, accepted_at
-         ) VALUES (
-            ?1, NULL, '_migration_marker', '',
-            'active', 'migration', 'dadbear_bootstrap', datetime('now')
-         )",
-        rusqlite::params![marker_id],
+    crate::pyramid::config_contributions::write_contribution_envelope(
+        conn,
+        crate::pyramid::config_contributions::ContributionEnvelopeInput {
+            contribution_id: marker_id,
+            slug: None,
+            schema_type: "_migration_marker".to_string(),
+            body: String::new(),
+            wire_native_metadata_json: None,
+            supersedes_id: None,
+            triggering_note: None,
+            status: "active".to_string(),
+            source: "migration".to_string(),
+            wire_contribution_id: None,
+            created_by: Some("dadbear_bootstrap".to_string()),
+            accepted_at: crate::pyramid::config_contributions::AcceptedAt::Now,
+            needs_migration: None,
+        },
+        crate::pyramid::config_contributions::TransactionMode::OwnTransaction,
     )?;
 
     Ok(())
@@ -3926,19 +3942,26 @@ pub fn migrate_legacy_auto_update_to_contributions(conn: &Connection) -> Result<
             .unwrap_or_else(|_| "{}".to_string());
 
         let contribution_id = uuid::Uuid::new_v4().to_string();
-        conn.execute(
-            "INSERT INTO pyramid_config_contributions (
-                contribution_id, slug, schema_type, yaml_content,
-                wire_native_metadata_json, wire_publication_state_json,
-                supersedes_id, superseded_by_id, triggering_note,
-                status, source, wire_contribution_id, created_by, accepted_at
-             ) VALUES (
-                ?1, ?2, 'auto_update_policy', ?3,
-                ?4, '{}',
-                NULL, NULL, 'Migrated from legacy pyramid_auto_update_config',
-                'active', 'migration', NULL, 'auto_update_bootstrap', datetime('now')
-             )",
-            rusqlite::params![contribution_id, cfg.slug, yaml, metadata_json],
+        crate::pyramid::config_contributions::write_contribution_envelope(
+            conn,
+            crate::pyramid::config_contributions::ContributionEnvelopeInput {
+                contribution_id: contribution_id.clone(),
+                slug: Some(cfg.slug.clone()),
+                schema_type: "auto_update_policy".to_string(),
+                body: yaml,
+                wire_native_metadata_json: Some(metadata_json),
+                supersedes_id: None,
+                triggering_note: Some(
+                    "Migrated from legacy pyramid_auto_update_config".to_string(),
+                ),
+                status: "active".to_string(),
+                source: "migration".to_string(),
+                wire_contribution_id: None,
+                created_by: Some("auto_update_bootstrap".to_string()),
+                accepted_at: crate::pyramid::config_contributions::AcceptedAt::Now,
+                needs_migration: None,
+            },
+            crate::pyramid::config_contributions::TransactionMode::OwnTransaction,
         )?;
         conn.execute(
             "UPDATE pyramid_auto_update_config SET contribution_id = ?1 WHERE slug = ?2",
@@ -3948,15 +3971,24 @@ pub fn migrate_legacy_auto_update_to_contributions(conn: &Connection) -> Result<
 
     // Sentinel row so subsequent runs short-circuit.
     let marker_id = uuid::Uuid::new_v4().to_string();
-    conn.execute(
-        "INSERT INTO pyramid_config_contributions (
-            contribution_id, slug, schema_type, yaml_content,
-            status, source, created_by, accepted_at
-         ) VALUES (
-            ?1, NULL, '_migration_marker', '',
-            'active', 'migration', 'auto_update_bootstrap', datetime('now')
-         )",
-        rusqlite::params![marker_id],
+    crate::pyramid::config_contributions::write_contribution_envelope(
+        conn,
+        crate::pyramid::config_contributions::ContributionEnvelopeInput {
+            contribution_id: marker_id,
+            slug: None,
+            schema_type: "_migration_marker".to_string(),
+            body: String::new(),
+            wire_native_metadata_json: None,
+            supersedes_id: None,
+            triggering_note: None,
+            status: "active".to_string(),
+            source: "migration".to_string(),
+            wire_contribution_id: None,
+            created_by: Some("auto_update_bootstrap".to_string()),
+            accepted_at: crate::pyramid::config_contributions::AcceptedAt::Now,
+            needs_migration: None,
+        },
+        crate::pyramid::config_contributions::TransactionMode::OwnTransaction,
     )?;
 
     Ok(())
