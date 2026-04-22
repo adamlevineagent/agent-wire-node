@@ -55,6 +55,9 @@ tokio-util = { version = "0.7", features = ["rt"] }
 notify = "7"
 thiserror = "2"
 dashmap = "6"
+# Walker v3 Phase 0a-1: lock-free ArcSwap<ScopeCache> for the scope_cache_reloader
+# task added in Phase 0a-2. Orphaned-looking after commit 1 by design.
+arc-swap = "1"
 tiktoken-rs = "0.6"
 async-trait = "0.1"
 subtle = "2"

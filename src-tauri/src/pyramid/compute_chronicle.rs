@@ -236,6 +236,68 @@ pub const EVENT_MARKET_BACKOFF_WAITING: &str = "market_backoff_waiting";
 #[allow(dead_code)]
 pub const EVENT_DISPATCH_POLICY_SUPERSEDED: &str = "dispatch_policy_superseded";
 
+// ── Walker v3 chronicle events ────────────────────────────────────────────
+//
+// 22 local-only events introduced by walker v3 (plan §5.4.6, rev 1.0.2).
+// Declared in Phase 0a-1; emission sites land in later phases. Authoritative
+// category split and total = 22; plan-integrity Check 9 counts §5.4.6 and
+// verifies every "adds N events" / "all N new events" prose claim matches.
+
+// Decision lifecycle (4)
+#[allow(dead_code)]
+pub const EVENT_DECISION_BUILT: &str = "decision_built";
+#[allow(dead_code)]
+pub const EVENT_DECISION_PREVIEWED: &str = "decision_previewed";
+#[allow(dead_code)]
+pub const EVENT_DECISION_BUILD_FAILED: &str = "decision_build_failed";
+#[allow(dead_code)]
+pub const EVENT_DISPATCH_FAILED_POLICY_BLOCKED: &str = "dispatch_failed_policy_blocked";
+
+// Readiness & breaker (4)
+#[allow(dead_code)]
+pub const EVENT_PROVIDER_SKIPPED_READINESS: &str = "provider_skipped_readiness";
+#[allow(dead_code)]
+pub const EVENT_BREAKER_TRIPPED: &str = "breaker_tripped";
+#[allow(dead_code)]
+pub const EVENT_BREAKER_SKIPPED: &str = "breaker_skipped";
+#[allow(dead_code)]
+pub const EVENT_DISPATCH_EXHAUSTED: &str = "dispatch_exhausted";
+
+// Config lifecycle (6)
+#[allow(dead_code)]
+pub const EVENT_CONFIG_SUPERSEDED: &str = "config_superseded";
+#[allow(dead_code)]
+pub const EVENT_CONFIG_RETRACTED: &str = "config_retracted";
+#[allow(dead_code)]
+pub const EVENT_CONFIG_RETRACTED_TO_BUNDLED: &str = "config_retracted_to_bundled";
+#[allow(dead_code)]
+pub const EVENT_RETRACTION_WALKED_DEEP: &str = "retraction_walked_deep";
+#[allow(dead_code)]
+pub const EVENT_SENSITIVE_SUPERSESSION_CONFIRMED: &str = "sensitive_supersession_confirmed";
+#[allow(dead_code)]
+pub const EVENT_CONFIG_SUPERSESSION_CONFLICT: &str = "config_supersession_conflict";
+
+// Plan integrity / drift (3)
+#[allow(dead_code)]
+pub const EVENT_TIER_UNRESOLVED: &str = "tier_unresolved";
+#[allow(dead_code)]
+pub const EVENT_PREVIEW_VS_APPLY_DRIFT: &str = "preview_vs_apply_drift";
+#[allow(dead_code)]
+pub const EVENT_REQUESTER_PROVIDER_PARAM_DRIFT: &str = "requester_provider_param_drift";
+
+// Infrastructure (5)
+#[allow(dead_code)]
+pub const EVENT_SCOPE_CACHE_LISTENER_RESTARTED: &str = "scope_cache_listener_restarted";
+#[allow(dead_code)]
+pub const EVENT_SCOPE_CACHE_QUARANTINED: &str = "scope_cache_quarantined";
+#[allow(dead_code)]
+pub const EVENT_BUNDLED_CONTRIBUTION_VALIDATION_FAILED: &str =
+    "bundled_contribution_validation_failed";
+#[allow(dead_code)]
+pub const EVENT_V3_MIGRATION_SNAPSHOTS_PRUNED: &str = "v3_migration_snapshots_pruned";
+#[allow(dead_code)]
+pub const EVENT_FLEET_PEER_VERSION_SKEW: &str = "fleet_peer_version_skew";
+
 // ── Event context ─────────────────────────────────────────────────────────
 
 /// All context needed to record a chronicle event.
