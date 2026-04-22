@@ -453,8 +453,6 @@ fn extract_error_slug_from_body(body: &serde_json::Value) -> Option<String> {
 /// when the header is absent or carries an unrecognized value.
 ///
 /// Header semantics:
-/// - `never` → CallTerminal. Wire has declared "do not retry"; walker
-///   bubbles rather than burning cascade entries.
 /// - `transient` → Retryable. Condition expected to clear imminently
 ///   (e.g., `all_offers_saturated_for_model`, FOR-UPDATE race on
 ///   `provider_queue_full`). Walker's saturation-retry loop (in
@@ -463,22 +461,28 @@ fn extract_error_slug_from_body(body: &serde_json::Value) -> Option<String> {
 ///   perspective; the distinction is operational (Wire hinting at
 ///   longer-than-immediate retry). Walker's retry loop honors backoff
 ///   inputs from the structured detail.
+/// - `never` → **fall through to slug classification.** The header
+///   means "don't re-POST to this endpoint expecting a different
+///   answer" — NOT "bubble out of the walker cascade entirely." The
+///   RouteSkipped vs CallTerminal distinction must come from the
+///   slug semantics: `no_offer_for_model` is route-specific (other
+///   providers can still serve — RouteSkipped), `operator_mismatch`
+///   is cross-route (no provider can fix it — CallTerminal). The
+///   slug table at `classify_rev21_slug` already has this right;
+///   this function defers to it on `never`.
 /// - Absent or unrecognized → fall through to slug-based classifier.
 ///
 /// `X-Retriable: true` (the orthogonal legacy header) is not consulted
 /// directly here; Wire always pairs it with `X-Wire-Retry: transient`
 /// so the intent is the same through this function.
 pub(crate) fn classify_wire_error(err: &ApiErrorWithHints, stage: &str) -> EntryError {
-    // 1. Honor X-Wire-Retry header with precedence.
+    // 1. Honor X-Wire-Retry header with precedence, BUT only for the
+    //    retry-intent-tiered cases. `never` means "don't re-POST here"
+    //    and maps to whatever the slug says about cross-route reach —
+    //    which is exactly what the slug classifier encodes. Fall
+    //    through to the slug path in that case.
     if let Some(hint) = err.hints.x_wire_retry.as_deref() {
         match hint {
-            "never" => {
-                // Wire said "do not retry" — CallTerminal.
-                // Preserve slug in the reason for telemetry.
-                let slug =
-                    extract_error_slug_from_body(&err.body).unwrap_or_else(|| stage.to_string());
-                return EntryError::CallTerminal { reason: slug };
-            }
             "transient" | "backoff" => {
                 // Retryable — walker's entry-level retry loop decides
                 // how to honor it. Preserve slug so the loop can match
@@ -488,16 +492,21 @@ pub(crate) fn classify_wire_error(err: &ApiErrorWithHints, stage: &str) -> Entry
                     .unwrap_or_else(|| format!("{stage}_transient"));
                 return EntryError::Retryable { reason: slug };
             }
-            _ => {
-                // Unrecognized hint value — fall through to
-                // slug/HTTP-code classification (defensive: Wire may
-                // ship a new hint value before node knows about it).
-            }
+            // `never`, unrecognized, absent → fall through to
+            // slug/HTTP-code classification. The slug table
+            // (classify_rev21_slug) distinguishes route-specific
+            // failures (RouteSkipped — other providers may serve)
+            // from cross-route failures (CallTerminal — no provider
+            // can help) with rationale on each arm.
+            _ => {}
         }
     }
 
-    // 2. No header hint (or unrecognized value) — fall through to the
-    //    existing slug-then-HTTP-code classification ladder.
+    // 2. Slug-then-HTTP-code classification. Route-specific failures
+    //    (like `no_offer_for_model`) surface as RouteSkipped so walker
+    //    advances to fleet/openrouter/ollama-local. Cross-route
+    //    failures (like `operator_mismatch`) surface as CallTerminal
+    //    so walker bubbles without burning cascade attempts.
     let err_str = err.to_string();
     classify_rev21_http_error(&err_str, stage)
 }
@@ -1155,20 +1164,47 @@ mod tests {
     }
 
     #[test]
-    fn classify_wire_error_x_wire_retry_never_forces_call_terminal() {
-        // Wire said "do not retry" — even if the slug would normally
-        // RouteSkip or even Retry, X-Wire-Retry: never wins. The slug is
-        // preserved in the reason for telemetry.
-        let err = make_api_err(
+    fn classify_wire_error_x_wire_retry_never_defers_to_slug_semantics() {
+        // `never` header means "don't re-POST this endpoint" — it does
+        // NOT mean "bubble out of the cascade." The RouteSkipped vs
+        // CallTerminal distinction comes from the slug, which
+        // classify_rev21_slug encodes correctly:
+        //   - no_offer_for_model → RouteSkipped (other providers may
+        //     serve this model; fleet/openrouter/ollama are unrelated
+        //     to Wire's offer table)
+        //   - operator_mismatch   → CallTerminal (identity bug; no
+        //     provider will serve until operator reconfigures)
+        //
+        // Both slugs pair with X-Wire-Retry: never on Wire's side.
+        // Walker's behavior is driven by the slug, not the header.
+
+        let no_offer = make_api_err(
             404,
             serde_json::json!({ "error": "no_offer_for_model" }),
             Some("never"),
             None,
         );
-        match classify_wire_error(&err, "quote") {
-            EntryError::CallTerminal { reason } => assert_eq!(reason, "no_offer_for_model"),
-            other => panic!("expected CallTerminal on X-Wire-Retry: never, got {:?}", other),
-        }
+        assert!(
+            matches!(
+                classify_wire_error(&no_offer, "quote"),
+                EntryError::RouteSkipped { .. }
+            ),
+            "no_offer_for_model must RouteSkip so walker advances cascade"
+        );
+
+        let op_mismatch = make_api_err(
+            403,
+            serde_json::json!({ "error": "operator_mismatch" }),
+            Some("never"),
+            None,
+        );
+        assert!(
+            matches!(
+                classify_wire_error(&op_mismatch, "quote"),
+                EntryError::CallTerminal { .. }
+            ),
+            "operator_mismatch must CallTerminal — no provider will serve"
+        );
     }
 
     #[test]
