@@ -58,3 +58,20 @@ These raw hits intentionally include tests, comments, and type definitions. The 
 - The most consequential active-path files are `llm.rs`, `chain_dispatch.rs`, `chain_executor.rs`, `routes.rs`, and `characterize.rs`.
 - The most consequential retirement files are `mod.rs`, `dispatch_policy.rs`, `db.rs`, and `build.rs`.
 - Any implementation branch should refresh this grep before Phase 1 starts if additional plan edits or unrelated code changes land first.
+
+## Rev 1.0.2 additions (post-fresh-audit code verification)
+
+Additional consumers surfaced by the 2026-04-22 pair audit against live code:
+
+| File | Hits | Bucket | Notes |
+|---|---|---|---|
+| `src-tauri/src/pyramid/build_runner.rs` | 2 | `retires` / behavioral | `state.use_chain_engine.load(Ordering::Relaxed)` at :328 and `from_depth is only supported with the chain engine` error at :358. Direct user-visible signal for §5.6.3's chain-engine-enable-ack modal when `use_chain_engine: false`. Not covered by grep for `primary_model`/`fallback_model_*`/`pyramid_tier_routing`/`RouteEntry`/`resolve_ir_model` but directly relevant to walker v3's behavioral gate. |
+| `src-tauri/src/pyramid/yaml_renderer.rs` (additional callers) | +2 | `retires` / replace | `:575` and `:749` call `registry.list_tier_routing()` alongside the :428 rewrite target. All three migrate together or UI tier surface silently drifts. |
+| `src-tauri/src/pyramid/llm.rs:2216-2232` | — | `reads Decision` | Market dispatch retry loop reads `get_compute_participation_policy(&conn)` on a fresh SQLite connection. Decision-in-scope threading required; not just a substitution. |
+
+### Code-reality corrections to rev 1.0.1 framing
+
+- `src-tauri/src/pyramid/stale_engine.rs` is DECOMMISSIONED for dispatch (explicit "DECOMMISSIONED" comments at lines 180, 498, 602, 619-622; `drain_and_dispatch` is a no-op). The active DADBEAR dispatch path is `src-tauri/src/pyramid/dadbear_supervisor.rs:514 dispatch_materialized_item`. Any plan or inventory reference to stale_engine-as-dispatch-site is stale.
+- `src-tauri/src/pyramid/ollama_probe.rs` does not exist. Ollama probing is `pub async fn probe_ollama(base_url: &str) -> OllamaProbeResult` at `src-tauri/src/pyramid/local_mode.rs:330` with callers at `:499`, `:570`, `:1204`.
+- `resolve_ir_model` at `src-tauri/src/pyramid/chain_dispatch.rs:1059` is already partially migrated (Phase 3 fix-pass): line 1067 consults `provider_registry.resolve_tier()` as priority-2 before falling back to `primary_model`. Phase 1 subsumes this registry-consulting path; the `match tier` fallback at :1080-1088 retires.
+- `INSERT INTO pyramid_config_contributions` hits exactly 35 sites across 9 files. Dropping the `pyramid_` prefix grep-matches 44 sites / 7 files on the different `config_contributions` table. CI deny-rule MUST use the full table name.
