@@ -17,7 +17,7 @@
 //
 // The name `StepContext` is reserved for this struct per the spec's
 // "Threading the Cache Context" section. A pre-existing
-// `chain_dispatch::StepContext` carries DB handles + live LlmConfig — the
+// `chain_dispatch::ChainDispatchContext` carries DB handles + live LlmConfig — the
 // two types live side-by-side in the codebase and are distinguished at use
 // sites via fully-qualified paths. They have different responsibilities.
 //

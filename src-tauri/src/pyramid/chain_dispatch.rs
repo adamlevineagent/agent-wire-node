@@ -28,7 +28,7 @@ use super::{OperationalConfig, Tier1Config};
 // ── Step context ────────────────────────────────────────────────────────────
 
 /// Phase 6 fix pass: build-scoped cache plumbing plus lazy prompt/model
-/// hash caches. Lives on `chain_dispatch::StepContext` so every LLM call
+/// hash caches. Lives on `chain_dispatch::ChainDispatchContext` so every LLM call
 /// site in the dispatcher (dispatch_ir_llm, dispatch_llm) can construct
 /// a per-call `pyramid::step_context::StepContext` without re-hashing the
 /// prompt template or re-resolving the tier.
@@ -50,10 +50,10 @@ pub struct CacheDispatchBase {
     /// lookups and writes.
     pub bus: Option<Arc<BuildEventBus>>,
     /// Chain name for chronicle task context (e.g., "code-mechanical").
-    /// Flows through to StepContext.chain_name via CacheAccess.
+    /// Flows through to ChainDispatchContext.chain_name via CacheAccess.
     pub chain_name: Option<String>,
     /// Content type for chronicle task context (e.g., "code", "document").
-    /// Flows through to StepContext.content_type via CacheAccess.
+    /// Flows through to ChainDispatchContext.content_type via CacheAccess.
     pub content_type: Option<String>,
     /// Phase 6 lazy cache: prompt template path → SHA-256 hex. The same
     /// template path used by multiple steps in the same build hashes
@@ -121,7 +121,7 @@ impl CacheDispatchBase {
 
 /// Context available to all chain steps during execution.
 #[derive(Clone)]
-pub struct StepContext {
+pub struct ChainDispatchContext {
     pub db_reader: Arc<Mutex<Connection>>,
     pub db_writer: Arc<Mutex<Connection>>,
     pub slug: String,
@@ -186,7 +186,7 @@ pub async fn dispatch_step(
     resolved_input: &Value,
     system_prompt: &str,
     defaults: &ChainDefaults,
-    ctx: &StepContext,
+    ctx: &ChainDispatchContext,
 ) -> Result<Value> {
     if step.mechanical {
         let fn_name = step
@@ -257,7 +257,7 @@ async fn dispatch_llm(
     resolved_input: &Value,
     system_prompt: &str,
     defaults: &ChainDefaults,
-    ctx: &StepContext,
+    ctx: &ChainDispatchContext,
 ) -> Result<Value> {
     let temperature = resolve_temperature(step, defaults);
     let resolved_model = resolve_model(step, defaults, &ctx.config);
@@ -573,10 +573,10 @@ const MECHANICAL_FUNCTIONS: &[&str] = &[
 /// Dispatch a mechanical step to a named Rust function.
 ///
 /// For v1, the actual build.rs functions require signatures that don't match
-/// the generic `(input: &Value, ctx: &StepContext) -> Result<Value>` contract.
+/// the generic `(input: &Value, ctx: &ChainDispatchContext) -> Result<Value>` contract.
 /// The dispatch framework is established here; actual wiring happens in Phase 5
 /// when the chain executor replaces the hardcoded build pipeline.
-fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &StepContext) -> Result<Value> {
+fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDispatchContext) -> Result<Value> {
     match function_name {
         "extract_import_graph" => {
             info!("[mechanical] extract_import_graph (placeholder)");
@@ -1206,7 +1206,7 @@ pub async fn dispatch_ir_step(
     step: &Step,
     resolved_input: &Value,
     system_prompt: &str,
-    ctx: &StepContext,
+    ctx: &ChainDispatchContext,
 ) -> Result<(Value, Option<LlmResponse>)> {
     match step.operation {
         StepOperation::Llm => {
@@ -1254,7 +1254,7 @@ pub async fn dispatch_ir_llm(
     step: &Step,
     resolved_input: &Value,
     system_prompt: &str,
-    ctx: &StepContext,
+    ctx: &ChainDispatchContext,
 ) -> Result<(Value, LlmResponse)> {
     let temperature = resolve_ir_temperature(&step.model_requirements, &ctx.tier1);
     let resolved_model = resolve_ir_model(&step.model_requirements, &ctx.config);
@@ -1441,7 +1441,7 @@ pub async fn dispatch_ir_llm(
 /// resolved model id is recorded against the tier, and the prompt hash
 /// is cached keyed on the instruction.
 fn build_cache_ctx_for_ir_step(
-    ctx: &StepContext,
+    ctx: &ChainDispatchContext,
     step: &Step,
     resolved_model: &str,
     system_prompt: &str,
@@ -1537,7 +1537,7 @@ fn build_cache_ctx_for_ir_step(
 pub fn dispatch_ir_mechanical(
     step: &Step,
     resolved_input: &Value,
-    ctx: &StepContext,
+    ctx: &ChainDispatchContext,
 ) -> Result<Value> {
     let fn_name = step
         .rust_function
@@ -1607,7 +1607,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_mechanical_unknown_fn() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
@@ -1628,7 +1628,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_mechanical_known_fn() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test-slug".into(),
@@ -1873,7 +1873,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_ir_mechanical_routes_correctly() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "ir-test".into(),
@@ -1895,7 +1895,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_ir_mechanical_missing_fn_name() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
@@ -1918,7 +1918,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_ir_mechanical_unknown_fn() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
@@ -1941,7 +1941,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_ir_step_transform_routes() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
@@ -1966,7 +1966,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_ir_step_transform_resolves_args_against_input() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
@@ -1995,7 +1995,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_ir_step_transform_missing_spec() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
@@ -2018,7 +2018,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_ir_step_wire_not_implemented() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
@@ -2037,7 +2037,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_ir_step_task_not_implemented() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
@@ -2056,7 +2056,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_ir_step_game_not_implemented() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
@@ -2075,7 +2075,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_ir_step_mechanical_routes() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "slug".into(),

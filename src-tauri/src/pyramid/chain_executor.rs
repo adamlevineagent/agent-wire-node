@@ -103,7 +103,7 @@ fn audience_value_to_legacy_string(v: &Value) -> Option<String> {
 // paths). Kept private to this module — other modules have their own
 // emission helpers.
 fn emit_chain_event(
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     kind: crate::pyramid::event_bus::TaggedKind,
 ) {
     if let Some(cb) = dispatch_ctx.cache_base.as_ref() {
@@ -119,7 +119,7 @@ fn emit_chain_event(
 /// Extract the build_id stored on the cache_base, or fall back to a
 /// synthetic id derived from the slug. The synthetic fallback should
 /// only be reached in tests where cache_base is `None`.
-fn dispatch_build_id(dispatch_ctx: &chain_dispatch::StepContext) -> String {
+fn dispatch_build_id(dispatch_ctx: &chain_dispatch::ChainDispatchContext) -> String {
     dispatch_ctx
         .cache_base
         .as_ref()
@@ -1510,7 +1510,7 @@ async fn enforce_max_thread_size(
     resolved_input: &Value,
     ctx: &ChainContext,
     reader: &Arc<Mutex<Connection>>,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     defaults: &super::chain_engine::ChainDefaults,
     error_strategy: &ErrorStrategy,
 ) -> Result<Value> {
@@ -3256,7 +3256,7 @@ fn build_legacy_expression_env(ctx: &ChainContext) -> Value {
 async fn execute_container_step(
     step: &ChainStep,
     ctx: &mut ChainContext,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     defaults: &super::chain_engine::ChainDefaults,
     error_strategy: &ErrorStrategy,
     writer_tx: &mpsc::Sender<WriteOp>,
@@ -3394,7 +3394,7 @@ async fn execute_container_step(
 fn execute_inner_steps<'a>(
     steps: &'a [ChainStep],
     ctx: &'a mut ChainContext,
-    dispatch_ctx: &'a chain_dispatch::StepContext,
+    dispatch_ctx: &'a chain_dispatch::ChainDispatchContext,
     defaults: &'a super::chain_engine::ChainDefaults,
     error_strategy: &'a ErrorStrategy,
     writer_tx: &'a mpsc::Sender<WriteOp>,
@@ -3560,7 +3560,7 @@ fn execute_split_step(step: &ChainStep, ctx: &mut ChainContext) -> Result<Value>
 async fn execute_loop_step(
     step: &ChainStep,
     ctx: &mut ChainContext,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     defaults: &super::chain_engine::ChainDefaults,
     error_strategy: &ErrorStrategy,
     writer_tx: &mpsc::Sender<WriteOp>,
@@ -3653,7 +3653,7 @@ async fn dispatch_with_retry(
     resolved_input: &Value,
     system_prompt: &str,
     defaults: &super::chain_engine::ChainDefaults,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     error_strategy: &ErrorStrategy,
     fallback_key: &str,
 ) -> Result<Value> {
@@ -3849,7 +3849,7 @@ pub async fn retry_dead_letter_entry(
     let system_prompt = entry.system_prompt.clone().unwrap_or_default();
 
     let llm_config = state.config.read().await.clone();
-    let dispatch_ctx = chain_dispatch::StepContext {
+    let dispatch_ctx = chain_dispatch::ChainDispatchContext {
         db_reader: state.reader.clone(),
         db_writer: state.writer.clone(),
         slug: entry.slug.clone(),
@@ -4129,7 +4129,7 @@ pub async fn execute_chain_from(
         info!("[CHAIN] concurrency cap: {cap}");
     }
 
-    let dispatch_ctx = chain_dispatch::StepContext {
+    let dispatch_ctx = chain_dispatch::ChainDispatchContext {
         db_reader: state.reader.clone(),
         db_writer: state.writer.clone(),
         slug: slug.to_string(),
@@ -6418,7 +6418,7 @@ struct ForEachTaskOutcome {
 async fn execute_for_each(
     step: &ChainStep,
     ctx: &mut ChainContext,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     defaults: &super::chain_engine::ChainDefaults,
     error_strategy: &ErrorStrategy,
     saves_node: bool,
@@ -7083,7 +7083,7 @@ async fn execute_for_each_concurrent(
     step: &ChainStep,
     ctx: &mut ChainContext,
     items: Vec<Value>,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     defaults: &super::chain_engine::ChainDefaults,
     error_strategy: &ErrorStrategy,
     saves_node: bool,
@@ -7740,7 +7740,7 @@ async fn execute_for_each_work_item(
     step: &ChainStep,
     work: &ForEachPendingWork,
     ctx_snapshot: &ChainContext,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     defaults: &super::chain_engine::ChainDefaults,
     error_strategy: &ErrorStrategy,
     saves_node: bool,
@@ -7957,7 +7957,7 @@ async fn execute_pair_adjacent(
     step: &ChainStep,
     source_depth: i64,
     ctx: &mut ChainContext,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     defaults: &super::chain_engine::ChainDefaults,
     error_strategy: &ErrorStrategy,
     saves_node: bool,
@@ -8179,7 +8179,7 @@ async fn execute_pair_adjacent(
 async fn dispatch_pair(
     step: &ChainStep,
     ctx: &mut ChainContext,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     defaults: &super::chain_engine::ChainDefaults,
     error_strategy: &ErrorStrategy,
     _instruction: &str,
@@ -8283,7 +8283,7 @@ async fn execute_recursive_pair(
     step: &ChainStep,
     starting_depth: i64,
     ctx: &mut ChainContext,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     defaults: &super::chain_engine::ChainDefaults,
     error_strategy: &ErrorStrategy,
     saves_node: bool,
@@ -8561,7 +8561,7 @@ async fn execute_recursive_cluster(
     step: &ChainStep,
     starting_depth: i64,
     ctx: &mut ChainContext,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     defaults: &super::chain_engine::ChainDefaults,
     error_strategy: &ErrorStrategy,
     saves_node: bool,
@@ -9317,7 +9317,7 @@ async fn execute_recursive_cluster(
 async fn dispatch_group(
     step: &ChainStep,
     ctx: &mut ChainContext,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     defaults: &super::chain_engine::ChainDefaults,
     error_strategy: &ErrorStrategy,
     _instruction: &str,
@@ -9455,7 +9455,7 @@ async fn web_nodes_batched(
     step: &ChainStep,
     ctx: &ChainContext,
     defaults: &super::chain_engine::ChainDefaults,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     error_strategy: &ErrorStrategy,
     max_tokens: usize,
 ) -> Result<Vec<PendingWebEdge>> {
@@ -9673,7 +9673,7 @@ async fn web_nodes_batched(
 async fn execute_web_step(
     step: &ChainStep,
     ctx: &mut ChainContext,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     defaults: &super::chain_engine::ChainDefaults,
     error_strategy: &ErrorStrategy,
     writer_tx: &mpsc::Sender<WriteOp>,
@@ -9873,7 +9873,7 @@ async fn execute_web_step(
 async fn execute_single(
     step: &ChainStep,
     ctx: &mut ChainContext,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     defaults: &super::chain_engine::ChainDefaults,
     error_strategy: &ErrorStrategy,
     saves_node: bool,
@@ -10004,7 +10004,7 @@ async fn execute_single(
 async fn execute_mechanical(
     step: &ChainStep,
     ctx: &mut ChainContext,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     defaults: &super::chain_engine::ChainDefaults,
 ) -> Result<Value> {
     info!("[CHAIN] mechanical step \"{}\" dispatching...", step.name);
@@ -11122,7 +11122,7 @@ async fn dispatch_ir_with_retry(
     step: &IrStep,
     resolved_input: &Value,
     system_prompt: &str,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     error_policy: &ErrorPolicy,
 ) -> Result<(Value, Option<super::llm::LlmResponse>)> {
     let max_attempts = match error_policy {
@@ -11280,7 +11280,7 @@ pub async fn execute_plan(
         }
         Arc::new(base)
     });
-    let dispatch_ctx = chain_dispatch::StepContext {
+    let dispatch_ctx = chain_dispatch::ChainDispatchContext {
         db_reader: state.reader.clone(),
         db_writer: state.writer.clone(),
         slug: slug.to_string(),
@@ -11525,7 +11525,7 @@ pub async fn execute_plan(
 async fn execute_ir_single(
     step: &IrStep,
     exec_state: &mut ExecutionState,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
 ) -> Result<Value> {
     let saves_node = ExecutionState::step_saves_node(step);
     let depth = ExecutionState::step_depth(step);
@@ -11683,7 +11683,7 @@ struct IrForEachOutcome {
 async fn execute_ir_parallel_foreach(
     step: &IrStep,
     exec_state: &mut ExecutionState,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
     cancel: &CancellationToken,
 ) -> Result<Value> {
     let saves_node = ExecutionState::step_saves_node(step);
@@ -11986,7 +11986,7 @@ async fn execute_ir_parallel_foreach(
 async fn execute_ir_sequential_foreach(
     step: &IrStep,
     exec_state: &mut ExecutionState,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
 ) -> Result<Value> {
     let saves_node = ExecutionState::step_saves_node(step);
     let depth = ExecutionState::step_depth(step);
@@ -12438,7 +12438,7 @@ fn ir_step_is_web_edges(step: &IrStep) -> bool {
 async fn execute_ir_web_edges(
     step: &IrStep,
     exec_state: &mut ExecutionState,
-    dispatch_ctx: &chain_dispatch::StepContext,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
 ) -> Result<Value> {
     let depth = ExecutionState::step_depth(step);
     let synthetic_id = format!("WEB-L{depth}");
