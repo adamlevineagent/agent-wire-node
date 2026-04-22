@@ -1,6 +1,6 @@
 # Walker v3 — YAML drafts + findings
 
-**Synced-to-rev:** 0.8 (integrity-pass-required banner per §2.13 item 7 of the plan doc).
+**Synced-to-rev:** 0.9 (integrity-pass-required banner per §2.13 item 7 of the plan doc).
 
 **Purpose:** concrete seeds for the six walker_* contributions. Originally authored against rev 0.2; this file has been updated through successive revs alongside the plan. Findings section at the bottom is historical (what the drafting pass surfaced at rev 0.2); the plan's §11 audit history is the authoritative record of resolutions.
 
@@ -55,7 +55,7 @@ These are the `source: bundled` contributions every install boots with, until op
 ```yaml
 schema_type: walker_provider_openrouter
 version: 1
-source: bundled
+# source: set by envelope writer (rev 0.6+); not in YAML body
 overrides:
   model_list:
     extractor: ["inception/mercury-2"]
@@ -74,7 +74,7 @@ overrides:
 ```yaml
 schema_type: walker_provider_local
 version: 1
-source: bundled
+# source: set by envelope writer (rev 0.6+); not in YAML body
 overrides:
   ollama_base_url: "http://localhost:11434/v1"
   ollama_probe_interval_secs: 300
@@ -94,7 +94,7 @@ Left empty on purpose: bundled install has no claim about what Ollama serves. Th
 ```yaml
 schema_type: walker_provider_fleet
 version: 1
-source: bundled
+# source: set by envelope writer (rev 0.6+); not in YAML body
 overrides:
   fleet_peer_min_staleness_secs: 300
   fleet_prefer_cached: true
@@ -135,7 +135,7 @@ overrides:
 ```yaml
 schema_type: walker_call_order
 version: 1
-source: bundled
+# source: set by envelope writer (rev 0.6+); not in YAML body
 order: [market, local, openrouter, fleet]
 overrides_by_provider: {}
 ```
@@ -145,7 +145,7 @@ overrides_by_provider: {}
 ```yaml
 schema_type: walker_slot_policy
 version: 1
-source: bundled
+# source: set by envelope writer (rev 0.6+); not in YAML body
 slots: {}
 ```
 
