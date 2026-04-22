@@ -1,8 +1,8 @@
 # Walker Provider Configs + Slot Policy (v3)
 
 **Date:** 2026-04-21
-**Status:** DRAFT (rev 0.9) — Cycle 3 Stage 1 absorbed (5 new structural roots). Pending Cycle 3 Stage 2.
-**Rev:** 0.9
+**Status:** DRAFT (rev 1.0) — Cycle 3 Stage 2 absorbed. Architectural convergence: all accumulated runtime state now contribution-native or in-memory. Pending Adam GO.
+**Rev:** 1.0
 **Supersedes:** `inference-routing-v2-model-aware-config.md` (retired); rev 0.1 (six-API model, obsolete); rev 0.2 (resolver-chain reframe, this doc continues it).
 **Author context:** planning thread, 2026-04-21. Rev 0.1 modeled this as six schemas with field lists. Rev 0.2 reframed as ONE resolver over a scope chain with schemas as thin value carriers. Rev 0.3 absorbs findings F1–F11 from `walker-v3-yaml-drafts.md` — shape-per-scope for `model_list`, `Option`-typed accessors replacing sentinels, `per_provider` block on slot-policy, provider readiness gates as a named layer parallel to the resolver, tier-set as union of provider `model_list` keys.
 
@@ -303,11 +303,13 @@ The 8 checks:
 6. **Cross-referenced state fields** — any field referenced as a state read must have a named write-site.
 7. **Companion drafts doc rev-match** — `walker-v3-yaml-drafts.md` must carry a "synced to rev X" banner matching the plan's current rev.
 8. **Sensitive-field catalog parity** — the sensitive-fields list (§2.15) must match exactly the set of parameters with `sensitive: true`.
-9. **Count-assertion parity (rev 0.9 — B-F2 response)** — any prose claim of form "adds N events" / "N scopes" / "N schemas" must equal the cardinality of the corresponding enumeration. Cycle 3 caught "Walker v3 adds 12 events" alongside a 14-item list alongside "all 10 new" exit criteria — exactly the failure mode Check 9 prevents.
-10. **Enum variant coverage (rev 0.9 — B-F3 response)** — every `enum` variant referenced in prose (e.g. `NetworkUnreachable`, `PeerIsV1Announcer`) must appear in the corresponding Rust-shape definition in the plan. Catches the class where §2.16.5 prose mentions a variant that §2.6's enum definition doesn't list.
-11. **Audit-evidence artifact (rev 0.9 — F-C3-10 response)** — when §11 audit history claims "plan-integrity skill caught N items", the next-rev skill run MUST also emit those findings to a persisted artifact under `docs/plans/history/plan-integrity-rev{N-1}-to-rev{N}.md`. Unsourced specific claims are flagged as drift-candidates; skill output verifiable.
+9. **Count-assertion parity (rev 1.0 fixed)** — any prose claim of form "adds N events" / "N scopes" / "N schemas" must equal the **actual enumerated list cardinality** (not eyeballed). The skill counts enumerations by regex-matching list items, not by trusting prose. Rev 0.9 added this as a syntactic check but missed the 18-vs-20 drift because the implementation trusted the prose number; rev 1.0 inverts — count the list, verify prose matches.
+10. **Enum variant coverage** — every `enum` variant referenced in prose (e.g. `NetworkUnreachable`, `PeerIsV1Announcer`) must appear in the corresponding Rust-shape definition in the plan.
+11. **Audit-evidence artifact** — `docs/plans/history/plan-integrity-rev{N-1}-to-rev{N}.md` must exist and list what was caught.
+12. **Invariant-tag coverage (rev 1.0 / B-F5)** — sections declaring single-writer / single-reader / single-gate invariants use an explicit marker (e.g. `{invariant: scope_cache_single_writer}`). Check 12 greps every prose mention of the named resource and verifies no section contradicts the invariant. Prevents a future rev from writing "ConfigSynced handler directly writes ScopeCache" alongside §2.16.2's one-writer invariant without the skill catching it.
+13. **Transaction-boundary compatibility (rev 1.0 / B-F5)** — any section that opens a SQL transaction on a given table must be cross-checked against every other section that opens a transaction on the same table. Catches contradictions like "`BEGIN IMMEDIATE` around supersede" + "`BEGIN IMMEDIATE TRANSACTION` wrapping boot" that could deadlock or be semantically incompatible.
 
-Plan-integrity skill at `~/.claude/skills/plan-integrity/SKILL.md` is updated to include checks 9-11 in its next invocation.
+Plan-integrity skill at `~/.claude/skills/plan-integrity/SKILL.md` is updated to include checks 9-13. Check 9's implementation is fixed (count the enumeration, not the prose).
 
 When the agent-wire-node repo gets CI (separate initiative), a subset of these checks can be ported to a shell/python script at `docs/tools/plan-integrity.sh` for redundant mechanical enforcement. Until then: Claude + skill-discipline is the enforcement. Rev 0.7's CI-script framing is explicitly walked back.
 
@@ -345,6 +347,8 @@ Consequences:
 - **Skill prompts do NOT bake numeric literals.** SYSTEM_DEFAULTS values are injected at skill-use time via prompt template interpolation (`{{patience_secs_default}}`, `{{retry_http_count_default}}`). Updating a SYSTEM_DEFAULT ripples into all skill outputs without re-authoring prompts — eliminates the Pillar 37 violation.
 - **Audit trail:** every sensitive supersession carries operator session ID and confirmation timestamp in the contribution envelope.
 
+**Draft-time parent reconciliation (rev 1.0 / B-F8):** DRAFT supersessions in the Tools > Create preview lane do NOT bind to a `supersedes_id` until commit time. If a ConfigSynced pull applies a Wire-side supersession on the SAME `schema_type` during the draft's lifetime, the draft is flagged `parent_changed: true` and the UI shows "Base changed while drafting — [Review merge] [Discard draft]." On commit of an unreconciled draft, the envelope writer detects `supersedes_id` mismatch with the current active row and emits `config_supersession_conflict`; operator re-reviews. This prevents the stale-draft-on-committed-parent silent-reparent hazard.
+
 ### 2.16 Concurrency and lifecycle invariants (Root 20 — rev 0.8)
 
 Cycle 2 Stage 2 surfaced a cluster of concurrency and lifecycle edge cases. This section names them with concrete invariants; Phase 0a builds the infrastructure.
@@ -377,51 +381,58 @@ Cycle 2 Stage 2 surfaced a cluster of concurrency and lifecycle edge cases. This
 
 **Fix (rev 0.9):** walker's SelfDealing check consults `node_identity_history` — **stored as a contribution** (per Root 23 "everything is a contribution"). Schema: `node_identity_history` with `overrides.history: Vec<{node_id, rotated_at, reason}>` and `local_only: true` + `sensitive: true` schema_annotation flags. Survives reinstall IF Wire sync restores it. Operators SHOULD retract their own market offers before re-onboarding; onboarding wizard surfaces this as a pre-rotation checklist. On rotation, the wizard appends to the history contribution in the same commit that sets the new node_id.
 
-### 2.17 Boot and init order (Root 24 — rev 0.9 new)
+### 2.17 Boot and init order (Root 24 — rev 1.0 sequential-startup rewrite)
 
-Rev 0.8 introduced migration invariants (§2.16.1-§2.16.4), ArcSwap reloader (§2.16.2), envelope writer (§2.11), bundled loader (§2.10), stale_engine rehydrate — but never specified the order these run at boot. Cycle 3 Stage 1 found a CRITICAL race: builds can transition to `status='running'` between §2.16.4's pre-migration builds-check and the migration transaction's DDL. Schema flip under a live build produces inconsistent L0 contributions.
+Rev 0.9's §2.17 proposed a transactional gate on `app_mode` in `pyramid_config`. Cycle 3 Stage 2 caught that (a) `pyramid_config` is a JSON file on disk, not a SQL table, so `BEGIN IMMEDIATE` doesn't serialize it; (b) the gate was fighting symptoms — there's no concurrent writer to serialize against if the code that starts builds hasn't been spawned yet.
 
-**The canonical boot sequence (rev 0.9):**
+**The canonical boot sequence (rev 1.0 — sequential startup, no transactional gate needed):**
 
 ```
-1. open DB + check schema_version
-2. BEGIN IMMEDIATE TRANSACTION
-3. set app_mode = 'migrating_v3' in pyramid_config (new field — a readable gate)
-4. check `builds.status IN ('running','paused_for_resume')` — if ANY row exists, ROLLBACK; boot into in-flight-build UI recovery modal
-5. run v3 migration (§5.3) — CREATE-COPY-DROP-RENAME as needed
-6. set `_v3_migration_marker`
-7. COMMIT
-8. load bundled_contributions.json manifest through envelope writer in `BundledBootSkipOnFail` mode (§2.11)
-9. spawn `scope_cache_reloader` task (§2.16.2) with panic-restart + quarantine supervisor (see §2.17.1 below)
-10. read active walker_* contributions → build initial ScopeCache → ArcSwap::store
-11. wire ConfigSynced listener — ready to handle supersession events
-12. stale_engine rehydrate — reads Decision via synthetic builder per §2.12
-13. set app_mode = 'ready' — build-starter code paths now permitted to start new builds
-14. routes_operator.rs comes up last — accepts operator HTTP traffic
+1. open DB
+2. load bundled_contributions.json manifest through envelope writer in
+   BundledBootSkipOnFail mode (§2.11)
+3. build initial ScopeCache from active contributions → ArcSwap::store
+4. migration phase (only if migration_marker contribution says v2 is active):
+   a. SQL transaction BEGIN
+   b. refuse-to-migrate if any builds row has status IN ('running','paused_for_resume')
+      (no race possible — step 8 hasn't started listeners yet)
+   c. run v3 migration DDL (§5.3 CREATE-COPY-DROP-RENAME)
+   d. supersede migration_marker contribution: v2 → v3 (atomic with DDL)
+   e. COMMIT
+5. spawn scope_cache_reloader task with quarantine supervisor (§2.17.2)
+6. wire ConfigSynced listener — ready to handle supersession events
+7. stale_engine rehydrate — reads via synthetic Decision builder (§2.12)
+8. AppState::transition_to(AppMode::Ready) — in-memory state change
+9. routes_operator.rs + HTTP listeners come up — accepts traffic
+10. chain executor + DADBEAR scheduler spawned — can now start builds
 ```
 
-**2.17.1 app_mode as a gate.** `app_mode` is a new readable field in `pyramid_config`, values: `migrating_v3` | `booting` | `ready` | `quarantined` | `shutting_down`. Every build-starter code path (chain executor, DADBEAR scheduler, stale_engine, operator HTTP build-create route) checks `app_mode == 'ready'` on entry. Fails fast with `AppNotReady` error if not. Closes F-C3-2's check-then-migrate window.
+**Why sequential replaces transactional:** steps 1-7 run on a single thread at boot before any code that can start a new build has been spawned. There is no concurrent writer. `AppMode::Ready` is an in-memory gate checked by build-starter code paths, and those code paths aren't running yet. The F-C3-2 CRITICAL (builds entering `running` during migration) is solved by not starting the listeners until after migration. This is simpler than a transactional gate and doesn't depend on pyramid_config being a SQL table (which it isn't).
 
-**2.17.2 ArcSwap reloader supervisor — quarantine on persistent panic (F-C3-1).** Rev 0.8's supervisor said "on panic, restart and emit `scope_cache_listener_restarted`." Cycle 3 caught: if the panic cause is persistent (superseded contribution that passes envelope validation but triggers a shape surprise on rebuild — `normalize != build`), restart loops infinitely. **Rev 0.9 fix:** restart-budget of 3 within 60s. On 4th panic within that window: (a) supervisor holds the LAST-KNOWN-GOOD `Arc<ScopeCache>` (resolver keeps serving reads from stale cache), (b) marks the triggering `contribution_id` as `status='quarantined'` (new status), (c) emits `scope_cache_quarantined` chronicle event (add to §5.4.6), (d) surfaces operator banner. `app_mode` transitions to `quarantined`; operator must retract or fix the contribution before boot proceeds past this state on next restart.
+**2.17.1 `AppMode` is an in-memory state machine.** `enum AppMode { Booting, Migrating, Ready, Quarantined, ShuttingDown }` lives in `AppState` (the Tauri-managed struct already threaded through IPC handlers) as `tokio::sync::RwLock<AppMode>`. Transitions are single-writer from the boot coordinator in main.rs; readers check on entry. Not persisted — if the app crashes, next boot starts fresh at `Booting`. Build-starter code paths check `app_state.app_mode.read().await == AppMode::Ready` on entry, fail fast with `AppNotReady` error otherwise. The boot-state-machine is ephemeral by design; persisting it would create recovery ambiguity (what does "Migrating" mean on a fresh-start after a crash mid-migration?).
 
-**2.17.3 Boot aborts to known states.** If any step 1-7 fails: transaction rollback, app refuses to boot, surfaces recovery modal. If step 8 produces a quarantined bundled row: boot continues (SkipOnFail), quarantined row surfaced in chronicle. If step 9-12 fail: degraded-mode boot, `app_mode='quarantined'`. No step can "partially succeed" without an app_mode transition.
+**2.17.2 ArcSwap reloader supervisor — quarantine on persistent panic.** Restart-budget of 3 within 60s. On 4th panic within that window: supervisor holds LAST-KNOWN-GOOD `Arc<ScopeCache>` (resolver keeps serving reads from stale cache), marks the triggering `contribution_id` as `status='quarantined'` (new contribution-status value), emits `scope_cache_quarantined` chronicle event, transitions `AppMode` to `Quarantined`. Operator must retract or fix the contribution; next restart re-runs the boot sequence and quarantined rows are skipped at step 2.
 
-### 2.18 Internal state contribution audit (Root 23 — rev 0.9 new)
+**2.17.3 Boot aborts to known states.** If step 1 fails (DB corrupt): app refuses to boot, surfaces recovery modal. If step 4 fails (migration DDL or migration_marker supersession): transaction rollback, `_pre_v3_snapshot_*` tables preserved, recovery modal. If step 2 produces a quarantined bundled row: boot continues (SkipOnFail), quarantined row surfaced in chronicle. If steps 5-7 fail: `AppMode::Quarantined`, listeners don't come up, operator banner. No step can "partially succeed" without an explicit AppMode transition.
 
-Cycle 3 Stage 1 flagged that walker v3 has introduced several pieces of persistent state that live OUTSIDE the contribution pattern, violating Adam's explicit rule (`feedback_everything_is_contribution.md`). This section is the audit pass:
+### 2.18 Internal state — contribution-native by default (Root 23 — rev 1.0 reframe)
 
-| State | Today | Rev 0.9 decision |
+Rev 0.9 invented new non-contribution storage (`pyramid_config` "field", sentinel rows) for state that should be contribution-backed. Cycle 3 Stage 2 caught that this was defaulting to hardcoding. Rev 1.0 converts runtime state to contributions wherever the semantic fits, and keeps the non-contribution cases strictly to runtime-ephemeral state that shouldn't be persisted.
+
+| State | Rev 1.0 decision | Rationale |
 |---|---|---|
-| `_v3_migration_marker` | Sentinel row in `pyramid_config` | **Non-contribution.** Justified: one-shot boot flag, no supersession model needed. |
-| `app_mode` | New field in `pyramid_config` (§2.17.1) | **Non-contribution.** Justified: runtime state, not configuration; changes every boot. |
-| `onboarding_complete_at` | Referenced in §2.6 / §8, previously "`pyramid_config.json` or contribution" | **Contribution** (`onboarding_state` schema). Decided per B-F11. Envelope-validated, survives Wire sync, enables the integrity-pass write-site check. |
-| `node_identity_history` | Rev 0.8 said "maintained on the node" without location | **Contribution** (`node_identity_history` schema) per §2.16.7 update. `local_only: true` + `sensitive: true`. Survives reinstall IF Wire sync restores. |
-| BreakerState HashMap | Runtime in-memory (Phase 5) | **Non-contribution.** Justified: ephemeral per-build state, doesn't survive restart by design. |
-| ScopeCache | Runtime in-memory (ArcSwap) | **Non-contribution.** Justified: derived from contributions, rebuilt on demand. |
-| `_pre_v3_snapshot_*` tables | SQL tables (§5.3) | **Non-contribution.** Justified: migration forensics, not runtime config. Auto-pruned 30d post-migration (F-C3-14). |
-| MarketSurfaceCache | Runtime in-memory + disk cache | **Non-contribution.** Justified: derived from Wire `/market-surface` responses, rebuilt on sync. |
+| **Migration marker** | **Contribution** (`migration_marker` schema). Bundled default declares `v2`. Phase 0a-1 final step supersedes to `v3`, atomic with the migration DDL transaction. Future migrations supersede further (`v4`, etc.). | Natural supersession model; no new infrastructure; schema_version is just the body of the active contribution. |
+| **`onboarding_state`** | **Contribution** (`onboarding_state` schema). Holds `onboarding_complete_at`, `completed_pages`. Written by Page 4 handler as operator-authored supersession. | Envelope-validated; surfaces in Settings as authoritative source; survives Wire sync if operator_private; Check 6 writer-site verifiable. |
+| **`node_identity_history`** | **Contribution** (`node_identity_history` schema). Holds `current: NodeId`, `history: Vec<{node_id, rotated_at, reason}>`. On re-onboarding, the rotation flow supersedes with current+previous appended. | SelfDealing check reads from the active contribution; historic node_ids survive reinstall via Wire's `operator_private` sync (see §5.4.3 — the op-private flag is distinct from `local_only`). |
+| **`AppMode`** | **In-memory only** (`AppState::app_mode: tokio::sync::RwLock<AppMode>`). Not persisted. | Boot-state-machine is meaningful only within a single process lifetime; crash-restart starts fresh. Persisting it creates recovery ambiguity. |
+| **BreakerState HashMap** | **In-memory only** (Phase 5). | Ephemeral per-build runtime state. |
+| **ScopeCache** | **In-memory only** (ArcSwap). | Derived from active contributions, rebuilt on demand. |
+| **MarketSurfaceCache** | **In-memory + disk cache** (Wire-derived). | Derived from Wire `/market-surface`, not operator config. |
+| **`_pre_v3_snapshot_*` tables** | **SQL tables, non-contribution.** Auto-pruned 30d post-migration (§5.5.9). | Migration forensics; intentionally decoupled from contribution graph to preserve the snapshot against subsequent contribution edits. |
 
-Two new contribution schema_types added to the walker family's register: `onboarding_state` and `node_identity_history`. Each ships with schema_definition + schema_annotation + generation_skill + default_seed per the four-part pattern. Phase 0b LOC absorbs these (~100 LOC for the two schemas; skills are trivial since these are written by the onboarding/rotation flows, not operators).
+**Three new contribution schema_types** land in rev 1.0: `migration_marker`, `onboarding_state`, `node_identity_history`. Each ships with schema_definition + schema_annotation + generation_skill + default_seed per the four-part pattern. Phase 0b LOC absorbs these (~150 LOC for all three).
+
+**Why this is different from rev 0.9:** rev 0.9 treated "this needs transactional coordination with the migration DDL" as a reason to invent new hardcoded SQL state. Rev 1.0 recognizes that migration_marker IS the schema-version tracker, naturally expressed as a superseding contribution, atomically committed alongside the DDL in the same SQL transaction on `pyramid_config_contributions`. No new sentinel field, no pyramid_config storage-type confusion, no transactional gate on a JSON file.
 
 ---
 
@@ -602,11 +613,12 @@ On first boot after v3 ships, migration runs in one transaction. Either all step
 
 5. **`walker_slot_policy` starts empty.** No per-slot overrides until operator declares.
 
-6. **Set `_v3_migration_marker` sentinel.** Only after steps 1-5 all succeed.
+6. **Supersede `migration_marker` contribution from `v2` to `v3`** (rev 1.0). This is a standard contribution supersession in the same SQL transaction as the DDL — no separate sentinel field. The active `migration_marker` contribution IS the schema-version tracker. Only after steps 1-5 all succeed.
+7. **Pre-index de-duplication (rev 1.0 / B-F3).** Before CREATE UNIQUE INDEX `uq_config_contrib_active`, run: for every `(slug, schema_type)` with >1 `status='active'` row in `pyramid_config_contributions`, deactivate all but the `id DESC` row; record as snapshot under `_pre_v3_dedup_snapshot`. Existing dev DBs with pre-enforcement duplicates will otherwise fail the CREATE INDEX. Then create index inside the same transaction.
 
 **Post-migration:** legacy tables/struct fields dropped in the same migration. No read-compatibility period — walker v3 is the only reader. `config.primary_model` removed from `AppConfig`. Pre-existing callers are migrated in the same Phase 1 commit; `cargo check` proves completeness.
 
-**On boot:** app asserts `_v3_migration_marker` exists before instantiating walker. If missing, boot refuses with clear error directing operator to retry migration or rollback.
+**On boot:** boot sequence (§2.17) reads active `migration_marker` contribution. If body is `v2`, step 4 runs migration. If `v3` (or higher), skip migration and proceed. Missing marker = treat as v2 (first-ever boot of v3 binary on an unmigrated DB). No separate sentinel needed — the contribution IS the marker.
 
 **SQLite mechanics for column removal (B-F9 / rev 0.7 — spelling out what rev 0.6 over-claimed):** SQLite versions < 3.35 cannot `ALTER TABLE DROP COLUMN`; `db.rs:2446` notes "SQLite DROP COLUMN is expensive." The migration removes these columns via CREATE-COPY-DROP-RENAME:
 
@@ -646,7 +658,7 @@ Cycle 2 Stage 2 caught that walker v3 silently changes the semantic weight of se
 
 **5.4.2 Fleet announce protocol versioning (B-I1).** `FleetAnnouncement.models_loaded` was observability-only in v2.1.1 (`fleet.rs:236` comment: "kept for observability"). Walker v3 promotes it to gating — `NoPeerHasModel` readiness filter reads it as authoritative. Mixed-version clusters: v3 node skips a v2.1.1 peer that actually has the model but populated `models_loaded` differently.
 
-**Fix (Phase 4):** add `announce_protocol_version: u8` field to `FleetAnnouncement` (default 1 for v2.1.1, 2 for v3 with semantic-gated `models_loaded`). Walker's fleet readiness on a v1-announcer does NOT apply the `NoPeerHasModel` filter — falls back to v2.1.1 behavior (dispatch by rule_name, let peer resolve). Only v2+ announcers get the strict gate. Tests: mixed-version roster, strict vs lenient readiness per peer.
+**Fix (Phase 4):** add `announce_protocol_version: u8` field to `FleetAnnouncement` with **`#[serde(default = "announce_protocol_version_default")]` returning `0`** (pre-versioning value, per rev 1.0 / B-F7). Version mapping: `0` = pre-v3 peer (field was absent in the deserialized announce), `1` = v2.1.1 with explicit versioning, `2` = v3. Walker's fleet readiness on a v<2 announcer returns `PeerIsV1Announcer` NotReady per §5.5.2 strict mode — refuses to dispatch. Additionally emits `fleet_peer_version_skew` chronicle event (add to §5.4.6 — brings total to 21 events) on first-seen v<2 peer per boot, so operator UI surfaces "N of M peers are pre-v3; upgrade to enable fleet dispatch." Sunset horizon: v3 ships with v<2 strict-refuse; no deprecation window — fleet just doesn't work for mixed clusters until peers upgrade. Tests: mixed-version roster with explicit 0/1/2 peers; version-skew event firing; NoPeerHasModel vs PeerIsV1Announcer distinction surfaced correctly.
 
 **5.4.3 Chronicle scope_snapshot leak (B-I3).** `DispatchDecision.scope_snapshot` serialized into `decision_built` chronicle payload. ScopeCache carries operator-local config — LAN URLs (`ollama_base_url: "http://behem.lan:11434"`), budget caps, closed-beta slugs. If chronicle syncs cross-node (Phase 6 "last N Decisions aggregation" is one path; Wire-side observability is another latent possibility), this leaks.
 
@@ -667,8 +679,15 @@ Cycle 2 Stage 2 caught that walker v3 silently changes the semantic weight of se
 
 **Fix (§5.3 step 1 revision):** unknown `provider_id` → **hard migration failure** by default. Operator opts in via `--allow-unknown-providers` CLI flag with an explicit "I understand these tiers will stop working" confirmation. Plus a Phase 0b boot check: enumerate all tier names referenced in chain YAMLs; cross-reference against post-migration `model_list` keys union; mismatches surface in Settings as a "Chain tiers not backed by any provider" banner, not just chronicle.
 
-**5.4.6 Two chronicle event categories.** The chronicle is the cross-subsystem boundary. Walker v3 adds 18 events (rev 0.9 count, was over-counted 12/14/10 across prior revs; plan-integrity Check 9 now enforces count-assertion parity). They divide into two categories:
-- **Local-only events** (informational, node-internal): all 18 listed in Phase 0a const declarations (§6) — `decision_built`, `decision_previewed`, `provider_skipped_readiness`, `breaker_tripped`, `breaker_skipped`, `dispatch_exhausted`, `decision_build_failed`, `config_superseded`, `config_retracted`, `config_retracted_to_bundled`, `retraction_walked_deep`, `sensitive_supersession_confirmed`, `config_supersession_conflict`, `tier_unresolved`, `preview_vs_apply_drift`, `requester_provider_param_drift`, `scope_cache_listener_restarted`, `scope_cache_quarantined`, `bundled_contribution_validation_failed`, `v3_migration_snapshots_pruned`.
+**5.4.6 Two chronicle event categories.** The chronicle is the cross-subsystem boundary. Walker v3 adds **21 events** (rev 1.0 authoritative count — B-F10 caught drift where prose said 18 but enumeration was 20; plan-integrity Check 9 now enforces by counting enumeration cardinality). They divide into two categories:
+- **Local-only events** (informational, node-internal, never cross-node-synced):
+  - Decision lifecycle (3): `decision_built`, `decision_previewed`, `decision_build_failed`
+  - Readiness & breaker (4): `provider_skipped_readiness`, `breaker_tripped`, `breaker_skipped`, `dispatch_exhausted`
+  - Config lifecycle (6): `config_superseded`, `config_retracted`, `config_retracted_to_bundled`, `retraction_walked_deep`, `sensitive_supersession_confirmed`, `config_supersession_conflict`
+  - Plan integrity / drift (3): `tier_unresolved`, `preview_vs_apply_drift`, `requester_provider_param_drift`
+  - Infrastructure (5): `scope_cache_listener_restarted`, `scope_cache_quarantined`, `bundled_contribution_validation_failed`, `v3_migration_snapshots_pruned`, `fleet_peer_version_skew`
+
+Total 3+4+6+3+5 = **21**. Plan-integrity skill verifies this sum matches the opening-sentence count. (Rev 1.0 added `fleet_peer_version_skew` for §5.4.2 sunset visibility.)
 - **Wire-visible events** (none in walker v3). Walker v3 does NOT emit any event that crosses to Wire. If a future phase introduces cross-node observability, the redaction from §5.4.3 applies.
 
 This boundary is load-bearing: chronicle can be arbitrarily verbose locally; nothing leaks unless an explicit cross-node sync is built, at which point §5.4.3's redaction is the required filter.
@@ -702,7 +721,29 @@ The validator's walk is schema-type-driven: `walker_slot_policy` YAML paths matc
 
 Both operator-overrideable via scope chain. Back-off logic lives in `ProviderReadiness::can_dispatch_now` (not in stale_engine — single home). stale_engine simply sees `NotReady` from the gate and skips, same as other NotReady reasons.
 
-**5.5.9 `_pre_v3_snapshot_*` retention (F-C3-14).** 30-day auto-prune. On any boot after v3 where `(current_time - _v3_migration_marker_time) > 30d`, drop the `_pre_v3_snapshot_*` tables and emit `v3_migration_snapshots_pruned`. Operator can also manually clear via Settings "Clear migration snapshots" button.
+**5.5.9 `_pre_v3_snapshot_*` retention (F-C3-14).** 30-day auto-prune. On any boot where the active `migration_marker` contribution is `v3+` AND its creation timestamp is older than 30 days, drop the `_pre_v3_snapshot_*` + `_pre_v3_dedup_snapshot` tables and emit `v3_migration_snapshots_pruned`. Operator can also manually clear via Settings "Clear migration snapshots" button.
+
+### 5.6 Lifecycle semantics for walker state (Root 31 — rev 1.0 new)
+
+Rev 0.9 added state to the contribution graph without specifying how it behaves across rollback, backup/restore, and default-flag changes. This section names each.
+
+**5.6.1 Rollback from v3 to v2.** Triggered either via the boot-time recovery modal's "Rollback" option (§2.17.3) or the `--rollback-v3-migration` CLI flag. Steps:
+
+1. Restore `pyramid_tier_routing`, `dispatch_policy`, `config` (JSON) from `_pre_v3_snapshot_*` tables.
+2. Purge rev-0.9-introduced contribution rows: `migration_marker` (all rows — no longer meaningful), `walker_provider_*`, `walker_call_order`, `walker_slot_policy`, `onboarding_state`, `node_identity_history`. Retract (not hard-delete) so they remain visible in chronicle for forensics; v2 code ignores unknown `schema_type` rows.
+3. Snapshot of `pyramid_config_contributions` PRE-v3 migration is captured as part of step 1's `_pre_v3_snapshot_config` — walker v3 migration extends §5.3 step 1 to include a pre-migration row-dump of the contributions table.
+4. The boot-time modal surfaces rollback as a first-class button (not CLI-flag, per §5.5.4).
+
+**5.6.2 Backup/restore.** Each contribution schema declares its backup semantics in `schema_annotation`:
+
+- `migration_marker`: backed up as-is. On restore, if the binary's embedded `schema_version > marker_body`, run migration (normal path — restored state is just another "needs migration" trigger). This prevents a restored v2-marker from short-circuiting a later-version migration.
+- `onboarding_state`: backed up as-is. On restore, validate `onboarding_complete_at.node_identity` matches current `node_identity_history.current`; if mismatch, mark state `re_onboarding_required: true` so Settings surfaces the prompt.
+- `node_identity_history`: backed up as-is with `operator_private: true` flag — encrypted to operator keypair for Wire sync; on OS-level backup, stored unencrypted per disk-backup security model.
+- `_pre_v3_snapshot_*` tables: backed up as tables, not contributions. If restored inside the 30-day window, they remain available for rollback; if older, they're pruned automatically on first boot.
+
+**5.6.3 `use_chain_engine` default flip — PUNCHLIST P0-2 resolution.** The `PyramidConfig.use_chain_engine` flag currently defaults to `false`, meaning fresh installs bypass the chain engine entirely and hit the legacy `build.rs` pipeline that doesn't go through the Decision spine. Walker v3 is inert on such installs. **Phase 1 exit criterion** includes flipping this default to `true` in `PyramidConfig::default()` + migrating existing installs' `pyramid_config.json` to set it explicitly. This ties P0-1 + P0-2 together as a single Phase 1 outcome: legacy dispatch_policy routing path retires, chain engine becomes the only dispatch path, walker v3 is live on fresh installs.
+
+**5.6.4 Retraction asymmetry in walker state.** §5.4.4's retract handler reactivates the `supersedes_id` ancestor. For rev 1.0's three new schemas (`migration_marker`, `onboarding_state`, `node_identity_history`): retraction reactivates the prior contribution normally. For `migration_marker` specifically, operator retraction is **refused** outside of rollback context — downgrading the schema-version marker via normal retraction would leave the DB in v3 DDL shape with a v2 marker. Rollback is the only valid downgrade path.
 
 ---
 
@@ -717,14 +758,7 @@ LOC estimates are cumulative across audit rounds. Rev 0.7 verified actuals: `con
 Rev 0.6 bundled all of Phase 0 into a single "groundwork" bucket and cycle 2 Stage 1 demonstrated that the Phase 0 promises rested on infrastructure that didn't exist. Phase 0a is infrastructure-creation — the scaffolding every later phase depends on — and must finish clean before 0b starts.
 
 - **Envelope writer extraction** (~300–500 LOC, B-F1 / Root 13 resolution). Extract `write_contribution_envelope(schema_type, body, source, extras) -> Result<ContributionId>` as the sole `INSERT INTO pyramid_config_contributions` site. Refactor the ~35 existing INSERT call sites across 9 files (`migration_config.rs`, `config_contributions.rs`, `wire_migration.rs`, `demand_signal.rs`, `evidence_answering.rs`, `wire_pull.rs`, `prompt_cache.rs`, `generative_config.rs`, `db.rs`) to call it. Add a clippy deny-rule regex blocking raw `INSERT INTO pyramid_config_contributions` outside the envelope writer.
-- **Chronicle event const declarations** (~60 LOC, rev 0.9 count-drift fix — B-F1). Declare all **18** new events in `compute_chronicle.rs` following the shipped `pub const EVENT_*: &str = "..."` convention:
-  - Decision lifecycle: `EVENT_DECISION_BUILT`, `EVENT_DECISION_BUILD_FAILED`, `EVENT_DECISION_PREVIEWED`
-  - Readiness & breaker: `EVENT_PROVIDER_SKIPPED_READINESS`, `EVENT_BREAKER_TRIPPED`, `EVENT_BREAKER_SKIPPED`, `EVENT_DISPATCH_EXHAUSTED`
-  - Config lifecycle: `EVENT_CONFIG_SUPERSEDED`, `EVENT_CONFIG_RETRACTED` (§5.4.4), `EVENT_CONFIG_RETRACTED_TO_BUNDLED` (§5.5.3), `EVENT_RETRACTION_WALKED_DEEP` (§5.5.3), `EVENT_SENSITIVE_SUPERSESSION_CONFIRMED`, `EVENT_CONFIG_SUPERSESSION_CONFLICT` (§2.16.1 loser-side)
-  - Plan integrity / drift: `EVENT_TIER_UNRESOLVED`, `EVENT_REQUESTER_PROVIDER_PARAM_DRIFT`, `EVENT_PREVIEW_VS_APPLY_DRIFT`
-  - Infrastructure: `EVENT_SCOPE_CACHE_LISTENER_RESTARTED` (§2.16.2), `EVENT_SCOPE_CACHE_QUARANTINED` (§2.17.2), `EVENT_BUNDLED_CONTRIBUTION_VALIDATION_FAILED` (§2.11 SkipOnFail), `EVENT_V3_MIGRATION_SNAPSHOTS_PRUNED` (§5.5.9)
-
-Emission sites use the consts, not string literals. §5.4.6 local-only events list kept in sync with this enumeration (plan-integrity Check 9 — new: "enumeration parity across event-list section, Phase 0a consts, and any count assertions").
+- **Chronicle event const declarations** (~70 LOC, rev 1.0 authoritative count = **20**). Declare all 20 new events in `compute_chronicle.rs` following the shipped `pub const EVENT_*: &str = "..."` convention. Emission sites use the consts, not string literals. The full list lives in §5.4.6; Phase 0a-1 body no longer restates it (single source of truth, plan-integrity Check 9 now enforces by comparing Phase 0a-1 to §5.4.6 list size).
 - **Placeholder interpolation engine v2** (~250 LOC, A-F1 / Root 13). Current `generative_config.rs:substitute_prompt` is single-brace literal replacer over 4 tokens. Extend (or add `substitute_prompt_v2`) to support double-brace `{{placeholder}}` with an async resolver context carrying handles to OllamaProbe, OpenRouter client (`/api/v1/models`), MarketSurfaceCache, and a SYSTEM_DEFAULTS borrow. Resolve at skill-invocation time. Named placeholders for v3: `{{openrouter_live_slugs}}`, `{{ollama_available_models}}`, `{{market_surface_slugs}}`, `{{patience_secs_default}}`, `{{retry_http_count_default}}`, `{{max_budget_credits_default}}`. Registered in the integrity-pass placeholder table (§2.13 item 1).
 - **ProviderReadiness trait + four impls** (~200 LOC). Trait def per §2.6. Impls in `local_mode.rs`, `fleet_mps.rs` or `fleet.rs`, `provider.rs` (openrouter), `compute_market_*.rs` (market). Each impl ~30–80 LOC carrying the reason enum.
 - **`ChainDispatchContext` rename** (~40 LOC, F-D2). Rename `chain_dispatch.rs:124`'s `StepContext` to `ChainDispatchContext`. Pin `step_context.rs:275` as the Decision home.
@@ -732,9 +766,27 @@ Emission sites use the consts, not string literals. §5.4.6 local-only events li
 
 **Phase 0a exit criteria (rev 0.9):** envelope writer is the sole INSERT site (lint-enforced — see below); all **18** new chronicle events exist as consts AND grep-hit at least one emission site (plan-integrity Check 9 enforces); placeholder engine resolves all 6 named placeholders against live sources in tests; ProviderReadiness trait compiles with four impls returning Ready stubs; `ChainDispatchContext` rename complete; §2.17 boot sequence test with `app_mode` flag gates exercised; `scope_cache_reloader` supervisor's restart-budget tested via injected panic; `ScopeSnapshot` does NOT derive `Serialize` (cargo-check enforced — Root 27 type-guard).
 
-**Phase 0a LOC revised (rev 0.9 / F-C3-12):** honest range ~1700-2100. Splits further to:
-- **Phase 0a-1** (~800 LOC): envelope writer + 35-site refactor + `BEGIN IMMEDIATE` wrap + chronicle const declarations + `arc_swap` dep + `ChainDispatchContext` rename + partial unique index migration.
-- **Phase 0a-2** (~1000 LOC): ProviderReadiness trait + 4 impls with `NetworkUnreachable` tracking + placeholder engine v2 + `scope_cache_reloader` task with supervision + §5.4.3 `ScopeSnapshot` type-guard + `retract_config_contribution` handler + boot sequence wiring per §2.17.
+**Phase 0a LOC (rev 1.0):** honest range ~1700-2100 per cycle-2 audit. Split into 0a-1 + 0a-2 with explicit commit order; **§11 B-F9's alternative commit list is retired — this body is the canonical sequence**.
+
+**Phase 0a-1 pre-flight (rev 1.0 / Root 29):** before any Phase 0a-1 commit, produce a **consumer inventory artifact** at `docs/plans/history/walker-v3-consumer-inventory.md` that greps every site reading `config.primary_model`, `config.fallback_model_{1,2}`, `pyramid_tier_routing`, `RouteEntry`, `resolve_ir_model`. Map each site to one of: `reads Decision` (migrates in Phase 1), `reads synthetic Decision` (preview path — DADBEAR, cost estimation, operator-HTTP preview), `retires` (legacy build.rs pipeline — flipped off by §5.6.3 `use_chain_engine` default change), or `test fixture`. Phase 1 LOC locks against the inventory. Cycle 3 Stage 2 found 55+ hits in `llm.rs`/`chain_executor.rs`/`dadbear_preview.rs` that rev 0.9's "~4-8 sites" didn't acknowledge — inventory surfaces these before Phase 1 commits scope.
+
+**Phase 0a-1 canonical commit order (~800 LOC):**
+1. `arc_swap` Cargo dep add + chronicle const declarations (all 21 events) — trivial, low-risk baseline commit.
+2. `ChainDispatchContext` rename (mechanical, ~40 LOC).
+3. `ProviderReadiness` trait definition + four stub impls returning `Ready` — enables Phase 0a-2 fills.
+4. Pre-index de-dup step (§5.3 step 7) then partial unique index `uq_config_contrib_active` migration.
+5. Envelope writer extraction + `BEGIN IMMEDIATE` wrap on supersessions + shape validator integration.
+6. Refactor the ~35 raw INSERT sites to call the envelope writer; grep-based CI check / cargo-deny lint blocks new direct INSERTs.
+7. Worktree cleanup: `git worktree list` shows main only; `.claude/worktrees/*` removed or merged back per §9.
+
+**Phase 0a-2 canonical commit order (~1000 LOC):**
+1. `migration_marker` + `onboarding_state` + `node_identity_history` contribution schemas registered with four-part bundles.
+2. Placeholder interpolation engine v2 with TTL + single-flight + circuit breaker + YAML injection escaping.
+3. `scope_cache_reloader` task with restart-budget supervisor + 250ms debounce.
+4. `ScopeSnapshot` type-guard: remove `Serialize` derive from raw type; add `redacted_for_chronicle() -> RedactedSnapshot`.
+5. `retract_config_contribution` handler + depth-ceiling/cycle-detection (§5.5.3).
+6. Boot sequence wiring per §2.17 — main.rs orchestrates the 10-step startup; `AppMode` state machine in `AppState`.
+7. Sequential integration test: full boot → migration → ready, with injected panic on reloader to verify quarantine.
 
 Phase 0a-1 gates Phase 0b (schemas can land); Phase 0a-2 gates Phase 1 (total migration requires readiness trait).
 
@@ -782,7 +834,21 @@ Scope corrected: actual site count is **194 occurrences across 18 files** (Stage
 - Decision builder (from Phase 0) runs resolver + readiness per provider at step entry.
 - StepContext construction adds `dispatch_decision: DispatchDecision`.
 - Delete `config.primary_model`, `fallback_model_1`, `fallback_model_2` struct fields. No `#[deprecated]` bridge. `cargo check` fails loud until every consumer is migrated (that's the point — enforces totality).
-- Tests: Decision construction for each persona; intra-provider fallback walking model_list on rate-limit; Decision immutability across retry attempts within a step; chain-YAML tier coverage assertion; save-time shape validation catches invalid overrides.
+- Tests (rev 1.0 expanded per B-F4):
+  - Decision construction for each persona (tester / hybrid / standard).
+  - Intra-provider fallback walking model_list on rate-limit.
+  - Decision immutability across retry attempts within a step.
+  - Chain-YAML tier coverage assertion (bundled chains resolve).
+  - Save-time shape validation catches invalid overrides.
+  - **DADBEAR bucket rotation + breaker carry-forward** for `probe_based` and `time_secs` variants (§5.5.1) — asserts 23:59→00:00 rotation preserves tripped state.
+  - **Retraction depth-chain** (§5.5.3) — ≤16-hop walk with cycle detection; `RetractionChainCorrupt` on pathological input; `config_retracted_to_bundled` when all ancestors retracted.
+  - **v1-peer strict refusal** (§5.5.2) — mixed-version roster test asserts `PeerIsV1Announcer` returned for v<2 peers; `fleet_peer_version_skew` chronicle event fires first-seen-per-boot.
+  - **ArcSwap reloader quarantine** (§2.17.2) — injected-panic test asserts restart-budget (3/60s), LKG cache preserved on 4th panic, `scope_cache_quarantined` event, AppMode::Quarantined.
+  - **`on_partial_failure: fail_loud` privacy path** — slot-scope override asserted to emit `dispatch_failed_policy_blocked` instead of cascading to next provider.
+  - **Synthetic Decision vs live Decision drift** (§Phase 6 `preview_vs_apply_drift` predicate) — DADBEAR compile+apply mismatch triggers event.
+  - **Envelope writer `BundledBootSkipOnFail` vs `Strict`** — malformed bundled row logs and boots; malformed operator-authored row returns error.
+  - **`use_chain_engine` default flip** (§5.6.3) — fresh-install completes an Ollama build end-to-end, jointly resolving P0-1 + P0-2.
+  - **Multi-writer ScopeCache debounce** (F-C3S2-7) — two supersessions of different walker_* schemas within 250ms, asserts both reflected in post-debounce cache.
 
 ### Phase 2 — Local provider config (~400 LOC)
 
@@ -993,6 +1059,17 @@ Same as walker / rev 2.1.1 cycle:
   - **Plan-integrity skill upgraded:** Check 9 (count-assertion parity), Check 10 (enum variant coverage), Check 11 (audit-evidence artifact persistence). Skill at `~/.claude/skills/plan-integrity/SKILL.md` updated. First persisted artifact at `docs/plans/history/plan-integrity-rev0.7-to-rev0.8.md`.
   - **Convergence indicator:** findings/root ratio has dropped to ~2-3 in cycle 3 (was 4-5 in cycles 1-2); remaining structural findings are at seams between rev 0.8 additions. Both auditors flagged that further cycles hit diminishing returns on paper — wanderers on built systems per `feedback_wanderers_on_built_systems.md` catch more residuals per hour than another paper audit round.
   - Ready for Cycle 3 Stage 2 discovery audit against rev 0.9.
+- **Rev 1.0 (2026-04-21):** Cycle 3 Stage 2 discovery audit (21 findings across 2 auditors, including 1 CRITICAL that reopened a prior CRITICAL) absorbed via systemic-synthesis. 6 new structural roots (28-33). Adam caught the architectural regression: rev 0.9 had defaulted to hardcoding more state instead of following "everything is a contribution." Rev 1.0 converts runtime state to contribution-native wherever the semantic fits.
+  - **Root 28 — Rev 0.9's §2.17/§2.18 built on false storage premise.** `pyramid_config` is a JSON file, not a SQL table; `BEGIN IMMEDIATE` around `app_mode` in it is physically impossible. No migration framework exists (`wire_migration.rs` is contribution-rewrite; no `schema_version` table). **Fix:** §2.17 rewritten to sequential startup — main.rs doesn't spawn listeners until after migration + `AppMode::Ready` transition, so there's no concurrent writer to serialize against. `BEGIN IMMEDIATE` only applies where it actually works (SQL transactions on `pyramid_config_contributions`). `migration_marker` becomes a contribution; the supersession IS the schema-version bump.
+  - **Root 29 — Phase scope enumeration impressionistic.** 55+ hits in `llm.rs`/`chain_executor.rs`/`dadbear_preview.rs` never named in plan; "~4-8 sites" wrong. **Fix:** Phase 0a-1 pre-flight REQUIRES authoritative consumer inventory artifact at `docs/plans/history/walker-v3-consumer-inventory.md` before any commit. Phase 1 LOC locks against inventory. §11 B-F9's alternative commit list retired; §6 body is canonical sequence. De-dup step added before CREATE INDEX (§5.3 step 7).
+  - **Root 30 — "Everything is a contribution" still quietly violated for runtime state.** **Fix:** §2.18 rewritten. `app_mode` is in-memory (RwLock in AppState); `migration_marker` / `onboarding_state` / `node_identity_history` are contributions. `local_only` vs `operator_private` distinction named in §5.4.3: former never crosses node boundary; latter syncs to Wire authenticated-private.
+  - **Root 31 — Lifecycle semantics for new state unmodeled.** New §5.6 covers rollback (snapshot includes `pyramid_config_contributions`; walker-introduced rows retracted on rollback), backup/restore (per-schema declared semantics), `use_chain_engine` default flip to `true` as Phase 1 exit criterion (resolves PUNCHLIST P0-1 + P0-2 jointly), retraction asymmetry for `migration_marker` (downgrade refused outside rollback context).
+  - **Root 32 — Plan-integrity skill failed flagship Check 9 on first use.** B-F10: "18 events" prose alongside 20-item enumeration. Check 9 implementation trusted the prose number. **Fix:** Check 9 rewritten — skill now counts enumeration cardinality first, then verifies prose matches. Checks 12 (invariant-tag coverage) + 13 (transaction-boundary compat) added per B-F5 to catch semantic contradictions the syntactic checks miss.
+  - **Root 33 — Backward-compat + operator-UX.** `announce_protocol_version` gets `#[serde(default)]` returning 0 (pre-versioning). New `fleet_peer_version_skew` chronicle event surfaces mixed-version clusters. Settings DRAFT lane doesn't bind `supersedes_id` until commit time; ConfigSynced during draft lifetime marks `parent_changed: true` and shows merge prompt. §12 rewritten for rev 1.0 current state.
+  - **21 chronicle events total** (rev 1.0 count, up from rev 0.9's over-counted "18" that was actually 20, now plus `fleet_peer_version_skew` = 21). Breakdown: Decision lifecycle 3, Readiness & breaker 4, Config lifecycle 6, Plan integrity / drift 3, Infrastructure 5. Plan-integrity Check 9 (fixed) enforces count-vs-enumeration parity.
+  - **Architectural convergence:** all accumulated runtime state is now contribution-native (3 new schemas) or in-memory (AppMode, BreakerState, ScopeCache, MarketSurfaceCache) with explicit justification per §2.18. No net-new SQL storage outside of existing migration patterns.
+  - **Plan-integrity artifact** at `docs/plans/history/plan-integrity-rev0.9-to-rev1.0.md` — first artifact written BEFORE audit-history claim, per Check 11 discipline.
+  - Ready for Cycle 4 audit (cycle 3 was not clean — rev 1.0's structural changes are substantial and warrant verification).
 
 Planned cadence from here:
 1. Rev 0.8 absorbs Cycle 2 Stage 2 findings (Roots 18-22).
@@ -1002,27 +1079,28 @@ Planned cadence from here:
 
 ---
 
-## 12. Picking this up cold
+## 12. Picking this up cold (rewritten rev 1.0 — B-F9)
 
-For a fresh agent:
+For a fresh agent picking up at rev 1.0:
 
-1. Read §2 (resolution chain) and §3 (parameter catalog) — that's the system.
-2. Read §4 (schemas are thin carriers) — that's the shape of the six contributions.
-3. Read §5 (migration) — what retires, what stays.
-4. Read §6 (phases) — where implementation lands each piece.
-5. Read §7 (collapse table) — why most "open questions" are parameters, not decisions.
-6. Memory files:
+1. **Read §Status + §11 rev-1.0 audit history entry FIRST.** The plan has been through 3 full audit cycles (6 rounds, ~125 findings, 33 structural roots absorbed). §11's most recent entry tells you what converged.
+2. **Read §2 — focus on the compute-once spine:**
+   - §2.1-2.8: resolution chain and scopes (the mechanism).
+   - §2.9: DispatchDecision — the spine. Every downstream consumer reads from this.
+   - §2.17-2.18: boot and state — sequential startup, in-memory AppMode, contribution-native for everything else.
+3. **Read §3 parameter catalog** — the declarable surface.
+4. **Read §5.3 + §5.4 + §5.5 + §5.6** — migration, cross-boundary wire contracts, cross-subsystem cascades, lifecycle semantics.
+5. **Phase 0a-1 pre-flight:** produce the consumer inventory artifact at `docs/plans/history/walker-v3-consumer-inventory.md` before any commit (Root 29 requirement).
+6. **Memory files to read:**
    - `project_compute_market_purpose_brief.md` — why the market exists.
-   - `feedback_canonical_100_years.md` — posture on shortcuts.
-   - `feedback_constraints_often_load_bearing.md` — why static deadlines exist.
-   - `feedback_smoke_before_big_merge.md` — pre-merge smoke discipline for big behavioral commits.
-7. Grep current `pyramid_tier_routing`, `RouteEntry`, `call_model_unified_with_audit_and_ctx`, `classify_wire_error`. Internalize the current shape you're replacing.
-8. Pre-flight Q&A with Adam.
-9. Stage 1 audit against rev 0.2.
-10. Rev 0.3 absorption.
-11. Phase 0.
+   - `feedback_everything_is_contribution.md` — default architectural move.
+   - `feedback_smoke_before_big_merge.md` — pre-merge smoke discipline.
+   - `feedback_systemic_before_fix.md` — root-cause posture.
+7. **Grep the code:** `config.primary_model`, `pyramid_tier_routing`, `RouteEntry`, `call_model_unified_with_audit_and_ctx`, `resolve_ir_model`, `FleetDispatchRequest`. Internalize what's retiring.
+8. **Integrity artifacts:** skim `docs/plans/history/plan-integrity-*.md` — these show what drift the plan has experienced and what the skill catches.
+9. **Phase 0a-1 canonical commit order:** §6 Phase 0a-1 body. Start at commit 1 (arc_swap + chronicle consts).
 
-Estimated cold-start → Phase 0 commit 1: 3–4 hours.
+Estimated cold-start → Phase 0a-1 commit 1: 3-5 hours (read + consumer inventory + first trivial commit).
 
 ---
 
