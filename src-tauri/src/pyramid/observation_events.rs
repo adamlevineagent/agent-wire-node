@@ -13,10 +13,11 @@ use rusqlite::Connection;
 /// Returns the autoincrement row ID of the new event.
 ///
 /// Parameters map to the table columns:
-/// - `source`: "watcher" | "cascade" | "rescan" | "evidence" | "vine"
+/// - `source`: "watcher" | "cascade" | "rescan" | "evidence" | "vine" | "annotation"
 /// - `event_type`: "file_modified" | "file_created" | "file_deleted" | "file_renamed"
 ///                  | "cascade_stale" | "edge_stale" | "evidence_growth" | "vine_stale"
 ///                  | "targeted_stale" | "full_sweep"
+///                  | "annotation_written" | "annotation_superseded"
 /// - `source_path`: filesystem path for the observation source (NULL for internal events)
 /// - `file_path`: filesystem path of the affected file (NULL for internal events)
 /// - `content_hash`: SHA-256 of new content (NULL for deletes/internal)

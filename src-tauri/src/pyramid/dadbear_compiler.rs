@@ -117,6 +117,10 @@ pub struct CompilationResult {
 ///   node_stale → node_stale_check
 ///   faq_category_stale → faq_redistill
 ///   full_sweep → extract for all source files
+///   annotation_written → re_distill (ancestor re-summary triggered by new annotation)
+///   annotation_superseded → re_distill (same primitive; supersession is a stronger signal
+///     preserved in metadata_json but coalesces with additive writes so a single parent
+///     re-distill runs even if multiple annotations fire within the dedup window)
 fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, &'static str, &'static str)> {
     // Returns (primitive, step_name, model_tier)
     match event_type {
@@ -133,6 +137,9 @@ fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, &'static st
         "node_stale" => Some(("node_stale_check", "node_stale_check", "stale_remote")),
         "faq_category_stale" => Some(("faq_redistill", "faq_redistill", "stale_remote")),
         "full_sweep" => Some(("extract", "full_sweep_extract", "stale_remote")),
+        "annotation_written" | "annotation_superseded" => {
+            Some(("re_distill", "annotation_redistill", "stale_remote"))
+        }
         _ => None,
     }
 }
@@ -211,6 +218,7 @@ fn derive_layer(event: &ObservationEvent) -> i64 {
         "cascade_stale" | "edge_stale" | "vine_stale" | "node_stale" | "faq_category_stale" | "connection_check" => {
             event.layer.unwrap_or(0)
         }
+        "annotation_written" | "annotation_superseded" => event.layer.unwrap_or(0),
         _ => event.layer.unwrap_or(0),
     }
 }
@@ -755,5 +763,42 @@ mod tests {
         assert_eq!(prim, "stale_check");
         assert_eq!(step, "l0_stale_check");
         assert_eq!(tier, "stale_remote");
+    }
+
+    #[test]
+    fn test_annotation_events_map_to_redistill() {
+        // annotation_written and annotation_superseded both map to the same
+        // (primitive, step_name) so they coalesce on the has_active_work_item
+        // dedup. The superseded variant is distinguishable in the event row's
+        // metadata_json, not in the work item.
+        let (prim, step, tier) = map_event_to_primitive("annotation_written").unwrap();
+        assert_eq!(prim, "re_distill");
+        assert_eq!(step, "annotation_redistill");
+        assert_eq!(tier, "stale_remote");
+
+        let (prim2, step2, tier2) = map_event_to_primitive("annotation_superseded").unwrap();
+        assert_eq!(prim2, prim);
+        assert_eq!(step2, step);
+        assert_eq!(tier2, tier);
+    }
+
+    #[test]
+    fn test_annotation_events_use_event_layer() {
+        let event = ObservationEvent {
+            id: 1,
+            slug: "s".into(),
+            source: "annotation".into(),
+            event_type: "annotation_written".into(),
+            source_path: None,
+            file_path: None,
+            content_hash: None,
+            previous_hash: None,
+            target_node_id: Some("L2-004".into()),
+            layer: Some(2),
+            detected_at: "2026-04-22 00:00:00".into(),
+            metadata_json: None,
+        };
+        assert_eq!(derive_layer(&event), 2);
+        assert_eq!(derive_target_id(&event), "L2-004");
     }
 }

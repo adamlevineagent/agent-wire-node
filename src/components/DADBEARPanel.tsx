@@ -783,25 +783,6 @@ Last check: ${lastCheckStr}
 
                         {/* Node counts now shown in bar chart labels below */}
 
-                        {statusError && !status && contentType !== 'question' && contentType !== 'conversation' && (
-                            <button
-                                className="btn btn-primary btn-sm"
-                                style={{ marginTop: '8px' }}
-                                onClick={async () => {
-                                    try {
-                                        await invoke('pyramid_auto_update_config_init', { slug });
-                                        setStatusError(null);
-                                        await loadConfig();
-                                        await Promise.all([loadStatus(), loadHolds()]);
-                                    } catch (err) {
-                                        setStatusError(String(err));
-                                    }
-                                }}
-                            >
-                                Initialize DADBEAR
-                            </button>
-                        )}
-
                         {/* Phase detail */}
                         {status?.phase_detail && (status.phase === 'evaluating' || status.phase === 'cascading') && (
                             <div className="dadbear-phase-detail">{status.phase_detail}</div>

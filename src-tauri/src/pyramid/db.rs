@@ -4621,8 +4621,22 @@ pub fn create_slug(
     )
     .with_context(|| format!("Failed to create slug '{slug}'"))?;
 
-    // Phase 8: pyramid_auto_update_config INSERT removed — table dropped.
-    // Contribution existence in pyramid_dadbear_config is the enable gate.
+    // Seed the DADBEAR enable gate for eligible content types. The Phase 8
+    // migration dropped pyramid_auto_update_config and made the presence of a
+    // pyramid_dadbear_config row the canonical enable signal, but nothing was
+    // writing that row on pyramid creation — leaving new pyramids showing
+    // "DADBEAR not configured" in the UI. vine/question pyramids don't have
+    // source files to watch, so they stay excluded.
+    let ct_str = content_type.as_str();
+    if matches!(ct_str, "code" | "conversation" | "document") {
+        conn.execute(
+            "INSERT OR IGNORE INTO pyramid_dadbear_config
+                (slug, source_path, content_type)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![slug, source_path, ct_str],
+        )
+        .with_context(|| format!("Failed to seed pyramid_dadbear_config for '{slug}'"))?;
+    }
 
     // Read back the row to get server-generated defaults (created_at)
     get_slug(conn, slug)?.ok_or_else(|| anyhow::anyhow!("Slug '{slug}' not found after insert"))

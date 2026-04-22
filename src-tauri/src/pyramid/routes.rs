@@ -4310,6 +4310,109 @@ async fn handle_annotate(
     )
 }
 
+/// Emit one `dadbear_observation_events` row per ancestor of the annotated node.
+///
+/// Walks the `pyramid_nodes.parent_id` chain from the annotated node upward and
+/// writes an event for each ancestor (L1 and above). The annotated node itself
+/// is skipped — its payload is the annotation, not a stale summary.
+///
+/// Correction annotations are emitted as `annotation_superseded` (a stronger
+/// signal that a prior claim is being overridden); all other annotation types
+/// are emitted as `annotation_written`. Both map to the same `re_distill`
+/// primitive in the compiler so they coalesce naturally on the active-work-item
+/// dedup check — multiple annotations against the same ancestor within the
+/// same work-item lifecycle produce ONE re_distill, not N.
+///
+/// Missing nodes (e.g. annotations keyed to an id outside `pyramid_nodes`)
+/// return `Ok(())` without error so annotation save isn't poisoned.
+async fn emit_annotation_observation_events(
+    writer: &Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+    slug: &str,
+    annotation: &PyramidAnnotation,
+) -> anyhow::Result<()> {
+    let event_type = match annotation.annotation_type {
+        AnnotationType::Correction => "annotation_superseded",
+        _ => "annotation_written",
+    };
+
+    let metadata_json = serde_json::json!({
+        "annotation_id": annotation.id,
+        "annotation_type": annotation.annotation_type.as_str(),
+        "annotated_node_id": annotation.node_id,
+        "author": annotation.author,
+    })
+    .to_string();
+
+    let conn = writer.lock().await;
+
+    // Walk parent_id chain upward. Same 20-step safety cap as
+    // reading_modes::build_ancestor_chain to bound pathological graphs.
+    let mut ancestors: Vec<(String, i64)> = Vec::new();
+    let mut current_id = annotation.node_id.clone();
+    for _ in 0..20 {
+        let row: Option<(Option<String>, i64)> = conn
+            .query_row(
+                "SELECT parent_id, depth FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
+                rusqlite::params![slug, &current_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+        let Some((parent_id_opt, _depth)) = row else {
+            break;
+        };
+        let Some(parent_id) = parent_id_opt.filter(|p| !p.is_empty()) else {
+            break;
+        };
+        let parent_row: Option<i64> = conn
+            .query_row(
+                "SELECT depth FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
+                rusqlite::params![slug, &parent_id],
+                |row| row.get(0),
+            )
+            .ok();
+        let Some(parent_depth) = parent_row else {
+            break;
+        };
+        ancestors.push((parent_id.clone(), parent_depth));
+        current_id = parent_id;
+    }
+
+    if ancestors.is_empty() {
+        tracing::debug!(
+            "[annotation] annotation #{} on node '{}' — no ancestors in pyramid_nodes, skipping observation emission",
+            annotation.id,
+            annotation.node_id
+        );
+        return Ok(());
+    }
+
+    for (ancestor_id, ancestor_depth) in &ancestors {
+        let _ = super::observation_events::write_observation_event(
+            &conn,
+            slug,
+            "annotation",
+            event_type,
+            None,                    // source_path
+            None,                    // file_path
+            None,                    // content_hash
+            None,                    // previous_hash
+            Some(ancestor_id),       // target_node_id
+            Some(*ancestor_depth),   // layer
+            Some(&metadata_json),
+        );
+    }
+
+    tracing::info!(
+        "[annotation] annotation #{} on node '{}' — emitted {} observation event(s) as '{}'",
+        annotation.id,
+        annotation.node_id,
+        ancestors.len(),
+        event_type
+    );
+
+    Ok(())
+}
+
 /// Background hook that runs after an annotation is saved.
 /// Correction annotations create deltas on the matching thread.
 /// Other types are logged for future FAQ/review processing.
@@ -4322,6 +4425,20 @@ async fn process_annotation_hook(
     model: &str,
     ops: &super::OperationalConfig,
 ) -> anyhow::Result<()> {
+    // Close the annotation→observation→re-distill loop: emit an observation
+    // event for every ancestor of the annotated node so the DADBEAR compiler
+    // turns the annotation into re_distill work items against L1+ parents.
+    // The annotated node itself is excluded — the annotation is already
+    // attached to it; re-distillation only makes sense for the parents whose
+    // summaries now depend on a fact they haven't seen.
+    if let Err(e) = emit_annotation_observation_events(writer, slug, annotation).await {
+        tracing::warn!(
+            "[annotation] failed to emit observation events for annotation #{}: {}",
+            annotation.id,
+            e
+        );
+    }
+
     match annotation.annotation_type {
         AnnotationType::Correction => {
             // Correction annotations create deltas on the relevant thread
@@ -10240,5 +10357,238 @@ async fn handle_reading_search(
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
             &e.to_string(),
         )),
+    }
+}
+
+// ── annotation → observation → re_distill integration tests ──────────────
+//
+// Exercises the closed loop added in the annotation-cascade fix:
+//   1. An annotation saved on a leaf node emits one observation event per
+//      ancestor in pyramid_nodes (L1 up to the apex).
+//   2. Corrections are emitted as annotation_superseded; all other types
+//      use annotation_written.
+//   3. Running the DADBEAR compiler over those events produces one
+//      re_distill work item per distinct (ancestor, step_name, layer).
+//   4. Repeated annotations on the same leaf coalesce — the compiler's
+//      active-work-item dedup means N annotations → 1 work item per
+//      ancestor per window, not N.
+#[cfg(test)]
+mod annotation_observation_tests {
+    use super::*;
+    use crate::pyramid::{db as dbmod, dadbear_compiler};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn seed_pyramid_with_tree(conn: &rusqlite::Connection, slug: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO pyramid_slugs (slug, content_type, source_path)
+             VALUES (?1, 'document', '/tmp/anno-test')",
+            rusqlite::params![slug],
+        )
+        .unwrap();
+
+        // 3-layer tree:
+        //   L2-apex (depth 2)
+        //     └── L1-mid (depth 1, parent=L2-apex)
+        //           └── L0-leaf (depth 0, parent=L1-mid)
+        for (id, depth, parent) in [
+            ("L2-apex", 2i64, None::<&str>),
+            ("L1-mid", 1, Some("L2-apex")),
+            ("L0-leaf", 0, Some("L1-mid")),
+        ] {
+            conn.execute(
+                "INSERT INTO pyramid_nodes (id, slug, depth, headline, distilled, parent_id, build_version)
+                 VALUES (?1, ?2, ?3, ?4, 'body', ?5, 1)",
+                rusqlite::params![id, slug, depth, format!("headline-{id}"), parent],
+            )
+            .unwrap();
+        }
+    }
+
+    fn make_annotation(node_id: &str, kind: AnnotationType, id: i64) -> PyramidAnnotation {
+        PyramidAnnotation {
+            id,
+            slug: "anno-pyr".into(),
+            node_id: node_id.into(),
+            annotation_type: kind,
+            content: "test content".into(),
+            question_context: None,
+            author: "tester".into(),
+            created_at: "2026-04-22 00:00:00".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn annotation_on_leaf_emits_one_event_per_ancestor() {
+        let raw = rusqlite::Connection::open_in_memory().unwrap();
+        dbmod::init_pyramid_db(&raw).unwrap();
+        seed_pyramid_with_tree(&raw, "anno-pyr");
+        let writer = Arc::new(Mutex::new(raw));
+
+        let ann = make_annotation("L0-leaf", AnnotationType::Observation, 101);
+        emit_annotation_observation_events(&writer, "anno-pyr", &ann)
+            .await
+            .unwrap();
+
+        let conn = writer.lock().await;
+        let rows: Vec<(String, String, Option<String>, Option<i64>)> = conn
+            .prepare(
+                "SELECT source, event_type, target_node_id, layer
+                 FROM dadbear_observation_events
+                 WHERE slug = 'anno-pyr'
+                 ORDER BY layer ASC",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(rows.len(), 2, "one event per ancestor (L1 + L2), skipping the leaf");
+        assert!(rows.iter().all(|r| r.0 == "annotation"));
+        assert!(rows.iter().all(|r| r.1 == "annotation_written"));
+        assert_eq!(rows[0].2.as_deref(), Some("L1-mid"));
+        assert_eq!(rows[0].3, Some(1));
+        assert_eq!(rows[1].2.as_deref(), Some("L2-apex"));
+        assert_eq!(rows[1].3, Some(2));
+    }
+
+    #[tokio::test]
+    async fn correction_annotation_emits_superseded_event_type() {
+        let raw = rusqlite::Connection::open_in_memory().unwrap();
+        dbmod::init_pyramid_db(&raw).unwrap();
+        seed_pyramid_with_tree(&raw, "anno-pyr");
+        let writer = Arc::new(Mutex::new(raw));
+
+        let ann = make_annotation("L0-leaf", AnnotationType::Correction, 202);
+        emit_annotation_observation_events(&writer, "anno-pyr", &ann)
+            .await
+            .unwrap();
+
+        let conn = writer.lock().await;
+        let kinds: Vec<String> = conn
+            .prepare(
+                "SELECT event_type FROM dadbear_observation_events
+                 WHERE slug = 'anno-pyr' ORDER BY id ASC",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(kinds.len(), 2);
+        assert!(kinds.iter().all(|k| k == "annotation_superseded"));
+    }
+
+    #[tokio::test]
+    async fn missing_node_skips_without_erroring() {
+        let raw = rusqlite::Connection::open_in_memory().unwrap();
+        dbmod::init_pyramid_db(&raw).unwrap();
+        // Seed the slug but no nodes — annotation.node_id won't resolve.
+        raw.execute(
+            "INSERT OR IGNORE INTO pyramid_slugs (slug, content_type, source_path)
+             VALUES ('anno-pyr', 'document', '/tmp/x')",
+            [],
+        )
+        .unwrap();
+        let writer = Arc::new(Mutex::new(raw));
+
+        let ann = make_annotation("missing-id", AnnotationType::Observation, 303);
+        emit_annotation_observation_events(&writer, "anno-pyr", &ann)
+            .await
+            .expect("missing nodes must not poison annotation save");
+
+        let conn = writer.lock().await;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events WHERE slug = 'anno-pyr'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "no events emitted when node is absent");
+    }
+
+    #[tokio::test]
+    async fn compiler_turns_annotation_events_into_redistill_work_items() {
+        let raw = rusqlite::Connection::open_in_memory().unwrap();
+        dbmod::init_pyramid_db(&raw).unwrap();
+        seed_pyramid_with_tree(&raw, "anno-pyr");
+        let writer = Arc::new(Mutex::new(raw));
+
+        // Write annotation observation events for two ancestors.
+        let ann = make_annotation("L0-leaf", AnnotationType::Observation, 404);
+        emit_annotation_observation_events(&writer, "anno-pyr", &ann)
+            .await
+            .unwrap();
+
+        // Run the compiler.
+        let conn = writer.lock().await;
+        let result = dadbear_compiler::run_compilation_for_slug(&conn, "anno-pyr", None, None)
+            .expect("compilation succeeds");
+        assert_eq!(result.items_compiled, 2, "one re_distill per ancestor");
+
+        let work_items: Vec<(String, String, i64, String)> = conn
+            .prepare(
+                "SELECT primitive, step_name, layer, target_id
+                 FROM dadbear_work_items
+                 WHERE slug = 'anno-pyr'
+                 ORDER BY layer ASC",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(work_items.len(), 2);
+        assert!(work_items.iter().all(|w| w.0 == "re_distill"));
+        assert!(work_items.iter().all(|w| w.1 == "annotation_redistill"));
+        assert_eq!(work_items[0].2, 1);
+        assert_eq!(work_items[0].3, "L1-mid");
+        assert_eq!(work_items[1].2, 2);
+        assert_eq!(work_items[1].3, "L2-apex");
+    }
+
+    #[tokio::test]
+    async fn multiple_annotations_same_parent_coalesce_to_one_work_item() {
+        let raw = rusqlite::Connection::open_in_memory().unwrap();
+        dbmod::init_pyramid_db(&raw).unwrap();
+        seed_pyramid_with_tree(&raw, "anno-pyr");
+        let writer = Arc::new(Mutex::new(raw));
+
+        for id in [501i64, 502, 503] {
+            let ann = make_annotation("L0-leaf", AnnotationType::Observation, id);
+            emit_annotation_observation_events(&writer, "anno-pyr", &ann)
+                .await
+                .unwrap();
+        }
+
+        // 3 annotations × 2 ancestors = 6 observation events.
+        let conn = writer.lock().await;
+        let event_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events WHERE slug = 'anno-pyr'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 6);
+
+        // ... but the compiler's has_active_work_item dedup means only 2
+        // work items (one per distinct ancestor).
+        let result = dadbear_compiler::run_compilation_for_slug(&conn, "anno-pyr", None, None)
+            .expect("compilation succeeds");
+        assert_eq!(result.items_compiled, 2, "one re_distill per parent, not per annotation");
+        assert_eq!(result.deduped, 4, "second/third annotations coalesce per ancestor");
+
+        let wi_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_work_items WHERE slug = 'anno-pyr'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wi_count, 2);
     }
 }
