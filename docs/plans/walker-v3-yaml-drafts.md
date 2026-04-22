@@ -1,6 +1,14 @@
 # Walker v3 — YAML drafts + findings
 
-**Purpose:** concrete seeds for the six walker_* contributions, authored against `walker-provider-configs-and-slot-policy-v3.md` rev 0.2. Writing them surfaces shape problems the plan doesn't yet resolve. Findings at the bottom — these should be absorbed into rev 0.3 before Stage 1 audit.
+**Synced-to-rev:** 0.7 (integrity-pass-required banner per §2.13 item 7 of the plan doc).
+
+**Purpose:** concrete seeds for the six walker_* contributions. Originally authored against rev 0.2; this file has been updated through successive revs alongside the plan. Findings section at the bottom is historical (what the drafting pass surfaced at rev 0.2); the plan's §11 audit history is the authoritative record of resolutions.
+
+**Rev 0.6+ deltas applied to seeds in §2:**
+- Removed `openrouter_credential_ref` from bundled `walker_provider_openrouter` — credential resolution is via shipped `pyramid_providers.api_key_ref` column (see plan §3 catalog struck-through row). Do NOT re-add this field in new seed authoring.
+- Removed `OPENROUTER_CREDENTIAL_REF_DEFAULT` const from the SYSTEM_DEFAULTS block.
+- Removed `source: bundled` from YAML bodies — the `source` column is set by the envelope writer at contribution creation time, NOT in the YAML body. Existing seeds in §2 that still show `source: bundled` are stale; strip on next regeneration.
+- `walker_provider_market.overrides.active` now defaults `false` in bundled (Root 17 / A-F6); onboarding Page 4 flip-to-true is the consent record, not the bundled default.
 
 **Three personas** the seeds have to cover:
 
@@ -30,7 +38,7 @@ pub const FLEET_PEER_MIN_STALENESS_SECS_DEFAULT: u64 = 300;
 pub const FLEET_PREFER_CACHED_DEFAULT: bool = true;
 pub const OLLAMA_BASE_URL_DEFAULT: &str = "http://localhost:11434/v1";
 pub const OLLAMA_PROBE_INTERVAL_SECS_DEFAULT: u64 = 300;
-pub const OPENROUTER_CREDENTIAL_REF_DEFAULT: &str = "OPENROUTER_KEY";
+// openrouter_credential_ref removed rev 0.6 — credential lookup uses pyramid_providers.api_key_ref
 
 // max_budget_credits intentionally returns Option<i64> — see Finding F6.
 // model_list intentionally returns Option<Vec<String>> — see Finding F5.
@@ -56,7 +64,7 @@ overrides:
     max: ["x-ai/grok-4.20-beta", "qwen/qwen3.5-flash-02-23"]
   sequential: false
   retry_http_count: 5
-  openrouter_credential_ref: "OPENROUTER_KEY"
+  # openrouter_credential_ref removed rev 0.6 — walker reads pyramid_providers.api_key_ref directly
 ```
 
 > Note: per `project_model_defaults.md` the confirmed OpenRouter fallback is `inception/mercury-2`. Other slugs above are placeholders pending Adam confirmation in pre-flight Q&A.
@@ -104,8 +112,9 @@ overrides:
 ```yaml
 schema_type: walker_provider_market
 version: 1
-source: bundled
+# source: bundled — set by envelope writer, NOT in YAML body (rev 0.6)
 overrides:
+  active: false  # Root 17 — onboarding Page 4 flip-to-true is the operator consent record
   model_list:
     # Q4 answer: prod today has 1 active offer (gemma4:26b). Seed is pragmatic — not empirical.
     # Covers common GPU classes; operators supersede as market diversifies.

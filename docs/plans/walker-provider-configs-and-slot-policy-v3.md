@@ -1,8 +1,8 @@
 # Walker Provider Configs + Slot Policy (v3)
 
 **Date:** 2026-04-21
-**Status:** DRAFT (rev 0.6) — Stage 2 discovery audit absorbed. Pending Adam GO; implementation-ready.
-**Rev:** 0.6
+**Status:** DRAFT (rev 0.7) — Cycle 2 Stage 1 absorbed. Pending Cycle 2 Stage 2, Adam GO.
+**Rev:** 0.7
 **Supersedes:** `inference-routing-v2-model-aware-config.md` (retired); rev 0.1 (six-API model, obsolete); rev 0.2 (resolver-chain reframe, this doc continues it).
 **Author context:** planning thread, 2026-04-21. Rev 0.1 modeled this as six schemas with field lists. Rev 0.2 reframed as ONE resolver over a scope chain with schemas as thin value carriers. Rev 0.3 absorbs findings F1–F11 from `walker-v3-yaml-drafts.md` — shape-per-scope for `model_list`, `Option`-typed accessors replacing sentinels, `per_provider` block on slot-policy, provider readiness gates as a named layer parallel to the resolver, tier-set as union of provider `model_list` keys.
 
@@ -261,7 +261,7 @@ The resolver's typed accessor for `breaker_reset` reads the structured form. Ope
 
 **Worked example — `model_list` shape-per-scope:** schema_annotation declares shape `tiered_map` with `scope_behavior: {scopes_3_4: "map_by_tier", scopes_1_2: "flat_list_scope_is_tier"}`. Save handler validates that a `model_list` appearing inside a scope-1 or scope-2 context is a flat list, not a map. User mistakes caught at save, not at runtime.
 
-### 2.13 Maintenance paths — synthetic Decision
+### 2.12 Maintenance paths — synthetic Decision
 
 Not every code path that needs routing parameters runs inside an outer chain step. DADBEAR's compile-time preview, `stale_engine`'s periodic staleness checks, `compute_cascade_build_plan`'s cost estimation, and operator-HTTP preview routes all consult routing without a StepContext. Rev 0.5's Decision-first spine silently excluded these (Root 8 / F-D8 / Issue 5).
 
@@ -271,28 +271,57 @@ Concrete consumers for the synthetic path:
 - `stale_engine.rs:92-127` — staleness check constructors. Build synthetic Decision per check; read `per_provider[local].model_list` for the tier being checked.
 - DADBEAR preview: builds synthetic at compile time, persists in preview payload. Apply-time builds a fresh full Decision; chronicle emits `preview_vs_apply_drift` if the two disagree on provider choice.
 - `preview.rs` cost estimation: synthetic Decision → walk per_provider to aggregate cost bounds.
-- Operator-HTTP preview routes: return synthetic Decision serialized as JSON.
+- Operator-HTTP preview routes: return synthetic Decision serialized as JSON. Bearer-gated same as all `routes_operator.rs`. Emits `decision_previewed` (NOT `decision_built` — separate event, B-F5) so Builds-tab observability doesn't show phantom dispatches when operators click "preview routing" in Settings. No `can_dispatch_now` calls in synthetic mode, no outbound HTTP/DB write reachable from the preview path, no billing events emitted.
+- Cost estimation across all tiers (A-F10): caller computes `tier_set_for_build(chain_id) -> Vec<String>` (union of `model_tier` strings across chain steps), then builds one `synthetic_for_preview(tier, scope_snapshot)` per tier, aggregates cost bounds. Synthetic builds skip breaker state (build_id may not exist yet — cost estimation runs pre-build) and readiness gates; they reflect **configured** routing only, not runtime availability.
 
 **StepContext home (F-D2):** the canonical carrier for `dispatch_decision` is `src-tauri/src/pyramid/step_context.rs:275`'s struct (which already owns `build_id`, `model_tier`, `resolved_model_id`, `bus`). `chain_dispatch.rs:124`'s sibling `StepContext` is renamed `ChainDispatchContext` in Phase 0 to remove the name collision; callers using it for dispatch decisions are migrated to the `step_context::StepContext` version or pass the Decision explicitly. This is a ~40-LOC pre-requisite in Phase 0, budgeted.
 
-### 2.14 Pre-commit plan-doc integrity pass (Root 9)
+### 2.13 Mechanized plan-doc integrity (Root 13 — rev 0.7 upgrade)
 
-Every rev, before declaring audit-ready, the plan author runs:
+Rev 0.6 introduced this as prose discipline. Cycle 2 Stage 1 demonstrated it self-violated on the same rev that introduced it: sections ordered 2.11→2.13→2.14→2.12; `openrouter_credential_ref` struck from §3 but still listed in §2.12's sensitive-fields; §11 claimed "F-D12 spelled out in §5.3" but §5.3 didn't contain it; `onboarding_complete_at` referenced but never defined; companion drafts doc stale across three revs.
 
-1. **Grep every new concept:** each new struct field, parameter name, enum variant, contribution schema, or chronicle event must appear in ≥1 of the catalog tables (§3), scope tables (§2.1), or canonical definitions (§2.9/§2.11/§2.12). Orphan concepts are declared in the doc but not owned by any section.
-2. **Cross-section consistency check:** for each skill claim, confirm §2.10, Phase 0's skill table, and any §2.12 reference agree. Rev 0.5 failed this on skill slug freshness (F-D11).
-3. **Decision fields ↔ catalog:** every `DispatchDecision` field must have a corresponding `on_partial_failure`-style entry in the parameter catalog with a SYSTEM_DEFAULT, or be explicitly marked as derived from other fields (e.g. `scope_snapshot` is derived, not resolved).
+Rev 0.7 **mechanizes** the discipline as a script `docs/tools/plan-integrity.sh` that runs before any plan rev can be declared audit-ready:
 
-This is a plan-author discipline, not a skill or tool. But it's named here so future revs can't claim audit-ready without it.
+1. **Placeholder resolution** — every `{{placeholder}}` in the plan must have an entry in the placeholder-resolver registry (a markdown table at the top of the integrity script) naming the Rust function that resolves it. Unregistered placeholders fail.
+2. **Chronicle event registry** — every chronicle event name in the plan must grep-hit `src-tauri/src/pyramid/compute_chronicle.rs` as a `pub const EVENT_*` declaration, OR appear in a "chronicle-events-to-be-added-in-phase-N" list in §6. Unregistered events fail.
+3. **Struct field ↔ catalog** — every field in `DispatchDecision` and `ResolvedProviderParams` must appear in the §3 parameter catalog, OR be flagged as `derived` in §2.9 with a comment naming the derivation.
+4. **Absorbed-finding claims ↔ section content** — every §11 audit-history claim of form "X absorbed in §Y" must grep-hit the referenced section for the keyword. Overclaimed absorptions fail (caught rev 0.6's F-D12 SQLite claim retroactively).
+5. **Section numbering** — monotonic increasing. Out-of-order numbering fails.
+6. **Cross-referenced state fields** — any field name referenced across multiple sections (e.g. `onboarding_complete_at`, `_v3_migration_marker`) must have a named write-site in at least one section. Referenced-but-unwritten fields fail.
+7. **Companion drafts doc rev-match** — `walker-v3-yaml-drafts.md` must have a top-of-doc "synced to rev X" banner; if the plan header rev ≠ companion banner rev, CI fails the plan commit.
+8. **Sensitive-field catalog** — every parameter with `sensitive: true` in schema_annotation must appear in §2.12's explicit sensitive-fields list and vice versa.
 
-### 2.12 Sensitive-parameter authorization
+Integrity pass runs in CI (blocks merge) AND locally via `just plan-integrity` (fast feedback for plan authors). The script itself lives in `docs/tools/` and is maintained as part of this plan's ownership.
+
+§2.14 as prose discipline is retired. If the script doesn't run, no rev is audit-ready, full stop.
+
+### 2.14 Growth and failure modes (Root 15 — rev 0.7 new)
+
+Cycle 2 surfaced three cases rev 0.6 left unspecified. All are now named here.
+
+**2.14.1 Cascade exhaustion** (B-F3). When `on_partial_failure: cascade` walks off the end of `effective_call_order` without any provider succeeding, walker emits `dispatch_exhausted` chronicle event with `{tried: [provider_type, NotReadyReason|DispatchError], decision_id, duration_ms}`, then returns `StepFailure::DispatchExhausted` to the chain executor. **One-pass guarantee:** cascade walks each provider at most once per Decision; saturation-retry inside a provider counts as `retry_same`, not `cascade`. No infinite loop possible.
+
+Tester first-build path with `effective_call_order: [market]`: if market's first dispatch returns a retryable failure AND market's own patience budget is exhausted, cascade has no next provider, `dispatch_exhausted` fires, step fails loudly. No silent hang.
+
+**2.14.2 Multi-node-per-operator SelfDealing** (A-F5). The SelfDealing readiness check is **node-local**: filters offers where `offer.node_id == self.node_id`. Operators running multiple nodes under a single identity (e.g. laptop + BEHEM, both publishing to market) can have Node A buy Node B's offer — a round-trip via Wire fees for nothing. v3 ships with this limitation explicitly named; v4 introduces operator-scoped sibling filtering. v3 workaround: operators who run multi-node setups configure `walker_provider_market.overrides.active = false` on nodes they intend as serve-only or ask-only. See §9.
+
+**2.14.3 Schema evolution** (B-F10). Rev 0.6 overclaimed "adding a parameter requires no schema change." Corrected semantics:
+
+- **Redeclaring an existing parameter at a new scope** (operator adds `patience_secs` override to walker_slot_policy when it was previously only in walker_provider_*) — no code change. Pure contribution supersession.
+- **Adding a genuinely-new parameter key** (e.g. `temperature_cap`) — requires (a) annotation-first supersession declaring the shape, (b) Rust SYSTEM_DEFAULT entry, (c) parameter catalog row, (d) typed accessor. Annotation ships before Rust binary so old nodes booting with the new annotation don't fail validation on unknown keys (the old validator grandfathers unrecognized keys as "declared but not consumed"; new binary recognizes them).
+- **Retroactive `sensitive: true`** — when an annotation supersession marks a previously-non-sensitive parameter as sensitive, existing contributions are grandfathered (not rejected) but Settings flags them with a "re-confirm this sensitive field" banner. Operators can re-supersede to explicitly acknowledge.
+
+Update §2.3's "adding a parameter = no schema change" wording accordingly — it's only true for scope redeclaration.
+
+### 2.15 Sensitive-parameter authorization
 
 Any parameter with `sensitive: true` in its schema_annotation triggers operator-confirmation dialog in Settings before the supersession is written. Sensitive fields:
 
-- `openrouter_credential_ref` (could redirect to a wrong / empty / attacker-controlled key)
+- ~~`openrouter_credential_ref`~~ — removed in rev 0.6; credential rotation now happens in `pyramid_providers` provider-registry UI which has its own confirmation surface. Walker-side sensitivity is on the provider-registry, not in walker_*.
 - `max_budget_credits` (could drain wallet if zeroed-out-to-None or lifted to astronomical)
 - `order` (call_order or slot_policy — could silently bypass expected providers)
-- `active` (disabling a provider without operator awareness)
+- `active` (disabling a provider without operator awareness, OR enabling market without consent on first build — see tester-onboarding Page 4 flip-to-true consent record per Root 17)
+- `on_partial_failure` — **directional sensitivity (Root 16 / A-F3):** confirmation fires only on transitions TO `cascade` (operator relaxing privacy). `fail_loud → cascade` on a privacy-sensitive slot is the dangerous direction; `cascade → fail_loud` is strictly tightening privacy and does not require confirmation.
 
 Consequences:
 
@@ -308,7 +337,7 @@ This table is the authoritative list of walker-behavioral parameters in v3. Anyt
 
 | Parameter | Type | Semantics | SYSTEM_DEFAULT |
 |---|---|---|---|
-| `active` | `bool` | Master switch for the provider type. `false` = readiness gate fails, provider is skipped in call_order. Field name matches existing `wire_compute_offers.structured_data.active` pattern (Q2 answer). | `true` for openrouter/fleet/market; `false` for local (opt-in to Ollama) |
+| `active` | `bool` | Master switch for the provider type. `false` = readiness gate fails, provider is skipped in call_order. Field name follows the `structured_data.active` pattern used by shipped contributions (Q2). | `true` for openrouter/fleet; `false` for local AND market (opt-in — see Root 17 / A-F6: tester's onboarding Page 4 flip-to-true is the consent record for first market spend, not a silent bundled default) |
 | `model_list` | **shape-per-scope**: `Map<tier, Vec<String>>` at scopes 3–4, `Vec<String>` at scopes 1–2. Typed accessor returns `Option<Vec<String>>`. Semantics vary by provider: OR / market → ordered list walker tries; local → declarative claim of what Ollama serves for this tier; fleet → preferred models peers should have cached. | Consumed by all four provider types (readiness gate separates "willing" from "able"). `None` at every scope → walker skips this (slot, provider) pair, emits `tier_unresolved`. | `None` |
 | `max_budget_credits` | `Option<i64>` | Per-dispatch credit ceiling fed to Wire's `/quote max_budget`. `None` = no cap (omit from /quote). | `None` |
 | `patience_secs` | `u64` | Wall-clock budget for the saturation-retry loop (walker waits up to this long across all retries on this scope's market dispatch before giving up). | `3600` |
@@ -321,7 +350,7 @@ This table is the authoritative list of walker-behavioral parameters in v3. Anyt
 | `dispatch_deadline_grace_secs` | `u64` | Grace appended to Wire's `dispatch_deadline_at` when computing walker's `/fill` await timeout. | `10` |
 | `fleet_peer_min_staleness_secs` | `u64` | How old a peer announcement may be before fleet provider skips it. | `300` |
 | `fleet_prefer_cached` | `bool` | Whether fleet provider prefers peers that have the requested model cached. | `true` |
-| `on_partial_failure` | tagged enum `{cascade, fail_loud, retry_same}` | Decision-level policy (F-D16, Issue 10). What happens when a provider returns a retryable failure: `cascade` (try next provider in effective_call_order — default, matches current behavior); `fail_loud` (emit `dispatch_failed_policy_blocked` and stop — privacy-preserving default for slots where cross-provider prompt leakage matters); `retry_same` (stay on same provider, respect breaker and patience budget). Lives at scope 2 (slot) or scope 4 (provider-type). Sensitive because changing to `cascade` on a privacy-sensitive slot could leak prompts. | `cascade` |
+| `on_partial_failure` | tagged enum `{cascade, fail_loud, retry_same}` | Decision-level policy. What happens when a provider returns a retryable failure: `cascade` (try next provider in effective_call_order — default, matches current behavior); `fail_loud` (emit `dispatch_failed_policy_blocked` and stop — privacy-preserving posture for slots where cross-provider prompt leakage matters); `retry_same` (stay on same provider, respect breaker and patience budget). **Scope 2 ONLY (slot-level).** Not per-provider, because at Decision-level there's exactly one policy per step; allowing scope 4 declarations across four providers creates ambiguity about which wins (Root 16 / A-F12). Sensitive **directionally** (Root 16 / A-F3): `new == cascade AND old != cascade` triggers confirmation; other transitions don't. | `cascade` |
 | `ollama_base_url` | `String` | Local Ollama endpoint. | `"http://localhost:11434/v1"` |
 | `ollama_probe_interval_secs` | `u64` | How often local provider config probes `/api/tags`. | `300` |
 | ~~`openrouter_credential_ref`~~ | — | **Removed (F-D3).** The shipped `pyramid_providers.api_key_ref` column (set to `"OPENROUTER_KEY"` in the default seed) is already the canonical credential pointer used by the `ResolvedSecret` resolver. Walker's openrouter readiness gate reads from that column directly; no parallel field. Operators rotating keys via the shipped provider-registry UI affect walker dispatch without a second place to edit. | — |
@@ -483,6 +512,34 @@ On first boot after v3 ships, migration runs in one transaction. Either all step
 
 **On boot:** app asserts `_v3_migration_marker` exists before instantiating walker. If missing, boot refuses with clear error directing operator to retry migration or rollback.
 
+**SQLite mechanics for column removal (B-F9 / rev 0.7 — spelling out what rev 0.6 over-claimed):** SQLite versions < 3.35 cannot `ALTER TABLE DROP COLUMN`; `db.rs:2446` notes "SQLite DROP COLUMN is expensive." The migration removes these columns via CREATE-COPY-DROP-RENAME:
+
+```sql
+BEGIN TRANSACTION;
+
+-- Example: removing legacy pyramid_tier_routing after consolidation
+CREATE TABLE pyramid_tier_routing__new (
+  -- post-migration shape: none needed; the table is fully retired
+  -- (all data now lives in walker_provider_* contributions)
+  placeholder INTEGER  -- or drop the table entirely if no FK refs remain
+);
+
+INSERT INTO pyramid_tier_routing__new SELECT ...;  -- no rows needed if retiring
+DROP TABLE pyramid_tier_routing;
+ALTER TABLE pyramid_tier_routing__new RENAME TO pyramid_tier_routing;
+-- Or simply: DROP TABLE pyramid_tier_routing; if no FK references remain.
+
+-- AppConfig struct fields (primary_model, fallback_model_1, fallback_model_2)
+-- are NOT database columns — they live in config JSON serialized per-operator.
+-- Migration rewrites that JSON: read the old shape, write the new shape without
+-- those fields, persist. Rust struct definition loses the fields in the same
+-- Phase 1 commit; `cargo check` enforces no stale readers.
+
+COMMIT;
+```
+
+Disable foreign-key enforcement during the rebuild if `pyramid_tier_routing` has FK references: `PRAGMA defer_foreign_keys = ON;` at transaction start, re-enable after commit. Indexes on the old table must be recreated on the new one; `schema_version` is bumped in the same transaction.
+
 ---
 
 ## 6. Phased implementation
@@ -491,7 +548,20 @@ Phases ship independently. Walker's dispatch path gets a new arm per phase as ea
 
 LOC estimates corrected per audit findings — `primary_model` is ~93 source-site occurrences across 16 files (not 25), Phase 6 UI realistically 1200–1800 LOC (not 600), Phase 0 bumped by ~200 LOC for six generation skills + six schema annotations. Total revised: ~3700–4700 LOC, 9–12 sessions.
 
-### Phase 0 — Resolver + Decision builder + schema groundwork (~1100 LOC, bumped for seventh skill + envelope validator + tier_registry rewrite + StepContext rename)
+### Phase 0a — Infrastructure extraction (Root 14 — rev 0.7, ~1000–1200 LOC)
+
+Rev 0.6 bundled all of Phase 0 into a single "groundwork" bucket and cycle 2 Stage 1 demonstrated that the Phase 0 promises rested on infrastructure that didn't exist. Phase 0a is infrastructure-creation — the scaffolding every later phase depends on — and must finish clean before 0b starts.
+
+- **Envelope writer extraction** (~300–500 LOC, B-F1 / Root 13 resolution). Extract `write_contribution_envelope(schema_type, body, source, extras) -> Result<ContributionId>` as the sole `INSERT INTO pyramid_config_contributions` site. Refactor the ~35 existing INSERT call sites across 9 files (`migration_config.rs`, `config_contributions.rs`, `wire_migration.rs`, `demand_signal.rs`, `evidence_answering.rs`, `wire_pull.rs`, `prompt_cache.rs`, `generative_config.rs`, `db.rs`) to call it. Add a clippy deny-rule regex blocking raw `INSERT INTO pyramid_config_contributions` outside the envelope writer.
+- **Chronicle event const declarations** (~50 LOC, B-F4 / Root 13). Declare all 10 new events in `compute_chronicle.rs` following the shipped `pub const EVENT_*: &str = "..."` convention: `EVENT_DECISION_BUILT`, `EVENT_DECISION_BUILD_FAILED`, `EVENT_DECISION_PREVIEWED` (NEW — for synthetic, see §2.12 / B-F5), `EVENT_PROVIDER_SKIPPED_READINESS`, `EVENT_BREAKER_TRIPPED`, `EVENT_BREAKER_SKIPPED`, `EVENT_CONFIG_SUPERSEDED`, `EVENT_TIER_UNRESOLVED`, `EVENT_SENSITIVE_SUPERSESSION_CONFIRMED`, `EVENT_REQUESTER_PROVIDER_PARAM_DRIFT`, `EVENT_PREVIEW_VS_APPLY_DRIFT`, `EVENT_DISPATCH_EXHAUSTED` (Root 15 / §2.14.1). Emission sites use the consts, not string literals.
+- **Placeholder interpolation engine v2** (~250 LOC, A-F1 / Root 13). Current `generative_config.rs:substitute_prompt` is single-brace literal replacer over 4 tokens. Extend (or add `substitute_prompt_v2`) to support double-brace `{{placeholder}}` with an async resolver context carrying handles to OllamaProbe, OpenRouter client (`/api/v1/models`), MarketSurfaceCache, and a SYSTEM_DEFAULTS borrow. Resolve at skill-invocation time. Named placeholders for v3: `{{openrouter_live_slugs}}`, `{{ollama_available_models}}`, `{{market_surface_slugs}}`, `{{patience_secs_default}}`, `{{retry_http_count_default}}`, `{{max_budget_credits_default}}`. Registered in the integrity-pass placeholder table (§2.13 item 1).
+- **ProviderReadiness trait + four impls** (~200 LOC). Trait def per §2.6. Impls in `local_mode.rs`, `fleet_mps.rs` or `fleet.rs`, `provider.rs` (openrouter), `compute_market_*.rs` (market). Each impl ~30–80 LOC carrying the reason enum.
+- **`ChainDispatchContext` rename** (~40 LOC, F-D2). Rename `chain_dispatch.rs:124`'s `StepContext` to `ChainDispatchContext`. Pin `step_context.rs:275` as the Decision home.
+- **`arc_swap` dep add** to `Cargo.toml` (Root 13 / F-D9).
+
+**Phase 0a exit criteria:** envelope writer is the sole INSERT site (clippy enforced); all 10 new chronicle events exist as consts; placeholder engine resolves all 6 named placeholders against live sources in tests; ProviderReadiness trait compiles with four impls returning Ready stubs; `ChainDispatchContext` rename complete. Nothing walker-specific has landed yet — this is pure infrastructure.
+
+### Phase 0b — Schema landing + Decision builder (~1200–1600 LOC, Root 14)
 
 - `walker_resolver.rs` with scope-chain walker + typed accessors + SYSTEM_DEFAULTS table.
 - `walker_decision.rs` — **DispatchDecision builder**. Called at outer-chain-step entry. Runs resolver per (provider_type), calls each provider's `can_dispatch_now`, assembles immutable Decision, emits `decision_built` chronicle event (with scope_snapshot serialized). This is the compute-once spine; every downstream consumer reads from `StepContext.dispatch_decision`.
@@ -582,7 +652,7 @@ Audit noted `InferenceRoutingPanel.tsx` is already 894 lines; six configs + list
 - Chronicle events for live breaker visibility and Decision trace: `decision_built` (serialized Decision — answers "why did walker route to X"), `breaker_tripped`, `breaker_skipped`, `config_superseded`, `tier_unresolved`, `provider_skipped_readiness` (with `reason: NotReadyReason` — specific), `decision_build_failed` (empty model_list + active:true case), `sensitive_supersession_confirmed` (audit trail).
 - Probe-driven dropdowns for per-provider-type model suggestions.
 
-### Total: ~4350–5150 LOC, 10–13 sessions (rev 0.6: Phase 0 bumped to 1100, Phase 6 revised up to 2200-2800)
+### Total: ~4900–5850 LOC, 11–14 sessions (rev 0.7: Phase 0 split into 0a infrastructure (~1000-1200) + 0b schema landing (~1200-1600))
 
 ---
 
@@ -616,7 +686,7 @@ The resolver reframe absorbs most of rev 0.1's open items and the audit's Q&A li
 ## 8. Acceptance criteria
 
 - **Tester smoke:** GPU-less tester installs app, asks question on small corpus. Bundled call-order `[market, local, openrouter, fleet]`. Decision at step entry: `market` ready (onboarding seeded ≥1 credit AND balance cache primed during onboarding Page 4 — see orchestration note below), `local` NotReady(OllamaOffline), `openrouter` NotReady(CredentialMissing), `fleet` NotReady(NoReachablePeer). `effective_call_order: [market]`. Network providers matching tester's market config serve via market. If market dry for the requested tier (`MarketSurfaceCache` has zero non-self offers) → `decision_build_failed` chronicle event with reason `NoMarketOffersForSlot`; build fails loud rather than silently burning patience on a dry market.
-  - **Onboarding/walker orchestration (Root 10 / Issue 3):** `tester-onboarding.md`'s Page 4 (tunnel validation) additionally primes the market balance cache via a parallel `/balance` fetch alongside the existing handle-check. First build after onboarding boots into a warm cache. A `onboarding_complete_at` timestamp is written; market readiness's 5-minute grace window reads from it. Boots where the timestamp is >5min old require a fresh balance fetch before market readiness passes.
+  - **Onboarding/walker orchestration (Root 10 / Issue 3, Root 13 F-D2, Root 17):** `tester-onboarding.md`'s Page 4 (tunnel validation) additionally: (a) primes the market balance cache via parallel `/balance` fetch alongside the existing handle-check, (b) flips `walker_provider_market.overrides.active` from the bundled `false` to `true` as the explicit consent supersession (operator-authored, chronicle-logged — this IS the market-participation consent record), (c) writes `onboarding_complete_at` timestamp to `pyramid_config.json` or a dedicated `onboarding_state` contribution. The write site is in the onboarding Page 4 handler in `src-tauri/src/pyramid/onboarding.rs` (or equivalent). Walker plan and tester-onboarding plan must be rev-aligned on this field — the integrity-pass script (§2.13 item 6) enforces that `onboarding_complete_at` has a named writer. Boots where the timestamp is >5min old require a fresh balance fetch before market readiness passes.
 - **Hybrid operator (Adam-shape):** laptop + BEHEM + OpenRouter key. Call-order `[market, local, openrouter, fleet]`. Extract slot market patience 15 min via slot-policy override. Market serves local-model offers when BEHEM is up; extract work routes to BEHEM via market. Synth-heavy slot-policy bypasses market (`order: [openrouter]`), goes straight to OR. When BEHEM down longer than 15 min, breaker trips; extract falls to local (empty) → openrouter until build completes.
 - **Bridge operator:** third operator's market config publishes OR-slug offers using their own OR key. Adam's market config requests those slugs. Match. Bridge serves, pays OR, Adam pays bridge in credits. Wire market primitive unchanged. Bridge's OWN walker_provider_market requests are filtered by the `SelfDealing` readiness reason so bridge never buys their own offers (Root 12 / Issue 1).
 
@@ -697,6 +767,15 @@ Same as walker / rev 2.1.1 cycle:
   - **Residuals patched:** F-D9 (arc_swap in Cargo.toml — Phase 0 dep add), F-D10 (§2.1 clarification for scope-2 order vs overrides), F-D12 (SQLite migration mechanics spelled out in §5.3 — CREATE-COPY-DROP-RENAME dance), F-D15 (Phase 6 LOC revised up to 2200-2800), Issue 6 (slug coherence named as v4 in §9), Issue 8 (Phase 6 "last N Decisions" aggregation view added), plus §9 additions for worktree cleanup pre-flight, ts-rs double-maintenance flag, and Wire-surfaces contract doc as follow-up.
   - **Stage 2 Issue 7 verified-not-an-issue:** `/quote` returns `queue_position` nested inside `response.price_breakdown` — matches plan's claim. Verified against Next.js route.
   - Rev 0.6 is implementation-ready pending Adam GO.
+- **Rev 0.7 (2026-04-21):** Cycle 2 Stage 1 informed audit (23 findings across 2 auditors) absorbed via systemic-synthesis. 5 structural roots (13–17). Cycle 2 surfaced a meta-pattern: rev 0.6 promised infrastructure and discipline that didn't actually exist in the codebase.
+  - **Root 13 — Rev 0.6 added discipline and infrastructure-promises without wiring them.** Symptoms: envelope writer doesn't exist (35 raw INSERT sites); `{{placeholder}}` syntax doesn't exist in generative_config.rs engine; `onboarding_complete_at` referenced but undefined; 10 new chronicle events not in `compute_chronicle.rs` const registry; §11 over-claimed F-D12 SQLite mechanics; §2.12 still listed removed `openrouter_credential_ref`; section numbering ordered 2.11→2.13→2.14→2.12; companion drafts doc stale across 3 revs. **Fix:** §2.14 (now §2.13) upgraded from prose discipline to **mechanized `docs/tools/plan-integrity.sh`** script with 8 automated checks (placeholder resolution, chronicle event registry grep, struct↔catalog cross-check, absorbed-finding verification, section monotonicity, cross-ref field write-sites, companion rev-match, sensitive-field catalog parity). Runs in CI AND `just plan-integrity`. No rev is audit-ready without it.
+  - **Root 14 — Phase 0 is infrastructure-creation, not groundwork.** Cycle 1 treated Phase 0 as "scaffolding"; cycle 2 showed it's ~2200-2800 LOC of actual infrastructure work. **Fix:** Phase 0 split into **Phase 0a (infrastructure extraction, ~1000-1200 LOC)** — envelope writer, chronicle consts, placeholder engine v2, ProviderReadiness trait + 4 impls, ChainDispatchContext rename, arc_swap dep — and **Phase 0b (schema landing, ~1200-1600 LOC)** — schemas, skills, shape validator, tier_registry rewrite, test_bundled_tier_coverage.
+  - **Root 15 — Failure and growth paths unspecified.** New §2.14 "Growth and failure modes" covering: (2.14.1) cascade exhaustion → `dispatch_exhausted` event + `StepFailure::DispatchExhausted` + one-pass guarantee; (2.14.2) multi-node-per-operator SelfDealing is node-local only, v3 workaround is per-node `active: false`, v4 adds operator-scoped sibling filtering; (2.14.3) schema evolution — new parameter keys require annotation+catalog+SYSTEM_DEFAULT+accessor (Rust release), only redeclaration at new scopes is schema-change-free. §2.3's "no schema change" language corrected.
+  - **Root 16 — `on_partial_failure` scope semantics.** Narrowed to scope 2 only (slot-level, not scope 4 per-provider — would create Decision-level ambiguity). Directional sensitivity: confirms only on `new == cascade AND old != cascade`. Added to §2.15's explicit sensitive-fields list.
+  - **Root 17 — Drift comparators / market active default.** Bundled `walker_provider_market.active = false`; onboarding Page 4 flip-to-true is the consent record. (Drift comparators B-F11 remain as residual — see below.)
+  - **Residuals patched:** A-F4 (§2.15 sensitive-fields list — removed `openrouter_credential_ref`, added `on_partial_failure`), A-F10 (§2.12 synthetic Decision adds per-tier iteration spec for cost estimation), A-F11 (§4.4 fleet drift pairing noted; drift comparators spec deferred — see below), B-F5 (§2.12 synthetic Decision emits `decision_previewed` not `decision_built`), B-F9 (§5.3 adds SQLite CREATE-COPY-DROP-RENAME recipe), A-F8 (Phase 1 framing clarification — behavioral vs mechanical touch surface), A-F7 + B-F7 + B-F11 (companion drafts doc synced to rev 0.7 with rev-match banner).
+  - **Still open (B-F11 Root 17 drift comparator specs):** `preview_vs_apply_drift` and `requester_provider_param_drift` concrete predicate thresholds remain fuzzy. Named as implementation-time decision; integrity pass will enforce that whichever spec ships is documented before Phase 0a completes.
+  - Ready for Cycle 2 Stage 2 discovery audit against rev 0.7.
 
 Planned cadence from here:
 1. Stage 1 informed pair audit against rev 0.3.
