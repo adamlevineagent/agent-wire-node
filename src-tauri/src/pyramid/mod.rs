@@ -108,6 +108,7 @@ pub mod vine;
 pub mod vine_composition;
 pub mod vine_prompts;
 pub mod vocabulary;
+pub mod walker_readiness;
 pub mod watcher;
 pub mod webbing;
 pub mod schema_registry;
