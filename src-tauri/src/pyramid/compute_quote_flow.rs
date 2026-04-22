@@ -55,8 +55,9 @@ use crate::WireNodeConfig;
 // ever drifts from the contracts crate, change the re-export to a local
 // struct here — no call-site churn.
 pub use agent_wire_contracts::{
-    ComputePurchaseBody, ComputePurchaseResponse, ComputePurchaseTrigger, ComputeQuoteBody,
-    ComputeQuotePriceBreakdown, ComputeQuoteResponse, LatencyPreference,
+    AllOffersSaturatedDetail, ComputePurchaseBody, ComputePurchaseResponse,
+    ComputePurchaseTrigger, ComputeQuoteBody, ComputeQuotePriceBreakdown, ComputeQuoteResponse,
+    LatencyPreference,
 };
 
 // ---------------------------------------------------------------------------
@@ -112,37 +113,6 @@ pub struct ComputeFillBody {
     pub privacy_tier: String,
     pub input_token_count: i64,
     pub requester_callback_url: String,
-}
-
-/// Detail payload carried on `all_offers_saturated_for_model` (P0410, 409)
-/// responses from Wire's `plan_compute_match` (rev 2.1.1). Shape MATCHES
-/// `agent_wire_contracts::AllOffersSaturatedDetail` verbatim — declared
-/// locally because the contracts crate rev pinned in `Cargo.toml`
-/// (a9e356d3) was cut before the rev 2.1.1 type landed. Swap to
-/// `pub use agent_wire_contracts::AllOffersSaturatedDetail;` as soon
-/// as the contracts crate rev bumps (same pattern as ComputeFillBody).
-///
-/// Field semantics (per bilateral decision doc
-/// compute-market-saturation-decisions-2026-04-21.md):
-/// - `offer_count`: size of the saturated cohort.
-/// - `min_current_queue_depth`: shortest queue in the cohort.
-/// - `max_queue_depth_across_offers`: largest max_queue_depth in the
-///   cohort (informational ceiling on waiting-room).
-/// - `min_expected_drain_ms`: Wire-computed `min(typical_serve_ms_p50)`
-///   across the cohort — shortest head-of-queue completion time.
-///   Walker uses as backoff FLOOR. Option-typed: `None` when the cohort
-///   lacks observations (fresh offers, <10 settled jobs). Walker falls
-///   back to a policy-local default in that case.
-/// - `median_typical_serve_ms_p50`: cohort median serve time for
-///   walker's own horizon math. Option-typed for the same reason.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AllOffersSaturatedDetail {
-    pub model_id: String,
-    pub offer_count: i64,
-    pub min_current_queue_depth: i64,
-    pub max_queue_depth_across_offers: i64,
-    pub min_expected_drain_ms: Option<f64>,
-    pub median_typical_serve_ms_p50: Option<f64>,
 }
 
 /// Walker-side bundling of the wire body plus the two fields the walker
