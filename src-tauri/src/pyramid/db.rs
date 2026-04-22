@@ -1939,6 +1939,16 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     crate::pyramid::config_contributions::migrate_dadbear_policy_to_split(conn)?;
     crate::pyramid::config_contributions::migrate_auto_update_into_norms(conn)?;
 
+    // Walker-v3 Phase 0a-1 commit 5 / §5.3 step 7 + §2.16.1: dedup
+    // any `(COALESCE(slug, '__global__'), schema_type)` pairs that
+    // somehow gained multiple status='active' rows on dev DBs, then
+    // create the `uq_config_contrib_active` partial unique index.
+    // Single SQL transaction; idempotent (short-circuits when the
+    // index already exists). Must run AFTER every other migration
+    // that writes `_migration_marker` or other bootstrap rows so
+    // those rows are already present when the dedup pass runs.
+    crate::pyramid::config_contributions::ensure_config_contrib_active_unique_index(conn)?;
+
     // Dispatch policy operational table (stores active YAML for hot-reload).
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS pyramid_dispatch_policy (
@@ -3823,6 +3833,7 @@ pub fn migrate_legacy_dadbear_to_contributions(conn: &Connection) -> Result<()> 
                 created_by: Some("dadbear_bootstrap".to_string()),
                 accepted_at: crate::pyramid::config_contributions::AcceptedAt::Now,
                 needs_migration: None,
+                write_mode: crate::pyramid::config_contributions::WriteMode::default(),
             },
             crate::pyramid::config_contributions::TransactionMode::OwnTransaction,
         )?;
@@ -3853,6 +3864,7 @@ pub fn migrate_legacy_dadbear_to_contributions(conn: &Connection) -> Result<()> 
             created_by: Some("dadbear_bootstrap".to_string()),
             accepted_at: crate::pyramid::config_contributions::AcceptedAt::Now,
             needs_migration: None,
+            write_mode: crate::pyramid::config_contributions::WriteMode::default(),
         },
         crate::pyramid::config_contributions::TransactionMode::OwnTransaction,
     )?;
@@ -3960,6 +3972,7 @@ pub fn migrate_legacy_auto_update_to_contributions(conn: &Connection) -> Result<
                 created_by: Some("auto_update_bootstrap".to_string()),
                 accepted_at: crate::pyramid::config_contributions::AcceptedAt::Now,
                 needs_migration: None,
+                write_mode: crate::pyramid::config_contributions::WriteMode::default(),
             },
             crate::pyramid::config_contributions::TransactionMode::OwnTransaction,
         )?;
@@ -3987,6 +4000,7 @@ pub fn migrate_legacy_auto_update_to_contributions(conn: &Connection) -> Result<
             created_by: Some("auto_update_bootstrap".to_string()),
             accepted_at: crate::pyramid::config_contributions::AcceptedAt::Now,
             needs_migration: None,
+            write_mode: crate::pyramid::config_contributions::WriteMode::default(),
         },
         crate::pyramid::config_contributions::TransactionMode::OwnTransaction,
     )?;
@@ -19201,6 +19215,15 @@ mod phase13_tests {
     // ── Phase 14: pyramid_wire_update_cache helper tests ──────────────
 
     fn seed_wire_update_cache_config(conn: &Connection, contribution_id: &str) {
+        // Phase 0a-1 commit 5: these tests seed multiple active rows
+        // for the same (schema_type='custom_prompts', slug=NULL) to
+        // exercise wire-update-cache queries. Walker-v3's
+        // `uq_config_contrib_active` would otherwise reject the
+        // second INSERT. Drop the index for the duration of the
+        // seed (it is re-established next boot via
+        // `ensure_config_contrib_active_unique_index`).
+        conn.execute("DROP INDEX IF EXISTS uq_config_contrib_active", [])
+            .unwrap();
         conn.execute(
             "INSERT INTO pyramid_config_contributions (
                 contribution_id, slug, schema_type, yaml_content,
@@ -19286,7 +19309,11 @@ mod phase13_tests {
         seed_wire_update_cache_config(&conn, "local-1");
 
         // Second contribution without a wire_contribution_id — should
-        // NOT appear in the tracked list.
+        // NOT appear in the tracked list. Phase 0a-1 commit 5: drop
+        // `uq_config_contrib_active` because the seed deliberately
+        // lands a second active row for the same (schema_type, slug).
+        conn.execute("DROP INDEX IF EXISTS uq_config_contrib_active", [])
+            .unwrap();
         conn.execute(
             "INSERT INTO pyramid_config_contributions (
                 contribution_id, slug, schema_type, yaml_content,

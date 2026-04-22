@@ -443,6 +443,7 @@ pub fn migrate_prompts_and_chains_to_contributions(
                 created_by: Some("phase5_bootstrap".to_string()),
                 accepted_at: crate::pyramid::config_contributions::AcceptedAt::Now,
                 needs_migration: None,
+                write_mode: crate::pyramid::config_contributions::WriteMode::default(),
             },
             crate::pyramid::config_contributions::TransactionMode::OwnTransaction,
         )?;
@@ -992,11 +993,47 @@ fn build_bundled_metadata(entry: &BundledContributionEntry) -> WireNativeMetadat
 /// insert is not atomic, but the boot path is single-threaded, and
 /// the prior `INSERT OR IGNORE` was only stronger w.r.t. the
 /// `contribution_id` uniqueness the pre-check already enforces.
+/// Test-only re-export of the private `insert_bundled_contribution`
+/// so `pyramid::config_contributions::tests` can exercise the
+/// bundled-vs-user-active pre-check (Phase 0a-1 commit 5, wanderer
+/// note 2). Not used by production code.
+#[cfg(test)]
+pub(crate) fn insert_bundled_contribution_for_test(
+    conn: &Connection,
+    entry: &BundledContributionEntry,
+    metadata: &WireNativeMetadata,
+) -> Result<bool> {
+    insert_bundled_contribution(conn, entry, metadata)
+}
+
 fn insert_bundled_contribution(
     conn: &Connection,
     entry: &BundledContributionEntry,
     metadata: &WireNativeMetadata,
 ) -> Result<bool> {
+    // Phase 0a-1 commit 5: bundled-vs-user-active pre-check (wanderer
+    // note 2). Once `uq_config_contrib_active` is enforced, a bundled
+    // INSERT for `(schema_type, slug)` where a user-authored active
+    // row already exists raises SQLITE_CONSTRAINT before
+    // `consolidate_bundled_versions` can run. Detect that case here
+    // and skip the bundled insert — the user's supersession implicitly
+    // retracts the bundled default.
+    let user_active_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM pyramid_config_contributions
+             WHERE schema_type = ?1
+               AND COALESCE(slug, '__global__') = COALESCE(?2, '__global__')
+               AND status = 'active'
+               AND source != 'bundled'",
+            rusqlite::params![entry.schema_type, entry.slug],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if user_active_exists {
+        return Ok(false);
+    }
+
     // Pre-check: if contribution_id already exists, mirror the prior
     // `INSERT OR IGNORE` no-op behavior.
     let existing: Option<i64> = conn
@@ -1010,11 +1047,53 @@ fn insert_bundled_contribution(
         return Ok(false);
     }
 
+    // Phase 0a-1 commit 5 wanderer fix: bundled v-bump path. Before
+    // `uq_config_contrib_active` landed, a v2 manifest entry could be
+    // inserted alongside a still-active v1; `consolidate_bundled_versions`
+    // (run after the manifest walk) then picked the winner. The unique
+    // index now makes that double-active impossible, so a v-bump INSERT
+    // fails with SupersessionConflict and the new bundled default is
+    // silently lost on upgrade. Pre-emptively supersede any OTHER active
+    // bundled row for the same (schema_type, slug) here so the INSERT
+    // below respects the index. The post-walk `consolidate_bundled_versions`
+    // pass remains as a belt-and-suspenders for any residual state
+    // (pre-commit-5 DBs that dedup missed, hypothetical races, etc).
+    let prior_bundled_id: Option<String> = conn
+        .query_row(
+            "SELECT contribution_id FROM pyramid_config_contributions
+             WHERE schema_type = ?1
+               AND COALESCE(slug, '__global__') = COALESCE(?2, '__global__')
+               AND status = 'active'
+               AND source = 'bundled'
+               AND contribution_id != ?3",
+            rusqlite::params![entry.schema_type, entry.slug, entry.contribution_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(ref prior_id) = prior_bundled_id {
+        conn.execute(
+            "UPDATE pyramid_config_contributions
+             SET status = 'superseded'
+             WHERE contribution_id = ?1",
+            rusqlite::params![prior_id],
+        )?;
+        debug!(
+            schema_type = %entry.schema_type,
+            slug = ?entry.slug,
+            prior_bundled = %prior_id,
+            new_bundled = %entry.contribution_id,
+            "insert_bundled_contribution: v-bump detected, prior bundled row superseded ahead of INSERT"
+        );
+    }
+
     let metadata_json = metadata
         .to_json()
         .map_err(|e| anyhow::anyhow!("failed to serialize wire_native_metadata: {e}"))?;
 
-    crate::pyramid::config_contributions::write_contribution_envelope(
+    // Supersedes pointer: if this is a v-bump, record the prior
+    // bundled row as the parent in the supersession chain.
+    let supersedes_ptr = prior_bundled_id.clone();
+    match crate::pyramid::config_contributions::write_contribution_envelope(
         conn,
         crate::pyramid::config_contributions::ContributionEnvelopeInput {
             contribution_id: entry.contribution_id.clone(),
@@ -1022,7 +1101,7 @@ fn insert_bundled_contribution(
             schema_type: entry.schema_type.clone(),
             body: entry.yaml_content.clone(),
             wire_native_metadata_json: Some(metadata_json),
-            supersedes_id: None,
+            supersedes_id: supersedes_ptr,
             triggering_note: Some(entry.triggering_note.clone()),
             status: "active".to_string(),
             source: "bundled".to_string(),
@@ -1030,12 +1109,81 @@ fn insert_bundled_contribution(
             created_by: Some("bootstrap".to_string()),
             accepted_at: crate::pyramid::config_contributions::AcceptedAt::Now,
             needs_migration: None,
+            // Phase 0a-1 commit 5: bundled loader MUST skip-on-fail
+            // for shape-validation failures so a malformed bundled
+            // row cannot brick the install (§2.11 Root 22 / A-C4).
+            write_mode: crate::pyramid::config_contributions::WriteMode::BundledBootSkipOnFail,
         },
-        crate::pyramid::config_contributions::TransactionMode::OwnTransaction,
-    )
-    .map_err(|e| anyhow::anyhow!("write_contribution_envelope: {e}"))?;
-
-    Ok(true)
+        crate::pyramid::config_contributions::TransactionMode::JoinAmbient,
+    ) {
+        Ok(_) => {
+            // Phase 0a-1 commit 5 wanderer fix: back-fill the prior
+            // bundled row's forward pointer after the INSERT lands.
+            if let Some(ref prior_id) = prior_bundled_id {
+                conn.execute(
+                    "UPDATE pyramid_config_contributions
+                     SET superseded_by_id = ?1
+                     WHERE contribution_id = ?2",
+                    rusqlite::params![entry.contribution_id, prior_id],
+                )?;
+            }
+            Ok(true)
+        }
+        Err(crate::pyramid::config_contributions::ContributionWriterError::BundledValidationSkipped {
+            contribution_id,
+            schema_type,
+        }) => {
+            // §2.11 skip-on-fail path. The warn! emission inside the
+            // writer already includes chronicle event name + details;
+            // caller reports the skip via Ok(false) and continues.
+            //
+            // Phase 0a-1 commit 5 wanderer fix: if we pre-emptively
+            // superseded a prior bundled row (v-bump path) and then
+            // the new row failed validation, restore the prior to
+            // active so the node is not left with zero active rows
+            // for this (schema_type, slug).
+            if let Some(ref prior_id) = prior_bundled_id {
+                conn.execute(
+                    "UPDATE pyramid_config_contributions
+                     SET status = 'active'
+                     WHERE contribution_id = ?1",
+                    rusqlite::params![prior_id],
+                )?;
+                warn!(
+                    prior_bundled = %prior_id,
+                    new_bundled = %contribution_id,
+                    "bundled v-bump aborted due to validation failure; prior bundled row restored to active"
+                );
+            }
+            debug!(
+                contribution_id = %contribution_id,
+                schema_type = %schema_type,
+                "bundled contribution skipped by writer: shape validation failed"
+            );
+            Ok(false)
+        }
+        Err(e) => {
+            // Phase 0a-1 commit 5 wanderer fix: same restore-on-failure
+            // handling for non-validation INSERT errors (e.g. disk
+            // full, unexpected constraint). Never leave the DB with
+            // zero active rows for this key.
+            if let Some(ref prior_id) = prior_bundled_id {
+                if let Err(restore_err) = conn.execute(
+                    "UPDATE pyramid_config_contributions
+                     SET status = 'active'
+                     WHERE contribution_id = ?1",
+                    rusqlite::params![prior_id],
+                ) {
+                    warn!(
+                        prior_bundled = %prior_id,
+                        error = %restore_err,
+                        "bundled v-bump aborted and prior-row restore also failed"
+                    );
+                }
+            }
+            Err(anyhow::anyhow!("write_contribution_envelope: {e}"))
+        }
+    }
 }
 
 /// After the bundled manifest walk, ensure at most one `active` row
@@ -2133,10 +2281,18 @@ applies_to: 'chain_step_config'
         walk_bundled_contributions_manifest(&conn).unwrap();
 
         // Simulate the user superseding the bundled evidence_policy
-        // default with their own refinement. Mark the bundled row
-        // superseded + point at a new user row.
+        // default with their own refinement. Phase 0a-1 commit 5:
+        // mark the bundled row superseded BEFORE the user INSERT so
+        // `uq_config_contrib_active` never sees two active rows.
         let bundled_id = "bundled-evidence_policy-default-v1";
         let user_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "UPDATE pyramid_config_contributions
+             SET status = 'superseded'
+             WHERE contribution_id = ?1",
+            rusqlite::params![bundled_id],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO pyramid_config_contributions (
                 contribution_id, slug, schema_type, yaml_content,
@@ -2154,7 +2310,7 @@ applies_to: 'chain_step_config'
         .unwrap();
         conn.execute(
             "UPDATE pyramid_config_contributions
-             SET status = 'superseded', superseded_by_id = ?1
+             SET superseded_by_id = ?1
              WHERE contribution_id = ?2",
             rusqlite::params![user_id, bundled_id],
         )
@@ -2216,6 +2372,15 @@ applies_to: 'chain_step_config'
     /// explicit contribution_id and source, skipping the standard
     /// create_config_contribution path. Used to simulate pre-existing
     /// rows in the DB before calling the consolidation helper.
+    ///
+    /// Phase 0a-1 commit 5 note: these tests deliberately seed
+    /// duplicate `status='active'` rows for the same
+    /// (schema_type, slug) to simulate pre-upgrade dev-DB state.
+    /// Walker-v3 added `uq_config_contrib_active` which would
+    /// otherwise reject the second INSERT. Tests drop the index
+    /// before seeding; the dedup helper under test restores a
+    /// single-active invariant and the index is re-created in the
+    /// post-dedup assertion by calling `ensure_config_contrib_active_unique_index`.
     fn insert_active_row(
         conn: &Connection,
         contribution_id: &str,
@@ -2224,6 +2389,8 @@ applies_to: 'chain_step_config'
         source: &str,
         yaml_content: &str,
     ) {
+        conn.execute("DROP INDEX IF EXISTS uq_config_contrib_active", [])
+            .unwrap();
         conn.execute(
             "INSERT INTO pyramid_config_contributions (
                 contribution_id, slug, schema_type, yaml_content,
@@ -2768,5 +2935,90 @@ fields:
             .unwrap();
         assert_eq!(content, yaml);
         assert_eq!(contrib_id, "test-dispatch-policy-v1");
+    }
+
+    /// Phase 0a-1 commit 5 wanderer fix regression guard: when the
+    /// bundled manifest ships a v-bump (new contribution_id for an
+    /// existing (schema_type, slug) where the prior row is still
+    /// `source='bundled'`), `insert_bundled_contribution` must
+    /// pre-emptively supersede the prior so the `uq_config_contrib_active`
+    /// unique index does not reject the INSERT. Before the fix, the
+    /// new bundled default silently failed to land on upgrade.
+    #[test]
+    fn insert_bundled_v_bump_supersedes_prior_bundled() {
+        use crate::pyramid::wire_native_metadata::default_wire_native_metadata;
+        let conn = mem_conn();
+
+        // Seed a v1 bundled active row via the production path (index
+        // in force, no duplicate-actives).
+        let v1 = BundledContributionEntry {
+            contribution_id: "bundled-vbump_test-v1".to_string(),
+            slug: Some("vbump-slug".to_string()),
+            schema_type: "vbump_test_schema".to_string(),
+            yaml_content: "version: 1\n".to_string(),
+            triggering_note: "v1".to_string(),
+            topics_extra: Vec::new(),
+            applies_to: None,
+        };
+        let metadata_v1 = default_wire_native_metadata(&v1.schema_type, v1.slug.as_deref());
+        assert!(
+            insert_bundled_contribution(&conn, &v1, &metadata_v1).unwrap(),
+            "v1 insert should return Ok(true)"
+        );
+
+        // Now ship a v-bump with a new contribution_id, same slug +
+        // schema_type. Pre-fix, this would fail SupersessionConflict.
+        // Post-fix, it supersedes v1 and lands v2.
+        let v2 = BundledContributionEntry {
+            contribution_id: "bundled-vbump_test-v2".to_string(),
+            slug: Some("vbump-slug".to_string()),
+            schema_type: "vbump_test_schema".to_string(),
+            yaml_content: "version: 2\n".to_string(),
+            triggering_note: "v2".to_string(),
+            topics_extra: Vec::new(),
+            applies_to: None,
+        };
+        let metadata_v2 = default_wire_native_metadata(&v2.schema_type, v2.slug.as_deref());
+        assert!(
+            insert_bundled_contribution(&conn, &v2, &metadata_v2).unwrap(),
+            "v2 insert should return Ok(true) after v-bump handling"
+        );
+
+        // v1 must now be superseded with forward pointer to v2.
+        let (v1_status, v1_fwd): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, superseded_by_id FROM pyramid_config_contributions
+                 WHERE contribution_id = 'bundled-vbump_test-v1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(v1_status, "superseded");
+        assert_eq!(v1_fwd.as_deref(), Some("bundled-vbump_test-v2"));
+
+        // v2 must be the sole active row with supersedes_id pointing
+        // back at v1 (chain symmetric).
+        let (v2_status, v2_back): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, supersedes_id FROM pyramid_config_contributions
+                 WHERE contribution_id = 'bundled-vbump_test-v2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(v2_status, "active");
+        assert_eq!(v2_back.as_deref(), Some("bundled-vbump_test-v1"));
+
+        // Unique index still holds: exactly one active for this pair.
+        let active_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_config_contributions
+                 WHERE schema_type = 'vbump_test_schema' AND slug = 'vbump-slug'
+                   AND status = 'active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_count, 1);
     }
 }

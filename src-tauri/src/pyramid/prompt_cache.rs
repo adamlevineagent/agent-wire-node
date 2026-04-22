@@ -294,6 +294,16 @@ mod tests {
             )
             .unwrap();
         let new_id = uuid::Uuid::new_v4().to_string();
+        // Phase 0a-1 commit 5: flip prior → superseded BEFORE the
+        // INSERT so `uq_config_contrib_active` never sees two active
+        // rows at once; back-link in follow-up UPDATE.
+        tx.execute(
+            "UPDATE pyramid_config_contributions
+             SET status = 'superseded'
+             WHERE contribution_id = ?1",
+            rusqlite::params![prior_id],
+        )
+        .unwrap();
         tx.execute(
             "INSERT INTO pyramid_config_contributions (
                 contribution_id, slug, schema_type, yaml_content,
@@ -311,7 +321,7 @@ mod tests {
         .unwrap();
         tx.execute(
             "UPDATE pyramid_config_contributions
-             SET status = 'superseded', superseded_by_id = ?1
+             SET superseded_by_id = ?1
              WHERE contribution_id = ?2",
             rusqlite::params![new_id, prior_id],
         )

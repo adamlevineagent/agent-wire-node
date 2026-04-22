@@ -51,6 +51,16 @@ pub enum PullError {
     EmptyPayload,
     #[error("pulled contribution missing schema_type")]
     MissingSchemaType,
+    /// Phase 0a-1 commit 5: unique-index contention on
+    /// `uq_config_contrib_active` during pull commit. A concurrent
+    /// local supersession beat the pull's INSERT. Caller can retry
+    /// (re-resolve the prior active and attempt again) rather than
+    /// surface a generic error to the operator.
+    #[error("supersession conflict for schema_type={schema_type} slug={slug:?}: concurrent writer landed first")]
+    SupersessionConflict {
+        schema_type: String,
+        slug: Option<String>,
+    },
     #[error("database error: {0}")]
     DbError(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -346,7 +356,10 @@ fn commit_pulled_active(
         .to_json()
         .map_err(|e| PullError::Other(anyhow!("serialize metadata: {e}")))?;
 
-    let tx = conn.transaction()?;
+    // Phase 0a-1 commit 5 / §2.16.1: BEGIN IMMEDIATE so Wire-side
+    // pulls serialize on write intent against concurrent local
+    // supersessions.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
     // Resolve the current active row INSIDE the transaction. Same
     // predicate as `load_active_config_contribution`. Holding the
@@ -377,6 +390,24 @@ fn commit_pulled_active(
     };
 
     let new_id = uuid::Uuid::new_v4().to_string();
+
+    // Phase 0a-1 commit 5: flip prior to superseded BEFORE inserting
+    // the new active row so the `uq_config_contrib_active` unique
+    // index never sees two active rows for the same (schema_type,
+    // slug). The predicate includes the `status='active'` guard so
+    // a re-run from a retry path is a no-op rather than clobbering
+    // an already-superseded row.
+    if let Some(prior_id) = &prior_active_id {
+        tx.execute(
+            "UPDATE pyramid_config_contributions
+             SET status = 'superseded'
+             WHERE contribution_id = ?1
+               AND status = 'active'
+               AND superseded_by_id IS NULL",
+            rusqlite::params![prior_id],
+        )?;
+    }
+
     crate::pyramid::config_contributions::write_contribution_envelope(
         &tx,
         crate::pyramid::config_contributions::ContributionEnvelopeInput {
@@ -393,21 +424,25 @@ fn commit_pulled_active(
             created_by: Some("wire-pull".to_string()),
             accepted_at: crate::pyramid::config_contributions::AcceptedAt::Now,
             needs_migration: None,
+            write_mode: crate::pyramid::config_contributions::WriteMode::default(),
         },
         crate::pyramid::config_contributions::TransactionMode::JoinAmbient,
     )
-    .map_err(|e| PullError::Other(anyhow!("write_contribution_envelope: {e}")))?;
+    .map_err(|e| match e {
+        crate::pyramid::config_contributions::ContributionWriterError::SupersessionConflict {
+            schema_type,
+            slug,
+        } => PullError::SupersessionConflict { schema_type, slug },
+        other => PullError::Other(anyhow!("write_contribution_envelope: {other}")),
+    })?;
 
     if let Some(prior_id) = &prior_active_id {
-        // Flip the prior to superseded. Predicate includes the
-        // `status='active'` guard so a re-run from a retry path is a
-        // no-op rather than clobbering an already-superseded row.
+        // Back-fill forward pointer after the INSERT so the
+        // `supersedes_id`/`superseded_by_id` chain is symmetric.
         tx.execute(
             "UPDATE pyramid_config_contributions
-             SET status = 'superseded', superseded_by_id = ?1
-             WHERE contribution_id = ?2
-               AND status = 'active'
-               AND superseded_by_id IS NULL",
+             SET superseded_by_id = ?1
+             WHERE contribution_id = ?2",
             rusqlite::params![new_id, prior_id],
         )?;
     }

@@ -620,7 +620,10 @@ fn create_draft_supersession(
         return Err(anyhow!("triggering_note must not be empty"));
     }
 
-    let tx = conn.transaction()?;
+    // Phase 0a-1 commit 5 / §2.16.1: BEGIN IMMEDIATE so draft
+    // supersessions serialize on write intent against concurrent
+    // supersessions.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
     // Carry forward the prior's canonical metadata with maturity reset
     // to Draft (matching supersede_config_contribution semantics).
@@ -652,6 +655,7 @@ fn create_draft_supersession(
             created_by: Some("generative_config".to_string()),
             accepted_at: crate::pyramid::config_contributions::AcceptedAt::Null,
             needs_migration: None,
+            write_mode: crate::pyramid::config_contributions::WriteMode::default(),
         },
         crate::pyramid::config_contributions::TransactionMode::JoinAmbient,
     )?;
@@ -779,7 +783,11 @@ pub fn accept_config_draft(
         // active exists for this (type, slug), the new row sets its
         // supersedes_id to the prior row and the prior is flipped to
         // `superseded`.
-        let tx = conn.transaction()?;
+        //
+        // Phase 0a-1 commit 5 / §2.16.1: BEGIN IMMEDIATE so
+        // accept-direct-YAML writes serialize on write intent against
+        // concurrent supersessions.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         // Find the prior active row (if any) to thread supersession
         // through. Uses the same predicate as
@@ -815,6 +823,19 @@ pub fn accept_config_draft(
             .map_err(|e| anyhow!("failed to serialize wire_native_metadata: {e}"))?;
 
         let new_id = uuid::Uuid::new_v4().to_string();
+
+        // Phase 0a-1 commit 5: flip prior to superseded BEFORE the
+        // INSERT so the `uq_config_contrib_active` unique index never
+        // sees two active rows for the same (schema_type, slug).
+        if let Some(prior_id) = &prior_active_id {
+            tx.execute(
+                "UPDATE pyramid_config_contributions
+                 SET status = 'superseded'
+                 WHERE contribution_id = ?1",
+                rusqlite::params![prior_id],
+            )?;
+        }
+
         crate::pyramid::config_contributions::write_contribution_envelope(
             &tx,
             crate::pyramid::config_contributions::ContributionEnvelopeInput {
@@ -831,15 +852,16 @@ pub fn accept_config_draft(
                 created_by: Some("user".to_string()),
                 accepted_at: crate::pyramid::config_contributions::AcceptedAt::Now,
                 needs_migration: None,
+                write_mode: crate::pyramid::config_contributions::WriteMode::default(),
             },
             crate::pyramid::config_contributions::TransactionMode::JoinAmbient,
         )?;
 
         if let Some(prior_id) = &prior_active_id {
+            // Back-fill forward pointer after the INSERT.
             tx.execute(
                 "UPDATE pyramid_config_contributions
-                 SET status = 'superseded',
-                     superseded_by_id = ?1
+                 SET superseded_by_id = ?1
                  WHERE contribution_id = ?2",
                 rusqlite::params![new_id, prior_id],
             )?;
@@ -991,7 +1013,9 @@ fn promote_draft_to_active(
     conn: &mut Connection,
     draft: &ConfigContribution,
 ) -> Result<()> {
-    let tx = conn.transaction()?;
+    // Phase 0a-1 commit 5 / §2.16.1: BEGIN IMMEDIATE so draft promotion
+    // serializes on write intent against concurrent supersessions.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
     // Find the prior active contribution (if any) to supersede it.
     let prior_id: Option<String> = if let Some(ref slug_val) = draft.slug {
@@ -1020,6 +1044,19 @@ fn promote_draft_to_active(
         .ok()
     };
 
+    // Phase 0a-1 commit 5: supersede prior BEFORE promoting the
+    // draft so `uq_config_contrib_active` never sees two active
+    // rows for the same (schema_type, slug) at once.
+    if let Some(ref prior) = prior_id {
+        tx.execute(
+            "UPDATE pyramid_config_contributions
+             SET status = 'superseded',
+                 superseded_by_id = ?1
+             WHERE contribution_id = ?2",
+            rusqlite::params![draft.contribution_id, prior],
+        )?;
+    }
+
     // Promote the draft.
     tx.execute(
         "UPDATE pyramid_config_contributions
@@ -1029,17 +1066,6 @@ fn promote_draft_to_active(
          WHERE contribution_id = ?2",
         rusqlite::params![prior_id, draft.contribution_id],
     )?;
-
-    // Supersede the prior (if any).
-    if let Some(prior) = prior_id {
-        tx.execute(
-            "UPDATE pyramid_config_contributions
-             SET status = 'superseded',
-                 superseded_by_id = ?1
-             WHERE contribution_id = ?2",
-            rusqlite::params![draft.contribution_id, prior],
-        )?;
-    }
 
     tx.commit()?;
     Ok(())

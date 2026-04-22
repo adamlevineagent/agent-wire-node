@@ -692,7 +692,11 @@ pub fn persist_migration_proposal(
     // status='draft', source='migration'. Guarded by the same filter
     // `reject_config_migration` uses (status='draft' AND
     // source='migration') so we can only delete our own drafts.
-    let tx = conn.transaction()?;
+    //
+    // Phase 0a-1 commit 5 / §2.16.1: BEGIN IMMEDIATE so migration
+    // draft persistence serializes on write intent against concurrent
+    // supersessions.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let stale_drafts_deleted = tx.execute(
         "DELETE FROM pyramid_config_contributions
          WHERE supersedes_id = ?1
@@ -723,6 +727,7 @@ pub fn persist_migration_proposal(
             created_by: Some("migration_proposal".to_string()),
             accepted_at: crate::pyramid::config_contributions::AcceptedAt::Null,
             needs_migration: Some(0),
+            write_mode: crate::pyramid::config_contributions::WriteMode::default(),
         },
         crate::pyramid::config_contributions::TransactionMode::JoinAmbient,
     )?;
@@ -828,7 +833,11 @@ pub fn accept_config_migration(
     }
 
     // Open a transaction for the supersession + flag clear.
-    let tx = conn.transaction()?;
+    //
+    // Phase 0a-1 commit 5 / §2.16.1: BEGIN IMMEDIATE so
+    // accept-migration serializes on write intent against concurrent
+    // supersessions.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
     // Confirm the prior is still the active row for this (schema_type,
     // slug). If something else superseded it between propose and
@@ -866,6 +875,18 @@ pub fn accept_config_migration(
         ));
     }
 
+    // Phase 0a-1 commit 5: mark prior superseded BEFORE promoting the
+    // draft so `uq_config_contrib_active` never sees two active rows
+    // for the same (schema_type, slug). The back-link
+    // (`superseded_by_id = draft_id`) is written in this same UPDATE.
+    tx.execute(
+        "UPDATE pyramid_config_contributions
+         SET status = 'superseded',
+             superseded_by_id = ?1
+         WHERE contribution_id = ?2",
+        rusqlite::params![draft_id, prior_id],
+    )?;
+
     // Promote the draft to active. Carry the accept note in
     // triggering_note so the supersession chain records the user's
     // accept rationale.
@@ -877,15 +898,6 @@ pub fn accept_config_migration(
              triggering_note = ?1
          WHERE contribution_id = ?2",
         rusqlite::params![note, draft_id],
-    )?;
-
-    // Mark the prior row as superseded and link forward.
-    tx.execute(
-        "UPDATE pyramid_config_contributions
-         SET status = 'superseded',
-             superseded_by_id = ?1
-         WHERE contribution_id = ?2",
-        rusqlite::params![draft_id, prior_id],
     )?;
 
     tx.commit()?;
@@ -1065,6 +1077,18 @@ mod tests {
         // execution paths.
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
+        // Phase 0a-1 commit 5 test fixture: flip prior to superseded
+        // BEFORE creating the new active row so
+        // `uq_config_contrib_active` does not reject the INSERT. The
+        // `superseded_by_id` back-link is patched in after.
+        conn.execute(
+            "UPDATE pyramid_config_contributions
+             SET status = 'superseded'
+             WHERE contribution_id = ?1",
+            rusqlite::params![prior_id],
+        )
+        .unwrap();
+
         let new_id =
             create_config_contribution_with_metadata(
                 conn,
@@ -1081,7 +1105,7 @@ mod tests {
 
         conn.execute(
             "UPDATE pyramid_config_contributions
-             SET status = 'superseded', superseded_by_id = ?1
+             SET superseded_by_id = ?1
              WHERE contribution_id = ?2",
             rusqlite::params![new_id, prior_id],
         )
