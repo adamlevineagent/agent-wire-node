@@ -1,8 +1,8 @@
 # Walker Provider Configs + Slot Policy (v3)
 
 **Date:** 2026-04-21
-**Status:** DRAFT (rev 0.7) — Cycle 2 Stage 1 absorbed. Pending Cycle 2 Stage 2, Adam GO.
-**Rev:** 0.7
+**Status:** DRAFT (rev 0.8) — Cycle 2 Stage 2 absorbed. Pending Adam GO. Plan-integrity pass clean as of rev 0.8.
+**Rev:** 0.8
 **Supersedes:** `inference-routing-v2-model-aware-config.md` (retired); rev 0.1 (six-API model, obsolete); rev 0.2 (resolver-chain reframe, this doc continues it).
 **Author context:** planning thread, 2026-04-21. Rev 0.1 modeled this as six schemas with field lists. Rev 0.2 reframed as ONE resolver over a scope chain with schemas as thin value carriers. Rev 0.3 absorbs findings F1–F11 from `walker-v3-yaml-drafts.md` — shape-per-scope for `model_list`, `Option`-typed accessors replacing sentinels, `per_provider` block on slot-policy, provider readiness gates as a named layer parallel to the resolver, tier-set as union of provider `model_list` keys.
 
@@ -67,7 +67,7 @@ First non-None wins. All scope lookups key on `(slot, provider_type)`; list posi
 
 ### 2.3 Override storage
 
-Each scope's `overrides` is a `Map<String, serde_json::Value>` (or a typed enum with a serde-heterogeneous variant). Keeps schemas static — adding a parameter requires no schema migration; operator just writes a new key in YAML and the resolver picks it up.
+Each scope's `overrides` is a `Map<String, serde_json::Value>` (or a typed enum with a serde-heterogeneous variant). Keeps schemas static — **redeclaring** an existing parameter at a new scope requires no schema migration; operator just writes the key in YAML and the resolver picks it up. **Genuinely-new parameter keys** require code (annotation + catalog + SYSTEM_DEFAULT + accessor); see §2.14.3.
 
 For type safety at call sites, the resolver is wrapped in typed accessors per parameter. Accessors fall into two groups:
 
@@ -195,7 +195,7 @@ pub struct ResolvedProviderParams {
     pub retry_backoff_base_secs: u64,
     pub dispatch_deadline_grace_secs: u64,
     pub active: bool,                              // readiness precondition
-    // ...provider-specific fields (ollama_base_url, openrouter_credential_ref, etc.)
+    // ...provider-specific fields (ollama_base_url, ollama_probe_interval_secs, fleet_peer_min_staleness_secs, fleet_prefer_cached, etc.)
 }
 ```
 
@@ -232,6 +232,10 @@ The `overrides` map holds `serde_json::Value` at runtime, but **per-parameter sh
 - Any future programmatic contribution writer
 
 The envelope writer runs normalize-then-validate: normalization converts string shorthand (`"time_secs:300"` → `{kind: "time_secs", value: 300}`) and coerces empty lists to None; validation rejects anything that doesn't match the declared shape for the target schema's parameter. Failures return an error; no silent persist.
+
+**Bundled loader skip-and-log mode (A-C4 / Root 22).** The bundled manifest loader at boot routes through the envelope writer (single choke point per Root 11). But a malformed bundled YAML (author error, or operator-authored-then-bundled drift from a build-time manifest-generator bug) that fails validation must NOT brick the install — other bundled contributions should still load. Phase 0a envelope writer has a `mode: WriteMode::{Strict, BundledBootSkipOnFail}` parameter. `Strict` (default, for runtime writes) returns error on validation failure. `BundledBootSkipOnFail` logs a `bundled_contribution_validation_failed` chronicle event (new; add to §5.4.6 local-only list) with the contribution and validation error, skips that row, continues loading. App boots; operator sees the error in chronicle.
+
+**Placeholder-interpolated content injection escaping (A-C8 / Root 22).** Generation skills inject `{{market_surface_slugs}}` from Wire-controlled data — adversarial slug strings could contain YAML control characters (`:`, `\n`, quotes) that break shape in post-interpolation output. Placeholder engine v2 (Phase 0a) MUST (a) YAML-safe-quote every interpolated value (round-trip through a YAML string-encoder), (b) reject values containing null bytes or non-printable control chars at injection time, (c) validate post-substitution output is still well-formed YAML at skill-generation time (not just at draft-apply). Shape validator at the envelope writer catches only shape violations — semantic injection (right shape, adversarial intent) is a separate safety layer that lives at the placeholder engine.
 
 Schema_annotation carries, per parameter:
 
@@ -276,24 +280,26 @@ Concrete consumers for the synthetic path:
 
 **StepContext home (F-D2):** the canonical carrier for `dispatch_decision` is `src-tauri/src/pyramid/step_context.rs:275`'s struct (which already owns `build_id`, `model_tier`, `resolved_model_id`, `bus`). `chain_dispatch.rs:124`'s sibling `StepContext` is renamed `ChainDispatchContext` in Phase 0 to remove the name collision; callers using it for dispatch decisions are migrated to the `step_context::StepContext` version or pass the Decision explicitly. This is a ~40-LOC pre-requisite in Phase 0, budgeted.
 
-### 2.13 Mechanized plan-doc integrity (Root 13 — rev 0.7 upgrade)
+### 2.13 Plan-doc integrity via `plan-integrity` skill (rev 0.8 — honest)
 
-Rev 0.6 introduced this as prose discipline. Cycle 2 Stage 1 demonstrated it self-violated on the same rev that introduced it: sections ordered 2.11→2.13→2.14→2.12; `openrouter_credential_ref` struck from §3 but still listed in §2.12's sensitive-fields; §11 claimed "F-D12 spelled out in §5.3" but §5.3 didn't contain it; `onboarding_complete_at` referenced but never defined; companion drafts doc stale across three revs.
+Rev 0.7 described this as a CI-gated script at `docs/tools/plan-integrity.sh`. Cycle 2 Stage 2 audit caught that agent-wire-node has no CI infrastructure (no `.github/`, no `justfile`, no `docs/tools/`), so the "mechanized" framing was a second recursion of the same "promised infrastructure without wiring" pattern rev 0.7 diagnosed.
 
-Rev 0.7 **mechanizes** the discipline as a script `docs/tools/plan-integrity.sh` that runs before any plan rev can be declared audit-ready:
+**The honest mechanism: the `plan-integrity` skill** — a Claude-run discipline invoked between audit rounds by the `conductor-audit-pass` skill. Claude reads the plan + companions end-to-end, runs the 8 consistency checks below, auto-fixes safe drift, and surfaces judgment calls to the operator before launching the next audit round. Skill lives at `~/.claude/skills/plan-integrity/SKILL.md`.
 
-1. **Placeholder resolution** — every `{{placeholder}}` in the plan must have an entry in the placeholder-resolver registry (a markdown table at the top of the integrity script) naming the Rust function that resolves it. Unregistered placeholders fail.
-2. **Chronicle event registry** — every chronicle event name in the plan must grep-hit `src-tauri/src/pyramid/compute_chronicle.rs` as a `pub const EVENT_*` declaration, OR appear in a "chronicle-events-to-be-added-in-phase-N" list in §6. Unregistered events fail.
-3. **Struct field ↔ catalog** — every field in `DispatchDecision` and `ResolvedProviderParams` must appear in the §3 parameter catalog, OR be flagged as `derived` in §2.9 with a comment naming the derivation.
-4. **Absorbed-finding claims ↔ section content** — every §11 audit-history claim of form "X absorbed in §Y" must grep-hit the referenced section for the keyword. Overclaimed absorptions fail (caught rev 0.6's F-D12 SQLite claim retroactively).
-5. **Section numbering** — monotonic increasing. Out-of-order numbering fails.
-6. **Cross-referenced state fields** — any field name referenced across multiple sections (e.g. `onboarding_complete_at`, `_v3_migration_marker`) must have a named write-site in at least one section. Referenced-but-unwritten fields fail.
-7. **Companion drafts doc rev-match** — `walker-v3-yaml-drafts.md` must have a top-of-doc "synced to rev X" banner; if the plan header rev ≠ companion banner rev, CI fails the plan commit.
-8. **Sensitive-field catalog** — every parameter with `sensitive: true` in schema_annotation must appear in §2.12's explicit sensitive-fields list and vice versa.
+This is the same enforcement architecture as `systemic-synthesis`: a required stage in the audit cycle, enforced by skill-discipline not CI.
 
-Integrity pass runs in CI (blocks merge) AND locally via `just plan-integrity` (fast feedback for plan authors). The script itself lives in `docs/tools/` and is maintained as part of this plan's ownership.
+The 8 checks:
 
-§2.14 as prose discipline is retired. If the script doesn't run, no rev is audit-ready, full stop.
+1. **Placeholder resolution** — every `{{placeholder}}` in the plan must appear in a placeholder-registry section naming the resolver.
+2. **Chronicle event registry** — every chronicle event name must appear in a single event-list section AND have a named emission location (existing file or Phase N).
+3. **Struct field ↔ catalog** — every field in `DispatchDecision` / `ResolvedProviderParams` must appear in the §3 parameter catalog or be flagged `derived`.
+4. **Absorbed-finding claims ↔ section content** — every §11 audit-history claim of form "X absorbed in §Y" must grep-verify in §Y.
+5. **Section numbering** — monotonic.
+6. **Cross-referenced state fields** — any field referenced as a state read must have a named write-site.
+7. **Companion drafts doc rev-match** — `walker-v3-yaml-drafts.md` must carry a "synced to rev X" banner matching the plan's current rev.
+8. **Sensitive-field catalog parity** — the sensitive-fields list (§2.15) must match exactly the set of parameters with `sensitive: true`.
+
+When the agent-wire-node repo gets CI (separate initiative), a subset of these checks can be ported to a shell/python script at `docs/tools/plan-integrity.sh` for redundant mechanical enforcement. Until then: Claude + skill-discipline is the enforcement. Rev 0.7's CI-script framing is explicitly walked back.
 
 ### 2.14 Growth and failure modes (Root 15 — rev 0.7 new)
 
@@ -328,6 +334,38 @@ Consequences:
 - **Generation skills output DRAFT supersessions** into a preview lane in Tools > Create. Operator reviews, explicitly confirms sensitive changes, then commits. No auto-apply.
 - **Skill prompts do NOT bake numeric literals.** SYSTEM_DEFAULTS values are injected at skill-use time via prompt template interpolation (`{{patience_secs_default}}`, `{{retry_http_count_default}}`). Updating a SYSTEM_DEFAULT ripples into all skill outputs without re-authoring prompts — eliminates the Pillar 37 violation.
 - **Audit trail:** every sensitive supersession carries operator session ID and confirmation timestamp in the contribution envelope.
+
+### 2.16 Concurrency and lifecycle invariants (Root 20 — rev 0.8)
+
+Cycle 2 Stage 2 surfaced a cluster of concurrency and lifecycle edge cases. This section names them with concrete invariants; Phase 0a builds the infrastructure.
+
+**2.16.1 Single-active-contribution invariant (B-I5).** Today the `pyramid_config_contributions` table has no unique constraint enforcing one active contribution per `(slug, schema_type)`. Concurrent supersession (Settings save + ConfigSynced pull applying a Wire-side supersession on the same schema) can produce two rows with `status='active'` — resolver picks whichever `id DESC` returns, supersession chain is broken.
+
+**Fix (Phase 0a):** add partial unique index `CREATE UNIQUE INDEX uq_config_contrib_active ON pyramid_config_contributions(slug, schema_type) WHERE status='active'`. Wrap `supersede_config_contribution` in `BEGIN IMMEDIATE TRANSACTION` to serialize on write intent. Second concurrent supersession fails with SQLITE_CONSTRAINT; caller retries or surfaces conflict to operator.
+
+**2.16.2 ArcSwap listener supervision (A-M4).** `ArcSwap<ScopeCache>` is the rebuild primitive but rev 0.7 didn't name the supervisor. If a ConfigSynced handler panics (e.g. shape validation surprise in a superseded contribution), ArcSwap never gets the rebuild and all subsequent Decisions use the stale cache.
+
+**Fix (Phase 0a):** main.rs spawns a single named task `scope_cache_reloader` that holds the ArcSwap writer. Task supervision: on panic, restart and emit `scope_cache_listener_restarted` chronicle event. Rebuild debounced 250ms (coalesces rapid operator edits into one rebuild). Dead-listener detection: integrity-pass check 2 (chronicle events) additionally verifies `scope_cache_listener_restarted` has an emission site.
+
+**2.16.3 Placeholder interpolation engine cost model (B-I6).** `{{openrouter_live_slugs}}` fires a live OR API call. Without cost model, opening Tools > Create and rendering 7 skill cards triggers 7 concurrent ~80KB fetches.
+
+**Fix (Phase 0a placeholder engine v2):** per-placeholder TTL (60s OR, 30s Ollama, 60s market-surface); single-flight deduplication (concurrent resolution of same placeholder blocks on one in-flight fetch); offline-safe stale fallback (use last successful value, return with `stale: true` flag so UI can render offline badge); circuit breaker (back off 5min after 3 consecutive failures). Named as Phase 0a acceptance criteria.
+
+**2.16.4 In-flight builds at v3 upgrade (B-I7).** Mid-build binary swap: operator has build with `status='running'` when they quit to upgrade. Migration drops `pyramid_tier_routing`, removes `config.primary_model`. On v3 boot, chain executor resumes via replay — but it reads retired routing state. Silent re-route mid-build.
+
+**Fix (§5.3 pre-migration check):** migration refuses to run if any row in `builds` has `status IN ('running','paused_for_resume')`. Boot-time modal surfaces: "Upgrade to v3 requires in-progress builds to finish or be marked failed. [Resume] [Mark failed] [Rollback to v2]". No silent data-corruption path.
+
+**2.16.5 Offline-aware readiness (A-C6).** Openrouter's `can_dispatch_now` today checks only local credential — returns Ready on a network-partitioned laptop, then dispatch fails with 5xx/timeout, burns `retry_http_count × backoff`, cascades to fleet (NotReady), emits `dispatch_exhausted`. DADBEAR keeps scheduling the loop → battery/resource drain.
+
+**Fix (Phase 0a ProviderReadiness):** each network provider tracks a `last_success_at` and a `consecutive_failure_count`. `can_dispatch_now` returns `NotReady { NetworkUnreachable }` when `consecutive_failure_count >= 3` AND `last_success_at` > 5 minutes. Resets on any success. DADBEAR additionally applies a back-off bucket: after N `dispatch_exhausted` fires within T seconds, stale_engine suppresses its next scheduled dispatch until T elapses.
+
+**2.16.6 Per-build breaker semantics for DADBEAR (A-M1).** `breaker_reset: per_build` permanently trips for DADBEAR's long-lived maintenance build. One transient market flake → provider bypassed until app restart.
+
+**Fix (Phase 5):** DADBEAR's maintenance build_id uses time-bucketed sub-build-ids (`{parent_build_id}:bucket_{epoch_hour}`). The effective breaker key becomes `(parent_build_id:bucket, slot, provider_type)`; per-hour bucket rotation gives `per_build` meaningful granularity for long-lived builds. Operators running short builds see no change; DADBEAR gets a natural reset cadence.
+
+**2.16.7 Node identity rotation + SelfDealing (brain-dump Q10).** `self.node_id` changes on re-onboarding (new pin → new node_id). Old self-published offers still sit on market under the previous node_id. Post-rotation walker sees `offer.node_id != current_self_node_id` → passes SelfDealing → buys own historic offers.
+
+**Fix (rev 0.8 scope note):** walker's SelfDealing check consults a `node_identity_history: Vec<NodeId>` list maintained on the node (last N node_ids this install has used). Offers matching any entry in the history are filtered as SelfDealing. Separately: operators SHOULD retract their own market offers before re-onboarding; onboarding wizard surfaces this as a pre-rotation checklist.
 
 ---
 
@@ -540,20 +578,50 @@ COMMIT;
 
 Disable foreign-key enforcement during the rebuild if `pyramid_tier_routing` has FK references: `PRAGMA defer_foreign_keys = ON;` at transaction start, re-enable after commit. Indexes on the old table must be recreated on the new one; `schema_version` is bumped in the same transaction.
 
+### 5.4 Cross-boundary wire-format contracts (Root 19 — rev 0.8)
+
+Cycle 2 Stage 2 caught that walker v3 silently changes the semantic weight of several cross-boundary contracts (fleet announce, fleet dispatch, chronicle serialization, retraction). Silently = without version bumps or explicit compatibility handling. This section names every cross-boundary contract walker v3 touches and the compatibility strategy.
+
+**5.4.1 Fleet dispatch wire format — `rule_name` vs `model_id` (B-I2, CRITICAL).** Today `FleetDispatchRequest` (at `src-tauri/src/fleet.rs:264`) sends a `rule_name` string; the peer resolves rule → local model via its own routing rules. Walker v3 resolves a model_list per provider but never translates into `rule_name`. Without a translation layer, walker v3's fleet arm cannot dispatch.
+
+**Fix (Phase 4):** extend `FleetDispatchRequest` with `model_id: Option<String>` (additive, backward-compatible). Peer prefers `model_id` when present; falls back to `rule_name` otherwise. Walker v3 fleet dispatcher populates `model_id` from `decision.per_provider[fleet].model_list[0]` and sets `rule_name` from the chain step's `model_tier` for old-peer compatibility. Tests: mixed-cluster dispatch (v3 requester, v2.1.1 peer with only rule_name awareness).
+
+**5.4.2 Fleet announce protocol versioning (B-I1).** `FleetAnnouncement.models_loaded` was observability-only in v2.1.1 (`fleet.rs:236` comment: "kept for observability"). Walker v3 promotes it to gating — `NoPeerHasModel` readiness filter reads it as authoritative. Mixed-version clusters: v3 node skips a v2.1.1 peer that actually has the model but populated `models_loaded` differently.
+
+**Fix (Phase 4):** add `announce_protocol_version: u8` field to `FleetAnnouncement` (default 1 for v2.1.1, 2 for v3 with semantic-gated `models_loaded`). Walker's fleet readiness on a v1-announcer does NOT apply the `NoPeerHasModel` filter — falls back to v2.1.1 behavior (dispatch by rule_name, let peer resolve). Only v2+ announcers get the strict gate. Tests: mixed-version roster, strict vs lenient readiness per peer.
+
+**5.4.3 Chronicle scope_snapshot leak (B-I3).** `DispatchDecision.scope_snapshot` serialized into `decision_built` chronicle payload. ScopeCache carries operator-local config — LAN URLs (`ollama_base_url: "http://behem.lan:11434"`), budget caps, closed-beta slugs. If chronicle syncs cross-node (Phase 6 "last N Decisions aggregation" is one path; Wire-side observability is another latent possibility), this leaks.
+
+**Fix (Phase 0a + §2.11):** add `local_only: bool` to schema_annotation fields. Default `true` for `ollama_base_url`, default `false` for tier names and public params. `ScopeSnapshot::redacted_for_chronicle() -> SerializableView` strips any parameter with `sensitive: true` OR `local_only: true`. The `decision_built` event serializes the redacted view. Decision retains full snapshot in-memory for dispatchers; chronicle only sees safe data. Phase 0a envelope writer validates schema_annotations declare `local_only` for every parameter explicitly (no default implicit).
+
+**5.4.4 Retraction semantics (B-I4).** `wire-contribute retract` is first-class in the Wire skill but the node side has zero handler — grep `retract|is_retracted|retraction` in `src-tauri/src/pyramid/` returns nothing. An operator retracting their `walker_provider_market` on Wire sees no effect locally. Silent state divergence.
+
+**Fix (Phase 0a):** implement `retract_config_contribution(prior_id, triggering_note) -> Result<()>` that (a) marks the row `status='retracted'`, (b) reactivates the `supersedes_id` ancestor if it's bundled-or-operator-authored, (c) emits `config_retracted` chronicle event (new — add to const registry), (d) triggers ArcSwap rebuild. Refuses to retract a bundled-only row (bundled is the floor — nothing to revert to). Wire-originating retractions (pulled via sync) hit the same code path.
+
+**5.4.5 Unknown provider_id migration outcome (B-I8).** Rev 0.7 §5.3 step 1 treated unknown `provider_id` rows (non-openrouter/ollama/fleet/market) as "continue with warning." Operators who customized their tier routing with tier names backed by unknown providers silently drop those tiers — then their chain YAMLs reference tiers that no walker_provider_* declares → runtime `tier_unresolved`.
+
+**Fix (§5.3 step 1 revision):** unknown `provider_id` → **hard migration failure** by default. Operator opts in via `--allow-unknown-providers` CLI flag with an explicit "I understand these tiers will stop working" confirmation. Plus a Phase 0b boot check: enumerate all tier names referenced in chain YAMLs; cross-reference against post-migration `model_list` keys union; mismatches surface in Settings as a "Chain tiers not backed by any provider" banner, not just chronicle.
+
+**5.4.6 Two chronicle event categories.** The chronicle is the cross-subsystem boundary. Walker v3 adds 12 events, but they divide into two categories:
+- **Local-only events** (informational, node-internal): `decision_built`, `decision_previewed`, `provider_skipped_readiness`, `breaker_tripped`, `breaker_skipped`, `dispatch_exhausted`, `decision_build_failed`, `config_superseded`, `config_retracted`, `tier_unresolved`, `preview_vs_apply_drift`, `sensitive_supersession_confirmed`, `scope_cache_listener_restarted`, `requester_provider_param_drift`.
+- **Wire-visible events** (none in walker v3). Walker v3 does NOT emit any event that crosses to Wire. If a future phase introduces cross-node observability, the redaction from §5.4.3 applies.
+
+This boundary is load-bearing: chronicle can be arbitrarily verbose locally; nothing leaks unless an explicit cross-node sync is built, at which point §5.4.3's redaction is the required filter.
+
 ---
 
 ## 6. Phased implementation
 
 Phases ship independently. Walker's dispatch path gets a new arm per phase as each provider-type's resolver integration lands.
 
-LOC estimates corrected per audit findings — `primary_model` is ~93 source-site occurrences across 16 files (not 25), Phase 6 UI realistically 1200–1800 LOC (not 600), Phase 0 bumped by ~200 LOC for six generation skills + six schema annotations. Total revised: ~3700–4700 LOC, 9–12 sessions.
+LOC estimates are cumulative across audit rounds. Rev 0.7 verified actuals: `config.primary_model` spans ~194 source-site occurrences across 18 files (not the earlier 93/16 estimate); Phase 6 revised up to 2200-2800 after Stage 2 cycle-2 found UI scope underestimated; Phase 0 split into 0a (infrastructure, 1000-1200) + 0b (schema landing, 1200-1600). Current total: ~4900–5850 LOC, 11–14 sessions. See §6 section header of each phase for the current number; this paragraph is an index, not authoritative.
 
 ### Phase 0a — Infrastructure extraction (Root 14 — rev 0.7, ~1000–1200 LOC)
 
 Rev 0.6 bundled all of Phase 0 into a single "groundwork" bucket and cycle 2 Stage 1 demonstrated that the Phase 0 promises rested on infrastructure that didn't exist. Phase 0a is infrastructure-creation — the scaffolding every later phase depends on — and must finish clean before 0b starts.
 
 - **Envelope writer extraction** (~300–500 LOC, B-F1 / Root 13 resolution). Extract `write_contribution_envelope(schema_type, body, source, extras) -> Result<ContributionId>` as the sole `INSERT INTO pyramid_config_contributions` site. Refactor the ~35 existing INSERT call sites across 9 files (`migration_config.rs`, `config_contributions.rs`, `wire_migration.rs`, `demand_signal.rs`, `evidence_answering.rs`, `wire_pull.rs`, `prompt_cache.rs`, `generative_config.rs`, `db.rs`) to call it. Add a clippy deny-rule regex blocking raw `INSERT INTO pyramid_config_contributions` outside the envelope writer.
-- **Chronicle event const declarations** (~50 LOC, B-F4 / Root 13). Declare all 10 new events in `compute_chronicle.rs` following the shipped `pub const EVENT_*: &str = "..."` convention: `EVENT_DECISION_BUILT`, `EVENT_DECISION_BUILD_FAILED`, `EVENT_DECISION_PREVIEWED` (NEW — for synthetic, see §2.12 / B-F5), `EVENT_PROVIDER_SKIPPED_READINESS`, `EVENT_BREAKER_TRIPPED`, `EVENT_BREAKER_SKIPPED`, `EVENT_CONFIG_SUPERSEDED`, `EVENT_TIER_UNRESOLVED`, `EVENT_SENSITIVE_SUPERSESSION_CONFIRMED`, `EVENT_REQUESTER_PROVIDER_PARAM_DRIFT`, `EVENT_PREVIEW_VS_APPLY_DRIFT`, `EVENT_DISPATCH_EXHAUSTED` (Root 15 / §2.14.1). Emission sites use the consts, not string literals.
+- **Chronicle event const declarations** (~50 LOC, B-F4 / Root 13). Declare all 12 new events in `compute_chronicle.rs` following the shipped `pub const EVENT_*: &str = "..."` convention: `EVENT_DECISION_BUILT`, `EVENT_DECISION_BUILD_FAILED`, `EVENT_DECISION_PREVIEWED` (NEW — for synthetic, see §2.12 / B-F5), `EVENT_PROVIDER_SKIPPED_READINESS`, `EVENT_BREAKER_TRIPPED`, `EVENT_BREAKER_SKIPPED`, `EVENT_CONFIG_SUPERSEDED`, `EVENT_TIER_UNRESOLVED`, `EVENT_SENSITIVE_SUPERSESSION_CONFIRMED`, `EVENT_REQUESTER_PROVIDER_PARAM_DRIFT`, `EVENT_PREVIEW_VS_APPLY_DRIFT`, `EVENT_DISPATCH_EXHAUSTED` (Root 15 / §2.14.1). Emission sites use the consts, not string literals.
 - **Placeholder interpolation engine v2** (~250 LOC, A-F1 / Root 13). Current `generative_config.rs:substitute_prompt` is single-brace literal replacer over 4 tokens. Extend (or add `substitute_prompt_v2`) to support double-brace `{{placeholder}}` with an async resolver context carrying handles to OllamaProbe, OpenRouter client (`/api/v1/models`), MarketSurfaceCache, and a SYSTEM_DEFAULTS borrow. Resolve at skill-invocation time. Named placeholders for v3: `{{openrouter_live_slugs}}`, `{{ollama_available_models}}`, `{{market_surface_slugs}}`, `{{patience_secs_default}}`, `{{retry_http_count_default}}`, `{{max_budget_credits_default}}`. Registered in the integrity-pass placeholder table (§2.13 item 1).
 - **ProviderReadiness trait + four impls** (~200 LOC). Trait def per §2.6. Impls in `local_mode.rs`, `fleet_mps.rs` or `fleet.rs`, `provider.rs` (openrouter), `compute_market_*.rs` (market). Each impl ~30–80 LOC carrying the reason enum.
 - **`ChainDispatchContext` rename** (~40 LOC, F-D2). Rename `chain_dispatch.rs:124`'s `StepContext` to `ChainDispatchContext`. Pin `step_context.rs:275` as the Decision home.
@@ -643,16 +711,33 @@ Wire dev confirmed rev 2.1.1 surfaced `typical_serve_ms_p50_7d` per-offer and `m
 - **Legacy fallback path is not part of this phase** — Phase 1 deleted it in the same commit as the Decision refactor. Phase 5 is pure feature work on the breaker + slot-policy surfaces.
 - Tests: breaker trip/reset under each variant; slot-policy `order` replaces call-order for that slot; slot-policy `per_provider` applies without reordering; builds complete when breaker trips mid-build; concurrent breaker-update races stay within the stated bound.
 
-### Phase 6 — UI + onboarding (~2200–2800 LOC, Stage 2 discovery revised up)
+### Phase 6 — UI + onboarding (~2500–3100 LOC, rev 0.8 revised up for Root 21)
 
-Audit noted `InferenceRoutingPanel.tsx` is already 894 lines; six configs + list-editing for model arrays + per-entry patience/breaker + onboarding wizard + live breaker visibility → honest range is 1400–1800 LOC, likely 2 sessions.
+`InferenceRoutingPanel.tsx` is already 894 lines. Rev 0.8 scope includes:
+
+- Six provider-type config renderers (~400 LOC)
+- Slot-policy grid (tier × provider with per_provider overrides) (~300 LOC)
+- Call-order drag-reorder (~150 LOC)
+- Onboarding wizard (Root 10 orchestration + `active: false → true` consent flip + balance cache prime + `onboarding_complete_at` write) (~400 LOC)
+- Sensitive-supersession confirmation modals + directional guard for `on_partial_failure` (~200 LOC)
+- Seven generation-skill drafts + DRAFT preview lane in Tools > Create (~300 LOC)
+- Schema-annotation-driven client-side shape hints (not a replacement for server validator; UX pre-check) (~200 LOC)
+- **Chronicle color-map extension (Root 21 / A-C3):** `ComputeChronicle.tsx` currently colors ~35 fleet/market/network events; walker v3 adds 14 local-only events (see §5.4.6). Add color entries, category = "Dispatch Decisions" (~100 LOC).
+- **"Dispatch Decisions" aggregation tab (Root 21 / A-C3, Issue 8):** filter preset over Decision lineage for a build. Shows per-step `decision_built` payload (redacted per §5.4.3), `effective_call_order`, winner provider, per-provider NotReady reasons. Click-through to raw chronicle. Primary surface for operator's "why did walker route to X" question (~400 LOC).
+- **Bundled-vs-operator-authored source indicator** in Settings (B-D brain-dump item): each config surface displays `source: bundled | operator_authored` with a "Reset to bundled" affordance (retraction per §5.4.4 reactivates the bundled ancestor) (~150 LOC).
+
+**Drift comparator predicates (Root 21 / B-F11 / A-M2, rev 0.8 closes the residual):**
+- `preview_vs_apply_drift`: emit when `decision_synthetic.effective_call_order != decision_apply.effective_call_order` OR `decision_synthetic.per_provider[winner].model_list[0] != decision_apply.per_provider[winner].model_list[0]`. Not every field — just order + winner's primary model. Avoids flood-fire from patience/budget params cycling.
+- `requester_provider_param_drift`: emit at boot if `walker_provider_market.overrides.patience_secs` differs from `market_delivery_policy.overrides.callback_post_timeout_secs` by >2× in either direction, OR if `walker_provider_fleet.overrides.fleet_peer_min_staleness_secs` differs from `fleet_delivery_policy.overrides.peer_staleness_secs` by any amount (different axes — any divergence is notable). One event per boot, not per step.
+
+**Emission-site integrity check (Root 21 / A-M2):** plan-integrity skill's Check 2 strengthened — every `EVENT_*` declared in §5.4.6 must grep-hit at least one non-test Rust file as an emission site. Unused events caught before ship.
 
 - Settings surface renders six configs + call-order + slot-policy via the generative-YAML-to-UI renderer.
 - First-launch onboarding wizard (v2 plan's wizard carries forward, re-scoped to the resolver framing).
 - Chronicle events for live breaker visibility and Decision trace: `decision_built` (serialized Decision — answers "why did walker route to X"), `breaker_tripped`, `breaker_skipped`, `config_superseded`, `tier_unresolved`, `provider_skipped_readiness` (with `reason: NotReadyReason` — specific), `decision_build_failed` (empty model_list + active:true case), `sensitive_supersession_confirmed` (audit trail).
 - Probe-driven dropdowns for per-provider-type model suggestions.
 
-### Total: ~4900–5850 LOC, 11–14 sessions (rev 0.7: Phase 0 split into 0a infrastructure (~1000-1200) + 0b schema landing (~1200-1600))
+### Total: ~5300–6300 LOC, 12–15 sessions (rev 0.8: Phase 6 revised up to 2500-3100 for chronicle UI + Dispatch Decisions tab + drift comparators; concurrency-and-lifecycle work per §2.16 absorbed into Phase 0a's existing LOC budget)
 
 ---
 
@@ -672,7 +757,7 @@ The resolver reframe absorbs most of rev 0.1's open items and the audit's Q&A li
 | Audit Q2 — `max_budget_credits` destination | Parameter in resolver chain. Natural home = provider-type scope. Slot-scope overrides per-tier. |
 | Audit Q3 — `is_local` carry-forward | Gone. `walker_provider_local` existence IS the local signal; fleet provider filters on its own criteria. |
 | Audit Q4 — `sequential` / `bypass_pool` destination | Parameters in resolver chain. Default differs per provider-type (see parameter catalog). |
-| Audit Q5 — Phase 1 legacy-coexistence contract | Named in Phase 1 above: walker checks provider-type config first, falls to legacy `config.primary_model` when resolver returns empty. Removed Phase 5. |
+| Audit Q5 — Phase 1 legacy-coexistence contract | Removed in rev 0.5 via total-migration approach (Root 2). No `#[deprecated]` bridge, no Phase 1→5 coexistence. Phase 1 deletes `config.primary_model` struct fields in one commit; migration §5.3 populates walker_provider_openrouter.model_list. `cargo check` enforces no stale readers. |
 | Audit Q6 — Saturation patience scope (per-model vs per-leg) | `patience_clock_resets_per_model: bool` parameter. Default false (single budget per leg). Operator overrides at any scope. |
 | Audit Q7 — `pricing_json` destination | Lives on the offer rows Wire-side; node-side pricing metadata (if needed for cost reporting) is an `overrides.pricing_ref` pointer at provider-type scope. Low priority; cost chronicle works without it. |
 | Audit Q8 — ConfigSynced locking discipline | Snapshot-per-call clone. Resolver takes an `Arc<ScopeCache>` at dispatch start; config supersessions rebuild the next `Arc<ScopeCache>` for subsequent calls. No locks held across await. |
@@ -776,13 +861,21 @@ Same as walker / rev 2.1.1 cycle:
   - **Residuals patched:** A-F4 (§2.15 sensitive-fields list — removed `openrouter_credential_ref`, added `on_partial_failure`), A-F10 (§2.12 synthetic Decision adds per-tier iteration spec for cost estimation), A-F11 (§4.4 fleet drift pairing noted; drift comparators spec deferred — see below), B-F5 (§2.12 synthetic Decision emits `decision_previewed` not `decision_built`), B-F9 (§5.3 adds SQLite CREATE-COPY-DROP-RENAME recipe), A-F8 (Phase 1 framing clarification — behavioral vs mechanical touch surface), A-F7 + B-F7 + B-F11 (companion drafts doc synced to rev 0.7 with rev-match banner).
   - **Still open (B-F11 Root 17 drift comparator specs):** `preview_vs_apply_drift` and `requester_provider_param_drift` concrete predicate thresholds remain fuzzy. Named as implementation-time decision; integrity pass will enforce that whichever spec ships is documented before Phase 0a completes.
   - Ready for Cycle 2 Stage 2 discovery audit against rev 0.7.
+- **Rev 0.8 (2026-04-21):** Cycle 2 Stage 2 discovery audit (24 findings across 2 auditors) absorbed via systemic-synthesis. 5 structural roots (18-22). Plan-integrity skill created and invoked between rev 0.7 corrections and rev 0.8 — caught + auto-fixed 8 drift items.
+  - **Root 18 — Rev 0.7's "mechanization" depends on CI that doesn't exist.** Meta-recursion: rev 0.7 diagnosed "promised infrastructure without wiring" in rev 0.6, then did the same thing with §2.13's CI-gated script. **Fix:** §2.13 walked back from "CI-script + clippy deny-rule" to honest "plan-integrity skill in the audit cycle, Claude-run discipline." Skill built at `~/.claude/skills/plan-integrity/SKILL.md`; wired into conductor-audit-pass as required stage between audit rounds. CI port is a separate future initiative; plan doesn't depend on it.
+  - **Root 19 — Walker v3 silently changes cross-boundary wire-format semantics.** Collapses B-I1, B-I2, B-I3, B-I4, B-I8, brain-dump Q10. **Fix:** new §5.4 "Cross-boundary wire-format contracts" names every contract walker v3 changes. Fleet dispatch gets additive `model_id` field (B-I2 critical — fleet arm couldn't dispatch without this). Fleet announce gets `announce_protocol_version` for mixed-version compatibility. Chronicle `scope_snapshot` gets `redacted_for_chronicle()` + `local_only: bool` schema_annotation flag. `retract_config_contribution` handler implemented (Phase 0a). Unknown migration provider_id changed from soft-fail-with-warning to hard-fail by default.
+  - **Root 20 — Concurrency and lifecycle races unbounded.** Collapses B-I5, A-M4, B-I6, B-I7, A-C6, A-M1, brain-dump Q10 (SelfDealing node_id history). **Fix:** new §2.16 "Concurrency and lifecycle invariants" — partial unique index on `(slug, schema_type) WHERE status='active'` + `BEGIN IMMEDIATE` (B-I5 critical); named `scope_cache_reloader` task with supervision + 250ms debounce (A-M4); placeholder engine TTL + single-flight + circuit breaker (B-I6); pre-migration in-flight build check with UI recovery dialog (B-I7); `NetworkUnreachable` reason on consecutive-failure heuristic (A-C6); time-bucketed DADBEAR build_id for per_build breaker semantics (A-M1); node_identity_history for SelfDealing across re-onboardings (Q10).
+  - **Root 21 — Chronicle viewer UI doesn't speak walker events.** Collapses A-C3, A-M2. **Fix:** Phase 6 LOC revised up to 2500-3100; adds chronicle color-map extension, "Dispatch Decisions" aggregation tab as primary observability surface, bundled-vs-operator-authored source indicator. Drift comparator predicates spec'd concretely (`preview_vs_apply_drift` = order + winner's primary model mismatch; `requester_provider_param_drift` = boot-time once, >2× deviation threshold). Plan-integrity Check 2 strengthened: every `EVENT_*` const must grep-hit an emission site.
+  - **Root 22 — Envelope-writer validator scope/failure-mode underspecified.** Collapses A-C4, A-M3, A-C8. **Fix:** §2.11 adds `WriteMode::{Strict, BundledBootSkipOnFail}` — bundled loader logs and skips on validation failure rather than bricking boot. Placeholder engine v2 adds YAML-safe injection escaping + control-char rejection (prevents market-surface-slug adversarial content from rewriting draft YAML). Clippy deny-rule → honest grep-based CI check (or Rust custom lint via `dylint`) with named exempt list; not AST-level clippy.
+  - **Residuals patched:** A-C1 / A-C2 / A-C5 (CI infrastructure — deferred via Root 18 walk-back; `onboarding.rs` cross-workstream coordination noted in §8 "write site in onboarding Page 4 handler"), A-C7 (migration recovery dialog added per §2.16.4), D-M3 (clippy deny-rule scope per Root 22), D-m1 (bundled market model_list — stays pragmatic seed, onboarding wizard offers to expand per §6 Phase 3), D-m2 (test_bundled_tier_coverage gated on plan-integrity's emission-site check). Brain-dump items 1-12 noted for implementation-time decisions; none require rev 0.9 before Phase 0a.
+  - **Plan-integrity skill caught** in its first run: Phase 0a event count "10" → "12", stale `openrouter_credential_ref` in struct comment, §2.3 schema-static overclaim needs forward-reference to §2.14.3, §6 header LOC paragraph from rev 0.3, §6 Phase 6 contradiction "1400-1800" vs header "2200-2800", §7 Q5 legacy-coexistence text superseded by Root 2, trailing "Planned cadence" block at rev 0.2, "End of plan rev 0.2" footer. All auto-fixed.
+  - Rev 0.8 is implementation-ready pending Adam GO. No structural roots remain open; residual items are implementation-time decisions for Phase 0a workstream leads.
 
 Planned cadence from here:
-1. Stage 1 informed pair audit against rev 0.3.
-2. Stage 2 discovery pair audit.
-3. Pre-flight Q&A with Adam (includes F9).
-4. Rev 0.4 absorbing Stage 1+2 findings.
-5. Hand to implementation thread, Phase 0 first.
+1. Rev 0.8 absorbs Cycle 2 Stage 2 findings (Roots 18-22).
+2. Plan-integrity skill runs between every rev.
+3. Optional Cycle 3 audit if Stage 2 Roots 19 (cross-boundary wire contracts) surface more substantial issues than rev 0.8 absorbs.
+4. Adam GO → hand to implementation thread, Phase 0a first.
 
 ---
 
@@ -810,6 +903,6 @@ Estimated cold-start → Phase 0 commit 1: 3–4 hours.
 
 ---
 
-**End of plan rev 0.2.**
+**End of plan — current rev at top (§Status).**
 
-Written 2026-04-21 by planning thread after Adam's resolver-chain pushback. Ready for Stage 1 audit.
+Originally written 2026-04-21. Cumulatively audited through 2 full cycles (4 audit rounds, 71+ findings, 17+ structural roots). Plan-integrity skill enforces self-consistency between revs.
