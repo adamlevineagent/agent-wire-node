@@ -1,6 +1,6 @@
 # Walker v3 — YAML drafts + findings
 
-**Synced-to-rev:** 1.0 (integrity-pass-required banner per §2.13 item 7 of the plan doc).
+**Synced-to-rev:** 1.0.1 (integrity-pass-required banner per §2.13 Check 7 of the plan doc).
 
 **Purpose:** concrete seeds for the six walker_* contributions. Originally authored against rev 0.2; this file has been updated through successive revs alongside the plan. Findings section at the bottom is historical (what the drafting pass surfaced at rev 0.2); the plan's §11 audit history is the authoritative record of resolutions.
 
