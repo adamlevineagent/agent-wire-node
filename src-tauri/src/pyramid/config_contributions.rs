@@ -28,7 +28,9 @@ use tracing::{debug, warn};
 
 use crate::pyramid::chain_registry;
 use crate::pyramid::compute_chronicle::{
-    EVENT_BUNDLED_CONTRIBUTION_VALIDATION_FAILED, EVENT_CONFIG_SUPERSESSION_CONFLICT,
+    EVENT_BUNDLED_CONTRIBUTION_VALIDATION_FAILED, EVENT_CONFIG_RETRACTED,
+    EVENT_CONFIG_RETRACTED_TO_BUNDLED, EVENT_CONFIG_SUPERSESSION_CONFLICT,
+    EVENT_RETRACTION_WALKED_DEEP,
 };
 use crate::pyramid::db;
 use crate::pyramid::event_bus::{BuildEventBus, TaggedBuildEvent, TaggedKind};
@@ -323,6 +325,45 @@ pub enum ContributionWriterError {
     BundledValidationSkipped {
         contribution_id: String,
         schema_type: String,
+    },
+    /// Target contribution_id not present in pyramid_config_contributions.
+    #[error("contribution {contribution_id} not found")]
+    ContributionNotFound { contribution_id: String },
+    /// §5.4.4 — refused to retract the bundled floor (nothing to revert to).
+    #[error("retraction refused for {contribution_id}: {reason}")]
+    RetractionRefused {
+        contribution_id: String,
+        reason: String,
+    },
+    /// §5.5.3 — supersession chain walk hit a cycle or exceeded the depth
+    /// ceiling (16 hops). Loud fail; operator must investigate the chain.
+    #[error("retraction chain corrupt at {contribution_id}: {reason}")]
+    RetractionChainCorrupt {
+        contribution_id: String,
+        reason: String,
+    },
+}
+
+/// Outcome of `retract_config_contribution`. Callers can use this to
+/// decide whether to notify UI, trigger ScopeCache rebuild, or refresh
+/// downstream state.
+#[derive(Debug, Clone)]
+pub enum RetractionOutcome {
+    /// Walked the supersession chain backwards and reactivated the
+    /// first non-retracted ancestor. `walked_hops == 1` means the
+    /// immediate parent; `> 1` means intervening retracted ancestors
+    /// were skipped (emits `retraction_walked_deep`).
+    ReactivatedAncestor {
+        retracted_id: String,
+        reactivated_id: String,
+        walked_hops: u32,
+    },
+    /// Walked off the end of the supersession chain; every ancestor
+    /// retracted. Reactivated the bundled floor. Emits
+    /// `config_retracted_to_bundled`.
+    ReactivatedBundledFloor {
+        retracted_id: String,
+        reactivated_id: String,
     },
 }
 
@@ -1194,6 +1235,210 @@ pub fn supersede_config_contribution(
 
     tx.commit()?;
     Ok(new_id)
+}
+
+/// Retract a config contribution and walk backwards through the
+/// supersession chain to reactivate the nearest non-retracted ancestor.
+/// Plan rev 1.0.2 §5.4.4 + §5.5.3.
+///
+/// Semantics:
+/// - Marks the target row `status='retracted'`.
+/// - Walks `supersedes_id` backwards, skipping retracted ancestors, with
+///   depth ceiling 16 and visited-set cycle detection.
+/// - First non-retracted ancestor found → reactivate (status='active',
+///   clear superseded_by_id). Emits `config_retracted`. If the walk
+///   traversed more than 1 hop, additionally emits `retraction_walked_deep`.
+/// - If all ancestors retracted and a bundled floor is in the chain,
+///   reactivate the bundled floor with `config_retracted_to_bundled`.
+/// - Refuses to retract a bundled-floor row (source='bundled' AND
+///   supersedes_id IS NULL — nothing to revert to).
+/// - On cycle or depth exhaustion → RetractionChainCorrupt.
+///
+/// Entire operation runs inside a single BEGIN IMMEDIATE transaction so
+/// concurrent writers serialize; the target's retraction, the ancestor's
+/// reactivation, and the chronicle emission are atomic. Wire-originating
+/// retractions (pulled via sync) hit the same code path.
+///
+/// The caller is responsible for triggering a ScopeCache rebuild after
+/// a successful retraction. For now, emit the chronicle event and let
+/// downstream listeners pick up the state change. Phase 0a-2 WS5's boot
+/// sequence wires an ArcSwap reload trigger; future refactor can take
+/// an optional rebuild-notify channel here.
+pub fn retract_config_contribution(
+    conn: &mut Connection,
+    contribution_id: &str,
+    triggering_note: &str,
+) -> std::result::Result<RetractionOutcome, ContributionWriterError> {
+    const DEPTH_CEILING: u32 = 16;
+
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+    // Load target.
+    let target = load_contribution_for_retract(&tx, contribution_id)?;
+
+    // Refusal: target is the bundled floor (no ancestor to revert to).
+    if target.source == "bundled" && target.supersedes_id.is_none() {
+        return Err(ContributionWriterError::RetractionRefused {
+            contribution_id: contribution_id.to_string(),
+            reason: "bundled floor — no ancestor to revert to".to_string(),
+        });
+    }
+
+    // Mark target retracted. The superseded_by_id forward pointer on
+    // target's prior (if any) is preserved — retraction is distinct
+    // from supersession; downstream readers use the status field to
+    // distinguish. (load_active_config_contribution filters on
+    // status='active' so retracted rows naturally drop out of reads.)
+    tx.execute(
+        "UPDATE pyramid_config_contributions
+         SET status = 'retracted', triggering_note = ?1
+         WHERE contribution_id = ?2",
+        rusqlite::params![triggering_note, contribution_id],
+    )?;
+
+    // Walk ancestors.
+    let mut candidate_id = target.supersedes_id.clone();
+    let mut hops: u32 = 0;
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visited.insert(contribution_id.to_string());
+    let mut last_bundled_floor_id: Option<String> = None;
+
+    while let Some(cid) = candidate_id {
+        hops += 1;
+        if hops > DEPTH_CEILING {
+            return Err(ContributionWriterError::RetractionChainCorrupt {
+                contribution_id: contribution_id.to_string(),
+                reason: format!("depth ceiling {DEPTH_CEILING} exceeded"),
+            });
+        }
+        if !visited.insert(cid.clone()) {
+            return Err(ContributionWriterError::RetractionChainCorrupt {
+                contribution_id: contribution_id.to_string(),
+                reason: format!("cycle detected at {cid}"),
+            });
+        }
+
+        let candidate = match load_contribution_for_retract(&tx, &cid) {
+            Ok(c) => c,
+            Err(ContributionWriterError::ContributionNotFound { .. }) => {
+                return Err(ContributionWriterError::RetractionChainCorrupt {
+                    contribution_id: contribution_id.to_string(),
+                    reason: format!("dangling supersedes_id pointer to {cid}"),
+                });
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Track any bundled floor we walk past; used as the fallback if
+        // every ancestor is retracted.
+        if candidate.source == "bundled" && candidate.supersedes_id.is_none() {
+            last_bundled_floor_id = Some(candidate.contribution_id.clone());
+        }
+
+        if candidate.status != "retracted" {
+            // Alive ancestor — reactivate and return.
+            tx.execute(
+                "UPDATE pyramid_config_contributions
+                 SET status = 'active', superseded_by_id = NULL
+                 WHERE contribution_id = ?1",
+                rusqlite::params![candidate.contribution_id],
+            )?;
+            tx.commit()?;
+
+            warn!(
+                event = EVENT_CONFIG_RETRACTED,
+                retracted_id = contribution_id,
+                reactivated_id = %candidate.contribution_id,
+                hops,
+                "config retracted; ancestor reactivated"
+            );
+            if hops > 1 {
+                warn!(
+                    event = EVENT_RETRACTION_WALKED_DEEP,
+                    retracted_id = contribution_id,
+                    reactivated_id = %candidate.contribution_id,
+                    hops,
+                    "retraction walked past {} retracted ancestors", hops - 1
+                );
+            }
+
+            return Ok(RetractionOutcome::ReactivatedAncestor {
+                retracted_id: contribution_id.to_string(),
+                reactivated_id: candidate.contribution_id,
+                walked_hops: hops,
+            });
+        }
+
+        candidate_id = candidate.supersedes_id;
+    }
+
+    // Walked off the end; every ancestor was retracted. If we passed
+    // through a bundled floor, resurrect it.
+    if let Some(floor_id) = last_bundled_floor_id {
+        tx.execute(
+            "UPDATE pyramid_config_contributions
+             SET status = 'active', superseded_by_id = NULL
+             WHERE contribution_id = ?1",
+            rusqlite::params![floor_id],
+        )?;
+        tx.commit()?;
+
+        warn!(
+            event = EVENT_CONFIG_RETRACTED_TO_BUNDLED,
+            retracted_id = contribution_id,
+            reactivated_id = %floor_id,
+            hops,
+            "retraction walked chain to exhaustion; bundled floor reactivated"
+        );
+        return Ok(RetractionOutcome::ReactivatedBundledFloor {
+            retracted_id: contribution_id.to_string(),
+            reactivated_id: floor_id,
+        });
+    }
+
+    // No bundled floor in the chain. Chain is dead-ended with no revert
+    // target. Fail loud — surfaces operator-authored roots that were
+    // never anchored to a bundled default.
+    Err(ContributionWriterError::RetractionRefused {
+        contribution_id: contribution_id.to_string(),
+        reason: "all ancestors retracted and no bundled floor found in chain".to_string(),
+    })
+}
+
+/// Shim read for retract: loads a minimal projection (status, source,
+/// supersedes_id) and returns `ContributionNotFound` instead of None
+/// so the caller can short-circuit cleanly via `?`.
+fn load_contribution_for_retract(
+    conn: &rusqlite::Connection,
+    contribution_id: &str,
+) -> std::result::Result<RetractRow, ContributionWriterError> {
+    let row: Option<RetractRow> = conn
+        .query_row(
+            "SELECT contribution_id, status, source, supersedes_id
+             FROM pyramid_config_contributions
+             WHERE contribution_id = ?1",
+            rusqlite::params![contribution_id],
+            |r| {
+                Ok(RetractRow {
+                    contribution_id: r.get(0)?,
+                    status: r.get(1)?,
+                    source: r.get(2)?,
+                    supersedes_id: r.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    row.ok_or_else(|| ContributionWriterError::ContributionNotFound {
+        contribution_id: contribution_id.to_string(),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct RetractRow {
+    contribution_id: String,
+    status: String,
+    source: String,
+    supersedes_id: Option<String>,
 }
 
 /// Load the active config contribution for a given (schema_type, slug).
@@ -5033,5 +5278,235 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cnt, 0);
+    }
+
+    // ── Phase 0a-2 WS4: retract_config_contribution tests ──────────────
+
+    /// Seed a minimal row via raw SQL (bypasses the envelope writer; tests
+    /// are allow-listed by scripts/check-insert-sites.sh). Caller supplies
+    /// the full chain topology.
+    fn seed_retract_row(
+        conn: &Connection,
+        contribution_id: &str,
+        status: &str,
+        source: &str,
+        supersedes_id: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions (
+                contribution_id, slug, schema_type, yaml_content, wire_native_metadata_json,
+                wire_publication_state_json, supersedes_id, superseded_by_id,
+                triggering_note, status, source, wire_contribution_id,
+                created_at, accepted_at, created_by
+             ) VALUES (?1, 'retract-test', 'dadbear_policy', '', '{}', '{}',
+                      ?2, NULL, 'seed', ?3, ?4, NULL,
+                      datetime('now'), datetime('now'), NULL)",
+            rusqlite::params![contribution_id, supersedes_id, status, source],
+        )
+        .unwrap();
+    }
+
+    fn row_status(conn: &Connection, contribution_id: &str) -> String {
+        conn.query_row(
+            "SELECT status FROM pyramid_config_contributions WHERE contribution_id = ?1",
+            rusqlite::params![contribution_id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn retract_reactivates_immediate_parent() {
+        let mut conn = mem_conn();
+        seed_retract_row(&conn, "floor", "superseded", "bundled", None);
+        seed_retract_row(&conn, "active", "active", "operator_authored", Some("floor"));
+
+        let outcome = retract_config_contribution(&mut conn, "active", "operator retract").unwrap();
+        match outcome {
+            RetractionOutcome::ReactivatedAncestor {
+                retracted_id,
+                reactivated_id,
+                walked_hops,
+            } => {
+                assert_eq!(retracted_id, "active");
+                assert_eq!(reactivated_id, "floor");
+                assert_eq!(walked_hops, 1);
+            }
+            other => panic!("expected ReactivatedAncestor, got {other:?}"),
+        }
+        assert_eq!(row_status(&conn, "active"), "retracted");
+        assert_eq!(row_status(&conn, "floor"), "active");
+    }
+
+    #[test]
+    fn retract_walks_past_retracted_ancestors() {
+        let mut conn = mem_conn();
+        // chain: floor (bundled, superseded) <- mid (retracted) <- top (active)
+        seed_retract_row(&conn, "floor", "superseded", "bundled", None);
+        seed_retract_row(&conn, "mid", "retracted", "operator_authored", Some("floor"));
+        seed_retract_row(&conn, "top", "active", "operator_authored", Some("mid"));
+
+        let outcome = retract_config_contribution(&mut conn, "top", "walk deep").unwrap();
+        match outcome {
+            RetractionOutcome::ReactivatedAncestor {
+                reactivated_id,
+                walked_hops,
+                ..
+            } => {
+                assert_eq!(reactivated_id, "floor");
+                assert_eq!(walked_hops, 2, "should walk past retracted mid to find floor");
+            }
+            other => panic!("expected ReactivatedAncestor, got {other:?}"),
+        }
+        assert_eq!(row_status(&conn, "top"), "retracted");
+        assert_eq!(row_status(&conn, "mid"), "retracted"); // untouched
+        assert_eq!(row_status(&conn, "floor"), "active");
+    }
+
+    #[test]
+    fn retract_reactivates_bundled_floor_when_all_ancestors_retracted() {
+        let mut conn = mem_conn();
+        // chain: floor (bundled, retracted) <- mid (retracted) <- top (active)
+        seed_retract_row(&conn, "floor", "retracted", "bundled", None);
+        seed_retract_row(&conn, "mid", "retracted", "operator_authored", Some("floor"));
+        seed_retract_row(&conn, "top", "active", "operator_authored", Some("mid"));
+
+        let outcome = retract_config_contribution(&mut conn, "top", "full retract cascade").unwrap();
+        match outcome {
+            RetractionOutcome::ReactivatedBundledFloor {
+                retracted_id,
+                reactivated_id,
+            } => {
+                assert_eq!(retracted_id, "top");
+                assert_eq!(reactivated_id, "floor");
+            }
+            other => panic!("expected ReactivatedBundledFloor, got {other:?}"),
+        }
+        assert_eq!(row_status(&conn, "top"), "retracted");
+        assert_eq!(row_status(&conn, "mid"), "retracted");
+        assert_eq!(row_status(&conn, "floor"), "active");
+    }
+
+    #[test]
+    fn retract_refused_on_bundled_floor() {
+        let mut conn = mem_conn();
+        seed_retract_row(&conn, "floor", "active", "bundled", None);
+
+        let err = retract_config_contribution(&mut conn, "floor", "try retract floor").unwrap_err();
+        assert!(
+            matches!(err, ContributionWriterError::RetractionRefused { .. }),
+            "got {err:?}"
+        );
+        // Floor still active — transaction rolled back on refusal.
+        assert_eq!(row_status(&conn, "floor"), "active");
+    }
+
+    #[test]
+    fn retract_detects_cycle() {
+        let mut conn = mem_conn();
+        // FK constraint prevents forward-referencing a row that doesn't
+        // exist yet, so seed both with supersedes_id=NULL, then patch
+        // them into a cycle via UPDATE.
+        seed_retract_row(&conn, "a", "active", "operator_authored", None);
+        seed_retract_row(&conn, "b", "retracted", "operator_authored", None);
+        conn.execute(
+            "UPDATE pyramid_config_contributions SET supersedes_id = 'b' WHERE contribution_id = 'a'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE pyramid_config_contributions SET supersedes_id = 'a' WHERE contribution_id = 'b'",
+            [],
+        )
+        .unwrap();
+
+        let err = retract_config_contribution(&mut conn, "a", "cycle probe").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ContributionWriterError::RetractionChainCorrupt { ref reason, .. }
+                    if reason.contains("cycle")
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn retract_detects_depth_exhaustion() {
+        let mut conn = mem_conn();
+        // FK-forward-reference safe: insert root first (supersedes_id=NULL),
+        // then each child whose parent already exists. Chain is
+        // retracted_19 (root, no parent) <- retracted_18 <- ... <- retracted_0 <- top (active).
+        // No bundled floor; every ancestor retracted; walk hits depth ceiling.
+        seed_retract_row(&conn, "retracted_19", "retracted", "operator_authored", None);
+        for i in (0..19u32).rev() {
+            let id = format!("retracted_{i}");
+            let parent = format!("retracted_{}", i + 1);
+            seed_retract_row(&conn, &id, "retracted", "operator_authored", Some(&parent));
+        }
+        seed_retract_row(
+            &conn,
+            "top",
+            "active",
+            "operator_authored",
+            Some("retracted_0"),
+        );
+
+        let err = retract_config_contribution(&mut conn, "top", "depth probe").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ContributionWriterError::RetractionChainCorrupt { ref reason, .. }
+                    if reason.contains("depth ceiling")
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn retract_refused_when_chain_dead_ends_without_bundled_floor() {
+        let mut conn = mem_conn();
+        // Every ancestor retracted AND root is operator-authored, not bundled.
+        seed_retract_row(&conn, "root", "retracted", "operator_authored", None);
+        seed_retract_row(
+            &conn,
+            "top",
+            "active",
+            "operator_authored",
+            Some("root"),
+        );
+
+        let err = retract_config_contribution(&mut conn, "top", "dead end").unwrap_err();
+        assert!(
+            matches!(err, ContributionWriterError::RetractionRefused { .. }),
+            "got {err:?}"
+        );
+        // Both rows stay put — tx rolled back.
+        assert_eq!(row_status(&conn, "top"), "active");
+        assert_eq!(row_status(&conn, "root"), "retracted");
+    }
+
+    #[test]
+    fn retract_nonexistent_returns_not_found() {
+        let mut conn = mem_conn();
+        let err =
+            retract_config_contribution(&mut conn, "does-not-exist", "probe").unwrap_err();
+        assert!(
+            matches!(err, ContributionWriterError::ContributionNotFound { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn retract_empty_triggering_note_allowed() {
+        // §5.4.4 does not require a triggering_note to be non-empty for
+        // retraction (unlike supersede, where intent is explicit). A
+        // chronicle-event trail carries the retraction context.
+        let mut conn = mem_conn();
+        seed_retract_row(&conn, "floor", "superseded", "bundled", None);
+        seed_retract_row(&conn, "top", "active", "operator_authored", Some("floor"));
+
+        let outcome = retract_config_contribution(&mut conn, "top", "").unwrap();
+        assert!(matches!(outcome, RetractionOutcome::ReactivatedAncestor { .. }));
     }
 }
