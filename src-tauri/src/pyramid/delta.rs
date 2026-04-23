@@ -20,7 +20,7 @@ use crate::pyramid::db;
 use crate::pyramid::llm;
 use crate::pyramid::llm::LlmConfig;
 use crate::pyramid::naming::{clean_headline, headline_for_node};
-use crate::pyramid::step_context::make_step_ctx_from_llm_config_with_model;
+use crate::pyramid::step_context::make_step_ctx_from_llm_config;
 use crate::pyramid::types::*;
 
 use super::OperationalConfig;
@@ -102,17 +102,29 @@ Output JSON:
 {{"match": "thread-id" | "NEW", "thread_name": "name for new thread if NEW"}}"#
     );
 
-    // W3c: legacy clone_with_model_override removed. Model threads via
-    // LlmCallOptions.model_override + explicit step_ctx model arg.
-    let cache_ctx = make_step_ctx_from_llm_config_with_model(
-        base_config,
-        "delta_thread_match",
-        "delta",
-        -1,
-        None,
-        system_prompt,
-        Some(model),
-    );
+    // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+    // slot="mid" for delta work (fast focused decision).
+    let delta_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+    let cache_ctx = match &delta_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "delta_thread_match",
+                "delta",
+                -1,
+                None,
+                system_prompt,
+                "mid",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
     let raw = llm::call_model_with_override_and_ctx(
         base_config,
         model,
@@ -292,17 +304,28 @@ Output JSON only:
         n = recent_deltas.len(),
     );
 
-    // W3c: legacy clone_with_model_override removed. Model threads via
-    // LlmCallOptions.model_override + explicit step_ctx model arg.
-    let cache_ctx = make_step_ctx_from_llm_config_with_model(
-        base_config,
-        "delta_describe_change",
-        "delta",
-        -1,
-        None,
-        system_prompt,
-        Some(model),
-    );
+    // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+    let delta_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+    let cache_ctx = match &delta_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "delta_describe_change",
+                "delta",
+                -1,
+                None,
+                system_prompt,
+                "mid",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
     let raw = llm::call_model_with_override_and_ctx(
         base_config,
         model,
@@ -538,17 +561,28 @@ Output JSON only:
         budget = ops.tier2.distillation_token_budget,
     );
 
-    // W3c: legacy clone_with_model_override removed. Model threads via
-    // LlmCallOptions.model_override + explicit step_ctx model arg.
-    let cache_ctx = make_step_ctx_from_llm_config_with_model(
-        base_config,
-        "delta_rewrite_distillation",
-        "delta",
-        -1,
-        None,
-        system_prompt,
-        Some(model),
-    );
+    // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+    let delta_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+    let cache_ctx = match &delta_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "delta_rewrite_distillation",
+                "delta",
+                -1,
+                None,
+                system_prompt,
+                "mid",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
     let raw = llm::call_model_with_override_and_ctx(
         base_config,
         model,
@@ -741,17 +775,28 @@ Output valid JSON matching this schema:
         deltas = deltas_text,
     );
 
-    // W3c: legacy clone_with_model_override removed. Model threads via
-    // LlmCallOptions.model_override + explicit step_ctx model arg.
-    let cache_ctx = make_step_ctx_from_llm_config_with_model(
-        base_config,
-        "delta_collapse_deltas",
-        "delta",
-        -1,
-        None,
-        system_prompt,
-        Some(collapse_model),
-    );
+    // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+    let delta_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+    let cache_ctx = match &delta_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "delta_collapse_deltas",
+                "delta",
+                -1,
+                None,
+                system_prompt,
+                "mid",
+                Some(collapse_model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
     let raw = llm::call_model_with_override_and_ctx(
         base_config,
         collapse_model,
