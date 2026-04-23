@@ -127,6 +127,90 @@ fn dispatch_build_id(dispatch_ctx: &chain_dispatch::ChainDispatchContext) -> Str
         .unwrap_or_else(|| format!("{}-no-cache", dispatch_ctx.slug))
 }
 
+// ── Walker v3 W3b: save-step provenance model resolver ──────────────────────
+//
+// Compute the model-id string stamped on `pyramid_step` / `pyramid_cluster`
+// provenance rows written from within a chain step. Save sites sit AFTER
+// `dispatch_with_retry` returns a bare `serde_json::Value` — the
+// `DispatchDecision` built inside `dispatch_llm` at outer-step entry is
+// not propagated back to the save path, and the dispatcher doesn't
+// currently return an `LlmResponse` with an `actual_model_id` field.
+//
+// The resolver therefore mirrors `chain_dispatch::resolve_model`'s
+// priority chain:
+//   1. `step.model` override (highest precedence — explicit per-step pin)
+//   2. `defaults.model` override (when the step has no tier)
+//   3. `DispatchDecision::per_provider[OpenRouter].model_list[0]` (Pattern A —
+//      built on demand; matches "what the LLM would try first")
+//   4. `walker_resolver::first_openrouter_model_from_db` (Pattern D — DB
+//      fallback)
+//   5. `dispatch_ctx.config.primary_model.clone()` (legacy fallback — W3c
+//      sweeps this after the field deletion)
+//
+// Priority 3 requires an async DB read via `build_step_dispatch_decision`,
+// so callers pre-resolve ONCE per outer executor function and reuse the
+// resulting `String` at every save site. This keeps the save path cheap
+// AND matches W1b's "build once per outer step" semantics.
+//
+// Until W3c deletes `LlmConfig.primary_model`, the legacy-fallback arm on
+// line 5 stays. Cargo-check in W3c will surface every site carrying that
+// fallback and W3c removes them together with the field.
+async fn compute_save_step_provenance_model(
+    step: &ChainStep,
+    defaults: &super::chain_engine::ChainDefaults,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
+) -> String {
+    // Priority 1: explicit per-step model override.
+    if let Some(ref model) = step.model {
+        return model.clone();
+    }
+    // Priority 2: defaults.model override, but only when the step doesn't
+    // specify a tier (mirrors `resolve_model`).
+    if let Some(ref model) = defaults.model {
+        if step.model_tier.is_none() {
+            return model.clone();
+        }
+    }
+
+    let slot = step
+        .model_tier
+        .clone()
+        .unwrap_or_else(|| defaults.model_tier.clone());
+
+    // Priority 3: pull from the step's DispatchDecision (Pattern A).
+    if let Some(decision) =
+        chain_dispatch::build_step_dispatch_decision(dispatch_ctx, &slot).await
+    {
+        if let Some(model) = decision
+            .per_provider
+            .get(&super::walker_resolver::ProviderType::OpenRouter)
+            .and_then(|p| p.model_list.as_ref())
+            .and_then(|ml| ml.first().cloned())
+        {
+            return model;
+        }
+    }
+
+    // Priority 4: read directly from the walker provider-scope DB cascade
+    // (Pattern D). A best-effort provenance tag when the Decision build
+    // failed and we have no better signal.
+    {
+        let conn = dispatch_ctx.db_reader.lock().await;
+        if let Some(model) = super::walker_resolver::first_openrouter_model_from_db(&conn) {
+            return model;
+        }
+    }
+
+    // Priority 5: legacy fallback — W3c sweeps this after the field deletion.
+    tracing::warn!(
+        event = "save_step_provenance_fallback_to_primary_model",
+        step = %step.name,
+        slot = %slot,
+        "W3b: no Decision / DB model available, falling back to config.primary_model for provenance"
+    );
+    dispatch_ctx.config.primary_model.clone()
+}
+
 // ── Error strategy ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -6553,6 +6637,10 @@ async fn execute_for_each(
         .await;
     }
 
+    // Walker v3 W3b: resolve the provenance model ONCE for all save sites
+    // in this forEach. Mirrors W1b's "build once per outer step" shape.
+    let save_model = compute_save_step_provenance_model(step, defaults, dispatch_ctx).await;
+
     for (index, item) in items.iter().enumerate() {
         if cancel.is_cancelled() {
             info!("forEach cancelled at iteration {index}");
@@ -6804,7 +6892,7 @@ async fn execute_for_each(
                             depth,
                             &sub_node_id,
                             &output_json,
-                            &dispatch_ctx.config.primary_model,
+                            &save_model,
                             merge_elapsed,
                         )
                         .await;
@@ -6854,7 +6942,7 @@ async fn execute_for_each(
                     depth,
                     &node_id,
                     &output_json,
-                    &dispatch_ctx.config.primary_model,
+                    &save_model,
                     elapsed,
                 )
                 .await;
@@ -6933,7 +7021,7 @@ async fn execute_for_each(
                     depth,
                     &node_id,
                     &output_json,
-                    &dispatch_ctx.config.primary_model,
+                    &save_model,
                     elapsed,
                 )
                 .await;
@@ -7108,6 +7196,10 @@ async fn execute_for_each_concurrent(
     let (result_tx, mut result_rx) =
         mpsc::channel::<ForEachTaskOutcome>(concurrency * 4);
 
+    // Walker v3 W3b: resolve the provenance model ONCE before the producer
+    // spawns. Each per-item task inherits the same String via clone below.
+    let save_model = compute_save_step_provenance_model(step, defaults, dispatch_ctx).await;
+
     // ── Capture clones for the producer task ────────────────────────────
     let step_owned = step.clone();
     let ctx_snap_producer = ctx_snapshot.clone();
@@ -7119,6 +7211,7 @@ async fn execute_for_each_concurrent(
     let semaphore_producer = semaphore.clone();
     let cancel_producer = cancel.clone();
     let result_tx_producer = result_tx;
+    let save_model_producer = save_model.clone();
 
     // ── Producer task ───────────────────────────────────────────────────
     let producer_handle = tokio::spawn(async move {
@@ -7252,6 +7345,7 @@ async fn execute_for_each_concurrent(
             let defaults_work = defaults_producer.clone();
             let error_strategy_work = error_strategy_producer.clone();
             let result_tx_work = result_tx_producer.clone();
+            let save_model_work = save_model_producer.clone();
             let item_owned = item.clone();
 
             let work_handle = tokio::spawn(async move {
@@ -7445,7 +7539,7 @@ async fn execute_for_each_concurrent(
                             };
                             send_save_step(
                                 &writer_tx_work, &ctx_snap_work.slug, &step_work.name, chunk_index, depth, &node_id,
-                                &output_json, &dispatch_ctx_work.config.primary_model, 0.0,
+                                &output_json, &save_model_work, 0.0,
                             ).await;
 
                             if saves_node {
@@ -7492,7 +7586,7 @@ async fn execute_for_each_concurrent(
                                 };
                                 send_save_step(
                                     &writer_tx_work, &ctx_snap_work.slug, &step_work.name, chunk_index, depth, &sub_node_id,
-                                    &output_json, &dispatch_ctx_work.config.primary_model, 0.0,
+                                    &output_json, &save_model_work, 0.0,
                                 ).await;
 
                                 if saves_node {
@@ -7547,7 +7641,7 @@ async fn execute_for_each_concurrent(
                             };
                             send_save_step(
                                 &writer_tx_work, &ctx_snap_work.slug, &step_work.name, chunk_index, depth, &node_id,
-                                &output_json, &dispatch_ctx_work.config.primary_model, 0.0,
+                                &output_json, &save_model_work, 0.0,
                             ).await;
 
                             if saves_node {
@@ -7781,6 +7875,9 @@ async fn execute_for_each_work_item(
     }
     let decorated_output = decorate_step_output(analysis.clone(), &work.node_id, work.chunk_index);
 
+    // Walker v3 W3b: resolve the provenance model for the save-step write.
+    let save_model = compute_save_step_provenance_model(step, defaults, dispatch_ctx).await;
+
     let output_json = serde_json::to_string(&decorated_output)?;
     send_save_step(
         writer_tx,
@@ -7790,7 +7887,7 @@ async fn execute_for_each_work_item(
         work.depth,
         &work.node_id,
         &output_json,
-        &dispatch_ctx.config.primary_model,
+        &save_model,
         elapsed,
     )
     .await;
@@ -8235,6 +8332,8 @@ async fn dispatch_pair(
     let decorated_output = decorate_step_output(analysis.clone(), node_id, -1);
 
     // Save step
+    // Walker v3 W3b: resolve the provenance model for the save-step write.
+    let save_model = compute_save_step_provenance_model(step, defaults, dispatch_ctx).await;
     let output_json = serde_json::to_string(&decorated_output)?;
     send_save_step(
         writer_tx,
@@ -8244,7 +8343,7 @@ async fn dispatch_pair(
         target_depth,
         node_id,
         &output_json,
-        &dispatch_ctx.config.primary_model,
+        &save_model,
         elapsed,
     )
     .await;
@@ -8869,13 +8968,18 @@ async fn execute_recursive_cluster(
                 }
             };
 
+            // Walker v3 W3b: resolve the provenance model using the
+            // clustering step's own config (it may override step.model via
+            // `cluster_model`).
+            let cluster_save_model =
+                compute_save_step_provenance_model(&cluster_step, defaults, dispatch_ctx).await;
             save_cluster_assignment_output(
                 writer_tx,
                 &ctx.slug,
                 target_depth,
                 &cluster_assignment_node_id,
                 &output,
-                &dispatch_ctx.config.primary_model,
+                &cluster_save_model,
             )
             .await?;
 
@@ -9394,6 +9498,8 @@ async fn dispatch_group(
     let decorated_output = decorate_step_output(analysis.clone(), node_id, -1);
 
     // Save step
+    // Walker v3 W3b: resolve the provenance model for the save-step write.
+    let save_model = compute_save_step_provenance_model(step, defaults, dispatch_ctx).await;
     let output_json = serde_json::to_string(&decorated_output)?;
     send_save_step(
         writer_tx,
@@ -9403,7 +9509,7 @@ async fn dispatch_group(
         target_depth,
         node_id,
         &output_json,
-        &dispatch_ctx.config.primary_model,
+        &save_model,
         elapsed,
     )
     .await;
@@ -9769,11 +9875,16 @@ async fn execute_web_step(
         "saved_edge_count": 0,
     });
 
+    // Walker v3 W3b: resolve the provenance model ONCE for both webbing
+    // save-step writes (pre-persist preview + final with edge counts).
+    let web_save_model =
+        compute_save_step_provenance_model(step, defaults, dispatch_ctx).await;
+
     let output_json = serde_json::to_string(&output)?;
     let save_slug = ctx.slug.clone();
     let save_step_name = step.name.clone();
     let save_synthetic_id = synthetic_id.clone();
-    let save_model = dispatch_ctx.config.primary_model.clone();
+    let save_model = web_save_model.clone();
     let writer = writer.clone();
     let persist_writer = writer.clone();
     let final_writer = persist_writer.clone();
@@ -9827,7 +9938,7 @@ async fn execute_web_step(
     let save_slug = ctx.slug.clone();
     let save_step_name = step.name.clone();
     let save_synthetic_id = synthetic_id.clone();
-    let save_model = dispatch_ctx.config.primary_model.clone();
+    let save_model = web_save_model.clone();
     let writer = final_writer;
     tokio::task::spawn_blocking(move || -> Result<()> {
         let conn = writer.blocking_lock();
@@ -9958,6 +10069,8 @@ async fn execute_single(
     let decorated_output = decorate_step_output(analysis.clone(), &node_id, -1);
 
     // Save step
+    // Walker v3 W3b: resolve the provenance model for the save-step write.
+    let save_model = compute_save_step_provenance_model(step, defaults, dispatch_ctx).await;
     let output_json = serde_json::to_string(&decorated_output)?;
     send_save_step(
         writer_tx,
@@ -9967,7 +10080,7 @@ async fn execute_single(
         depth,
         &node_id,
         &output_json,
-        &dispatch_ctx.config.primary_model,
+        &save_model,
         elapsed,
     )
     .await;
