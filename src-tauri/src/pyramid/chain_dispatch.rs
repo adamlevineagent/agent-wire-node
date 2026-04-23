@@ -23,6 +23,7 @@ use super::naming::headline_from_analysis;
 use super::step_context::{compute_prompt_hash, StepContext as CacheStepContext};
 use super::transform_runtime;
 use super::types::{Correction, Decision, PyramidNode, Term, Topic};
+use super::walker_decision::DispatchDecision;
 use super::{OperationalConfig, Tier1Config};
 
 // ── Step context ────────────────────────────────────────────────────────────
@@ -172,6 +173,129 @@ impl CacheDispatchBase {
     }
 }
 
+// ── Walker v3 W1b: outer-step DispatchDecision builder ─────────────────────
+//
+// Plan rev 1.0.2 §2.9 DispatchDecision + §6 Phase 1: the Decision is built
+// ONCE per chain step at the outer LLM dispatch entry. Every CacheStepContext
+// constructed inside the step inherits the same `Arc<DispatchDecision>` via
+// `with_dispatch_decision`, so downstream consumers (W2's target) can reach
+// the pre-resolved per-provider params + effective call order without
+// re-walking the resolver.
+//
+// Permissive-on-failure: if `DispatchDecision::build` errors (e.g. cascade
+// exhausted, all providers NotReady, DB read failure), we log and return
+// `None`. The CacheStepContext still reaches consumers with
+// `dispatch_decision = None`; legacy consumers fall back to the
+// `config.primary_model / fallback_model_{1,2}` chain so steps don't
+// hard-fail before W2 migrates the last site. `EVENT_DECISION_BUILD_FAILED`
+// is emitted by `build()` itself for the cascade-exhausted case.
+//
+// `test_capture` module below lets the W1b integration test observe the
+// Decision that the executor built without running a real LLM dispatch.
+/// Walker v3 W1b: build the step's DispatchDecision at the outer LLM
+/// dispatch entry. Exposed as `pub` so the W1b integration test can
+/// observe the Decision attachment without running a real LLM dispatch.
+/// Production call sites are the private `dispatch_llm` / `dispatch_ir_llm`
+/// paths within this module.
+pub async fn build_step_dispatch_decision(
+    ctx: &ChainDispatchContext,
+    slot: &str,
+) -> Option<Arc<DispatchDecision>> {
+    let conn = ctx.db_reader.lock().await;
+    match DispatchDecision::build(slot, &conn) {
+        Ok(decision) => {
+            let arc = Arc::new(decision);
+            test_capture::record_if_enabled(slot, &arc);
+            Some(arc)
+        }
+        Err(e) => {
+            tracing::warn!(
+                event = "decision_build_failed_in_executor",
+                slot = %slot,
+                error = ?e,
+                "W1b: dispatch decision build failed; falling through to legacy dispatch"
+            );
+            None
+        }
+    }
+}
+
+#[doc(hidden)]
+pub mod test_capture {
+    //! Walker v3 W1b test-observability hook.
+    //!
+    //! The W1b integration test needs to observe that the executor built
+    //! and attached a DispatchDecision at outer-step entry, WITHOUT
+    //! running a real LLM dispatch (which would require an OpenRouter
+    //! key / network + full chain_executor wiring through a 15k-line
+    //! file). Gating this hook behind `CAPTURE_ENABLED` keeps the
+    //! production dispatch path zero-cost (a single `AtomicBool::load`
+    //! per step, opt-in only when a test explicitly calls `enable`).
+    //!
+    //! Production callers never flip `CAPTURE_ENABLED`. If you find
+    //! yourself tempted to enable capture from non-test code: don't —
+    //! the capture store grows unbounded and leaks across build runs.
+    use super::DispatchDecision;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    static CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+    #[derive(Debug, Clone)]
+    pub struct CapturedDecision {
+        pub slot: String,
+        pub decision: Arc<DispatchDecision>,
+    }
+
+    fn slot_store() -> &'static Mutex<Vec<CapturedDecision>> {
+        static STORE: OnceLock<Mutex<Vec<CapturedDecision>>> = OnceLock::new();
+        STORE.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub(super) fn record_if_enabled(slot: &str, decision: &Arc<DispatchDecision>) {
+        if !CAPTURE_ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut g) = slot_store().lock() {
+            g.push(CapturedDecision {
+                slot: slot.to_string(),
+                decision: decision.clone(),
+            });
+        }
+    }
+
+    /// Enable capture for the current process. Idempotent. Tests that
+    /// want the capture path must call this at start. Safe to leave
+    /// enabled for the duration of a test binary.
+    pub fn enable() {
+        CAPTURE_ENABLED.store(true, Ordering::Relaxed);
+    }
+
+    /// Disable capture and clear the store. Called at test teardown
+    /// when capture is no longer needed.
+    pub fn disable() {
+        CAPTURE_ENABLED.store(false, Ordering::Relaxed);
+        clear();
+    }
+
+    /// Clear any captured decisions. Tests call this at start so state
+    /// doesn't leak across tests within the same process.
+    pub fn clear() {
+        if let Ok(mut g) = slot_store().lock() {
+            g.clear();
+        }
+    }
+
+    /// Return the list of captured decisions so the test can assert on
+    /// count + per-slot Decision content.
+    pub fn snapshot() -> Vec<CapturedDecision> {
+        slot_store()
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+}
+
 // ── Top-level dispatcher ────────────────────────────────────────────────────
 
 /// Dispatch a chain step to either LLM or mechanical execution.
@@ -264,6 +388,18 @@ async fn dispatch_llm(
     let resolved_limit = resolve_context_limit(step, defaults, &ctx.config, &ctx.tier1);
     let max_tokens: usize = ctx.tier1.ir_max_tokens;
 
+    // Walker v3 W1b: build the step's DispatchDecision ONCE at the outer
+    // LLM entry. Every CacheStepContext constructed below inherits the
+    // same Arc via `.with_dispatch_decision`. Permissive on failure —
+    // see `build_step_dispatch_decision` for the fallback policy.
+    // `slot` mirrors the tier used by cache-site `with_model_resolution`
+    // calls so the Decision is keyed to the same scope as the LLM call.
+    let slot = step
+        .model_tier
+        .clone()
+        .unwrap_or_else(|| defaults.model_tier.clone());
+    let dispatch_decision = build_step_dispatch_decision(ctx, &slot).await;
+
     // Apply model override: if the resolved model differs from the config's
     // primary model, create a modified config so call_model() uses it.
     // Uses clone_with_model_override to pin ALL model slots (primary +
@@ -329,6 +465,10 @@ async fn dispatch_llm(
             if let Some(bus) = &cb.bus {
                 c = c.with_bus(bus.clone());
             }
+            // Walker v3 W1b: inherit the step's outer Decision.
+            if let Some(d) = &dispatch_decision {
+                c = c.with_dispatch_decision(d.clone());
+            }
             c
         });
         let response = llm::call_model_structured_and_ctx(
@@ -375,6 +515,10 @@ async fn dispatch_llm(
                         }
                         if let Some(bus) = &cb.bus {
                             c = c.with_bus(bus.clone());
+                        }
+                        // Walker v3 W1b: inherit the step's outer Decision.
+                        if let Some(d) = &dispatch_decision {
+                            c = c.with_dispatch_decision(d.clone());
                         }
                         c
                     });
@@ -423,6 +567,10 @@ async fn dispatch_llm(
         }
         if let Some(bus) = &cb.bus {
             c = c.with_bus(bus.clone());
+        }
+        // Walker v3 W1b: inherit the step's outer Decision.
+        if let Some(d) = &dispatch_decision {
+            c = c.with_dispatch_decision(d.clone());
         }
         c
     });
@@ -486,6 +634,10 @@ async fn dispatch_llm(
                     if let Some(bus) = &cb.bus {
                         c = c.with_bus(bus.clone());
                     }
+                    // Walker v3 W1b: inherit the step's outer Decision.
+                    if let Some(d) = &dispatch_decision {
+                        c = c.with_dispatch_decision(d.clone());
+                    }
                     c
                 });
                 let retry_resp = llm::call_model_and_ctx(
@@ -530,6 +682,10 @@ async fn dispatch_llm(
                     }
                     if let Some(bus) = &cb.bus {
                         c = c.with_bus(bus.clone());
+                    }
+                    // Walker v3 W1b: inherit the step's outer Decision.
+                    if let Some(d) = &dispatch_decision {
+                        c = c.with_dispatch_decision(d.clone());
                     }
                     c
                 });
@@ -1263,6 +1419,17 @@ pub async fn dispatch_ir_llm(
     let max_tokens = resolve_ir_max_tokens(step, &ctx.tier1);
     let llm_options = resolve_ir_llm_call_options(step, &ctx.tier1);
 
+    // Walker v3 W1b: build the step's DispatchDecision ONCE at the outer
+    // IR LLM entry. See dispatch_llm for the symmetric wire-in; the same
+    // Arc is threaded into every CacheStepContext constructed for this
+    // step (structured/retry variants + the standard dispatch ctx).
+    let slot = step
+        .model_requirements
+        .tier
+        .clone()
+        .unwrap_or_else(|| "mid".to_string());
+    let dispatch_decision = build_step_dispatch_decision(ctx, &slot).await;
+
     // Apply model override: pin ALL model slots (primary + fallback_1 +
     // fallback_2) to the resolved model so cascade stays on the same
     // provider. Also override context limit to match the resolved tier.
@@ -1313,6 +1480,7 @@ pub async fn dispatch_ir_llm(
         &resolved_model,
         system_prompt,
         &user_prompt,
+        dispatch_decision.as_ref(),
     );
 
     // If step has a response_schema, use structured outputs for guaranteed JSON
@@ -1446,6 +1614,7 @@ fn build_cache_ctx_for_ir_step(
     resolved_model: &str,
     system_prompt: &str,
     user_prompt: &str,
+    dispatch_decision: Option<&Arc<DispatchDecision>>,
 ) -> Option<CacheStepContext> {
     let base = ctx.cache_base.as_ref()?;
     if resolved_model.is_empty() {
@@ -1527,6 +1696,14 @@ fn build_cache_ctx_for_ir_step(
     }
     if let Some(bus) = base.bus.as_ref() {
         cache_ctx = cache_ctx.with_bus(bus.clone());
+    }
+    // Walker v3 W1b: inherit the step's outer Decision (built ONCE per
+    // step at the `dispatch_ir_llm` entry). Downstream consumers read
+    // `step_ctx.dispatch_decision`; legacy consumers whose site hasn't
+    // been migrated to W2 still see `config.primary_model / fallback_*`
+    // on the surrounding config, so behavior is unchanged until W2.
+    if let Some(d) = dispatch_decision {
+        cache_ctx = cache_ctx.with_dispatch_decision(d.clone());
     }
     Some(cache_ctx)
 }
@@ -2093,5 +2270,132 @@ mod tests {
             .unwrap();
         assert_eq!(result["_mechanical"], "extract_mechanical_metadata");
         assert!(llm_resp.is_none()); // mechanical steps don't produce LlmResponse
+    }
+
+    // ── Walker v3 W1b: outer-step DispatchDecision build + attach ───────
+    //
+    // `build_step_dispatch_decision` is the one place chain_executor wires
+    // the step's DispatchDecision. These unit tests exercise the
+    // happy-path (empty DB → SYSTEM_DEFAULTS Decision) and the
+    // permissive-on-failure path (uninitialized DB → None, fall-through).
+
+    fn make_w1b_seedable_ctx(conn: Connection) -> ChainDispatchContext {
+        ChainDispatchContext {
+            db_reader: Arc::new(Mutex::new(conn)),
+            db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            slug: "w1b-test".into(),
+            config: LlmConfig::default(),
+            tier1: Tier1Config::default(),
+            ops: OperationalConfig::default(),
+            audit: None,
+            cache_base: None,
+            concurrency_cap: None,
+        }
+    }
+
+    fn make_pyramid_config_contributions_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pyramid_config_contributions (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 contribution_id TEXT NOT NULL UNIQUE,
+                 slug TEXT,
+                 schema_type TEXT NOT NULL,
+                 yaml_content TEXT NOT NULL,
+                 wire_native_metadata_json TEXT NOT NULL DEFAULT '{}',
+                 wire_publication_state_json TEXT NOT NULL DEFAULT '{}',
+                 supersedes_id TEXT,
+                 superseded_by_id TEXT,
+                 triggering_note TEXT,
+                 status TEXT NOT NULL DEFAULT 'active',
+                 source TEXT NOT NULL DEFAULT 'local',
+                 wire_contribution_id TEXT,
+                 created_by TEXT,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 accepted_at TEXT
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[tokio::test]
+    async fn test_w1b_build_step_dispatch_decision_empty_db_returns_some_default() {
+        test_capture::enable();
+        test_capture::clear();
+        let conn = make_pyramid_config_contributions_db();
+        let ctx = make_w1b_seedable_ctx(conn);
+        let d = build_step_dispatch_decision(&ctx, "mid").await;
+        assert!(
+            d.is_some(),
+            "W1b: empty pyramid_config_contributions table means \
+             SYSTEM_DEFAULTS — Decision must build successfully"
+        );
+        let decision = d.unwrap();
+        assert_eq!(decision.slot, "mid");
+        assert!(!decision.synthetic, "runtime path is not synthetic");
+        // test_capture observed it
+        let snap = test_capture::snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].slot, "mid");
+        assert!(Arc::ptr_eq(&snap[0].decision, &decision));
+    }
+
+    #[tokio::test]
+    async fn test_w1b_build_step_dispatch_decision_missing_table_is_permissive() {
+        // No pyramid_config_contributions table exists. `build` must error
+        // (DB read fails) and our helper must log + return None so the
+        // legacy dispatch path continues.
+        test_capture::enable();
+        test_capture::clear();
+        let conn = Connection::open_in_memory().unwrap();
+        let ctx = make_w1b_seedable_ctx(conn);
+        let d = build_step_dispatch_decision(&ctx, "mid").await;
+        assert!(
+            d.is_none(),
+            "W1b: DB read failure must be permissive (None + log)"
+        );
+        // Capture hook must NOT have fired on a failed build.
+        assert!(test_capture::snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_w1b_decision_reflects_seeded_walker_provider_openrouter() {
+        // Seed walker_provider_openrouter.overrides.model_list[mid] =
+        // ["test-model-id"]. After build, per_provider[OpenRouter].model_list
+        // must surface that value.
+        test_capture::enable();
+        test_capture::clear();
+        let conn = make_pyramid_config_contributions_db();
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions (
+                 contribution_id, slug, schema_type, yaml_content, status, source
+             ) VALUES (?1, NULL, 'walker_provider_openrouter', ?2, 'active', 'bundled')",
+            rusqlite::params![
+                "w1b-or-ml",
+                r#"
+schema_type: walker_provider_openrouter
+version: 1
+overrides:
+  model_list:
+    mid: ["test-model-id"]
+"#
+            ],
+        )
+        .unwrap();
+        let ctx = make_w1b_seedable_ctx(conn);
+        let d = build_step_dispatch_decision(&ctx, "mid").await;
+        assert!(d.is_some());
+        let decision = d.unwrap();
+        use crate::pyramid::walker_resolver::ProviderType;
+        let or = decision
+            .per_provider
+            .get(&ProviderType::OpenRouter)
+            .expect("OpenRouter must be in effective call order");
+        assert_eq!(
+            or.model_list.as_deref(),
+            Some(&["test-model-id".to_string()][..]),
+            "W1b: seeded model_list must reach the Decision"
+        );
     }
 }
