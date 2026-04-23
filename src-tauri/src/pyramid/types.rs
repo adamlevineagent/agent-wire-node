@@ -2566,6 +2566,13 @@ pub struct VoteLean {
 }
 
 /// Meta-layer node payload — purpose-aligned synthesis referencing substrate.
+///
+/// `topics` is the audit trail: each topic names a theme the synthesizer
+/// surfaced across the substrate and lists the specific substrate node ids
+/// that anchor it. Phase 7b verifier added this field — the LLM step's
+/// `response_schema` already requires it, but the original writer dropped
+/// the array on the floor (silent data loss). See
+/// `chain_dispatch::create_meta_layer_node`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetaLayerTopic {
     pub purpose_question: String,
@@ -2573,6 +2580,19 @@ pub struct MetaLayerTopic {
     pub parent_meta_layer_id: Option<String>,
     #[serde(default)]
     pub covered_substrate_nodes: Vec<String>,
+    #[serde(default)]
+    pub topics: Vec<MetaLayerTopicEntry>,
+}
+
+/// One theme surfaced by the meta-layer synthesizer, with anchor ids.
+///
+/// Shape mirrors the starter-synthesizer response_schema's `topics[]`
+/// entries so the LLM output deserializes directly into this struct.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaLayerTopicEntry {
+    pub topic: String,
+    #[serde(default)]
+    pub anchor_nodes: Vec<String>,
 }
 
 /// Gap node payload — explicit absence with demand state and candidate

@@ -21895,6 +21895,36 @@ mod rev061_leg_helpers_tests {
 }
 
 #[cfg(test)]
+pub(super) mod post_build_test_support {
+    //! Shared test helpers for the post-build accretion v5 test modules.
+    //!
+    //! Phase 7b verifier: we serialize tests across the whole
+    //! `*_post_build_tests` family through a single process-wide mutex.
+    //!
+    //! Motivation: every test that exercises `dadbear_compiler` or a
+    //! genesis-seeded chain hits the shared `vocab_entries::CACHE`. Before
+    //! this module existed each sibling test module had its own local
+    //! `static LOCK: OnceLock<Mutex<()>> = OnceLock::new();` — an
+    //! intra-module barrier that did NOT serialize against siblings. Two
+    //! phase modules running tests concurrently would race on the global
+    //! vocab cache (one module's `invalidate_cache()` could happen after
+    //! the other module had already pulled a cache snapshot and was
+    //! mid-query), producing intermittent flakes.
+    //!
+    //! The fix is a single shared lock all post_build modules import via
+    //! `use super::post_build_test_support::test_lock;`. Test runtime is
+    //! effectively unchanged — tests were already expected to serialize.
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    pub fn test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
+#[cfg(test)]
 mod phase1_post_build_tests {
     //! Post-build accretion v5 Phase 1 tests.
     //! See .lab/architecture/agent-wire-node-post-build-plan-v5.md
@@ -22235,6 +22265,7 @@ mod phase2_post_build_tests {
             purpose_question: "q?".into(),
             parent_meta_layer_id: None,
             covered_substrate_nodes: vec![],
+            topics: vec![],
         });
         let m_json = serde_json::to_string(&meta).unwrap();
         assert!(!m_json.contains("\"kind\""));
@@ -22873,6 +22904,14 @@ mod phase3_post_build_tests {
 #[cfg(test)]
 mod phase4_post_build_tests {
     use super::*;
+    // Phase 7b verifier: unified test lock across ALL post_build modules.
+    // Each module previously declared its own local test_lock() with a
+    // module-private `static LOCK: OnceLock<Mutex<()>>`, which serialized
+    // tests *within* a module but NOT across sibling modules — and the
+    // underlying flake class is the process-wide vocab cache, which is
+    // cross-module. Use the shared lock so the whole post_build test
+    // family serializes through one mutex.
+    use super::post_build_test_support::test_lock;
     use crate::pyramid::dadbear_compiler;
     use crate::pyramid::types::{
         parse_shape_payload, ContentType, DebatePosition, DebateTopic, GapCandidate, GapTopic,
@@ -22880,17 +22919,6 @@ mod phase4_post_build_tests {
     };
     use crate::pyramid::vocab_entries;
     use rusqlite::Connection;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    /// Phase 6c-D: NodeShape::from_db now reads the process-wide vocab
-    /// cache; serialize tests so each test sees a consistent cache scoped
-    /// to its own in-memory DB.
-    fn test_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
 
     fn mem_conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();
@@ -22970,6 +22998,7 @@ mod phase4_post_build_tests {
             purpose_question: "Why X?".to_string(),
             parent_meta_layer_id: None,
             covered_substrate_nodes: vec!["L1-1".into(), "L1-2".into()],
+            topics: vec![],
         };
         let json = serde_json::to_string(&m).unwrap();
         match parse_shape_payload(&NodeShape::new("meta_layer"), Some(&json)).unwrap().unwrap() {
@@ -25971,24 +26000,13 @@ mod phase6b_post_build_tests {
 #[cfg(test)]
 mod phase6c_a_post_build_tests {
     use super::*;
+    // Phase 7b verifier: shared lock across all post_build modules. See
+    // phase4_post_build_tests for the fuller rationale.
+    use super::post_build_test_support::test_lock;
     use crate::pyramid::vocab_entries::{
         self, VocabEntry, VOCAB_KIND_ANNOTATION_TYPE, VOCAB_KIND_NODE_SHAPE, VOCAB_KIND_ROLE_NAME,
     };
     use rusqlite::Connection;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    /// The process-wide vocab cache is shared across parallel tests, and
-    /// each test opens its own in-memory DB. Without a test-level lock,
-    /// one test's `invalidate_cache()` → `ensure_cache(other_conn)` can
-    /// splat another test's DB state into the cache mid-assertion.
-    /// Serialize the whole mod behind this mutex so each test sees a
-    /// consistent cache scoped to its own connection.
-    fn test_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
 
     fn mem_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -26648,21 +26666,13 @@ mod phase6c_a_post_build_tests {
 #[cfg(test)]
 mod phase6c_b_post_build_tests {
     use super::*;
+    // Phase 7b verifier: shared lock across all post_build modules.
+    use super::post_build_test_support::test_lock;
     use crate::pyramid::types::{AnnotationType, ContentType, PyramidAnnotation};
     use crate::pyramid::vocab_entries::{
         self, VocabEntry, VOCAB_KIND_ANNOTATION_TYPE,
     };
     use rusqlite::Connection;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    /// Serialize the whole mod behind this mutex so the process-wide vocab
-    /// cache stays scoped to each test's own in-memory DB.
-    fn test_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
 
     fn mem_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -27187,6 +27197,8 @@ mod phase6c_b_post_build_tests {
 #[cfg(test)]
 mod phase6c_d_post_build_tests {
     use super::*;
+    // Phase 7b verifier: shared lock across all post_build modules.
+    use super::post_build_test_support::test_lock;
     use crate::pyramid::types::{
         parse_shape_payload, ContentType, NodeShape, UnknownShapePayload,
     };
@@ -27194,17 +27206,6 @@ mod phase6c_d_post_build_tests {
         self, VocabEntry, VOCAB_KIND_NODE_SHAPE, VOCAB_KIND_ROLE_NAME,
     };
     use rusqlite::Connection;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    /// Serialize tests behind this mutex so the process-wide vocab cache
-    /// stays scoped to each test's own in-memory DB. Same pattern as the
-    /// earlier 6c-A / 6c-B modules.
-    fn test_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
 
     fn mem_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -27636,6 +27637,8 @@ mod phase6c_d_post_build_tests {
 #[cfg(test)]
 mod phase7a_post_build_tests {
     use super::*;
+    // Phase 7b verifier: shared lock across all post_build modules.
+    use super::post_build_test_support::test_lock;
     use crate::pyramid::chain_engine::{ChainDefaults, ChainDefinition, ChainStep};
     use crate::pyramid::types::{
         AnnotationType, ContentType, DebatePosition, DebateTopic, NodeShape, PyramidAnnotation,
@@ -27645,18 +27648,9 @@ mod phase7a_post_build_tests {
     use rusqlite::Connection;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+    use std::sync::Arc;
     use std::collections::HashMap;
     use tokio::sync::Mutex as TokioMutex;
-
-    /// Serialize the mod behind this mutex so vocab_entries' process-wide
-    /// cache stays scoped to each test's own in-memory DB.
-    fn test_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
 
     fn chains_dir_path() -> PathBuf {
         let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
@@ -28267,26 +28261,18 @@ mod phase7a_post_build_tests {
 #[cfg(test)]
 mod phase7b_post_build_tests {
     use super::*;
+    // Phase 7b verifier: shared lock across all post_build modules — see
+    // post_build_test_support for full rationale. The original Phase 7b
+    // ship used a module-private lock which was a no-op against
+    // cross-module cache races; switching to the shared lock makes the
+    // serialization actually match the flake class.
+    use super::post_build_test_support::test_lock;
     use crate::pyramid::chain_engine::{ChainDefaults, ChainDefinition};
     use crate::pyramid::types::{ContentType, ShapePayload, NODE_SHAPE_META_LAYER};
     use crate::pyramid::{chain_executor, chain_loader, dadbear_compiler, vocab_entries};
     use rusqlite::Connection;
     use serde_json::json;
     use std::path::PathBuf;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    /// Same process-wide lock pattern phase7a uses. Tests that exercise
-    /// `dadbear_compiler::run_compilation_for_slug` end-to-end hit the
-    /// process-wide vocab cache (in `vocab_entries`), which would otherwise
-    /// race with sibling-module tests running in parallel. We serialize
-    /// ourselves behind this lock AND invalidate the cache in `fresh_db()`
-    /// so each test faults from its own in-memory DB.
-    fn test_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
 
     fn chains_dir_path() -> PathBuf {
         let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
@@ -28311,7 +28297,7 @@ mod phase7b_post_build_tests {
         assert_eq!(
             loaded.steps.len(),
             4,
-            "Phase 7b oracle has 4 steps: emit → decide → dispatch → complete"
+            "Phase 7b oracle has 4 steps: emit → decide → dispatch → finalize"
         );
         let names: Vec<&str> = loaded.steps.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
@@ -28320,7 +28306,11 @@ mod phase7b_post_build_tests {
                 "emit_oracle_invoked",
                 "decide_crystallization",
                 "dispatch_synthesizer",
-                "oracle_log_and_complete",
+                // Phase 7b verifier: oracle_finalize replaces the Phase 5 generic
+                // log_and_complete so a SKIP path lands a loud
+                // `meta_layer_oracle_skipped` chronicle event instead of
+                // silently CASing with only an info!() line.
+                "oracle_finalize",
             ],
             "canonical 4-step shape"
         );
@@ -28582,6 +28572,13 @@ mod phase7b_post_build_tests {
                 "headline": "Test meta layer",
                 "distilled": "Synthesis over L0-A and L0-B aligned to test purpose.",
                 "covered_substrate_node_ids": ["L0-A", "L0-B"],
+                // Phase 7b verifier: topics is now required at the writer.
+                // The LLM step's response_schema declares it required but
+                // the current dispatch path does not enforce schema, so
+                // the writer validates directly (feedback_loud_deferrals).
+                "topics": [
+                    {"topic": "coverage", "anchor_nodes": ["L0-A", "L0-B"]}
+                ],
                 "purpose_question": "What is the test purpose?",
                 "parent_meta_layer_id": null,
                 "purpose_id": 1,
@@ -28677,6 +28674,9 @@ mod phase7b_post_build_tests {
                 "headline": "Emit test",
                 "distilled": "Substrate-rooted synthesis.",
                 "covered_substrate_node_ids": ["L0-X"],
+                "topics": [
+                    {"topic": "x-axis", "anchor_nodes": ["L0-X"]}
+                ],
                 "purpose_question": "Emit-path purpose question.",
                 "parent_meta_layer_id": null,
                 "purpose_id": 42,
@@ -28703,6 +28703,320 @@ mod phase7b_post_build_tests {
                 && (meta.contains(":42") || meta.contains(": 42")),
             "purpose_id must ride in metadata: {meta}"
         );
+    }
+
+    // ── Phase 7b verifier regression — topics is required at writer ───────
+    //
+    // The synthesizer's response_schema declares topics required, but the
+    // current LLM dispatch path does NOT enforce response_schema. The
+    // writer therefore validates directly: missing topics, non-array
+    // topics, empty topics, and floating-topic entries (no anchor_nodes)
+    // all raise loudly per feedback_loud_deferrals.
+
+    #[tokio::test]
+    async fn create_meta_layer_node_raises_when_topics_missing() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7bv1", &ContentType::Code, "/tmp/p7bv1").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L0-A', 'p7bv1', 0, 'A', 'd', '', 1)",
+            [],
+        )
+        .unwrap();
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7bv-missing-topics".into(),
+            name: "missing topics".into(),
+            description: "topics required".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "verifier".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".into(),
+            },
+            steps: vec![crate::pyramid::chain_engine::ChainStep {
+                name: "create".into(),
+                primitive: "custom".into(),
+                mechanical: true,
+                rust_function: Some("create_meta_layer_node".into()),
+                ..Default::default()
+            }],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+        let err = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7bv1",
+            None,
+            json!({
+                "headline": "h",
+                "distilled": "d",
+                "covered_substrate_node_ids": ["L0-A"],
+                "purpose_question": "q?",
+                "parent_meta_layer_id": null,
+                // topics intentionally omitted
+            }),
+        )
+        .await
+        .expect_err("writer must raise when topics missing");
+        let s = format!("{err:#}");
+        assert!(s.contains("topics"), "error must name `topics`: {s}");
+    }
+
+    #[tokio::test]
+    async fn create_meta_layer_node_raises_on_empty_topics_and_floating_anchors() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7bv2", &ContentType::Code, "/tmp/p7bv2").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L0-A', 'p7bv2', 0, 'A', 'd', '', 1)",
+            [],
+        )
+        .unwrap();
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7bv-bad-topics".into(),
+            name: "bad topics".into(),
+            description: "empty / floating".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "verifier".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".into(),
+            },
+            steps: vec![crate::pyramid::chain_engine::ChainStep {
+                name: "create".into(),
+                primitive: "custom".into(),
+                mechanical: true,
+                rust_function: Some("create_meta_layer_node".into()),
+                ..Default::default()
+            }],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+
+        // Empty topics array → raise.
+        let err = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7bv2",
+            None,
+            json!({
+                "headline": "h",
+                "distilled": "d",
+                "covered_substrate_node_ids": ["L0-A"],
+                "purpose_question": "q?",
+                "parent_meta_layer_id": null,
+                "topics": [],
+            }),
+        )
+        .await
+        .expect_err("empty topics must raise");
+        assert!(format!("{err:#}").contains("empty"), "{err:#}");
+
+        // Topic with no anchor_nodes → raise.
+        let err2 = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7bv2",
+            None,
+            json!({
+                "headline": "h",
+                "distilled": "d",
+                "covered_substrate_node_ids": ["L0-A"],
+                "purpose_question": "q?",
+                "parent_meta_layer_id": null,
+                "topics": [{"topic": "floating", "anchor_nodes": []}],
+            }),
+        )
+        .await
+        .expect_err("topic with no anchor_nodes must raise");
+        assert!(format!("{err2:#}").contains("floating"), "{err2:#}");
+    }
+
+    #[tokio::test]
+    async fn create_meta_layer_node_persists_topics_into_payload() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7bv3", &ContentType::Code, "/tmp/p7bv3").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L0-A', 'p7bv3', 0, 'A', 'd', '', 1)",
+            [],
+        )
+        .unwrap();
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7bv-topics-ok".into(),
+            name: "topics persisted".into(),
+            description: "topics make it into the payload".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "verifier".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".into(),
+            },
+            steps: vec![crate::pyramid::chain_engine::ChainStep {
+                name: "create".into(),
+                primitive: "custom".into(),
+                mechanical: true,
+                rust_function: Some("create_meta_layer_node".into()),
+                ..Default::default()
+            }],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+        let out = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7bv3",
+            None,
+            json!({
+                "headline": "h",
+                "distilled": "d",
+                "covered_substrate_node_ids": ["L0-A"],
+                "purpose_question": "q?",
+                "parent_meta_layer_id": null,
+                "topics": [
+                    {"topic": "one", "anchor_nodes": ["L0-A"]},
+                    {"topic": "two", "anchor_nodes": ["L0-A"]},
+                ],
+            }),
+        )
+        .await
+        .expect("valid topics input must succeed");
+        let ml_id = out["meta_layer_node_id"].as_str().unwrap().to_string();
+        let writer = state.writer.lock().await;
+        let view = get_node_shape(&writer, "p7bv3", &ml_id)
+            .unwrap()
+            .unwrap();
+        match view.payload {
+            Some(ShapePayload::MetaLayer(m)) => {
+                assert_eq!(m.topics.len(), 2, "topics must be persisted");
+                assert_eq!(m.topics[0].topic, "one");
+                assert_eq!(m.topics[0].anchor_nodes, vec!["L0-A"]);
+            }
+            other => panic!("expected MetaLayer payload, got {other:?}"),
+        }
+    }
+
+    // ── Phase 7b verifier regression — oracle_finalize emits skip event ───
+    //
+    // The skip path is operator-visible: when decide_crystallization
+    // returns should_crystallize=false, oracle_finalize writes a
+    // `meta_layer_oracle_skipped` observation event carrying the reasoning
+    // so a chronicle reader can see WHY the oracle declined.
+
+    #[tokio::test]
+    async fn oracle_finalize_emits_meta_layer_oracle_skipped_on_skip_path() {
+        use crate::pyramid::purpose;
+        let _lock = test_lock();
+
+        // No L0 substrate → decide_crystallization returns
+        // should_crystallize=false → dispatch_synthesizer skipped →
+        // oracle_finalize emits meta_layer_oracle_skipped.
+        let conn = fresh_db();
+        create_slug(&conn, "p7bv4", &ContentType::Code, "/tmp/p7bv4").unwrap();
+        purpose::supersede_purpose(
+            &conn,
+            "p7bv4",
+            "purpose with no substrate",
+            Some("verifier"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result =
+            dadbear_compiler::run_compilation_for_slug(&conn, "p7bv4", None, None).unwrap();
+        assert!(result.items_compiled >= 1);
+        let (wi_id,): (String,) = conn
+            .query_row(
+                "SELECT id FROM dadbear_work_items
+                  WHERE slug='p7bv4' AND step_name='oracle_purpose_shift'",
+                [],
+                |r| Ok((r.get(0)?,)),
+            )
+            .unwrap();
+
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+        let chain =
+            chain_loader::load_chain_by_id("starter-meta-layer-oracle", &state.chains_dir)
+                .unwrap();
+        chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7bv4",
+            None,
+            json!({
+                "work_item_id": wi_id,
+                "step_name": "oracle_purpose_shift",
+                "target_id": serde_json::Value::Null,
+                "layer": 0,
+            }),
+        )
+        .await
+        .expect("oracle chain must run to completion on skip");
+
+        let writer = state.writer.lock().await;
+        let (skipped_count, skipped_meta): (i64, Option<String>) = writer
+            .query_row(
+                "SELECT COUNT(*), MAX(metadata_json) FROM dadbear_observation_events
+                  WHERE slug='p7bv4' AND event_type='meta_layer_oracle_skipped'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            skipped_count, 1,
+            "a single meta_layer_oracle_skipped event must land on the skip path"
+        );
+        let meta = skipped_meta.expect("metadata must be populated");
+        assert!(
+            meta.contains("reasoning"),
+            "skip event metadata must carry reasoning: {meta}"
+        );
+
+        // meta_layer_crystallized must NOT have been emitted (no writer ran).
+        let cryst_count: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE slug='p7bv4' AND event_type='meta_layer_crystallized'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cryst_count, 0, "no meta-layer on skip path");
     }
 
     // ── 7b-7.7: CROWN JEWEL — purpose_shifted → oracle → synthesizer e2e ──

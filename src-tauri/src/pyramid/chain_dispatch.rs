@@ -23,8 +23,8 @@ use super::naming::headline_from_analysis;
 use super::step_context::{compute_prompt_hash, StepContext as CacheStepContext};
 use super::transform_runtime;
 use super::types::{
-    Correction, DebatePosition, DebateTopic, Decision, MetaLayerTopic, NodeShape, PyramidNode,
-    RedTeamEntry, Term, Topic, NODE_SHAPE_DEBATE, NODE_SHAPE_META_LAYER,
+    Correction, DebatePosition, DebateTopic, Decision, MetaLayerTopic, MetaLayerTopicEntry,
+    NodeShape, PyramidNode, RedTeamEntry, Term, Topic, NODE_SHAPE_DEBATE, NODE_SHAPE_META_LAYER,
 };
 use super::{OperationalConfig, Tier1Config};
 
@@ -627,6 +627,7 @@ const MECHANICAL_FUNCTIONS: &[&str] = &[
     "emit_oracle_invoked",
     "decide_crystallization",
     "dispatch_synthesizer",
+    "oracle_finalize",
     "emit_synthesizer_invoked",
     "load_substrate_nodes",
     "create_meta_layer_node",
@@ -1693,12 +1694,29 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                         .unwrap_or_default();
                     drop(conn_guard);
                     let ids: Vec<String> = nodes.into_iter().map(|n| n.id).collect();
-                    let reason = format!(
-                        "purpose_shifted is a deliberate operator signal; crystallizing a \
-                         meta-layer over L0 substrate ({} node(s)) aligned to the new purpose.",
-                        ids.len()
-                    );
-                    (true, reason, ids)
+                    if ids.is_empty() {
+                        // Phase 7b verifier: purpose_shifted on a slug with
+                        // no L0 substrate would have produced a meta-layer
+                        // synthesized over nothing — the writer now raises
+                        // on empty topics, but the oracle itself should
+                        // skip rather than dispatch the synthesizer into a
+                        // guaranteed failure. feedback_loud_deferrals: the
+                        // skip is visible via oracle_finalize's
+                        // meta_layer_oracle_skipped event.
+                        let reason =
+                            "purpose_shifted fired but slug has no L0 substrate to synthesize \
+                             over; skipping crystallization. Supersede purpose after at least \
+                             one L0 node exists for a meaningful meta-layer."
+                                .to_string();
+                        (false, reason, vec![])
+                    } else {
+                        let reason = format!(
+                            "purpose_shifted is a deliberate operator signal; crystallizing a \
+                             meta-layer over L0 substrate ({} node(s)) aligned to the new purpose.",
+                            ids.len()
+                        );
+                        (true, reason, ids)
+                    }
                 }
                 Some("gap_resolved") => {
                     // Inspect the gap node's candidate_resolutions.
@@ -2031,7 +2049,25 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 drop(conn_guard);
             }
 
-            if nodes_out.is_empty() && !covered_substrate_nodes.is_empty() {
+            if covered_substrate_nodes.is_empty() {
+                // Phase 7b verifier (Audit Target 7): an empty covered
+                // list means the caller asked to synthesize over nothing.
+                // The oracle's purpose_shifted arm now pre-filters the
+                // empty-L0 case, so reaching this branch is an upstream
+                // contract bug — either decide_crystallization skipped
+                // the empty-substrate guard or a future direct-call path
+                // sent an unset/empty list. Raise rather than LLM-call
+                // with no context.
+                return Err(anyhow!(
+                    "load_substrate_nodes: covered_substrate_nodes is empty for slug '{}'. \
+                     A synthesizer run needs at least one substrate node; an empty envelope \
+                     means the oracle or caller is routing a crystallization with no grounding \
+                     input. Fix the upstream decide_crystallization rule or the caller's \
+                     envelope.",
+                    ctx.slug,
+                ));
+            }
+            if nodes_out.is_empty() {
                 return Err(anyhow!(
                     "load_substrate_nodes: none of the {} covered substrate node ids resolved \
                      against slug '{}' — the synthesizer has no substrate to synthesize on. \
@@ -2132,6 +2168,75 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 })
                 .unwrap_or_default();
 
+            // topics carries the audit trail — each topic names a theme
+            // and lists anchor substrate node ids. The LLM step's
+            // response_schema declares `topics` required, but Phase 6a
+            // verifier flagged that response_schema is NOT enforced by
+            // the current LLM dispatch path. Without a check here a
+            // non-strict provider return (`{headline, distilled}` with
+            // topics omitted) would write a MetaLayer node with a
+            // silently-empty topics array — the prompt's core grounding
+            // contract (every topic anchors back to substrate ids) would
+            // be lost at the persistence boundary with no signal to the
+            // operator.
+            //
+            // feedback_loud_deferrals: raise loudly on missing /
+            // malformed-shaped topics. An empty topics array is also a
+            // failure (prompt explicitly calls it a failure mode); a
+            // meta-layer with zero topics is structurally meaningless.
+            let topics: Vec<MetaLayerTopicEntry> = match input.get("topics") {
+                Some(Value::Array(arr)) => arr
+                    .iter()
+                    .map(|entry| {
+                        serde_json::from_value::<MetaLayerTopicEntry>(entry.clone())
+                            .map_err(|e| anyhow!(
+                                "create_meta_layer_node: topics entry {:?} did not deserialize \
+                                 into MetaLayerTopicEntry: {}",
+                                entry, e,
+                            ))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                Some(other) => {
+                    return Err(anyhow!(
+                        "create_meta_layer_node: `topics` must be a JSON array per the \
+                         synthesize_meta_layer response_schema, got {:?}. This is the \
+                         audit trail between the synthesis and its substrate; failing \
+                         loudly rather than persist a meta-layer with floating claims.",
+                        other,
+                    ));
+                }
+                None => {
+                    return Err(anyhow!(
+                        "create_meta_layer_node: `topics` is missing from the synthesizer \
+                         LLM step output. The starter-synthesizer response_schema declares \
+                         it required, but the current LLM dispatch path does NOT enforce \
+                         response_schema yet (Phase 6a verifier flag). Refusing to persist \
+                         a meta-layer without the topic→anchor audit trail; fix the LLM \
+                         provider path or the synthesize_meta_layer prompt so topics is \
+                         always returned."
+                    ));
+                }
+            };
+            if topics.is_empty() {
+                return Err(anyhow!(
+                    "create_meta_layer_node: topics array is empty. The synthesize_meta_layer \
+                     prompt explicitly documents this as a failure mode (\"an empty anchor_nodes \
+                     list is a failure mode — the topic is floating\"); a meta-layer with zero \
+                     topics has no audit trail back to substrate. Re-prompt or surface the \
+                     synthesizer's refusal rather than write a hollow node."
+                ));
+            }
+            for t in &topics {
+                if t.anchor_nodes.is_empty() {
+                    return Err(anyhow!(
+                        "create_meta_layer_node: topic '{}' has no anchor_nodes. The \
+                         synthesize_meta_layer prompt requires each topic to anchor at least \
+                         one substrate node id; a floating topic breaks drill-down.",
+                        t.topic,
+                    ));
+                }
+            }
+
             // Pull purpose_question + parent_meta_layer_id. These fields
             // come in via the threaded envelope when upstream steps echo
             // their input, but the default chain_executor threading
@@ -2207,6 +2312,7 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 purpose_question: purpose_question.clone(),
                 parent_meta_layer_id: parent_meta_layer_id.clone(),
                 covered_substrate_nodes: covered_substrate_nodes.clone(),
+                topics: topics.clone(),
             };
             let payload_json = serde_json::to_string(&payload)?;
 
@@ -2279,6 +2385,129 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 "covered_substrate_node_ids": covered_substrate_nodes,
                 "crystallized_event_id": crystallized_event_id,
             }))
+        }
+        "oracle_finalize" => {
+            // Terminal step for `starter-meta-layer-oracle`. Replaces the
+            // Phase 5 generic `log_and_complete` so a SKIP decision lands
+            // loudly in the chronicle.
+            //
+            // Why this exists (verifier Audit Target 1 + feedback_loud_deferrals):
+            //   decide_crystallization may legitimately return
+            //   should_crystallize=false (unknown trigger, gap with no
+            //   candidate_resolutions, chain invoked outside the
+            //   observation-event path). When that happens the
+            //   dispatch_synthesizer step is when-gated off, the chain
+            //   fast-forwards to this terminal step, and the work item
+            //   CASes to `applied`. Before this arm existed the only
+            //   signal was a single info!() line — operator-invisible in
+            //   the chronicle (which is where operators LOOK for
+            //   oracle activity). A skipped oracle run must leave a
+            //   visible mark.
+            //
+            // Behavior:
+            //   - If the threaded input carries should_crystallize=true
+            //     AND a meta_layer_node_id (i.e. create_meta_layer_node
+            //     already ran and emitted meta_layer_crystallized), we
+            //     don't double-emit; just pass through.
+            //   - Otherwise, emit a `meta_layer_oracle_skipped` event
+            //     carrying {reasoning, trigger_event_type, target_node_id,
+            //     source_event_id, purpose_id} so a chronicle reader can
+            //     reconstruct WHY the oracle declined.
+            let should_crystallize = input
+                .get("should_crystallize")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let created = input
+                .get("created")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || input.get("meta_layer_node_id").is_some();
+
+            if should_crystallize && created {
+                // Happy path already emitted meta_layer_crystallized via
+                // create_meta_layer_node. Nothing to add; threading forwards
+                // the writer's output verbatim.
+                info!(
+                    "[mechanical] oracle_finalize slug={} crystallize=true created=true (no-op pass-through)",
+                    ctx.slug,
+                );
+                return Ok(input.clone());
+            }
+
+            let reasoning = input
+                .get("reasoning")
+                .and_then(|v| v.as_str())
+                .unwrap_or("no reasoning carried through threading — likely an upstream author bug in the oracle chain")
+                .to_string();
+            let trigger_event_type = input
+                .get("trigger_event_type")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let source_event_id = input
+                .get("source_event_id")
+                .and_then(|v| v.as_i64());
+            let purpose_id = input
+                .get("purpose_id")
+                .and_then(|v| v.as_i64());
+
+            let mut meta = serde_json::Map::new();
+            meta.insert("reasoning".to_string(), Value::String(reasoning.clone()));
+            if let Some(ref t) = trigger_event_type {
+                meta.insert(
+                    "trigger_event_type".to_string(),
+                    Value::String(t.clone()),
+                );
+            }
+            if let Some(ref t) = target_node_id {
+                meta.insert("target_node_id".to_string(), Value::String(t.clone()));
+            }
+            if let Some(eid) = source_event_id {
+                meta.insert("source_event_id".to_string(), Value::from(eid));
+            }
+            if let Some(pid) = purpose_id {
+                meta.insert("purpose_id".to_string(), Value::from(pid));
+            }
+            let metadata_json = serde_json::to_string(&Value::Object(meta))?;
+
+            info!(
+                "[mechanical] oracle_finalize slug={} crystallize=false reasoning=\"{}\"",
+                ctx.slug, reasoning,
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "meta_layer_oracle_skipped",
+                None,
+                None,
+                None,
+                None,
+                target_node_id.as_deref(),
+                None,
+                Some(&metadata_json),
+            )?;
+            drop(conn_guard);
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert(
+                "oracle_finalized".to_string(),
+                Value::from(true),
+            );
+            out.insert(
+                "oracle_skipped_event_id".to_string(),
+                Value::from(event_id),
+            );
+            Ok(Value::Object(out))
         }
         // ── Post-build accretion v5 Phase 6b: sub-chain invocation ──────────
         //

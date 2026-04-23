@@ -20,16 +20,20 @@ description: >
            candidate_resolutions (there is substrate to synthesize on).
          * anything else   → skip (should_crystallize=false) — not a silent
            stub: the synthesizer call is gated by a `when:` guard, and the
-           oracle_log_and_complete step still fires so the work item CASes
-           to applied cleanly.
+           oracle_finalize step still fires so the work item CASes to
+           applied cleanly AND a `meta_layer_oracle_skipped` observation
+           event lands in the chronicle with the reasoning string (Phase
+           7b verifier — skip-path visibility per feedback_loud_deferrals).
        Phase 8+ replaces the heuristic with an LLM judge step reading the
        full purpose + substrate context.
     3. dispatch_synthesizer — mechanical wrapper reading the threaded
        decide_crystallization output and invoking starter-synthesizer via
        the sub-chain runner. Guarded by
        `when: $decide_crystallization.should_crystallize == true`.
-    4. oracle_log_and_complete — terminal no-op so the work item CASes to
-       applied even on skip paths.
+    4. oracle_finalize — terminal step. On the happy path (synthesizer
+       created a meta-layer) it passes through; on the skip path it emits
+       a `meta_layer_oracle_skipped` chronicle event so the operator sees
+       WHY the oracle declined.
 
   Notes:
     - Starter runner does NOT resolve $refs inside `step.input` literals,
@@ -63,9 +67,9 @@ steps:
     rust_function: dispatch_synthesizer
     when: $decide_crystallization.should_crystallize == true
 
-  - name: oracle_log_and_complete
+  - name: oracle_finalize
     primitive: custom
     mechanical: true
-    rust_function: log_and_complete
+    rust_function: oracle_finalize
 
 post_build: []
