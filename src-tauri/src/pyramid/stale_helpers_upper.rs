@@ -1495,6 +1495,14 @@ pub struct ManifestGenerationInput {
     pub changed_children: Vec<ChangedChild>,
     /// Originating stale-check reason (for prompt context).
     pub stale_check_reason: String,
+    /// Phase 8 tail: annotations on the target node that post-date the last
+    /// re-distill. The prompt renders these in a dedicated section so the
+    /// LLM sees the annotation content directly — closing the
+    /// non-correction cascade gap. For correction annotations this list is
+    /// redundant with `changed_children` / `pyramid_deltas`, but harmless;
+    /// the LLM can cross-reference. Empty for pure file-change stale paths
+    /// (no annotations on the node), which leaves the prompt unchanged.
+    pub cascade_annotations: Vec<CascadeAnnotation>,
 }
 
 #[derive(Debug, Clone)]
@@ -1506,6 +1514,25 @@ pub struct ChangedChild {
     /// manifest's `children_swapped.old` / `.new` will be formatted as
     /// `{prefix}:{child_id}`.
     pub slug_prefix: Option<String>,
+}
+
+/// Phase 8 tail: compact representation of an annotation passed to the
+/// change-manifest LLM. Carries only the fields the prompt renders; payload
+/// fidelity comes from `pyramid_annotations.content` verbatim (truncated to
+/// keep the prompt bounded).
+///
+/// Populated by `load_cascade_annotations_for_target` which reads all rows
+/// on the target node since the last re-distill application (or node
+/// creation if no prior re-distill). Ordered oldest-first so the prompt
+/// reads like a narrative of accumulated feedback.
+#[derive(Debug, Clone)]
+pub struct CascadeAnnotation {
+    pub id: i64,
+    pub annotation_type: String,
+    pub author: String,
+    pub content: String,
+    pub question_context: Option<String>,
+    pub created_at: String,
 }
 
 /// Load the change-manifest prompt. Reads the canonical file at
@@ -1644,6 +1671,51 @@ pub async fn generate_change_manifest(
         "\n---\n\nSTALE-CHECK REASON: {}\n",
         input.stale_check_reason
     ));
+
+    // Phase 8 tail: surface cascade annotations directly to the LLM.
+    // Only emit the section when there is something to render — keeps the
+    // prompt identical to pre-tail for pure file-change stale paths (L0
+    // file_change mutations) and for L1+ nodes that have no pending
+    // annotations since the last re-distill.
+    //
+    // Design note: we render annotations in their OWN section, not
+    // smuggled into `changed_children`, because they are not child-node
+    // deltas — they are feedback ON the target itself. Mixing them into
+    // `changed_children` would mislead the LLM about which node changed
+    // and pollute the children_swapped reasoning. `creates_delta` stays
+    // truthful (correction-only) per vocab and per the Option-3 hybrid
+    // chosen in the Phase 8 tail scope (narrative feedback channel +
+    // semantic delta channel as distinct inputs).
+    if !input.cascade_annotations.is_empty() {
+        user_prompt.push_str(
+            "\n---\n\nPENDING ANNOTATIONS ON THIS NODE:\n\
+             These are annotations added to the target node since its last \
+             re-distill. Your manifest should incorporate this feedback. \
+             If annotations contradict each other or the existing distilled \
+             text, surface that tension explicitly in the reason field.\n",
+        );
+        for (i, a) in input.cascade_annotations.iter().enumerate() {
+            user_prompt.push_str(&format!(
+                "\n{}. [type={}, author={}, created_at={}]\n",
+                i + 1,
+                a.annotation_type,
+                a.author,
+                a.created_at,
+            ));
+            if let Some(ref q) = a.question_context {
+                if !q.is_empty() {
+                    user_prompt.push_str(&format!(
+                        "   question_context: {}\n",
+                        truncate_str(q, 400)
+                    ));
+                }
+            }
+            user_prompt.push_str(&format!(
+                "   content: {}\n",
+                truncate_str(&a.content, 1_600)
+            ));
+        }
+    }
 
     // ── LLM call ──
     // Note (Pillar 37): temperature + max_tokens here match the existing
@@ -2098,6 +2170,44 @@ pub async fn execute_supersession(
     })
     .await??;
 
+    // Phase 8 tail: load cascade annotations for the target so the
+    // change-manifest prompt can surface them. Pulled in its own
+    // spawn_blocking because load_supersession_node_context's return value
+    // is `Clone`-only via its current shape — simpler to add a second
+    // blocking query than to widen SupersessionNodeContext.
+    //
+    // Failure here is NOT fatal: if the annotation read errors (e.g.
+    // schema skew during migration, locked DB race), we log and fall
+    // back to an empty list. The re-distill still runs, just without the
+    // annotation channel. A hard error would regress the correction-only
+    // path the verifier already proved works end-to-end.
+    let cascade_annotations = tokio::task::spawn_blocking({
+        let db = db_owned.clone();
+        let nid = nid.clone();
+        let s = s.clone();
+        move || -> Vec<CascadeAnnotation> {
+            let conn = match super::db::open_pyramid_connection(Path::new(&db)) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, "cascade_annotations: failed to open DB — empty list");
+                    return Vec::new();
+                }
+            };
+            match load_cascade_annotations_for_target(&conn, &s, &nid) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        slug = %s, node_id = %nid, error = %e,
+                        "cascade_annotations: load failed — empty list"
+                    );
+                    Vec::new()
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or_default();
+
     // The "changed children" the LLM needs are the nodes under this one that
     // appear in recent deltas. For depth==0 nodes this is a synthesized
     // entry carrying the source file content (see
@@ -2143,6 +2253,7 @@ pub async fn execute_supersession(
         expected_build_version,
         changed_children,
         stale_check_reason,
+        cascade_annotations,
     };
 
     // Phase 6 retrofit: build the unified StepContext for the change
@@ -2660,6 +2771,118 @@ fn load_supersession_node_context(
         source_file_path,
         source_snapshot,
     })
+}
+
+/// Phase 8 tail — annotation content channel.
+///
+/// Loads every annotation on `node_id` that post-dates the node's most
+/// recent re-distill apply (or the node's `created_at` if no prior
+/// re-distill). The result flows into `ManifestGenerationInput.
+/// cascade_annotations` and is rendered in the change-manifest prompt so
+/// the LLM sees non-correction annotation content directly — closing the
+/// gap the Phase 8 verifier flagged: pre-tail, only `correction`
+/// annotations (vocab `creates_delta=true`) produced pyramid_deltas rows
+/// the prompt surfaced via `recent_deltas` / `changed_children`;
+/// observation, hypothesis, steel_man, position, etc. were invisible to
+/// the LLM.
+///
+/// Watermark choice: `dadbear_result_applications.applied_at` for actions
+/// beginning with `re_distilled:` on this target. This is the correct
+/// "last time the LLM saw this node's annotations" checkpoint — it moves
+/// forward only when the supervisor arm successfully ran through to
+/// applied. A failed re-distill leaves the watermark where it was, so the
+/// next successful run re-includes the same annotations.
+///
+/// Fallback: when no prior re-distill row exists (first re-distill on a
+/// fresh node, or a vine node with no applications yet), the watermark
+/// becomes `pyramid_nodes.created_at` so the first re-distill still sees
+/// every annotation added since creation.
+///
+/// Ordering: oldest-first so the prompt reads like a narrative of
+/// accumulated feedback. Bounded at 50 rows to keep prompts tractable
+/// even on heavily-annotated nodes — more than 50 pending annotations on
+/// a single node means the re-distill cadence is broken and the
+/// individual annotations matter less than the volume, which the LLM can
+/// still weigh from the count alone.
+fn load_cascade_annotations_for_target(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Vec<CascadeAnnotation>> {
+    // Most recent re-distill applied_at (watermark ceiling).
+    let last_redistill_at: Option<String> = conn
+        .query_row(
+            "SELECT MAX(applied_at) FROM dadbear_result_applications
+              WHERE slug = ?1 AND target_id = ?2
+                AND action LIKE 're_distilled:%'",
+            rusqlite::params![slug, node_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap_or(None);
+
+    // Fallback: node's created_at when no prior re-distill exists.
+    let watermark: String = match last_redistill_at {
+        Some(ts) => ts,
+        None => conn
+            .query_row(
+                "SELECT COALESCE(created_at, datetime('now','-100 years'))
+                   FROM pyramid_nodes
+                  WHERE slug = ?1 AND id = ?2",
+                rusqlite::params![slug, node_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_else(|_| "1970-01-01 00:00:00".to_string()),
+    };
+
+    // `>=` not `>` on the watermark comparison: SQLite `datetime('now')`
+    // has only second granularity, so a node seeded at time T and an
+    // annotation inserted milliseconds later both read as T. Using `>`
+    // would silently drop annotations on a fresh node whose watermark
+    // falls back to `pyramid_nodes.created_at`. Ties go toward INCLUDE —
+    // a spurious extra annotation in the prompt is harmless; a silent
+    // drop (feedback_loud_deferrals) is not.
+    let mut stmt = conn.prepare(
+        "SELECT id, annotation_type, author, content, question_context,
+                created_at
+           FROM pyramid_annotations
+          WHERE slug = ?1 AND node_id = ?2 AND created_at >= ?3
+          ORDER BY created_at ASC, id ASC
+          LIMIT 50",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![slug, node_id, watermark],
+        |row| {
+            Ok(CascadeAnnotation {
+                id: row.get(0)?,
+                annotation_type: row.get(1)?,
+                author: row.get(2)?,
+                content: row.get(3)?,
+                question_context: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        },
+    )?;
+    let mut out = Vec::new();
+    for r in rows {
+        if let Ok(a) = r {
+            out.push(a);
+        }
+    }
+    Ok(out)
+}
+
+/// Phase 8 tail: test-only wrapper exposing
+/// `load_cascade_annotations_for_target` so the watermark-regression test
+/// in `db.rs::phase8_post_build_tests` can call the helper without going
+/// through the full `execute_supersession` path. NOT for production use —
+/// `execute_supersession` is the production entry point.
+#[doc(hidden)]
+pub fn public_load_cascade_annotations_for_target_test_only(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Vec<CascadeAnnotation>> {
+    load_cascade_annotations_for_target(conn, slug, node_id)
 }
 
 fn build_changed_children_from_deltas(
@@ -4572,6 +4795,7 @@ mod tests {
                 slug_prefix: None,
             }],
             stale_check_reason: "test".into(),
+            cascade_annotations: vec![],
         };
 
         // Build the call as a typed pointer-bound future without

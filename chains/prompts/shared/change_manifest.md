@@ -10,6 +10,7 @@ RULES:
 - Topic operations: "add" for a genuinely new topic, "update" for a topic whose current text needs refinement, "remove" ONLY for a topic that is no longer relevant after the child changed.
 - The reason field is mandatory: one sentence explaining what changed and why.
 - Do NOT invent children_swapped entries the user did not ask about — only include the child id pairs you were told about in the input.
+- If a PENDING ANNOTATIONS section is present, treat each annotation as feedback on this node that may warrant an update. Weigh the annotation's type and content against the existing distilled text. If the annotations contradict each other or the prior synthesis, surface the tension explicitly in the reason field rather than silently picking one side.
 
 Output valid JSON in this exact shape:
 

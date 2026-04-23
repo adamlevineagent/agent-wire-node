@@ -32925,6 +32925,246 @@ mod phase8_post_build_tests {
         );
     }
 
+    // ── Test 2b: CROWN JEWEL (Phase 8 TAIL) — NON-correction annotation content
+    //            actually reaches the LLM prompt + node gets updated.
+    // ──────────────────────────────────────────────────────────────────────
+    //
+    // THE test for the Phase 8 verifier's deferred-to-v6 gap. Pre-tail, the
+    // crown jewel above (annotation_to_node_update_true_end_to_end) was only
+    // provably correct for `correction` annotations — the only vocab type
+    // with `creates_delta=true`, which routes content through pyramid_deltas
+    // into the prompt's `changed_children` section. For every other type
+    // (observation, hypothesis, steel_man, position, etc.) the LLM saw the
+    // node state + a boilerplate stale-check reason + empty changed_children
+    // and typically produced a no-op manifest — annotation content was NEVER
+    // visible to the re-distill.
+    //
+    // Phase 8 tail closes this by adding `cascade_annotations` to
+    // `ManifestGenerationInput`. The supervisor arm -> execute_supersession
+    // -> generate_change_manifest path now loads every annotation on the
+    // target node since the last re-distill (via
+    // `load_cascade_annotations_for_target`) and renders them in a dedicated
+    // PENDING ANNOTATIONS section of the prompt.
+    //
+    // This test proves the channel end-to-end by BODY-MATCHING the mockito
+    // mock on the annotation content string: the mock ONLY fires when the
+    // LLM request body contains the annotation's content. If the content
+    // doesn't reach the prompt, mockito returns 501 on the unmatched
+    // request and execute_supersession's LLM call errors out. A green test
+    // therefore proves BOTH (a) annotation content reaches the LLM prompt
+    // AND (b) the LLM-returned manifest updates pyramid_nodes.
+    //
+    // Annotation type: `observation` — a type that vocab has
+    // `creates_delta=false` for. No pyramid_deltas row is written by this
+    // test for this annotation; the only way the content reaches the LLM
+    // is via the new cascade_annotations path.
+    #[tokio::test]
+    async fn non_correction_annotation_reaches_llm_and_updates_node() {
+        let _guard = test_lock();
+
+        // Annotation content strings. These must appear in the mocked LLM
+        // request body for the mock to fire. The Regex matcher makes the
+        // assertion structural — if either string is missing, the mock
+        // returns 501 on an unmatched request.
+        let annotation_content =
+            "distinctive observation string aardvark-cascade-channel-42";
+        let annotation_type = "observation";
+
+        let mut server = mockito::Server::new_async().await;
+        let manifest_json = serde_json::json!({
+            "node_id": "L1-TAIL",
+            "identity_changed": false,
+            "content_updates": {
+                "distilled": "NEW distilled driven by the observation annotation — Phase 8 tail",
+                "headline": "TAIL updated headline"
+            },
+            "children_swapped": [],
+            "reason": "observation annotation incorporated via cascade_annotations channel",
+            "build_version": 2
+        })
+        .to_string();
+
+        // Body-matching mock: fires ONLY when BOTH the annotation content AND
+        // the "PENDING ANNOTATIONS" section header appear in the request
+        // body. If cascade_annotations were empty, neither string would be
+        // in the prompt → mockito would return 501 on the unmatched call →
+        // execute_supersession would error out → this test would fail loud.
+        let content_re = regex::escape(annotation_content);
+        let _m = server
+            .mock("POST", "/chat/completions")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(content_re),
+                mockito::Matcher::Regex(
+                    "PENDING ANNOTATIONS ON THIS NODE".to_string(),
+                ),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openrouter_body(&manifest_json))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap().to_string();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            init_pyramid_db(&conn).unwrap();
+            vocab_entries::invalidate_cache();
+            create_slug(&conn, "p8-tail", &ContentType::Code, "/tmp/p8-tail").unwrap();
+            seed_l1_node(&conn, "p8-tail", "L1-TAIL");
+
+            // Insert a non-correction annotation BEFORE the re-distill.
+            // This is what pyramid_annotations looks like for a real
+            // observation annotation landed via the annotation route.
+            conn.execute(
+                "INSERT INTO pyramid_annotations
+                     (slug, node_id, annotation_type, content, question_context,
+                      author, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
+                rusqlite::params![
+                    "p8-tail",
+                    "L1-TAIL",
+                    annotation_type,
+                    annotation_content,
+                    "what changed about the cascade channel?",
+                    "phase8-tail-test",
+                ],
+            )
+            .unwrap();
+
+            drop(conn);
+        }
+
+        let config = mocked_llm_config(server.url()).await;
+        // Drive execute_supersession directly — this is the exact function
+        // the supervisor's re_distill arm calls (via
+        // run_re_distill_supervisor_arm). Testing at this layer isolates
+        // the cascade_annotations channel from the cascade chain / work
+        // item machinery already covered by the correction-path crown jewel.
+        let resolved = crate::pyramid::stale_helpers_upper::execute_supersession(
+            "L1-TAIL",
+            &db_path,
+            "p8-tail",
+            &config,
+            "openai/gpt-4o-mini",
+        )
+        .await
+        .expect(
+            "execute_supersession must succeed — if it fails with \
+             UnmatchedRequest, the annotation content did NOT reach the \
+             LLM prompt (cascade_annotations channel is broken)",
+        );
+        assert_eq!(resolved, "L1-TAIL", "node identity must NOT change");
+
+        // Post-condition: node was updated with the manifest's new content.
+        // This confirms the full loop: annotation → prompt → LLM → manifest
+        // → pyramid_nodes UPDATE for a non-correction annotation.
+        let conn = Connection::open(&db_path).unwrap();
+        let (post_distilled, post_headline, post_bv): (String, String, i64) = conn
+            .query_row(
+                "SELECT distilled, headline, COALESCE(build_version, 1)
+                   FROM pyramid_nodes
+                  WHERE slug = 'p8-tail' AND id = 'L1-TAIL'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(
+            post_distilled.contains(
+                "NEW distilled driven by the observation annotation"
+            ),
+            "node distilled must carry the manifest's new content for \
+             a non-correction annotation, got: {post_distilled}"
+        );
+        assert_eq!(post_headline, "TAIL updated headline");
+        assert_eq!(post_bv, 2, "build_version must bump 1 → 2");
+    }
+
+    // ── Test 2c: cascade_annotations watermark — prior re-distill filters
+    //            out already-seen annotations on subsequent runs.
+    // ──────────────────────────────────────────────────────────────────────
+    //
+    // Directly tests `load_cascade_annotations_for_target` — no LLM mock
+    // needed. Seeds a stale annotation (before the prior re-distill) and a
+    // fresh annotation (after), inserts a `re_distilled:%`
+    // dadbear_result_applications row between them, and asserts the helper
+    // returns only the fresh annotation. If the watermark is wrong, both
+    // annotations would come back.
+    #[test]
+    fn cascade_annotations_respects_watermark() {
+        let _guard = test_lock();
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        create_slug(&conn, "p8-wm", &ContentType::Code, "/tmp/p8-wm").unwrap();
+        seed_l1_node(&conn, "p8-wm", "L1-WM");
+
+        // Stale annotation, 7 days ago.
+        conn.execute(
+            "INSERT INTO pyramid_annotations
+                 (slug, node_id, annotation_type, content,
+                  question_context, author, created_at)
+             VALUES (?1, ?2, 'observation', 'stale-content-xxx',
+                     NULL, 'wm', datetime('now', '-7 days'))",
+            rusqlite::params!["p8-wm", "L1-WM"],
+        )
+        .unwrap();
+
+        // Prior re-distill 3 days ago. dadbear_work_items requires
+        // batch_id + epoch_id NOT NULL; supply both.
+        conn.execute(
+            "INSERT INTO dadbear_work_items
+                 (id, slug, batch_id, epoch_id, step_name, primitive,
+                  layer, target_id, system_prompt, user_prompt, model_tier,
+                  observation_event_ids, compiled_at, state,
+                  state_changed_at, applied_at)
+             VALUES ('wi-prior', 'p8-wm', 'batch-wm', 'epoch-wm',
+                     'cascade_re_distill', 're_distill', 1, 'L1-WM',
+                     '', '', 'mid', '[]',
+                     datetime('now', '-3 days'), 'applied',
+                     datetime('now', '-3 days'), datetime('now', '-3 days'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dadbear_result_applications
+                 (work_item_id, slug, target_id, action, applied_at)
+             VALUES ('wi-prior', 'p8-wm', 'L1-WM', 're_distilled:L1-WM',
+                     datetime('now', '-3 days'))",
+            [],
+        )
+        .unwrap();
+
+        // Fresh annotation, just now.
+        conn.execute(
+            "INSERT INTO pyramid_annotations
+                 (slug, node_id, annotation_type, content,
+                  question_context, author, created_at)
+             VALUES (?1, ?2, 'observation', 'fresh-content-yyy',
+                     NULL, 'wm', datetime('now'))",
+            rusqlite::params!["p8-wm", "L1-WM"],
+        )
+        .unwrap();
+
+        // Query the helper directly — no LLM call. Watermark must be the
+        // prior re-distill's applied_at (3 days ago), so ONLY the fresh
+        // annotation (now) qualifies. If the watermark is broken (e.g.
+        // uses node.created_at instead), both rows would come back.
+        let out = crate::pyramid::stale_helpers_upper::
+            public_load_cascade_annotations_for_target_test_only(
+                &conn, "p8-wm", "L1-WM",
+            )
+            .unwrap();
+        assert_eq!(
+            out.len(),
+            1,
+            "watermark must filter stale annotation; got: {:?}",
+            out.iter().map(|a| a.content.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(out[0].content, "fresh-content-yyy");
+    }
+
     // Silences unused-import warning when only some tests run.
     #[allow(dead_code)]
     fn _touch_annotation_type(_: AnnotationType, _: PyramidAnnotation) {}

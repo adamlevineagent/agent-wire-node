@@ -2287,21 +2287,33 @@ fn emit_state_changed(
 /// → chain → queue_re_distill → supervisor arm → execute_supersession →
 /// pyramid_nodes UPDATE path in one test.
 ///
-/// FIXME(v6 annotation-aware re-distill): `execute_supersession` generates the
-/// change manifest from node content + `pyramid_deltas.content` for the node's
-/// thread. Today only `correction`-type annotations write a delta (vocab
-/// `creates_delta=true`), so for other annotation types (observation,
-/// hypothesis, steel_man, etc.) the LLM prompt sees NO annotation text. It
-/// gets node state + "Automated stale check: delta(s) detected on children"
-/// reason + empty changed_children — and will typically return a no-op
-/// manifest. The re-distill path still runs, the supervisor still CAS'es to
-/// applied, and the chronicle breadcrumb lands, but the node isn't meaningfully
-/// updated for non-correction annotations. This is a spec-level gap outside
-/// Phase 8 scope: a proper fix requires either (a) routing annotation content
-/// into `ManifestGenerationInput` via a new `cascade_annotations: Vec<Annot>`
-/// field, or (b) having `creates_delta` default to true across all annotation
-/// types that should cascade. Flagged here rather than silently accepted per
-/// feedback_loud_deferrals.
+/// Phase 8 tail — annotation content channel (closes the v6 FIXME).
+///
+/// `execute_supersession` builds `ManifestGenerationInput` with a
+/// `cascade_annotations: Vec<CascadeAnnotation>` field populated from
+/// `pyramid_annotations` WHERE node_id = target AND created_at > (last
+/// re-distill `applied_at` | node `created_at`). Every annotation type —
+/// `observation`, `hypothesis`, `steel_man`, `position`, `correction`, etc.
+/// — is surfaced to the change-manifest prompt in its own PENDING
+/// ANNOTATIONS section, so the LLM sees non-correction annotation content
+/// directly and can decide whether to update distilled / headline / topics.
+///
+/// Semantic clarity preserved (Option-3 hybrid per scope doc):
+/// - `creates_delta=true` (correction only) still routes through
+///   `pyramid_deltas` → `recent_deltas` → `changed_children`. That is the
+///   mechanical field-level edit channel.
+/// - `creates_delta=false` (everything else) flows through
+///   `cascade_annotations`. That is the narrative feedback channel.
+/// Both channels are visible to the LLM; `creates_delta` remains a
+/// truthful statement about WHICH mechanism applies, not a gate on
+/// whether the annotation reaches the prompt at all.
+///
+/// The watermark for `cascade_annotations` is the target's most recent
+/// `dadbear_result_applications.action LIKE 're_distilled:%'.applied_at`
+/// (falling back to `pyramid_nodes.created_at` on first re-distill).
+/// Failed re-distills leave the watermark where it was, so the next run
+/// re-includes the same annotations — no silent loss of annotation
+/// feedback on retry.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_re_distill_supervisor_arm(
     db_path: &str,
