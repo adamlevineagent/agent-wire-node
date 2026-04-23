@@ -745,6 +745,52 @@ mod tests {
         }
     }
 
+    /// Phase 0a-2 WS1: assert that each of the three new walker-v3
+    /// internal-state schemas (`migration_marker`, `onboarding_state`,
+    /// `node_identity_history`) resolves all four parts at boot —
+    /// schema_definition, schema_annotation, generation_skill, and
+    /// default_seed. Plan rev 1.0.2 named the four-part-completeness
+    /// gap in schema_registry boot; Phase 0b extends this to all six
+    /// walker_* schemas + `compute_market_offer` skill.
+    #[test]
+    fn test_walker_schemas_four_part_complete() {
+        let conn = mem_conn();
+        let report = walk_bundled_contributions_manifest(&conn).unwrap();
+        assert_eq!(
+            report.failed, 0,
+            "bundled manifest walk had {} failures",
+            report.failed
+        );
+
+        let registry = SchemaRegistry::hydrate_from_contributions(&conn).unwrap();
+
+        for schema_type in [
+            "migration_marker",
+            "onboarding_state",
+            "node_identity_history",
+        ] {
+            let entry = registry.get(schema_type).unwrap_or_else(|| {
+                panic!("{schema_type}: no schema_definition resolved from bundled manifest")
+            });
+            assert!(
+                !entry.schema_definition_contribution_id.is_empty(),
+                "{schema_type}: schema_definition contribution_id empty"
+            );
+            assert!(
+                !entry.schema_annotation_contribution_id.is_empty(),
+                "{schema_type}: schema_annotation contribution_id missing — four-part bundle incomplete"
+            );
+            assert!(
+                !entry.generation_skill_contribution_id.is_empty(),
+                "{schema_type}: generation_skill contribution_id missing — four-part bundle incomplete"
+            );
+            assert!(
+                entry.default_seed_contribution_id.is_some(),
+                "{schema_type}: default_seed contribution_id missing — four-part bundle incomplete"
+            );
+        }
+    }
+
     #[test]
     fn test_annotation_body_matches_applies_to() {
         assert!(annotation_body_matches(

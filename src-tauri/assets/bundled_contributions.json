@@ -324,6 +324,105 @@
       "applies_to": "reconciliation_result"
     },
     {
+      "contribution_id": "bundled-schema_definition-migration_marker-v1",
+      "schema_type": "schema_definition",
+      "slug": "migration_marker",
+      "yaml_content": "{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"title\":\"Migration Marker\",\"description\":\"Active schema-version string for walker/migration boot gating. The body value (e.g. 'v2', 'v3-db-migrated-config-pending', 'v3', 'v4') names the schema version currently applied to this node. Written by migration code as a superseding contribution; read at boot to decide whether a migration pass is needed.\",\"type\":\"object\",\"required\":[\"schema_type\",\"body\"],\"properties\":{\"schema_type\":{\"type\":\"string\",\"const\":\"migration_marker\"},\"body\":{\"type\":\"string\",\"description\":\"Schema-version string (e.g. 'v2', 'v3-db-migrated-config-pending', 'v3')\"}}}",
+      "triggering_note": "Bundled JSON schema for migration_marker (walker v3 Phase 0a-2)",
+      "applies_to": "migration_marker"
+    },
+    {
+      "contribution_id": "bundled-schema_annotation-migration_marker-v1",
+      "schema_type": "schema_annotation",
+      "slug": "migration_marker",
+      "yaml_content": "schema_type: schema_annotation\napplies_to: migration_marker\nversion: 1\nlabel: \"Migration Marker\"\ndescription: \"Active schema-version string. Written by migration flow, not operator-edited directly.\"\nfields:\n  body:\n    label: \"Schema Version\"\n    help: \"Current schema version string (e.g. v2, v3-db-migrated-config-pending, v3). Managed by migration code; do not edit manually.\"\n    widget: text\n    visibility: advanced\n",
+      "triggering_note": "Bundled UI annotation for migration_marker (walker v3 Phase 0a-2)"
+    },
+    {
+      "contribution_id": "bundled-skill-generation-migration_marker-v1",
+      "schema_type": "skill",
+      "slug": "generation/migration_marker.md",
+      "yaml_content": "You are generating a migration_marker YAML for a Wire Node.\n\nThe migration_marker is an internal schema-version tracker — its body is a\nversion string like `v2`, `v3-db-migrated-config-pending`, or `v3`. It is\nwritten by migration code at boot when schema versions change, NOT by\noperators. Operator-generated migration_marker YAMLs are rare; this skill\nexists to complete the four-part bundle for the schema but typically will\nnot be invoked.\n\n## Schema (JSON Schema)\n{schema}\n\n## User Intent\n{intent}\n\n## Output rules\n\n- Output ONLY the YAML document, no prose before or after\n- Start the document with `schema_type: migration_marker`\n- Set `body` to the version string the user requests (verbatim)\n- Do not invent intermediate version strings; use exactly what the user provides\n",
+      "triggering_note": "Bundled generation prompt for migration_marker (walker v3 Phase 0a-2)",
+      "topics_extra": [
+        "generation",
+        "migration_marker"
+      ]
+    },
+    {
+      "contribution_id": "bundled-migration_marker-default-v1",
+      "schema_type": "migration_marker",
+      "slug": null,
+      "yaml_content": "schema_type: migration_marker\n# Pre-walker-v3 state. Walker v3 migration logic supersedes this with\n# `v3-db-migrated-config-pending` mid-transaction, then `v3` after the\n# post-DDL config-file rewrite completes. Missing marker is treated as\n# `v2` per the boot rules in walker-provider-configs-and-slot-policy-v3\n# §2.18 / §6.\nbody: \"v2\"\n",
+      "triggering_note": "Bundled default migration_marker (walker v3 Phase 0a-2)"
+    },
+    {
+      "contribution_id": "bundled-schema_definition-onboarding_state-v1",
+      "schema_type": "schema_definition",
+      "slug": "onboarding_state",
+      "yaml_content": "{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"title\":\"Onboarding State\",\"description\":\"Durable onboarding progress and acknowledgments. Written by the onboarding save path, Page 4 market consent, unknown-provider migration acks, and chain-engine-enable acks. Surfaces in Settings as the authoritative source of completed onboarding steps.\",\"type\":\"object\",\"required\":[\"schema_type\"],\"properties\":{\"schema_type\":{\"type\":\"string\",\"const\":\"onboarding_state\"},\"onboarding_complete_at\":{\"type\":[\"string\",\"null\"],\"description\":\"ISO-8601 timestamp of first full onboarding completion. Null until operator finishes the flow.\"},\"completed_pages\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Page identifiers the operator has completed (e.g. identity, storage, mesh, market-consent).\"},\"migration_acks\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"boolean\"},\"description\":\"Per-migration acknowledgments keyed by migration id (e.g. migration_unknown_providers_ack). True once operator has acknowledged the prompt.\"},\"chain_engine_enable_ack\":{\"type\":[\"boolean\",\"null\"],\"description\":\"Operator acknowledgment of chain-engine enable (A-F5 / use_chain_engine explicit-false modal).\"},\"re_onboarding_required\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Set true by restore-from-backup when node identity mismatch is detected; Settings surfaces a re-onboarding prompt.\"}}}",
+      "triggering_note": "Bundled JSON schema for onboarding_state (walker v3 Phase 0a-2)",
+      "applies_to": "onboarding_state"
+    },
+    {
+      "contribution_id": "bundled-schema_annotation-onboarding_state-v1",
+      "schema_type": "schema_annotation",
+      "slug": "onboarding_state",
+      "yaml_content": "schema_type: schema_annotation\napplies_to: onboarding_state\nversion: 1\nlabel: \"Onboarding State\"\ndescription: \"Durable onboarding progress and migration acknowledgments.\"\n# operator_private: syncs to Wire as authenticated-private (restorable across\n# reinstalls), unlike local_only which never leaves the node.\noperator_private: true\nfields:\n  onboarding_complete_at:\n    label: \"Onboarding Completed At\"\n    help: \"Timestamp of first full onboarding completion\"\n    widget: text\n    visibility: basic\n  completed_pages:\n    label: \"Completed Pages\"\n    help: \"Onboarding page ids the operator has finished\"\n    widget: list\n    item_widget: text\n    visibility: basic\n  migration_acks:\n    label: \"Migration Acknowledgments\"\n    help: \"Per-migration ack flags keyed by migration id\"\n    widget: code\n    visibility: advanced\n  chain_engine_enable_ack:\n    label: \"Chain Engine Enable Ack\"\n    help: \"Operator acknowledgment for use_chain_engine enable (A-F5 modal).\"\n    widget: toggle\n    visibility: advanced\n  re_onboarding_required:\n    label: \"Re-onboarding Required\"\n    help: \"Set true when a restore-from-backup detected node identity mismatch\"\n    widget: toggle\n    visibility: advanced\n",
+      "triggering_note": "Bundled UI annotation for onboarding_state (walker v3 Phase 0a-2)"
+    },
+    {
+      "contribution_id": "bundled-skill-generation-onboarding_state-v1",
+      "schema_type": "skill",
+      "slug": "generation/onboarding_state.md",
+      "yaml_content": "You are generating an onboarding_state YAML for a Wire Node.\n\nThe onboarding_state contribution tracks durable onboarding progress —\nwhen onboarding completed, which pages were finished, which migration\nprompts were acknowledged, whether the chain-engine enable modal was\nacknowledged, and whether a restore-from-backup detected identity\nmismatch. This contribution is written by the onboarding save path, Page\n4 market-consent, the unknown-provider migration modal, and the\nchain-engine-enable ack path — NOT by operators directly. This generation\nskill exists to complete the four-part bundle; typical use is narrow\n(e.g. manual repair flows).\n\n## Schema (JSON Schema)\n{schema}\n\n## User Intent\n{intent}\n\n## Output rules\n\n- Output ONLY the YAML document, no prose before or after\n- Start the document with `schema_type: onboarding_state`\n- Use null / absent fields where the user's intent does not set them\n- Do not fabricate timestamps; if the user doesn't supply one, omit\n  `onboarding_complete_at`\n",
+      "triggering_note": "Bundled generation prompt for onboarding_state (walker v3 Phase 0a-2)",
+      "topics_extra": [
+        "generation",
+        "onboarding_state"
+      ]
+    },
+    {
+      "contribution_id": "bundled-onboarding_state-default-v1",
+      "schema_type": "onboarding_state",
+      "slug": null,
+      "yaml_content": "schema_type: onboarding_state\n# Uninitialized — no onboarding completion, no pages completed, no acks.\n# Walker v3 onboarding save path / Page 4 consent / unknown-provider\n# migration modal / chain-engine-enable ack path all supersede this seed\n# with operator-written state.\nonboarding_complete_at: null\ncompleted_pages: []\nmigration_acks: {}\nchain_engine_enable_ack: null\nre_onboarding_required: false\n",
+      "triggering_note": "Bundled default onboarding_state (walker v3 Phase 0a-2)"
+    },
+    {
+      "contribution_id": "bundled-schema_definition-node_identity_history-v1",
+      "schema_type": "schema_definition",
+      "slug": "node_identity_history",
+      "yaml_content": "{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"title\":\"Node Identity History\",\"description\":\"Current node identity plus the rotation history. On re-onboarding, the rotation flow supersedes this with the new current + previous appended. The SelfDealing check (walker v3 §2.16.7) reads the active contribution to recognize this node's own historic identities. operator_private: historic node_ids survive reinstall via Wire authenticated-private sync (distinct from local_only which never leaves the node — see §5.4.3).\",\"type\":\"object\",\"required\":[\"schema_type\"],\"properties\":{\"schema_type\":{\"type\":\"string\",\"const\":\"node_identity_history\"},\"current\":{\"type\":[\"string\",\"null\"],\"description\":\"Current NodeId. Null only in the bundled seed before first identity provision.\"},\"history\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"required\":[\"node_id\",\"rotated_at\",\"reason\"],\"properties\":{\"node_id\":{\"type\":\"string\"},\"rotated_at\":{\"type\":\"string\",\"description\":\"ISO-8601 timestamp of when this node_id was rotated out of `current`\"},\"reason\":{\"type\":\"string\",\"description\":\"Free-text rotation reason (e.g. re_onboarding, reinstall, key_compromise)\"}}}}}}",
+      "triggering_note": "Bundled JSON schema for node_identity_history (walker v3 Phase 0a-2)",
+      "applies_to": "node_identity_history"
+    },
+    {
+      "contribution_id": "bundled-schema_annotation-node_identity_history-v1",
+      "schema_type": "schema_annotation",
+      "slug": "node_identity_history",
+      "yaml_content": "schema_type: schema_annotation\napplies_to: node_identity_history\nversion: 1\nlabel: \"Node Identity History\"\ndescription: \"Current node identity plus rotation history. Read by the SelfDealing check.\"\n# operator_private: syncs to Wire as authenticated-private so historic\n# node_ids survive reinstall. Distinct from local_only (which never\n# leaves the node). See walker-provider-configs-and-slot-policy-v3 §5.4.3.\noperator_private: true\nfields:\n  current:\n    label: \"Current Node ID\"\n    help: \"This node's current identity. Null only in the bundled seed before first provisioning.\"\n    widget: text\n    visibility: basic\n  history:\n    label: \"Rotation History\"\n    help: \"Prior node_ids with timestamps and reasons. Appended on every re-onboarding rotation.\"\n    widget: code\n    visibility: advanced\n",
+      "triggering_note": "Bundled UI annotation for node_identity_history (walker v3 Phase 0a-2)"
+    },
+    {
+      "contribution_id": "bundled-skill-generation-node_identity_history-v1",
+      "schema_type": "skill",
+      "slug": "generation/node_identity_history.md",
+      "yaml_content": "You are generating a node_identity_history YAML for a Wire Node.\n\nThis contribution tracks the node's current identity plus its rotation\nhistory. It is written by the identity-provisioning and re-onboarding\nrotation flows, NOT by operators directly. This generation skill exists\nto complete the four-part bundle; typical use is narrow (e.g. manual\nrepair flows after a restore).\n\n## Schema (JSON Schema)\n{schema}\n\n## User Intent\n{intent}\n\n## Output rules\n\n- Output ONLY the YAML document, no prose before or after\n- Start the document with `schema_type: node_identity_history`\n- Do NOT fabricate node_ids; only emit values the user supplies verbatim\n- `rotated_at` must be ISO-8601; copy verbatim from user intent\n- `reason` is free text; use the user's wording (e.g. re_onboarding,\n  reinstall, key_compromise)\n",
+      "triggering_note": "Bundled generation prompt for node_identity_history (walker v3 Phase 0a-2)",
+      "topics_extra": [
+        "generation",
+        "node_identity_history"
+      ]
+    },
+    {
+      "contribution_id": "bundled-node_identity_history-default-v1",
+      "schema_type": "node_identity_history",
+      "slug": null,
+      "yaml_content": "schema_type: node_identity_history\n# Empty seed — current identity is set by the provisioning flow, not the\n# bundled default. SelfDealing check treats `current: null` + empty\n# history as \"no prior identity to match against\" and falls through.\ncurrent: null\nhistory: []\n",
+      "triggering_note": "Bundled default node_identity_history (walker v3 Phase 0a-2)"
+    },
+    {
       "contribution_id": "bundled-skill-migration-migrate_config-v1",
       "schema_type": "skill",
       "slug": "migration/migrate_config.md",
