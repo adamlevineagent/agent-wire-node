@@ -11,19 +11,27 @@ This is the single most valuable habit to develop. Pyramids get dramatically mor
 An annotation is a piece of knowledge pinned to a specific node. It has:
 
 - **Content** — what you learned, as prose.
-- **Type** — observation, correction, question, friction, or idea.
+- **Type** — one of the annotation-type vocabulary (see below).
 - **Author** — your handle or an agent's pseudonym.
 - **Question context** (optional) — the question this annotation answers. If present, it feeds the FAQ.
 
 Annotations are immutable. You never edit an annotation; if you want to change what it says, you add a new one (and optionally mark the old one as superseded). Reactions (up/down votes) are a separate mechanism — the community can express agreement with an annotation without touching it.
 
-### The five annotation types
+### The annotation types
+
+Canonical list of annotation types (mirrored in `src-tauri/src/pyramid/types.rs` as `AnnotationType::ALL` and `mcp-server/src/lib.ts` as `ANNOTATION_TYPES`). Unknown types are refused at the ingress — the MCP Zod enum rejects them before they reach the Wire Node, and the HTTP write path uses `from_str_strict` so drift fails loud.
 
 - **Observation** — *"The retry logic caps at 3 attempts with exponential backoff."* Factual. Most common type. Observations get folded into the FAQ when they answer a question.
-- **Correction** — *"This says the cache TTL is 60s but the code says 120s."* Marks the node as containing an inaccuracy. Triggers DADBEAR to re-evaluate the node.
+- **Correction** — *"This says the cache TTL is 60s but the code says 120s."* Marks the node as containing an inaccuracy. Triggers DADBEAR to re-evaluate the node and creates a delta on the matching thread.
 - **Question** — *"It's unclear from this whether the handler returns before or after the side effect."* An open question; someone will hopefully answer it as an observation later.
 - **Friction** — *"The behavior here surprised me; I expected X but got Y."* Records a learning-curve moment. Useful for improving docs, prompts, or the source itself.
 - **Idea** — *"This module could be split along these lines: ..."* A suggestion or hypothesis.
+- **Era** — Vine-intelligence type. Marks a project-phase boundary on vine nodes.
+- **Transition** — Vine-intelligence type. Classifies a phase shift between ERAs.
+- **Health_check** — Result payload from a vine integrity-check pass.
+- **Directory** — Sub-apex directory wiring for vine navigation.
+- **Steel_man** — Post-build accretion v5. Debate-position annotation; consumed by the debate steward once enough positions accrue on a node.
+- **Red_team** — Post-build accretion v5. Counter-argument to a debate position; paired with a steel_man through the debate pipeline.
 
 Pick the type that matches what you're saying. Types help filter later; a view of "all corrections" is more useful than a view of "all annotations".
 

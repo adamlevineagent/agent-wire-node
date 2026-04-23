@@ -65,7 +65,7 @@ alias pyramid-cli='node /path/to/agent-wire-node/mcp-server/dist/cli.js'
 |---|---|
 | `annotate <slug> <node_id> <content>` | Add annotation to a node |
 
-Annotation flags: `--question "..."` `--author "..."` `--type observation|correction|question|friction|idea`
+Annotation flags: `--question "..."` `--author "..."` `--type <type>` where `<type>` is one of: `observation | correction | question | friction | idea | era | transition | health_check | directory | steel_man | red_team` (run `pyramid-cli annotate --help` for the authoritative list)
 
 ### Question Pyramid Commands
 
