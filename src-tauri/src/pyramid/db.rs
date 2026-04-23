@@ -24745,18 +24745,20 @@ mod phase6_post_build_tests {
         );
 
         // A 2-step mechanical chain: step1 emits (returns {emitted:true}),
-        // step2 is a guarded queue that would fail (no target_node_id in
-        // the guard expression's scope beyond step_outputs) — but when
-        // the guard is false the queue is skipped entirely.
+        // step2 is a guarded queue whose `when:` resolves cleanly to false.
+        //
+        // Phase 6a verifier: guard is now a resolvable expression that
+        // returns false (step1.emitted == false, but step1.emitted is true,
+        // so the binary op evaluates to false). Previously this test used
+        // `$step1.never_present` which relied on the now-removed silent-skip
+        // behavior; under the verifier pass, missing fields raise loudly.
         let chain = minimal_chain_with_steps(
             "test-when-guard",
             vec![
                 mech_step("step1", "emit_cascade_handler_invoked"),
                 {
                     let mut s = mech_step("step2", "queue_re_distill_for_target");
-                    // Guard is literally false (references a step output field
-                    // that doesn't exist → evaluate_when_starter returns false).
-                    s.when = Some("$step1.never_present".into());
+                    s.when = Some("$step1.emitted == false".into());
                     s
                 },
             ],
@@ -24886,6 +24888,145 @@ mod phase6_post_build_tests {
         assert!(
             msg.contains("nope") || msg.contains("template"),
             "error must mention the bad variable or the template failure: {}",
+            msg
+        );
+    }
+
+    // ── Phase 6a verifier pass: missing when-ref raises loudly.
+    //       Previously `evaluate_when_starter` returned `false` on an
+    //       unresolved ref, which silently skipped the guarded step — a
+    //       silent-skip class bug per feedback_loud_deferrals. The
+    //       verifier flipped the semantics: author typos must surface
+    //       the first time the chain runs.
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn when_guard_missing_ref_raises_loud() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p6gerr", &ContentType::Code, "/tmp/p6gerr").unwrap();
+        let state = pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        // A 2-step mechanical chain where step2's when-guard references
+        // a step that never ran (typo in the chain author's intent).
+        // The verifier requires a loud raise rather than silent skip.
+        let chain = minimal_chain_with_steps(
+            "test-when-typo",
+            vec![
+                mech_step("step1", "emit_cascade_handler_invoked"),
+                {
+                    let mut s = mech_step("step2", "queue_re_distill_for_target");
+                    // `$step_that_never_ran` is not in step_outputs — the
+                    // expression engine raises "unknown symbol", which
+                    // evaluate_when_starter now surfaces as WhenDecision::Err.
+                    s.when = Some("$step_that_never_ran == \"yes\"".into());
+                    s
+                },
+            ],
+        );
+        let err = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p6gerr",
+            Some("L1-GERR"),
+            serde_json::json!({"target_node_id": "L1-GERR"}),
+        )
+        .await
+        .expect_err("when-expression referencing a missing symbol must raise loudly");
+        let msg = err.to_string() + " " + &err.root_cause().to_string();
+        assert!(
+            msg.contains("when-expression") || msg.contains("step_that_never_ran"),
+            "error must mention the bad when-expression or the unresolved symbol: {}",
+            msg
+        );
+    }
+
+    // ── Phase 6a verifier pass: unknown primitive raises loudly at runtime.
+    //       chain_engine::validate_chain catches this at load time, but
+    //       programmatic ChainDefinition construction (tests + future APIs)
+    //       can bypass the validator. Silent pass-through of an unknown
+    //       primitive would land in dispatch_llm as if the step were a
+    //       legitimate LLM call.
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn unknown_primitive_on_llm_step_raises_loud() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p6bogus", &ContentType::Code, "/tmp/p6bogus").unwrap();
+        let state = pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        let chain = minimal_chain_with_steps(
+            "test-unknown-primitive",
+            vec![ChainStep {
+                name: "badprim".into(),
+                primitive: "bogus_primitive".into(),
+                mechanical: false,
+                instruction: Some("whatever".into()),
+                ..Default::default()
+            }],
+        );
+        let err = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p6bogus",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("unknown primitive must raise loudly at runtime");
+        let msg = err.to_string() + " " + &err.root_cause().to_string();
+        assert!(
+            msg.contains("bogus_primitive") && msg.contains("unknown primitive"),
+            "error must name the unknown primitive: {}",
+            msg
+        );
+    }
+
+    // ── Phase 6a verifier pass: missing instruction on an LLM step
+    //       raises loudly rather than sending an empty system prompt.
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn llm_step_without_instruction_raises_loud() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p6noinst", &ContentType::Code, "/tmp/p6noinst").unwrap();
+        let state = pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        let chain = minimal_chain_with_steps(
+            "test-no-instruction",
+            vec![ChainStep {
+                name: "naked".into(),
+                primitive: "classify".into(),
+                mechanical: false,
+                // No instruction — previously silently sent empty prompt.
+                instruction: None,
+                ..Default::default()
+            }],
+        );
+        let err = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p6noinst",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("LLM step without instruction must raise loudly");
+        let msg = err.to_string() + " " + &err.root_cause().to_string();
+        assert!(
+            msg.contains("no instruction") || msg.contains("instruction"),
+            "error must explain the missing instruction: {}",
             msg
         );
     }

@@ -13084,6 +13084,19 @@ fn classify_ir_step_path(step: &IrStep) -> IrStepExecutionPath {
 // via the existing expression engine (`super::expression::evaluate_expression`).
 // When the guard is false the step is skipped — threading continues with
 // the prior step's output. When omitted the guard is treated as true.
+//
+// Phase 6a verifier (2026-04-22 e779c6b follow-up):
+//   - `when:` that fails to evaluate (typo / unknown symbol) now raises
+//     loudly rather than silently skipping the guarded step. The three-
+//     valued `WhenDecision` enum separates Run / Skip / Err.
+//   - LLM steps missing an instruction raise loudly rather than
+//     dispatching an empty system prompt.
+//   - Unknown primitives (anything not in `VALID_PRIMITIVES`) raise at
+//     runtime, covering programmatic ChainDefinition construction that
+//     bypasses `validate_chain`.
+//   - `step.invoke_chain.is_some()` is rejected at this path — starter
+//     chains recurse via the `call_starter_chain` mechanical primitive.
+//   All flips per `feedback_loud_deferrals`.
 pub async fn execute_chain_for_target(
     state: &Arc<PyramidState>,
     chain: &ChainDefinition,
@@ -13173,6 +13186,11 @@ pub async fn execute_chain_for_target(
         // execute_chain_from builds, which pulls in pyramid chunk loading
         // and thread state. Loud error so a mis-authored starter chain
         // surfaces before it silently no-ops.
+        //
+        // Phase 6a verifier: also reject `invoke_chain` at this path —
+        // starter chains that need sub-chain invocation must go through
+        // the `call_starter_chain` mechanical primitive (Phase 6b), not
+        // the recipe-primitive invoke_chain shape.
         match step.primitive.as_str() {
             "container" | "split" | "loop" | "gate"
             | "recursive_decompose" | "build_lifecycle"
@@ -13187,23 +13205,72 @@ pub async fn execute_chain_for_target(
             _ => {}
         }
 
+        // Phase 6a verifier: `invoke_chain` as a step field is a
+        // recipe-primitive shape; starter chains use the mechanical
+        // `call_starter_chain` primitive (Phase 6b) to recurse instead.
+        // Silent pass-through would send the chain_id as a prompt, which
+        // the caller would never notice. See feedback_loud_deferrals.
+        if step.invoke_chain.is_some() {
+            anyhow::bail!(
+                "execute_chain_for_target: chain '{}' step '{}' uses invoke_chain — \
+                 starter chains must recurse via the `call_starter_chain` mechanical primitive.",
+                chain.id, step.name,
+            );
+        }
+
+        // Phase 6a verifier: unknown primitive → loud raise. `validate_chain`
+        // catches this at load time, but programmatically-constructed chains
+        // (tests, future APIs) could bypass the validator. Without this
+        // guard, a non-mechanical step with e.g. `primitive: "bogus"` would
+        // silently reach `dispatch_llm` and be treated as an LLM call.
+        // `custom` is the escape hatch used by mechanical steps and bypasses
+        // this check — mechanical dispatch does not consult primitive text.
+        if !step.mechanical
+            && !super::chain_engine::VALID_PRIMITIVES.contains(&step.primitive.as_str())
+        {
+            anyhow::bail!(
+                "execute_chain_for_target: chain '{}' step '{}' uses unknown primitive '{}'. \
+                 Valid primitives are listed in chain_engine::VALID_PRIMITIVES.",
+                chain.id, step.name, step.primitive,
+            );
+        }
+
         // ── `when:` guard ─────────────────────────────────────────────
         //
-        // Evaluate against {step_outputs..., initial_input fields}. When
-        // the guard is false, skip the step entirely — `current` carries
-        // the prior step's output forward. When the expression errors
-        // (e.g., ref to a step that didn't run), evaluate_when_starter
-        // logs the failure and returns `false` — safer than crashing
-        // the whole chain on an author typo, and matches the legacy
-        // evaluate_when behavior at line 3186.
-        if !evaluate_when_starter(step.when.as_deref(), &step_outputs) {
-            info!(
-                "[CHAIN-TARGET] step[{}] '{}' skipped (when='{}' is false)",
-                idx,
-                step.name,
-                step.when.as_deref().unwrap_or(""),
-            );
-            continue;
+        // Evaluate against {step_outputs..., initial_input fields}.
+        // When the guard resolves to a boolean false, skip the step —
+        // `current` carries the prior step's output forward. When the
+        // expression errors (e.g., references a step that never
+        // ran / typo'd step name), raise loudly so author typos are
+        // surfaced at the first run rather than silently skipping what
+        // may be the step that matters most (see feedback_loud_deferrals
+        // — "missing-field refs returning false" is a silent-skip bomb).
+        //
+        // Legitimate "optional gate" shapes should use a resolvable
+        // expression (e.g. `$step1.emitted == false` where `emitted` is
+        // known to be present, or a literal `false`).
+        match evaluate_when_starter(step.when.as_deref(), &step_outputs) {
+            WhenDecision::Run => {}
+            WhenDecision::Skip => {
+                info!(
+                    "[CHAIN-TARGET] step[{}] '{}' skipped (when='{}' is false)",
+                    idx,
+                    step.name,
+                    step.when.as_deref().unwrap_or(""),
+                );
+                continue;
+            }
+            WhenDecision::Err(e) => {
+                anyhow::bail!(
+                    "chain '{}' step '{}' when-expression '{}' failed to evaluate: {}. \
+                     An unresolved when-ref is an author bug; fix the expression or use a \
+                     resolvable form like `$prior_step.field == <literal>`.",
+                    chain.id,
+                    step.name,
+                    step.when.as_deref().unwrap_or(""),
+                    e,
+                );
+            }
         }
 
         // If the YAML declares an explicit `step.input` expression, take
@@ -13247,16 +13314,23 @@ pub async fn execute_chain_for_target(
         // `{{var}}` template substitution against the resolved input so the
         // judge can see e.g. the cascade_reason / target text the supervisor
         // passed in.
+        //
+        // Phase 6a verifier: missing instruction on an LLM step raises
+        // loudly. `validate_chain` already rejects this at chain load time
+        // (line ~466 of chain_engine.rs), but programmatic chains can
+        // bypass the validator — silently sending an empty system prompt
+        // would burn LLM cost on meaningless output. See feedback_loud_deferrals.
         let system_prompt: String = if step.mechanical {
             String::new()
         } else {
             let template = step.instruction.as_deref().unwrap_or("");
             if template.is_empty() {
-                warn!(
-                    "[CHAIN-TARGET] chain '{}' step '{}' is LLM but has no instruction — sending empty system prompt",
-                    chain.id, step.name,
+                anyhow::bail!(
+                    "chain '{}' step '{}' is an LLM step (primitive='{}') but has no instruction — \
+                     refusing to dispatch an empty system prompt. Add a resolvable `instruction:` \
+                     field or route this chain through `validate_chain` at load time.",
+                    chain.id, step.name, step.primitive,
                 );
-                String::new()
             } else {
                 match super::chain_resolve::resolve_prompt_template(template, &resolved_input) {
                     Ok(rendered) => rendered,
@@ -13317,6 +13391,20 @@ pub async fn execute_chain_for_target(
     Ok(current)
 }
 
+/// Outcome of a starter-chain `when:` evaluation.
+///
+/// Three-valued so the caller can distinguish "guard resolved to false,
+/// cleanly skip" from "guard could not be evaluated, raise loudly". The
+/// previous two-valued return collapsed the error case into `false`,
+/// which is a silent-skip class bug per `feedback_loud_deferrals` — an
+/// author typo in a `when:` expression could make a critical queue step
+/// quietly disappear with no signal beyond a warn!() in the log.
+enum WhenDecision {
+    Run,
+    Skip,
+    Err(anyhow::Error),
+}
+
 /// Evaluate a starter-chain `when:` expression.
 ///
 /// Minimal cousin of the full-executor `evaluate_when(..., &ChainContext)`
@@ -13324,41 +13412,38 @@ pub async fn execute_chain_for_target(
 /// a full ChainContext. Defers to the shared expression engine so
 /// `$step_name.decision == "redistill"` + `count($items) > 0` all work.
 ///
-/// `None` / empty returns true (step runs). Expression errors return false
-/// (step skipped) — matches the legacy executor's behavior on unresolvable
-/// refs. A warn!() is emitted so author typos show up in logs.
+/// Returns:
+///   - `Run`  — `when:` is None / empty, or the expression resolves to a
+///     truthy value.
+///   - `Skip` — the expression resolves to a falsy value (bool false,
+///     number 0, empty string/array/object, the literal `"false"`).
+///   - `Err`  — the expression failed to parse or evaluate. The caller
+///     raises loudly; a failed when-expression must not silently skip the
+///     guarded step.
 fn evaluate_when_starter(
     when: Option<&str>,
     step_outputs: &serde_json::Map<String, Value>,
-) -> bool {
+) -> WhenDecision {
     let expr = match when {
         Some(e) => e.trim(),
-        None => return true,
+        None => return WhenDecision::Run,
     };
     if expr.is_empty() {
-        return true;
+        return WhenDecision::Run;
     }
 
     let env_value = Value::Object(step_outputs.clone());
     let env = super::expression::ValueEnv::new(&env_value);
 
-    // Fast path: bare `$ref` without operators → truthiness only.
-    if expr.starts_with('$') && !expr.contains(' ') {
-        return match super::expression::evaluate_expression(expr, &env) {
-            Ok(v) => super::expression::value_is_truthy(&v),
-            Err(_) => false,
-        };
-    }
-
     match super::expression::evaluate_expression(expr, &env) {
-        Ok(v) => super::expression::value_is_truthy(&v),
-        Err(e) => {
-            warn!(
-                "[CHAIN-TARGET] when-expression '{}' failed to evaluate ({}) — skipping step",
-                expr, e,
-            );
-            false
+        Ok(v) => {
+            if super::expression::value_is_truthy(&v) {
+                WhenDecision::Run
+            } else {
+                WhenDecision::Skip
+            }
         }
+        Err(e) => WhenDecision::Err(e),
     }
 }
 
