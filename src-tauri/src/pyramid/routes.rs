@@ -5232,21 +5232,41 @@ async fn emit_annotation_observation_events(
     slug: &str,
     annotation: &PyramidAnnotation,
 ) -> anyhow::Result<()> {
-    // Phase 6c-B: dispatch on the canonical string rather than enum variants
-    // so new vocab-defined types "just work". `correction` gets the stronger
-    // `annotation_superseded` signal; everything else is `annotation_written`.
-    // If a future vocab entry needs `annotation_superseded` semantics, it
-    // should be lifted to a vocab flag (like `creates_delta`) rather than
-    // re-hardcoded here. FIXME(6c-B): this string special-case is a tactical
-    // residual — the long-term fix is an `event_type_on_emit` field on the
-    // vocab entry, defaulting to "annotation_written" and allowing
-    // "annotation_superseded". Not scoped for this phase to keep the surface
-    // minimal; the match is still only one string comparison.
-    let event_type = if annotation.annotation_type.as_str() == ANNOTATION_TYPE_CORRECTION {
-        "annotation_superseded"
-    } else {
-        "annotation_written"
+    // Phase 9 close-2: event_type is vocab-driven.
+    //
+    // Pre-close-2, this branch was hardcoded as
+    // `correction → annotation_superseded`, else `annotation_written`
+    // (the Phase 6c-B FIXME). Lifting to vocab makes the routing
+    // contribution-driven: an operator publishing a new annotation type
+    // can claim supersession semantics (or any custom event_type) via
+    // the `event_type_on_emit` field without a code deploy.
+    //
+    // Lookup strategy:
+    //   - Read the annotation's type from the vocab registry.
+    //   - If the vocab entry has `event_type_on_emit: Some(s)`, use `s`.
+    //   - If `None` (genesis default for non-correction types +
+    //     pre-close-2 contributions without the field), emit the
+    //     default `annotation_written`.
+    //   - If the type isn't in the registry at all (shouldn't happen —
+    //     writes validate via `from_str_strict`), fall back to
+    //     `annotation_written` loudly (still emits so the cascade is
+    //     not silently dropped).
+    //
+    // feedback_everything_is_contribution + feedback_loud_deferrals.
+    let vocab_event_type_override: Option<String> = {
+        let conn = writer.lock().await;
+        super::vocab_entries::get_vocabulary_entry(
+            &conn,
+            super::vocab_entries::VOCAB_KIND_ANNOTATION_TYPE,
+            annotation.annotation_type.as_str(),
+        )
+        .ok()
+        .flatten()
+        .and_then(|entry| entry.event_type_on_emit)
     };
+    let event_type: &str = vocab_event_type_override
+        .as_deref()
+        .unwrap_or("annotation_written");
 
     let metadata_json = serde_json::json!({
         "annotation_id": annotation.id,

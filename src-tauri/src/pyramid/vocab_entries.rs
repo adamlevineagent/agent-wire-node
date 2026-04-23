@@ -148,6 +148,21 @@ pub struct VocabEntry {
     /// flip the default to `false` for operational types they add.
     #[serde(default = "default_include_in_cascade_prompt")]
     pub include_in_cascade_prompt: bool,
+    /// For annotation_type entries: the observation `event_type` the
+    /// annotation hook emits on each walked ancestor when an annotation
+    /// of this type arrives. Phase 9 close-2 lifted the pre-9 hardcoded
+    /// match — `correction → annotation_superseded`, else
+    /// `annotation_written` — into a vocab flag so operators can publish
+    /// new annotation types that emit supersession semantics without a
+    /// code deploy. `None` → emits `annotation_written` (the default
+    /// cascade event). Genesis `correction` carries
+    /// `Some("annotation_superseded")` to preserve pre-9 behavior.
+    ///
+    /// Serde default `None` keeps pre-close-2 contributions forward-
+    /// compatible: a row without the field deserializes as `None` and
+    /// maps to the default `annotation_written` event.
+    #[serde(default)]
+    pub event_type_on_emit: Option<String>,
     pub created_at: String,
     /// If this row was superseded by another row, the successor's
     /// integer `id`. None for the currently-active row.
@@ -179,6 +194,13 @@ struct VocabBody {
     /// every annotation type flowed into the prompt.
     #[serde(default = "default_include_in_cascade_prompt")]
     pub include_in_cascade_prompt: bool,
+    /// Phase 9 close-2: lifts the pre-9 hardcoded
+    /// `correction → annotation_superseded` match from
+    /// `emit_annotation_observation_events` into vocab. `None` → default
+    /// `annotation_written` event. Serde default `None` keeps pre-close-2
+    /// contributions forward-compatible.
+    #[serde(default)]
+    pub event_type_on_emit: Option<String>,
 }
 
 /// Serde default for `include_in_cascade_prompt` — preserves the
@@ -216,6 +238,13 @@ pub struct VocabListItem {
     /// `VocabEntry::include_in_cascade_prompt` for rationale.
     #[serde(default = "default_include_in_cascade_prompt")]
     pub include_in_cascade_prompt: bool,
+    /// Phase 9 close-2: observation event_type emitted on ancestor walk
+    /// when an annotation of this type arrives. `None` → default
+    /// `annotation_written`. Exposed so MCP / frontend can surface which
+    /// vocab entries will emit the stronger supersession signal vs the
+    /// default written signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_type_on_emit: Option<String>,
 }
 
 // ── Cache ───────────────────────────────────────────────────────────
@@ -396,6 +425,7 @@ fn ensure_cache(conn: &Connection) -> Result<()> {
             reactive: body.reactive,
             creates_delta: body.creates_delta,
             include_in_cascade_prompt: body.include_in_cascade_prompt,
+            event_type_on_emit: body.event_type_on_emit,
             created_at,
             superseded_by: None,
             supersede_reason: triggering_note,
@@ -539,6 +569,7 @@ fn load_entry_by_schema_type(
                 reactive: body.reactive,
                 creates_delta: body.creates_delta,
                 include_in_cascade_prompt: body.include_in_cascade_prompt,
+                event_type_on_emit: body.event_type_on_emit,
                 created_at,
                 superseded_by,
                 supersede_reason: triggering_note,
@@ -606,6 +637,7 @@ pub fn publish_vocabulary_entry(
         reactive: entry.reactive,
         creates_delta: entry.creates_delta,
         include_in_cascade_prompt: entry.include_in_cascade_prompt,
+        event_type_on_emit: entry.event_type_on_emit.clone(),
     };
     let yaml = body_to_yaml(&body)?;
     let schema_type = compound_schema_type(&entry.vocab_kind, &entry.name);
@@ -657,7 +689,8 @@ pub fn publish_vocabulary_entry(
 /// Supersede the active entry for `(vocab_kind, name)` with a new
 /// row. At least one of `new_description` / `new_handler_chain_id`
 /// / `new_reactive` / `new_creates_delta` / `new_include_in_cascade_prompt`
-/// should be Some — unchanged fields inherit from the prior row.
+/// / `new_event_type_on_emit` should be Some — unchanged fields inherit
+/// from the prior row.
 ///
 /// Emits a `vocabulary_superseded` observation event. Loud-raises if
 /// no active entry exists.
@@ -670,6 +703,7 @@ pub fn supersede_vocabulary_entry(
     new_reactive: Option<bool>,
     new_creates_delta: Option<bool>,
     new_include_in_cascade_prompt: Option<bool>,
+    new_event_type_on_emit: Option<Option<&str>>,
     reason: Option<&str>,
 ) -> Result<VocabEntry> {
     validate_vocab_identifiers(vocab_kind, name)?;
@@ -693,6 +727,10 @@ pub fn supersede_vocabulary_entry(
         creates_delta: new_creates_delta.unwrap_or(prior.creates_delta),
         include_in_cascade_prompt: new_include_in_cascade_prompt
             .unwrap_or(prior.include_in_cascade_prompt),
+        event_type_on_emit: match new_event_type_on_emit {
+            Some(v) => v.map(|s| s.to_string()),
+            None => prior.event_type_on_emit.clone(),
+        },
     };
     let new_yaml = body_to_yaml(&new_body)?;
     let schema_type = compound_schema_type(vocab_kind, name);
@@ -863,8 +901,15 @@ fn emit_vocabulary_event_with_reason(
 /// so operators see the drift.
 pub fn seed_genesis_vocabulary(conn: &Connection) -> Result<()> {
     // Annotation types (16 — 11 original + 4 Phase 7c verbs + debate_collapse Phase 9c-1)
-    for (name, description, handler_chain_id, reactive, creates_delta, include_in_cascade_prompt) in
-        GENESIS_ANNOTATION_TYPES
+    for (
+        name,
+        description,
+        handler_chain_id,
+        reactive,
+        creates_delta,
+        include_in_cascade_prompt,
+        event_type_on_emit,
+    ) in GENESIS_ANNOTATION_TYPES
     {
         seed_if_missing(
             conn,
@@ -875,12 +920,14 @@ pub fn seed_genesis_vocabulary(conn: &Connection) -> Result<()> {
             *reactive,
             *creates_delta,
             *include_in_cascade_prompt,
+            *event_type_on_emit,
         )?;
     }
 
     // Node shapes (4) — never reactive, no handler, never creates_delta.
     // include_in_cascade_prompt defaults to true (harmless — node_shape
     // entries are not annotation types and never hit the cascade filter).
+    // event_type_on_emit is None (not an annotation type).
     for (name, description) in GENESIS_NODE_SHAPES {
         seed_if_missing(
             conn,
@@ -891,12 +938,14 @@ pub fn seed_genesis_vocabulary(conn: &Connection) -> Result<()> {
             false,
             false,
             true,
+            None,
         )?;
     }
 
     // Role names (11 incl. cascade_handler) — always have handler_chain_id,
     // non-reactive. include_in_cascade_prompt defaults to true (same
     // rationale as node_shape above — not an annotation type).
+    // event_type_on_emit is None (not an annotation type).
     for (name, description, handler_chain_id) in GENESIS_ROLE_NAMES {
         seed_if_missing(
             conn,
@@ -907,6 +956,7 @@ pub fn seed_genesis_vocabulary(conn: &Connection) -> Result<()> {
             false,
             false,
             true,
+            None,
         )?;
     }
 
@@ -934,6 +984,7 @@ fn seed_if_missing(
     reactive: bool,
     creates_delta: bool,
     include_in_cascade_prompt: bool,
+    event_type_on_emit: Option<&str>,
 ) -> Result<()> {
     validate_vocab_identifiers(vocab_kind, name)?;
     let schema_type = compound_schema_type(vocab_kind, name);
@@ -959,6 +1010,7 @@ fn seed_if_missing(
         reactive,
         creates_delta,
         include_in_cascade_prompt,
+        event_type_on_emit: event_type_on_emit.map(|s| s.to_string()),
     };
     let yaml = body_to_yaml(&body)?;
 
@@ -1035,6 +1087,7 @@ pub fn handle_get_vocabulary(
             reactive: e.reactive,
             creates_delta: e.creates_delta,
             include_in_cascade_prompt: e.include_in_cascade_prompt,
+            event_type_on_emit: e.event_type_on_emit,
         })
         .collect();
     Ok(VocabListResponse {

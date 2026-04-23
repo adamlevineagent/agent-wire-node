@@ -39,7 +39,7 @@
 
 // ── Annotation Types (16 genesis entries) ───────────────────────────
 //
-// Tuple shape: (name, description, handler_chain_id, reactive, creates_delta, include_in_cascade_prompt)
+// Tuple shape: (name, description, handler_chain_id, reactive, creates_delta, include_in_cascade_prompt, event_type_on_emit)
 //
 // Phase 6c-B added `creates_delta` — before v5 `process_annotation_hook`
 // had a hardcoded `AnnotationType::Correction => create_delta(...)` arm.
@@ -58,7 +58,24 @@
 // the LLM should consider when re-distilling. steel_man + red_team carry
 // `true` despite also being handled by debate_steward because their
 // CONTENT (the argument body) IS narrative and belongs in the prompt.
-pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool, bool)] = &[
+//
+// Phase 9 close-2 added `event_type_on_emit` — lifts the pre-close-2
+// hardcoded `emit_annotation_observation_events` branch
+// (`correction → annotation_superseded`, else `annotation_written`)
+// into vocab. Only `correction` carries
+// `Some("annotation_superseded")` in genesis to preserve pre-close-2
+// behavior. All other genesis types carry `None`, which
+// `emit_annotation_observation_events` maps to the default
+// `annotation_written` cascade event.
+pub const GENESIS_ANNOTATION_TYPES: &[(
+    &str,
+    &str,
+    Option<&str>,
+    bool,
+    bool,
+    bool,
+    Option<&str>,
+)] = &[
     (
         "observation",
         "Neutral fact-based observation attached to a node.",
@@ -66,6 +83,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool, boo
         false,
         false,
         true,
+        None,
     ),
     (
         "correction",
@@ -74,6 +92,10 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool, boo
         false,
         true,
         true,
+        // Phase 9 close-2: correction carries the stronger
+        // `annotation_superseded` signal — matches the pre-close-2
+        // hardcoded behavior that this field replaces.
+        Some("annotation_superseded"),
     ),
     (
         "question",
@@ -82,6 +104,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool, boo
         false,
         false,
         true,
+        None,
     ),
     (
         "friction",
@@ -90,6 +113,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool, boo
         false,
         false,
         true,
+        None,
     ),
     (
         "idea",
@@ -98,6 +122,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool, boo
         false,
         false,
         true,
+        None,
     ),
     (
         "era",
@@ -106,6 +131,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool, boo
         false,
         false,
         true,
+        None,
     ),
     (
         "transition",
@@ -114,6 +140,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool, boo
         false,
         false,
         true,
+        None,
     ),
     (
         "health_check",
@@ -122,6 +149,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool, boo
         false,
         false,
         true,
+        None,
     ),
     (
         "directory",
@@ -130,6 +158,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool, boo
         false,
         false,
         true,
+        None,
     ),
     // v5 Phase 7 reactives — steel_man + red_team are the two Phase 7a
     // wire to emit `annotation_reacted` observation events. Phase 7c adds
@@ -145,6 +174,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool, boo
         true,
         false,
         true,
+        None,
     ),
     (
         "red_team",
@@ -153,6 +183,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool, boo
         true,
         false,
         true,
+        None,
     ),
     // Phase 7c — 4 v5 reactive verbs added as pure vocab entries.
     // Per project_convergence_decision.md + project_wire_canonical_vocabulary.md
@@ -172,6 +203,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool, boo
         // annotation content itself is routing metadata, not narrative the
         // ancestor re-distill should absorb.
         false,
+        None,
     ),
     (
         "hypothesis",
@@ -182,6 +214,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool, boo
         // 9c-2-2: hypothesis content IS narrative (the proposed claim) —
         // should influence re-distill.
         true,
+        None,
     ),
     (
         "purpose_declaration",
@@ -192,6 +225,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool, boo
         // 9c-2-2: operational directive — triggers crystallization path,
         // not narrative the node re-distill should absorb.
         false,
+        None,
     ),
     (
         "purpose_shift",
@@ -202,6 +236,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool, boo
         // 9c-2-2: operational directive — same rationale as
         // purpose_declaration.
         false,
+        None,
     ),
     // Post-build accretion v5 Phase 9c-1: close the debate-collapse
     // dormant-emitter gap. The 7a debate_steward chain only APPENDS
@@ -228,6 +263,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool, boo
         // finalize reason string (e.g. "Pro side wins"), not substrate
         // the ancestor re-distill should absorb as narrative.
         false,
+        None,
     ),
 ];
 
