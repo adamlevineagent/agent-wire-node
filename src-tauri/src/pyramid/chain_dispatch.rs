@@ -226,7 +226,15 @@ pub async fn build_step_dispatch_decision(
     slot: &str,
 ) -> Option<Arc<DispatchDecision>> {
     let conn = ctx.db_reader.lock().await;
-    match DispatchDecision::build(slot, &conn) {
+    // Phase 5 §E: pass build_id so the Decision builder can consult the
+    // per-build circuit breaker. The cache_base carries the canonical
+    // build_id established by the outer chain executor; when absent
+    // (unit tests, bring-up paths) the breaker gate is skipped — a
+    // no-op, preserving prior behavior.
+    let build_id_owned: Option<String> =
+        ctx.cache_base.as_ref().map(|cb| cb.build_id.clone());
+    let build_id_ref: Option<&str> = build_id_owned.as_deref();
+    match DispatchDecision::build_with_build_id(slot, build_id_ref, &conn) {
         Ok(decision) => {
             let arc = Arc::new(decision);
             test_capture::record_if_enabled(slot, &arc);

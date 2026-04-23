@@ -42,9 +42,10 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::pyramid::compute_chronicle::{
-    EVENT_DECISION_BUILD_FAILED, EVENT_DECISION_BUILT, EVENT_DECISION_PREVIEWED,
-    EVENT_PROVIDER_SKIPPED_READINESS,
+    EVENT_BREAKER_TRIPPED, EVENT_DECISION_BUILD_FAILED, EVENT_DECISION_BUILT,
+    EVENT_DECISION_PREVIEWED, EVENT_PROVIDER_SKIPPED_READINESS,
 };
+use crate::pyramid::walker_breaker;
 use crate::pyramid::walker_cache::ScopeCache;
 use crate::pyramid::walker_readiness::{
     FleetReadiness, LocalReadiness, MarketReadiness, NotReadyReason,
@@ -221,8 +222,32 @@ impl DispatchDecision {
     /// `StepContext.dispatch_decision`.
     #[allow(dead_code)]
     pub fn build(slot: &str, conn: &Connection) -> std::result::Result<Self, DecisionBuildError> {
+        Self::build_with_build_id(slot, None, conn)
+    }
+
+    /// Phase 5 §2.16.6 / §E: runtime Decision build with breaker
+    /// consultation keyed on `build_id`. When `build_id` is `None` the
+    /// breaker check is skipped (preview paths / cost estimation /
+    /// pre-build callers don't have a build_id yet — that case uses
+    /// `synthetic_for_preview` per §2.12 rather than this path).
+    ///
+    /// For each ProviderType in the base order, in addition to the
+    /// readiness gate, consults `walker_breaker::is_tripped(build_id,
+    /// slot, pt, reset)`. If tripped, the provider is dropped from the
+    /// effective call order and `EVENT_BREAKER_TRIPPED` fires with the
+    /// build context. If every provider is either NotReady or tripped,
+    /// the empty-cascade branch fires
+    /// `EVENT_DECISION_BUILD_FAILED` and returns
+    /// `NoReadyProviders` (§2.14 cascade exhaustion).
+    #[allow(dead_code)]
+    pub fn build_with_build_id(
+        slot: &str,
+        build_id: Option<&str>,
+        conn: &Connection,
+    ) -> std::result::Result<Self, DecisionBuildError> {
         let data = build_scope_cache_pair(conn).map_err(DecisionBuildError::ScopeCacheLoadFailed)?;
-        let decision = build_from_chain(slot, Arc::new(data.cache), &data.chain, false)?;
+        let decision =
+            build_from_chain(slot, Arc::new(data.cache), &data.chain, false, build_id)?;
         emit_event(EVENT_DECISION_BUILT, &decision);
         Ok(decision)
     }
@@ -336,6 +361,7 @@ fn build_from_chain(
     scope_cache: Arc<ScopeCache>,
     chain: &ScopeChain,
     _synthetic: bool,
+    build_id: Option<&str>,
 ) -> std::result::Result<DispatchDecision, DecisionBuildError> {
     // §4.3 per-slot full-replace: slot-scoped override wins over global.
     let base_order = chain
@@ -356,6 +382,34 @@ fn build_from_chain(
 
     for pt in base_order.iter().copied() {
         let params = resolve_all_params(chain, slot, pt);
+
+        // §E Phase 5: consult the per-build breaker BEFORE readiness.
+        // A tripped breaker for (build_id, slot, provider_type) drops
+        // the provider from effective_call_order for the remainder of
+        // the build (subject to `breaker_reset` semantics resolved per
+        // §3 — PerBuild / ProbeBased / TimeSecs:N).
+        //
+        // `build_id == None` is the preview path (synthetic callers go
+        // through `synthetic_for_preview`; runtime callers with no
+        // build_id are pre-build helpers that can't meaningfully
+        // consult build-scoped state). In that case the breaker gate
+        // is a no-op and we fall through to readiness.
+        if let Some(bid) = build_id {
+            if walker_breaker::is_tripped(bid, slot, pt, params.breaker_reset) {
+                let consecutive_failures = walker_breaker::peek_state(bid, slot, pt)
+                    .map(|s| s.consecutive_failures)
+                    .unwrap_or(0);
+                emit_breaker_tripped(bid, slot, pt, params.breaker_reset, consecutive_failures);
+                skipped.push((
+                    pt,
+                    NotReadyReason::BreakerTripped {
+                        consecutive_failures,
+                    },
+                ));
+                continue;
+            }
+        }
+
         match readiness_for(pt).can_dispatch_now(&params) {
             ReadinessResult::Ready => {
                 effective_call_order.push(pt);
@@ -495,6 +549,35 @@ fn emit_skipped(slot: &str, pt: ProviderType, reason: &NotReadyReason) {
         provider_type = pt.as_str(),
         reason = ?reason,
         "provider skipped readiness gate"
+    );
+}
+
+/// Phase 5 §H: emit `breaker_tripped` chronicle event when the
+/// Decision builder skips a provider because its per-build breaker
+/// cell is tripped. Payload shape documented at the event constant
+/// declaration in compute_chronicle.rs.
+fn emit_breaker_tripped(
+    build_id: &str,
+    slot: &str,
+    pt: ProviderType,
+    reset: crate::pyramid::walker_resolver::BreakerReset,
+    consecutive_failures: u32,
+) {
+    let reset_policy = match reset {
+        crate::pyramid::walker_resolver::BreakerReset::PerBuild => "per_build".to_string(),
+        crate::pyramid::walker_resolver::BreakerReset::ProbeBased => "probe_based".to_string(),
+        crate::pyramid::walker_resolver::BreakerReset::TimeSecs { value } => {
+            format!("time_secs:{value}")
+        }
+    };
+    tracing::warn!(
+        event = EVENT_BREAKER_TRIPPED,
+        build_id = build_id,
+        slot = slot,
+        provider_type = pt.as_str(),
+        reset_policy = %reset_policy,
+        consecutive_failures = consecutive_failures,
+        "breaker tripped — provider dropped from effective_call_order"
     );
 }
 
@@ -1038,6 +1121,92 @@ overrides:
     }
 
     #[test]
+    fn test_effective_call_order_slot_override_wins() {
+        // §4.3 full-replace: slot-scoped order overrides the global
+        // walker_call_order, full-replace (not merge).
+        let (_dir, conn) = make_db();
+        // Seed global walker_call_order
+        insert_active(
+            &conn,
+            "c-wco-global",
+            "walker_call_order",
+            None,
+            r#"
+schema_type: walker_call_order
+version: 1
+order: [local, market, openrouter, fleet]
+"#,
+        );
+        // Slot-specific order takes precedence for "extract".
+        insert_active(
+            &conn,
+            "c-sp-slot-order",
+            "walker_slot_policy",
+            None,
+            r#"
+schema_type: walker_slot_policy
+version: 1
+slots:
+  extract:
+    order: [openrouter]
+"#,
+        );
+        let d = DispatchDecision::build("extract", &conn).unwrap();
+        assert_eq!(d.effective_call_order, vec![ProviderType::OpenRouter]);
+    }
+
+    #[test]
+    fn test_effective_call_order_falls_through_to_global() {
+        // When no slot override is declared, the base order walked by
+        // the Decision builder inherits the global walker_call_order.
+        // Real-provider readiness gates (Phase 2/3/4) may drop Local /
+        // Market / Fleet when their probe caches are unseeded — so
+        // we verify the OpenRouter entry (always-Ready stub) is
+        // retained in the resulting effective_call_order, confirming
+        // the fall-through reached the builder with OpenRouter in it.
+        let (_dir, conn) = make_db();
+        insert_active(
+            &conn,
+            "c-wco-fallthrough",
+            "walker_call_order",
+            None,
+            r#"
+schema_type: walker_call_order
+version: 1
+order: [openrouter, fleet]
+"#,
+        );
+        let d = DispatchDecision::build("mid", &conn).unwrap();
+        assert!(
+            d.effective_call_order.contains(&ProviderType::OpenRouter),
+            "OpenRouter must survive into effective_call_order when \
+             declared at global scope; got {:?}",
+            d.effective_call_order
+        );
+        // Fleet may or may not survive readiness depending on roster
+        // cache; we don't assert on it, only on the always-Ready stub.
+    }
+
+    #[test]
+    fn test_effective_call_order_system_default() {
+        // No walker_call_order contribution → the base order is
+        // DEFAULT_CALL_ORDER ([Market, Local, OpenRouter, Fleet] per
+        // §8 tester smoke). Real-provider readiness gates drop
+        // Local/Market/Fleet without probe-cache seeding, but the
+        // always-Ready OpenRouter stub must survive, confirming the
+        // SYSTEM_DEFAULT was in fact used.
+        let (_dir, conn) = make_db();
+        let d = DispatchDecision::build("mid", &conn).unwrap();
+        assert!(
+            d.effective_call_order.contains(&ProviderType::OpenRouter),
+            "OpenRouter (DEFAULT_CALL_ORDER member) must survive into \
+             effective_call_order when no walker_call_order is declared; \
+             got {:?}",
+            d.effective_call_order
+        );
+    }
+
+    #[test]
     fn test_decision_effective_call_order_honors_slot_full_replace() {
         let (_dir, conn) = make_db();
         insert_active(
@@ -1170,6 +1339,196 @@ overrides:
         assert_eq!(view.per_provider[0].provider_type, "market");
         assert_eq!(view.effective_call_order, vec!["market".to_string()]);
         invalidate_cached_model(market_slug);
+    }
+
+    #[test]
+    fn test_decision_skips_tripped_providers() {
+        // Phase 5 §E: when the breaker is tripped for a
+        // (build_id, slot, provider_type) triple, the Decision
+        // builder drops that provider from effective_call_order.
+        //
+        // Seed OpenRouter to Ready (stub), declare OR-only order,
+        // then trip the breaker for (build_id, mid, OpenRouter).
+        // Decision should have empty effective_call_order and error.
+        use crate::pyramid::walker_breaker::{
+            breaker_test_lock, clear_all_for_tests, record_failure, TRIP_THRESHOLD,
+        };
+        let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_all_for_tests();
+        let bid = "build-decision-skip";
+        for _ in 0..TRIP_THRESHOLD {
+            record_failure(bid, "mid", ProviderType::OpenRouter);
+        }
+        let (_dir, conn) = make_db();
+        insert_active(
+            &conn,
+            "c-or-only",
+            "walker_slot_policy",
+            None,
+            r#"
+schema_type: walker_slot_policy
+version: 1
+slots:
+  mid:
+    order: [openrouter]
+"#,
+        );
+        let err = DispatchDecision::build_with_build_id("mid", Some(bid), &conn).unwrap_err();
+        match err {
+            DecisionBuildError::NoReadyProviders { reasons, .. } => {
+                assert!(reasons.iter().any(|(_pt, r)| matches!(
+                    r,
+                    NotReadyReason::BreakerTripped { .. }
+                )));
+            }
+            other => panic!("expected NoReadyProviders, got {other:?}"),
+        }
+        clear_all_for_tests();
+    }
+
+    #[test]
+    fn test_decision_skip_tripped_does_not_affect_other_build() {
+        // Tripping breaker for build-A must not affect build-B.
+        use crate::pyramid::walker_breaker::{
+            breaker_test_lock, clear_all_for_tests, record_failure, TRIP_THRESHOLD,
+        };
+        let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_all_for_tests();
+        for _ in 0..TRIP_THRESHOLD {
+            record_failure("build-A", "mid", ProviderType::OpenRouter);
+        }
+        let (_dir, conn) = make_db();
+        insert_active(
+            &conn,
+            "c-or-only-b",
+            "walker_slot_policy",
+            None,
+            r#"
+schema_type: walker_slot_policy
+version: 1
+slots:
+  mid:
+    order: [openrouter]
+"#,
+        );
+        // build-B still sees OpenRouter as Ready.
+        let d =
+            DispatchDecision::build_with_build_id("mid", Some("build-B"), &conn).unwrap();
+        assert!(d.effective_call_order.contains(&ProviderType::OpenRouter));
+        clear_all_for_tests();
+    }
+
+    #[test]
+    fn test_decision_build_without_build_id_skips_breaker() {
+        // build() = build_with_build_id(None, ...). Breaker gate is
+        // skipped so Decision sees Ready providers even when a
+        // different build_id has tripped cells.
+        use crate::pyramid::walker_breaker::{
+            breaker_test_lock, clear_all_for_tests, record_failure, TRIP_THRESHOLD,
+        };
+        let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_all_for_tests();
+        for _ in 0..TRIP_THRESHOLD {
+            record_failure("build-irrelevant", "mid", ProviderType::OpenRouter);
+        }
+        let (_dir, conn) = make_db();
+        insert_active(
+            &conn,
+            "c-or-only-nobid",
+            "walker_slot_policy",
+            None,
+            r#"
+schema_type: walker_slot_policy
+version: 1
+slots:
+  mid:
+    order: [openrouter]
+"#,
+        );
+        let d = DispatchDecision::build("mid", &conn).unwrap();
+        assert!(d.effective_call_order.contains(&ProviderType::OpenRouter));
+        clear_all_for_tests();
+    }
+
+    #[test]
+    fn test_slot_policy_per_provider_override_reaches_decision() {
+        // §4.3 scope-1 (slot × provider) override. Set
+        // slots[mid].per_provider.market.breaker_reset =
+        // "probe_based" and assert the Decision's per_provider[Market]
+        // reflects it.
+        //
+        // MarketReadiness (Phase 3) requires a surface-cache entry +
+        // an active market config, so seed both.
+        use crate::pyramid::walker_market_probe::{
+            clear_node_state_for_tests, invalidate_cached_model, node_state_test_lock,
+            write_cached_model, CachedMarketModel, CachedOffer,
+        };
+        let _g = node_state_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_node_state_for_tests();
+        let market_slug = "test-slot-policy-per-provider/market-model";
+        write_cached_model(
+            market_slug,
+            CachedMarketModel {
+                active_offers: 1,
+                all_offers_saturated: false,
+                only_self_offers: false,
+                model_typical_serve_ms_p50_7d: Some(1000.0),
+                offers_detail: vec![CachedOffer {
+                    offer_id: "o1".into(),
+                    node_handle: "other".into(),
+                    operator_handle: "op".into(),
+                    typical_serve_ms_p50_7d: Some(1000.0),
+                    execution_concurrency: 1,
+                    current_queue_depth: 0,
+                    max_queue_depth: 5,
+                }],
+                at: std::time::Instant::now(),
+            },
+        );
+        let (_dir, conn) = make_db();
+        insert_active(
+            &conn,
+            "c-wpm-pp",
+            "walker_provider_market",
+            None,
+            &format!(
+                r#"
+schema_type: walker_provider_market
+version: 1
+overrides:
+  active: true
+  model_list:
+    mid: ["{market_slug}"]
+"#
+            ),
+        );
+        insert_active(
+            &conn,
+            "c-sp-pp-market",
+            "walker_slot_policy",
+            None,
+            r#"
+schema_type: walker_slot_policy
+version: 1
+slots:
+  mid:
+    order: [market]
+    per_provider:
+      market:
+        breaker_reset: "probe_based"
+"#,
+        );
+        let d = DispatchDecision::build("mid", &conn).unwrap();
+        let mkt = d
+            .per_provider
+            .get(&ProviderType::Market)
+            .expect("market must be present");
+        assert_eq!(
+            mkt.breaker_reset,
+            crate::pyramid::walker_resolver::BreakerReset::ProbeBased,
+        );
+        invalidate_cached_model(market_slug);
+        clear_node_state_for_tests();
     }
 
     #[test]

@@ -97,6 +97,53 @@ fn openrouter_context_limit_from_decision(
         .and_then(|p| p.context_limit)
 }
 
+/// Phase 5 §C: consult the Decision's `on_partial_failure` policy at
+/// a walker-loop post-failure point. Returns `true` when the policy
+/// is `FailLoud` and the walker should emit
+/// `dispatch_failed_policy_blocked` and bubble a terminal instead of
+/// cascading. Returns `false` for `Cascade` (default, existing
+/// behavior) and for `RetrySame` (walker-level retries inside the
+/// cascade loop spin without meaningful provider-side retry
+/// semantics; the per-provider dispatchers already handle their own
+/// retry budgets — see dispatch_market_entry's saturation retry).
+///
+/// `RetrySame` degrading to `FailLoud` when the breaker is tripped is
+/// handled in `walker_breaker::on_partial_failure_action`. This
+/// helper is the llm-side wiring that consumes that decision.
+fn check_fail_loud_stops(
+    step_ctx: Option<&StepContext>,
+    provider_type: WalkerProviderType,
+) -> bool {
+    use crate::pyramid::walker_breaker::{on_partial_failure_action, PartialFailureAction};
+    let Some(ctx) = step_ctx else { return false };
+    let Some(decision) = ctx.dispatch_decision.as_ref() else {
+        return false;
+    };
+    let breaker_reset = decision
+        .per_provider
+        .get(&provider_type)
+        .map(|p| p.breaker_reset)
+        .unwrap_or(crate::pyramid::walker_resolver::BreakerReset::PerBuild);
+    let build_id_opt = if ctx.build_id.is_empty() {
+        None
+    } else {
+        Some(ctx.build_id.as_str())
+    };
+    let slot = if ctx.model_tier.is_empty() {
+        &decision.slot
+    } else {
+        &ctx.model_tier
+    };
+    let action = on_partial_failure_action(
+        decision.on_partial_failure,
+        build_id_opt,
+        slot,
+        provider_type,
+        breaker_reset,
+    );
+    matches!(action, PartialFailureAction::FailLoud)
+}
+
 // ── Global rate limiter: configurable sliding window ────────────────────────
 
 static RATE_LIMITER: LazyLock<TokioMutex<VecDeque<std::time::Instant>>> =
@@ -2581,6 +2628,13 @@ pub async fn call_model_unified_with_audit_and_ctx(
 
             match market_outcome {
                 Ok(response) => {
+                    // Phase 5 §F: record market success against the
+                    // per-build breaker. Resets consecutive_failures
+                    // for this (build_id, slot, market) cell.
+                    crate::pyramid::walker_breaker::record_success_from_ctx(
+                        ctx,
+                        crate::pyramid::walker_resolver::ProviderType::Market,
+                    );
                     let latency_ms = call_started.elapsed().as_millis() as i64;
                     let walker_ms = walker_started.elapsed().as_millis() as i64;
 
@@ -2646,6 +2700,43 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         &entry.provider_id,
                         serde_json::json!({ "reason": reason, "branch": "market" }),
                     );
+                    // Phase 5 §F: Retryable reflects a genuine
+                    // provider-side failure (HTTP 5xx, connection
+                    // reset, quote expired) so it counts against the
+                    // breaker. Saturation retries are exhausted
+                    // internally by dispatch_market_entry and surface
+                    // as RouteSkipped (not here).
+                    crate::pyramid::walker_breaker::record_failure_from_ctx(
+                        ctx,
+                        crate::pyramid::walker_resolver::ProviderType::Market,
+                    );
+                    // Phase 5 §C: consult on_partial_failure policy
+                    // from the Decision. `FailLoud` bubbles a terminal;
+                    // `RetrySame` is not supported on the Retryable
+                    // branch inside the walker loop (walker already
+                    // has its own saturation-retry inside
+                    // dispatch_market_entry; RetrySame at the walker
+                    // level adds no value and would spin). Fall back
+                    // to Cascade for RetrySame here.
+                    if check_fail_loud_stops(
+                        ctx,
+                        crate::pyramid::walker_resolver::ProviderType::Market,
+                    ) {
+                        emit_walker_chronicle(
+                            ctx,
+                            config,
+                            super::compute_chronicle::EVENT_DISPATCH_FAILED_POLICY_BLOCKED,
+                            &walker_source_label,
+                            &entry.provider_id,
+                            serde_json::json!({
+                                "reason": reason.clone(),
+                                "branch": "market",
+                                "policy": "fail_loud",
+                            }),
+                        );
+                        emit_step_error(ctx, &reason);
+                        return Err(anyhow!(format!("policy=fail_loud: {}", reason)));
+                    }
                     skip_reasons
                         .push(format!("{}:retryable({})", entry.provider_id, reason));
                     continue;
@@ -2678,6 +2769,13 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     continue;
                 }
                 Err(EntryError::CallTerminal { reason }) => {
+                    // Phase 5 §F: CallTerminal is a genuine provider
+                    // failure (auth expired, dispatch deadline missed)
+                    // — counts against the breaker.
+                    crate::pyramid::walker_breaker::record_failure_from_ctx(
+                        ctx,
+                        crate::pyramid::walker_resolver::ProviderType::Market,
+                    );
                     // CallTerminal also covers stage-tagged auth
                     // reasons (`quote_auth_failed` / `fill_auth_failed`)
                     // that should surface as `network_auth_expired` for
@@ -2919,6 +3017,11 @@ pub async fn call_model_unified_with_audit_and_ctx(
 
             match fleet_outcome {
                 Ok(response) => {
+                    // Phase 5 §F: record fleet success.
+                    crate::pyramid::walker_breaker::record_success_from_ctx(
+                        ctx,
+                        crate::pyramid::walker_resolver::ProviderType::Fleet,
+                    );
                     let latency_ms = call_started.elapsed().as_millis() as i64;
                     let walker_ms = walker_started.elapsed().as_millis() as i64;
 
@@ -2953,6 +3056,12 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     return Ok(response);
                 }
                 Err(EntryError::Retryable { reason }) => {
+                    // Phase 5 §F: fleet Retryable = genuine peer-side
+                    // failure (HTTP 5xx, connection reset, JWT expired).
+                    crate::pyramid::walker_breaker::record_failure_from_ctx(
+                        ctx,
+                        crate::pyramid::walker_resolver::ProviderType::Fleet,
+                    );
                     emit_walker_chronicle(
                         ctx,
                         config,
@@ -2961,6 +3070,26 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         &entry.provider_id,
                         serde_json::json!({ "reason": reason }),
                     );
+                    // Phase 5 §C: fail_loud policy bubbles terminal.
+                    if check_fail_loud_stops(
+                        ctx,
+                        crate::pyramid::walker_resolver::ProviderType::Fleet,
+                    ) {
+                        emit_walker_chronicle(
+                            ctx,
+                            config,
+                            super::compute_chronicle::EVENT_DISPATCH_FAILED_POLICY_BLOCKED,
+                            &walker_source_label,
+                            &entry.provider_id,
+                            serde_json::json!({
+                                "reason": reason.clone(),
+                                "branch": "fleet",
+                                "policy": "fail_loud",
+                            }),
+                        );
+                        emit_step_error(ctx, &reason);
+                        return Err(anyhow!(format!("policy=fail_loud: {}", reason)));
+                    }
                     skip_reasons
                         .push(format!("{}:retryable({})", entry.provider_id, reason));
                     continue;
@@ -2981,6 +3110,13 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     continue;
                 }
                 Err(EntryError::CallTerminal { reason }) => {
+                    // Phase 5 §F: defensive record; fleet CallTerminal
+                    // is not spec'd to fire today, but if it does, the
+                    // breaker should see it as a genuine failure.
+                    crate::pyramid::walker_breaker::record_failure_from_ctx(
+                        ctx,
+                        crate::pyramid::walker_resolver::ProviderType::Fleet,
+                    );
                     // Per §4.1 plan: no fleet branch returns CallTerminal.
                     // Defensive: bubble for unknown-variant future-proofing.
                     emit_walker_chronicle(
@@ -4026,8 +4162,23 @@ pub async fn call_model_unified_with_audit_and_ctx(
         // walker iterations (or waiters on the same pool) can proceed.
         drop(_entry_permit);
 
+        // Phase 5 §F: pool entries split into Local vs OpenRouter for
+        // breaker attribution. The `is_local` flag is the same split
+        // used by the per-entry local-execution gate above.
+        let pool_provider_type = if entry.is_local {
+            crate::pyramid::walker_resolver::ProviderType::Local
+        } else {
+            crate::pyramid::walker_resolver::ProviderType::OpenRouter
+        };
+
         match http_outcome {
             Ok(response) => {
+                // Phase 5 §F: record pool success for the mapped
+                // ProviderType. See pool_provider_type above.
+                crate::pyramid::walker_breaker::record_success_from_ctx(
+                    ctx,
+                    pool_provider_type,
+                );
                 let latency_ms = call_started.elapsed().as_millis() as i64;
                 let walker_ms = walker_started.elapsed().as_millis() as i64;
 
@@ -4064,6 +4215,12 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 return Ok(response);
             }
             Err(EntryError::Retryable { reason }) => {
+                // Phase 5 §F: pool Retryable = genuine HTTP failure
+                // against openrouter/local pool provider.
+                crate::pyramid::walker_breaker::record_failure_from_ctx(
+                    ctx,
+                    pool_provider_type,
+                );
                 emit_walker_chronicle(
                     ctx,
                     config,
@@ -4072,6 +4229,23 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     &entry.provider_id,
                     serde_json::json!({ "reason": reason }),
                 );
+                // Phase 5 §C: fail_loud bubbles terminal.
+                if check_fail_loud_stops(ctx, pool_provider_type) {
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_DISPATCH_FAILED_POLICY_BLOCKED,
+                        &walker_source_label,
+                        &entry.provider_id,
+                        serde_json::json!({
+                            "reason": reason.clone(),
+                            "branch": "pool",
+                            "policy": "fail_loud",
+                        }),
+                    );
+                    emit_step_error(ctx, &reason);
+                    return Err(anyhow!(format!("policy=fail_loud: {}", reason)));
+                }
                 skip_reasons.push(format!("{}:retryable({})", entry.provider_id, reason));
                 continue;
             }
@@ -4088,6 +4262,14 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 continue;
             }
             Err(EntryError::CallTerminal { reason }) => {
+                // Phase 5 §F: pool CallTerminal = terminal 4xx,
+                // parse-failed-permanently, or `max_retries` HTTP
+                // exhaustion. Records against the breaker before
+                // bubbling.
+                crate::pyramid::walker_breaker::record_failure_from_ctx(
+                    ctx,
+                    pool_provider_type,
+                );
                 emit_walker_chronicle(
                     ctx,
                     config,

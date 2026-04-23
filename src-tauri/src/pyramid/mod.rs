@@ -109,6 +109,7 @@ pub mod vine_composition;
 pub mod vine_prompts;
 pub mod vocabulary;
 pub mod v3_migration;
+pub mod walker_breaker;
 pub mod walker_cache;
 pub mod walker_decision;
 pub mod walker_fleet_probe;

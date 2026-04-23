@@ -67,6 +67,14 @@ pub enum NotReadyReason {
     /// Fleet: peer's `announce_protocol_version < 2`; strict mode refuses
     /// dispatch (§5.5.2).
     PeerIsV1Announcer,
+    /// Phase 5 (§2.16.6 / §E): per-build circuit breaker tripped for
+    /// this (build_id, slot, provider_type) tuple. Provider was removed
+    /// from `effective_call_order` by the Decision builder; readiness
+    /// itself may or may not still be Ready. Reset policy determines
+    /// whether the breaker will untrip within the build.
+    BreakerTripped {
+        consecutive_failures: u32,
+    },
 }
 
 /// Resolved per-provider parameters passed into `can_dispatch_now`.

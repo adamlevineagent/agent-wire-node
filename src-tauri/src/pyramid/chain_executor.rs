@@ -4031,6 +4031,11 @@ pub async fn execute_chain_from(
         "chain-{}",
         uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0")
     );
+    // Phase 5 §G: RAII guard — on any exit (success, error, panic)
+    // this drops every per-build breaker cell for chain_build_id so
+    // the map doesn't leak across builds.
+    let _breaker_guard =
+        super::walker_breaker::BuildBreakerGuard::new(chain_build_id.clone());
     let llm_config = state.llm_config_with_cache(slug, &chain_build_id).await;
 
     // Count chunks
@@ -11295,6 +11300,10 @@ pub async fn execute_plan(
         "ir-{}",
         uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0")
     );
+    // Phase 5 §G: RAII guard ensures breaker cells keyed on
+    // ir_build_id are reclaimed whenever this scope unwinds.
+    let _breaker_guard =
+        super::walker_breaker::BuildBreakerGuard::new(ir_build_id.clone());
     let llm_config = state.llm_config_with_cache(slug, &ir_build_id).await;
 
     // ── 1. Load chunks ──────────────────────────────────────────────────
