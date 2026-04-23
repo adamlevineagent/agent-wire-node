@@ -3561,7 +3561,13 @@ async fn post_build_seed(
             let conn = pyramid_state.reader.lock().await;
             wire_node_lib::pyramid::walker_resolver::first_openrouter_model_from_db(&conn)
         };
-        let model = resolved.unwrap_or_else(|| cfg.primary_model.clone());
+        let model = resolved.unwrap_or_else(|| {
+            tracing::warn!(
+                event = "pattern4_no_openrouter_model",
+                "walker-v3: Pattern-4 site found no walker_provider_openrouter model; stamping '<unknown>' — downstream dispatch will surface no-model-available",
+            );
+            "<unknown>".to_string()
+        });
         (with_cache, model)
     };
 
@@ -4329,13 +4335,15 @@ async fn pyramid_set_config(
     // Persist non-secret config to disk. Deliberately not updating
     // openrouter_api_key — credential store is SOT. Stale value
     // preserved as boot-time migration source.
+    //
+    // W3c: PyramidConfig no longer carries primary_model /
+    // fallback_model_{1,2}. Model selection lives in
+    // walker_provider_openrouter. We still write the other non-secret
+    // fields through.
     if let Some(ref data_dir) = state.pyramid.data_dir {
         let mut pyramid_config = wire_node_lib::pyramid::PyramidConfig::load(data_dir);
         let config = state.pyramid.config.read().await;
         pyramid_config.auth_token = config.auth_token.clone();
-        pyramid_config.primary_model = config.primary_model.clone();
-        pyramid_config.fallback_model_1 = config.fallback_model_1.clone();
-        pyramid_config.fallback_model_2 = config.fallback_model_2.clone();
         pyramid_config.use_ir_executor = state
             .pyramid
             .use_ir_executor
@@ -5049,7 +5057,13 @@ async fn pyramid_meta_run(
         let conn = state.pyramid.reader.lock().await;
         wire_node_lib::pyramid::walker_resolver::first_openrouter_model_from_db(&conn)
     };
-    let model = resolved.unwrap_or_else(|| base_config.primary_model.clone());
+    let model = resolved.unwrap_or_else(|| {
+        tracing::warn!(
+            event = "pattern4_no_openrouter_model",
+            "walker-v3: Pattern-4 site found no walker_provider_openrouter model; stamping '<unknown>'",
+        );
+        "<unknown>".to_string()
+    });
 
     let reader = state.pyramid.reader.clone();
     let writer = state.pyramid.writer.clone();
@@ -5944,26 +5958,21 @@ async fn pyramid_get_config(
         .and_then(|v| v["auto_execute"].as_bool())
         .unwrap_or(false);
 
-    // walker-v3 W3a (Cluster 1): synthesize the legacy model triple from
+    // walker-v3 W3c (Cluster 1): synthesize the legacy model triple from
     // the active walker_provider_openrouter contribution so existing
-    // frontend Settings views keep rendering while the legacy write path
-    // is stubbed. When the contribution isn't present (fresh install
-    // before bundled seed land, unit-test fixtures), fall back to the
-    // legacy LlmConfig field. W3c deletes the fallback arm when the
-    // field goes away.
+    // frontend Settings views keep rendering. No legacy fallback — when
+    // the contribution isn't present the Settings UI shows null for
+    // those fields and the operator follows up via Tools > Create.
     let (primary_syn, fb1_syn, fb2_syn) = {
         let conn = state.pyramid.reader.lock().await;
         wire_node_lib::pyramid::walker_resolver::synthesize_legacy_model_triple_from_db(&conn)
     };
-    let primary_model = primary_syn.unwrap_or_else(|| config.primary_model.clone());
-    let fallback_model_1 = fb1_syn.unwrap_or_else(|| config.fallback_model_1.clone());
-    let fallback_model_2 = fb2_syn.unwrap_or_else(|| config.fallback_model_2.clone());
     Ok(serde_json::json!({
         "api_key_set": !config.api_key.is_empty(),
         "auth_token_set": !config.auth_token.is_empty(),
-        "primary_model": primary_model,
-        "fallback_model_1": fallback_model_1,
-        "fallback_model_2": fallback_model_2,
+        "primary_model": primary_syn,
+        "fallback_model_1": fb1_syn,
+        "fallback_model_2": fb2_syn,
         "auto_execute": auto_execute,
     }))
 }
@@ -6040,22 +6049,15 @@ async fn pyramid_apply_profile(
         state.pyramid.provider_registry.clone(),
         state.pyramid.credential_store.clone(),
     );
-    let (legacy_primary, legacy_fb1, legacy_fb2) = {
+    {
         let mut live = state.pyramid.config.write().await;
         let previous_live = live.clone();
         *live = new_llm.with_runtime_overlays_from(&previous_live);
-        (
-            live.primary_model.clone(),
-            live.fallback_model_1.clone(),
-            live.fallback_model_2.clone(),
-        )
-    };
+    }
 
-    // walker-v3 W3a (Cluster 1): operator-visible tracing log now pulls
-    // the triple from the active walker_provider_openrouter contribution;
-    // falls back to the legacy LlmConfig fields when the contribution
-    // isn't present. W3c deletes the fallback arm once
-    // config.primary_model and friends are removed.
+    // walker-v3 W3c: operator-visible tracing log pulls the triple from
+    // the active walker_provider_openrouter contribution. No legacy
+    // fallback — LlmConfig.primary_model + friends are deleted.
     // TODO(walker-v3 Phase 6): pyramid_apply_profile itself may retire
     // entirely if profile semantics fold into walker_slot_policy /
     // walker_provider_* contribution overlays.
@@ -6063,14 +6065,11 @@ async fn pyramid_apply_profile(
         let conn = state.pyramid.reader.lock().await;
         wire_node_lib::pyramid::walker_resolver::synthesize_legacy_model_triple_from_db(&conn)
     };
-    let primary_log = primary_syn.unwrap_or(legacy_primary);
-    let fb1_log = fb1_syn.unwrap_or(legacy_fb1);
-    let fb2_log = fb2_syn.unwrap_or(legacy_fb2);
     tracing::info!(
         profile = %profile,
-        primary = %primary_log,
-        fallback_1 = %fb1_log,
-        fallback_2 = %fb2_log,
+        primary = ?primary_syn,
+        fallback_1 = ?fb1_syn,
+        fallback_2 = ?fb2_syn,
         "applied model profile",
     );
     Ok(())
@@ -6722,7 +6721,13 @@ async fn ensure_dadbear_running(
             let conn = state.pyramid.reader.lock().await;
             wire_node_lib::pyramid::walker_resolver::first_openrouter_model_from_db(&conn)
         };
-        let model = resolved.unwrap_or_else(|| cfg.primary_model.clone());
+        let model = resolved.unwrap_or_else(|| {
+            tracing::warn!(
+                event = "pattern4_no_openrouter_model",
+                "walker-v3: Pattern-4 site found no walker_provider_openrouter model; stamping '<unknown>' — downstream dispatch will surface no-model-available",
+            );
+            "<unknown>".to_string()
+        });
         let defer = cfg.dispatch_policy
             .as_ref()
             .map(|p| p.build_coordination.defer_maintenance_during_build)
@@ -8311,7 +8316,13 @@ async fn pyramid_faq_directory(
         let conn = state.pyramid.reader.lock().await;
         wire_node_lib::pyramid::walker_resolver::first_openrouter_model_from_db(&conn)
     };
-    let model = resolved.unwrap_or_else(|| base_config.primary_model.clone());
+    let model = resolved.unwrap_or_else(|| {
+        tracing::warn!(
+            event = "pattern4_no_openrouter_model",
+            "walker-v3: Pattern-4 site found no walker_provider_openrouter model; stamping '<unknown>'",
+        );
+        "<unknown>".to_string()
+    });
 
     let directory = pyramid_faq::get_faq_directory(
         &state.pyramid.reader,

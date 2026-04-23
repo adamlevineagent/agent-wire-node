@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::pyramid::llm::LlmConfig;
-use crate::pyramid::step_context::make_step_ctx_from_llm_config;
+use crate::pyramid::step_context::make_step_ctx_from_llm_config_with_model;
 use crate::pyramid::{db, llm, types::*};
 
 // ── Meta analysis passes ─────────────────────────────────────────────────────
@@ -59,21 +59,25 @@ Output the timeline as plain text (not JSON). Be concise but capture the arc."#,
         thread_summaries.join("\n\n")
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let cfg = base_config.clone_with_model_override(model);
+    // W3c: the legacy clone_with_model_override helper was deleted along
+    // with LlmConfig.primary_model. The resolved model now threads into
+    // dispatch via LlmCallOptions.model_override (call_model_with_override_and_ctx)
+    // and into the cache row via make_step_ctx_from_llm_config_with_model's
+    // explicit `model` arg.
     let system_prompt =
         "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &cfg,
+    let cache_ctx = make_step_ctx_from_llm_config_with_model(
+        base_config,
         "meta_timeline_forward",
         "meta",
         -1,
         None,
         system_prompt,
+        Some(model),
     );
-    let result = llm::call_model_and_ctx(
-        &cfg,
+    let result = llm::call_model_with_override_and_ctx(
+        base_config,
+        model,
         cache_ctx.as_ref(),
         system_prompt,
         &prompt,
@@ -117,21 +121,25 @@ Output the reverse analysis as plain text. Be concise."#,
         forward_timeline
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let cfg = base_config.clone_with_model_override(model);
+    // W3c: the legacy clone_with_model_override helper was deleted along
+    // with LlmConfig.primary_model. The resolved model now threads into
+    // dispatch via LlmCallOptions.model_override (call_model_with_override_and_ctx)
+    // and into the cache row via make_step_ctx_from_llm_config_with_model's
+    // explicit `model` arg.
     let system_prompt =
         "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &cfg,
+    let cache_ctx = make_step_ctx_from_llm_config_with_model(
+        base_config,
         "meta_timeline_backward",
         "meta",
         -1,
         None,
         system_prompt,
+        Some(model),
     );
-    let result = llm::call_model_and_ctx(
-        &cfg,
+    let result = llm::call_model_with_override_and_ctx(
+        base_config,
+        model,
         cache_ctx.as_ref(),
         system_prompt,
         &prompt,
@@ -177,21 +185,25 @@ Output the narrative as plain text. This should read like a story, not a report.
         forward_timeline, backward_timeline
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let cfg = base_config.clone_with_model_override(model);
+    // W3c: the legacy clone_with_model_override helper was deleted along
+    // with LlmConfig.primary_model. The resolved model now threads into
+    // dispatch via LlmCallOptions.model_override (call_model_with_override_and_ctx)
+    // and into the cache row via make_step_ctx_from_llm_config_with_model's
+    // explicit `model` arg.
     let system_prompt =
         "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &cfg,
+    let cache_ctx = make_step_ctx_from_llm_config_with_model(
+        base_config,
         "meta_narrative",
         "meta",
         -1,
         None,
         system_prompt,
+        Some(model),
     );
-    let result = llm::call_model_and_ctx(
-        &cfg,
+    let result = llm::call_model_with_override_and_ctx(
+        base_config,
+        model,
         cache_ctx.as_ref(),
         system_prompt,
         &prompt,
@@ -259,21 +271,25 @@ Produce the quickstart (target: under 1500 tokens). The reader should have the s
         narrative_text, context
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let cfg = base_config.clone_with_model_override(model);
+    // W3c: the legacy clone_with_model_override helper was deleted along
+    // with LlmConfig.primary_model. The resolved model now threads into
+    // dispatch via LlmCallOptions.model_override (call_model_with_override_and_ctx)
+    // and into the cache row via make_step_ctx_from_llm_config_with_model's
+    // explicit `model` arg.
     let system_prompt =
         "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &cfg,
+    let cache_ctx = make_step_ctx_from_llm_config_with_model(
+        base_config,
         "meta_quickstart",
         "meta",
         -1,
         None,
         system_prompt,
+        Some(model),
     );
-    let result = llm::call_model_and_ctx(
-        &cfg,
+    let result = llm::call_model_with_override_and_ctx(
+        base_config,
+        model,
         cache_ctx.as_ref(),
         system_prompt,
         &prompt,

@@ -234,16 +234,18 @@ async fn call_generation_llm(
     let (model_id, provider_id) = match resolved {
         Some(entry) => (entry.tier.model_id.clone(), entry.provider.id.clone()),
         None => {
-            // TODO(W3/Phase 1): walker v3 — mirror of migration_config.rs
-            // fallback. primary_model retires in W3; resolution of the
-            // "synth_heavy" tier should flow through a walker-scope-chain
-            // synthetic Decision once a `&Connection` / ArcSwap handle is
-            // threaded into this helper.
-            warn!(
+            // W3c: legacy `llm_config.primary_model` fallback removed.
+            // The `synth_heavy` tier must resolve via the provider
+            // registry / walker_provider_openrouter — no implicit
+            // default.
+            return Err(anyhow!(
+                "call_generation_llm: tier '{}' not resolved via provider registry \
+                 and walker-v3 W3c removed the legacy primary_model fallback. \
+                 Configure a walker_provider_openrouter contribution with a \
+                 '{}' slot.",
                 tier,
-                "call_generation_llm: tier not resolved via registry; falling back to llm_config.primary_model"
-            );
-            (llm_config.primary_model.clone(), "openrouter".to_string())
+                tier,
+            ));
         }
     };
 
@@ -1085,12 +1087,12 @@ fn operational_table_for(schema_type: &str) -> String {
         "dadbear_policy" => "pyramid_dadbear_config".to_string(),
         "evidence_policy" => "pyramid_evidence_policy".to_string(),
         "build_strategy" => "pyramid_build_strategy".to_string(),
-        // TODO(W3/Phase 1): walker v3 §5.1 — the `pyramid_tier_routing`
-        // operational table is retired. The `tier_routing` schema_type
-        // itself stops being a valid config surface once bundled
-        // `walker_provider_*` contributions cover the tier declarations.
-        // Remove this arm in W3.
-        "tier_routing" => "pyramid_tier_routing".to_string(),
+        // W3c: the `tier_routing` schema_type + `pyramid_tier_routing`
+        // table are retired by walker v3. Tier declarations now live in
+        // `walker_provider_*` contributions; the schema_type itself is
+        // no longer a valid config surface, so supersession via the
+        // generic config-contributions endpoints falls through to the
+        // empty-string default (i.e. "no dedicated operational table").
         "custom_prompts" => "pyramid_custom_prompts".to_string(),
         "step_overrides" => "pyramid_step_overrides".to_string(),
         "folder_ingestion_heuristics" => "pyramid_folder_ingestion_heuristics".to_string(),

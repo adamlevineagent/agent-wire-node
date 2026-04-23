@@ -167,9 +167,15 @@ use self::watcher::PyramidFileWatcher;
 ///   Set via the desktop app Settings → API Key, or manually in the JSON file.
 ///   All requests must include header: `Authorization: Bearer <auth_token>`
 /// - `openrouter_api_key`: API key for LLM calls via OpenRouter.
-/// - `primary_model`: Default LLM model (default: `inception/mercury-2`).
 /// - `use_ir_executor`: Enable the IR-based chain executor (default: false).
 ///   Toggle at runtime via: `POST /pyramid/config` with `{"use_ir_executor": true}`
+///
+/// Walker v3 (W3c): the legacy `primary_model` / `fallback_model_1` /
+/// `fallback_model_2` fields were deleted. Model selection flows through
+/// the walker Decision spine: `walker_provider_openrouter.model_list[tier]`
+/// is the authoritative source. Pre-W3c configs with those fields on
+/// disk still parse (serde ignores unknown fields when `deny_unknown_fields`
+/// is absent); W4 rewrites the on-disk `pyramid_config.json` to drop them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PyramidConfig {
     #[serde(default)]
@@ -178,16 +184,16 @@ pub struct PyramidConfig {
     /// Set in this config file or via the desktop app Settings → API Key.
     #[serde(default)]
     pub auth_token: String,
-    #[serde(default = "default_primary_model")]
-    pub primary_model: String,
-    #[serde(default = "default_fallback_1")]
-    pub fallback_model_1: String,
-    #[serde(default = "default_fallback_2")]
-    pub fallback_model_2: String,
     #[serde(default = "default_partner_model")]
     pub partner_model: String,
     #[serde(default = "default_collapse_model")]
     pub collapse_model: String,
+    /// W3c: parsed-but-ignored serde residue. Preserves compat for old
+    /// install configs that have `{use_chain_engine: false}` persisted;
+    /// the chain engine is always on at runtime, so the value is never
+    /// read. Phase 6's chain-engine-enable-ack onboarding migrates old
+    /// configs out; the field will retire with that work.
+    #[allow(dead_code)]
     #[serde(default)]
     pub use_chain_engine: bool,
     #[serde(default)]
@@ -213,15 +219,6 @@ pub struct PyramidConfig {
     pub model_aliases: HashMap<String, String>,
 }
 
-fn default_primary_model() -> String {
-    "inception/mercury-2".into()
-}
-fn default_fallback_1() -> String {
-    "qwen/qwen3.5-flash-02-23".into()
-}
-fn default_fallback_2() -> String {
-    "x-ai/grok-4.20-beta".into()
-}
 fn default_partner_model() -> String {
     "xiaomi/mimo-v2-pro".into()
 }
@@ -558,9 +555,6 @@ impl Default for PyramidConfig {
         Self {
             openrouter_api_key: String::new(),
             auth_token: String::new(),
-            primary_model: default_primary_model(),
-            fallback_model_1: default_fallback_1(),
-            fallback_model_2: default_fallback_2(),
             partner_model: default_partner_model(),
             collapse_model: default_collapse_model(),
             use_chain_engine: true,
@@ -686,11 +680,6 @@ impl PyramidConfig {
         LlmConfig {
             api_key: self.openrouter_api_key.clone(),
             auth_token: self.auth_token.clone(),
-            primary_model: self.primary_model.clone(),
-            fallback_model_1: self.fallback_model_1.clone(),
-            fallback_model_2: self.fallback_model_2.clone(),
-            primary_context_limit: self.operational.tier1.primary_context_limit,
-            fallback_1_context_limit: self.operational.tier1.fallback_1_context_limit,
             max_retries: self.operational.tier1.llm_max_retries,
             base_timeout_secs: self.operational.tier2.llm_base_timeout_secs,
             max_timeout_secs: self.operational.tier2.llm_max_timeout_secs,
@@ -736,36 +725,11 @@ impl PyramidConfig {
             cfg.api_key = secret.raw_clone();
         }
 
-        // ── Resolve cascade model fields from tier routing ──────────
-        // The cascade in call_model_unified picks primary/fallback_1/fallback_2
-        // based on input token count. Without this resolution, these fields
-        // carry OpenRouter slugs even when Ollama (or another provider) is
-        // active — the HTTP request goes to the right endpoint but sends a
-        // model name the provider doesn't recognize.
-        //
-        // Mapping: primary → mid, fallback_1 → high, fallback_2 → max.
-        // Failures are non-fatal: the field keeps its default (OpenRouter slug),
-        // which is correct when OpenRouter IS the active provider.
-        let tier_map: &[(&str, fn(&mut LlmConfig, String, Option<usize>))] = &[
-            ("mid", |c, model, ctx| {
-                c.primary_model = model;
-                if let Some(limit) = ctx { c.primary_context_limit = limit; }
-            }),
-            ("high", |c, model, ctx| {
-                c.fallback_model_1 = model;
-                if let Some(limit) = ctx { c.fallback_1_context_limit = limit; }
-            }),
-            ("max", |c, model, _ctx| {
-                c.fallback_model_2 = model;
-                // fallback_2 has no dedicated context_limit field — it's the
-                // "everything bigger than fallback_1_context_limit" bucket.
-            }),
-        ];
-        for &(tier_name, apply) in tier_map {
-            if let Ok(resolved) = provider_registry.resolve_tier(tier_name, None, None, None) {
-                apply(&mut cfg, resolved.tier.model_id.clone(), resolved.tier.context_limit);
-            }
-        }
+        // W3c: the legacy `primary_model` / `fallback_model_{1,2}` +
+        // `*_context_limit` fields are gone from `LlmConfig`. Walker v3's
+        // Decision spine pulls `model_list[tier]` from the active
+        // `walker_provider_openrouter` contribution at dispatch time;
+        // there is no config-level cascade to resolve here anymore.
 
         cfg
     }

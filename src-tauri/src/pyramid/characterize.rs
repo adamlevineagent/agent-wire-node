@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use tracing::{info, warn};
 
 use super::llm::{self, LlmConfig};
@@ -157,37 +157,25 @@ Analyze this material and produce the characterization."#,
         Some(resolved) => {
             let model_id = resolved.tier.model_id.clone();
             let provider_id = resolved.provider.id.clone();
-            let context_limit = resolved.tier.context_limit;
-            let mut cloned = llm_config.clone();
-            // TODO(W3/Phase 1): walker v3 — `primary_model` field goes away
-            // when W3 removes the fallback. Keep the overwrite for now to
-            // satisfy the LlmConfig struct contract the field still enforces.
-            cloned.primary_model = model_id.clone();
-            if let Some(ctx_limit) = context_limit {
-                cloned.primary_context_limit = ctx_limit;
-            }
+            let _context_limit = resolved.tier.context_limit;
+            // W3c: no longer overriding LlmConfig.primary_model /
+            // primary_context_limit — those fields are deleted. The
+            // resolved model_id below threads into dispatch via
+            // LlmCallOptions.model_override on the call path.
+            let cloned = llm_config.clone();
             ("max", model_id, Some(provider_id), cloned)
         }
         None => {
-            // TODO(W3/Phase 1): walker v3 — replace with a synthetic Decision
-            // for the "max" slot built via
-            // `DispatchDecision::synthetic_for_preview`. This is a top-level
-            // entry point that has no step_ctx from an outer chain, and the
-            // provider_registry path above is the primary path today. The
-            // `primary_model` fallback read here exists as a last-resort
-            // bridge; W3 removes the field + this branch together.
-            warn!(
-                "characterize: provider registry unavailable — falling back to \
-                 llm_config.primary_model='{}' (declared intent was max-tier). \
-                 This will fail on any route whose provider does not accept that model id.",
-                llm_config.primary_model,
-            );
-            (
-                "primary",
-                llm_config.primary_model.clone(),
-                None,
-                llm_config.clone(),
-            )
+            // W3c: legacy `llm_config.primary_model` fallback removed.
+            // Characterize is a top-level entry point with no outer
+            // Decision; if the registry can't resolve the "max" tier we
+            // can't dispatch at all.
+            return Err(anyhow!(
+                "characterize: provider registry has no 'max' tier routing \
+                 and walker-v3 W3c removed the legacy LlmConfig.primary_model \
+                 fallback. Configure a walker_provider_openrouter contribution \
+                 with a 'max' slot model_list entry.",
+            ));
         }
     };
 

@@ -1,69 +1,18 @@
-// pyramid/config_helper.rs — Shared helper for building single-model LlmConfig instances.
+// pyramid/config_helper.rs — Shared helpers for LlmConfig + pricing math.
 //
-// **Phase 3 fix pass:** `config_for_model(api_key, model)` is DEPRECATED.
-// Production code should use `LlmConfig::clone_with_model_override(&self,
-// model)` instead — that helper preserves the `provider_registry` and
-// `credential_store` runtime handles that the Phase 3 refactor added to
-// `LlmConfig`. The legacy `config_for_model` builds a fresh `LlmConfig`
-// via `..Default::default()`, which zeroes both runtime handles, so
-// every caller silently bypasses the provider registry, the
-// `pyramid_tier_routing` table, the `pyramid_step_overrides` table, and
-// the `.credentials` file. The maintenance subsystem (~22 call sites
-// across `stale_helpers*`, `faq.rs`, `delta.rs`, `meta.rs`, `webbing.rs`)
-// was using this helper everywhere; the fix pass retired it from
-// production code and re-routed everything through
-// `clone_with_model_override`.
+// W3c (walker v3, Phase 1): the former `config_for_model(api_key, model)`
+// helper was deleted here. It wrote the five legacy
+// `LlmConfig::{primary_model, fallback_model_{1,2}, primary_context_limit,
+// fallback_1_context_limit}` fields, all of which retired in W3c. Per-call
+// model overrides now flow through `LlmCallOptions.model_override` (§2.9
+// "reqs.model" pattern), and per-tier resolution flows through the walker
+// Decision or `provider_registry.resolve_tier` — both read at dispatch
+// time, both without needing a fresh `LlmConfig` constructed per call.
 //
-// `config_for_model` is retained ONLY for unit-test fixtures that don't
-// have a live `PyramidState` to clone from. Do NOT call it in
-// production code paths — the deprecation warning is wired up to make
-// any new caller fail clippy.
+// If a test needs an isolated `LlmConfig`, use `LlmConfig::default()`.
 
-use crate::pyramid::llm::LlmConfig;
 use crate::pyramid::types::TokenUsage;
 use crate::pyramid::Tier1Config;
-
-/// **DEPRECATED — use `LlmConfig::clone_with_model_override` instead.**
-///
-/// Build an `LlmConfig` targeting a specific model from raw `(api_key,
-/// model)` strings. This helper drops the Phase 3 `provider_registry`
-/// and `credential_store` fields because it ends in
-/// `..Default::default()`, so every LLM call routed through the
-/// resulting config silently bypasses the provider registry and the
-/// `.credentials` file. Any caller in production code is a bug — use
-/// `LlmConfig::clone_with_model_override(&self, model)` to clone the
-/// live `PyramidState.config` while overriding the primary model.
-///
-/// This function is retained for unit-test fixtures that build a fresh
-/// `LlmConfig` from scratch without a `PyramidState`.
-#[deprecated(
-    note = "Drops provider_registry + credential_store. Use \
-            LlmConfig::clone_with_model_override on the live config from \
-            PyramidState.config (or thread an &LlmConfig down to the \
-            helper) so registry-aware Phase 3 routing applies."
-)]
-pub fn config_for_model(api_key: &str, model: &str) -> LlmConfig {
-    let defaults = Tier1Config::default();
-    // TODO(W3/Phase 1): walker v3 — the three model-id fields written
-    // below retire in W3. This deprecated helper is already flagged
-    // unsafe for production use and only survives for a handful of
-    // isolated unit-test fixtures; W3's field deletion forces rewrite
-    // of those fixtures + deletion of this helper together.
-    LlmConfig {
-        api_key: api_key.to_string(),
-        auth_token: String::new(),
-        primary_model: model.to_string(),
-        // Set fallbacks to the same model so the cascade stays on-model.
-        fallback_model_1: model.to_string(),
-        fallback_model_2: model.to_string(),
-        primary_context_limit: defaults.primary_context_limit,
-        fallback_1_context_limit: defaults.fallback_1_context_limit,
-        max_retries: defaults.llm_max_retries,
-        base_timeout_secs: 120,
-        max_timeout_secs: 600,
-        ..Default::default()
-    }
-}
 
 /// Estimate USD cost from token usage using configurable per-million pricing.
 pub fn estimate_cost(usage: &TokenUsage) -> f64 {

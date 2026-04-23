@@ -578,11 +578,46 @@ pub fn make_step_ctx_from_llm_config(
     chunk_index: Option<i64>,
     system_prompt: &str,
 ) -> Option<StepContext> {
+    make_step_ctx_from_llm_config_with_model(
+        config,
+        step_name,
+        primitive,
+        depth,
+        chunk_index,
+        system_prompt,
+        None,
+    )
+}
+
+/// W3c variant: explicitly thread the model slug used for this call,
+/// replacing the deleted `config.primary_model` read. Maintenance
+/// subsystem callers that used to clone LlmConfig via
+/// `clone_with_model_override(model)` now pass the model directly.
+/// When `model` is None, the cache row's model_resolution is stamped
+/// with `<unknown>` with a tracing warn — it's a provenance field, so
+/// dispatch doesn't depend on it.
+pub fn make_step_ctx_from_llm_config_with_model(
+    config: &LlmConfig,
+    step_name: &str,
+    primitive: &str,
+    depth: i64,
+    chunk_index: Option<i64>,
+    system_prompt: &str,
+    model: Option<&str>,
+) -> Option<StepContext> {
     let cache = config.cache_access.as_ref()?;
     if system_prompt.is_empty() {
         return None;
     }
     let prompt_hash = compute_prompt_hash(system_prompt);
+    let resolved_model = model.map(|s| s.to_string()).unwrap_or_else(|| {
+        tracing::warn!(
+            event = "make_step_ctx_model_unknown",
+            step = %step_name,
+            "walker-v3: no model slug provided for cache model_resolution stamp; using '<unknown>'",
+        );
+        "<unknown>".to_string()
+    });
     let mut ctx = StepContext::new(
         cache.slug.clone(),
         cache.build_id.clone(),
@@ -592,7 +627,7 @@ pub fn make_step_ctx_from_llm_config(
         chunk_index,
         cache.db_path.to_string(),
     )
-    .with_model_resolution("primary", config.primary_model.clone())
+    .with_model_resolution("primary", resolved_model)
     .with_prompt_hash(prompt_hash);
     if let Some(bus) = &cache.bus {
         ctx = ctx.with_bus(bus.clone());

@@ -396,20 +396,20 @@ fn resolve_model(
         warn!("[CHAIN] tier '{}' not in registry, falling back to legacy resolution", tier);
     }
 
-    // Legacy fallback: aliases then hardcoded mapping. W3 removes the
-    // match arms when config.primary_model / fallback_model_{1,2} go.
+    // W3c: legacy `config.primary_model` / `fallback_model_{1,2}` arms
+    // deleted. Aliases remain as an operator-level escape hatch; if
+    // neither the Decision, registry, nor an alias covers the tier we
+    // stamp `<unknown>` — the call will fail at dispatch time via
+    // `call_model_unified`'s RouteSkipped path (no model_list → skip).
     if let Some(model) = config.model_aliases.get(tier) {
         return model.clone();
     }
-    match tier {
-        "low" | "mid" => config.primary_model.clone(),
-        "high" => config.fallback_model_1.clone(),
-        "max" => config.fallback_model_2.clone(),
-        other => {
-            warn!("[CHAIN] unknown tier '{}', using primary_model", other);
-            config.primary_model.clone()
-        }
-    }
+    warn!(
+        "[CHAIN] walker-v3: tier '{}' had no Decision, no registry row, and no alias; \
+         returning '<unknown>' — dispatch will surface no-model-available",
+        tier,
+    );
+    "<unknown>".to_string()
 }
 
 /// Resolve temperature from step override or defaults.
@@ -447,26 +447,17 @@ async fn dispatch_llm(
 
     let resolved_model =
         resolve_model(step, defaults, &ctx.config, dispatch_decision.as_ref());
-    let resolved_limit = resolve_context_limit(step, defaults, &ctx.config, &ctx.tier1);
+    let _resolved_limit = resolve_context_limit(step, defaults, &ctx.config, &ctx.tier1);
     let max_tokens: usize = ctx.tier1.ir_max_tokens;
 
-    // Apply model override: if the resolved model differs from the config's
-    // primary model, create a modified config so call_model() uses it.
-    // Uses clone_with_model_override to pin ALL model slots (primary +
-    // fallback_1 + fallback_2) to the resolved model, preventing the
-    // cascade from escaping to a different provider's models.
-    let config_ref;
-    let overridden_config;
-    if resolved_model != ctx.config.primary_model
-        || resolved_limit != ctx.config.primary_context_limit
-    {
-        let mut cfg = ctx.config.clone_with_model_override(&resolved_model);
-        cfg.primary_context_limit = resolved_limit;
-        overridden_config = cfg;
-        config_ref = &overridden_config;
-    } else {
-        config_ref = &ctx.config;
-    }
+    // W3c: the deleted `LlmConfig.primary_model` + `primary_context_limit`
+    // fields used to carry the resolved model/limit down into
+    // `call_model` via `clone_with_model_override`. The Decision attached
+    // to the cache StepContext is now the sole source — `call_model_unified`
+    // reads `model_list[0]` / `context_limit` from it directly, so the
+    // override clone is unnecessary. `resolved_model` is retained for
+    // tracing / cache-row model_resolution below.
+    let config_ref = &ctx.config;
 
     // Build user prompt from resolved input
     let user_prompt =
@@ -1304,20 +1295,19 @@ pub fn resolve_ir_model(
         warn!("[IR] tier '{}' not in registry, falling back to legacy resolution", tier);
     }
 
-    // Priority 4: legacy hardcoded match. W3 deletes these arms when
-    // config.primary_model / fallback_model_{1,2} retire.
+    // W3c: legacy hardcoded per-tier match arms deleted. Aliases
+    // remain as the last escape hatch. Missing → `<unknown>` so
+    // dispatch surfaces "no model available" rather than silently
+    // picking up a hardcoded default.
     if let Some(model) = config.model_aliases.get(tier) {
         return model.clone();
     }
-    match tier {
-        "low" | "mid" => config.primary_model.clone(),
-        "high" => config.fallback_model_1.clone(),
-        "max" => config.fallback_model_2.clone(),
-        other => {
-            warn!("[IR] unknown tier '{}', using primary_model", other);
-            config.primary_model.clone()
-        }
-    }
+    warn!(
+        "[IR] walker-v3: tier '{}' had no Decision, no registry row, and no alias; \
+         returning '<unknown>' — dispatch will surface no-model-available",
+        tier,
+    );
+    "<unknown>".to_string()
 }
 
 /// Resolve the primary context limit (in estimated tokens) for an IR step's model.
@@ -1348,15 +1338,17 @@ fn resolve_ir_context_limit(
         }
     }
 
-    // Legacy fallback
+    // W3c: legacy fallback on `LlmConfig.primary_context_limit` replaced
+    // with Tier1Config's `primary_context_limit` (same numeric field,
+    // now authoritative in operational config).
     if config.model_aliases.contains_key(tier) {
         return tier1.high_tier_context_limit;
     }
     match tier {
-        "low" | "mid" => config.primary_context_limit,
+        "low" | "mid" => tier1.primary_context_limit,
         "high" => tier1.high_tier_context_limit,
         "max" => tier1.max_tier_context_limit,
-        _ => config.primary_context_limit,
+        _ => tier1.primary_context_limit,
     }
 }
 
@@ -1391,15 +1383,16 @@ fn resolve_context_limit(
         }
     }
 
-    // Legacy fallback
+    // W3c: legacy fallback on `LlmConfig.primary_context_limit` replaced
+    // with Tier1Config's `primary_context_limit`.
     if config.model_aliases.contains_key(tier) {
         return tier1.high_tier_context_limit;
     }
     match tier {
-        "low" | "mid" => config.primary_context_limit,
+        "low" | "mid" => tier1.primary_context_limit,
         "high" => tier1.high_tier_context_limit,
         "max" => tier1.max_tier_context_limit,
-        _ => config.primary_context_limit,
+        _ => tier1.primary_context_limit,
     }
 }
 
@@ -1517,21 +1510,11 @@ pub async fn dispatch_ir_llm(
     let max_tokens = resolve_ir_max_tokens(step, &ctx.tier1);
     let llm_options = resolve_ir_llm_call_options(step, &ctx.tier1);
 
-    // Apply model override: pin ALL model slots (primary + fallback_1 +
-    // fallback_2) to the resolved model so cascade stays on the same
-    // provider. Also override context limit to match the resolved tier.
-    let config_ref;
-    let overridden_config;
-    if resolved_model != ctx.config.primary_model
-        || resolved_limit != ctx.config.primary_context_limit
-    {
-        let mut cfg = ctx.config.clone_with_model_override(&resolved_model);
-        cfg.primary_context_limit = resolved_limit;
-        overridden_config = cfg;
-        config_ref = &overridden_config;
-    } else {
-        config_ref = &ctx.config;
-    }
+    // W3c: legacy `clone_with_model_override` + `primary_context_limit`
+    // override removed. The Decision attached to the IR StepContext
+    // carries both slug and context_limit; `call_model_unified` reads
+    // those directly.
+    let config_ref = &ctx.config;
 
     let raw_input_len = serde_json::to_string(resolved_input)
         .unwrap_or_default()
@@ -1968,7 +1951,14 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_model_tier_mapping() {
+    fn test_resolve_model_tier_mapping_aliases() {
+        // W3c: legacy hardcoded `primary_model` / `fallback_model_{1,2}`
+        // fallbacks were deleted. The resolver consults:
+        //   1. `reqs.model` / step.model (direct override)
+        //   2. Decision (unit test has none)
+        //   3. provider_registry (unit test has none)
+        //   4. `config.model_aliases` (we seed these for the test)
+        //   5. `<unknown>` sentinel — tested in the sibling test below.
         let make_step = |tier: &str| ChainStep {
             name: "test".into(),
             primitive: "compress".into(),
@@ -1982,23 +1972,60 @@ mod tests {
             temperature: 0.3,
             on_error: "retry(2)".into(),
         };
-        let config = LlmConfig::default();
+        let mut config = LlmConfig::default();
+        config
+            .model_aliases
+            .insert("low".into(), "alias/low".into());
+        config
+            .model_aliases
+            .insert("mid".into(), "alias/mid".into());
+        config
+            .model_aliases
+            .insert("high".into(), "alias/high".into());
+        config
+            .model_aliases
+            .insert("max".into(), "alias/max".into());
 
         assert_eq!(
             resolve_model(&make_step("low"), &defaults, &config, None),
-            config.primary_model
+            "alias/low"
         );
         assert_eq!(
             resolve_model(&make_step("mid"), &defaults, &config, None),
-            config.primary_model
+            "alias/mid"
         );
         assert_eq!(
             resolve_model(&make_step("high"), &defaults, &config, None),
-            config.fallback_model_1
+            "alias/high"
         );
         assert_eq!(
             resolve_model(&make_step("max"), &defaults, &config, None),
-            config.fallback_model_2
+            "alias/max"
+        );
+    }
+
+    #[test]
+    fn test_resolve_model_no_decision_no_alias_returns_unknown_sentinel() {
+        // W3c: when neither Decision, registry, nor alias covers the tier,
+        // the resolver stamps `<unknown>`. `call_model_unified` turns that
+        // into a RouteSkipped at dispatch time.
+        let step = ChainStep {
+            name: "test".into(),
+            primitive: "compress".into(),
+            model_tier: Some("mid".into()),
+            instruction: Some("x".into()),
+            ..Default::default()
+        };
+        let defaults = ChainDefaults {
+            model_tier: "mid".into(),
+            model: None,
+            temperature: 0.3,
+            on_error: "retry(2)".into(),
+        };
+        let config = LlmConfig::default();
+        assert_eq!(
+            resolve_model(&step, &defaults, &config, None),
+            "<unknown>"
         );
     }
 
@@ -2048,8 +2075,21 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_ir_model_tier_mapping() {
-        let config = LlmConfig::default();
+    fn test_resolve_ir_model_tier_mapping_aliases() {
+        // W3c: aliases are the last escape hatch after Decision/registry.
+        let mut config = LlmConfig::default();
+        config
+            .model_aliases
+            .insert("low".into(), "alias/low".into());
+        config
+            .model_aliases
+            .insert("mid".into(), "alias/mid".into());
+        config
+            .model_aliases
+            .insert("high".into(), "alias/high".into());
+        config
+            .model_aliases
+            .insert("max".into(), "alias/max".into());
 
         let make_reqs = |tier: &str| ModelRequirements {
             tier: Some(tier.into()),
@@ -2059,40 +2099,41 @@ mod tests {
 
         assert_eq!(
             resolve_ir_model(&make_reqs("low"), &config, None),
-            config.primary_model
+            "alias/low"
         );
         assert_eq!(
             resolve_ir_model(&make_reqs("mid"), &config, None),
-            config.primary_model
+            "alias/mid"
         );
         assert_eq!(
             resolve_ir_model(&make_reqs("high"), &config, None),
-            config.fallback_model_1
+            "alias/high"
         );
         assert_eq!(
             resolve_ir_model(&make_reqs("max"), &config, None),
-            config.fallback_model_2
+            "alias/max"
         );
     }
 
     #[test]
-    fn test_resolve_ir_model_default_tier() {
-        // When tier is None, defaults to "mid" → primary_model
+    fn test_resolve_ir_model_default_tier_no_decision_returns_unknown() {
+        // W3c: without Decision/registry/alias, default-tier "mid" resolves
+        // to `<unknown>` — dispatch surfaces RouteSkipped.
         let reqs = ModelRequirements::default();
         let config = LlmConfig::default();
-        assert_eq!(resolve_ir_model(&reqs, &config, None), config.primary_model);
+        assert_eq!(resolve_ir_model(&reqs, &config, None), "<unknown>");
     }
 
     #[test]
-    fn test_resolve_ir_model_unknown_tier() {
+    fn test_resolve_ir_model_unknown_tier_returns_unknown() {
+        // W3c: arbitrary tier without any resolver match → `<unknown>`.
         let reqs = ModelRequirements {
             tier: Some("ultra".into()),
             model: None,
             temperature: None,
         };
         let config = LlmConfig::default();
-        // Unknown tier falls back to primary
-        assert_eq!(resolve_ir_model(&reqs, &config, None), config.primary_model);
+        assert_eq!(resolve_ir_model(&reqs, &config, None), "<unknown>");
     }
 
     #[test]

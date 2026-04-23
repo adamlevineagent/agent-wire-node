@@ -581,6 +581,10 @@ impl DadbearSupervisor {
                 skip_fleet_dispatch: false,
                 chronicle_job_path: None,
                 dispatch_origin: Default::default(),
+                // W3c: explicit per-call model override. DADBEAR enqueues
+                // with the slug pinned at the outer dispatch site; this
+                // keeps the queue consumer dispatching the same model.
+                model_override: Some(model_id.clone()),
             },
             step_ctx: Some(step_ctx),
             model_id: model_id.clone(),

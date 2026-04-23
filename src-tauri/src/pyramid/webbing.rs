@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use crate::pyramid::db;
 use crate::pyramid::llm;
 use crate::pyramid::llm::LlmConfig;
-use crate::pyramid::step_context::make_step_ctx_from_llm_config;
+use crate::pyramid::step_context::make_step_ctx_from_llm_config_with_model;
 use crate::pyramid::types::*;
 
 use super::Tier3Config;
@@ -264,19 +264,20 @@ Output JSON only:
         delta_contents = delta_contents,
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let cfg = base_config.clone_with_model_override(model);
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &cfg,
+    // W3c: legacy clone_with_model_override removed. Model threads via
+    // LlmCallOptions.model_override + explicit step_ctx model arg.
+    let cache_ctx = make_step_ctx_from_llm_config_with_model(
+        base_config,
         "webbing_collapse_edge",
         "webbing",
         -1,
         None,
         system_prompt,
+        Some(model),
     );
-    let raw = llm::call_model_and_ctx(
-        &cfg,
+    let raw = llm::call_model_with_override_and_ctx(
+        base_config,
+        model,
         cache_ctx.as_ref(),
         system_prompt,
         &user_prompt,

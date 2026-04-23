@@ -3989,13 +3989,14 @@ async fn handle_config(
 
     // Persist non-secret config to disk. Deliberately not updating
     // openrouter_api_key — credential store is SOT. Stale value
-    // preserved as boot-time migration source. Model fields echo
-    // whatever is already live (no write path mutates them from here).
+    // preserved as boot-time migration source.
+    //
+    // W3c: PyramidConfig no longer carries `primary_model` /
+    // `fallback_model_{1,2}`. Model selection lives in
+    // `walker_provider_openrouter`. We still write the other
+    // non-secret fields through.
     if let Some(ref data_dir) = state.data_dir {
         let mut pyramid_config = super::PyramidConfig::load(data_dir);
-        pyramid_config.primary_model = config.primary_model.clone();
-        pyramid_config.fallback_model_1 = config.fallback_model_1.clone();
-        pyramid_config.fallback_model_2 = config.fallback_model_2.clone();
         pyramid_config.use_ir_executor = state
             .use_ir_executor
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -4004,29 +4005,25 @@ async fn handle_config(
         }
     }
 
-    // walker-v3 W3a: response echoes synthesize the model triple from
-    // the active walker_provider_openrouter contribution. Legacy
-    // fallback removed by W3c once config.primary_model dies.
+    // walker-v3 W3c: response echoes synthesize the model triple from
+    // the active walker_provider_openrouter contribution. No legacy
+    // fallback — the Settings UI shows "not configured" (null) if the
+    // contribution is missing and the operator follows up via
+    // Tools > Create.
     // TODO(walker-v3 Phase 6): drop this route entirely; operators
     // observe walker_provider_* contributions via the standard
     // config-contributions endpoints instead.
-    let legacy_primary = config.primary_model.clone();
-    let legacy_fb1 = config.fallback_model_1.clone();
-    let legacy_fb2 = config.fallback_model_2.clone();
     drop(config);
     let (primary_syn, fb1_syn, fb2_syn) = {
         let conn = state.reader.lock().await;
         super::walker_resolver::synthesize_legacy_model_triple_from_db(&conn)
     };
-    let primary_model = primary_syn.unwrap_or(legacy_primary);
-    let fallback_model_1 = fb1_syn.unwrap_or(legacy_fb1);
-    let fallback_model_2 = fb2_syn.unwrap_or(legacy_fb2);
 
     Ok(json_ok(&serde_json::json!({
         "status": "updated",
-        "primary_model": primary_model,
-        "fallback_model_1": fallback_model_1,
-        "fallback_model_2": fallback_model_2,
+        "primary_model": primary_syn,
+        "fallback_model_1": fb1_syn,
+        "fallback_model_2": fb2_syn,
         "use_ir_executor": state.use_ir_executor.load(std::sync::atomic::Ordering::Relaxed),
     })))
 }
@@ -4324,7 +4321,13 @@ async fn handle_annotate(
         let conn = state.reader.lock().await;
         super::walker_resolver::first_openrouter_model_from_db(&conn)
     };
-    let model = resolved.unwrap_or_else(|| base_config.primary_model.clone());
+    let model = resolved.unwrap_or_else(|| {
+        tracing::warn!(
+            event = "pattern4_no_openrouter_model",
+            "walker-v3: Pattern-4 site found no walker_provider_openrouter model; stamping '<unknown>' — downstream dispatch will surface no-model-available",
+        );
+        "<unknown>".to_string()
+    });
     let ops_clone = state.operational.clone();
 
     tokio::spawn(async move {
@@ -4687,7 +4690,13 @@ async fn handle_meta_run(
         let conn = state.reader.lock().await;
         super::walker_resolver::first_openrouter_model_from_db(&conn)
     };
-    let model = resolved.unwrap_or_else(|| base_config.primary_model.clone());
+    let model = resolved.unwrap_or_else(|| {
+        tracing::warn!(
+            event = "pattern4_no_openrouter_model",
+            "walker-v3: Pattern-4 site found no walker_provider_openrouter model; stamping '<unknown>' — downstream dispatch will surface no-model-available",
+        );
+        "<unknown>".to_string()
+    });
 
     let reader = state.reader.clone();
     let writer = state.writer.clone();
@@ -4754,7 +4763,13 @@ async fn handle_match_faq(
         let conn = state.reader.lock().await;
         super::walker_resolver::first_openrouter_model_from_db(&conn)
     };
-    let model = resolved.unwrap_or_else(|| base_config.primary_model.clone());
+    let model = resolved.unwrap_or_else(|| {
+        tracing::warn!(
+            event = "pattern4_no_openrouter_model",
+            "walker-v3: Pattern-4 site found no walker_provider_openrouter model; stamping '<unknown>' — downstream dispatch will surface no-model-available",
+        );
+        "<unknown>".to_string()
+    });
 
     match faq::match_faq(
         &state.reader,
@@ -4795,7 +4810,13 @@ async fn handle_faq_directory(
         let conn = state.reader.lock().await;
         super::walker_resolver::first_openrouter_model_from_db(&conn)
     };
-    let model = resolved.unwrap_or_else(|| base_config.primary_model.clone());
+    let model = resolved.unwrap_or_else(|| {
+        tracing::warn!(
+            event = "pattern4_no_openrouter_model",
+            "walker-v3: Pattern-4 site found no walker_provider_openrouter model; stamping '<unknown>' — downstream dispatch will surface no-model-available",
+        );
+        "<unknown>".to_string()
+    });
 
     match faq::get_faq_directory(
         &state.reader,

@@ -20,7 +20,7 @@ use crate::pyramid::db;
 use crate::pyramid::llm;
 use crate::pyramid::llm::LlmConfig;
 use crate::pyramid::naming::{clean_headline, headline_for_node};
-use crate::pyramid::step_context::make_step_ctx_from_llm_config;
+use crate::pyramid::step_context::make_step_ctx_from_llm_config_with_model;
 use crate::pyramid::types::*;
 
 use super::OperationalConfig;
@@ -102,19 +102,20 @@ Output JSON:
 {{"match": "thread-id" | "NEW", "thread_name": "name for new thread if NEW"}}"#
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let cfg = base_config.clone_with_model_override(model);
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &cfg,
+    // W3c: legacy clone_with_model_override removed. Model threads via
+    // LlmCallOptions.model_override + explicit step_ctx model arg.
+    let cache_ctx = make_step_ctx_from_llm_config_with_model(
+        base_config,
         "delta_thread_match",
         "delta",
         -1,
         None,
         system_prompt,
+        Some(model),
     );
-    let raw = llm::call_model_and_ctx(
-        &cfg,
+    let raw = llm::call_model_with_override_and_ctx(
+        base_config,
+        model,
         cache_ctx.as_ref(),
         system_prompt,
         &user_prompt,
@@ -291,19 +292,20 @@ Output JSON only:
         n = recent_deltas.len(),
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let cfg = base_config.clone_with_model_override(model);
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &cfg,
+    // W3c: legacy clone_with_model_override removed. Model threads via
+    // LlmCallOptions.model_override + explicit step_ctx model arg.
+    let cache_ctx = make_step_ctx_from_llm_config_with_model(
+        base_config,
         "delta_describe_change",
         "delta",
         -1,
         None,
         system_prompt,
+        Some(model),
     );
-    let raw = llm::call_model_and_ctx(
-        &cfg,
+    let raw = llm::call_model_with_override_and_ctx(
+        base_config,
+        model,
         cache_ctx.as_ref(),
         system_prompt,
         &user_prompt,
@@ -528,19 +530,20 @@ Output JSON only:
         budget = ops.tier2.distillation_token_budget,
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let cfg = base_config.clone_with_model_override(model);
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &cfg,
+    // W3c: legacy clone_with_model_override removed. Model threads via
+    // LlmCallOptions.model_override + explicit step_ctx model arg.
+    let cache_ctx = make_step_ctx_from_llm_config_with_model(
+        base_config,
         "delta_rewrite_distillation",
         "delta",
         -1,
         None,
         system_prompt,
+        Some(model),
     );
-    let raw = llm::call_model_and_ctx(
-        &cfg,
+    let raw = llm::call_model_with_override_and_ctx(
+        base_config,
+        model,
         cache_ctx.as_ref(),
         system_prompt,
         &user_prompt,
@@ -730,19 +733,20 @@ Output valid JSON matching this schema:
         deltas = deltas_text,
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let cfg = base_config.clone_with_model_override(collapse_model);
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &cfg,
+    // W3c: legacy clone_with_model_override removed. Model threads via
+    // LlmCallOptions.model_override + explicit step_ctx model arg.
+    let cache_ctx = make_step_ctx_from_llm_config_with_model(
+        base_config,
         "delta_collapse_deltas",
         "delta",
         -1,
         None,
         system_prompt,
+        Some(collapse_model),
     );
-    let raw = llm::call_model_and_ctx(
-        &cfg,
+    let raw = llm::call_model_with_override_and_ctx(
+        base_config,
+        collapse_model,
         cache_ctx.as_ref(),
         system_prompt,
         &user_prompt,

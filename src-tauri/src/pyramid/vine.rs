@@ -1364,13 +1364,10 @@ pub async fn build_vine_l1(
                     1,
                     &l1_id,
                     &output_json,
-                    // TODO(W3/Phase 1): walker v3 — primary_model field
-                    // retires in W3. Step telemetry should record the
-                    // Decision-resolved model id for this slot, not the
-                    // LlmConfig default. vine's run_build_pipeline doesn't
-                    // receive step_ctx; W3 migration needs to either thread
-                    // the Decision in or record the resolved id explicitly.
-                    &llm_config.primary_model,
+                    // W3c: legacy `llm_config.primary_model` removed. Step
+                    // telemetry stamps `<unknown>` here until vine runs
+                    // through the walker Decision spine. Provenance only.
+                    "<unknown>",
                     elapsed,
                 )
                 .await;
@@ -1554,9 +1551,8 @@ pub async fn build_vine_upper(
                         next_depth,
                         &node_id,
                         &output_json,
-                        // TODO(W3/Phase 1): walker v3 — see telemetry TODO
-                        // at sibling call site in this file (~line 1470).
-                        &llm_config.primary_model,
+                        // W3c: see sibling at ~line 1373. Provenance stamp only.
+                        "<unknown>",
                         elapsed,
                     )
                     .await;

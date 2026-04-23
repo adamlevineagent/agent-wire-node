@@ -230,7 +230,23 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
             .as_ref()
             .map(|p| p.build_coordination.defer_maintenance_during_build)
             .unwrap_or(false);
-        (config.clone(), config.primary_model.clone(), defer)
+        // W3c: resolve the stale-engine maintenance model via the
+        // walker_provider_openrouter contribution (Pattern-4 helper).
+        // Legacy `config.primary_model` field deleted; fall back to a
+        // sentinel so the engine still constructs and maintenance
+        // dispatch surfaces the gap at call-time rather than here.
+        let resolved_model = {
+            let conn = pyramid_state.reader.lock().await;
+            crate::pyramid::walker_resolver::first_openrouter_model_from_db(&conn)
+        };
+        let model = resolved_model.unwrap_or_else(|| {
+            tracing::warn!(
+                event = "stale_engine_init_no_model",
+                "walker-v3: no walker_provider_openrouter model for stale engine init; stamping '<unknown>'",
+            );
+            "<unknown>".to_string()
+        });
+        (config.clone(), model, defer)
     };
 
     // Get the DB path from data_dir
@@ -1699,8 +1715,18 @@ async fn handle_fleet_dispatch(
         let cfg = state.pyramid.config.read().await;
         if let Some(ref policy) = cfg.dispatch_policy {
             match policy.resolve_local_for_rule(&rule_name) {
-                Some((_provider_id, model_id)) => {
-                    model_id.unwrap_or_else(|| cfg.primary_model.clone())
+                Some((_provider_id, Some(model_id))) => model_id,
+                Some((_provider_id, None)) => {
+                    // W3c: legacy `cfg.primary_model` fallback removed.
+                    // A LOCAL rule must pin a concrete model_id; without
+                    // one we reject the dispatch rather than silently
+                    // picking up a different provider's slug.
+                    return Ok(Box::new(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({
+                            "error": "LOCAL dispatch rule missing model_id",
+                        })),
+                        warp::http::StatusCode::BAD_REQUEST,
+                    )));
                 }
                 None => {
                     return Ok(Box::new(warp::reply::with_status(
@@ -2055,15 +2081,15 @@ fn spawn_fleet_worker(
         // Derive worker config via prepare_for_replay — the node is
         // fulfilling a fleet-received job, so dispatch contexts
         // (compute_queue, fleet, market) must all be cleared to prevent
-        // recursive outbound dispatch. Then override the model to the
-        // requested one.
+        // recursive outbound dispatch.
+        //
+        // W3c: the legacy `LlmConfig.primary_model` + fallback fields are
+        // gone. The resolved model is passed down via
+        // `LlmCallOptions.model_override`, which `call_model_unified`
+        // honors ahead of any entry/tier slot.
         let fleet_config = {
             let cfg = state.pyramid.config.read().await;
-            let mut fc = cfg.prepare_for_replay(crate::pyramid::llm::DispatchOrigin::FleetReceived);
-            fc.primary_model = resolved_model.clone();
-            fc.fallback_model_1 = resolved_model.clone();
-            fc.fallback_model_2 = resolved_model.clone();
-            fc
+            cfg.prepare_for_replay(crate::pyramid::llm::DispatchOrigin::FleetReceived)
         };
 
         let chronicle_job_path = format!("fleet-recv:{}:{}", dispatcher_nid, job_id);
@@ -2071,6 +2097,7 @@ fn spawn_fleet_worker(
             skip_fleet_dispatch: true,
             chronicle_job_path: Some(chronicle_job_path.clone()),
             dispatch_origin: crate::pyramid::llm::DispatchOrigin::FleetReceived,
+            model_override: Some(resolved_model.clone()),
             ..Default::default()
         };
 
@@ -3984,15 +4011,15 @@ fn spawn_market_worker(
         // Derive worker config via prepare_for_replay — the node is
         // fulfilling a market-received job, so dispatch contexts
         // (compute_queue, fleet, market) must all be cleared to prevent
-        // recursive outbound dispatch. Then override the model to the
-        // market-requested one.
+        // recursive outbound dispatch.
+        //
+        // W3c: the legacy `LlmConfig.primary_model` + fallback fields are
+        // gone. The market-requested slug is passed via
+        // `LlmCallOptions.model_override` — non-negotiable for market
+        // workers since the remote requester contracted for that slug.
         let worker_config = {
             let cfg = state.pyramid.config.read().await;
-            let mut wc = cfg.prepare_for_replay(crate::pyramid::llm::DispatchOrigin::MarketReceived);
-            wc.primary_model = model_id.clone();
-            wc.fallback_model_1 = model_id.clone();
-            wc.fallback_model_2 = model_id.clone();
-            wc
+            cfg.prepare_for_replay(crate::pyramid::llm::DispatchOrigin::MarketReceived)
         };
 
         let chronicle_job_path = format!("market-recv:{}", job_id);
@@ -4000,6 +4027,7 @@ fn spawn_market_worker(
             skip_fleet_dispatch: true,
             chronicle_job_path: Some(chronicle_job_path.clone()),
             dispatch_origin: crate::pyramid::llm::DispatchOrigin::MarketReceived,
+            model_override: Some(model_id.clone()),
             ..Default::default()
         };
 

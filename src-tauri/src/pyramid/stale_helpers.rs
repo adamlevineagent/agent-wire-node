@@ -19,7 +19,7 @@ use tracing::{info, warn};
 
 
 use super::config_helper::estimate_cost;
-use super::llm::{call_model_unified_and_ctx, extract_json, LlmConfig};
+use super::llm::{call_model_unified_with_options_and_ctx, extract_json, LlmConfig};
 use super::step_context::{compute_prompt_hash, StepContext};
 use super::naming::{headline_from_path, tombstone_headline};
 use super::stale_helpers_upper::{
@@ -297,9 +297,8 @@ Output JSON only. Array of objects, one per file:
         ));
     }
 
-    // Call LLM via the live config (preserves Phase 3 provider_registry +
-    // credential_store) with the model overridden to the per-call slug.
-    let config = base_config.clone_with_model_override(model);
+    // W3c: legacy clone_with_model_override removed. Model now
+    // threads into dispatch via LlmCallOptions.model_override below.
     let ctx = StepContext::new(
         slug.clone(),
         format!("stale-file-check-{}", slug),
@@ -311,14 +310,18 @@ Output JSON only. Array of objects, one per file:
     )
     .with_model_resolution("stale_local", model.to_string())
     .with_prompt_hash(compute_prompt_hash(system_prompt));
-    let llm_resp = call_model_unified_and_ctx(
-        &config,
+    let llm_resp = call_model_unified_with_options_and_ctx(
+        base_config,
         Some(&ctx),
         system_prompt,
         &user_prompt,
         0.1,
         1024,
         None,
+        crate::pyramid::llm::LlmCallOptions {
+            model_override: Some(model.to_string()),
+            ..Default::default()
+        },
     )
     .await?;
     let response = llm_resp.content;
@@ -790,9 +793,8 @@ Output JSON only:
         old_path, old_distilled, new_path, new_content_head
     );
 
-    // Call LLM via the live config (preserves Phase 3 provider_registry +
-    // credential_store) with the model overridden to the per-call slug.
-    let config = base_config.clone_with_model_override(model);
+    // W3c: legacy clone_with_model_override removed. Model now
+    // threads into dispatch via LlmCallOptions.model_override below.
     let ctx = StepContext::new(
         slug.clone(),
         format!("stale-rename-check-{}", slug),
@@ -804,14 +806,18 @@ Output JSON only:
     )
     .with_model_resolution("stale_local", model.to_string())
     .with_prompt_hash(compute_prompt_hash(system_prompt));
-    let llm_resp = call_model_unified_and_ctx(
-        &config,
+    let llm_resp = call_model_unified_with_options_and_ctx(
+        base_config,
         Some(&ctx),
         system_prompt,
         &user_prompt,
         0.1,
         256,
         None,
+        crate::pyramid::llm::LlmCallOptions {
+            model_override: Some(model.to_string()),
+            ..Default::default()
+        },
     )
     .await?;
     let response = llm_resp.content;
@@ -1234,9 +1240,8 @@ Output JSON only:
             context
         );
 
-        // Call LLM via the live config (preserves Phase 3 provider_registry +
-        // credential_store) with the model overridden to the per-call slug.
-        let config = base_config.clone_with_model_override(model);
+        // W3c: legacy clone_with_model_override removed. Model threads
+        // via LlmCallOptions.model_override below.
         let ctx = StepContext::new(
             slug.clone(),
             format!("stale-evidence-apex-{}", slug),
@@ -1248,14 +1253,18 @@ Output JSON only:
         )
         .with_model_resolution("stale_local", model.to_string())
         .with_prompt_hash(compute_prompt_hash(system_prompt));
-        let llm_resp = call_model_unified_and_ctx(
-            &config,
+        let llm_resp = call_model_unified_with_options_and_ctx(
+            base_config,
             Some(&ctx),
             system_prompt,
             &user_prompt,
             0.2,
             1024,
             None,
+            crate::pyramid::llm::LlmCallOptions {
+                model_override: Some(model.to_string()),
+                ..Default::default()
+            },
         )
         .await?;
         let response = llm_resp.content;
@@ -1517,9 +1526,8 @@ Output JSON only:
             self_prompt, distilled, file_content
         );
 
-        // Call LLM via the live config (preserves Phase 3 provider_registry +
-        // credential_store) with the model overridden to the per-call slug.
-        let config = base_config.clone_with_model_override(model);
+        // W3c: legacy clone_with_model_override removed. Model threads
+        // via LlmCallOptions.model_override below.
         let ctx = StepContext::new(
             slug.clone(),
             format!("stale-targeted-l0-{}", slug),
@@ -1531,14 +1539,18 @@ Output JSON only:
         )
         .with_model_resolution("stale_local", model.to_string())
         .with_prompt_hash(compute_prompt_hash(system_prompt));
-        let llm_resp = call_model_unified_and_ctx(
-            &config,
+        let llm_resp = call_model_unified_with_options_and_ctx(
+            base_config,
             Some(&ctx),
             system_prompt,
             &user_prompt,
             0.1,
             256,
             None,
+            crate::pyramid::llm::LlmCallOptions {
+                model_override: Some(model.to_string()),
+                ..Default::default()
+            },
         )
         .await?;
         let response = llm_resp.content;

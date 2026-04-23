@@ -56,7 +56,6 @@ use crate::pyramid::config_contributions::{
     TransactionMode, WriteMode,
 };
 use crate::pyramid::walker_resolver::ProviderType;
-use crate::pyramid::PyramidConfig;
 
 /// Per-boot successful Phase-A migration report. Surfaces what landed
 /// so boot.rs can log contribution_ids + confirm the marker transition.
@@ -323,14 +322,25 @@ pub fn run_v3_phase_a_migration(
     // Per §5.3 step 3: fallbacks become list entries; mid is the
     // default workhorse tier per §8. The config file is NOT rewritten
     // here (W4); we only READ.
+    //
+    // W3c: the typed `PyramidConfig` no longer carries these fields, so
+    // we read the raw JSON directly with serde_json::Value. Pre-W3c
+    // configs on disk still have the keys; once W4 rewrites the file
+    // they'll be absent and this migration becomes a no-op harmlessly.
     let config_fallback_chain: Vec<String> = data_dir
-        .map(|d| {
-            let cfg = PyramidConfig::load(d);
-            let mut out = Vec::new();
-            push_unique(&mut out, &cfg.primary_model);
-            push_unique(&mut out, &cfg.fallback_model_1);
-            push_unique(&mut out, &cfg.fallback_model_2);
-            out
+        .and_then(|d| {
+            let path = d.join("pyramid_config.json");
+            let raw = std::fs::read_to_string(&path).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+            let mut out: Vec<String> = Vec::new();
+            for key in ["primary_model", "fallback_model_1", "fallback_model_2"] {
+                if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+                    if !s.is_empty() {
+                        push_unique(&mut out, s);
+                    }
+                }
+            }
+            Some(out)
         })
         .unwrap_or_default();
 

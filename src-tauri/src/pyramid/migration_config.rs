@@ -568,17 +568,17 @@ pub async fn run_migration_llm_call(
     let (model_id, provider_id) = match resolved {
         Some(entry) => (entry.tier.model_id.clone(), entry.provider.id.clone()),
         None => {
-            // TODO(W3/Phase 1): walker v3 — primary_model retires in W3.
-            // This fallback branch should resolve the "synth_heavy" tier
-            // via a synthetic `DispatchDecision::synthetic_for_preview`
-            // against the walker scope chain. Requires threading a
-            // `&Connection` (or an ArcSwap<ScopeCache> handle) into this
-            // helper — a W3 task since it coincides with field deletion.
-            warn!(
+            // W3c: legacy `llm_config.primary_model` fallback removed.
+            // Migration LLM calls must resolve via the provider registry
+            // / walker_provider_openrouter — no implicit default.
+            return Err(anyhow!(
+                "run_migration_llm_call: tier '{}' not resolved via provider registry \
+                 and walker-v3 W3c removed the legacy primary_model fallback. \
+                 Configure a walker_provider_openrouter contribution with a \
+                 '{}' slot.",
                 tier,
-                "run_migration_llm_call: tier not resolved via registry; falling back to llm_config.primary_model"
-            );
-            (llm_config.primary_model.clone(), "openrouter".to_string())
+                tier,
+            ));
         }
     };
 

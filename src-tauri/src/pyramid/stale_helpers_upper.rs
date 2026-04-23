@@ -14,7 +14,7 @@ use rusqlite::Connection;
 use tracing::{error, info, warn};
 
 use super::config_helper::estimate_cost;
-use super::llm::{call_model_unified_and_ctx, extract_json, LlmConfig};
+use super::llm::{call_model_unified_with_options_and_ctx, extract_json, LlmCallOptions, LlmConfig};
 use super::step_context::{compute_prompt_hash, StepContext};
 use super::naming::{clean_headline, headline_for_node};
 use super::stale_engine::batch_items;
@@ -592,9 +592,8 @@ pub async fn dispatch_node_stale_check(
         [{\"node_id\": \"...\", \"stale\": true, \"reason\": \"one sentence\"}]",
     );
 
-    // Call LLM via the live config (preserves Phase 3 provider_registry +
-    // credential_store) with the model overridden to the per-call slug.
-    let config = base_config.clone_with_model_override(model);
+    // W3c: legacy clone_with_model_override removed. Model threads via
+    // LlmCallOptions.model_override below.
     let ctx = StepContext::new(
         batch[0].slug.clone(),
         format!("stale-node-batch-{}", batch[0].slug),
@@ -606,14 +605,18 @@ pub async fn dispatch_node_stale_check(
     )
     .with_model_resolution("stale_local", model.to_string())
     .with_prompt_hash(compute_prompt_hash(system_prompt));
-    let llm_resp = call_model_unified_and_ctx(
-        &config,
+    let llm_resp = call_model_unified_with_options_and_ctx(
+        base_config,
         Some(&ctx),
         system_prompt,
         &user_prompt,
         0.1,
         2048,
         None,
+        LlmCallOptions {
+            model_override: Some(model.to_string()),
+            ..Default::default()
+        },
     )
     .await?;
     let response = llm_resp.content;
@@ -923,9 +926,8 @@ pub async fn dispatch_connection_check(
             [{\"connection_id\": \"...\", \"still_valid\": true, \"reason\": \"one sentence\"}]",
         );
 
-        // Call LLM via the live config (preserves Phase 3 provider_registry +
-        // credential_store) with the model overridden to the per-call slug.
-        let config = base_config.clone_with_model_override(model);
+        // W3c: legacy clone_with_model_override removed. Model threads
+        // via LlmCallOptions.model_override below.
         let ctx = StepContext::new(
             slug.to_string(),
             format!("stale-connection-check-{}", slug),
@@ -937,14 +939,18 @@ pub async fn dispatch_connection_check(
         )
         .with_model_resolution("stale_local", model.to_string())
         .with_prompt_hash(compute_prompt_hash(system_prompt));
-        let llm_resp = call_model_unified_and_ctx(
-            &config,
+        let llm_resp = call_model_unified_with_options_and_ctx(
+            base_config,
             Some(&ctx),
             system_prompt,
             &user_prompt,
             0.1,
             2048,
             None,
+            LlmCallOptions {
+                model_override: Some(model.to_string()),
+                ..Default::default()
+            },
         )
         .await?;
         let response = llm_resp.content;
@@ -1269,9 +1275,8 @@ pub async fn dispatch_edge_stale_check(
             truncate_str(&edge_data.new_content, 500),
         );
 
-        // Call LLM via the live config (preserves Phase 3 provider_registry +
-        // credential_store) with the model overridden to the per-call slug.
-        let config = base_config.clone_with_model_override(model);
+        // W3c: legacy clone_with_model_override removed. Model threads
+        // via LlmCallOptions.model_override below.
         let ctx = StepContext::new(
             mutation.slug.clone(),
             format!("stale-edge-check-{}", mutation.slug),
@@ -1283,14 +1288,18 @@ pub async fn dispatch_edge_stale_check(
         )
         .with_model_resolution("stale_local", model.to_string())
         .with_prompt_hash(compute_prompt_hash(system_prompt));
-        let llm_resp = call_model_unified_and_ctx(
-            &config,
+        let llm_resp = call_model_unified_with_options_and_ctx(
+            base_config,
             Some(&ctx),
             system_prompt,
             &user_prompt,
             0.1,
             1024,
             None,
+            LlmCallOptions {
+                model_override: Some(model.to_string()),
+                ..Default::default()
+            },
         )
         .await?;
         let response = llm_resp.content;
@@ -1353,14 +1362,18 @@ pub async fn dispatch_edge_stale_check(
             )
             .with_model_resolution("stale_local", model.to_string())
             .with_prompt_hash(compute_prompt_hash(system_prompt));
-            let re_eval_llm_resp = call_model_unified_and_ctx(
-                &config,
+            let re_eval_llm_resp = call_model_unified_with_options_and_ctx(
+                base_config,
                 Some(&re_eval_ctx),
                 system_prompt,
                 &re_eval_prompt,
                 0.3,
                 512,
                 None,
+                LlmCallOptions {
+                    model_override: Some(model.to_string()),
+                    ..Default::default()
+                },
             )
             .await?;
             let re_eval_response = re_eval_llm_resp.content;
@@ -1657,16 +1670,20 @@ pub async fn generate_change_manifest(
     // with the provided StepContext. The ctx carries the cache plumbing;
     // if it is None (or not cache-ready) this function behaves exactly
     // like the pre-Phase-6 path.
-    let config = base_config.clone_with_model_override(model);
+    // W3c: legacy clone_with_model_override removed; model threads via
+    // LlmCallOptions.model_override.
     let llm_response = super::llm::call_model_unified_with_options_and_ctx(
-        &config,
+        base_config,
         ctx,
         system_prompt,
         &user_prompt,
         0.2,
         4096,
         None,
-        super::llm::LlmCallOptions::default(),
+        super::llm::LlmCallOptions {
+            model_override: Some(model.to_string()),
+            ..Default::default()
+        },
     )
     .await?;
     let response = llm_response.content;
@@ -3062,9 +3079,8 @@ async fn execute_supersession_identity_change(
         )
     };
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let config = base_config.clone_with_model_override(model);
+    // W3c: legacy clone_with_model_override removed; model threads via
+    // LlmCallOptions.model_override.
     let supersession_ctx = StepContext::new(
         slug.to_string(),
         format!("supersession-apply-{}", slug),
@@ -3076,14 +3092,18 @@ async fn execute_supersession_identity_change(
     )
     .with_model_resolution("stale_local", model.to_string())
     .with_prompt_hash(compute_prompt_hash(system_prompt));
-    let supersession_llm_resp = call_model_unified_and_ctx(
-        &config,
+    let supersession_llm_resp = call_model_unified_with_options_and_ctx(
+        base_config,
         Some(&supersession_ctx),
         system_prompt,
         &user_prompt,
         0.2,
         4096,
         None,
+        LlmCallOptions {
+            model_override: Some(model.to_string()),
+            ..Default::default()
+        },
     )
     .await?;
     let supersession_response = supersession_llm_resp.content;

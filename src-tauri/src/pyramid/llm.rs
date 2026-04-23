@@ -41,14 +41,15 @@ use super::walker_resolver::ProviderType as WalkerProviderType;
 
 // ── Walker v3 DispatchDecision accessors (Phase 1 W2a consumer migration) ────
 //
-// Phase 1 W2a (plan §6) migrates read sites of `config.primary_model`,
-// `config.fallback_model_{1,2}`, and `pyramid_tier_routing` onto the
-// Decision spine (`StepContext.dispatch_decision`). W3 will delete the
-// legacy `LlmConfig` fields outright; every migrated site retains an
-// `.unwrap_or_else(|| config.primary_model.clone())` (or the positional
-// fallback variant) as a transitional fallback so the code continues
-// to compile and run during the transition. W3's cargo-check on the
-// struct-field deletion will prove every read site was migrated.
+// Phase 1 W2a (plan §6) migrated read sites of legacy model/context
+// fields onto the Decision spine (`StepContext.dispatch_decision`).
+// W3c (this phase) deleted the legacy `LlmConfig.primary_model`,
+// `fallback_model_{1,2}`, `primary_context_limit`, and
+// `fallback_1_context_limit` fields; the Decision is now the sole
+// runtime source. Sites that previously chained
+// `.unwrap_or_else(|| config.primary_model.clone())` now either
+//   - stamp `"<unknown>"` with a tracing::warn (provenance strings), or
+//   - return `Err(EntryError::RouteSkipped)` / `continue` (dispatch paths).
 //
 // These helpers cover only the reads that repeat ≥3× in this file.
 // Open-coded site-specific shapes (e.g. context-cascade at the HTTP
@@ -59,8 +60,8 @@ use super::walker_resolver::ProviderType as WalkerProviderType;
 /// current `DispatchDecision`, if one is attached. Returns `None` if
 /// no Decision is attached, or if the Decision has no OpenRouter
 /// per-provider params, or if that params row has no `model_list`.
-/// Callers should chain `.unwrap_or_else(|| config.primary_model.clone())`
-/// to preserve the Phase 1 legacy fallback (§6 migration contract).
+/// Callers decide what `None` means for their context — `<unknown>`
+/// for provenance stamps, RouteSkipped for dispatch sites.
 fn first_openrouter_model_from_decision(
     step_ctx: Option<&StepContext>,
 ) -> Option<String> {
@@ -174,14 +175,24 @@ fn walker_chronicle_db_path(
 
 fn walker_resolved_model(
     ctx: Option<&StepContext>,
-    config: &LlmConfig,
+    _config: &LlmConfig,
 ) -> String {
-    // W2a: Decision first when ctx carries one; legacy fields second.
-    // W3 drops the final `config.primary_model` fallback.
+    // W3c: Decision is now the sole source. Legacy
+    // `config.primary_model` fallback deleted. When neither a
+    // step-local resolved_model_id nor the Decision's OpenRouter slot
+    // carries a model, stamp a loud sentinel — provenance rows go
+    // out with "<unknown>" so operator telemetry can spot gaps, but
+    // dispatch doesn't silently pick up a stale default.
     ctx.and_then(|c| c.resolved_model_id.clone())
         .filter(|m| !m.is_empty())
         .or_else(|| first_openrouter_model_from_decision(ctx))
-        .unwrap_or_else(|| config.primary_model.clone())
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                event = "walker_resolved_model_unknown",
+                "walker-v3: walker_resolved_model found no Decision / resolved_model_id; stamping '<unknown>' for provenance",
+            );
+            "<unknown>".to_string()
+        })
 }
 
 /// Map a walker-market classified `reason` slug to its specific
@@ -343,10 +354,17 @@ async fn dispatch_fleet_entry(
         response_format,
     } = args;
 
-    // W2a: Decision first for the fleet chronicle model label;
-    // legacy field preserved as tail fallback (W3 drops it).
+    // W3c: Decision is the sole source of the fleet chronicle
+    // model label. `<unknown>` is stamped when Decision is absent;
+    // dispatch itself does not depend on this value.
     let fleet_label_model = first_openrouter_model_from_decision(ctx)
-        .unwrap_or_else(|| config.primary_model.clone());
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                event = "fleet_label_model_unknown",
+                "walker-v3: no Decision for fleet chronicle label; stamping '<unknown>'",
+            );
+            "<unknown>".to_string()
+        });
     let fleet_job_path = super::compute_chronicle::generate_job_path(
         ctx, None, &fleet_label_model, "fleet",
     );
@@ -1094,11 +1112,6 @@ pub struct LlmResponse {
 pub struct LlmConfig {
     pub api_key: String,
     pub auth_token: String,
-    pub primary_model: String,
-    pub fallback_model_1: String,
-    pub fallback_model_2: String,
-    pub primary_context_limit: usize,
-    pub fallback_1_context_limit: usize,
     /// Max retry attempts for LLM calls (loaded from Tier1Config).
     pub max_retries: u32,
     /// Base timeout in seconds for LLM calls (loaded from Tier2Config).
@@ -1245,11 +1258,6 @@ impl std::fmt::Debug for LlmConfig {
         f.debug_struct("LlmConfig")
             .field("api_key", &"[redacted]")
             .field("auth_token", &"[redacted]")
-            .field("primary_model", &self.primary_model)
-            .field("fallback_model_1", &self.fallback_model_1)
-            .field("fallback_model_2", &self.fallback_model_2)
-            .field("primary_context_limit", &self.primary_context_limit)
-            .field("fallback_1_context_limit", &self.fallback_1_context_limit)
             .field("max_retries", &self.max_retries)
             .field("base_timeout_secs", &self.base_timeout_secs)
             .field("max_timeout_secs", &self.max_timeout_secs)
@@ -1295,11 +1303,6 @@ impl Default for LlmConfig {
         Self {
             api_key: String::new(),
             auth_token: String::new(),
-            primary_model: "inception/mercury-2".into(),
-            fallback_model_1: "qwen/qwen3.5-flash-02-23".into(),
-            fallback_model_2: "x-ai/grok-4.20-beta".into(),
-            primary_context_limit: 120_000,
-            fallback_1_context_limit: 900_000,
             max_retries: 5,
             base_timeout_secs: 120,
             max_timeout_secs: 600,
@@ -1360,16 +1363,6 @@ impl LlmConfig {
             chain_name: None,
             content_type: None,
         });
-        cloned
-    }
-
-    pub fn clone_with_model_override(&self, model: &str) -> Self {
-        let mut cloned = self.clone();
-        cloned.primary_model = model.to_string();
-        // Pin both fallbacks to the same model so the cascade stays
-        // on-model — mirrors the legacy `config_for_model` semantics.
-        cloned.fallback_model_1 = model.to_string();
-        cloned.fallback_model_2 = model.to_string();
         cloned
     }
 
@@ -1704,6 +1697,13 @@ pub struct LlmCallOptions {
     /// label on the compute-queue entry so provider-side history
     /// distinguishes market-received from fleet-received jobs.
     pub dispatch_origin: DispatchOrigin,
+    /// W3c: explicit per-call model override (§2.9 "reqs.model" pattern).
+    /// Replaces the legacy `LlmConfig::clone_with_model_override` shape —
+    /// fleet-received and market-received worker paths set this to the
+    /// slug the remote requester asked for, so the cascade never picks
+    /// up a different slug from the Decision. When None, the Decision's
+    /// model_list / tier_routing / aliases pipeline runs normally.
+    pub model_override: Option<String>,
 }
 
 // ── Provider synthesis (Phase 3 bridge) ──────────────────────────────────────
@@ -1762,14 +1762,14 @@ pub(crate) fn build_call_provider(
 ///
 /// W2a: when a `DispatchDecision` is attached to the StepContext and
 /// the resolved OpenRouter `ResolvedProviderParams.context_limit` is
-/// `Some`, prefer that over the legacy `config.*_context_limit`
-/// fields. Legacy behavior (per-model equality against
-/// `primary_model` / `fallback_model_1`) is preserved verbatim as the
-/// fallback path; W3 collapses this onto the Decision side when the
-/// struct fields are deleted.
+/// W3c: Decision is now the sole source of per-model context_limit.
+/// When the Decision is absent (pre-walker call sites or tests that
+/// don't attach a StepContext), return `usize::MAX` so the
+/// downstream `.saturating_sub(input).min(48_000)` clamp in
+/// `call_model_unified` produces the default 48k ceiling.
 fn resolve_context_limit(
-    model: &str,
-    config: &LlmConfig,
+    _model: &str,
+    _config: &LlmConfig,
     step_ctx: Option<&StepContext>,
 ) -> usize {
     if let Some(limit) = openrouter_context_limit_from_decision(step_ctx) {
@@ -1777,14 +1777,13 @@ fn resolve_context_limit(
         // usize cast is safe for any realistic context window.
         return limit as usize;
     }
-    if model == config.primary_model {
-        config.primary_context_limit
-    } else if model == config.fallback_model_1 {
-        config.fallback_1_context_limit
-    } else {
-        // fallback_model_2 or unknown — use the largest limit
-        config.fallback_1_context_limit.max(config.primary_context_limit)
-    }
+    // No Decision attached (pre-walker test or synthetic call site).
+    // Return a large sentinel; caller clamps to its own ceiling.
+    tracing::debug!(
+        event = "resolve_context_limit_no_decision",
+        "walker-v3: no Decision attached for context_limit lookup; falling through to caller's clamp",
+    );
+    usize::MAX
 }
 
 /// Estimate token count for pre-flight model selection using tiktoken cl100k_base.
@@ -2002,14 +2001,20 @@ pub async fn call_model_unified_with_audit_and_ctx(
     let cache_lookup = match try_cache_lookup_or_key(ctx, system_prompt, user_prompt) {
         CacheProbeOutcome::Hit(response) => {
             if let Some(audit_ctx) = audit {
-                // W2a: Decision-resolved model sits between the
-                // step-local `resolved_model_id` and the legacy
-                // `config.primary_model` fallback (W3 drops final).
+                // W3c: Decision-resolved model after step-local id.
+                // Legacy `config.primary_model` fallback removed —
+                // audit rows stamp `<unknown>` when nothing resolves.
                 let model_for_row = ctx
                     .and_then(|c| c.resolved_model_id.clone())
                     .filter(|m| !m.is_empty())
                     .or_else(|| first_openrouter_model_from_decision(ctx))
-                    .unwrap_or_else(|| config.primary_model.clone());
+                    .unwrap_or_else(|| {
+                        tracing::warn!(
+                            event = "cache_hit_audit_model_unknown",
+                            "walker-v3: no Decision model for cache-hit audit row; stamping '<unknown>'",
+                        );
+                        "<unknown>".to_string()
+                    });
                 let latency_ms = probe_started.elapsed().as_millis() as i64;
                 let conn = audit_ctx.conn.lock().await;
                 let _ = super::db::insert_llm_audit_cache_hit(
@@ -2069,11 +2074,17 @@ pub async fn call_model_unified_with_audit_and_ctx(
     // is updated to 'complete' or 'failed' below. Queueing and fleet
     // dispatch both happen earlier, so this row now tracks only the
     // actual execution path that will perform the provider HTTP call.
-    // W2a: audit-pending row stamps the pre-dispatch "expected" model.
-    // Decision-resolved OpenRouter head first; legacy fallback second
-    // (W3 drops `config.primary_model`).
+    // W3c: audit-pending row stamps the pre-dispatch "expected"
+    // model from the Decision. Legacy `config.primary_model` fallback
+    // removed — pending rows stamp `<unknown>` when nothing resolves.
     let audit_pending_model = first_openrouter_model_from_decision(ctx)
-        .unwrap_or_else(|| config.primary_model.clone());
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                event = "audit_pending_model_unknown",
+                "walker-v3: no Decision for audit-pending model stamp; using '<unknown>'",
+            );
+            "<unknown>".to_string()
+        });
     let audit_id: Option<i64> = if let Some(audit_ctx) = audit {
         let conn = audit_ctx.conn.lock().await;
         super::db::insert_llm_audit_pending(
@@ -2237,9 +2248,11 @@ pub async fn call_model_unified_with_audit_and_ctx(
             };
 
             // Resolve the canonical model id for this entry.
-            // W2a: per-route override → step-resolved model →
-            // Decision OpenRouter head → legacy primary_model fallback.
-            let market_model_id = entry
+            // W3c: per-route override → step-resolved model →
+            // Decision OpenRouter head. Legacy `config.primary_model`
+            // fallback removed — skip this market entry if nothing
+            // resolves (no model to /quote against).
+            let market_model_id = match entry
                 .model_id
                 .clone()
                 .filter(|m| !m.is_empty())
@@ -2248,7 +2261,19 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         .filter(|m| !m.is_empty())
                 })
                 .or_else(|| first_openrouter_model_from_decision(ctx))
-                .unwrap_or_else(|| config.primary_model.clone());
+            {
+                Some(m) => m,
+                None => {
+                    tracing::warn!(
+                        event = "walker_v3_market_no_model",
+                        provider_id = %entry.provider_id,
+                        "walker-v3: no Decision OpenRouter model for market entry; advancing route",
+                    );
+                    skip_reasons
+                        .push(format!("{}:walker_v3_no_model", entry.provider_id));
+                    continue;
+                }
+            };
 
             // Advisory cache pre-check (plan §4.2 "Acquire"). Cache is
             // advisory only; /quote is authoritative. Missing cache →
@@ -2759,16 +2784,30 @@ pub async fn call_model_unified_with_audit_and_ctx(
             && !walker_bypass_pool
         {
             if let Some(ref queue_handle) = config.compute_queue {
-                // W2a: per-route override → step-resolved model →
-                // Decision OpenRouter head → legacy primary_model fallback.
-                let queue_model_id = entry
+                // W3c: per-route override → step-resolved model →
+                // Decision OpenRouter head. Legacy `config.primary_model`
+                // fallback removed — skip the queue hop if nothing
+                // resolves (no model slug to enqueue on).
+                let queue_model_id = match entry
                     .model_id
                     .clone()
                     .filter(|m| !m.is_empty())
                     .or_else(|| ctx.and_then(|c| c.resolved_model_id.clone()))
                     .filter(|m| !m.is_empty())
                     .or_else(|| first_openrouter_model_from_decision(ctx))
-                    .unwrap_or_else(|| config.primary_model.clone());
+                {
+                    Some(m) => m,
+                    None => {
+                        tracing::warn!(
+                            event = "walker_v3_queue_no_model",
+                            provider_id = %entry.provider_id,
+                            "walker-v3: no Decision OpenRouter model for local queue hop; advancing route",
+                        );
+                        skip_reasons
+                            .push(format!("{}:walker_v3_no_model", entry.provider_id));
+                        continue;
+                    }
+                };
 
                 let (tx, rx) = tokio::sync::oneshot::channel();
 
@@ -3096,7 +3135,14 @@ pub async fn call_model_unified_with_audit_and_ctx(
         //
         // The resolved model drives the HTTP body, context-limit lookup,
         // and every downstream audit/chronicle emit for this entry.
-        let entry_model_override = entry.model_id.clone();
+        // W3c: the per-call `options.model_override` (§2.9 reqs.model)
+        // outranks `entry.model_id` — fleet-received and market-received
+        // workers set this to the slug the remote requester asked for,
+        // and that contract is non-negotiable.
+        let entry_model_override = options
+            .model_override
+            .clone()
+            .or_else(|| entry.model_id.clone());
         let tier_routed_model: Option<String> = if entry_model_override.is_some() {
             None
         } else {
@@ -3122,42 +3168,71 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 })
             })
         };
-        // W2a: context cascade — positional resolve against the
-        // Decision's OpenRouter model_list. Positions map to legacy
-        // fields as:
-        //   model_list[0] ←→ primary_model
-        //   model_list[1] ←→ fallback_model_1
-        //   model_list[2] ←→ fallback_model_2
-        // Missing positions fall back to the legacy field at the same
-        // slot. W3 removes the legacy-field clones once model_list is
-        // authoritative for this site and the struct fields are gone.
+        // W3c: context cascade — positional resolve against the
+        // Decision's OpenRouter model_list. Positions map to:
+        //   model_list[0] = primary, [1] = fallback_1, [2] = fallback_2.
+        // The legacy `config.primary_model` / `fallback_model_{1,2}` +
+        // `config.*_context_limit` fallbacks were deleted in W3c. When
+        // the Decision's model_list is absent AND neither entry.model_id
+        // nor tier_routing covers the call, there is no runtime slug to
+        // send — return a RouteSkipped so the walker advances to the
+        // next route (or surfaces the error to the caller).
         let decision_or_models = openrouter_model_list_from_decision(ctx);
-        let cascade_primary = decision_or_models
-            .as_ref()
-            .and_then(|ml| ml.first().cloned())
-            .unwrap_or_else(|| config.primary_model.clone());
-        let cascade_fallback_1 = decision_or_models
-            .as_ref()
-            .and_then(|ml| ml.get(1).cloned())
-            .unwrap_or_else(|| config.fallback_model_1.clone());
-        let cascade_fallback_2 = decision_or_models
-            .as_ref()
-            .and_then(|ml| ml.get(2).cloned())
-            .unwrap_or_else(|| config.fallback_model_2.clone());
-        let mut use_model = if let Some(ref model) = entry_model_override {
+        let cascade_primary = decision_or_models.as_ref().and_then(|ml| ml.first().cloned());
+        let cascade_fallback_1 = decision_or_models.as_ref().and_then(|ml| ml.get(1).cloned());
+        let cascade_fallback_2 = decision_or_models.as_ref().and_then(|ml| ml.get(2).cloned());
+        // Decision's context_limit corresponds to the "primary" slot
+        // (position 0). Without it, no cascade thresholds exist — the
+        // caller picks position 0 unconditionally.
+        let decision_primary_ctx_limit = openrouter_context_limit_from_decision(ctx);
+        // Pick the model slug for this entry. `None` means "no slug
+        // available for this route" — advance to the next walker entry.
+        let use_model_opt: Option<String> = if let Some(ref model) = entry_model_override {
             info!("[entry-model->{}]", short_name(model));
-            model.clone()
+            Some(model.clone())
         } else if let Some(ref model) = tier_routed_model {
             info!("[tier-model->{}]", short_name(model));
-            model.clone()
-        } else if est_input_tokens > config.fallback_1_context_limit {
-            info!("[fallback->{}]", short_name(&cascade_fallback_2));
-            cascade_fallback_2.clone()
-        } else if est_input_tokens > config.primary_context_limit {
-            info!("[fallback->{}]", short_name(&cascade_fallback_1));
-            cascade_fallback_1.clone()
+            Some(model.clone())
+        } else if let Some(limit) = decision_primary_ctx_limit {
+            // Tier-wide cascade only fires when Decision provides a
+            // context_limit. Position [2] for above-limit inputs, else [0].
+            if est_input_tokens > limit as usize {
+                if let Some(ref m) = cascade_fallback_2 {
+                    info!("[fallback->{}]", short_name(m));
+                    Some(m.clone())
+                } else if let Some(ref m) = cascade_fallback_1 {
+                    info!("[fallback->{}]", short_name(m));
+                    Some(m.clone())
+                } else {
+                    cascade_primary.clone()
+                }
+            } else {
+                cascade_primary.clone()
+            }
         } else {
+            // No context_limit → pick position 0 unconditionally.
             cascade_primary.clone()
+        };
+        let mut use_model = match use_model_opt {
+            Some(m) => m,
+            None => {
+                tracing::warn!(
+                    event = "walker_v3_no_model_available",
+                    provider_id = %entry.provider_id,
+                    "walker-v3: no Decision model_list / entry / tier override for route; advancing",
+                );
+                emit_walker_chronicle(
+                    ctx,
+                    config,
+                    super::compute_chronicle::EVENT_NETWORK_ROUTE_UNAVAILABLE,
+                    &walker_source_label,
+                    &entry.provider_id,
+                    serde_json::json!({ "reason": "walker_v3_no_model_available" }),
+                );
+                skip_reasons
+                    .push(format!("{}:walker_v3_no_model_available", entry.provider_id));
+                continue;
+            }
         };
 
         let client = &*HTTP_CLIENT;
@@ -3338,15 +3413,29 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         || body_lower.contains("too many tokens")
                         || body_lower.contains("token limit");
 
-                    // W2a: context-exceeded cascade — promote against
-                    // the same Decision-or-legacy positional list the
-                    // outer `use_model` selection used.
-                    if is_context_exceeded && use_model != cascade_fallback_2 {
+                    // W3c: context-exceeded cascade — promote against
+                    // the Decision's OpenRouter model_list positions.
+                    // All three cascade slots are `Option<String>` now
+                    // (legacy LlmConfig.primary_model/fallback_* deleted).
+                    let already_at_fb2 = cascade_fallback_2
+                        .as_ref()
+                        .map(|m| &use_model == m)
+                        .unwrap_or(false);
+                    if is_context_exceeded && !already_at_fb2 {
                         let prev_model = use_model.clone();
-                        if use_model == cascade_primary {
-                            use_model = cascade_fallback_1.clone();
+                        let at_primary = cascade_primary
+                            .as_ref()
+                            .map(|m| &use_model == m)
+                            .unwrap_or(false);
+                        let next = if at_primary {
+                            cascade_fallback_1
+                                .clone()
+                                .or_else(|| cascade_fallback_2.clone())
                         } else {
-                            use_model = cascade_fallback_2.clone();
+                            cascade_fallback_2.clone()
+                        };
+                        if let Some(m) = next {
+                            use_model = m;
                         }
                         warn!(
                             "[LLM] Context exceeded on {}, cascading to {}",
@@ -4366,6 +4455,39 @@ pub async fn call_model_and_ctx(
     Ok(resp.content)
 }
 
+/// W3c replacement for the old `config.clone_with_model_override(model)` →
+/// `call_model_and_ctx(&cfg, ..)` pattern used across the maintenance
+/// subsystem (faq, delta, meta, stale_helpers, webbing). Threads the
+/// explicit model slug through `LlmCallOptions.model_override`
+/// (§2.9 reqs.model), so the dispatch layer honors it ahead of any
+/// Decision/tier slot without needing a per-call `LlmConfig` clone.
+pub async fn call_model_with_override_and_ctx(
+    config: &LlmConfig,
+    model: &str,
+    ctx: Option<&StepContext>,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f32,
+    max_tokens: usize,
+) -> Result<String> {
+    let options = LlmCallOptions {
+        model_override: Some(model.to_string()),
+        ..Default::default()
+    };
+    let resp = call_model_unified_with_options_and_ctx(
+        config,
+        ctx,
+        system_prompt,
+        user_prompt,
+        temperature,
+        max_tokens,
+        None,
+        options,
+    )
+    .await?;
+    Ok(resp.content)
+}
+
 /// Call OpenRouter with automatic model cascade and retry logic.
 /// Same as `call_model()` but also returns token usage from the API response.
 ///
@@ -4410,6 +4532,36 @@ pub async fn call_model_with_usage_and_ctx(
         max_tokens,
         None,
         LlmCallOptions::default(),
+    )
+    .await?;
+    Ok((resp.content, resp.usage))
+}
+
+/// W3c: variant of `call_model_with_usage_and_ctx` that pins the
+/// dispatched model via `LlmCallOptions.model_override`. Same §2.9
+/// reqs.model contract as `call_model_with_override_and_ctx`.
+pub async fn call_model_with_usage_with_override_and_ctx(
+    config: &LlmConfig,
+    model: &str,
+    ctx: Option<&StepContext>,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f32,
+    max_tokens: usize,
+) -> Result<(String, TokenUsage)> {
+    let options = LlmCallOptions {
+        model_override: Some(model.to_string()),
+        ..Default::default()
+    };
+    let resp = call_model_unified_with_options_and_ctx(
+        config,
+        ctx,
+        system_prompt,
+        user_prompt,
+        temperature,
+        max_tokens,
+        None,
+        options,
     )
     .await?;
     Ok((resp.content, resp.usage))
@@ -5070,9 +5222,9 @@ routing_rules:
         LlmConfig {
             api_key: String::new(),
             auth_token: String::new(),
-            primary_model: "test-primary".into(),
-            fallback_model_1: "test-fallback1".into(),
-            fallback_model_2: "test-fallback2".into(),
+            // W3c: legacy primary_model/fallback_model_{1,2} fields deleted.
+            // Tests that need a specific dispatched model pass it via
+            // `LlmCallOptions.model_override`.
             dispatch_policy: Some(policy),
             provider_pools: Some(pools),
             max_retries: 1,
@@ -6780,9 +6932,7 @@ routing_rules:
         let config = LlmConfig {
             api_key: "sk-or-v1-test".into(),
             auth_token: String::new(),
-            primary_model: "openai/gpt-4o-mini".into(),
-            fallback_model_1: "openai/gpt-4o-mini".into(),
-            fallback_model_2: "openai/gpt-4o-mini".into(),
+            // W3c: legacy primary_model/fallback_model_{1,2} fields deleted.
             provider_registry: Some(registry.clone()),
             dispatch_policy: Some(policy),
             provider_pools: Some(pools),
@@ -6846,11 +6996,15 @@ routing_rules:
                 );
             }
         }
+        // W3c: legacy LlmConfig.primary_model fallback deleted. Tests
+        // that exercise the queue / market routes now pin an explicit
+        // model_id on the route entry so the walker has a concrete slug
+        // to enqueue / quote against.
         let route_to = route_entries
             .into_iter()
             .map(|(pid, is_local)| RouteEntry {
                 provider_id: pid.to_string(),
-                model_id: None,
+                model_id: Some(format!("walker-test/{}-model", pid)),
                 tier_name: None,
                 is_local,
                 max_budget_credits: None,
@@ -6935,9 +7089,7 @@ routing_rules:
         let config = LlmConfig {
             api_key: String::new(),
             auth_token: String::new(),
-            primary_model: "walker-short-circuit/test-model".into(),
-            fallback_model_1: "fallback1".into(),
-            fallback_model_2: "fallback2".into(),
+            // W3c: legacy primary_model/fallback_model_{1,2} fields deleted.
             dispatch_policy: Some(policy),
             provider_pools: Some(pools),
             compute_queue: Some(queue),
@@ -7242,9 +7394,7 @@ routing_rules:
         let config = LlmConfig {
             api_key: "sk-or-test".into(),
             auth_token: String::new(),
-            primary_model: "openai/gpt-4o-mini".into(),
-            fallback_model_1: "openai/gpt-4o-mini".into(),
-            fallback_model_2: "openai/gpt-4o-mini".into(),
+            // W3c: legacy primary_model/fallback_model_{1,2} fields deleted.
             provider_registry: Some(registry.clone()),
             dispatch_policy: Some(policy),
             provider_pools: Some(pools),

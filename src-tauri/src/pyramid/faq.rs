@@ -15,8 +15,10 @@ use uuid::Uuid;
 use super::config_helper::estimate_cost;
 use super::db;
 use super::llm::LlmConfig;
-use super::llm::{call_model_and_ctx, call_model_with_usage_and_ctx, extract_json};
-use super::step_context::make_step_ctx_from_llm_config;
+use super::llm::{
+    call_model_with_override_and_ctx, call_model_with_usage_with_override_and_ctx, extract_json,
+};
+use super::step_context::make_step_ctx_from_llm_config_with_model;
 use super::types::{FaqCategory, FaqCategoryEntry, FaqDirectory, FaqNode, PyramidAnnotation};
 
 /// Called after every annotation is saved.
@@ -85,20 +87,20 @@ pub async fn process_annotation(
         question_context, faq_list
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh LlmConfig.
-    let config = base_config.clone_with_model_override(model);
-
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &config,
+    // W3c: legacy clone_with_model_override removed. Model threads via
+    // LlmCallOptions.model_override + explicit step_ctx model arg.
+    let cache_ctx = make_step_ctx_from_llm_config_with_model(
+        base_config,
         "faq_match_existing",
         "faq",
         -1,
         None,
         system_prompt,
+        Some(model),
     );
-    let response = call_model_and_ctx(
-        &config,
+    let response = call_model_with_override_and_ctx(
+        base_config,
+        model,
         cache_ctx.as_ref(),
         system_prompt,
         &user_prompt,
@@ -262,20 +264,20 @@ async fn match_faq_with_llm(
         question, faq_list
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh LlmConfig.
-    let config = base_config.clone_with_model_override(model);
-
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &config,
+    // W3c: legacy clone_with_model_override removed. Model threads via
+    // LlmCallOptions.model_override + explicit step_ctx model arg.
+    let cache_ctx = make_step_ctx_from_llm_config_with_model(
+        base_config,
         "faq_disambiguate",
         "faq",
         -1,
         None,
         system_prompt,
+        Some(model),
     );
-    let response = call_model_and_ctx(
-        &config,
+    let response = call_model_with_override_and_ctx(
+        base_config,
+        model,
         cache_ctx.as_ref(),
         system_prompt,
         &user_prompt,
@@ -322,10 +324,8 @@ pub async fn update_faq_answer(
             .ok_or_else(|| anyhow::anyhow!("FAQ node '{}' not found", faq_id))?
     };
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh LlmConfig.
-    let config = base_config.clone_with_model_override(model);
-
+    // W3c: legacy clone_with_model_override removed. Model threads via
+    // LlmCallOptions.model_override + explicit step_ctx model arg.
     // --- Answer refinement ---
     let system_prompt = "You are a FAQ answer refiner. Given an existing FAQ answer and a new piece of information from an annotation, produce an updated, comprehensive answer that incorporates the new information. Keep it concise and well-structured. Return ONLY the updated answer text, no preamble.";
 
@@ -337,16 +337,18 @@ pub async fn update_faq_answer(
         new_annotation.question_context.as_deref().unwrap_or("(none)")
     );
 
-    let update_ctx = make_step_ctx_from_llm_config(
-        &config,
+    let update_ctx = make_step_ctx_from_llm_config_with_model(
+        base_config,
         "faq_update_answer",
         "faq",
         -1,
         None,
         system_prompt,
+        Some(model),
     );
-    let updated_answer = call_model_and_ctx(
-        &config,
+    let updated_answer = call_model_with_override_and_ctx(
+        base_config,
+        model,
         update_ctx.as_ref(),
         system_prompt,
         &user_prompt,
@@ -384,16 +386,18 @@ pub async fn update_faq_answer(
             "Current question: {}\nAccumulated triggers: {}\nNew annotation: {}",
             faq.question, triggers_list, new_annotation.content
         );
-        let regen_ctx = make_step_ctx_from_llm_config(
-            &config,
+        let regen_ctx = make_step_ctx_from_llm_config_with_model(
+            base_config,
             "faq_regeneralize",
             "faq",
             -1,
             None,
             regen_system,
+            Some(model),
         );
-        match call_model_and_ctx(
-            &config,
+        match call_model_with_override_and_ctx(
+            base_config,
+            model,
             regen_ctx.as_ref(),
             regen_system,
             &regen_user,
@@ -457,9 +461,7 @@ async fn create_new_faq(
         let generalized_text =
             annotation.content[gen_pos + "Generalized understanding:".len()..].trim();
 
-        // Phase 3 fix pass: clone the live config (preserves provider_registry +
-        // credential_store) instead of building a fresh LlmConfig.
-        let config = base_config.clone_with_model_override(model);
+        // W3c: legacy clone_with_model_override removed.
 
         let gen_system = "You are a question generalization engine. Produce a single one-sentence generalized question about the underlying mechanism. Output only the question, nothing else.";
         let gen_user = format!(
@@ -467,16 +469,18 @@ async fn create_new_faq(
             question, generalized_text
         );
 
-        let gen_ctx = make_step_ctx_from_llm_config(
-            &config,
+        let gen_ctx = make_step_ctx_from_llm_config_with_model(
+            base_config,
             "faq_generalize",
             "faq",
             -1,
             None,
             gen_system,
+            Some(model),
         );
-        match call_model_and_ctx(
-            &config,
+        match call_model_with_override_and_ctx(
+            base_config,
+            model,
             gen_ctx.as_ref(),
             gen_system,
             &gen_user,
@@ -669,19 +673,19 @@ Return ONLY valid JSON: an array of objects with fields "name", "faq_ids", and "
         faq_list
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let config = base_config.clone_with_model_override(model);
-    let cat_ctx = make_step_ctx_from_llm_config(
-        &config,
+    // W3c: legacy clone_with_model_override removed.
+    let cat_ctx = make_step_ctx_from_llm_config_with_model(
+        base_config,
         "faq_categorize",
         "faq",
         -1,
         None,
         system_prompt,
+        Some(model),
     );
-    let (response, usage) = call_model_with_usage_and_ctx(
-        &config,
+    let (response, usage) = call_model_with_usage_with_override_and_ctx(
+        base_config,
+        model,
         cat_ctx.as_ref(),
         system_prompt,
         &user_prompt,

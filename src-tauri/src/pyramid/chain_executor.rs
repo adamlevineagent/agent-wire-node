@@ -201,14 +201,17 @@ async fn compute_save_step_provenance_model(
         }
     }
 
-    // Priority 5: legacy fallback — W3c sweeps this after the field deletion.
+    // W3c: legacy `config.primary_model` fallback deleted. When neither
+    // Decision nor DB walker_provider_openrouter covers the slot,
+    // provenance rows stamp `<unknown>` with a loud warn — provenance
+    // strings are not dispatch-load-bearing.
     tracing::warn!(
-        event = "save_step_provenance_fallback_to_primary_model",
+        event = "save_step_provenance_model_unknown",
         step = %step.name,
         slot = %slot,
-        "W3b: no Decision / DB model available, falling back to config.primary_model for provenance"
+        "walker-v3: no Decision / DB model available for save-step provenance; stamping '<unknown>'"
     );
-    dispatch_ctx.config.primary_model.clone()
+    "<unknown>".to_string()
 }
 
 // ── Error strategy ──────────────────────────────────────────────────────────
