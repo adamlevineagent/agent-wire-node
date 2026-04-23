@@ -22057,4 +22057,65 @@ mod phase2_post_build_tests {
         assert!(AnnotationType::from_str_strict("bogus_type").is_err());
         assert!(AnnotationType::from_str_strict("").is_err());
     }
+
+    /// Wanderer-added: ShapePayload is #[serde(untagged)] so the JSON body is
+    /// the raw inner struct and node_shape (stored in a sibling column) is the
+    /// discriminator. This test pins the Rust side of the contract so the
+    /// frontend parser in src/types/pyramid.ts can safely narrow on
+    /// node_shape before JSON.parse.
+    #[test]
+    fn shape_payload_serializes_untagged_and_disambiguates_on_parse() {
+        use super::super::types::{
+            DebatePosition, DebateTopic, GapTopic, MetaLayerTopic, ShapePayload,
+        };
+
+        // Serialize each variant — there must be NO "kind"/"payload" wrapping.
+        let debate = ShapePayload::Debate(DebateTopic {
+            concern: "c".into(),
+            positions: vec![DebatePosition {
+                label: "a".into(),
+                steel_manning: "b".into(),
+                red_teams: vec![],
+                evidence_anchors: vec![],
+            }],
+            cross_refs: vec![],
+            vote_lean: None,
+        });
+        let d_json = serde_json::to_string(&debate).unwrap();
+        assert!(
+            !d_json.contains("\"kind\""),
+            "untagged should not emit kind: {}",
+            d_json
+        );
+        assert!(d_json.contains("\"positions\""), "debate json: {}", d_json);
+
+        let meta = ShapePayload::MetaLayer(MetaLayerTopic {
+            purpose_question: "q?".into(),
+            parent_meta_layer_id: None,
+            covered_substrate_nodes: vec![],
+        });
+        let m_json = serde_json::to_string(&meta).unwrap();
+        assert!(!m_json.contains("\"kind\""));
+        assert!(m_json.contains("\"purpose_question\""));
+
+        let gap = ShapePayload::Gap(GapTopic {
+            concern: "x".into(),
+            description: "y".into(),
+            demand_state: "open".into(),
+            candidate_resolutions: vec![],
+        });
+        let g_json = serde_json::to_string(&gap).unwrap();
+        assert!(!g_json.contains("\"kind\""));
+        assert!(g_json.contains("\"demand_state\""));
+
+        // Round-trip each — serde's untagged should pick the right variant
+        // because each struct has a distinct required field combination
+        // (debate: positions, meta: purpose_question, gap: demand_state).
+        let d_back: ShapePayload = serde_json::from_str(&d_json).unwrap();
+        assert!(matches!(d_back, ShapePayload::Debate(_)));
+        let m_back: ShapePayload = serde_json::from_str(&m_json).unwrap();
+        assert!(matches!(m_back, ShapePayload::MetaLayer(_)));
+        let g_back: ShapePayload = serde_json::from_str(&g_json).unwrap();
+        assert!(matches!(g_back, ShapePayload::Gap(_)));
+    }
 }

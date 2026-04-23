@@ -138,9 +138,31 @@ export interface GapTopic {
   candidate_resolutions?: GapCandidate[];
 }
 
-// Tagged discriminator for typed shape payload consumption. Frontend drill
-// views inspect node_shape and narrow to the typed payload.
-export type ShapePayload =
-  | { kind: "debate"; payload: DebateTopic }
-  | { kind: "meta_layer"; payload: MetaLayerTopic }
-  | { kind: "gap"; payload: GapTopic };
+// Shape payload is stored as JSON in `pyramid_nodes.shape_payload_json`;
+// the sibling `pyramid_nodes.node_shape` column is the discriminator. Rust
+// serializes the payload untagged (#[serde(untagged)]), so the JSON body is
+// the raw inner struct with NO `kind`/`payload` wrapping. Frontend drill
+// views read `node_shape` from the same row and narrow to the matching
+// variant before parsing `shape_payload_json`.
+//
+// Consumer pattern (pseudo):
+//   if (node.node_shape === "debate") {
+//     const payload = JSON.parse(node.shape_payload_json) as DebateTopic;
+//   }
+//
+// This union is the union of valid payload shapes, not a tagged enum.
+export type ShapePayload = DebateTopic | MetaLayerTopic | GapTopic;
+
+// Helper to parse shape_payload_json given the sibling node_shape discriminator.
+// Returns null when shape is "scaffolding" or the payload is absent/invalid.
+export function parseShapePayload(
+  nodeShape: NodeShape,
+  shapePayloadJson: string | null | undefined
+): ShapePayload | null {
+  if (nodeShape === "scaffolding" || !shapePayloadJson) return null;
+  try {
+    return JSON.parse(shapePayloadJson) as ShapePayload;
+  } catch {
+    return null;
+  }
+}
