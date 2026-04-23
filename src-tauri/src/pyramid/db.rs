@@ -11628,6 +11628,17 @@ pub fn bump_agent_session(conn: &Connection, slug: &str, agent_id: &str) {
 }
 
 /// Set gap resolution confidence to a specific value.
+///
+/// Phase 8-4 verifier: when `confidence >= 0.8` this also flips `resolved`
+/// to 1 in the same statement — which would bypass `mark_gap_resolved`'s
+/// `gap_resolved` observation-event emission. Emit the event here too so
+/// the chronicle contract holds regardless of which caller closes a gap.
+/// If the UPDATE didn't actually flip resolved to 1 (e.g. confidence < 0.8
+/// or the row wasn't found) the emit is skipped.
+///
+/// Kept as a compatibility shim. Today there are no call sites, but the
+/// function is `pub` and hardening the bypass costs less than the risk of
+/// a future caller silently skipping the event.
 pub fn set_gap_confidence(
     conn: &Connection,
     slug: &str,
@@ -11639,6 +11650,49 @@ pub fn set_gap_confidence(
         "UPDATE pyramid_gaps SET resolution_confidence = ?1, resolved = CASE WHEN ?1 >= 0.8 THEN 1 ELSE 0 END WHERE slug = ?2 AND question_id = ?3 AND description = ?4",
         rusqlite::params![confidence, slug, question_id, description],
     )?;
+
+    // Emit gap_resolved only when this call flipped the row to resolved=1.
+    // Re-query the live row rather than trusting the CASE clause: if the
+    // UPDATE affected 0 rows (unknown gap), we must not emit.
+    if confidence >= 0.8 && rows > 0 {
+        let is_resolved: i64 = conn
+            .query_row(
+                "SELECT resolved FROM pyramid_gaps
+                  WHERE slug = ?1 AND question_id = ?2 AND description = ?3",
+                rusqlite::params![slug, question_id, description],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if is_resolved == 1 {
+            let metadata = serde_json::json!({
+                "gap_question_id": question_id,
+                "gap_description": description,
+                "resolution_reason": "set_gap_confidence_threshold",
+                "resolved_by": "set_gap_confidence",
+                "confidence": confidence,
+            })
+            .to_string();
+            if let Err(e) = super::observation_events::write_observation_event(
+                conn,
+                slug,
+                "dadbear",
+                "gap_resolved",
+                None, None, None, None,
+                None,
+                None,
+                Some(&metadata),
+            ) {
+                tracing::warn!(
+                    slug = %slug,
+                    question_id = %question_id,
+                    confidence = confidence,
+                    error = %e,
+                    "set_gap_confidence: failed to emit gap_resolved observation event (UPDATE succeeded)"
+                );
+            }
+        }
+    }
+
     Ok(rows)
 }
 
@@ -32627,6 +32681,248 @@ mod phase8_post_build_tests {
         assert_eq!(meta["reason"], serde_json::json!("last_position_abandoned"));
         assert_eq!(meta["positions_remaining"], serde_json::json!(0));
         assert_eq!(meta["collapsed_by"], serde_json::json!("phase8-test"));
+    }
+
+    // ── Test 8: TRUE CROWN JEWEL — annotation event → compile → chain →
+    //            queued re_distill → supervisor arm → pyramid_nodes UPDATE
+    // ──────────────────────────────────────────────────────────────────────
+    //
+    // The prior Test 2 (`re_distill_end_to_end_updates_node_distilled_and_headline`)
+    // unit-tested `execute_supersession` in isolation and overclaimed
+    // "end-to-end". This test plugs the missing links:
+    //
+    //   annotation_written observation event
+    //   → run_compilation_for_slug (produces role_bound work item)
+    //   → execute_chain_for_target on the legacy immediate-redistill chain
+    //     (no judge — unconditional queue, avoids a second mock)
+    //   → finds the queued re_distill work item
+    //   → moves it to `previewed` (supervisor CAS precondition)
+    //   → calls run_re_distill_supervisor_arm (Phase 8 verifier helper;
+    //     identical body to the supervisor's inline re_distill arm)
+    //   → asserts pyramid_nodes.distilled + build_version + work item
+    //     state=applied + result_applications row + node_re_distilled event.
+    //
+    // Pre-Phase-8 this test would have been impossible: the supervisor's
+    // default arm marked the item applied without touching the node. The
+    // chain+queue infrastructure did its job (the work item existed), but
+    // nothing applied it. Phase 8-2's supervisor arm is what closes the loop.
+    #[tokio::test]
+    async fn annotation_to_node_update_true_end_to_end() {
+        let _guard = test_lock();
+
+        let mut server = mockito::Server::new_async().await;
+        let manifest_json = serde_json::json!({
+            "node_id": "L1-E2E",
+            "identity_changed": false,
+            "content_updates": {
+                "distilled": "E2E: distilled reflects the annotation-triggered re-distill",
+                "headline": "E2E updated headline"
+            },
+            "children_swapped": [],
+            "reason": "annotation cascade triggered re-distill (E2E)",
+            "build_version": 2
+        })
+        .to_string();
+        let _m = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openrouter_body(&manifest_json))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        // Persist DB to disk so execute_supersession can re-open the path.
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap().to_string();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            init_pyramid_db(&conn).unwrap();
+            vocab_entries::invalidate_cache();
+            create_slug(&conn, "p8-e2e", &ContentType::Code, "/tmp/p8-e2e").unwrap();
+            // Use the immediate-redistill (legacy) binding — unconditional
+            // queue, no judge LLM mock needed for the chain step.
+            role_binding::set_binding(
+                &conn,
+                "p8-e2e",
+                "cascade_handler",
+                role_binding::CASCADE_HANDLER_EXISTING_DEFAULT,
+            )
+            .unwrap();
+            seed_l1_node(&conn, "p8-e2e", "L1-E2E");
+            // Write the annotation_written observation event — same shape
+            // routes::emit_annotation_observation_events produces on save.
+            write_annotation_written_event(&conn, "p8-e2e", "L1-E2E", 1, 7);
+            drop(conn);
+        }
+
+        // Step 1: compile — should produce one role_bound work item.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let res = dadbear_compiler::run_compilation_for_slug(
+                &conn, "p8-e2e", None, None,
+            )
+            .unwrap();
+            assert_eq!(res.items_compiled, 1, "compile should make a role_bound work item");
+        }
+
+        // Step 2: execute the bound chain. On the immediate-redistill path
+        // this queues a re_distill work item via queue_re_distill_for_target.
+        let config = mocked_llm_config(server.url()).await;
+        let state = {
+            let conn = Connection::open(&db_path).unwrap();
+            pyramid_state_with_llm_config(conn, config.clone())
+        };
+        let chain = chain_loader::load_chain_by_id(
+            role_binding::CASCADE_HANDLER_EXISTING_DEFAULT,
+            &state.chains_dir,
+        )
+        .expect("immediate-redistill chain must load");
+        let inputs = serde_json::json!({
+            "work_item_id": "wi-e2e-rolebound",
+            "target_node_id": "L1-E2E",
+            "layer": 1,
+            "reason": "E2E annotation cascade",
+        });
+        chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p8-e2e",
+            Some("L1-E2E"),
+            inputs,
+        )
+        .await
+        .expect("immediate-redistill chain must run end-to-end");
+
+        // Step 3: find the queued re_distill work item.
+        let (re_wi_id, re_target_id, re_layer): (String, String, i64) = {
+            let writer = state.writer.lock().await;
+            writer
+                .query_row(
+                    "SELECT id, target_id, layer
+                       FROM dadbear_work_items
+                      WHERE slug = 'p8-e2e' AND primitive = 're_distill'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .expect("chain must have queued one re_distill work item")
+        };
+        assert_eq!(re_target_id, "L1-E2E");
+        assert_eq!(re_layer, 1);
+
+        // Step 4: move the work item to `previewed` (supervisor CAS
+        // precondition; the real supervisor does this in dispatch_phase
+        // before apply_phase). We do it inline here so the verifier helper's
+        // CAS matches.
+        {
+            let writer = state.writer.lock().await;
+            writer
+                .execute(
+                    "UPDATE dadbear_work_items SET state = 'previewed'
+                      WHERE id = ?1",
+                    rusqlite::params![re_wi_id],
+                )
+                .unwrap();
+        }
+
+        // Baseline pyramid_nodes state before the supervisor arm runs.
+        let (pre_distilled, pre_bv): (String, i64) = {
+            let writer = state.writer.lock().await;
+            writer
+                .query_row(
+                    "SELECT distilled, build_version
+                       FROM pyramid_nodes
+                      WHERE slug = 'p8-e2e' AND id = 'L1-E2E'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(pre_distilled, "old distilled content");
+        assert_eq!(pre_bv, 1);
+
+        // Step 5: invoke the supervisor arm helper. This is the inline
+        // `re_distill` arm body of apply_mechanical_primitive, extracted to
+        // pub(crate) so tests can drive it without standing up a whole
+        // DadbearSupervisor with compute queue + pyramid state plumbing.
+        let event_bus = std::sync::Arc::new(
+            crate::pyramid::event_bus::BuildEventBus::new(),
+        );
+        crate::pyramid::dadbear_supervisor::run_re_distill_supervisor_arm(
+            &db_path,
+            &re_wi_id,
+            "p8-e2e",
+            &re_target_id,
+            re_layer,
+            "re_distill",
+            &config,
+            "openai/gpt-4o-mini",
+            &event_bus,
+        )
+        .await
+        .expect("supervisor re_distill arm must succeed against mocked LLM");
+
+        // Step 6: the original DADBEAR non-firing bug is DEAD.
+        // pyramid_nodes.distilled / headline MUST reflect the LLM manifest
+        // and build_version MUST have bumped. Pre-Phase-8 none of this
+        // happened because the supervisor default arm silently marked the
+        // item applied without touching the node.
+        drop(state); // release DB lock before re-opening
+        let conn = Connection::open(&db_path).unwrap();
+        let (post_distilled, post_headline, post_bv): (String, String, i64) = conn
+            .query_row(
+                "SELECT distilled, headline, COALESCE(build_version, 1)
+                   FROM pyramid_nodes
+                  WHERE slug = 'p8-e2e' AND id = 'L1-E2E'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(
+            post_distilled.contains("E2E: distilled reflects the annotation-triggered re-distill"),
+            "node distilled must carry the manifest's new content, got: {post_distilled}"
+        );
+        assert_eq!(post_headline, "E2E updated headline");
+        assert_eq!(post_bv, 2, "build_version must bump from 1 → 2");
+
+        // Step 7: work item CAS'd to applied.
+        let wi_state: String = conn
+            .query_row(
+                "SELECT state FROM dadbear_work_items WHERE id = ?1",
+                rusqlite::params![re_wi_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wi_state, "applied");
+
+        // Step 8: result_applications row stamped with `re_distilled:{new_id}`.
+        let result_action: String = conn
+            .query_row(
+                "SELECT action FROM dadbear_result_applications
+                  WHERE work_item_id = ?1",
+                rusqlite::params![re_wi_id],
+                |r| r.get(0),
+            )
+            .expect("supervisor arm must have inserted a result_applications row");
+        assert!(
+            result_action.starts_with("re_distilled:"),
+            "result_action must name the new canonical id, got: {result_action}"
+        );
+
+        // Step 9: chronicle breadcrumb landed.
+        let chronicle_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE slug = 'p8-e2e' AND event_type = 'node_re_distilled'
+                    AND target_node_id = 'L1-E2E'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            chronicle_count >= 1,
+            "node_re_distilled chronicle event must have been emitted"
+        );
     }
 
     // Silences unused-import warning when only some tests run.

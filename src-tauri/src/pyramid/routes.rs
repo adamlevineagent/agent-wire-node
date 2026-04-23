@@ -10685,10 +10685,34 @@ mod annotation_observation_tests {
     }
 
     #[tokio::test]
-    async fn compiler_turns_annotation_events_into_redistill_work_items() {
+    async fn compiler_turns_annotation_events_into_role_bound_work_items() {
+        // Phase 8-1 flip: annotation_written events now compile to `role_bound`
+        // work items that route through the cascade_handler binding. The bound
+        // chain (starter-cascade-judge-gated for new slugs, immediate-redistill
+        // for legacy) runs its terminal queue_re_distill_for_target step, which
+        // enqueues the actual re_distill work item for the supervisor's Phase
+        // 8-2 arm to apply.
+        //
+        // Pre-Phase-8 this test asserted `primitive == "re_distill"` with
+        // `step_name == "annotation_redistill"`. That legacy primitive fell
+        // through the supervisor's default arm and silently no-op'd — the
+        // original DADBEAR non-firing bug.
         let raw = rusqlite::Connection::open_in_memory().unwrap();
         dbmod::init_pyramid_db(&raw).unwrap();
         seed_pyramid_with_tree(&raw, "anno-pyr");
+        // Phase 8-1 regression fix: seed role bindings so the compiler can
+        // resolve cascade_handler. Without this the role_bound resolution
+        // fails, the cursor is held, and items_compiled = 0. `seed_pyramid_
+        // with_tree` uses a raw INSERT INTO pyramid_slugs so create_slug's
+        // cascade_handler seeding never ran; we bind it explicitly here.
+        crate::pyramid::role_binding::initialize_genesis_bindings(&raw, "anno-pyr").unwrap();
+        crate::pyramid::role_binding::set_binding(
+            &raw,
+            "anno-pyr",
+            "cascade_handler",
+            crate::pyramid::role_binding::CASCADE_HANDLER_NEW_DEFAULT,
+        )
+        .unwrap();
         let writer = Arc::new(Mutex::new(raw));
 
         // Write annotation observation events for two ancestors.
@@ -10701,7 +10725,7 @@ mod annotation_observation_tests {
         let conn = writer.lock().await;
         let result = dadbear_compiler::run_compilation_for_slug(&conn, "anno-pyr", None, None)
             .expect("compilation succeeds");
-        assert_eq!(result.items_compiled, 2, "one re_distill per ancestor");
+        assert_eq!(result.items_compiled, 2, "one role_bound per ancestor");
 
         let work_items: Vec<(String, String, i64, String)> = conn
             .prepare(
@@ -10717,8 +10741,9 @@ mod annotation_observation_tests {
             .collect();
 
         assert_eq!(work_items.len(), 2);
-        assert!(work_items.iter().all(|w| w.0 == "re_distill"));
-        assert!(work_items.iter().all(|w| w.1 == "annotation_redistill"));
+        // Phase 8-1: primitive is now `role_bound`, step_name is `annotation_cascade`.
+        assert!(work_items.iter().all(|w| w.0 == "role_bound"));
+        assert!(work_items.iter().all(|w| w.1 == "annotation_cascade"));
         assert_eq!(work_items[0].2, 1);
         assert_eq!(work_items[0].3, "L1-mid");
         assert_eq!(work_items[1].2, 2);
@@ -10727,9 +10752,24 @@ mod annotation_observation_tests {
 
     #[tokio::test]
     async fn multiple_annotations_same_parent_coalesce_to_one_work_item() {
+        // Phase 8-1 note: dedup still applies post-flip. annotation_written
+        // now compiles to role_bound+annotation_cascade; multiple events
+        // targeting the same ancestor still coalesce via has_active_work_item.
         let raw = rusqlite::Connection::open_in_memory().unwrap();
         dbmod::init_pyramid_db(&raw).unwrap();
         seed_pyramid_with_tree(&raw, "anno-pyr");
+        // Phase 8-1 regression fix: seed role bindings so the compiler can
+        // resolve cascade_handler. initialize_genesis_bindings skips
+        // cascade_handler (create_slug owns it), so set the binding
+        // explicitly — the raw-INSERT seed fixture never ran create_slug.
+        crate::pyramid::role_binding::initialize_genesis_bindings(&raw, "anno-pyr").unwrap();
+        crate::pyramid::role_binding::set_binding(
+            &raw,
+            "anno-pyr",
+            "cascade_handler",
+            crate::pyramid::role_binding::CASCADE_HANDLER_NEW_DEFAULT,
+        )
+        .unwrap();
         let writer = Arc::new(Mutex::new(raw));
 
         for id in [501i64, 502, 503] {
@@ -10751,10 +10791,10 @@ mod annotation_observation_tests {
         assert_eq!(event_count, 6);
 
         // ... but the compiler's has_active_work_item dedup means only 2
-        // work items (one per distinct ancestor).
+        // work items (one per distinct ancestor), each role_bound.
         let result = dadbear_compiler::run_compilation_for_slug(&conn, "anno-pyr", None, None)
             .expect("compilation succeeds");
-        assert_eq!(result.items_compiled, 2, "one re_distill per parent, not per annotation");
+        assert_eq!(result.items_compiled, 2, "one role_bound per parent, not per annotation");
         assert_eq!(result.deduped, 4, "second/third annotations coalesce per ancestor");
 
         let wi_count: i64 = conn
