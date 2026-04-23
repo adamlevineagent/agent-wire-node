@@ -1677,40 +1677,13 @@ pub(crate) fn classify_pool_404(body: &str) -> EntryError {
     }
 }
 
-/// Resolve the model string for a single walker route entry (Option C
-/// hybrid — post-ship C1 fix).
-///
-/// Priority:
-///   1. `entry.model_id` — explicit per-route operator override.
-///   2. Tier-routing lookup — `entry.tier_name` → TierRoutingEntry; the
-///      row's `provider_id` MUST match `entry.provider_id` or we fall
-///      through (never cross-provider a mismatched slug).
-///   3. `primary_model_fallback` — caller passes the legacy
-///      `config.primary_model` (or whatever context-cascade value the
-///      walker settled on); used when neither 1 nor 2 produced a model.
-///
-/// Exposed as `pub(crate)` for unit tests. The walker inlines this same
-/// logic in the dispatch loop to keep the single log line about which
-/// priority fired, but the resolver here is the authoritative spec.
-pub(crate) fn resolve_route_model(
-    entry: &crate::pyramid::dispatch_policy::RouteEntry,
-    registry: Option<&std::sync::Arc<crate::pyramid::provider::ProviderRegistry>>,
-    primary_model_fallback: &str,
-) -> String {
-    if let Some(ref explicit) = entry.model_id {
-        return explicit.clone();
-    }
-    if let Some(tier_name) = entry.tier_name.as_deref() {
-        if let Some(reg) = registry {
-            if let Some(tier_row) = reg.get_tier(tier_name) {
-                if tier_row.provider_id == entry.provider_id {
-                    return tier_row.model_id;
-                }
-            }
-        }
-    }
-    primary_model_fallback.to_string()
-}
+// walker-v3 W2a: `resolve_route_model` retired — the walker v3
+// dispatch path reads models directly from `decision.per_provider[...]
+// .model_list`, and the `RouteEntry.model_id` / `tier_name` overrides
+// are both marked "Gone" in plan §5.1. The fn was `pub(crate)` with
+// no non-test callers post-W2 migration; the related unit tests were
+// dropped with it. Cross-provider-mismatch prevention is now enforced
+// by scope keying on `ProviderType` (plan §2.7).
 
 #[derive(Debug, Clone, Default)]
 pub struct LlmCallOptions {
@@ -6555,7 +6528,8 @@ routing_rules:
 
     // ──────────────────────────────────────────────────────────────────────
     // Post-ship walker bug fixes (W1 + C1) — classify_pool_400 +
-    // resolve_route_model + cascade-crossing regression guard.
+    // cascade-crossing regression guard (resolve_route_model tests
+    // retired in walker-v3 W3a along with the fn itself).
     // ──────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -6652,156 +6626,6 @@ routing_rules:
         let _ = classify_pool_400(&body); // no panic
     }
 
-    #[test]
-    fn resolve_route_model_priority_1_explicit_entry_model_id() {
-        use crate::pyramid::dispatch_policy::RouteEntry;
-        let entry = RouteEntry {
-            provider_id: "openrouter".into(),
-            model_id: Some("explicit/model".into()),
-            tier_name: Some("some_tier".into()),
-            is_local: false,
-            max_budget_credits: None,
-        };
-        // Registry passed as None — explicit override must win regardless.
-        let got = resolve_route_model(&entry, None, "stale/primary");
-        assert_eq!(got, "explicit/model");
-    }
-
-    #[test]
-    fn resolve_route_model_priority_2_tier_routing_match() {
-        use crate::pyramid::dispatch_policy::RouteEntry;
-        use crate::pyramid::provider::{Provider, ProviderRegistry, ProviderType, TierRoutingEntry};
-        use crate::pyramid::credentials::CredentialStore;
-        use std::sync::Arc;
-
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(CredentialStore::load(tmp.path()).unwrap());
-        std::mem::forget(tmp);
-
-        let registry = Arc::new(ProviderRegistry::new(store));
-        // tier_routing has FK → provider_id; ensure provider row exists.
-        registry
-            .save_provider(
-                &conn,
-                Provider {
-                    id: "openrouter".into(),
-                    display_name: "OR".into(),
-                    provider_type: ProviderType::Openrouter,
-                    base_url: "https://openrouter.ai/api/v1".into(),
-                    api_key_ref: Some("OPENROUTER_KEY".into()),
-                    auto_detect_context: false,
-                    supports_broadcast: false,
-                    broadcast_config_json: None,
-                    config_json: "{}".into(),
-                    enabled: true,
-                },
-            )
-            .unwrap();
-        registry
-            .save_tier_routing(
-                &conn,
-                TierRoutingEntry {
-                    tier_name: "my_tier".into(),
-                    provider_id: "openrouter".into(),
-                    model_id: "tier/model-from-routing".into(),
-                    context_limit: Some(128_000),
-                    max_completion_tokens: None,
-                    pricing_json: "{}".into(),
-                    supported_parameters_json: None,
-                    notes: None,
-                },
-            )
-            .unwrap();
-
-        let entry = RouteEntry {
-            provider_id: "openrouter".into(),
-            model_id: None,
-            tier_name: Some("my_tier".into()),
-            is_local: false,
-            max_budget_credits: None,
-        };
-        let got = resolve_route_model(&entry, Some(&registry), "stale/primary");
-        assert_eq!(got, "tier/model-from-routing");
-    }
-
-    #[test]
-    fn resolve_route_model_priority_2_skips_when_tier_provider_mismatch() {
-        // Tier routing row is for a DIFFERENT provider than the route
-        // entry. Resolver must NOT cross-provider an incompatible slug —
-        // it falls through to the primary_model fallback. This is the
-        // regression guard for the original C1 bug.
-        use crate::pyramid::dispatch_policy::RouteEntry;
-        use crate::pyramid::provider::{Provider, ProviderRegistry, ProviderType, TierRoutingEntry};
-        use crate::pyramid::credentials::CredentialStore;
-        use std::sync::Arc;
-
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(CredentialStore::load(tmp.path()).unwrap());
-        std::mem::forget(tmp);
-
-        let registry = Arc::new(ProviderRegistry::new(store));
-        registry
-            .save_provider(
-                &conn,
-                Provider {
-                    id: "ollama-local".into(),
-                    display_name: "Ollama".into(),
-                    provider_type: ProviderType::OpenaiCompat,
-                    base_url: "http://127.0.0.1:11434/v1".into(),
-                    api_key_ref: None,
-                    auto_detect_context: false,
-                    supports_broadcast: false,
-                    broadcast_config_json: None,
-                    config_json: "{}".into(),
-                    enabled: true,
-                },
-            )
-            .unwrap();
-        registry
-            .save_tier_routing(
-                &conn,
-                TierRoutingEntry {
-                    tier_name: "local_tier".into(),
-                    provider_id: "ollama-local".into(),
-                    model_id: "gemma4:26b".into(),
-                    context_limit: Some(32_000),
-                    max_completion_tokens: None,
-                    pricing_json: "{}".into(),
-                    supported_parameters_json: None,
-                    notes: None,
-                },
-            )
-            .unwrap();
-
-        let entry = RouteEntry {
-            provider_id: "openrouter".into(),
-            model_id: None,
-            tier_name: Some("local_tier".into()),
-            is_local: false,
-            max_budget_credits: None,
-        };
-        let got = resolve_route_model(&entry, Some(&registry), "fallback/primary");
-        // Must fall through — NOT "gemma4:26b".
-        assert_eq!(got, "fallback/primary");
-    }
-
-    #[test]
-    fn resolve_route_model_priority_3_primary_fallback() {
-        use crate::pyramid::dispatch_policy::RouteEntry;
-        let entry = RouteEntry {
-            provider_id: "openrouter".into(),
-            model_id: None,
-            tier_name: None,
-            is_local: false,
-            max_budget_credits: None,
-        };
-        let got = resolve_route_model(&entry, None, "fallback/primary");
-        assert_eq!(got, "fallback/primary");
-    }
 
     #[tokio::test]
     async fn walker_advances_past_openrouter_400_model_rejection_to_ollama_local() {

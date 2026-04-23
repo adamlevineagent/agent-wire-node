@@ -1080,6 +1080,92 @@ pub fn tier_set_from_chain(chain: &ScopeChain) -> std::collections::BTreeSet<Str
     set
 }
 
+// ── Pattern-4 helper (walker-v3 W3a) ─────────────────────────────────────────
+//
+// Pattern-4 sites (DADBEAR bootstrap, meta-run IPC, faq-directory IPC,
+// annotation post-save hook, ensure_dadbear_running) have a DB
+// connection in scope but NO StepContext — they run outside any chain
+// step. They need a synthetic "first OpenRouter model for the mid
+// slot" value to feed legacy signatures that accept `model: &str`.
+//
+// This helper builds a fresh ScopeCache from the DB on demand and
+// pulls `model_list[mid][0]` from the active walker_provider_openrouter
+// contribution. Returns `None` if either the cache build fails or the
+// list is empty; callers are expected to fall back to
+// `config.primary_model` until W3c deletes that field.
+//
+// After W3c: the fallback closure gets cargo-check errors and the
+// sites either accept `None` (if synthetic Decision is wired by that
+// phase) or surface `DispatchDecision::synthetic_for_preview(..)`.
+#[allow(dead_code)]
+pub fn first_openrouter_model_from_db(conn: &Connection) -> Option<String> {
+    let cache = match build_scope_cache(conn) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                event = "scope_cache_load_failed_in_pattern_4_site",
+                error = ?e,
+            );
+            return None;
+        }
+    };
+    resolve_model_list(&cache.scope_chain, "mid", ProviderType::OpenRouter)
+        .and_then(|ml| ml.into_iter().next())
+}
+
+/// Synthesize a `(primary, fallback_1, fallback_2)` triple from the
+/// active `walker_provider_openrouter` contribution. Used by the
+/// read-side of the retired legacy `pyramid_set_config` /
+/// `POST /pyramid/config` path in walker-v3 W3a so existing frontend
+/// Settings views keep getting a shape they understand while the
+/// write-side returns a directed error.
+///
+/// Mapping per W3a plan guidance:
+///   - primary    = `overrides.model_list["mid"][0]`
+///   - fallback_1 = `overrides.model_list["mid"][1]` (next in mid),
+///                  then `overrides.model_list["cheap"][0]` if mid has
+///                  only one entry.
+///   - fallback_2 = `overrides.model_list["high"][0]` (then "max")
+///
+/// Returns `None` entries for any slot that can't be resolved; caller
+/// decides whether to echo empty strings or fall back to the legacy
+/// `LlmConfig` field. W3c's field deletion removes the fallback arm.
+#[allow(dead_code)]
+pub fn synthesize_legacy_model_triple_from_db(
+    conn: &Connection,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let cache = match build_scope_cache(conn) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                event = "scope_cache_load_failed_in_legacy_config_synth",
+                error = ?e,
+            );
+            return (None, None, None);
+        }
+    };
+    let chain = &cache.scope_chain;
+
+    let mid = resolve_model_list(chain, "mid", ProviderType::OpenRouter);
+    let cheap = resolve_model_list(chain, "cheap", ProviderType::OpenRouter);
+    let high = resolve_model_list(chain, "high", ProviderType::OpenRouter);
+    let max_list = resolve_model_list(chain, "max", ProviderType::OpenRouter);
+
+    let primary = mid.as_ref().and_then(|v| v.first().cloned());
+    // fallback_1: prefer mid[1], then cheap[0].
+    let fallback_1 = mid
+        .as_ref()
+        .and_then(|v| v.get(1).cloned())
+        .or_else(|| cheap.as_ref().and_then(|v| v.first().cloned()));
+    // fallback_2: prefer high[0], then max[0].
+    let fallback_2 = high
+        .as_ref()
+        .and_then(|v| v.first().cloned())
+        .or_else(|| max_list.as_ref().and_then(|v| v.first().cloned()));
+
+    (primary, fallback_1, fallback_2)
+}
+
 // ── build_scope_cache (integration surface for WS-E) ─────────────────────────
 //
 // Reads the active `walker_*` contributions and assembles a

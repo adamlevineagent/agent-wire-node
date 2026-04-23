@@ -552,13 +552,13 @@ struct VineBuildBody {
     evidence_mode: String,
 }
 
-// TODO(walker-v3 Phase 6 — Pattern 3): `ConfigBody` is the POST /pyramid/config
-// HTTP body that mirrors the Tauri `pyramid_set_config` IPC. Phase 6's
-// Settings-UI redesign retires both surfaces: operators edit walker_provider_*
-// contributions via Tools > Create, and DispatchDecision resolves models per
-// step. The primary_model / fallback_model_1 / fallback_model_2 fields (and
-// their writes in handle_config at ~3960-3967 / 3982-3984 below) die with
-// this route in Phase 6.
+// walker-v3 W3a (Cluster 1 / Option A): `ConfigBody` is retained for the
+// credential + flag writes (openrouter_api_key / use_ir_executor);
+// model-slug writes (primary_model / fallback_model_{1,2}) are rejected
+// with a directed error pointing at the walker_provider_openrouter
+// contribution. Phase 6 deletes the whole route once the Settings UI
+// rewrites to edit walker_* contributions directly.
+// TODO(walker-v3 Phase 6): delete ConfigBody + POST /pyramid/config.
 #[derive(Deserialize)]
 struct ConfigBody {
     openrouter_api_key: Option<String>,
@@ -3946,6 +3946,21 @@ async fn handle_config(
     state: Arc<PyramidState>,
     body: ConfigBody,
 ) -> Result<warp::reply::Response, warp::Rejection> {
+    // walker-v3 W3a: model-slug writes retired — direct operators to the
+    // walker_provider_openrouter contribution editor.
+    if body.primary_model.is_some()
+        || body.fallback_model_1.is_some()
+        || body.fallback_model_2.is_some()
+    {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "Model selection moved to the walker_provider_openrouter contribution. \
+             Edit it via Tools > Create (schema: walker_provider_openrouter) or \
+             POST /config-contributions; this legacy field write was retired in \
+             walker-v3 W3a and will be deleted in Phase 6.",
+        ));
+    }
+
     let mut config = state.config.write().await;
 
     if let Some(ref key) = body.openrouter_api_key {
@@ -3964,15 +3979,6 @@ async fn handle_config(
         // credential store at use-time) resolves this. The primary write
         // path (IPC pyramid_set_config) DOES sync the partner cache.
     }
-    if let Some(ref model) = body.primary_model {
-        config.primary_model = model.clone();
-    }
-    if let Some(ref model) = body.fallback_model_1 {
-        config.fallback_model_1 = model.clone();
-    }
-    if let Some(ref model) = body.fallback_model_2 {
-        config.fallback_model_2 = model.clone();
-    }
 
     if let Some(use_ir) = body.use_ir_executor {
         state
@@ -3983,7 +3989,8 @@ async fn handle_config(
 
     // Persist non-secret config to disk. Deliberately not updating
     // openrouter_api_key — credential store is SOT. Stale value
-    // preserved as boot-time migration source.
+    // preserved as boot-time migration source. Model fields echo
+    // whatever is already live (no write path mutates them from here).
     if let Some(ref data_dir) = state.data_dir {
         let mut pyramid_config = super::PyramidConfig::load(data_dir);
         pyramid_config.primary_model = config.primary_model.clone();
@@ -3997,16 +4004,29 @@ async fn handle_config(
         }
     }
 
-    // TODO(walker-v3 W3 — Pattern 2): handle_config's response echoes the
-    // legacy LlmConfig fields back to the HTTP caller for display/confirm.
-    // When W3 deletes these fields, echo from the newly-written
-    // walker_provider_openrouter.overrides.model_list instead. Route itself
-    // retires in Phase 6 alongside the ConfigBody struct.
+    // walker-v3 W3a: response echoes synthesize the model triple from
+    // the active walker_provider_openrouter contribution. Legacy
+    // fallback removed by W3c once config.primary_model dies.
+    // TODO(walker-v3 Phase 6): drop this route entirely; operators
+    // observe walker_provider_* contributions via the standard
+    // config-contributions endpoints instead.
+    let legacy_primary = config.primary_model.clone();
+    let legacy_fb1 = config.fallback_model_1.clone();
+    let legacy_fb2 = config.fallback_model_2.clone();
+    drop(config);
+    let (primary_syn, fb1_syn, fb2_syn) = {
+        let conn = state.reader.lock().await;
+        super::walker_resolver::synthesize_legacy_model_triple_from_db(&conn)
+    };
+    let primary_model = primary_syn.unwrap_or(legacy_primary);
+    let fallback_model_1 = fb1_syn.unwrap_or(legacy_fb1);
+    let fallback_model_2 = fb2_syn.unwrap_or(legacy_fb2);
+
     Ok(json_ok(&serde_json::json!({
         "status": "updated",
-        "primary_model": config.primary_model,
-        "fallback_model_1": config.fallback_model_1,
-        "fallback_model_2": config.fallback_model_2,
+        "primary_model": primary_model,
+        "fallback_model_1": fallback_model_1,
+        "fallback_model_2": fallback_model_2,
         "use_ir_executor": state.use_ir_executor.load(std::sync::atomic::Ordering::Relaxed),
     })))
 }
@@ -4297,13 +4317,14 @@ async fn handle_annotate(
     let base_config = state
         .llm_config_with_cache(&slug_clone, &annotation_build_id)
         .await;
-    // TODO(walker-v3 W3 — Pattern 4): annotation post-save hook has no
-    // step_ctx (spawned from HTTP annotation POST). When W3 deletes
-    // config.primary_model, a future phase must build a synthetic
-    // StepContext (or call DispatchDecision::synthetic_for_preview) so
-    // process_annotation_hook's delta + faq calls resolve via
-    // walker_provider_openrouter.overrides.model_list.mid[0].
-    let model = base_config.primary_model.clone();
+    // walker-v3 W3a (Pattern 4): resolve via walker_resolver reading
+    // the active walker_provider_openrouter contribution. Legacy
+    // fallback removed by W3c once config.primary_model dies.
+    let resolved = {
+        let conn = state.reader.lock().await;
+        super::walker_resolver::first_openrouter_model_from_db(&conn)
+    };
+    let model = resolved.unwrap_or_else(|| base_config.primary_model.clone());
     let ops_clone = state.operational.clone();
 
     tokio::spawn(async move {
@@ -4659,10 +4680,14 @@ async fn handle_meta_run(
     let base_config = state
         .llm_config_with_cache(&slug_name, &format!("meta-{}", slug_name))
         .await;
-    // TODO(walker-v3 W3 — Pattern 4): HTTP POST /pyramid/:slug/meta has
-    // no step_ctx. When W3 deletes config.primary_model, resolve via
-    // DispatchDecision::synthetic_for_preview or a synthetic StepContext.
-    let model = base_config.primary_model.clone();
+    // walker-v3 W3a (Pattern 4): resolve via walker_resolver reading
+    // the active walker_provider_openrouter contribution. Legacy
+    // fallback removed by W3c once config.primary_model dies.
+    let resolved = {
+        let conn = state.reader.lock().await;
+        super::walker_resolver::first_openrouter_model_from_db(&conn)
+    };
+    let model = resolved.unwrap_or_else(|| base_config.primary_model.clone());
 
     let reader = state.reader.clone();
     let writer = state.writer.clone();
@@ -4722,10 +4747,14 @@ async fn handle_match_faq(
     let base_config = state
         .llm_config_with_cache(&slug_name, &format!("faq-match-{}", slug_name))
         .await;
-    // TODO(walker-v3 W3 — Pattern 4): HTTP GET /pyramid/:slug/faq/match
-    // has no step_ctx. When W3 deletes config.primary_model, resolve via
-    // DispatchDecision::synthetic_for_preview or a synthetic StepContext.
-    let model = base_config.primary_model.clone();
+    // walker-v3 W3a (Pattern 4): resolve via walker_resolver reading
+    // the active walker_provider_openrouter contribution. Legacy
+    // fallback removed by W3c once config.primary_model dies.
+    let resolved = {
+        let conn = state.reader.lock().await;
+        super::walker_resolver::first_openrouter_model_from_db(&conn)
+    };
+    let model = resolved.unwrap_or_else(|| base_config.primary_model.clone());
 
     match faq::match_faq(
         &state.reader,
@@ -4759,10 +4788,14 @@ async fn handle_faq_directory(
     let base_config = state
         .llm_config_with_cache(&slug_name, &format!("faq-dir-{}", slug_name))
         .await;
-    // TODO(walker-v3 W3 — Pattern 4): HTTP GET /pyramid/:slug/faq/directory
-    // has no step_ctx. When W3 deletes config.primary_model, resolve via
-    // DispatchDecision::synthetic_for_preview or a synthetic StepContext.
-    let model = base_config.primary_model.clone();
+    // walker-v3 W3a (Pattern 4): resolve via walker_resolver reading
+    // the active walker_provider_openrouter contribution. Legacy
+    // fallback removed by W3c once config.primary_model dies.
+    let resolved = {
+        let conn = state.reader.lock().await;
+        super::walker_resolver::first_openrouter_model_from_db(&conn)
+    };
+    let model = resolved.unwrap_or_else(|| base_config.primary_model.clone());
 
     match faq::get_faq_directory(
         &state.reader,

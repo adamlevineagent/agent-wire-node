@@ -548,105 +548,13 @@ pub fn assemble_vine_l0(
 }
 
 // ── Vine Build Pipeline Helper ───────────────────────────────────────────────
-
-/// Run the build pipeline for a single slug, setting up all required channels.
-/// Extracted from routes.rs to be shared between HTTP builds and vine bunch builds.
-///
-/// Phase 16: takes an optional `state` reference so the `ContentType::Vine`
-/// branch can dispatch the topical-vine chain via
-/// `build::build_topical_vine`. Existing callers that build conversation
-/// bunches pass `None` because they never hit the vine branch.
-pub async fn run_build_pipeline(
-    reader: Arc<Mutex<Connection>>,
-    writer: Arc<Mutex<Connection>>,
-    llm_config: &LlmConfig,
-    slug: &str,
-    content_type: ContentType,
-    cancel: &CancellationToken,
-    bus: Option<&super::event_bus::BuildEventBus>,
-    state: Option<&PyramidState>,
-) -> Result<i32> {
-    // Use shared writer drain helper (single implementation, not duplicated)
-    let (write_tx, writer_handle) = spawn_write_drain(writer);
-
-    // Create progress channel. When a BuildEventBus is supplied, tee onto the
-    // bus so the public web surface (post-agents-retro WS) can subscribe
-    // per-slug. The downstream debug-log consumer is unaffected.
-    let (progress_tx, raw_progress_rx) = mpsc::channel::<BuildProgress>(64);
-    let mut progress_rx = if let Some(bus) = bus {
-        super::event_bus::tee_build_progress_to_bus(bus, slug.to_string(), raw_progress_rx)
-    } else {
-        raw_progress_rx
-    };
-    let slug_for_progress = slug.to_string();
-    let progress_handle = tokio::spawn(async move {
-        while let Some(prog) = progress_rx.recv().await {
-            tracing::debug!(
-                "Build progress for '{}': {}/{}",
-                slug_for_progress,
-                prog.done,
-                prog.total
-            );
-        }
-    });
-
-    // Dispatch by content type
-    let result = match content_type {
-        ContentType::Conversation => {
-            build::build_conversation(reader, &write_tx, llm_config, slug, cancel, &progress_tx)
-                .await
-        }
-        ContentType::Code => {
-            build::build_code(reader, &write_tx, llm_config, slug, cancel, &progress_tx).await
-        }
-        ContentType::Document => {
-            build::build_docs(reader, &write_tx, llm_config, slug, cancel, &progress_tx).await
-        }
-        ContentType::Vine => {
-            // Phase 16: vines are built by dispatching the topical vine
-            // chain through the chain executor. The executor pulls child
-            // apex data from `pyramid_vine_compositions` via the
-            // cross_build_input primitive and composes bedrock + sub-vine
-            // children uniformly.
-            match state {
-                Some(s) => build::build_topical_vine(s, slug, cancel, &progress_tx).await,
-                None => Err(anyhow!(
-                    "Vine build requires PyramidState: use run_build_from or pass state \
-                     to run_build_pipeline. Phase 16 dispatches vines via the topical-vine chain."
-                )),
-            }
-        }
-        ContentType::Question => Err(anyhow!(
-            "Question build uses question-driven pipeline, not run_build_pipeline"
-        )),
-    };
-
-    // Clean up channels
-    drop(write_tx);
-    drop(progress_tx);
-    let _ = writer_handle.await;
-    let _ = progress_handle.await;
-
-    // WS-EVENTS §15.21: SlopeChanged catch-all at legacy build-pipeline
-    // completion. `build::build_conversation` / `build_code` / `build_docs`
-    // don't have the bus threaded through yet (intentionally unrefactored
-    // per WS-EVENTS scope — brief forbids restructuring those call sites),
-    // so we emit once here on success to guarantee WS-PRIMER subscribers
-    // see a cache-invalidation edge after every successful legacy build.
-    // Empty `affected_layers` = "revalidate everything".
-    if result.is_ok() {
-        if let Some(bus) = bus {
-            let _ = bus.tx.send(super::event_bus::TaggedBuildEvent {
-                slug: slug.to_string(),
-                kind: super::event_bus::TaggedKind::SlopeChanged {
-                    affected_layers: Vec::new(),
-                },
-            });
-        }
-    }
-
-    result
-}
+//
+// walker-v3 W3a: `run_build_pipeline` retired with the legacy build
+// pipeline. Its sole remaining caller (the chain-fail fallback in
+// `build_vine_bunch`) was removed in the same commit, and no other
+// site called it. Chain engine dispatch via
+// `build_runner::run_build_from_with_evidence_mode` is the only
+// supported path.
 
 // ── Vine DB CRUD ─────────────────────────────────────────────────────────────
 
@@ -1037,25 +945,14 @@ pub async fn build_bunch(
             info!("Bunch '{bunch_slug}' built via chain executor: {node_count} nodes");
         }
         Err(e) => {
-            warn!("Bunch '{bunch_slug}' chain build failed, falling back to legacy: {e}");
-            // Fallback to legacy pipeline if chain executor fails
-            let reader = if let Some(data_dir) = state.data_dir.as_ref() {
-                let build_conn = db::open_pyramid_connection(&data_dir.join("pyramid.db"))?;
-                Arc::new(Mutex::new(build_conn))
-            } else {
-                state.reader.clone()
-            };
-            let writer = state.writer.clone();
-            // Phase 12 verifier fix: attach cache_access so build.rs retrofit
-            // sites reach the step cache.
-            let llm_config = state
-                .llm_config_with_cache(&bunch_slug, &format!("vine-fallback-{}", bunch_slug))
-                .await;
-            run_build_pipeline(
-                reader, writer, &llm_config, &bunch_slug,
-                ContentType::Conversation, cancel, Some(&state.build_event_bus),
-                Some(state),
-            ).await?;
+            // walker-v3 W3a: legacy fallback retired. The chain engine
+            // is the only supported dispatch path per plan §5.6.3; if
+            // the chain build fails here, surface it — no silent
+            // fallback to the removed build_conversation/build_code/
+            // build_docs path.
+            return Err(anyhow!(
+                "Vine bunch '{bunch_slug}' chain build failed: {e}"
+            ));
         }
     }
 

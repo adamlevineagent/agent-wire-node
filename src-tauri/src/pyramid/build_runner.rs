@@ -198,7 +198,12 @@ pub async fn run_build_from_with_evidence_mode(
     evidence_mode: &str,
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
-    write_tx: &mpsc::Sender<WriteOp>,
+    // walker-v3 W3a: `write_tx` was consumed by the retired
+    // `run_legacy_build` only — chain engine manages its own writer
+    // drain. Kept in the signature to preserve the public surface until
+    // downstream callers (parity.rs, dadbear_extend.rs, routes.rs,
+    // main.rs) can be updated in a separate pass.
+    _write_tx: &mpsc::Sender<WriteOp>,
     layer_tx: Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
     // ── 0. WS-CONCURRENCY (§15.16 races 1/3/7): serialize builds on the
@@ -324,8 +329,20 @@ pub async fn run_build_from_with_evidence_mode(
     }
 
     // ── 2. Check feature flags ───────────────────────────────────────────
+    //
+    // walker-v3 W3a: the `use_chain_engine: false` branch retired. The
+    // chain engine is the only supported dispatch path per plan §5.6.3;
+    // from_depth is now universally supported. `use_ir_executor` still
+    // toggles between the IR executor (ExecutionPlan compile → execute)
+    // and the chain executor. Configs that load as `use_chain_engine:
+    // false` are handled by the boot-time intervention modal (Phase 0a-2
+    // onboarding_state.chain_engine_enable_ack flow), not here.
+    // TODO(walker-v3 W3c): decide the fate of the use_chain_engine
+    // field on PyramidConfig — either (a) keep it for backward-compat
+    // serde and always treat it as true at runtime, or (b) delete the
+    // field entirely. W3c's field-deletion commit picks.
+    let _ = state.use_chain_engine.load(Ordering::Relaxed); // read-only; value ignored
     let use_ir = state.use_ir_executor.load(Ordering::Relaxed);
-    let use_chain = state.use_chain_engine.load(Ordering::Relaxed);
 
     let result = if use_ir {
         // IR executor path: compile chain to ExecutionPlan, execute via execute_plan
@@ -339,7 +356,7 @@ pub async fn run_build_from_with_evidence_mode(
         )
         .await
         .map(|(apex, failures)| (apex, failures, vec![]))
-    } else if use_chain {
+    } else {
         run_chain_build(
             state,
             slug_name,
@@ -352,22 +369,6 @@ pub async fn run_build_from_with_evidence_mode(
             layer_tx,
         )
         .await
-    } else {
-        if from_depth > 0 {
-            return Err(anyhow!(
-                "from_depth is only supported with the chain engine (set use_chain_engine: true)"
-            ));
-        }
-        run_legacy_build(
-            state,
-            slug_name,
-            &content_type,
-            cancel,
-            progress_tx,
-            write_tx,
-        )
-        .await
-        .map(|(apex, failures)| (apex, failures, vec![]))
     };
 
     run_post_build_hooks(state, slug_name, &result).await;
@@ -851,92 +852,16 @@ async fn run_ir_build(
     chain_executor::execute_plan(state, &plan, slug_name, from_depth, cancel, progress_tx).await
 }
 
-/// Legacy path: dispatch to the old build_conversation/build_code/build_docs.
-async fn run_legacy_build(
-    state: &PyramidState,
-    slug_name: &str,
-    content_type: &ContentType,
-    cancel: &CancellationToken,
-    progress_tx: Option<mpsc::Sender<BuildProgress>>,
-    write_tx: &mpsc::Sender<WriteOp>,
-) -> Result<(String, i32)> {
-    // Phase 12 verifier fix: attach cache_access so build.rs retrofit
-    // sites reach the step cache.
-    let llm_config = state
-        .llm_config_with_cache(slug_name, &format!("legacy-build-{}", slug_name))
-        .await;
-
-    // The legacy build functions require a progress_tx reference; create a
-    // dummy one if the caller didn't supply one.
-    let owned_tx;
-    let ptx: &mpsc::Sender<BuildProgress> = match progress_tx {
-        Some(ref tx) => tx,
-        None => {
-            let (tx, mut rx) = mpsc::channel::<BuildProgress>(16);
-            // Spawn a drain so the channel doesn't block
-            tokio::spawn(async move { while rx.recv().await.is_some() {} });
-            owned_tx = tx;
-            &owned_tx
-        }
-    };
-
-    let failures = match content_type {
-        ContentType::Conversation => {
-            build::build_conversation(
-                state.reader.clone(),
-                write_tx,
-                &llm_config,
-                slug_name,
-                cancel,
-                ptx,
-            )
-            .await?
-        }
-        ContentType::Code => {
-            build::build_code(
-                state.reader.clone(),
-                write_tx,
-                &llm_config,
-                slug_name,
-                cancel,
-                ptx,
-            )
-            .await?
-        }
-        ContentType::Document => {
-            build::build_docs(
-                state.reader.clone(),
-                write_tx,
-                &llm_config,
-                slug_name,
-                cancel,
-                ptx,
-            )
-            .await?
-        }
-        ContentType::Vine => {
-            // Phase 16: the legacy path has no standalone vine builder.
-            // Vines are always dispatched through the chain engine via the
-            // topical-vine chain, regardless of the legacy/IR/chain flags.
-            // Delegate to `build::build_topical_vine`, which loads the
-            // topical-vine chain YAML and runs it through
-            // `chain_executor::execute_chain_from` — exactly the behaviour
-            // `run_chain_build` uses for the non-legacy path, but packaged
-            // behind a stable entry point so future callers (including the
-            // `vine.rs::run_build_pipeline` fallback arm) can share one
-            // implementation.
-            let failures = build::build_topical_vine(state, slug_name, cancel, ptx).await?;
-            return Ok(("topical-vine".to_string(), failures));
-        }
-        ContentType::Question => {
-            return Err(anyhow!(
-                "Question builds use the question-driven build endpoint"
-            ));
-        }
-    };
-
-    Ok(("legacy".to_string(), failures))
-}
+// walker-v3 W3a: `run_legacy_build` retired. The chain engine is the
+// only supported dispatch path per plan §5.6.3; the `use_chain_engine:
+// false` branch in `run_build_from_with_evidence_mode` no longer exists
+// and this function had no other callers. Legacy content-type
+// dispatchers (`build_conversation` / `build_code` / `build_docs`) and
+// their helpers (`build_l1_pairing`, `build_threads_layer`,
+// `build_upper_layers`, `flatten_analysis`, `extract_import_graph`,
+// `cluster_by_imports`, `truncate_text`, `get_resume_state`) were
+// deleted with it; vines still route through `build::build_topical_vine`
+// which is a chain-engine entry point.
 
 /// Decomposed question build path: decompose apex question → question tree →
 /// QuestionSet → IR → execute.

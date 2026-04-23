@@ -3550,13 +3550,18 @@ async fn post_build_seed(
         let cfg = pyramid_state.config.read().await;
         let base_id = format!("stale-{}", slug);
         let with_cache = pyramid_state.attach_cache_access(cfg.clone(), slug, &base_id);
-        // TODO(walker-v3 W3 — Pattern 4): stale-engine bootstrap has no
-        // step_ctx in scope. When W3 deletes config.primary_model, a future
-        // phase must wire DispatchDecision::synthetic_for_preview(slot,
-        // chain, cache) here (or thread a synthetic StepContext through
-        // PyramidStaleEngine::new) so the stale path resolves the model
-        // via walker_provider_openrouter.overrides.model_list.mid[0].
-        let model = cfg.primary_model.clone();
+        // walker-v3 W3a (Pattern 4): resolve the model for this
+        // out-of-step-ctx bootstrap via walker_resolver reading the
+        // active walker_provider_openrouter contribution. The
+        // `.unwrap_or_else(config.primary_model)` legacy fallback stays
+        // until W3c deletes the field; cargo-check will then surface
+        // this closure for cleanup. A future phase may instead wire
+        // DispatchDecision::synthetic_for_preview(..) here.
+        let resolved = {
+            let conn = pyramid_state.reader.lock().await;
+            wire_node_lib::pyramid::walker_resolver::first_openrouter_model_from_db(&conn)
+        };
+        let model = resolved.unwrap_or_else(|| cfg.primary_model.clone());
         (with_cache, model)
     };
 
@@ -4234,13 +4239,17 @@ async fn pyramid_ingest(
     }))
 }
 
-// TODO(walker-v3 Phase 6 — Pattern 3): `pyramid_set_config` is config-CRUD
-// IPC that writes operator-selected model slugs into the legacy LlmConfig
-// fields. Phase 6's Settings-UI redesign retires this IPC entirely: the
-// operator edits walker_provider_* contributions via Tools > Create, and
-// DispatchDecision resolves the active model per step. The primary_model /
-// fallback_model_1 / fallback_model_2 parameters (and their writes at
-// ~4251-4259 / 4310-4312 below) all die with this IPC in Phase 6.
+// walker-v3 W3a (Cluster 1 / Option A — stub model writes): `pyramid_set_config`
+// is retained as a credentials + flags write path (api_key / auth_token /
+// use_ir_executor / auto_execute) because frontend PyramidFirstRun and
+// PyramidSettings still ride it. Model-slug writes (primary_model /
+// fallback_model_{1,2}) are now a hard error directing operators to edit
+// the walker_provider_openrouter contribution via Tools > Create. Phase 6
+// retires the whole IPC once the Settings UI rewrites to edit walker_*
+// contributions directly.
+// TODO(walker-v3 Phase 6): delete pyramid_set_config entirely — the
+// api_key / auth_token writes move to a dedicated credential-only IPC,
+// and auto_execute / use_ir_executor move to per-feature toggle IPCs.
 #[tauri::command]
 async fn pyramid_set_config(
     state: tauri::State<'_, SharedState>,
@@ -4252,7 +4261,20 @@ async fn pyramid_set_config(
     use_ir_executor: Option<bool>,
     auto_execute: Option<bool>,
 ) -> Result<(), String> {
-    // Update in-memory LLM config
+    // walker-v3 W3a: model-slug writes are no longer accepted — models
+    // are resolved from the active walker_provider_openrouter
+    // contribution at dispatch time. Surface a directed error so the
+    // operator knows where to edit instead.
+    if primary_model.is_some() || fallback_model_1.is_some() || fallback_model_2.is_some() {
+        return Err(
+            "Model selection moved to the walker_provider_openrouter contribution. \
+             Edit it via Tools > Create (schema: walker_provider_openrouter) or \
+             POST /config-contributions; this legacy field write was retired in \
+             walker-v3 W3a and will be deleted in Phase 6."
+                .to_string(),
+        );
+    }
+    // Update in-memory LLM config (credentials + flags only now).
     {
         let mut config = state.pyramid.config.write().await;
         if let Some(ref key) = api_key {
@@ -4260,15 +4282,6 @@ async fn pyramid_set_config(
         }
         if let Some(ref token) = auth_token {
             config.auth_token = token.clone();
-        }
-        if let Some(ref model) = primary_model {
-            config.primary_model = model.clone();
-        }
-        if let Some(ref model) = fallback_model_1 {
-            config.fallback_model_1 = model.clone();
-        }
-        if let Some(ref model) = fallback_model_2 {
-            config.fallback_model_2 = model.clone();
         }
     }
 
@@ -5029,11 +5042,14 @@ async fn pyramid_meta_run(
         .pyramid
         .llm_config_with_cache(&slug, &format!("meta-{}", slug))
         .await;
-    // TODO(walker-v3 W3 — Pattern 4): IPC `pyramid_meta_run` has no
-    // step_ctx. When W3 drops config.primary_model, a future phase must
-    // build a synthetic StepContext (via DispatchDecision::synthetic_for_preview)
-    // so meta passes resolve via walker_provider_openrouter.overrides.model_list.mid[0].
-    let model = base_config.primary_model.clone();
+    // walker-v3 W3a (Pattern 4): resolve via walker_resolver reading
+    // the active walker_provider_openrouter contribution. Legacy
+    // fallback removed by W3c once config.primary_model dies.
+    let resolved = {
+        let conn = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::walker_resolver::first_openrouter_model_from_db(&conn)
+    };
+    let model = resolved.unwrap_or_else(|| base_config.primary_model.clone());
 
     let reader = state.pyramid.reader.clone();
     let writer = state.pyramid.writer.clone();
@@ -5928,20 +5944,26 @@ async fn pyramid_get_config(
         .and_then(|v| v["auto_execute"].as_bool())
         .unwrap_or(false);
 
-    // TODO(walker-v3 W3 — Pattern 2): `pyramid_get_config` surfaces the
-    // legacy LlmConfig fields to the Settings UI for display-only. When W3
-    // deletes these fields, this endpoint should either (a) synthesize the
-    // values from load_active_config_contribution(walker_provider_openrouter)
-    // .overrides.model_list (primary = mid[0], fallback_1 = cheap[0],
-    // fallback_2 = mid.get(1)), or (b) be deleted in favor of a new
-    // pyramid_get_walker_providers IPC that returns the contributions
-    // directly.
+    // walker-v3 W3a (Cluster 1): synthesize the legacy model triple from
+    // the active walker_provider_openrouter contribution so existing
+    // frontend Settings views keep rendering while the legacy write path
+    // is stubbed. When the contribution isn't present (fresh install
+    // before bundled seed land, unit-test fixtures), fall back to the
+    // legacy LlmConfig field. W3c deletes the fallback arm when the
+    // field goes away.
+    let (primary_syn, fb1_syn, fb2_syn) = {
+        let conn = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::walker_resolver::synthesize_legacy_model_triple_from_db(&conn)
+    };
+    let primary_model = primary_syn.unwrap_or_else(|| config.primary_model.clone());
+    let fallback_model_1 = fb1_syn.unwrap_or_else(|| config.fallback_model_1.clone());
+    let fallback_model_2 = fb2_syn.unwrap_or_else(|| config.fallback_model_2.clone());
     Ok(serde_json::json!({
         "api_key_set": !config.api_key.is_empty(),
         "auth_token_set": !config.auth_token.is_empty(),
-        "primary_model": config.primary_model,
-        "fallback_model_1": config.fallback_model_1,
-        "fallback_model_2": config.fallback_model_2,
+        "primary_model": primary_model,
+        "fallback_model_1": fallback_model_1,
+        "fallback_model_2": fallback_model_2,
         "auto_execute": auto_execute,
     }))
 }
@@ -6018,21 +6040,37 @@ async fn pyramid_apply_profile(
         state.pyramid.provider_registry.clone(),
         state.pyramid.credential_store.clone(),
     );
-    let mut live = state.pyramid.config.write().await;
-    let previous_live = live.clone();
-    *live = new_llm.with_runtime_overlays_from(&previous_live);
+    let (legacy_primary, legacy_fb1, legacy_fb2) = {
+        let mut live = state.pyramid.config.write().await;
+        let previous_live = live.clone();
+        *live = new_llm.with_runtime_overlays_from(&previous_live);
+        (
+            live.primary_model.clone(),
+            live.fallback_model_1.clone(),
+            live.fallback_model_2.clone(),
+        )
+    };
 
-    // TODO(walker-v3 W3 — Pattern 2): tracing log reads legacy LlmConfig
-    // fields for operator visibility. When W3 deletes the fields, this
-    // log should pull from load_active_config_contribution(walker_provider_openrouter)
-    // .overrides.model_list (mid / cheap / mid[1]) or be dropped. Note that
-    // pyramid_apply_profile itself may also retire in Phase 6 once profiles
-    // become walker_provider_* contribution overlays.
+    // walker-v3 W3a (Cluster 1): operator-visible tracing log now pulls
+    // the triple from the active walker_provider_openrouter contribution;
+    // falls back to the legacy LlmConfig fields when the contribution
+    // isn't present. W3c deletes the fallback arm once
+    // config.primary_model and friends are removed.
+    // TODO(walker-v3 Phase 6): pyramid_apply_profile itself may retire
+    // entirely if profile semantics fold into walker_slot_policy /
+    // walker_provider_* contribution overlays.
+    let (primary_syn, fb1_syn, fb2_syn) = {
+        let conn = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::walker_resolver::synthesize_legacy_model_triple_from_db(&conn)
+    };
+    let primary_log = primary_syn.unwrap_or(legacy_primary);
+    let fb1_log = fb1_syn.unwrap_or(legacy_fb1);
+    let fb2_log = fb2_syn.unwrap_or(legacy_fb2);
     tracing::info!(
         profile = %profile,
-        primary = %live.primary_model,
-        fallback_1 = %live.fallback_model_1,
-        fallback_2 = %live.fallback_model_2,
+        primary = %primary_log,
+        fallback_1 = %fb1_log,
+        fallback_2 = %fb2_log,
         "applied model profile",
     );
     Ok(())
@@ -6677,13 +6715,14 @@ async fn ensure_dadbear_running(
         let with_cache = state
             .pyramid
             .attach_cache_access(cfg.clone(), slug, &stale_build_id);
-        // TODO(walker-v3 W3 — Pattern 4): `ensure_dadbear_running` bootstraps
-        // the stale engine outside any chain step. When W3 deletes
-        // config.primary_model, a future phase must resolve the model via
-        // DispatchDecision::synthetic_for_preview or by threading a synthetic
-        // StepContext into PyramidStaleEngine::new (see also the sibling
-        // site in the other DADBEAR bootstrap ~line 3553).
-        let model = cfg.primary_model.clone();
+        // walker-v3 W3a (Pattern 4): resolve via walker_resolver reading
+        // the active walker_provider_openrouter contribution. Legacy
+        // fallback removed by W3c once config.primary_model dies.
+        let resolved = {
+            let conn = state.pyramid.reader.lock().await;
+            wire_node_lib::pyramid::walker_resolver::first_openrouter_model_from_db(&conn)
+        };
+        let model = resolved.unwrap_or_else(|| cfg.primary_model.clone());
         let defer = cfg.dispatch_policy
             .as_ref()
             .map(|p| p.build_coordination.defer_maintenance_during_build)
@@ -8265,11 +8304,14 @@ async fn pyramid_faq_directory(
         .pyramid
         .llm_config_with_cache(&slug, &format!("faq-dir-{}", slug))
         .await;
-    // TODO(walker-v3 W3 — Pattern 4): IPC `pyramid_faq_directory` has no
-    // step_ctx. When W3 deletes config.primary_model, resolve via
-    // DispatchDecision::synthetic_for_preview(Slot::mid, chain, cache) or
-    // a synthetic StepContext threaded into get_faq_directory.
-    let model = base_config.primary_model.clone();
+    // walker-v3 W3a (Pattern 4): resolve via walker_resolver reading
+    // the active walker_provider_openrouter contribution. Legacy
+    // fallback removed by W3c once config.primary_model dies.
+    let resolved = {
+        let conn = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::walker_resolver::first_openrouter_model_from_db(&conn)
+    };
+    let model = resolved.unwrap_or_else(|| base_config.primary_model.clone());
 
     let directory = pyramid_faq::get_faq_directory(
         &state.pyramid.reader,
