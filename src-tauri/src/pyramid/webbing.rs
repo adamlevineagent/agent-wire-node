@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use crate::pyramid::db;
 use crate::pyramid::llm;
 use crate::pyramid::llm::LlmConfig;
-use crate::pyramid::step_context::make_step_ctx_from_llm_config_with_model;
+use crate::pyramid::step_context::make_step_ctx_from_llm_config;
 use crate::pyramid::types::*;
 
 use super::Tier3Config;
@@ -264,17 +264,29 @@ Output JSON only:
         delta_contents = delta_contents,
     );
 
-    // W3c: legacy clone_with_model_override removed. Model threads via
-    // LlmCallOptions.model_override + explicit step_ctx model arg.
-    let cache_ctx = make_step_ctx_from_llm_config_with_model(
-        base_config,
-        "webbing_collapse_edge",
-        "webbing",
-        -1,
-        None,
-        system_prompt,
-        Some(model),
-    );
+    // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+    // slot="web" (existing bundled walker tier → xiaomi/mimo-v2.5-pro).
+    let web_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("web", None, None, None).ok());
+    let cache_ctx = match &web_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "webbing_collapse_edge",
+                "webbing",
+                -1,
+                None,
+                system_prompt,
+                "web",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
     let raw = llm::call_model_with_override_and_ctx(
         base_config,
         model,
