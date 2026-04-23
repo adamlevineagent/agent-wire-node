@@ -52,6 +52,13 @@ use rusqlite::Connection;
 ///                                                     //   Emitted instead of tracing::warn so
 ///                                                     //   operators see it in the chronicle
 ///                                                     //   (feedback_loud_deferrals).
+///                  | "judge_invoked"                  // v5 Phase 7d: starter-judge chain fired
+///                  | "authorize_question_invoked"    // v5 Phase 7d: starter-authorize-question fired
+///                  | "accretion_invoked"              // v5 Phase 7d: starter-accretion-handler fired
+///                  | "accretion_written"              // v5 Phase 7d: accretion note persisted
+///                  | "sweep_invoked"                  // v5 Phase 7d: starter-sweep chain fired
+///                  | "sweep_stale_failed_counted"    // v5 Phase 7d: sweep count-only step
+///                  | "sweep_vocab_reindexed"          // v5 Phase 7d: sweep vocab cache refresh
 ///                  | "vocabulary_published"          // v5 6c-A: vocab entry publish
 ///                  | "vocabulary_superseded"         // v5 6c-A: vocab entry supersede
 /// - `source_path`: filesystem path for the observation source (NULL for internal events)

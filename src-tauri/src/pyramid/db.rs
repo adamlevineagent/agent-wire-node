@@ -22378,6 +22378,141 @@ mod phase3_post_build_tests {
     }
 
     #[test]
+    fn map_event_to_primitive_covers_every_phase7_chain_emitted_event() {
+        // v5 Phase 7 wanderer regression test. Every event_type that a
+        // Phase 7 starter chain writes to dadbear_observation_events MUST
+        // have an explicit arm in map_event_to_primitive — otherwise the
+        // next compile tick hits the unknown-event loud-hold arm and
+        // stalls the cursor FOREVER for that slug.
+        //
+        // Pre-fix state: only `cascade_handler_invoked` and
+        // `debate_steward_invoked` had log_only arms; the 12 other
+        // chain-emitted observability events (oracle/synthesizer/gap/
+        // judge/authorize/accretion/sweep) were all missing, so the
+        // first chain execution permanently jammed compilation.
+        //
+        // Kept in lockstep with the `chain` source emissions in
+        // chain_dispatch.rs. If you add a new observability event
+        // emitted from a chain step, add its arm AND its case here.
+        let chain_emitted: &[(&str, &str, &str)] = &[
+            ("cascade_handler_invoked", "log_only", "cascade_invoked_log"),
+            ("debate_steward_invoked", "log_only", "debate_steward_invoked_log"),
+            ("meta_layer_oracle_invoked", "log_only", "oracle_invoked_log"),
+            ("meta_layer_oracle_skipped", "log_only", "oracle_skipped_log"),
+            ("synthesizer_invoked", "log_only", "synthesizer_invoked_log"),
+            ("gap_dispatcher_invoked", "log_only", "gap_dispatcher_invoked_log"),
+            ("gap_dispatcher_skipped", "log_only", "gap_dispatcher_skipped_log"),
+            ("judge_invoked", "log_only", "judge_invoked_log"),
+            ("authorize_question_invoked", "log_only", "authorize_invoked_log"),
+            ("accretion_invoked", "log_only", "accretion_invoked_log"),
+            ("accretion_written", "log_only", "accretion_written_log"),
+            ("sweep_invoked", "log_only", "sweep_invoked_log"),
+            ("sweep_stale_failed_counted", "log_only", "sweep_stale_counted_log"),
+            ("sweep_vocab_reindexed", "log_only", "sweep_vocab_reindexed_log"),
+        ];
+        for (event_type, exp_prim, exp_step) in chain_emitted {
+            let got = dadbear_compiler::map_event_to_primitive(event_type)
+                .unwrap_or_else(|| panic!(
+                    "Phase 7 chain-emitted event_type '{}' missing arm — \
+                     compile cursor will stall on first chain run",
+                    event_type,
+                ));
+            assert_eq!(got.0, *exp_prim, "primitive for '{}'", event_type);
+            assert_eq!(got.1, *exp_step, "step_name for '{}'", event_type);
+        }
+    }
+
+    #[test]
+    fn compile_tick_does_not_stall_on_chain_emitted_observability_events() {
+        // v5 Phase 7 wanderer end-to-end regression. Simulate the state
+        // dadbear_observation_events lands in after a Phase 7 chain
+        // executes — a mix of role_bound events (debate_spawned) and
+        // chain observability events (meta_layer_oracle_invoked,
+        // synthesizer_invoked, gap_dispatcher_invoked, judge_invoked,
+        // accretion_written) from the SAME slug. Run compile_observations
+        // and assert the cursor advances past all of them. Pre-fix, the
+        // compiler stalled at the first unknown event_type and never
+        // progressed.
+        let conn = mem_conn();
+        seed_slug(&conn, "p7wan");
+
+        let e1 = observation_events::write_observation_event(
+            &conn, "p7wan", "watcher", "file_created",
+            None, Some("/tmp/f"), None, None, None, None, None,
+        ).unwrap();
+        // chain observability events — the failure class we just fixed
+        let e2 = observation_events::write_observation_event(
+            &conn, "p7wan", "chain", "meta_layer_oracle_invoked",
+            None, None, None, None, Some("L2-foo"), None, Some(r#"{}"#),
+        ).unwrap();
+        let e3 = observation_events::write_observation_event(
+            &conn, "p7wan", "chain", "synthesizer_invoked",
+            None, None, None, None, None, None, Some(r#"{}"#),
+        ).unwrap();
+        let e4 = observation_events::write_observation_event(
+            &conn, "p7wan", "chain", "gap_dispatcher_invoked",
+            None, None, None, None, Some("L1-bar"), None, Some(r#"{}"#),
+        ).unwrap();
+        let e5 = observation_events::write_observation_event(
+            &conn, "p7wan", "chain", "judge_invoked",
+            None, None, None, None, None, None, Some(r#"{}"#),
+        ).unwrap();
+        let e6 = observation_events::write_observation_event(
+            &conn, "p7wan", "chain", "accretion_written",
+            None, None, None, None, None, None, Some(r#"{}"#),
+        ).unwrap();
+        let e7 = observation_events::write_observation_event(
+            &conn, "p7wan", "chain", "sweep_stale_failed_counted",
+            None, None, None, None, None, None, Some(r#"{}"#),
+        ).unwrap();
+        let e8 = observation_events::write_observation_event(
+            &conn, "p7wan", "chain", "sweep_vocab_reindexed",
+            None, None, None, None, None, None, Some(r#"{}"#),
+        ).unwrap();
+        let e9 = observation_events::write_observation_event(
+            &conn, "p7wan", "chain", "meta_layer_oracle_skipped",
+            None, None, None, None, Some("L2-baz"), None, Some(r#"{}"#),
+        ).unwrap();
+        let e10 = observation_events::write_observation_event(
+            &conn, "p7wan", "chain", "gap_dispatcher_skipped",
+            None, None, None, None, Some("L1-qux"), None, Some(r#"{}"#),
+        ).unwrap();
+        let e11 = observation_events::write_observation_event(
+            &conn, "p7wan", "chain", "authorize_question_invoked",
+            None, None, None, None, None, None, Some(r#"{}"#),
+        ).unwrap();
+        let e12 = observation_events::write_observation_event(
+            &conn, "p7wan", "chain", "accretion_invoked",
+            None, None, None, None, None, None, Some(r#"{}"#),
+        ).unwrap();
+        let e13 = observation_events::write_observation_event(
+            &conn, "p7wan", "chain", "sweep_invoked",
+            None, None, None, None, None, None, Some(r#"{}"#),
+        ).unwrap();
+
+        let result = dadbear_compiler::run_compilation_for_slug(
+            &conn, "p7wan", None, None,
+        )
+        .unwrap();
+        assert_eq!(
+            result.new_cursor, e13,
+            "cursor must advance past every chain-emitted observability event \
+             (e1..e13 = {}..{}) — pre-fix the cursor stalled at e1={}",
+            e1, e13, e1,
+        );
+        // All 13 events handled, none dropped. The log_only arms don't
+        // create work_items but they DO count as `items_compiled` in
+        // the compiler's return. We just assert no events held for retry.
+        assert_eq!(
+            result.new_cursor - e1 + 1, 13,
+            "13 total events should have been seen (e1={} through e13={})",
+            e1, e13,
+        );
+        // Sanity: referenced handles used
+        let _ = (e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12);
+    }
+
+    #[test]
     fn map_event_to_primitive_pre_phase3_types_still_map() {
         // Regression guard: Phase 3 edits in map_event_to_primitive must
         // not regress the pre-Phase-3 vocabulary. Spot-check the big ones.

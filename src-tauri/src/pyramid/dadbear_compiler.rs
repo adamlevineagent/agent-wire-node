@@ -167,6 +167,51 @@ pub(crate) fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, 
         "debate_steward_invoked" => {
             Some(("log_only", "debate_steward_invoked_log", "stale_remote"))
         }
+        // v5 Phase 7 wanderer fix: every Phase 7 starter chain emits a
+        // `*_invoked` / `*_skipped` / `*_written` observation event for
+        // chronicle visibility. Those events land in dadbear_observation_events
+        // and are read back by the next compile tick. Without an explicit
+        // mapping, the compiler's unknown-event loud-hold arm (feedback_loud_deferrals)
+        // pins the cursor FOREVER on the first chain execution — stalling
+        // all subsequent compilation for that slug. All of these are pure
+        // observability and carry no downstream primitive; log_only keeps
+        // the chronicle row without spawning a work item.
+        "meta_layer_oracle_invoked" => {
+            Some(("log_only", "oracle_invoked_log", "stale_remote"))
+        }
+        "meta_layer_oracle_skipped" => {
+            Some(("log_only", "oracle_skipped_log", "stale_remote"))
+        }
+        "synthesizer_invoked" => {
+            Some(("log_only", "synthesizer_invoked_log", "stale_remote"))
+        }
+        "gap_dispatcher_invoked" => {
+            Some(("log_only", "gap_dispatcher_invoked_log", "stale_remote"))
+        }
+        "gap_dispatcher_skipped" => {
+            Some(("log_only", "gap_dispatcher_skipped_log", "stale_remote"))
+        }
+        "judge_invoked" => {
+            Some(("log_only", "judge_invoked_log", "stale_remote"))
+        }
+        "authorize_question_invoked" => {
+            Some(("log_only", "authorize_invoked_log", "stale_remote"))
+        }
+        "accretion_invoked" => {
+            Some(("log_only", "accretion_invoked_log", "stale_remote"))
+        }
+        "accretion_written" => {
+            Some(("log_only", "accretion_written_log", "stale_remote"))
+        }
+        "sweep_invoked" => {
+            Some(("log_only", "sweep_invoked_log", "stale_remote"))
+        }
+        "sweep_stale_failed_counted" => {
+            Some(("log_only", "sweep_stale_counted_log", "stale_remote"))
+        }
+        "sweep_vocab_reindexed" => {
+            Some(("log_only", "sweep_vocab_reindexed_log", "stale_remote"))
+        }
         unknown => {
             // Per v5 R5 loud-raise discipline: opt-in strict mode for
             // production. Default warn-and-skip preserves backward compat
