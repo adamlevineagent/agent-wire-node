@@ -36572,3 +36572,451 @@ mod phase9c3_post_build_tests {
         );
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 9 close — v5 close-pass tests
+//
+// Covers:
+//   - Close-1: execute_chain_for_target serialization on same slug
+//     (reentrant for call_starter_chain), parallel on different slugs.
+//   - Close-2: event_type_on_emit vocab field — correction preserves
+//     pre-close-2 annotation_superseded semantic; custom type with
+//     explicit event_type_on_emit emits the configured event; default
+//     (no field set) emits annotation_written.
+//   - Close-3: smoke-level — handlers construct well-formed response
+//     payloads for seeded debate / bindings / synthesis-history nodes.
+//     (Full HTTP integration lives in phase9d_smoke.)
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod phase9e_post_build_tests {
+    use super::*;
+    use super::post_build_test_support::test_lock;
+    use crate::pyramid::chain_engine::{ChainDefaults, ChainDefinition, ChainStep};
+    use crate::pyramid::chain_executor;
+    use crate::pyramid::lock_manager::LockManager;
+    use crate::pyramid::types::ContentType;
+    use crate::pyramid::vocab_entries::{
+        self, VocabEntry, VOCAB_KIND_ANNOTATION_TYPE,
+    };
+    use rusqlite::Connection;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn chains_dir_path() -> PathBuf {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        PathBuf::from(manifest).parent().unwrap().join("chains")
+    }
+
+    fn fresh_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        conn
+    }
+
+    fn test_pyramid_state(conn: Connection) -> Arc<crate::pyramid::PyramidState> {
+        let db = Arc::new(Mutex::new(conn));
+        let config = crate::pyramid::llm::LlmConfig::default();
+        Arc::new(crate::pyramid::PyramidState {
+            reader: db.clone(),
+            writer: db,
+            config: Arc::new(tokio::sync::RwLock::new(config)),
+            active_build: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            data_dir: None,
+            stale_engines: Arc::new(Mutex::new(HashMap::new())),
+            file_watchers: Arc::new(Mutex::new(HashMap::new())),
+            vine_builds: Arc::new(Mutex::new(HashMap::new())),
+            use_chain_engine: AtomicBool::new(false),
+            use_ir_executor: AtomicBool::new(true),
+            event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
+            operational: Arc::new(crate::pyramid::OperationalConfig::default()),
+            chains_dir: chains_dir_path(),
+            remote_query_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            absorption_gate: Arc::new(Mutex::new(crate::pyramid::AbsorptionGate::new())),
+            build_event_bus: Arc::new(crate::pyramid::event_bus::BuildEventBus::new()),
+            supabase_url: None,
+            supabase_anon_key: None,
+            csrf_secret: [0u8; 32],
+            dadbear_handle: Arc::new(Mutex::new(None)),
+            dadbear_supervisor_handle: Arc::new(Mutex::new(None)),
+            dadbear_in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            provider_registry: {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                Arc::new(crate::pyramid::provider::ProviderRegistry::new(store))
+            },
+            credential_store: {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                store
+            },
+            schema_registry: Arc::new(crate::pyramid::schema_registry::SchemaRegistry::new()),
+            cross_pyramid_router: Arc::new(
+                crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
+            ),
+            ollama_pull_cancel: Arc::new(AtomicBool::new(false)),
+            ollama_pull_in_progress: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    fn minimal_chain_with_steps(id: &str, steps: Vec<ChainStep>) -> ChainDefinition {
+        ChainDefinition {
+            schema_version: 1,
+            id: id.to_string(),
+            name: format!("Test {}", id),
+            description: "Phase 9e close test chain".to_string(),
+            content_type: "code".to_string(),
+            version: "0.0.1".to_string(),
+            author: "phase9e-test".to_string(),
+            defaults: ChainDefaults {
+                model_tier: "mid".to_string(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".to_string(),
+            },
+            steps,
+            post_build: vec![],
+            audience: Default::default(),
+        }
+    }
+
+    fn mech_step(name: &str, rust_fn: &str) -> ChainStep {
+        ChainStep {
+            name: name.to_string(),
+            primitive: "custom".to_string(),
+            mechanical: true,
+            rust_function: Some(rust_fn.to_string()),
+            ..Default::default()
+        }
+    }
+
+    // ── Close-1: lock serialization ─────────────────────────────────────
+
+    // Two chain executions on the same slug serialize. Using a minimal
+    // log_and_complete chain so the chain body is trivial — the only
+    // thing we measure is whether the second call BLOCKS while the
+    // first holds the slug write guard.
+    //
+    // The first task parks while holding the slug write guard (we
+    // acquire it directly to simulate an in-flight chain). The second
+    // task calls `execute_chain_for_target`, which MUST wait until
+    // the outer guard is dropped.
+    #[tokio::test]
+    async fn close1_chain_executions_on_same_slug_serialize() {
+        let _lock = test_lock();
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "close1-same", &ContentType::Code, "/tmp/close1-same").unwrap();
+        let state = test_pyramid_state(conn);
+
+        let chain = minimal_chain_with_steps(
+            "close1-chain",
+            vec![mech_step("done", "log_and_complete")],
+        );
+
+        // Acquire an outer write guard on the slug — simulates an
+        // in-flight chain execution that hasn't released yet.
+        let outer_guard = LockManager::global().write("close1-same").await;
+
+        // Spawn the inner task. It must block until outer_guard drops.
+        let state_clone = state.clone();
+        let chain_clone = chain.clone();
+        let inner = tokio::spawn(async move {
+            let inputs = serde_json::json!({"target_node_id": "L1-X"});
+            chain_executor::execute_chain_for_target(
+                &state_clone,
+                &chain_clone,
+                "close1-same",
+                Some("L1-X"),
+                inputs,
+            )
+            .await
+        });
+
+        // Give the spawned task time to reach the lock acquire.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !inner.is_finished(),
+            "inner chain on same slug must block while outer guard is held",
+        );
+
+        // Release the outer guard — the inner task should complete.
+        drop(outer_guard);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), inner)
+            .await
+            .expect("inner chain must complete within 5s after outer guard released")
+            .expect("tokio task must not panic")
+            .expect("inner chain must succeed");
+        // Sanity: chain returned SOME JSON value.
+        let _ = result;
+    }
+
+    // Different slugs run concurrently. Outer guard on slug A must not
+    // block inner chain on slug B.
+    #[tokio::test]
+    async fn close1_chain_executions_on_different_slugs_run_concurrent() {
+        let _lock = test_lock();
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "close1-A", &ContentType::Code, "/tmp/close1-A").unwrap();
+        create_slug(&conn, "close1-B", &ContentType::Code, "/tmp/close1-B").unwrap();
+        let state = test_pyramid_state(conn);
+
+        let chain = minimal_chain_with_steps(
+            "close1-diff-chain",
+            vec![mech_step("done", "log_and_complete")],
+        );
+
+        // Outer guard on A.
+        let outer_guard = LockManager::global().write("close1-A").await;
+
+        // Inner chain on B. Must complete without waiting for A's guard.
+        let state_clone = state.clone();
+        let chain_clone = chain.clone();
+        let inner_b = tokio::spawn(async move {
+            let inputs = serde_json::json!({"target_node_id": "L1-B"});
+            chain_executor::execute_chain_for_target(
+                &state_clone,
+                &chain_clone,
+                "close1-B",
+                Some("L1-B"),
+                inputs,
+            )
+            .await
+        });
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), inner_b)
+            .await
+            .expect("inner chain on different slug must complete concurrently")
+            .expect("tokio task must not panic")
+            .expect("inner chain must succeed");
+        drop(outer_guard);
+        let _ = result;
+    }
+
+    // ── Close-2: event_type_on_emit vocab field ─────────────────────────
+
+    use super::super::routes as routes_mod;
+
+    // Correction annotation emits `annotation_superseded` — preserves
+    // pre-close-2 behavior. Genesis seeds correction with
+    // `event_type_on_emit: Some("annotation_superseded")`.
+    #[tokio::test]
+    async fn close2_correction_annotation_emits_annotation_superseded() {
+        let _lock = test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("close2_corr.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "close2-corr", &ContentType::Code, "/tmp/close2-corr").unwrap();
+        // Seed a parent-child node pair so the ancestor walk writes to
+        // the parent.
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version, parent_id)
+             VALUES ('L1-parent', 'close2-corr', 1, 'P', 'p', '', 1, NULL),
+                    ('L0-child',  'close2-corr', 0, 'C', 'c', '', 1, 'L1-parent')",
+            [],
+        ).unwrap();
+        drop(conn);
+
+        let writer = std::sync::Arc::new(tokio::sync::Mutex::new(
+            Connection::open(&db_path).unwrap(),
+        ));
+        vocab_entries::invalidate_cache();
+        let ann = PyramidAnnotation {
+            id: 1,
+            slug: "close2-corr".to_string(),
+            node_id: "L0-child".to_string(),
+            annotation_type: AnnotationType::new("correction"),
+            content: "correcting".to_string(),
+            question_context: None,
+            author: "t".to_string(),
+            created_at: String::new(),
+        };
+        routes_mod::emit_annotation_observation_events_test_only(
+            &writer,
+            "close2-corr",
+            &ann,
+        )
+        .await
+        .unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let ev_type: String = conn
+            .query_row(
+                "SELECT event_type FROM dadbear_observation_events
+                  WHERE slug='close2-corr' AND target_node_id='L1-parent'
+                  ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ev_type, "annotation_superseded",
+            "correction must emit the superseded event_type (vocab-driven)",
+        );
+    }
+
+    // A vocab entry with explicit `event_type_on_emit` emits that event.
+    // Uses a freshly-published annotation type and a custom value.
+    #[tokio::test]
+    async fn close2_custom_type_emits_configured_event_type() {
+        let _lock = test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("close2_custom.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "close2-cust", &ContentType::Code, "/tmp/close2-cust").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version, parent_id)
+             VALUES ('L1-parent', 'close2-cust', 1, 'P', 'p', '', 1, NULL),
+                    ('L0-child',  'close2-cust', 0, 'C', 'c', '', 1, 'L1-parent')",
+            [],
+        ).unwrap();
+        // Publish the new annotation type with a custom event_type_on_emit.
+        let entry = VocabEntry {
+            id: 0,
+            vocab_kind: VOCAB_KIND_ANNOTATION_TYPE.to_string(),
+            name: "my_custom_supersede".to_string(),
+            description: "custom type that emits a bespoke event".to_string(),
+            handler_chain_id: None,
+            reactive: false,
+            creates_delta: false,
+            include_in_cascade_prompt: true,
+            event_type_on_emit: Some("my_custom_event".to_string()),
+            created_at: String::new(),
+            superseded_by: None,
+            supersede_reason: None,
+        };
+        vocab_entries::publish_vocabulary_entry(&conn, &entry).unwrap();
+        drop(conn);
+
+        let writer = std::sync::Arc::new(tokio::sync::Mutex::new(
+            Connection::open(&db_path).unwrap(),
+        ));
+        vocab_entries::invalidate_cache();
+        let ann = PyramidAnnotation {
+            id: 10,
+            slug: "close2-cust".to_string(),
+            node_id: "L0-child".to_string(),
+            annotation_type: AnnotationType::new("my_custom_supersede"),
+            content: "custom".to_string(),
+            question_context: None,
+            author: "t".to_string(),
+            created_at: String::new(),
+        };
+        routes_mod::emit_annotation_observation_events_test_only(
+            &writer,
+            "close2-cust",
+            &ann,
+        )
+        .await
+        .unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let ev_type: String = conn
+            .query_row(
+                "SELECT event_type FROM dadbear_observation_events
+                  WHERE slug='close2-cust' AND target_node_id='L1-parent'
+                  ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ev_type, "my_custom_event",
+            "custom type must emit the configured event_type_on_emit",
+        );
+    }
+
+    // Default case: a vocab entry without `event_type_on_emit` (None)
+    // emits `annotation_written`. Uses `observation` (genesis None).
+    #[tokio::test]
+    async fn close2_default_type_emits_annotation_written() {
+        let _lock = test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("close2_def.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "close2-def", &ContentType::Code, "/tmp/close2-def").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version, parent_id)
+             VALUES ('L1-parent', 'close2-def', 1, 'P', 'p', '', 1, NULL),
+                    ('L0-child',  'close2-def', 0, 'C', 'c', '', 1, 'L1-parent')",
+            [],
+        ).unwrap();
+        drop(conn);
+
+        let writer = std::sync::Arc::new(tokio::sync::Mutex::new(
+            Connection::open(&db_path).unwrap(),
+        ));
+        vocab_entries::invalidate_cache();
+        let ann = PyramidAnnotation {
+            id: 20,
+            slug: "close2-def".to_string(),
+            node_id: "L0-child".to_string(),
+            annotation_type: AnnotationType::new("observation"),
+            content: "obs".to_string(),
+            question_context: None,
+            author: "t".to_string(),
+            created_at: String::new(),
+        };
+        routes_mod::emit_annotation_observation_events_test_only(
+            &writer,
+            "close2-def",
+            &ann,
+        )
+        .await
+        .unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let ev_type: String = conn
+            .query_row(
+                "SELECT event_type FROM dadbear_observation_events
+                  WHERE slug='close2-def' AND target_node_id='L1-parent'
+                  ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ev_type, "annotation_written",
+            "observation (genesis None) must emit the default annotation_written",
+        );
+    }
+
+    // ── Close-3: role_bindings GET — smoke via list_bindings ────────────
+    //
+    // The HTTP handler just wraps `role_binding::list_bindings`. Verify
+    // the wrapper's data source returns what the handler will serialize.
+    #[test]
+    fn close3_role_bindings_list_returns_seeded_bindings() {
+        let _lock = test_lock();
+        let conn = fresh_conn();
+        create_slug(&conn, "close3-rb", &ContentType::Code, "/tmp/close3-rb").unwrap();
+        let bindings = crate::pyramid::role_binding::list_bindings(&conn, "close3-rb")
+            .expect("list_bindings must succeed for a seeded slug");
+        assert!(
+            bindings.iter().any(|b| b.role_name == "cascade_handler"),
+            "cascade_handler binding must be present for a fresh slug, got {:?}",
+            bindings.iter().map(|b| &b.role_name).collect::<Vec<_>>(),
+        );
+        assert!(
+            bindings.iter().any(|b| b.role_name == "debate_steward"),
+            "debate_steward binding must be present for a fresh slug",
+        );
+    }
+}

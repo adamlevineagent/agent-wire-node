@@ -2904,10 +2904,60 @@ pub fn pyramid_routes(
 
     let top37 = top36.or(reopen_debate).unify().boxed();
 
+    // ── Post-build accretion v5 Phase 9 close-3: introspection GETs ──
+    //
+    // Three read-only operator endpoints that surface v5 state without
+    // requiring `sqlite3 pyramid.db` queries. Auth-gated (same
+    // `with_auth_state` as the existing annotation reads — these expose
+    // pyramid interiors so local-auth is the consistent floor).
+    //
+    //   GET /pyramid/:slug/debates/:node_id
+    //       — current debate state: shape, payload, recent observation
+    //         events, is_collapsed, cooldown_until
+    //   GET /pyramid/:slug/role_bindings
+    //       — active role bindings for the slug
+    //   GET /pyramid/:slug/synthesis_history/:node_id
+    //       — meta-layer node re-distill history from
+    //         dadbear_result_applications + recent cascade annotations
+    //
+    // 404 on missing slug / node, 400 on malformed params, 500 on DB.
+    // Per `feedback_loud_deferrals`: the debate handler 404s when the
+    // node is not a debate shape (vs returning a null payload) because
+    // "no debate here" is the actionable signal.
+    let debate_state_get = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("debates"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_get_debate_state));
+
+    let role_bindings_get = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("role_bindings"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_get_role_bindings));
+
+    let synthesis_history_get = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("synthesis_history"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_get_synthesis_history));
+
+    let intro_a = debate_state_get.or(role_bindings_get).unify().boxed();
+    let intro = intro_a.or(synthesis_history_get).unify().boxed();
+    let top38 = top37.or(intro).unify().boxed();
+
     // public_html is now mounted separately at the server level so it can
     // get a permissive CORS filter (the desktop API allowlist would block
     // form POSTs from the tunnel host).
-    top37
+    top38
 }
 
 /// GET /vocabulary/:vocab_kind — public read of the vocabulary
@@ -3584,6 +3634,480 @@ async fn handle_reopen_debate(
         warp::reply::with_status(warp::reply::json(&payload), warp::http::StatusCode::OK)
             .into_response(),
     )
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Post-build accretion v5 Phase 9 close-3: introspection GET handlers
+// ════════════════════════════════════════════════════════════════════
+//
+// Three read-only endpoints for operator introspection without
+// sqlite3 queries. All local-auth, 404 on missing slug/node, 500 on
+// DB error.
+//
+// - handle_get_debate_state
+// - handle_get_role_bindings
+// - handle_get_synthesis_history
+
+/// GET /pyramid/:slug/debates/:node_id
+///
+/// Returns current Debate state plus recent observation events.
+/// Shape:
+///   {
+///     "node_id": "L1-007",
+///     "slug": "my-slug",
+///     "node_shape": "debate" | "scaffolding" | "meta_layer" | "gap",
+///     "payload": { /* DebateTopic JSON */ } | null,
+///     "recent_events": [{event_type, detected_at, metadata}, ...],
+///     "is_collapsed": bool,
+///     "cooldown_until": "2026-04-23T..." | null
+///   }
+///
+/// `is_collapsed` is true iff the most recent `debate_collapsed` event
+/// postdates the most recent `debate_reopened` (Phase 9c-3-3 semantics).
+/// `cooldown_until` is set iff collapsed AND `collapse_cooldown_secs`
+/// > 0 AND the cooldown has not expired.
+async fn handle_get_debate_state(
+    slug_name: String,
+    node_id: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+
+    // Validate slug.
+    match slug::get_slug(&conn, &slug_name) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                &format!("slug '{slug_name}' not found"),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ));
+        }
+    }
+
+    // Validate node + pull node_shape + shape_payload_json.
+    let (node_shape_str, shape_payload_json): (String, Option<serde_json::Value>) = match db::get_node_shape(&conn, &slug_name, &node_id) {
+        Ok(Some(view)) => {
+            let shape_str = view.shape.as_str().to_string();
+            let payload = view.payload.as_ref().map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null));
+            (shape_str, payload)
+        }
+        Ok(None) => {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                &format!("node '{node_id}' not found in slug '{slug_name}'"),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to read node shape: {e}"),
+            ));
+        }
+    };
+
+    // Pull the 10 most-recent relevant observation events for this
+    // node (debate_spawned / debate_collapsed / debate_reopened /
+    // annotation_written / annotation_superseded / annotation_reacted).
+    // Loud-raise on DB error — this is not a shortcut we silently skip.
+    let recent_events: Vec<serde_json::Value> = {
+        let mut stmt = match conn.prepare(
+            "SELECT event_type, detected_at, COALESCE(metadata_json, '{}')
+               FROM dadbear_observation_events
+              WHERE slug = ?1
+                AND target_node_id = ?2
+                AND event_type IN (
+                    'debate_spawned', 'debate_collapsed', 'debate_reopened',
+                    'annotation_written', 'annotation_superseded', 'annotation_reacted'
+                )
+              ORDER BY id DESC
+              LIMIT 10",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to prepare observation query: {e}"),
+                ));
+            }
+        };
+        let rows = match stmt.query_map(
+            rusqlite::params![slug_name, node_id],
+            |r| {
+                let event_type: String = r.get(0)?;
+                let detected_at: String = r.get(1)?;
+                let metadata_raw: String = r.get(2)?;
+                Ok((event_type, detected_at, metadata_raw))
+            },
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to query observation events: {e}"),
+                ));
+            }
+        };
+        let mut out = Vec::new();
+        for row in rows {
+            match row {
+                Ok((etype, detected, meta_raw)) => {
+                    let meta: serde_json::Value = serde_json::from_str(&meta_raw)
+                        .unwrap_or(serde_json::Value::Object(Default::default()));
+                    out.push(serde_json::json!({
+                        "event_type": etype,
+                        "detected_at": detected,
+                        "metadata": meta,
+                    }));
+                }
+                Err(e) => {
+                    return Ok(json_error(
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("failed to read observation row: {e}"),
+                    ));
+                }
+            }
+        }
+        out
+    };
+
+    // Determine is_collapsed: most recent debate_collapsed id > most
+    // recent debate_reopened id (Phase 9c-3-3 semantics). Also pull
+    // the latest collapse detected_at for cooldown_until computation.
+    let latest_collapse: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, detected_at
+               FROM dadbear_observation_events
+              WHERE slug = ?1
+                AND event_type = 'debate_collapsed'
+                AND target_node_id = ?2
+              ORDER BY id DESC
+              LIMIT 1",
+            rusqlite::params![slug_name, node_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )
+        .ok();
+    let latest_reopen: Option<i64> = conn
+        .query_row(
+            "SELECT id
+               FROM dadbear_observation_events
+              WHERE slug = ?1
+                AND event_type = 'debate_reopened'
+                AND target_node_id = ?2
+              ORDER BY id DESC
+              LIMIT 1",
+            rusqlite::params![slug_name, node_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok();
+    let is_collapsed = match (&latest_collapse, latest_reopen) {
+        (Some((collapse_id, _)), Some(reopen_id)) => *collapse_id > reopen_id,
+        (Some(_), None) => true,
+        _ => false,
+    };
+
+    // cooldown_until: if collapsed AND collapse_cooldown_secs > 0 AND
+    // the cooldown has not yet elapsed, compute the end timestamp.
+    // Format: SQLite datetime string (matches detected_at).
+    let cooldown_until: Option<String> = if is_collapsed {
+        let cooldown_secs = super::pyramid_scheduler::load_config(&conn).collapse_cooldown_secs;
+        if cooldown_secs > 0 {
+            if let Some((_, detected_at)) = &latest_collapse {
+                // Compute detected_at + cooldown_secs vs now; return Some
+                // only if still in cooldown. SQLite strftime handles the
+                // arithmetic.
+                let end_time: Option<String> = conn
+                    .query_row(
+                        "SELECT CASE
+                            WHEN strftime('%s','now') < strftime('%s', ?1) + ?2
+                            THEN datetime(?1, '+' || ?2 || ' seconds')
+                            ELSE NULL
+                         END",
+                        rusqlite::params![detected_at, cooldown_secs],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .ok()
+                    .flatten();
+                end_time
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let response = serde_json::json!({
+        "slug": slug_name,
+        "node_id": node_id,
+        "node_shape": node_shape_str,
+        "payload": shape_payload_json,
+        "recent_events": recent_events,
+        "is_collapsed": is_collapsed,
+        "cooldown_until": cooldown_until,
+    });
+    Ok(json_ok(&response))
+}
+
+/// GET /pyramid/:slug/role_bindings
+///
+/// Returns all active role bindings for the slug as:
+///   {
+///     "slug": "my-slug",
+///     "bindings": [
+///       {"role_name": "cascade_handler",
+///        "chain_id": "starter-cascade-judge-gated",
+///        "created_at": "..."},
+///       ...
+///     ]
+///   }
+async fn handle_get_role_bindings(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match slug::get_slug(&conn, &slug_name) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                &format!("slug '{slug_name}' not found"),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ));
+        }
+    }
+
+    match super::role_binding::list_bindings(&conn, &slug_name) {
+        Ok(bindings) => {
+            let items: Vec<serde_json::Value> = bindings
+                .into_iter()
+                .map(|b| serde_json::json!({
+                    "role_name": b.role_name,
+                    "chain_id": b.handler_chain_id,
+                    "created_at": b.created_at,
+                }))
+                .collect();
+            let response = serde_json::json!({
+                "slug": slug_name,
+                "bindings": items,
+            });
+            Ok(json_ok(&response))
+        }
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to list role bindings: {e}"),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/synthesis_history/:node_id
+///
+/// Returns the re-distill history for a node (including meta-layer
+/// nodes) from `dadbear_result_applications` plus the most-recent
+/// cascade-annotation events reaching this node.
+///
+/// Shape:
+///   {
+///     "slug": "my-slug",
+///     "node_id": "L2-META-abc",
+///     "node_shape": "meta_layer" | "scaffolding" | ...,
+///     "payload": { ... } | null,
+///     "re_distill_history": [
+///       {"applied_at": "...", "work_item_id": "...",
+///        "action": "redistilled", "new_contribution_id": "..."},
+///       ...
+///     ],
+///     "cascade_annotations_last_loaded": [
+///       {"event_type": "annotation_written", "detected_at": "...",
+///        "metadata": {...}},
+///       ...
+///     ]
+///   }
+async fn handle_get_synthesis_history(
+    slug_name: String,
+    node_id: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+
+    match slug::get_slug(&conn, &slug_name) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                &format!("slug '{slug_name}' not found"),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ));
+        }
+    }
+
+    let (node_shape_str, shape_payload_json): (String, Option<serde_json::Value>) = match db::get_node_shape(&conn, &slug_name, &node_id) {
+        Ok(Some(view)) => {
+            let s = view.shape.as_str().to_string();
+            let p = view.payload.as_ref().map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null));
+            (s, p)
+        }
+        Ok(None) => {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                &format!("node '{node_id}' not found in slug '{slug_name}'"),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to read node shape: {e}"),
+            ));
+        }
+    };
+
+    // Pull re-distill history from dadbear_result_applications.
+    // Ordered oldest → newest so readers see the timeline naturally.
+    let re_distill_history: Vec<serde_json::Value> = {
+        let mut stmt = match conn.prepare(
+            "SELECT work_item_id, action, old_contribution_id,
+                    new_contribution_id, applied_at
+               FROM dadbear_result_applications
+              WHERE slug = ?1 AND target_id = ?2
+              ORDER BY id ASC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to prepare history query: {e}"),
+                ));
+            }
+        };
+        let rows = match stmt.query_map(
+            rusqlite::params![slug_name, node_id],
+            |r| {
+                let work_item_id: String = r.get(0)?;
+                let action: String = r.get(1)?;
+                let old_id: Option<String> = r.get(2)?;
+                let new_id: Option<String> = r.get(3)?;
+                let applied_at: String = r.get(4)?;
+                Ok((work_item_id, action, old_id, new_id, applied_at))
+            },
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to query history: {e}"),
+                ));
+            }
+        };
+        let mut out = Vec::new();
+        for row in rows {
+            match row {
+                Ok((wi_id, act, old, new, applied)) => out.push(serde_json::json!({
+                    "work_item_id": wi_id,
+                    "action": act,
+                    "old_contribution_id": old,
+                    "new_contribution_id": new,
+                    "applied_at": applied,
+                })),
+                Err(e) => {
+                    return Ok(json_error(
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("failed to read history row: {e}"),
+                    ));
+                }
+            }
+        }
+        out
+    };
+
+    // Pull the most-recent 20 annotation-cascade events reaching this
+    // node (written / superseded / reacted). Useful for operators
+    // tracing "why did this synthesis run?"
+    let cascade_annotations_last_loaded: Vec<serde_json::Value> = {
+        let mut stmt = match conn.prepare(
+            "SELECT event_type, detected_at, COALESCE(metadata_json, '{}')
+               FROM dadbear_observation_events
+              WHERE slug = ?1
+                AND target_node_id = ?2
+                AND event_type IN (
+                    'annotation_written', 'annotation_superseded', 'annotation_reacted'
+                )
+              ORDER BY id DESC
+              LIMIT 20",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to prepare cascade-events query: {e}"),
+                ));
+            }
+        };
+        let rows = match stmt.query_map(
+            rusqlite::params![slug_name, node_id],
+            |r| {
+                let etype: String = r.get(0)?;
+                let detected: String = r.get(1)?;
+                let meta: String = r.get(2)?;
+                Ok((etype, detected, meta))
+            },
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to query cascade events: {e}"),
+                ));
+            }
+        };
+        let mut out = Vec::new();
+        for row in rows {
+            match row {
+                Ok((etype, detected, meta_raw)) => {
+                    let meta: serde_json::Value = serde_json::from_str(&meta_raw)
+                        .unwrap_or(serde_json::Value::Object(Default::default()));
+                    out.push(serde_json::json!({
+                        "event_type": etype,
+                        "detected_at": detected,
+                        "metadata": meta,
+                    }));
+                }
+                Err(e) => {
+                    return Ok(json_error(
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("failed to read cascade event row: {e}"),
+                    ));
+                }
+            }
+        }
+        out
+    };
+
+    let response = serde_json::json!({
+        "slug": slug_name,
+        "node_id": node_id,
+        "node_shape": node_shape_str,
+        "payload": shape_payload_json,
+        "re_distill_history": re_distill_history,
+        "cascade_annotations_last_loaded": cascade_annotations_last_loaded,
+    });
+    Ok(json_ok(&response))
 }
 
 // ── Route handlers ──────────────────────────────────────────────────

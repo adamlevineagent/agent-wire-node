@@ -40,6 +40,69 @@ use super::PyramidState;
 const CODE_THREAD_SPLIT_PROMPT: &str =
     include_str!("../../../chains/prompts/code/code_thread_split.md");
 
+// ── Phase 9 close-1: per-task "I hold this chain-slug guard" tracking ─────
+//
+// `execute_chain_for_target` acquires `LockManager::global().write(slug)`
+// at entry to cover chain-side mechanical writes transitively. Because
+// `call_starter_chain` recurses back into `execute_chain_for_target`
+// with the same slug to invoke library chains, a naive acquire would
+// deadlock the non-reentrant `tokio::sync::RwLock`.
+//
+// The tokio task-local set below tracks slugs this specific tokio task
+// is currently holding a chain-level guard for. On recursive entry
+// with the same slug IN THE SAME TASK, we observe the held set and
+// skip the acquire (the outer frame's guard still covers us).
+// Concurrent peer tasks on the same slug see an EMPTY task-local (the
+// scope is per-task and doesn't leak to siblings), miss the shortcut,
+// and serialize at the real lock as intended.
+//
+// `LockManager::is_write_locked` is process-wide and would falsely
+// short-circuit peer tasks. A `thread_local!` would leak between
+// concurrent tasks on the same worker thread. `tokio::task_local!` is
+// the right unit of isolation — it's scoped to the future that
+// called `SCOPE.scope(...)`, so the set is visible exactly to that
+// future tree and nowhere else.
+tokio::task_local! {
+    static SELF_CHAIN_SLUGS: std::cell::RefCell<std::collections::HashSet<String>>;
+}
+
+fn self_chain_slug_held(slug: &str) -> bool {
+    SELF_CHAIN_SLUGS
+        .try_with(|set| set.borrow().contains(slug))
+        .unwrap_or(false)
+}
+
+fn self_chain_push(slug: &str) {
+    let _ = SELF_CHAIN_SLUGS.try_with(|set| {
+        set.borrow_mut().insert(slug.to_string());
+    });
+}
+
+fn self_chain_pop(slug: &str) {
+    let _ = SELF_CHAIN_SLUGS.try_with(|set| {
+        set.borrow_mut().remove(slug);
+    });
+}
+
+/// RAII marker: adds `slug` to the task-local held set and removes
+/// it on drop. `call_starter_chain`'s recursion observes the marker's
+/// presence via `self_chain_slug_held` and skips the non-reentrant
+/// `LockManager::write` acquire.
+struct SelfChainSlugMarker {
+    slug: String,
+}
+impl SelfChainSlugMarker {
+    fn push(slug: &str) -> Self {
+        self_chain_push(slug);
+        SelfChainSlugMarker { slug: slug.to_string() }
+    }
+}
+impl Drop for SelfChainSlugMarker {
+    fn drop(&mut self) {
+        self_chain_pop(&self.slug);
+    }
+}
+
 // ── WS-AUDIENCE-CONTRACT helpers ────────────────────────────────────────────
 
 /// Coerce an `audience` JSON value (either the canonical `Audience` Object or
@@ -13104,6 +13167,68 @@ pub async fn execute_chain_for_target(
     target_id: Option<&str>,
     inputs: serde_json::Value,
 ) -> Result<serde_json::Value> {
+    // ── Phase 9 close-1: per-slug write lock for chain execution ──
+    //
+    // Chain execution can mutate `pyramid_nodes` via mechanical primitives
+    // (`append_annotation_to_debate_node`, `finalize_debate_node`,
+    // `create_meta_layer_node`, `materialize_gap_node`). Phase 9c-3-2
+    // flipped `execute_supersession` to enforce `LockManager::is_locked`,
+    // but these chain-side mechanical writers were un-guarded. Wrap at
+    // the chain entry so a single guard covers every chain-side write
+    // transitively. Serializes concurrent chain executions on the same
+    // slug. Different-slug chains still run concurrent.
+    //
+    // Reentrancy: `call_starter_chain` recurses with the same slug.
+    // `tokio::sync::RwLock` is non-reentrant so we use a task-local
+    // set to detect self-held and short-circuit — peer tasks see an
+    // empty scope and block at the real lock.
+    //
+    // Wrap in `SELF_CHAIN_SLUGS.scope(...)` on the outer entry;
+    // recursive entries discover the scope via `try_with` and
+    // just mutate the inherited `RefCell`. `feedback_systemic_before_fix`.
+    if self_chain_slug_held(slug) {
+        // Recursive (same-task) call: guard is held by outer frame.
+        // Push+run inside the inherited scope; no new write acquire.
+        let _marker = SelfChainSlugMarker::push(slug);
+        return execute_chain_for_target_inner(state, chain, slug, target_id, inputs).await;
+    }
+
+    // Outer call: acquire the real slug write guard, then run inside a
+    // fresh task-local scope so any nested recursive call sees the
+    // held set.
+    let _slug_write_guard = super::lock_manager::LockManager::global()
+        .write(slug)
+        .await;
+    let chain = chain.clone();
+    let slug_owned = slug.to_string();
+    let target_id_owned = target_id.map(|s| s.to_string());
+    let inputs = inputs;
+    let state_clone = state.clone();
+    return SELF_CHAIN_SLUGS
+        .scope(
+            std::cell::RefCell::new(std::collections::HashSet::new()),
+            async move {
+                let _marker = SelfChainSlugMarker::push(&slug_owned);
+                execute_chain_for_target_inner(
+                    &state_clone,
+                    &chain,
+                    &slug_owned,
+                    target_id_owned.as_deref(),
+                    inputs,
+                )
+                .await
+            },
+        )
+        .await;
+}
+
+async fn execute_chain_for_target_inner(
+    state: &Arc<PyramidState>,
+    chain: &ChainDefinition,
+    slug: &str,
+    target_id: Option<&str>,
+    inputs: serde_json::Value,
+) -> Result<serde_json::Value> {
     info!(
         "[CHAIN-TARGET] executing starter chain '{}' for slug '{}' target={:?} steps={}",
         chain.id,
@@ -13111,72 +13236,6 @@ pub async fn execute_chain_for_target(
         target_id,
         chain.steps.len()
     );
-
-    // ── Phase 9 close-1: per-slug write lock for chain execution ──
-    //
-    // Chain execution can mutate `pyramid_nodes` via mechanical primitives
-    // (`append_annotation_to_debate_node`, `finalize_debate_node`,
-    // `create_meta_layer_node`, `materialize_gap_node`). Phase 9c-3-2
-    // flipped `execute_supersession` to enforce `LockManager::is_locked`,
-    // but these chain-side mechanical writers run without the slug-scoped
-    // guard — they relied on the `dadbear_work_items` active-work dedup
-    // to prevent two overlapping dispatches against the same node. The
-    // wanderer pass flagged this as "not observed-flaky but systemically
-    // racy."
-    //
-    // Wrap here (at the chain entry point) rather than on each mechanical
-    // write site because:
-    //
-    //   1. A single guard covers every chain-side write transitively
-    //      regardless of which future primitives are added.
-    //   2. `tokio::sync::RwLock` is non-reentrant, so the per-mechanical
-    //      approach would force a guard-weaving discipline on every new
-    //      primitive + would deadlock any composite primitive that
-    //      rewrites under multiple headers.
-    //   3. Chain steps that ALSO call into shared writers (e.g.
-    //      `execute_supersession` via re_distill) are already covered by
-    //      the slug lock — their `LockManager::is_locked` assertion now
-    //      passes naturally instead of requiring a carved-out caller.
-    //
-    // Concurrency tradeoff: chain executions on the same slug serialize.
-    // Acceptable per Adam's mandate — per-slug ordering invariant > raw
-    // throughput. Different-slug chains still run concurrently.
-    //
-    // Reentrant safety: `call_starter_chain` (Phase 6b) recurses back
-    // into this function with the SAME slug to invoke library chains.
-    // `tokio::sync::RwLock` is non-reentrant, so unconditional acquire
-    // here would deadlock on every sub-chain call. Skip acquisition if
-    // THIS process already holds the write guard for this slug — the
-    // reentrant call is covered by the outer guard.
-    //
-    // Process-wide `is_write_locked` cannot distinguish "self-held" from
-    // "foreign-held," but when the outer guard is foreign-held we WANT
-    // to block anyway (serialization), and the `await` on a foreign lock
-    // would yield. The only case where we end up on this branch with a
-    // foreign lock held is a same-process peer — which would already
-    // serialize correctly even without acquiring here (the outer
-    // chain-level guard on the other tokio task would release before
-    // this one runs). In practice the branch is taken only for the
-    // reentrant sub-chain case. See the Close-1 tests in
-    // `phase9e_close_tests`.
-    //
-    // Callers that previously never held the lock (supervisor role_bound
-    // arm, `run_authorize_question_chain`, test harness) fall through
-    // and acquire here as expected.
-    //
-    // See `feedback_systemic_before_fix` — the fix is at the root (chain
-    // entry), not patched per-primitive.
-    let already_held =
-        super::lock_manager::LockManager::global().is_write_locked(slug);
-    let _slug_write_guard = if already_held {
-        None
-    } else {
-        Some(
-            super::lock_manager::LockManager::global()
-                .write(slug)
-                .await,
-        )
-    };
 
     // Merge target_id into the initial input under `target_node_id`
     // unless the caller already set it. Starter chain mechanical
