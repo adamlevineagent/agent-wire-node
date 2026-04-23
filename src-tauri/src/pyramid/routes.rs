@@ -4738,6 +4738,70 @@ async fn process_annotation_hook(
         }
     }
 
+    // ── Phase 9b-2: accretion volume-threshold trigger ──────────────
+    //
+    // Two triggers converge on the `accretion_handler` role:
+    //   (a) Scheduled `accretion_tick` (Phase 9b-1, every N minutes).
+    //   (b) Volume-threshold `accretion_threshold_hit` — when a slug
+    //       accumulates >= K annotations since its last
+    //       `accretion_cursor`, fire immediately.
+    //
+    // Threshold K lives in `scheduler_parameters`
+    // (accretion_threshold), operator-editable via contribution
+    // supersession. K=0 disables the volume path (tick-only).
+    //
+    // The count+cursor read uses the writer connection we already
+    // hold below for the emit, so the check is consistent with the
+    // annotation we just wrote. A follow-on ANOTHER annotation
+    // firing the same threshold is desirable: each threshold crossing
+    // is its own event, dedupe happens at the work-item layer via
+    // the distinct step_name `accretion_threshold_dispatch`.
+    let threshold_cfg = {
+        let conn = reader.lock().await;
+        super::pyramid_scheduler::load_config(&conn)
+    };
+    let threshold_k = threshold_cfg.accretion_threshold;
+    if threshold_k > 0 {
+        let conn = writer.lock().await;
+        match super::pyramid_scheduler::count_annotations_since_cursor(&conn, slug) {
+            Ok((count, cursor)) if count as u64 >= threshold_k => {
+                if let Err(e) = super::pyramid_scheduler::emit_accretion_threshold_hit(
+                    &conn,
+                    slug,
+                    annotation.id,
+                    count,
+                    cursor,
+                    threshold_k,
+                ) {
+                    tracing::warn!(
+                        slug = %slug,
+                        annotation_id = annotation.id,
+                        error = %e,
+                        "[annotation] failed to emit accretion_threshold_hit"
+                    );
+                } else {
+                    tracing::info!(
+                        "[annotation] accretion_threshold_hit: slug={} annotation#{} count={} cursor={} K={}",
+                        slug, annotation.id, count, cursor, threshold_k
+                    );
+                }
+            }
+            Ok((count, _cursor)) => {
+                tracing::debug!(
+                    "[annotation] accretion threshold not yet crossed: slug={} count={} K={}",
+                    slug, count, threshold_k
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    slug = %slug,
+                    error = %e,
+                    "[annotation] accretion threshold check failed"
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
