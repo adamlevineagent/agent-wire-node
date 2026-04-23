@@ -13061,6 +13061,16 @@ pub async fn execute_chain_for_target(
     // Merge target_id into the initial input under `target_node_id`
     // unless the caller already set it. Starter chain mechanical
     // primitives read this field.
+    //
+    // Phase 5 verifier note: target_node_id is ALSO re-merged into every
+    // step's resolved_input below, because threading the previous step's
+    // OUTPUT as the next step's INPUT drops target_node_id when that output
+    // is something like `{"emitted": true, "event_id": N}` (what
+    // emit_cascade_handler_invoked returns). Without the per-step merge,
+    // starter-cascade-immediate-redistill's step 2 (queue_re_distill_for_target)
+    // would bail with "missing target_node_id / target_id field". Keeping the
+    // initial merge too so the trivial 1-step case and the resolved_input
+    // path below both do the right thing.
     let mut initial_input = inputs;
     if let Some(tid) = target_id {
         if let Value::Object(ref mut map) = initial_input {
@@ -13114,7 +13124,7 @@ pub async fn execute_chain_for_target(
         // path is needed. Emit loudly if `step.input` is set on a Phase 5
         // starter chain because it indicates the YAML expects richer
         // resolution than this runner provides.
-        let resolved_input = if let Some(ref explicit) = step.input {
+        let mut resolved_input = if let Some(ref explicit) = step.input {
             // Starter chains in Phase 5 should thread via output chaining,
             // not step.input. Warn if someone authored one relying on this
             // field — this runner returns the literal `input` value, not a
@@ -13129,6 +13139,22 @@ pub async fn execute_chain_for_target(
         } else {
             current.clone()
         };
+
+        // Re-merge target_node_id into each step's input so multi-step
+        // starter chains (e.g. starter-cascade-immediate-redistill: emit
+        // → queue) still carry the target context even when the previous
+        // step's output doesn't. Threading output as input would otherwise
+        // strip target_node_id at step 2+ because the output of
+        // emit_cascade_handler_invoked is {"emitted": true, "event_id": N}.
+        //
+        // Caller-set / upstream-preserved target_node_id always wins — we
+        // only insert when absent, matching the initial-input merge semantics.
+        if let Some(tid) = target_id {
+            if let Value::Object(ref mut map) = resolved_input {
+                map.entry("target_node_id".to_string())
+                    .or_insert_with(|| Value::String(tid.to_string()));
+            }
+        }
 
         info!(
             "[CHAIN-TARGET] step[{}] '{}' (fn={:?}) dispatching",

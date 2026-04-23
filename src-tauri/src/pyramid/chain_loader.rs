@@ -298,6 +298,13 @@ pub fn ensure_default_chains(
     // Create directory structure
     let dirs_to_create = [
         chains_dir.join("defaults"),
+        // Post-build accretion v5 Phase 5: starter chains live here.
+        // Role_bound work items resolve their handler chain via
+        // `chain_loader::load_chain_by_id`, which scans this directory.
+        // Omitting the dir in Tier 2 (standalone release) meant every
+        // cascade_stale / purpose_shifted dispatch failed to load its
+        // chain and flipped the work item to `failed`. Verifier fix.
+        chains_dir.join("defaults").join("starter"),
         chains_dir.join("variants"),
         chains_dir.join("prompts").join("conversation"),
         chains_dir.join("prompts").join("conversation-chronological"),
@@ -353,6 +360,34 @@ pub fn ensure_default_chains(
             std::fs::write(&path, content)
                 .with_context(|| format!("failed to write default chain: {}", path.display()))?;
             tracing::info!(path = %path.display(), "bootstrapped default chain file");
+        }
+    }
+
+    // Post-build accretion v5 Phase 5: bundle starter chains for role_bound
+    // dispatch. These are shipped in-tree at `chains/defaults/starter/*.yaml`
+    // and need to be available in standalone release builds too — otherwise
+    // role_bound work items (cascade_stale / purpose_shifted / gap_resolved)
+    // fail to resolve their chain and flip to `failed` instead of `applied`.
+    let starter_chains: &[(&str, &str)] = &[
+        (
+            "starter-cascade-immediate-redistill.yaml",
+            include_str!("../../../chains/defaults/starter/starter-cascade-immediate-redistill.yaml"),
+        ),
+        (
+            "starter-cascade-judge-gated.yaml",
+            include_str!("../../../chains/defaults/starter/starter-cascade-judge-gated.yaml"),
+        ),
+        (
+            "starter-meta-layer-oracle.yaml",
+            include_str!("../../../chains/defaults/starter/starter-meta-layer-oracle.yaml"),
+        ),
+    ];
+    for (filename, content) in starter_chains {
+        let path = chains_dir.join("defaults").join("starter").join(filename);
+        if !path.exists() {
+            std::fs::write(&path, content)
+                .with_context(|| format!("failed to write starter chain: {}", path.display()))?;
+            tracing::info!(path = %path.display(), "bootstrapped starter chain file");
         }
     }
 
@@ -704,5 +739,45 @@ steps:
             msg.contains("not found"),
             "expected not-found message, got: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod phase5_ensure_default_chains_tests {
+    //! Post-build accretion v5 Phase 5 verifier: the Tier 2 (standalone
+    //! release) bootstrap path must install starter chains so role_bound
+    //! dispatch can resolve its handler chain on a machine without a
+    //! source tree. Missing starter YAMLs caused silent failure where
+    //! every cascade_stale / purpose_shifted work item flipped to
+    //! `failed` in release builds.
+    use super::{ensure_default_chains, load_chain_by_id};
+    use tempfile::TempDir;
+
+    #[test]
+    fn tier2_bootstrap_installs_starter_chains_for_role_bound_dispatch() {
+        let tmp = TempDir::new().unwrap();
+        let chains_dir = tmp.path();
+        // No source_chains_dir → forces Tier 2 bootstrap.
+        ensure_default_chains(chains_dir, None).expect("Tier 2 bootstrap must succeed");
+
+        for id in [
+            "starter-cascade-immediate-redistill",
+            "starter-cascade-judge-gated",
+            "starter-meta-layer-oracle",
+        ] {
+            let loaded = load_chain_by_id(id, chains_dir).unwrap_or_else(|e| {
+                panic!(
+                    "starter chain '{id}' must be bootstrapped in Tier 2 so role_bound \
+                     dispatch works in standalone release builds: {e}"
+                )
+            });
+            assert_eq!(loaded.id, id);
+            // Starter chains must ship with at least one mechanical step
+            // (the chain runner is mechanical-only in Phase 5).
+            assert!(
+                !loaded.steps.is_empty(),
+                "starter chain '{id}' must have at least one step"
+            );
+        }
     }
 }

@@ -23971,4 +23971,73 @@ mod phase5_post_build_tests {
         ).unwrap();
         assert!(eid > 0);
     }
+
+    // ── 12. Phase 5 verifier regression: two-step starter chain preserves
+    //        target_node_id across output-threaded boundary.
+    //
+    // starter-cascade-immediate-redistill ships with two steps:
+    //   step 1: emit_cascade_handler_invoked → returns {"emitted": true, "event_id": N}
+    //   step 2: queue_re_distill_for_target → REQUIRES target_node_id in input
+    //
+    // If the runner threads only step1's output as step2's input, step2
+    // fails with "missing target_node_id / target_id field". The verifier
+    // fix re-merges target_node_id into each step's input. This test
+    // guards against a regression where that re-merge is removed.
+
+    #[tokio::test]
+    async fn execute_chain_for_target_threads_target_id_across_multi_step_chain() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p5thread", &ContentType::Code, "/tmp/p5thread").unwrap();
+        let state = test_pyramid_state(conn);
+
+        // Load the starter-cascade-immediate-redistill chain — the real
+        // YAML shipped in Phase 5, not a hand-crafted one — so the test
+        // catches author-time mistakes too.
+        let chain = chain_loader::load_chain_by_id(
+            "starter-cascade-immediate-redistill",
+            &state.chains_dir,
+        )
+        .expect("starter-cascade-immediate-redistill must load");
+
+        // Inputs mirror what the supervisor's role_bound arm passes: basic
+        // work-item context, no target_node_id (target_id is the function
+        // argument). The runner must inject target_id into every step.
+        let inputs = serde_json::json!({
+            "work_item_id": "wi-thread-1",
+            "step_name": "cascade_stale_handler",
+            "layer": 1,
+        });
+        let out = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p5thread",
+            Some("L1-THREADED"),
+            inputs,
+        )
+        .await
+        .expect(
+            "two-step starter-cascade-immediate-redistill must succeed end-to-end — \
+             regression: if this fails with 'missing target_node_id / target_id \
+             field', the runner is not re-merging target_node_id into step 2's input",
+        );
+
+        // Final output is step 2's output — queue_re_distill_for_target
+        // returns {"queued": true, "work_item_id": "wi-…"}.
+        assert_eq!(out["queued"], serde_json::json!(true));
+        let wi_id = out["work_item_id"].as_str().expect("work_item_id");
+        assert!(wi_id.starts_with("wi-"));
+
+        // The queued re_distill work item targets L1-THREADED (proving
+        // threading landed at step 2, not stopped at step 1).
+        let writer = state.writer.lock().await;
+        let target_id: Option<String> = writer
+            .query_row(
+                "SELECT target_id FROM dadbear_work_items WHERE id = ?1",
+                rusqlite::params![wi_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(target_id.as_deref(), Some("L1-THREADED"));
+    }
 }
