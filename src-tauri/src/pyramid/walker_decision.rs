@@ -52,14 +52,15 @@ use crate::pyramid::walker_readiness::{
 };
 use crate::pyramid::walker_resolver::{
     build_scope_cache_pair, resolve_active, resolve_breaker_reset,
-    resolve_bypass_pool, resolve_dispatch_deadline_grace_secs,
+    resolve_bypass_pool, resolve_context_limit, resolve_dispatch_deadline_grace_secs,
     resolve_fleet_peer_min_staleness_secs, resolve_fleet_prefer_cached,
-    resolve_max_budget_credits, resolve_model_list, resolve_network_failure_backoff_secs,
-    resolve_network_failure_backoff_threshold, resolve_ollama_base_url,
-    resolve_ollama_probe_interval_secs, resolve_on_partial_failure,
-    resolve_patience_clock_resets_per_model, resolve_patience_secs,
+    resolve_max_budget_credits, resolve_max_completion_tokens, resolve_model_list,
+    resolve_network_failure_backoff_secs, resolve_network_failure_backoff_threshold,
+    resolve_ollama_base_url, resolve_ollama_probe_interval_secs, resolve_on_partial_failure,
+    resolve_patience_clock_resets_per_model, resolve_patience_secs, resolve_pricing_json,
     resolve_retry_backoff_base_secs, resolve_retry_http_count, resolve_sequential,
-    tier_set_from_chain, PartialFailurePolicy, ProviderType, ScopeChain, DEFAULT_CALL_ORDER,
+    resolve_supported_parameters, tier_set_from_chain, PartialFailurePolicy, ProviderType,
+    ScopeChain, DEFAULT_CALL_ORDER,
 };
 
 // ── DispatchDecision (§2.9) ──────────────────────────────────────────────────
@@ -435,6 +436,14 @@ fn resolve_all_params(
             chain, slot, pt,
         ),
         network_failure_backoff_secs: resolve_network_failure_backoff_secs(chain, slot, pt),
+        // W1a: four new params absorbed from pyramid_tier_routing (§5.1).
+        // All Option-surfacing — None means the provider will answer at
+        // dispatch time (context limits) or the value is unknown
+        // (pricing / supported_parameters).
+        context_limit: resolve_context_limit(chain, slot, pt),
+        max_completion_tokens: resolve_max_completion_tokens(chain, slot, pt),
+        pricing_json: resolve_pricing_json(chain, slot, pt),
+        supported_parameters: resolve_supported_parameters(chain, slot, pt),
     }
 }
 

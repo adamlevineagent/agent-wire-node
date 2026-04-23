@@ -114,6 +114,21 @@ pub struct ResolvedProviderParams {
     pub network_failure_backoff_threshold: u32,
     /// Duration in `NetworkUnreachable` state before readiness retries.
     pub network_failure_backoff_secs: u64,
+
+    // ── W1a: four new params absorbed from legacy pyramid_tier_routing
+    //        columns per §5.1. All Option-surfacing with no SYSTEM_DEFAULT —
+    //        `None` means "ask the provider at dispatch time" (context
+    //        limits) or "unknown" (pricing/supported_parameters).
+    /// Per-(slot, provider) context window ceiling. None = provider-declared.
+    pub context_limit: Option<u64>,
+    /// Per-(slot, provider) max completion tokens. None = provider-declared.
+    pub max_completion_tokens: Option<u64>,
+    /// Per-provider opaque pricing blob (OpenRouter-shape). None = unknown
+    /// at config time; pricing engine may fetch live.
+    pub pricing_json: Option<serde_json::Value>,
+    /// Per-provider list of parameter names the backing model honors
+    /// (e.g. `["tools", "response_format"]`). None = unknown.
+    pub supported_parameters: Option<Vec<String>>,
 }
 
 impl Default for ResolvedProviderParams {
@@ -140,6 +155,13 @@ impl Default for ResolvedProviderParams {
             fleet_prefer_cached: None,
             network_failure_backoff_threshold: 3,
             network_failure_backoff_secs: 300,
+            // W1a: all four new params default to None — no SYSTEM_DEFAULT,
+            // and per §2.14.3 / §5.1 the absent-everywhere state means
+            // "provider declares at dispatch time" / "unknown".
+            context_limit: None,
+            max_completion_tokens: None,
+            pricing_json: None,
+            supported_parameters: None,
         }
     }
 }
@@ -233,5 +255,17 @@ mod tests {
             NotReadyReason::PeerIsV1Announcer,
         ];
         assert_eq!(variants.len(), 12);
+    }
+
+    #[test]
+    fn resolved_provider_params_default_has_none_for_w1a_fields() {
+        // W1a: four new Option-surfacing fields must default to None so
+        // any consumer that branches on "is this declared?" treats the
+        // absent case as "ask the provider" / "unknown", not a ghost zero.
+        let p = ResolvedProviderParams::default();
+        assert!(p.context_limit.is_none());
+        assert!(p.max_completion_tokens.is_none());
+        assert!(p.pricing_json.is_none());
+        assert!(p.supported_parameters.is_none());
     }
 }

@@ -31,11 +31,51 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::app_mode::{transition_to, AppMode};
-use crate::pyramid::config_contributions::load_active_config_contribution;
 use crate::pyramid::event_bus::{BuildEventBus, TaggedKind};
+use crate::pyramid::v3_migration::{self, V3MigrationError, V3MigrationReport};
 use crate::pyramid::walker_cache::{
     spawn_scope_cache_reloader, AppModeTransition, RebuildTrigger, ScopeCache,
 };
+
+/// Internal: outcome of boot step 4's migration attempt.
+enum MigrationStepOutcome {
+    /// Phase A executed and committed. `report` carries the details
+    /// logged for operator visibility.
+    Ran(V3MigrationReport),
+    /// Marker body indicated migration is not needed (`v3`, post-Phase A,
+    /// or an unknown marker body this boot doesn't recognize — logged
+    /// but not escalated).
+    NoOp { marker: String },
+}
+
+/// Read the active `migration_marker` contribution's inner `body:` field,
+/// returning `None` if no active marker exists or if the body doesn't
+/// parse as YAML with a `body:` string. Used by boot step 4 to decide
+/// whether Phase A migration should run.
+fn read_marker_body(conn: &Connection) -> std::result::Result<Option<String>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    let yaml: Option<String> = conn
+        .query_row(
+            "SELECT yaml_content FROM pyramid_config_contributions \
+             WHERE schema_type = 'migration_marker' \
+               AND status = 'active' \
+               AND superseded_by_id IS NULL \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(yaml) = yaml else {
+        return Ok(None);
+    };
+    // Parse: try YAML-with-body-field first; fall back to trimmed whole.
+    let trimmed: Option<String> = serde_yaml::from_str::<serde_yaml::Value>(&yaml)
+        .ok()
+        .and_then(|v| v.get("body").and_then(|b| b.as_str()).map(|s| s.trim().to_string()))
+        .or_else(|| Some(yaml.trim().to_string()));
+    Ok(trimmed.filter(|s| !s.is_empty()))
+}
 
 /// Handles + channels produced by `run_walker_cache_boot`. main.rs must
 /// keep these alive for the process lifetime; they are NOT owned by
@@ -69,8 +109,11 @@ pub struct BootHandles {
 /// bring up HTTP listeners so the operator can see the failure in UI.
 pub enum BootResult {
     Ok(BootHandles),
-    /// Fatal boot-abort: DB missing or similar. Caller logs
-    /// `boot_aborted` and refuses to come up.
+    /// Fatal boot-abort: DB missing, in-progress builds blocking a v3
+    /// migration, or an unknown provider_id preventing a clean route.
+    /// Caller logs `boot_aborted` and refuses to come up. The message
+    /// is operator-visible — it drives the modal copy in the Phase-6 UI
+    /// (§2.17.3 boot-aborts-to-known-states).
     Aborted(String),
 }
 
@@ -194,82 +237,137 @@ pub async fn run_walker_cache_boot(
         source_count
     );
 
-    // Step 4: migration phase. Phase 0a-2 does NOT implement the v3 DDL.
-    // We only read the active `migration_marker` body and log intent.
+    // Step 4: migration phase. W1a wires the real §5.3 Phase A migration.
+    //
+    // Sequence: probe the active `migration_marker`. If it says `v2` (or
+    // missing, per §2.17 / §5.3 "missing = v2"), run
+    // `v3_migration::run_v3_phase_a_migration` inside a single SQL
+    // transaction. On the known error classes that have operator-visible
+    // recovery modals (in-flight builds, unknown provider_ids) we return
+    // `BootResult::Aborted` with a precise message — per §2.17.3
+    // boot-aborts-to-known-states. On success we log the report and fall
+    // through to step 5 (post-migration cache rebuild).
+    //
+    // The config-file rewrite side of migration (marker → `v3`, removing
+    // `primary_model` / `fallback_model_{1,2}` from pyramid_config.json)
+    // is W4; §5.3 Phase B. Phase A leaves the marker at
+    // `v3-db-migrated-config-pending` deliberately.
     {
         let db_probe = db_path.clone();
-        let marker_check = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
-            let conn = Connection::open(&db_probe)?;
-            let active =
-                load_active_config_contribution(&conn, "migration_marker", None)
-                    .map_err(anyhow::Error::from)?;
-            Ok(active.map(|c| c.yaml_content))
-        })
+        let marker_and_migration = tokio::task::spawn_blocking(
+            move || -> std::result::Result<MigrationStepOutcome, V3MigrationError> {
+                let mut conn = Connection::open(&db_probe)?;
+                let marker_body = read_marker_body(&conn)?;
+                match marker_body.as_deref() {
+                    // v3 / v3-db-migrated-config-pending: skip.
+                    Some("v3") => Ok(MigrationStepOutcome::NoOp {
+                        marker: "v3".to_string(),
+                    }),
+                    Some("v3-db-migrated-config-pending") => Ok(MigrationStepOutcome::NoOp {
+                        marker: "v3-db-migrated-config-pending".to_string(),
+                    }),
+                    // v2 or missing: run Phase A.
+                    Some("v2") | None | Some("") => {
+                        let data_dir = v3_migration::default_data_dir();
+                        let report = v3_migration::run_v3_phase_a_migration(
+                            &mut conn,
+                            data_dir.as_deref(),
+                        )?;
+                        Ok(MigrationStepOutcome::Ran(report))
+                    }
+                    // Unknown marker body — log, skip migration, continue.
+                    Some(other) => Ok(MigrationStepOutcome::NoOp {
+                        marker: other.to_string(),
+                    }),
+                }
+            },
+        )
         .await;
 
-        match marker_check {
-            Ok(Ok(Some(body))) if body.trim() == "v2" => {
+        match marker_and_migration {
+            Ok(Ok(MigrationStepOutcome::Ran(report))) => {
                 tracing::info!(
                     event = "boot_step",
                     step = 4,
                     name = "migration_phase",
-                    marker = %body,
-                    "v3 migration pending (deferred; Phase 0a-2 scope does not implement DDL)"
+                    marker_from = %report.marker_transitioned_from,
+                    marker_to = %report.marker_transitioned_to,
+                    walker_provider_writes = report.walker_provider_contributions_written.len(),
+                    walker_call_order_written = report.walker_call_order_written.is_some(),
+                    snapshot_rows = report.snapshot_rows_dumped,
+                    "v3 migration Phase A committed"
                 );
-                // §2.17.3: defer transition_to(Migrating). Supersession to
-                // "v3-db-migrated-config-pending" and "v3" is a later phase.
             }
-            Ok(Ok(None)) => {
-                // Spec §2.17 / §5.3: missing marker = treat as v2 (first-ever
-                // boot of a v3 binary on an unmigrated DB). Log identically
-                // to the "v2" branch so operators searching for
-                // `v3 migration pending` catch both cases.
-                tracing::info!(
+            Ok(Ok(MigrationStepOutcome::NoOp { marker })) => {
+                tracing::debug!(
                     event = "boot_step",
                     step = 4,
                     name = "migration_phase",
-                    marker = "missing",
-                    "v3 migration pending (deferred; no active migration_marker — treating as v2)"
+                    marker = %marker,
+                    "v3 migration already applied or not required for this marker body"
                 );
             }
-            Ok(Ok(Some(body)))
-                if body.trim() == "v3"
-                    || body.trim() == "v3-db-migrated-config-pending" =>
-            {
+            Ok(Err(V3MigrationError::InProgressBuildsBlock(slugs))) => {
+                let msg = format!(
+                    "Upgrade to walker v3 requires in-progress builds to finish or be marked failed \
+                     (blocking slugs: {slugs:?}). [Resume] / [Mark failed] / [Rollback to v2]"
+                );
+                tracing::error!(
+                    event = "boot_aborted",
+                    step = 4,
+                    name = "migration_phase",
+                    reason = "in_progress_builds_block",
+                    slugs = ?slugs,
+                    "{}", msg
+                );
+                return BootResult::Aborted(msg);
+            }
+            Ok(Err(V3MigrationError::UnknownProviderIds { ids })) => {
+                let msg = format!(
+                    "Upgrade to walker v3 encountered unknown provider_ids in pyramid_tier_routing: {ids:?}. \
+                     Investigate and either rename to one of [openrouter, ollama, ollama-local, fleet, market] \
+                     or acknowledge via the unknown-provider modal (Phase 6 UI)."
+                );
+                tracing::error!(
+                    event = "boot_aborted",
+                    step = 4,
+                    name = "migration_phase",
+                    reason = "unknown_provider_ids",
+                    ids = ?ids,
+                    "{}", msg
+                );
+                return BootResult::Aborted(msg);
+            }
+            Ok(Err(V3MigrationError::AlreadyMigrated { body })) => {
                 tracing::debug!(
                     event = "boot_step",
                     step = 4,
                     name = "migration_phase",
                     marker = %body,
-                    "migration already applied; no DDL to run"
-                );
-            }
-            Ok(Ok(Some(body))) => {
-                tracing::info!(
-                    event = "boot_step",
-                    step = 4,
-                    name = "migration_phase",
-                    marker = %body,
-                    "migration_marker read; no migration required for this body"
+                    "AlreadyMigrated — rerun elided"
                 );
             }
             Ok(Err(e)) => {
-                tracing::warn!(
-                    event = "boot_step_warn",
+                let msg = format!("v3 migration failed: {e}");
+                tracing::error!(
+                    event = "boot_aborted",
                     step = 4,
                     name = "migration_phase",
                     error = %e,
-                    "failed to read migration_marker; continuing boot"
+                    "{}", msg
                 );
+                return BootResult::Aborted(msg);
             }
-            Err(e) => {
-                tracing::warn!(
-                    event = "boot_step_warn",
+            Err(join_err) => {
+                let msg = format!("migration task failed: {join_err}");
+                tracing::error!(
+                    event = "boot_aborted",
                     step = 4,
                     name = "migration_phase",
-                    error = %e,
-                    "migration_marker probe task failed; continuing boot"
+                    error = %join_err,
+                    "{}", msg
                 );
+                return BootResult::Aborted(msg);
             }
         }
     }

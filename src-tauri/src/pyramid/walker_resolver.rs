@@ -61,7 +61,7 @@ use crate::pyramid::walker_cache::ScopeCache;
 /// future revisions of this plan add a variant here and a matching
 /// schema_type (`walker_provider_<type>`).
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderType {
     Local,
@@ -419,6 +419,16 @@ pub fn system_default_json(param: &str) -> Option<serde_json::Value> {
         "on_partial_failure" => serde_json::to_value(ON_PARTIAL_FAILURE_DEFAULT).ok()?,
         "ollama_base_url" => json!(OLLAMA_BASE_URL_DEFAULT),
         "ollama_probe_interval_secs" => json!(OLLAMA_PROBE_INTERVAL_SECS_DEFAULT),
+        // W1a §5.1: four new parameters absorbed from pyramid_tier_routing
+        // legacy columns. All are Option-surfacing — `None` means "ask the
+        // provider at dispatch time" (context_limit, max_completion_tokens)
+        // or "unknown" (pricing_json, supported_parameters). They do NOT
+        // ship a SYSTEM_DEFAULT — the resolver returns None when neither
+        // scope declares them. The accessor layer returns Option<T>.
+        "context_limit" => return None,
+        "max_completion_tokens" => return None,
+        "pricing_json" => return None,
+        "supported_parameters" => return None,
         _ => return None,
     };
     Some(v)
@@ -797,6 +807,188 @@ pub fn resolve_max_budget_credits(
             None
         }
     }
+}
+
+/// §3 / §5.1 `context_limit` — Option-surfacing, SHAPE-PER-SCOPE (tiered_map).
+///
+/// Per-tier, per-provider. At scopes 1–2 stored as flat `u64` (slot is
+/// implicit). At scopes 3–4 stored as `{tier: u64}` map indexed on slot.
+/// `None` = "ask the provider at dispatch time" — no SYSTEM_DEFAULT.
+///
+/// Absorbed in W1a from `pyramid_tier_routing.context_limit` (§5.1).
+#[allow(dead_code)]
+pub fn resolve_context_limit(
+    chain: &ScopeChain,
+    slot: &str,
+    provider_type: ProviderType,
+) -> Option<u64> {
+    // Scopes 1 + 2: flat u64 (slot is implicit in scope key).
+    if let Some(v) = chain
+        .slot_provider
+        .get(&(slot.to_string(), provider_type))
+        .and_then(|e| e.overrides.get("context_limit"))
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<u64>(v.clone()).ok())
+    {
+        return Some(v);
+    }
+    if let Some(v) = chain
+        .slot
+        .get(slot)
+        .and_then(|e| e.overrides.get("context_limit"))
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<u64>(v.clone()).ok())
+    {
+        return Some(v);
+    }
+    // Scopes 3 + 4: HashMap<String, u64>; index on slot.
+    if let Some(v) = chain
+        .call_order_provider
+        .get(&provider_type)
+        .and_then(|e| e.overrides.get("context_limit"))
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<HashMap<String, u64>>(v.clone()).ok())
+        .and_then(|m| m.get(slot).copied())
+    {
+        return Some(v);
+    }
+    if let Some(v) = chain
+        .provider
+        .get(&provider_type)
+        .and_then(|e| e.overrides.get("context_limit"))
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<HashMap<String, u64>>(v.clone()).ok())
+        .and_then(|m| m.get(slot).copied())
+    {
+        return Some(v);
+    }
+    None
+}
+
+/// §3 / §5.1 `max_completion_tokens` — Option-surfacing, SHAPE-PER-SCOPE.
+///
+/// Same shape-per-scope as `context_limit`. `None` = "ask the provider
+/// at dispatch time" — no SYSTEM_DEFAULT.
+///
+/// Absorbed in W1a from `pyramid_tier_routing.max_completion_tokens` (§5.1).
+#[allow(dead_code)]
+pub fn resolve_max_completion_tokens(
+    chain: &ScopeChain,
+    slot: &str,
+    provider_type: ProviderType,
+) -> Option<u64> {
+    if let Some(v) = chain
+        .slot_provider
+        .get(&(slot.to_string(), provider_type))
+        .and_then(|e| e.overrides.get("max_completion_tokens"))
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<u64>(v.clone()).ok())
+    {
+        return Some(v);
+    }
+    if let Some(v) = chain
+        .slot
+        .get(slot)
+        .and_then(|e| e.overrides.get("max_completion_tokens"))
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<u64>(v.clone()).ok())
+    {
+        return Some(v);
+    }
+    if let Some(v) = chain
+        .call_order_provider
+        .get(&provider_type)
+        .and_then(|e| e.overrides.get("max_completion_tokens"))
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<HashMap<String, u64>>(v.clone()).ok())
+        .and_then(|m| m.get(slot).copied())
+    {
+        return Some(v);
+    }
+    if let Some(v) = chain
+        .provider
+        .get(&provider_type)
+        .and_then(|e| e.overrides.get("max_completion_tokens"))
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<HashMap<String, u64>>(v.clone()).ok())
+        .and_then(|m| m.get(slot).copied())
+    {
+        return Some(v);
+    }
+    None
+}
+
+/// §3 / §5.1 `pricing_json` — Option-surfacing, scalar opaque Value.
+///
+/// Per-provider (scope 4 only per §5.1). One value per provider; does not
+/// vary by slot. Takes `slot` for signature consistency with the other
+/// shape-per-scope accessors but ignores it — the resolver walks scopes
+/// 3 and 4 only. Absorbed in W1a from `pyramid_tier_routing.pricing_json`.
+///
+/// The blob is treated as opaque: the resolver does not parse the inner
+/// shape. Consumers interpret as OpenRouter-shaped {prompt, completion,
+/// request, image} string-encoded rates, or whatever the operator put.
+#[allow(dead_code)]
+pub fn resolve_pricing_json(
+    chain: &ScopeChain,
+    _slot: &str,
+    provider_type: ProviderType,
+) -> Option<serde_json::Value> {
+    // Scope 3 (overrides_by_provider at call-order) — rare but allowed.
+    if let Some(v) = chain
+        .call_order_provider
+        .get(&provider_type)
+        .and_then(|e| e.overrides.get("pricing_json"))
+        .filter(|v| !v.is_null())
+        .cloned()
+    {
+        return Some(v);
+    }
+    // Scope 4 (walker_provider_* default) — the expected home.
+    if let Some(v) = chain
+        .provider
+        .get(&provider_type)
+        .and_then(|e| e.overrides.get("pricing_json"))
+        .filter(|v| !v.is_null())
+        .cloned()
+    {
+        return Some(v);
+    }
+    None
+}
+
+/// §3 / §5.1 `supported_parameters` — Option-surfacing, list of parameter
+/// names the backing model honors (e.g. `["tools", "response_format"]`).
+///
+/// Per-provider (scope 4 only per §5.1). Absorbed in W1a from
+/// `pyramid_tier_routing.supported_parameters_json`.
+///
+/// Takes `slot` for signature consistency; ignores it (scope-4-only).
+#[allow(dead_code)]
+pub fn resolve_supported_parameters(
+    chain: &ScopeChain,
+    _slot: &str,
+    provider_type: ProviderType,
+) -> Option<Vec<String>> {
+    if let Some(v) = chain
+        .call_order_provider
+        .get(&provider_type)
+        .and_then(|e| e.overrides.get("supported_parameters"))
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+    {
+        return Some(v);
+    }
+    if let Some(v) = chain
+        .provider
+        .get(&provider_type)
+        .and_then(|e| e.overrides.get("supported_parameters"))
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+    {
+        return Some(v);
+    }
+    None
 }
 
 /// §3 `model_list` — SHAPE-PER-SCOPE Option-surfacing accessor.
@@ -1858,5 +2050,161 @@ slots:
             resolve_max_budget_credits(&chain, "mid", ProviderType::Market),
             Some(5000)
         );
+    }
+
+    // ── W1a: four new parameters (context_limit, max_completion_tokens,
+    //        pricing_json, supported_parameters) — §5.1 absorbed from
+    //        legacy pyramid_tier_routing columns. ───────────────────────
+
+    #[test]
+    fn test_context_limit_option_surfacing_and_shape_per_scope() {
+        let mut chain = ScopeChain::default();
+        // Unset everywhere → None.
+        assert_eq!(
+            resolve_context_limit(&chain, "mid", ProviderType::OpenRouter),
+            None
+        );
+
+        // Scope 4 as Map<tier, u64>.
+        chain.provider.insert(
+            ProviderType::OpenRouter,
+            entry(json!({
+                "context_limit": {
+                    "mid": 200_000_u64,
+                    "max": 1_000_000_u64,
+                }
+            })),
+        );
+        assert_eq!(
+            resolve_context_limit(&chain, "mid", ProviderType::OpenRouter),
+            Some(200_000)
+        );
+        assert_eq!(
+            resolve_context_limit(&chain, "max", ProviderType::OpenRouter),
+            Some(1_000_000)
+        );
+        // Tier not declared → None.
+        assert_eq!(
+            resolve_context_limit(&chain, "high", ProviderType::OpenRouter),
+            None
+        );
+
+        // Scope 1 flat u64 wins over scope 4 map.
+        chain.slot_provider.insert(
+            ("mid".to_string(), ProviderType::OpenRouter),
+            entry(json!({"context_limit": 128_000_u64})),
+        );
+        assert_eq!(
+            resolve_context_limit(&chain, "mid", ProviderType::OpenRouter),
+            Some(128_000)
+        );
+        // Scope 4 still wins for other tiers.
+        assert_eq!(
+            resolve_context_limit(&chain, "max", ProviderType::OpenRouter),
+            Some(1_000_000)
+        );
+    }
+
+    #[test]
+    fn test_max_completion_tokens_option_surfacing() {
+        let mut chain = ScopeChain::default();
+        assert_eq!(
+            resolve_max_completion_tokens(&chain, "mid", ProviderType::OpenRouter),
+            None
+        );
+        // Scope 4 map-by-tier.
+        chain.provider.insert(
+            ProviderType::OpenRouter,
+            entry(json!({"max_completion_tokens": {"mid": 8_192_u64}})),
+        );
+        assert_eq!(
+            resolve_max_completion_tokens(&chain, "mid", ProviderType::OpenRouter),
+            Some(8_192)
+        );
+        // Scope 2 flat wins over scope 4.
+        chain.slot.insert(
+            "mid".to_string(),
+            entry(json!({"max_completion_tokens": 32_768_u64})),
+        );
+        assert_eq!(
+            resolve_max_completion_tokens(&chain, "mid", ProviderType::OpenRouter),
+            Some(32_768)
+        );
+    }
+
+    #[test]
+    fn test_pricing_json_opaque_round_trip() {
+        let mut chain = ScopeChain::default();
+        assert_eq!(
+            resolve_pricing_json(&chain, "mid", ProviderType::OpenRouter),
+            None
+        );
+        let pricing = json!({
+            "prompt": "0.000002",
+            "completion": "0.000008",
+            "request": "0",
+            "image": "0"
+        });
+        chain.provider.insert(
+            ProviderType::OpenRouter,
+            entry(json!({"pricing_json": pricing.clone()})),
+        );
+        let got = resolve_pricing_json(&chain, "mid", ProviderType::OpenRouter);
+        assert_eq!(got, Some(pricing));
+        // Slot doesn't matter (scope-4-only).
+        let got_other_slot = resolve_pricing_json(&chain, "max", ProviderType::OpenRouter);
+        assert!(got_other_slot.is_some());
+    }
+
+    #[test]
+    fn test_supported_parameters_list_round_trip() {
+        let mut chain = ScopeChain::default();
+        assert_eq!(
+            resolve_supported_parameters(&chain, "mid", ProviderType::OpenRouter),
+            None
+        );
+        chain.provider.insert(
+            ProviderType::OpenRouter,
+            entry(json!({
+                "supported_parameters": ["tools", "response_format", "tool_choice"]
+            })),
+        );
+        let got = resolve_supported_parameters(&chain, "mid", ProviderType::OpenRouter);
+        assert_eq!(
+            got,
+            Some(vec![
+                "tools".to_string(),
+                "response_format".to_string(),
+                "tool_choice".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_system_default_json_returns_none_for_new_option_params() {
+        // All four W1a additions are Option-surfacing with no system floor.
+        assert!(system_default_json("context_limit").is_none());
+        assert!(system_default_json("max_completion_tokens").is_none());
+        assert!(system_default_json("pricing_json").is_none());
+        assert!(system_default_json("supported_parameters").is_none());
+    }
+
+    #[test]
+    fn test_notes_metadata_underscore_prefix_stored_but_not_resolved() {
+        // `_notes` is stored as an opaque string in overrides for the
+        // chronicle/operator surface. The envelope-writer shape validator
+        // skips `_`-prefixed keys; the resolver has no typed accessor
+        // for them. This test asserts raw overrides access works.
+        let mut chain = ScopeChain::default();
+        chain.provider.insert(
+            ProviderType::OpenRouter,
+            entry(json!({
+                "_notes": "custom pricing negotiated 2025-12",
+                "model_list": {"mid": ["inception/mercury-2"]}
+            })),
+        );
+        let entry = chain.provider.get(&ProviderType::OpenRouter).unwrap();
+        let notes = entry.overrides.get("_notes").and_then(|v| v.as_str());
+        assert_eq!(notes, Some("custom pricing negotiated 2025-12"));
     }
 }
