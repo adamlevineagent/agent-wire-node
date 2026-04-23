@@ -28452,15 +28452,20 @@ mod phase7b_post_build_tests {
         assert_eq!(
             loaded.steps.len(),
             4,
-            "Phase 7b oracle has 4 steps: emit → decide → dispatch → finalize"
+            "Phase 7b oracle has 4 steps: emit → decide → call → finalize"
         );
         let names: Vec<&str> = loaded.steps.iter().map(|s| s.name.as_str()).collect();
+        // v5 audit P4: `dispatch_synthesizer` wrapper primitive removed —
+        // the starter runner now resolves $refs inside step.input, so the
+        // oracle YAML calls starter-synthesizer via call_starter_chain
+        // directly. Step renamed to `call_synthesizer` to reflect that
+        // it's now a straight sub-chain invocation.
         assert_eq!(
             names,
             vec![
                 "emit_oracle_invoked",
                 "decide_crystallization",
-                "dispatch_synthesizer",
+                "call_synthesizer",
                 // Phase 7b verifier: oracle_finalize replaces the Phase 5 generic
                 // log_and_complete so a SKIP path lands a loud
                 // `meta_layer_oracle_skipped` chronicle event instead of
@@ -28478,15 +28483,23 @@ mod phase7b_post_build_tests {
             );
             assert!(step.rust_function.is_some());
         }
-        // The dispatch step carries a when-guard on decide_crystallization.
-        let dispatch_step = loaded
+        // The call step carries a when-guard on decide_crystallization.
+        let call_step = loaded
             .steps
             .iter()
-            .find(|s| s.name == "dispatch_synthesizer")
+            .find(|s| s.name == "call_synthesizer")
             .unwrap();
         assert!(
-            dispatch_step.when.is_some(),
-            "dispatch_synthesizer must carry a when-guard"
+            call_step.when.is_some(),
+            "call_synthesizer must carry a when-guard"
+        );
+        // v5 audit P4: the step also carries an explicit input block
+        // with $ref threading — the whole point of P4 is that the YAML
+        // can express this directly without a Rust wrapper.
+        assert!(
+            call_step.input.is_some(),
+            "call_synthesizer must carry an input block threading \
+             $decide_crystallization.purpose_question via $ref"
         );
     }
 

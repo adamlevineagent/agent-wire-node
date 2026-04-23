@@ -13306,14 +13306,36 @@ pub async fn execute_chain_for_target(
         // by default, but a literal input is still useful for the judge
         // step to carry a payload shape the mechanical step below
         // doesn't produce.
+        //
+        // v5 audit P4: recursively resolve `$ref` expressions embedded
+        // inside `step.input` object values. Before the audit this path
+        // passed the raw literal (so `"$decide_crystallization.purpose_question"`
+        // arrived at the mechanical as a string, not the resolved value).
+        // That forced each library-chain caller to ship a bespoke Rust
+        // wrapper primitive (e.g. `dispatch_synthesizer`) just to thread
+        // the data. With resolution, authors can write:
+        //     input:
+        //       chain_id: starter-synthesizer
+        //       input:
+        //         purpose_question: $decide_crystallization.purpose_question
+        // directly. The full-chain executor's ctx.resolve_value walks
+        // the same shape; this parallels it for the starter runner's
+        // simpler `step_outputs` environment.
         let mut resolved_input = if let Some(ref explicit) = step.input {
-            warn!(
-                "[CHAIN-TARGET] chain '{}' step '{}' uses step.input literal; \
-                 starter runner does not resolve $ref / template expressions \
-                 inside step.input — passing literal to dispatch.",
-                chain.id, step.name
-            );
-            explicit.clone()
+            let env_value = Value::Object(step_outputs.clone());
+            let env = super::expression::ValueEnv::new(&env_value);
+            match resolve_refs_in_starter_input(explicit, &env) {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    anyhow::bail!(
+                        "chain '{}' step '{}': step.input contains a $ref that \
+                         failed to resolve: {}. Referenced step must have run and \
+                         produced the named field (starter runner env = prior \
+                         step_outputs + initial input fields).",
+                        chain.id, step.name, e,
+                    );
+                }
+            }
         } else {
             current.clone()
         };
@@ -13448,6 +13470,102 @@ enum WhenDecision {
 ///   - `Err`  — the expression failed to parse or evaluate. The caller
 ///     raises loudly; a failed when-expression must not silently skip the
 ///     guarded step.
+/// v5 audit P4: recursively resolve `$ref` expressions inside a starter
+/// chain's `step.input` JSON value, using the starter runner's
+/// `step_outputs + initial_input` environment.
+///
+/// Rules (mirror `chain_resolve::ChainContext::resolve_value`):
+/// - A string that is entirely a single `$ref` (e.g.
+///   `"$step.field"`) → resolve and return the typed value (number /
+///   object / array preserved).
+/// - A string containing an embedded `$ref` alongside other text
+///   (e.g. `"prefix $foo bar"`) → stringify the resolution and
+///   substitute in place.
+/// - Objects and arrays are walked recursively.
+/// - Numbers, bools, nulls pass through unchanged.
+///
+/// Using `expression::evaluate_expression` as the resolver keeps
+/// semantics consistent with `evaluate_when_starter` (same path
+/// engine, same env shape).
+fn resolve_refs_in_starter_input(
+    value: &Value,
+    env: &super::expression::ValueEnv<'_>,
+) -> anyhow::Result<Value> {
+    match value {
+        Value::String(s) => resolve_refs_in_starter_string(s, env),
+        Value::Object(map) => {
+            let mut resolved = serde_json::Map::new();
+            for (k, v) in map {
+                resolved.insert(k.clone(), resolve_refs_in_starter_input(v, env)?);
+            }
+            Ok(Value::Object(resolved))
+        }
+        Value::Array(arr) => {
+            let resolved: anyhow::Result<Vec<Value>> = arr
+                .iter()
+                .map(|v| resolve_refs_in_starter_input(v, env))
+                .collect();
+            Ok(Value::Array(resolved?))
+        }
+        // Numbers, bools, null — pass through
+        other => Ok(other.clone()),
+    }
+}
+
+/// Resolve a string that may start with `$` (single ref) or contain
+/// embedded `$ref` tokens. Single-ref form preserves the resolved
+/// type; interpolation form stringifies.
+fn resolve_refs_in_starter_string(
+    s: &str,
+    env: &super::expression::ValueEnv<'_>,
+) -> anyhow::Result<Value> {
+    use std::sync::OnceLock;
+    static REF_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = REF_RE.get_or_init(|| {
+        // Matches `$identifier` followed by optional dotted/indexed
+        // path segments — same shape `expression::parse_reference`
+        // accepts. The `[^\s,)\]+=<>!*/&|]` class bounds the match so
+        // adjacent punctuation / operators don't get swallowed.
+        regex::Regex::new(r"\$[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*|\[[^\]]+\])*")
+            .expect("v5 P4 ref regex must compile")
+    });
+
+    let trimmed = s.trim();
+    // Case 1: entire string is a single $reference.
+    if trimmed.starts_with('$') {
+        // Test: does the whole trimmed string match a single ref?
+        if let Some(m) = re.find(trimmed) {
+            if m.start() == 0 && m.end() == trimmed.len() {
+                return super::expression::evaluate_expression(trimmed, env);
+            }
+        }
+    }
+
+    // Case 2: embedded refs — interpolate as strings.
+    if s.contains('$') {
+        let mut out = String::new();
+        let mut last = 0usize;
+        for m in re.find_iter(s) {
+            out.push_str(&s[last..m.start()]);
+            let ref_str = &s[m.start()..m.end()];
+            let resolved = super::expression::evaluate_expression(ref_str, env)?;
+            // Stringify the resolved value. JSON-style for objects /
+            // arrays so the interpolation is unambiguous; plain for
+            // strings / scalars.
+            match resolved {
+                Value::String(s) => out.push_str(&s),
+                other => out.push_str(&other.to_string()),
+            }
+            last = m.end();
+        }
+        out.push_str(&s[last..]);
+        return Ok(Value::String(out));
+    }
+
+    // Case 3: no refs — pass through.
+    Ok(Value::String(s.to_string()))
+}
+
 fn evaluate_when_starter(
     when: Option<&str>,
     step_outputs: &serde_json::Map<String, Value>,
@@ -13498,6 +13616,104 @@ mod tests {
     /// — they compose child pyramids via `pyramid_vine_compositions`.
     /// Phase 16 also exempts `"vine"`. All other content types must
     /// still require chunks.
+    // ── v5 audit P4: starter runner step.input ref resolver ──
+
+    #[test]
+    fn starter_input_resolves_single_ref_to_typed_value() {
+        let env_value = json!({
+            "decide_crystallization": {
+                "purpose_question": "What is X?",
+                "should_crystallize": true,
+                "covered_substrate_nodes": ["L0-a", "L0-b"],
+            }
+        });
+        let env = crate::pyramid::expression::ValueEnv::new(&env_value);
+
+        // Single-ref string preserves the resolved value's type.
+        let input = json!({
+            "chain_id": "starter-synthesizer",
+            "input": {
+                "purpose_question": "$decide_crystallization.purpose_question",
+                "covered_substrate_nodes": "$decide_crystallization.covered_substrate_nodes",
+                "should_crystallize": "$decide_crystallization.should_crystallize",
+            }
+        });
+        let resolved = resolve_refs_in_starter_input(&input, &env).unwrap();
+        assert_eq!(resolved["chain_id"], json!("starter-synthesizer"));
+        assert_eq!(resolved["input"]["purpose_question"], json!("What is X?"));
+        assert_eq!(
+            resolved["input"]["covered_substrate_nodes"],
+            json!(["L0-a", "L0-b"]),
+            "array type preserved for single-ref string"
+        );
+        assert_eq!(
+            resolved["input"]["should_crystallize"],
+            json!(true),
+            "bool type preserved for single-ref string"
+        );
+    }
+
+    #[test]
+    fn starter_input_resolves_embedded_ref_as_interpolated_string() {
+        let env_value = json!({ "slug": "my-slug", "n": 42 });
+        let env = crate::pyramid::expression::ValueEnv::new(&env_value);
+        let input = json!({
+            "note": "built slug $slug with $n items",
+        });
+        let resolved = resolve_refs_in_starter_input(&input, &env).unwrap();
+        assert_eq!(
+            resolved["note"],
+            json!("built slug my-slug with 42 items"),
+            "embedded refs interpolate as strings"
+        );
+    }
+
+    #[test]
+    fn starter_input_walks_arrays_and_nested_objects() {
+        let env_value = json!({ "a": 1, "b": 2, "nested": { "x": "hello" } });
+        let env = crate::pyramid::expression::ValueEnv::new(&env_value);
+        let input = json!({
+            "list": ["$a", "$b", "literal"],
+            "deep": {
+                "level2": {
+                    "val": "$nested.x",
+                }
+            }
+        });
+        let resolved = resolve_refs_in_starter_input(&input, &env).unwrap();
+        assert_eq!(resolved["list"], json!([1, 2, "literal"]));
+        assert_eq!(resolved["deep"]["level2"]["val"], json!("hello"));
+    }
+
+    #[test]
+    fn starter_input_passthrough_for_non_ref_values() {
+        let env_value = json!({});
+        let env = crate::pyramid::expression::ValueEnv::new(&env_value);
+        let input = json!({
+            "plain_string": "hello",
+            "number": 7,
+            "bool": false,
+            "null": null,
+            "array": [1, 2],
+        });
+        let resolved = resolve_refs_in_starter_input(&input, &env).unwrap();
+        assert_eq!(resolved, input);
+    }
+
+    #[test]
+    fn starter_input_missing_ref_raises() {
+        let env_value = json!({ "a": 1 });
+        let env = crate::pyramid::expression::ValueEnv::new(&env_value);
+        let input = json!({ "val": "$nonexistent.field" });
+        let err = resolve_refs_in_starter_input(&input, &env)
+            .expect_err("missing-ref lookup must fail, not silently return null");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("nonexistent"),
+            "error must name the missing symbol: {msg}"
+        );
+    }
+
     #[test]
     fn test_content_type_allows_zero_chunks_gate() {
         // Exempt: derive from cross-slug / composition state, not chunks.

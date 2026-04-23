@@ -26,9 +26,9 @@ description: >
            7b verifier — skip-path visibility per feedback_loud_deferrals).
        Phase 8+ replaces the heuristic with an LLM judge step reading the
        full purpose + substrate context.
-    3. dispatch_synthesizer — mechanical wrapper reading the threaded
-       decide_crystallization output and invoking starter-synthesizer via
-       the sub-chain runner. Guarded by
+    3. call_synthesizer — invokes starter-synthesizer via call_starter_chain,
+       threading decide_crystallization's output into the synthesizer's
+       input envelope with $refs. Guarded by
        `when: $decide_crystallization.should_crystallize == true`.
     4. oracle_finalize — terminal step. On the happy path (synthesizer
        created a meta-layer) it passes through; on the skip path it emits
@@ -36,13 +36,16 @@ description: >
        WHY the oracle declined.
 
   Notes:
-    - Starter runner does NOT resolve $refs inside `step.input` literals,
-      so we deliberately thread through the default (prior-step output →
-      next-step input) threading contract instead of declaring a literal
-      input block. See execute_chain_for_target's step.input handling.
+    - v5 audit P4: the starter runner NOW resolves $ref expressions
+      inside step.input (object values walked recursively; single-ref
+      strings preserve type; embedded refs interpolate). So this chain
+      uses call_starter_chain directly with $ref threading instead of
+      the bespoke dispatch_synthesizer wrapper primitive that used to
+      work around the limitation. Any future library-chain call can
+      follow the same pattern without shipping a Rust wrapper.
     - Every step is mechanical; Phase 7b ships no LLM call at this layer.
 content_type: code
-version: "1.1.0"
+version: "1.2.0"
 author: post-build-accretion-v5
 
 defaults:
@@ -61,11 +64,17 @@ steps:
     mechanical: true
     rust_function: decide_crystallization
 
-  - name: dispatch_synthesizer
+  - name: call_synthesizer
     primitive: custom
     mechanical: true
-    rust_function: dispatch_synthesizer
+    rust_function: call_starter_chain
     when: $decide_crystallization.should_crystallize == true
+    input:
+      chain_id: starter-synthesizer
+      input:
+        purpose_question: $decide_crystallization.purpose_question
+        covered_substrate_nodes: $decide_crystallization.covered_substrate_nodes
+        parent_meta_layer_id: $decide_crystallization.parent_meta_layer_id
 
   - name: oracle_finalize
     primitive: custom

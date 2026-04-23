@@ -625,9 +625,12 @@ const MECHANICAL_FUNCTIONS: &[&str] = &[
     "load_annotation_and_target",
     "append_annotation_to_debate_node",
     // Post-build accretion v5 Phase 7b — meta_layer_oracle upgrade + synthesizer chain.
+    // v5 audit P4: `dispatch_synthesizer` wrapper removed — the oracle
+    // YAML now calls starter-synthesizer via call_starter_chain with
+    // $ref threading directly. The starter runner resolves $refs inside
+    // step.input as of P4, so the wrapper is no longer needed.
     "emit_oracle_invoked",
     "decide_crystallization",
-    "dispatch_synthesizer",
     "oracle_finalize",
     "emit_synthesizer_invoked",
     "load_substrate_nodes",
@@ -1863,83 +1866,15 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 ),
             );
             out.insert("purpose_id".to_string(), Value::from(purpose_id));
-            Ok(Value::Object(out))
-        }
-        "dispatch_synthesizer" => {
-            // Wrapper that reads the threaded decide_crystallization output
-            // from the step input and invokes starter-synthesizer as a
-            // sub-chain. Split from a raw `call_starter_chain` step so the
-            // oracle YAML doesn't rely on $ref resolution inside
-            // `step.input` (starter runner doesn't resolve those — see
-            // execute_chain_for_target's step.input handling).
-            //
-            // The when-guard on this step (`$decide_crystallization.should_crystallize == true`)
-            // prevents us from reaching this arm when the heuristic said
-            // skip, but we double-check defensively: a mis-authored chain
-            // that strips the guard would otherwise silently invoke the
-            // synthesizer on empty substrate.
-            let should = input
-                .get("should_crystallize")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if !should {
-                return Err(anyhow!(
-                    "dispatch_synthesizer: reached with should_crystallize=false. The \
-                     oracle chain's when-guard `$decide_crystallization.should_crystallize == true` \
-                     was removed or bypassed. Restore the guard; this step must never fire \
-                     on a skip decision."
-                ));
+            // v5 audit P4: explicitly set parent_meta_layer_id (null by
+            // default in the Phase 7b heuristic — no parent meta-layer
+            // lineage today) so downstream callers can $ref it without
+            // tripping the starter runner's loud-resolve. Phase 8+ LLM
+            // judge may populate it when chaining meta-layers.
+            if !out.contains_key("parent_meta_layer_id") {
+                out.insert("parent_meta_layer_id".to_string(), Value::Null);
             }
-
-            let purpose_question = input
-                .get("purpose_question")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!(
-                    "dispatch_synthesizer: input missing `purpose_question` string — \
-                     decide_crystallization did not run or its output was stripped from threading."
-                ))?
-                .to_string();
-            let covered_substrate_nodes: Vec<Value> = input
-                .get("covered_substrate_nodes")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let parent_meta_layer_id = input
-                .get("parent_meta_layer_id")
-                .cloned()
-                .unwrap_or(Value::Null);
-
-            info!(
-                "[mechanical] dispatch_synthesizer slug={} substrate_count={} parent_meta_layer={:?}",
-                ctx.slug,
-                covered_substrate_nodes.len(),
-                parent_meta_layer_id,
-            );
-
-            // Build the call_starter_chain envelope and delegate. Same
-            // depth-guarded recursive path as the Phase 6b sub-chain
-            // primitive; we just shape the input here instead of requiring
-            // the YAML author to duplicate the envelope shape.
-            let sub_call_input = serde_json::json!({
-                "chain_id": "starter-synthesizer",
-                "input": {
-                    "purpose_question": purpose_question,
-                    "covered_substrate_nodes": covered_substrate_nodes,
-                    "parent_meta_layer_id": parent_meta_layer_id,
-                }
-            });
-
-            // Box::pin + recursion through the SAME mechanical dispatch
-            // ensures every invariant `call_starter_chain` enforces
-            // (depth guard, ctx.state presence, chain_loader load)
-            // applies here too.
-            let result: Value = Box::pin(dispatch_mechanical(
-                "call_starter_chain",
-                &sub_call_input,
-                ctx,
-            ))
-            .await?;
-            Ok(result)
+            Ok(Value::Object(out))
         }
         "emit_synthesizer_invoked" => {
             // Chronicle trace for the synthesizer role's first step.
