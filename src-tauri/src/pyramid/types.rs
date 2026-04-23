@@ -6,6 +6,7 @@
 //        TreeNode, DrillResult, SearchHit, EntityEntry, BuildStatus, BuildProgress,
 //        PyramidBatch, PendingMutation, AutoUpdateConfig, StaleCheckResult, etc.
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -2361,26 +2362,27 @@ pub const NODE_SHAPE_DEBATE: &str = "debate";
 pub const NODE_SHAPE_META_LAYER: &str = "meta_layer";
 pub const NODE_SHAPE_GAP: &str = "gap";
 
-/// Error raised when `parse_shape_payload` encounters a shape string that
-/// is known to the vocabulary registry but has no typed payload struct
-/// wired into the parser. Phase 6c-D limitation: the payload-handler
-/// registry is NOT contribution-driven yet (Phase 10+ will add that) —
-/// so an agent CAN publish a new node-shape vocab entry (`annotation_cluster`,
-/// say), and `NodeShape::from_db` will accept it as a valid discriminator,
-/// but until the payload struct + match arm here are added, the shape
-/// reader raises. FIXME(phase-10+): replace this static match with a
-/// contribution-driven shape-handler registry.
+/// Error raised when a typed shape handler fails to deserialize its
+/// payload. Phase 9c-2-1 replaced the `UnknownShapePayload` loud-raise
+/// for missing handlers with a `RawJsonShape` fallback (see
+/// `ShapeHandler` / `parse_shape_payload`), so this variant is reserved
+/// for the case where a shape HAS a typed handler but the JSON body
+/// fails to match — i.e. data drift, not a missing registration.
+///
+/// Historical note (pre-9c-2-1): this struct was also raised for "no
+/// handler registered for this shape" — today that path goes through
+/// the RawJsonShape fallback and returns `ShapePayload::Raw(value)`
+/// instead. The error message below reflects the 9c-2-1 semantics.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "No payload handler registered for node_shape '{0}' — the vocab entry \
-exists but no typed payload struct has been wired into parse_shape_payload. \
-Remediation: either (1) add a `NODE_SHAPE_{{name}}` const + payload struct \
-+ match arm in `parse_shape_payload` (src-tauri/src/pyramid/types.rs), or \
-(2) wait for the Phase 10+ contribution-driven shape-handler registry that \
-will make payload types first-class contributions. Context (slug + node_id) \
-is attached by the caller via with_context."
+    "Typed shape handler for node_shape '{0}' failed to parse its \
+payload: {1}. The vocab entry exists AND a typed handler is registered, \
+but the JSON body doesn't match the handler's schema — likely data drift \
+from a vocab supersession or a hand-edited row. Remediation: fix the \
+`shape_payload_json` column OR publish a new handler that accepts the \
+legacy body. Context (slug + node_id) is attached by the caller."
 )]
-pub struct UnknownShapePayload(pub String);
+pub struct UnknownShapePayload(pub String, pub String);
 
 /// Node shape discriminator stored in `pyramid_nodes.node_shape`.
 /// NULL / empty / "scaffolding" all normalize to the scaffolding shape.
@@ -2661,12 +2663,32 @@ pub struct GapCandidate {
 /// Tagged enum over shape-specific payloads. Serialized to
 /// `pyramid_nodes.shape_payload_json` via serde untagged with a sibling
 /// node_shape column as the discriminator.
+///
+/// Phase 9c-2-1: added `Raw(serde_json::Value)`. Core shapes (Debate /
+/// MetaLayer / Gap) still deserialize through their typed handlers; a
+/// shape published via vocab without a typed Rust handler parses into
+/// `Raw` so ingress + persistence work without a code deploy. Typed
+/// consumers that match on `Debate(_)` / `MetaLayer(_)` / `Gap(_)`
+/// silently skip a `Raw(_)` payload — the shape can hold data, but the
+/// typed consumer doesn't know the schema. Handlers can be added later
+/// without migrating data.
+///
+/// Serde `untagged` still applies, but `parse_shape_payload` does NOT
+/// dispatch via serde's try-each behavior — it routes by `shape.as_str()`
+/// through the registry, so the Raw variant will only be produced when
+/// the shape has no typed handler.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ShapePayload {
     Debate(DebateTopic),
     MetaLayer(MetaLayerTopic),
     Gap(GapTopic),
+    /// Phase 9c-2-1 pass-through JSON fallback for vocab-registered
+    /// shapes without a typed Rust handler. Kept last in the untagged
+    /// enum so serde's forward-compat attempts Debate/MetaLayer/Gap
+    /// first when external deserializers are used (today there are
+    /// none — `parse_shape_payload` is the only entrypoint).
+    Raw(serde_json::Value),
 }
 
 /// Typed view of a node's shape + payload as resolved from the two
@@ -2720,37 +2742,179 @@ pub fn parse_shape_payload(
         )
     })?;
 
-    // Phase 6c-D: match on the canonical string because NodeShape is now
-    // a newtype not an enum. Anything not in the genesis-known set raises
-    // `UnknownShapePayload` loud — the agent can publish a new node-shape
-    // vocab entry (accepted by `NodeShape::from_db`), but until someone
-    // writes the payload struct + extends this match, the parser refuses.
+    // Phase 9c-2-1: dispatch through the contribution-driven shape-handler
+    // registry. Core shapes (Debate / MetaLayer / Gap) ship typed handlers
+    // that deserialize into their Topic structs. Shapes without a typed
+    // handler flow through the RawJsonShape fallback → ShapePayload::Raw,
+    // so an agent can publish a new node-shape vocab entry AND start
+    // storing payloads under it without a code deploy. Typed consumers
+    // (match arms that read Debate/MetaLayer/Gap) will silently skip the
+    // Raw variant — adding a typed handler later lights them up with no
+    // migration.
     //
-    // FIXME(phase-10+): replace this static match with a contribution-driven
-    // shape-handler registry so payload types are first-class contributions
-    // too. Today this is the one spot where NodeShape is NOT fully generalized.
-    match shape_str {
-        NODE_SHAPE_DEBATE => serde_json::from_str::<DebateTopic>(payload)
-            .map(|t| Some(ShapePayload::Debate(t)))
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "shape_payload_json failed to parse as DebateTopic (node_shape='debate'): {e}"
-                )
-            }),
-        NODE_SHAPE_META_LAYER => serde_json::from_str::<MetaLayerTopic>(payload)
-            .map(|t| Some(ShapePayload::MetaLayer(t)))
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "shape_payload_json failed to parse as MetaLayerTopic (node_shape='meta_layer'): {e}"
-                )
-            }),
-        NODE_SHAPE_GAP => serde_json::from_str::<GapTopic>(payload)
-            .map(|t| Some(ShapePayload::Gap(t)))
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "shape_payload_json failed to parse as GapTopic (node_shape='gap'): {e}"
-                )
-            }),
-        other => Err(anyhow::Error::new(UnknownShapePayload(other.to_string()))),
+    // A mismatched payload (e.g. debate shape with gap-shaped JSON) still
+    // raises loud via the handler's own deserialize error path — the Raw
+    // fallback only fires for shapes with NO typed handler registered.
+    let handler = shape_handler_registry()
+        .get(shape_str)
+        .cloned();
+    match handler {
+        Some(h) => h
+            .parse_payload(payload)
+            .map(Some)
+            .with_context(|| format!("shape_handler '{}' failed to parse payload", shape_str)),
+        None => {
+            // Warn ONCE per unknown shape kind — loud enough an operator
+            // knows to wire a typed handler, quiet enough not to flood logs
+            // per read of a raw-shape node.
+            warn_unknown_shape_once(shape_str);
+            let value: serde_json::Value = serde_json::from_str(payload)
+                .with_context(|| {
+                    format!(
+                        "RawJsonShape fallback: shape_payload_json for node_shape='{}' \
+                         is not valid JSON",
+                        shape_str
+                    )
+                })?;
+            Ok(Some(ShapePayload::Raw(value)))
+        }
+    }
+}
+
+// ── Phase 9c-2-1: Contribution-driven shape-handler registry ─────────────
+//
+// Core shapes (Debate, MetaLayer, Gap) ship as typed handlers backed by
+// their respective `Topic` structs. The `Scaffolding` case is handled
+// BEFORE the registry dispatch in `parse_shape_payload` (null payload is
+// a special semantic, not a typed-vs-raw distinction) — so the registry
+// never contains `scaffolding`.
+//
+// Shapes whose vocab entry is known but which have no typed Rust handler
+// flow through the `RawJsonShape` fallback in `parse_shape_payload` →
+// `ShapePayload::Raw(value)`. Adding a new typed handler is a single
+// `ShapeHandler` impl + one line of registration in `build_registry()`.
+// Adding a new shape without a typed handler is a pure vocab publish
+// (contribution write) — no code deploy.
+//
+// Thread-safety: the registry is a `LazyLock<HashMap<..., Arc<dyn ShapeHandler>>>`.
+// It is built exactly once under the `LazyLock` mutex on first read and
+// is immutable afterward; subsequent lookups are lock-free reads. Handler
+// impls are `Send + Sync` (no interior state) so concurrent parsers
+// calling the same handler are safe.
+
+/// Trait every shape handler implements. Handlers are stateless — they
+/// encapsulate the shape name + a typed deserialize path. The `&self`
+/// receiver lets future handlers carry config (e.g. schema versions)
+/// without breaking the registry API.
+pub trait ShapeHandler: Send + Sync {
+    /// Canonical shape name (matches `pyramid_nodes.node_shape`).
+    fn shape_name(&self) -> &'static str;
+    /// Parse the `shape_payload_json` body into a typed `ShapePayload`.
+    /// Implementations return an error (NOT a Raw fallback) if the JSON
+    /// does not match the handler's schema — a handler mismatch is a
+    /// data bug, not a forward-compat scenario.
+    fn parse_payload(&self, json: &str) -> anyhow::Result<ShapePayload>;
+}
+
+/// Typed handler for `debate` shape — backs `ShapePayload::Debate`.
+struct DebateShapeHandler;
+impl ShapeHandler for DebateShapeHandler {
+    fn shape_name(&self) -> &'static str {
+        NODE_SHAPE_DEBATE
+    }
+    fn parse_payload(&self, json: &str) -> anyhow::Result<ShapePayload> {
+        let t: DebateTopic = serde_json::from_str(json).map_err(|e| {
+            anyhow::anyhow!(
+                "shape_payload_json failed to parse as DebateTopic \
+                 (node_shape='debate'): {e}"
+            )
+        })?;
+        Ok(ShapePayload::Debate(t))
+    }
+}
+
+/// Typed handler for `meta_layer` shape — backs `ShapePayload::MetaLayer`.
+struct MetaLayerShapeHandler;
+impl ShapeHandler for MetaLayerShapeHandler {
+    fn shape_name(&self) -> &'static str {
+        NODE_SHAPE_META_LAYER
+    }
+    fn parse_payload(&self, json: &str) -> anyhow::Result<ShapePayload> {
+        let t: MetaLayerTopic = serde_json::from_str(json).map_err(|e| {
+            anyhow::anyhow!(
+                "shape_payload_json failed to parse as MetaLayerTopic \
+                 (node_shape='meta_layer'): {e}"
+            )
+        })?;
+        Ok(ShapePayload::MetaLayer(t))
+    }
+}
+
+/// Typed handler for `gap` shape — backs `ShapePayload::Gap`.
+struct GapShapeHandler;
+impl ShapeHandler for GapShapeHandler {
+    fn shape_name(&self) -> &'static str {
+        NODE_SHAPE_GAP
+    }
+    fn parse_payload(&self, json: &str) -> anyhow::Result<ShapePayload> {
+        let t: GapTopic = serde_json::from_str(json).map_err(|e| {
+            anyhow::anyhow!(
+                "shape_payload_json failed to parse as GapTopic \
+                 (node_shape='gap'): {e}"
+            )
+        })?;
+        Ok(ShapePayload::Gap(t))
+    }
+}
+
+static SHAPE_HANDLER_REGISTRY: std::sync::LazyLock<
+    std::collections::HashMap<String, std::sync::Arc<dyn ShapeHandler>>,
+> = std::sync::LazyLock::new(build_shape_handler_registry);
+
+fn build_shape_handler_registry(
+) -> std::collections::HashMap<String, std::sync::Arc<dyn ShapeHandler>> {
+    let mut map: std::collections::HashMap<String, std::sync::Arc<dyn ShapeHandler>> =
+        std::collections::HashMap::new();
+    let handlers: Vec<std::sync::Arc<dyn ShapeHandler>> = vec![
+        std::sync::Arc::new(DebateShapeHandler),
+        std::sync::Arc::new(MetaLayerShapeHandler),
+        std::sync::Arc::new(GapShapeHandler),
+    ];
+    for h in handlers {
+        map.insert(h.shape_name().to_string(), h);
+    }
+    map
+}
+
+/// Lookup handle. Returns a map reference; `.get(shape_name)` yields the
+/// handler if one is registered. Exposed `pub(crate)` for tests that want
+/// to assert the genesis registration is complete.
+pub(crate) fn shape_handler_registry(
+) -> &'static std::collections::HashMap<String, std::sync::Arc<dyn ShapeHandler>> {
+    &SHAPE_HANDLER_REGISTRY
+}
+
+/// One-warn-per-unknown-shape helper. Keeps a process-wide `Mutex<HashSet<String>>`
+/// so an unknown shape encountered thousands of times (every read of the
+/// same raw-shape node) only logs a single `warn!` — loud enough to
+/// surface the gap, quiet enough not to flood. Subsequent reads return
+/// a Raw payload without emitting.
+fn warn_unknown_shape_once(shape_str: &str) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut guard = match seen.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.insert(shape_str.to_string()) {
+        tracing::warn!(
+            shape = %shape_str,
+            "parse_shape_payload: no typed ShapeHandler registered for node_shape \
+             — falling back to RawJsonShape (ShapePayload::Raw). Ingress works; \
+             typed consumers cannot read this shape until a ShapeHandler is \
+             added. Per feedback_loud_deferrals this warning fires once per \
+             shape kind."
+        );
     }
 }

@@ -6675,11 +6675,13 @@ pub fn get_node_shape(
     let Some((shape_str, payload_json)) = row else {
         return Ok(None);
     };
-    // Phase 6c-D: `NodeShape::from_db` now vocab-validates (NodeShape is
-    // a newtype wrapper, not an enum). Unknown strings still raise loud
-    // via `UnknownNodeShape`; `parse_shape_payload` raises
-    // `UnknownShapePayload` for shapes accepted by the registry but
-    // without a typed payload struct wired in.
+    // Phase 6c-D + 9c-2-1: `NodeShape::from_db` vocab-validates (NodeShape
+    // is a newtype wrapper, not an enum). Unknown strings still raise loud
+    // via `UnknownNodeShape`; `parse_shape_payload` dispatches through the
+    // contribution-driven shape-handler registry — shapes with a typed
+    // handler parse into their Topic struct, shapes without one fall back
+    // to `ShapePayload::Raw(serde_json::Value)` (no code deploy needed to
+    // publish + store a new shape). See the 6c-D + 9c-2-1 test modules.
     let shape = super::types::NodeShape::from_db(conn, shape_str.as_deref())
         .with_context(|| format!("slug='{slug}' node='{node_id}'"))?;
     let payload = super::types::parse_shape_payload(&shape, payload_json.as_deref())
@@ -27620,10 +27622,11 @@ mod phase6c_b_post_build_tests {
 // vocab-driven flip. Tests verify:
 //
 //   1. NodeShape::from_db vocab-validates + raises loud on unknown strings
-//   2. parse_shape_payload raises UnknownShapePayload on vocab-known but
-//      payload-unhandled shapes (the phase-10+ limitation)
+//   2. parse_shape_payload falls back to ShapePayload::Raw for vocab-known
+//      shapes without a typed handler (Phase 9c-2-1 flipped this from a
+//      loud-raise; the raise was the phase-10+ FIXME that 9c-2-1 closed).
 //   3. Publishing a new node_shape vocab entry makes NodeShape::from_db
-//      accept it (without unlocking its payload)
+//      accept it (and parse_shape_payload returns Raw for its payload)
 //   4. backfill_genesis_bindings reads from the vocab registry, not a const
 //   5. No source file still references `GENESIS_BINDINGS`
 //   6. init_pyramid_db orders seed-before-backfill so fresh DBs get
@@ -27636,7 +27639,7 @@ mod phase6c_d_post_build_tests {
     // Phase 7b verifier: shared lock across all post_build modules.
     use super::post_build_test_support::test_lock;
     use crate::pyramid::types::{
-        parse_shape_payload, ContentType, NodeShape, UnknownShapePayload,
+        parse_shape_payload, ContentType, NodeShape,
     };
     use crate::pyramid::vocab_entries::{
         self, VocabEntry, VOCAB_KIND_NODE_SHAPE, VOCAB_KIND_ROLE_NAME,
@@ -27697,11 +27700,13 @@ mod phase6c_d_post_build_tests {
     }
 
     // ── Test 2 ─────────────────────────────────────────────────────────
-    // `parse_shape_payload` raises `UnknownShapePayload` for a shape the
-    // registry accepts but no typed payload struct is wired for. This
-    // documents the phase-10+ FIXME: vocab accepts but the parser does not.
+    // Phase 9c-2-1 flipped this from a loud-raise to a Raw-fallback test.
+    // An agent-published node_shape vocab entry with NO typed Rust handler
+    // now parses into `ShapePayload::Raw(Value)` so ingress works without
+    // a code deploy. Typed consumers silently skip Raw — adding a typed
+    // handler later lights them up with zero data migration.
     #[test]
-    fn parse_shape_payload_unknown_shape_raises() {
+    fn parse_shape_payload_unknown_shape_falls_back_to_raw() {
         let _lock = test_lock();
         let conn = mem_conn();
 
@@ -27724,17 +27729,19 @@ mod phase6c_d_post_build_tests {
         let shape = NodeShape::from_db(&conn, Some("custom_shape")).unwrap();
         assert_eq!(shape.as_str(), "custom_shape");
 
-        // parse_shape_payload refuses — no typed payload handler wired in.
-        // The phase-10+ FIXME in types.rs documents that contribution-driven
-        // shape-handler registration is future work.
-        let err = parse_shape_payload(&shape, Some("{}")).unwrap_err();
-        let root = err.root_cause();
-        let down = root.downcast_ref::<UnknownShapePayload>();
-        assert!(
-            down.is_some(),
-            "expected UnknownShapePayload at root, got chain: {err:?}"
-        );
-        assert_eq!(down.unwrap().0, "custom_shape");
+        // Phase 9c-2-1: parse_shape_payload no longer refuses — the
+        // RawJsonShape fallback returns a `ShapePayload::Raw(Value)`
+        // carrying the original JSON body verbatim.
+        let body = r#"{"foo":"bar","nested":{"n":42}}"#;
+        let parsed = parse_shape_payload(&shape, Some(body))
+            .expect("Raw fallback should accept vocab-known shape without typed handler");
+        match parsed {
+            Some(crate::pyramid::types::ShapePayload::Raw(value)) => {
+                assert_eq!(value["foo"], serde_json::json!("bar"));
+                assert_eq!(value["nested"]["n"], serde_json::json!(42));
+            }
+            other => panic!("expected ShapePayload::Raw fallback, got {other:?}"),
+        }
     }
 
     // ── Test 3 ─────────────────────────────────────────────────────────
