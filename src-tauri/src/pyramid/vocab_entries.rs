@@ -684,7 +684,7 @@ fn emit_vocabulary_event_with_reason(
 
 // ── Genesis seeder ──────────────────────────────────────────────────
 
-/// Seed the 30 genesis vocabulary entries (15 annotation types, 4 node
+/// Seed the 31 genesis vocabulary entries (16 annotation types, 4 node
 /// shapes, 11 role names incl. cascade_handler) into the contribution
 /// store. Idempotent — existing active entries are left alone; only
 /// missing entries are inserted. Called from `db::init_pyramid_db` after
@@ -693,6 +693,9 @@ fn emit_vocabulary_event_with_reason(
 /// Phase 7c added 4 pure-vocab annotation types (gap, hypothesis,
 /// purpose_declaration, purpose_shift) — they have no `ANNOTATION_TYPE_*`
 /// const because the enum is vocab-driven post-6c-B.
+///
+/// Phase 9c-1 added `debate_collapse` (brings annotation types to 16)
+/// to close the Phase 8-3 `emit_debate_collapsed` dormant-emitter gap.
 ///
 /// Failures on individual entries do not abort the whole seed pass —
 /// each entry is wrapped in a best-effort `if let Err` per the pattern

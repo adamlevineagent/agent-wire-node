@@ -3629,6 +3629,15 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 // Canonical collapse path: transition to scaffolding, NULL
                 // the payload, emit `debate_collapsed` with the terminal
                 // debate state in metadata.
+                //
+                // v5 Phase 9c-1 verifier: the UPDATE + event-emit must be
+                // atomic. Without a transaction, a crash between the UPDATE
+                // and the event write leaves the node transitioned but the
+                // audit trail missing — worse than a pre-crash state because
+                // the terminal debate payload is already NULL in
+                // pyramid_nodes, so the debate content is unrecoverable.
+                // Wrap in SAVEPOINT so any mid-flight failure rolls BOTH
+                // back (feedback_loud_deferrals: integrity first).
                 let debate_ref = existing_debate.as_ref();
                 let position_labels: Vec<String> = debate_ref
                     .map(|d| d.positions.iter().map(|p| p.label.clone()).collect())
@@ -3642,13 +3651,18 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                     .unwrap_or(Value::Null);
                 let positions_remaining = position_labels.len();
 
-                // Transition: debate → scaffolding, NULL shape_payload_json.
-                conn_guard.execute(
-                    "UPDATE pyramid_nodes
-                     SET node_shape = 'scaffolding', shape_payload_json = NULL
-                     WHERE slug = ?1 AND id = ?2",
-                    rusqlite::params![ctx.slug, target_node_id],
-                )?;
+                // v5 Phase 9c-1 verifier: the debate payload is destroyed
+                // by the transition (shape_payload_json → NULL). Serialize
+                // the FULL DebateTopic (not just labels) into the
+                // observation event metadata so the chronicle carries every
+                // steel_manning argument, red_team rebuttal, evidence_anchor,
+                // and source_annotation_id. Without the full payload the
+                // audit trail is incomplete — a replay-for-accountability
+                // reader could reconstruct who argued what, not just the
+                // list of position names.
+                let final_debate_payload = debate_ref
+                    .and_then(|d| serde_json::to_value(d).ok())
+                    .unwrap_or(Value::Null);
 
                 // Compose the collapse reason + collapsed_by from the
                 // triggering annotation. Fall back to defaults when the
@@ -3662,24 +3676,8 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "starter-debate-collapse".to_string());
 
-                // Emit `debate_collapsed` via the canonical helper. The
-                // helper carries debate_node_id / reason / positions_remaining
-                // / collapsed_by; we merge in the audit-trail fields
-                // (final_concern, final_position_labels, final_vote_lean,
-                // annotation_id) by writing an EXTENDED metadata row
-                // directly, keeping the helper's contract for the base
-                // fields.
-                let metadata = serde_json::json!({
-                    "debate_node_id": target_node_id,
-                    "reason": reason,
-                    "positions_remaining": positions_remaining,
-                    "collapsed_by": collapsed_by,
-                    "annotation_id": annotation_id,
-                    "final_concern": concern,
-                    "final_position_labels": position_labels,
-                    "final_vote_lean": vote_lean_json,
-                })
-                .to_string();
+                // Resolve layer BEFORE opening the savepoint so the
+                // read doesn't need to roll back on emit failure.
                 let layer: Option<i64> = conn_guard
                     .query_row(
                         "SELECT depth FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
@@ -3687,8 +3685,35 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                         |r| r.get(0),
                     )
                     .ok();
-                let debate_collapsed_event_id =
-                    super::observation_events::write_observation_event(
+
+                // Atomic: UPDATE + event emit inside a savepoint. rusqlite
+                // has no Savepoint::new_named on &Connection without &mut,
+                // so drive it via raw SQL.
+                conn_guard.execute_batch("SAVEPOINT finalize_debate_collapse")?;
+                let collapse_result: std::result::Result<i64, anyhow::Error> = (|| {
+                    conn_guard.execute(
+                        "UPDATE pyramid_nodes
+                         SET node_shape = 'scaffolding', shape_payload_json = NULL
+                         WHERE slug = ?1 AND id = ?2",
+                        rusqlite::params![ctx.slug, target_node_id],
+                    )?;
+                    let metadata = serde_json::json!({
+                        "debate_node_id": target_node_id,
+                        "reason": reason,
+                        "positions_remaining": positions_remaining,
+                        "collapsed_by": collapsed_by,
+                        "annotation_id": annotation_id,
+                        "final_concern": concern,
+                        "final_position_labels": position_labels,
+                        "final_vote_lean": vote_lean_json,
+                        // v5 Phase 9c-1 verifier: full payload for audit
+                        // reconstruction (steel_manning/red_teams/evidence_anchors/
+                        // source_annotation_ids all preserved here since the
+                        // node's shape_payload_json is about to be NULLed).
+                        "final_debate_payload": final_debate_payload,
+                    })
+                    .to_string();
+                    let event_id = super::observation_events::write_observation_event(
                         &conn_guard,
                         &ctx.slug,
                         "chain",
@@ -3701,6 +3726,29 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                         layer,
                         Some(&metadata),
                     )?;
+                    Ok(event_id)
+                })();
+                let debate_collapsed_event_id = match collapse_result {
+                    Ok(eid) => {
+                        conn_guard
+                            .execute_batch("RELEASE SAVEPOINT finalize_debate_collapse")?;
+                        eid
+                    }
+                    Err(e) => {
+                        // Best-effort rollback; if this also fails the outer
+                        // error is the right one to surface.
+                        let _ = conn_guard.execute_batch(
+                            "ROLLBACK TO SAVEPOINT finalize_debate_collapse; \
+                             RELEASE SAVEPOINT finalize_debate_collapse",
+                        );
+                        return Err(anyhow!(
+                            "finalize_debate_node: atomic collapse failed for target '{}' — \
+                             rolled back to pre-transition state: {}",
+                            target_node_id,
+                            e
+                        ));
+                    }
+                };
                 drop(conn_guard);
 
                 info!(

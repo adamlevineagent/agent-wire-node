@@ -536,6 +536,25 @@ struct AnnotateBody {
     author: Option<String>,
 }
 
+/// Post-build accretion v5 Phase 9c-1: `POST /pyramid/:slug/debates/:node_id/collapse`.
+/// Operator-facing admin endpoint to collapse a Debate node. Internally writes
+/// a `debate_collapse` annotation, which fires the canonical annotation hook
+/// → annotation_reacted → handler_chain_id=starter-debate-collapse → shape
+/// transition. The dual path (HTTP admin + annotation) is canonical per
+/// feedback_no_deferral_creep — the feature must be usable both from the
+/// substrate UI (annotation) and from the operator surface (HTTP).
+#[derive(Deserialize, Default)]
+struct CollapseDebateBody {
+    /// Short human-readable reason. Stored as the annotation `content`.
+    /// Defaults to `"operator_collapsed"` when empty.
+    #[serde(default)]
+    reason: Option<String>,
+    /// Optional operator identity for the annotation `author` field.
+    /// Defaults to `"operator"` when missing.
+    #[serde(default)]
+    author: Option<String>,
+}
+
 // ── WS-VOCAB query parameter structs ────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -2822,10 +2841,33 @@ pub fn pyramid_routes(
 
     let top35 = top34.or(propose_question).unify().boxed();
 
+    // ── Post-build accretion v5 Phase 9c-1: operator debate collapse ──
+    //
+    // POST /pyramid/:slug/debates/:node_id/collapse — operator-facing
+    // admin path that writes a `debate_collapse` annotation on the
+    // target node, triggering the canonical starter-debate-collapse
+    // chain. Sibling of the annotation-based path; both paths shipped
+    // together per feedback_no_deferral_creep (the feature is not
+    // complete if an operator can only collapse via substrate UI).
+    // Local-only auth (mutation).
+    let collapse_debate = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("debates"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("collapse"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::content_length_limit(1_048_576))
+        .and(warp::body::json::<CollapseDebateBody>())
+        .and_then(handle_collapse_debate));
+
+    let top36 = top35.or(collapse_debate).unify().boxed();
+
     // public_html is now mounted separately at the server level so it can
     // get a permissive CORS filter (the desktop API allowlist would block
     // form POSTs from the tunnel host).
-    top35
+    top36
 }
 
 /// GET /vocabulary/:vocab_kind — public read of the vocabulary
@@ -3161,6 +3203,185 @@ async fn handle_propose_question(
         warp::http::StatusCode::OK,
     )
     .into_response())
+}
+
+/// Post-build accretion v5 Phase 9c-1: operator-facing admin endpoint
+/// to collapse a Debate node back to Scaffolding.
+///
+/// POST /pyramid/:slug/debates/:node_id/collapse
+/// Body (all optional):
+///   { "reason": "Consensus reached on X.", "author": "alice" }
+///
+/// Internally this writes a `debate_collapse` annotation on the target
+/// node via the canonical annotation path. The annotation's
+/// `process_annotation_hook` stamps `handler_chain_id=starter-debate-collapse`
+/// onto the emitted `annotation_reacted` event; the next compile tick
+/// compiles that into a work item whose `starter-debate-collapse` chain
+/// fires `finalize_debate_node` and performs the Debate → Scaffolding
+/// transition + `debate_collapsed` event emission atomically.
+///
+/// The HTTP path is a sibling of the annotation path — same effect,
+/// different entry point. This covers operator UIs / CLIs that want a
+/// single-verb collapse call without constructing an annotation
+/// payload themselves. Local-only auth (mutation).
+///
+/// Returns 200 + the created annotation. Does NOT wait for the chain
+/// to finish — the hook fires in the background (mirrors
+/// `handle_annotate`). The client can poll
+/// `GET /pyramid/:slug/nodes/:id` to observe the shape transition, or
+/// the chronicle for the `debate_collapsed` event.
+///
+/// Status codes:
+///   200 — annotation saved + hook scheduled
+///   404 — slug or node not found
+///   400 — node is not a Debate shape (clients can still post, but
+///         the collapse chain will skip loud — we prefer a fast 400
+///         at the HTTP boundary for the common mis-click case)
+///   500 — persistence failure
+async fn handle_collapse_debate(
+    slug_name: String,
+    node_id: String,
+    state: Arc<PyramidState>,
+    body: CollapseDebateBody,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Validate slug + node + current shape up front.
+    {
+        let conn = state.reader.lock().await;
+        match slug::get_slug(&conn, &slug_name) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("slug '{slug_name}' not found"),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+        match db::get_node(&conn, &slug_name, &node_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("node '{node_id}' not found in slug '{slug_name}'"),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+        // Shape pre-check: fail fast with a 400 on non-Debate targets so the
+        // operator UX doesn't have to poll the chronicle to discover the
+        // skip. The chain-level skip path still fires defensively for
+        // direct annotation writes that bypass this endpoint — both
+        // surfaces stay loud per feedback_loud_deferrals.
+        match db::get_node_shape(&conn, &slug_name, &node_id) {
+            Ok(Some(shape_view)) => {
+                if !shape_view.shape.as_str().eq(NODE_SHAPE_DEBATE) {
+                    return Ok(json_error(
+                        warp::http::StatusCode::BAD_REQUEST,
+                        &format!(
+                            "node '{node_id}' has shape '{}' — only Debate nodes can be \
+                             collapsed via this endpoint. Write a `debate_collapse` \
+                             annotation via /annotate if you need the chronicle trail anyway.",
+                            shape_view.shape.as_str(),
+                        ),
+                    ));
+                }
+            }
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("node '{node_id}' shape row missing"),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+    }
+
+    let content = body
+        .reason
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "operator_collapsed".to_string());
+    let author = body
+        .author
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "operator".to_string());
+
+    let annotation = PyramidAnnotation {
+        id: 0,
+        slug: slug_name.clone(),
+        node_id: node_id.clone(),
+        annotation_type: AnnotationType::from_db_string("debate_collapse"),
+        content,
+        question_context: None,
+        author,
+        created_at: String::new(),
+    };
+
+    let saved = {
+        let conn = state.writer.lock().await;
+        match db::save_annotation(&conn, &annotation) {
+            Ok(a) => a,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to save debate_collapse annotation: {e}"),
+                ));
+            }
+        }
+    };
+
+    // Fire the canonical annotation hook in the background — mirrors
+    // handle_annotate so the admin path and the annotation path have
+    // identical dispatch semantics.
+    let annotation_clone = saved.clone();
+    let writer_clone = state.writer.clone();
+    let reader_clone = state.reader.clone();
+    let slug_clone = saved.slug.clone();
+    let annotation_build_id = format!("annotation-{}-{}", slug_clone, saved.id);
+    let base_config = state
+        .llm_config_with_cache(&slug_clone, &annotation_build_id)
+        .await;
+    let model = base_config.primary_model.clone();
+    let ops_clone = state.operational.clone();
+    tokio::spawn(async move {
+        if let Err(e) = process_annotation_hook(
+            &reader_clone,
+            &writer_clone,
+            &slug_clone,
+            &annotation_clone,
+            &base_config,
+            &model,
+            &ops_clone,
+        )
+        .await
+        {
+            tracing::error!(
+                "[collapse-debate] post-save hook failed: {} (annotation saved but dispatch skipped)",
+                e
+            );
+        }
+    });
+
+    Ok(
+        warp::reply::with_status(warp::reply::json(&saved), warp::http::StatusCode::OK)
+            .into_response(),
+    )
 }
 
 // ── Route handlers ──────────────────────────────────────────────────

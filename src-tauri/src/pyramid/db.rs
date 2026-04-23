@@ -2695,9 +2695,10 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
 
     // ── Post-build accretion v5 Phase 6c-A/D: vocabulary genesis seed ─────
     //
-    // Seed the 30 genesis vocabulary entries (15 annotation types — 11
-    // pre-7c + 4 Phase 7c verbs, 4 node shapes, 11 role names) as
-    // `vocabulary_entry:<kind>:<name>` rows in `pyramid_config_contributions`.
+    // Seed the 31 genesis vocabulary entries (16 annotation types — 11
+    // pre-7c + 4 Phase 7c verbs + 1 Phase 9c-1 debate_collapse, 4 node
+    // shapes, 11 role names) as `vocabulary_entry:<kind>:<name>` rows in
+    // `pyramid_config_contributions`.
     // Idempotent via existence check on the compound schema_type —
     // existing active rows are left alone; only missing entries are
     // inserted.
@@ -30127,7 +30128,7 @@ mod phase7c_post_build_tests {
         );
     }
 
-    // ── 7c-7.2: genesis seeds 15 annotation types after Phase 7c ───────
+    // ── 7c-7.2: genesis seeds 16 annotation types after Phase 9c-1 ─────
     //
     // Phase 9c-1 update: bumped to 16 after `debate_collapse` was added
     // to close the 8-3 `emit_debate_collapsed` dormant-emitter gap. The
@@ -35450,5 +35451,159 @@ mod phase9c1_post_build_tests {
         let _: fn(
             &Connection, &str, &str, Option<i64>, &str, usize, &str,
         ) -> anyhow::Result<i64> = observation_events::emit_debate_collapsed;
+    }
+
+    // ── 9c-1.7 (verifier): debate_collapsed metadata carries the FULL
+    // debate payload (steel_manning / red_teams / evidence_anchors /
+    // source_annotation_ids), not just labels. The node's payload is
+    // NULLed by the transition, so the chronicle is the only trail.
+
+    #[tokio::test]
+    async fn finalize_debate_node_emits_full_debate_payload_in_metadata() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p9c1full", &ContentType::Code, "/tmp/p9c1full").unwrap();
+
+        // A debate with rich content: steel_manning text + red_team rebuttals
+        // + evidence_anchors + source_annotation_ids on every position.
+        let debate = DebateTopic {
+            concern: "Adopt SQLite WAL mode?".to_string(),
+            positions: vec![
+                DebatePosition {
+                    label: "Pro-WAL".to_string(),
+                    steel_manning: "WAL permits concurrent readers while a writer is active."
+                        .to_string(),
+                    red_teams: vec![crate::pyramid::types::RedTeamEntry {
+                        from_position: "Anti-WAL".to_string(),
+                        argument: "WAL adds a -shm / -wal sidecar.".to_string(),
+                        evidence_anchors: vec!["L1-002".to_string()],
+                        source_annotation_ids: vec!["annotation#21".to_string()],
+                    }],
+                    evidence_anchors: vec!["L1-001".to_string()],
+                    source_annotation_ids: vec!["annotation#10".to_string()],
+                },
+                DebatePosition {
+                    label: "Anti-WAL".to_string(),
+                    steel_manning: "Rollback journal mode is the default for a reason."
+                        .to_string(),
+                    red_teams: vec![],
+                    evidence_anchors: vec!["L1-003".to_string()],
+                    source_annotation_ids: vec!["annotation#11".to_string()],
+                },
+            ],
+            cross_refs: vec![],
+            vote_lean: Some(VoteLean {
+                up_count: 5,
+                down_count: 2,
+                per_position: None,
+            }),
+        };
+        seed_debate_node(&conn, "p9c1full", "L2-FULL", &debate);
+        let ann = save_collapse_annotation(
+            &conn,
+            "p9c1full",
+            "L2-FULL",
+            "WAL wins.",
+            "reviewer",
+        );
+
+        let state_pyr = test_pyramid_state(conn);
+        let chain = chain_loader::load_chain_by_id(
+            "starter-debate-collapse",
+            &state_pyr.chains_dir,
+        )
+        .unwrap();
+        chain_executor::execute_chain_for_target(
+            &state_pyr,
+            &chain,
+            "p9c1full",
+            Some("L2-FULL"),
+            serde_json::json!({
+                "target_id": "L2-FULL",
+                "annotation_id": ann.id,
+                "annotation_type": "debate_collapse",
+                "step_name": "cascade_reacted",
+                "layer": 2,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let writer = state_pyr.writer.lock().await;
+        let metadata: String = writer
+            .query_row(
+                "SELECT metadata_json FROM dadbear_observation_events
+                  WHERE slug = 'p9c1full' AND event_type = 'debate_collapsed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        let payload = &meta["final_debate_payload"];
+        assert!(
+            !payload.is_null(),
+            "final_debate_payload must be in metadata (audit trail)"
+        );
+        // Full concern preserved.
+        assert_eq!(payload["concern"], serde_json::json!("Adopt SQLite WAL mode?"));
+        // Full positions[0]: steel_manning, red_teams, evidence_anchors, source_annotation_ids.
+        let positions = payload["positions"].as_array().unwrap();
+        assert_eq!(positions.len(), 2);
+        assert_eq!(
+            positions[0]["steel_manning"],
+            serde_json::json!("WAL permits concurrent readers while a writer is active.")
+        );
+        let red_teams = positions[0]["red_teams"].as_array().unwrap();
+        assert_eq!(red_teams.len(), 1);
+        assert_eq!(
+            red_teams[0]["argument"],
+            serde_json::json!("WAL adds a -shm / -wal sidecar.")
+        );
+        assert_eq!(
+            red_teams[0]["evidence_anchors"][0],
+            serde_json::json!("L1-002")
+        );
+        assert_eq!(
+            positions[0]["evidence_anchors"][0],
+            serde_json::json!("L1-001")
+        );
+        assert_eq!(
+            positions[0]["source_annotation_ids"][0],
+            serde_json::json!("annotation#10")
+        );
+        // Node's shape_payload_json is now NULL — the chronicle is the
+        // only place this content still exists.
+        let payload_col: Option<String> = writer
+            .query_row(
+                "SELECT shape_payload_json FROM pyramid_nodes
+                  WHERE slug = 'p9c1full' AND id = 'L2-FULL'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            payload_col.is_none(),
+            "shape_payload_json must be NULL after collapse; chronicle is the sole audit trail"
+        );
+    }
+
+    // ── 9c-1.8 (verifier): debate_collapse_invoked + debate_collapse_skipped
+    // are mapped in map_event_to_primitive. Without mappings the
+    // compiler's unknown-event loud-hold arm pins the cursor and stalls
+    // compilation for the slug (mirror of the Phase 7 wanderer fix).
+
+    #[test]
+    fn debate_collapse_chain_events_are_mapped_as_log_only() {
+        use crate::pyramid::dadbear_compiler::map_event_to_primitive;
+        let cases: &[(&str, &str, &str)] = &[
+            ("debate_collapse_invoked", "log_only", "debate_collapse_invoked_log"),
+            ("debate_collapse_skipped", "log_only", "debate_collapse_skipped_log"),
+        ];
+        for (event, expected_primitive, expected_step) in cases {
+            let mapping = map_event_to_primitive(event)
+                .unwrap_or_else(|| panic!("event '{event}' must be mapped — unmapped events hold the cursor"));
+            assert_eq!(mapping.0, *expected_primitive, "event '{event}' primitive");
+            assert_eq!(mapping.1, *expected_step, "event '{event}' step_name");
+        }
     }
 }

@@ -212,6 +212,21 @@ pub(crate) fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, 
         "gap_dispatcher_skipped" => {
             Some(("log_only", "gap_dispatcher_skipped_log", "stale_remote"))
         }
+        // v5 Phase 9c-1 verifier: starter-debate-collapse emits
+        // `debate_collapse_invoked` at the head of the chain and
+        // `debate_collapse_skipped` on the non-Debate target arm.
+        // Both are pure observability — the chain has already done
+        // the work (or deliberately skipped it). Without these
+        // mappings, the compiler's unknown-event loud-hold arm
+        // (see line ~514) pins the cursor on the first chain
+        // execution and stalls all subsequent compilation for the
+        // slug. Mirror the gap_dispatcher_* pattern.
+        "debate_collapse_invoked" => {
+            Some(("log_only", "debate_collapse_invoked_log", "stale_remote"))
+        }
+        "debate_collapse_skipped" => {
+            Some(("log_only", "debate_collapse_skipped_log", "stale_remote"))
+        }
         "judge_invoked" => {
             Some(("log_only", "judge_invoked_log", "stale_remote"))
         }
