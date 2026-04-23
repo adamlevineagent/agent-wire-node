@@ -1,0 +1,96 @@
+schema_version: 1
+id: starter-authorize-question
+name: Authorize Question — gate proposed questions against slug purpose (Phase 7d)
+description: >
+  LLM gate deciding whether a proposed question is on-purpose for a
+  pyramid slug. Callable-on-demand library chain today — Phase 7d ships
+  the chain + dispatch primitives; the production caller (the HTTP route
+  that proposes Question pyramid slugs or queues question annotations)
+  wires in Phase 9.
+
+  Trigger investigation (Phase 7d orientation):
+    grepping `ContentType::Question` reveals the slug-creation path at
+    `handle_create_slug` in `routes.rs`, which stores referenced_slugs
+    and content_type but does NOT capture a free-text question body per
+    slug — question content lives in annotations (question_context) or
+    in downstream question-decomposition tables. So "authorize a
+    question at the point it's proposed" doesn't have a single load-
+    bearing existing call-site yet. Ship as callable-on-demand; flag
+    for Phase 9 wiring when the question-proposal HTTP route lands.
+
+  A question is on-purpose if answering it requires or directly advances
+  the pyramid's purpose. Off-purpose if it's about a different topic or
+  substrate. If it's almost-on-purpose but mis-scoped, the LLM may
+  suggest an alternative phrasing.
+
+  Input envelope (supplied by the caller):
+
+      {
+        "question": "<the proposed question text>",
+        "slug":     "<pyramid slug whose purpose gates approval>"
+      }
+
+  Steps:
+    1. emit_authorize_invoked — chronicle trace (source="chain",
+       event_type="authorize_question_invoked").
+    2. load_slug_purpose — reads the slug's active purpose row via
+       `purpose::load_or_create_purpose` (seeds stock purpose from
+       ContentType if missing). Returns `{purpose_text,
+       stock_purpose_key}` threaded onto the envelope so the LLM step
+       sees the authoritative gating text.
+    3. authorize_question — LLM evaluator producing
+       `{approved, reasoning, alternative_question_suggestion}`. The
+       `alternative_question_suggestion` field is nullable — null for
+       clean accepts AND clean rejects, populated only when the
+       question is almost-on-purpose but mis-scoped.
+    4. finalize — terminal log_and_complete; passes the LLM step's
+       output through verbatim so callers can key on `approved`.
+
+  This chain is bound to the `authorize_question` role via the role_name
+  vocab registry. Operators may supersede the binding per slug to route
+  authorization through a stricter or more permissive chain.
+
+  Temperature, token counts, and other knobs that shape LLM output live
+  in YAML (not Rust) per feedback_pillar37_no_hedging.
+content_type: code
+version: "1.0.0"
+author: post-build-accretion-v5
+
+defaults:
+  model_tier: mid
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  - name: emit_authorize_invoked
+    primitive: custom
+    mechanical: true
+    rust_function: emit_authorize_invoked
+
+  - name: load_slug_purpose
+    primitive: custom
+    mechanical: true
+    rust_function: load_slug_purpose
+
+  - name: authorize_question
+    primitive: evaluate
+    instruction: $prompts/starter/authorize_question.md
+    model_tier: mid
+    response_schema:
+      type: object
+      additionalProperties: false
+      required: [approved, reasoning, alternative_question_suggestion]
+      properties:
+        approved:
+          type: boolean
+        reasoning:
+          type: string
+        alternative_question_suggestion:
+          type: [string, "null"]
+
+  - name: finalize
+    primitive: custom
+    mechanical: true
+    rust_function: log_and_complete
+
+post_build: []

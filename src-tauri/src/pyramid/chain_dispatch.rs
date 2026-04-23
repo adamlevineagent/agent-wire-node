@@ -636,6 +636,21 @@ const MECHANICAL_FUNCTIONS: &[&str] = &[
     "emit_dispatcher_invoked",
     "load_gap_context",
     "materialize_gap_node",
+    // Post-build accretion v5 Phase 7d — utility chain primitives (judge,
+    // authorize_question, accretion_handler, sweep). Phase 7d ships the
+    // four genesis-bound utility roles as real chains (judge + accretion +
+    // sweep + authorize_question), not placeholders. The judge chain's LLM
+    // step reuses the generic LLM dispatch path; the mechanical primitives
+    // below back the non-LLM steps.
+    "emit_judge_invoked",
+    "emit_authorize_invoked",
+    "load_slug_purpose",
+    "emit_accretion_invoked",
+    "load_recent_annotations_for_slug",
+    "emit_accretion_written",
+    "emit_sweep_invoked",
+    "count_stale_failed_work_items",
+    "reindex_vocab_cache",
 ];
 
 /// Post-build accretion v5 Phase 6b: hard ceiling on sub-chain recursion.
@@ -3285,6 +3300,639 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
             // The parent chain sees the sub-chain's final output verbatim —
             // threading behavior is the same as any other mechanical step.
             Ok(sub_output)
+        }
+        // ── Post-build accretion v5 Phase 7d: utility chain primitives ──────
+        //
+        // The primitives below back the four Phase 7d starter chains —
+        // `starter-judge`, `starter-authorize-question`,
+        // `starter-accretion-handler`, and `starter-sweep`. Each follows
+        // the same threading contract as Phase 7a/7b/7c: read what you
+        // need from `input`, preserve the input fields you didn't consume
+        // in the output, loud-raise on missing required fields per
+        // `feedback_loud_deferrals`.
+        "emit_judge_invoked" => {
+            // Chronicle-only trace: records that the generalist `judge`
+            // library chain was invoked with a particular claim. The
+            // claim is threaded through to the LLM step unchanged.
+            let claim = input.get("claim").and_then(|v| v.as_str());
+            let criteria = input.get("criteria").and_then(|v| v.as_str());
+            let mut meta = serde_json::Map::new();
+            if let Some(c) = claim {
+                // Cap the claim preview in metadata so unusually-long
+                // claims don't bloat the chronicle row.
+                let preview: String = c.chars().take(500).collect();
+                meta.insert("claim_preview".to_string(), Value::String(preview));
+            }
+            if let Some(c) = criteria {
+                let preview: String = c.chars().take(300).collect();
+                meta.insert(
+                    "criteria_preview".to_string(),
+                    Value::String(preview),
+                );
+            }
+            let metadata_json = if meta.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&Value::Object(meta))?)
+            };
+            info!(
+                "[mechanical] emit_judge_invoked slug={} claim_present={} criteria_present={}",
+                ctx.slug,
+                claim.is_some(),
+                criteria.is_some(),
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "judge_invoked",
+                None,
+                None,
+                None,
+                None,
+                None, // judge is slug-level (or caller-level), not node-bound
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+            // Thread input through — the next LLM step needs claim/context/criteria.
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            Ok(Value::Object(out))
+        }
+        "emit_authorize_invoked" => {
+            // Chronicle-only trace: records that authorize_question was
+            // invoked for a slug + question pair. Threads input through
+            // so load_slug_purpose can read `slug` and the LLM step can
+            // read `question`.
+            let question = input.get("question").and_then(|v| v.as_str());
+            let slug_in = input.get("slug").and_then(|v| v.as_str());
+            let mut meta = serde_json::Map::new();
+            if let Some(q) = question {
+                let preview: String = q.chars().take(500).collect();
+                meta.insert(
+                    "question_preview".to_string(),
+                    Value::String(preview),
+                );
+            }
+            if let Some(s) = slug_in {
+                meta.insert("slug".to_string(), Value::String(s.to_string()));
+            }
+            let metadata_json = if meta.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&Value::Object(meta))?)
+            };
+            info!(
+                "[mechanical] emit_authorize_invoked slug={} question_present={}",
+                ctx.slug,
+                question.is_some(),
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "authorize_question_invoked",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            Ok(Value::Object(out))
+        }
+        "load_slug_purpose" => {
+            // Reads the active purpose row for `slug` via
+            // `purpose::load_or_create_purpose` (which seeds a stock
+            // purpose from ContentType if the slug has none). Returns
+            // the envelope with `purpose_text` + `stock_purpose_key`
+            // merged in so the LLM step sees the authoritative gating
+            // text.
+            //
+            // Input `slug` takes precedence over ctx.slug — the caller
+            // may be asking about a slug different from the one the
+            // chain was invoked against (library-chain pattern). Fall
+            // back to ctx.slug if not set.
+            let slug_for_purpose = input
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| ctx.slug.clone());
+
+            let (purpose_text, stock_purpose_key) = {
+                let conn_guard = ctx.db_reader.lock().await;
+                match super::purpose::load_or_create_purpose(
+                    &conn_guard,
+                    &slug_for_purpose,
+                ) {
+                    Ok(p) => (p.purpose_text, p.stock_purpose_key),
+                    Err(e) => {
+                        drop(conn_guard);
+                        // Loud raise: if the slug doesn't exist, this is
+                        // a caller bug. Per feedback_loud_deferrals we
+                        // don't paper over with an empty purpose.
+                        return Err(anyhow!(
+                            "load_slug_purpose: failed to load purpose for slug '{}': {}",
+                            slug_for_purpose,
+                            e,
+                        ));
+                    }
+                }
+            };
+
+            info!(
+                "[mechanical] load_slug_purpose slug={} purpose_len={} stock_key={:?}",
+                slug_for_purpose,
+                purpose_text.len(),
+                stock_purpose_key,
+            );
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("slug".to_string(), Value::String(slug_for_purpose));
+            out.insert(
+                "purpose_text".to_string(),
+                Value::String(purpose_text),
+            );
+            out.insert(
+                "stock_purpose_key".to_string(),
+                stock_purpose_key
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+            Ok(Value::Object(out))
+        }
+        "emit_accretion_invoked" => {
+            // Chronicle-only trace for the accretion_handler role.
+            let node_id = input.get("node_id").and_then(|v| v.as_str());
+            let window_n = input.get("window_n").and_then(|v| v.as_i64());
+            let mut meta = serde_json::Map::new();
+            if let Some(n) = node_id {
+                meta.insert("node_id".to_string(), Value::String(n.to_string()));
+            }
+            if let Some(w) = window_n {
+                meta.insert("window_n".to_string(), Value::from(w));
+            }
+            let metadata_json = if meta.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&Value::Object(meta))?)
+            };
+            info!(
+                "[mechanical] emit_accretion_invoked slug={} node_id={:?} window_n={:?}",
+                ctx.slug, node_id, window_n,
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "accretion_invoked",
+                None,
+                None,
+                None,
+                None,
+                node_id,
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            Ok(Value::Object(out))
+        }
+        "load_recent_annotations_for_slug" => {
+            // Reads up to `window_n` most recent annotations for the
+            // slug (optionally scoped to a single node_id) plus the
+            // slug's active purpose_text. Returns the envelope the LLM
+            // step needs to synthesize an accretion note.
+            //
+            // `window_n` is the hard cap on how many rows the LLM sees
+            // — it protects the prompt from runaway token spend on a
+            // slug with thousands of annotations. Default 20 matches
+            // the chain's documented input envelope default.
+            let window_n = input
+                .get("window_n")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(20)
+                .max(1);
+            let node_id_filter = input
+                .get("node_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let slug_for_load = input
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| ctx.slug.clone());
+
+            // Load purpose + annotations under a single reader lock.
+            let (purpose_text, annotations, total_count) = {
+                let conn_guard = ctx.db_reader.lock().await;
+                let p = super::purpose::load_or_create_purpose(
+                    &conn_guard,
+                    &slug_for_load,
+                )
+                .map_err(|e| anyhow!(
+                    "load_recent_annotations_for_slug: failed to load purpose for slug '{}': {}",
+                    slug_for_load, e,
+                ))?;
+
+                // Count total annotations for context (before window trim).
+                let total: i64 = if let Some(nid) = node_id_filter.as_deref() {
+                    conn_guard
+                        .query_row(
+                            "SELECT COUNT(*) FROM pyramid_annotations
+                              WHERE slug = ?1 AND node_id = ?2",
+                            rusqlite::params![slug_for_load, nid],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0)
+                } else {
+                    conn_guard
+                        .query_row(
+                            "SELECT COUNT(*) FROM pyramid_annotations
+                              WHERE slug = ?1",
+                            rusqlite::params![slug_for_load],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0)
+                };
+
+                // Load the window_n most recent annotations.
+                let mut anns: Vec<Value> = Vec::new();
+                if let Some(nid) = node_id_filter.as_deref() {
+                    let mut stmt = conn_guard.prepare(
+                        "SELECT id, node_id, annotation_type, content, author, created_at
+                           FROM pyramid_annotations
+                          WHERE slug = ?1 AND node_id = ?2
+                          ORDER BY id DESC LIMIT ?3",
+                    )?;
+                    let rows = stmt.query_map(
+                        rusqlite::params![slug_for_load, nid, window_n],
+                        |row| {
+                            Ok(serde_json::json!({
+                                "id": row.get::<_, i64>(0)?,
+                                "node_id": row.get::<_, String>(1)?,
+                                "annotation_type": row.get::<_, String>(2)?,
+                                "content": row.get::<_, String>(3)?,
+                                "author": row.get::<_, String>(4)?,
+                                "created_at": row.get::<_, String>(5)?,
+                            }))
+                        },
+                    )?;
+                    for r in rows {
+                        anns.push(r?);
+                    }
+                } else {
+                    let mut stmt = conn_guard.prepare(
+                        "SELECT id, node_id, annotation_type, content, author, created_at
+                           FROM pyramid_annotations
+                          WHERE slug = ?1
+                          ORDER BY id DESC LIMIT ?2",
+                    )?;
+                    let rows = stmt.query_map(
+                        rusqlite::params![slug_for_load, window_n],
+                        |row| {
+                            Ok(serde_json::json!({
+                                "id": row.get::<_, i64>(0)?,
+                                "node_id": row.get::<_, String>(1)?,
+                                "annotation_type": row.get::<_, String>(2)?,
+                                "content": row.get::<_, String>(3)?,
+                                "author": row.get::<_, String>(4)?,
+                                "created_at": row.get::<_, String>(5)?,
+                            }))
+                        },
+                    )?;
+                    for r in rows {
+                        anns.push(r?);
+                    }
+                }
+                (p.purpose_text, anns, total)
+            };
+
+            info!(
+                "[mechanical] load_recent_annotations_for_slug slug={} loaded={} total={} node_id_filter={:?}",
+                slug_for_load,
+                annotations.len(),
+                total_count,
+                node_id_filter,
+            );
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert(
+                "slug".to_string(),
+                Value::String(slug_for_load),
+            );
+            out.insert(
+                "purpose_text".to_string(),
+                Value::String(purpose_text),
+            );
+            out.insert(
+                "annotations".to_string(),
+                Value::Array(annotations),
+            );
+            out.insert(
+                "annotation_count".to_string(),
+                Value::from(total_count),
+            );
+            Ok(Value::Object(out))
+        }
+        "emit_accretion_written" => {
+            // Chronicle trace recording the accretion note the LLM
+            // step produced. The note body + references land in
+            // metadata so downstream FAQ / meta-layer consumers can
+            // find and cite it without a second DB read.
+            //
+            // Reads the LLM step's threaded output — specifically the
+            // `note` (string) and `references` (array of ints) fields
+            // the synthesize_accretion_note step returns. Missing
+            // `note` is loud-raised: an accretion_written event with
+            // no note is a dropped result, not a deferral target.
+            let note = input
+                .get("note")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "emit_accretion_written: missing `note` in input — the \
+                     synthesize_accretion_note LLM step must precede this \
+                     primitive and return a `note` field. Threading is \
+                     preserve-by-default in the chain executor; if the LLM \
+                     step succeeded but `note` is missing, the schema \
+                     enforcement failed upstream."
+                ))?
+                .to_string();
+            let references = input
+                .get("references")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(vec![]));
+            let slug_for_write = input
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| ctx.slug.clone());
+            let node_id = input.get("node_id").and_then(|v| v.as_str());
+
+            let meta = serde_json::json!({
+                "note": note,
+                "references": references,
+            });
+            let metadata_json = serde_json::to_string(&meta)?;
+
+            info!(
+                "[mechanical] emit_accretion_written slug={} note_len={} references={}",
+                slug_for_write,
+                note.len(),
+                meta["references"]
+                    .as_array()
+                    .map(|a| a.len())
+                    .unwrap_or(0),
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &slug_for_write,
+                "chain",
+                "accretion_written",
+                None,
+                None,
+                None,
+                None,
+                node_id,
+                None,
+                Some(&metadata_json),
+            )?;
+            drop(conn_guard);
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            Ok(Value::Object(out))
+        }
+        "emit_sweep_invoked" => {
+            // Chronicle-only trace: a sweep has begun against this slug.
+            let stale_days = input
+                .get("stale_days")
+                .and_then(|v| v.as_i64());
+            let mut meta = serde_json::Map::new();
+            if let Some(d) = stale_days {
+                meta.insert("stale_days".to_string(), Value::from(d));
+            }
+            let metadata_json = if meta.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&Value::Object(meta))?)
+            };
+            info!(
+                "[mechanical] emit_sweep_invoked slug={} stale_days={:?}",
+                ctx.slug, stale_days,
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "sweep_invoked",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            Ok(Value::Object(out))
+        }
+        "count_stale_failed_work_items" => {
+            // Measurement-only (Phase 7d MVP): count
+            // `dadbear_work_items` in state='failed' whose
+            // state_changed_at is older than stale_days days old.
+            // Emits a `sweep_stale_failed_counted` chronicle event so
+            // operators can key on the number.
+            //
+            // No mutation — Phase 9 decides archive vs. delete
+            // semantics (deletion semantics interact with the
+            // supervisor's retry-back-off window). Per
+            // feedback_no_deferral_creep: this measurement IS the
+            // MVP deliverable, not a stub — a number is real
+            // operator signal.
+            let stale_days = input
+                .get("stale_days")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(30)
+                .max(0);
+            let slug_for_count = input
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| ctx.slug.clone());
+
+            // Threshold: "older than N days ago" → state_changed_at <
+            // datetime('now', '-N days').
+            let threshold_modifier = format!("-{} days", stale_days);
+            let count: i64 = {
+                let conn_guard = ctx.db_reader.lock().await;
+                conn_guard
+                    .query_row(
+                        "SELECT COUNT(*) FROM dadbear_work_items
+                          WHERE slug = ?1
+                            AND state = 'failed'
+                            AND state_changed_at < datetime('now', ?2)",
+                        rusqlite::params![slug_for_count, threshold_modifier],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0)
+            };
+
+            info!(
+                "[mechanical] count_stale_failed_work_items slug={} stale_days={} count={}",
+                slug_for_count, stale_days, count,
+            );
+
+            let meta = serde_json::json!({
+                "stale_days": stale_days,
+                "count": count,
+            });
+            let metadata_json = serde_json::to_string(&meta)?;
+            let conn_guard = ctx.db_writer.lock().await;
+            super::observation_events::write_observation_event(
+                &conn_guard,
+                &slug_for_count,
+                "chain",
+                "sweep_stale_failed_counted",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&metadata_json),
+            )?;
+            drop(conn_guard);
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("slug".to_string(), Value::String(slug_for_count));
+            out.insert("stale_days".to_string(), Value::from(stale_days));
+            out.insert(
+                "stale_failed_count".to_string(),
+                Value::from(count),
+            );
+            Ok(Value::Object(out))
+        }
+        "reindex_vocab_cache" => {
+            // Invalidates the vocab_entries process-wide cache and
+            // warms it by issuing a `list_vocabulary` for each of the
+            // three known vocab_kinds. Emits a
+            // `sweep_vocab_reindexed` chronicle event with per-kind
+            // counts in metadata.
+            super::vocab_entries::invalidate_cache();
+
+            let (ann_count, shape_count, role_count) = {
+                let conn_guard = ctx.db_reader.lock().await;
+                let a = super::vocab_entries::list_vocabulary(
+                    &conn_guard,
+                    super::vocab_entries::VOCAB_KIND_ANNOTATION_TYPE,
+                )
+                .map(|v| v.len() as i64)
+                .unwrap_or(0);
+                let s = super::vocab_entries::list_vocabulary(
+                    &conn_guard,
+                    super::vocab_entries::VOCAB_KIND_NODE_SHAPE,
+                )
+                .map(|v| v.len() as i64)
+                .unwrap_or(0);
+                let r = super::vocab_entries::list_vocabulary(
+                    &conn_guard,
+                    super::vocab_entries::VOCAB_KIND_ROLE_NAME,
+                )
+                .map(|v| v.len() as i64)
+                .unwrap_or(0);
+                (a, s, r)
+            };
+
+            info!(
+                "[mechanical] reindex_vocab_cache slug={} annotation_type={} node_shape={} role_name={}",
+                ctx.slug, ann_count, shape_count, role_count,
+            );
+
+            let meta = serde_json::json!({
+                "annotation_type": ann_count,
+                "node_shape": shape_count,
+                "role_name": role_count,
+            });
+            let metadata_json = serde_json::to_string(&meta)?;
+            let conn_guard = ctx.db_writer.lock().await;
+            super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "sweep_vocab_reindexed",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&metadata_json),
+            )?;
+            drop(conn_guard);
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            let counts = serde_json::json!({
+                "annotation_type": ann_count,
+                "node_shape": shape_count,
+                "role_name": role_count,
+            });
+            out.insert("vocab_counts".to_string(), counts);
+            Ok(Value::Object(out))
         }
         unknown => Err(anyhow!("Unknown mechanical function: {}", unknown)),
     }

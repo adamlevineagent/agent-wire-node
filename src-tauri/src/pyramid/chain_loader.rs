@@ -428,6 +428,30 @@ pub fn ensure_default_chains(
             "starter-gap-dispatcher.yaml",
             include_str!("../../../chains/defaults/starter/starter-gap-dispatcher.yaml"),
         ),
+        // Post-build accretion v5 Phase 7d: four utility chains filling
+        // in the remaining genesis role_name bindings. None have a
+        // natural event trigger today (see each YAML's description
+        // block for trigger investigation notes); they ship as
+        // callable-on-demand library chains so operators / agents can
+        // invoke them via `call_starter_chain` or a future scheduled
+        // path. Tier 2 bundling keeps release builds from failing to
+        // resolve these chains when the genesis binding is asked for.
+        (
+            "starter-judge.yaml",
+            include_str!("../../../chains/defaults/starter/starter-judge.yaml"),
+        ),
+        (
+            "starter-authorize-question.yaml",
+            include_str!("../../../chains/defaults/starter/starter-authorize-question.yaml"),
+        ),
+        (
+            "starter-accretion-handler.yaml",
+            include_str!("../../../chains/defaults/starter/starter-accretion-handler.yaml"),
+        ),
+        (
+            "starter-sweep.yaml",
+            include_str!("../../../chains/defaults/starter/starter-sweep.yaml"),
+        ),
     ];
     for (filename, content) in starter_chains {
         let path = chains_dir.join("defaults").join("starter").join(filename);
@@ -490,6 +514,26 @@ pub fn ensure_default_chains(
         (
             "synthesize_meta_layer.md",
             include_str!("../../../chains/prompts/starter/synthesize_meta_layer.md"),
+        ),
+        // Post-build accretion v5 Phase 7d: three LLM prompts consumed
+        // by the Phase 7d utility chains. `judge.md` backs
+        // starter-judge's judge_claim step; `authorize_question.md`
+        // backs starter-authorize-question's authorize_question step;
+        // `synthesize_accretion_note.md` backs
+        // starter-accretion-handler's synthesize_accretion_note step.
+        // starter-sweep ships no LLM step (mechanical-only), so no
+        // new prompt is bundled for it.
+        (
+            "judge.md",
+            include_str!("../../../chains/prompts/starter/judge.md"),
+        ),
+        (
+            "authorize_question.md",
+            include_str!("../../../chains/prompts/starter/authorize_question.md"),
+        ),
+        (
+            "synthesize_accretion_note.md",
+            include_str!("../../../chains/prompts/starter/synthesize_accretion_note.md"),
         ),
     ];
     for (filename, content) in starter_prompts {
@@ -844,13 +888,36 @@ mod phase5_ensure_default_chains_tests {
         // No source_chains_dir → forces Tier 2 bootstrap.
         ensure_default_chains(chains_dir, None).expect("Tier 2 bootstrap must succeed");
 
+        // Phase 7d cross-phase fix: the 7c verifier flagged that this
+        // test only asserted a subset of starter chains. Every chain
+        // that ships from `ensure_default_chains::starter_chains`
+        // MUST be covered here, because the failure mode is the same
+        // for each missing one — `load_chain_by_id` returns "chain
+        // not found" at dispatch time and the work item flips to
+        // `failed`. An incomplete assertion leaves a regression hole
+        // for any chain added after 7c.
         for id in [
+            // Phase 5 cascade handlers.
             "starter-cascade-immediate-redistill",
             "starter-cascade-judge-gated",
+            // Phase 7b meta-layer oracle + synthesizer sub-chain.
             "starter-meta-layer-oracle",
-            // Phase 7c addition: starter-gap-dispatcher must also ship in
-            // Tier 2 so `gap` annotations route correctly in release builds.
+            // Phase 6b library chains invoked via call_starter_chain.
+            "starter-reconciler",
+            "starter-evidence-tester",
+            // Phase 7a debate_steward — flagged as missing in 7c verifier.
+            "starter-debate-steward",
+            // Phase 7b synthesizer — flagged as missing in 7c verifier.
+            "starter-synthesizer",
+            // Phase 7c: `gap` annotations route here.
             "starter-gap-dispatcher",
+            // Phase 7d utility chains — the four remaining genesis
+            // role_name bindings (judge, authorize_question,
+            // accretion_handler, sweep).
+            "starter-judge",
+            "starter-authorize-question",
+            "starter-accretion-handler",
+            "starter-sweep",
         ] {
             let loaded = load_chain_by_id(id, chains_dir).unwrap_or_else(|e| {
                 panic!(
@@ -859,8 +926,9 @@ mod phase5_ensure_default_chains_tests {
                 )
             });
             assert_eq!(loaded.id, id);
-            // Starter chains must ship with at least one mechanical step
-            // (the chain runner is mechanical-only in Phase 5).
+            // Starter chains must ship with at least one step — every
+            // starter chain today has at minimum an emit_* trace step
+            // plus a terminal step. A zero-step chain is always a bug.
             assert!(
                 !loaded.steps.is_empty(),
                 "starter chain '{id}' must have at least one step"

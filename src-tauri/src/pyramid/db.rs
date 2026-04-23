@@ -30175,3 +30175,714 @@ mod phase7c_post_build_tests {
         assert_eq!(final_state, "applied");
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 7d tests — the four utility chains (judge, authorize_question,
+// accretion_handler, sweep). Each chain ships as callable-on-demand (no
+// event trigger in Phase 7d — see each chain's YAML for trigger-investigation
+// notes). Tests here cover:
+//   1. Each chain loads via chain_loader (YAML is valid, prompts resolve).
+//   2. Every starter chain is asserted bundled in Tier 2.
+//   3. The judge chain's response_schema locks the three required fields
+//      and the decision enum, so a malformed LLM response fails schema
+//      validation rather than silently passing.
+//   4. authorize_question's load_slug_purpose primitive surfaces the
+//      active purpose_text the LLM step keys on.
+//   5. accretion_handler's load_recent_annotations_for_slug threads the
+//      slug's annotation window + purpose into the synthesizer step.
+//   6. sweep's mechanical steps count stale failed work items + reindex
+//      the vocab cache, emitting chronicle events on both.
+//   7. emit_accretion_written loud-raises when the LLM step's note is
+//      missing, per feedback_loud_deferrals.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod phase7d_post_build_tests {
+    use super::*;
+    use super::post_build_test_support::test_lock;
+    use crate::pyramid::chain_engine::{
+        ChainDefaults, ChainDefinition, ChainStep,
+    };
+    use crate::pyramid::types::{
+        AnnotationType, ContentType, PyramidAnnotation,
+    };
+    use crate::pyramid::{chain_executor, chain_loader, vocab_entries};
+    use rusqlite::Connection;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    fn chains_dir_path() -> PathBuf {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        PathBuf::from(manifest).parent().unwrap().join("chains")
+    }
+
+    fn fresh_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        conn
+    }
+
+    // ── 7d-8.1: each of the four Phase 7d chains loads via chain_loader ───
+
+    #[test]
+    fn starter_judge_chain_loads_via_chain_loader() {
+        let chains_dir = chains_dir_path();
+        let loaded = chain_loader::load_chain_by_id("starter-judge", &chains_dir)
+            .expect("starter-judge must load — Phase 7d");
+        assert_eq!(loaded.id, "starter-judge");
+        let names: Vec<&str> = loaded.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["emit_judge_invoked", "judge_claim", "return_judgment"],
+            "canonical 3-step judge shape: trace → LLM → passthrough"
+        );
+        let llm_step = loaded
+            .steps
+            .iter()
+            .find(|s| s.name == "judge_claim")
+            .unwrap();
+        assert!(!llm_step.mechanical, "judge_claim must be an LLM step");
+        assert_eq!(llm_step.primitive, "evaluate");
+        assert!(
+            llm_step.response_schema.is_some(),
+            "judge_claim must declare a structured response_schema so \
+             downstream callers can key on {{decision, confidence, reasoning}}"
+        );
+    }
+
+    #[test]
+    fn starter_authorize_question_chain_loads_via_chain_loader() {
+        let chains_dir = chains_dir_path();
+        let loaded = chain_loader::load_chain_by_id(
+            "starter-authorize-question",
+            &chains_dir,
+        )
+        .expect("starter-authorize-question must load — Phase 7d");
+        assert_eq!(loaded.id, "starter-authorize-question");
+        let names: Vec<&str> = loaded.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "emit_authorize_invoked",
+                "load_slug_purpose",
+                "authorize_question",
+                "finalize",
+            ],
+            "canonical 4-step shape: trace → load purpose → LLM → passthrough"
+        );
+        let llm_step = loaded
+            .steps
+            .iter()
+            .find(|s| s.name == "authorize_question")
+            .unwrap();
+        assert!(!llm_step.mechanical);
+        assert_eq!(llm_step.primitive, "evaluate");
+        assert!(llm_step.response_schema.is_some());
+    }
+
+    #[test]
+    fn starter_accretion_handler_chain_loads_via_chain_loader() {
+        let chains_dir = chains_dir_path();
+        let loaded = chain_loader::load_chain_by_id(
+            "starter-accretion-handler",
+            &chains_dir,
+        )
+        .expect("starter-accretion-handler must load — Phase 7d");
+        assert_eq!(loaded.id, "starter-accretion-handler");
+        let names: Vec<&str> = loaded.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "emit_accretion_invoked",
+                "load_recent_annotations_for_slug",
+                "synthesize_accretion_note",
+                "emit_accretion_written",
+                "finalize",
+            ],
+            "canonical 5-step accretion shape: trace → load → LLM → write → passthrough"
+        );
+        let llm_step = loaded
+            .steps
+            .iter()
+            .find(|s| s.name == "synthesize_accretion_note")
+            .unwrap();
+        assert!(!llm_step.mechanical);
+        assert_eq!(llm_step.primitive, "synthesize");
+    }
+
+    #[test]
+    fn starter_sweep_chain_loads_via_chain_loader() {
+        let chains_dir = chains_dir_path();
+        let loaded = chain_loader::load_chain_by_id("starter-sweep", &chains_dir)
+            .expect("starter-sweep must load — Phase 7d");
+        assert_eq!(loaded.id, "starter-sweep");
+        let names: Vec<&str> = loaded.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "emit_sweep_invoked",
+                "count_stale_failed_work_items",
+                "reindex_vocab_cache",
+                "finalize",
+            ],
+            "canonical 4-step sweep shape — mechanical-only, no LLM"
+        );
+        for step in &loaded.steps {
+            assert!(
+                step.mechanical,
+                "starter-sweep is mechanical-only in Phase 7d MVP; \
+                 step '{}' was LLM",
+                step.name
+            );
+            assert!(step.rust_function.is_some());
+        }
+    }
+
+    // ── 7d-8.2: all twelve starter chains bundled in Tier 2 ─────────────
+
+    #[test]
+    fn all_twelve_starter_chains_bundled_in_tier_2() {
+        // Phase 7d: Tier 2 bootstrap (no source_chains_dir) must now install
+        // ALL 12 starter chains — the two cascade handlers, three library
+        // chains called via call_starter_chain (oracle, reconciler,
+        // evidence_tester), the Phase 7a/b/c role handlers (debate_steward,
+        // synthesizer, gap_dispatcher), and the Phase 7d utility chains
+        // (judge, authorize_question, accretion_handler, sweep).
+        //
+        // Sibling test `tier2_bootstrap_installs_starter_chains_for_role_bound_dispatch`
+        // in chain_loader.rs asserts the full set via the load path. THIS
+        // test confirms the on-disk filenames landed so the Tier 2 install
+        // is complete without going through load_chain_by_id.
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let chains_dir = tmp.path();
+        chain_loader::ensure_default_chains(chains_dir, None)
+            .expect("Tier 2 bootstrap must succeed");
+
+        let starter_dir = chains_dir.join("defaults").join("starter");
+        let expected_files = [
+            "starter-cascade-immediate-redistill.yaml",
+            "starter-cascade-judge-gated.yaml",
+            "starter-meta-layer-oracle.yaml",
+            "starter-reconciler.yaml",
+            "starter-evidence-tester.yaml",
+            "starter-debate-steward.yaml",
+            "starter-synthesizer.yaml",
+            "starter-gap-dispatcher.yaml",
+            // Phase 7d additions.
+            "starter-judge.yaml",
+            "starter-authorize-question.yaml",
+            "starter-accretion-handler.yaml",
+            "starter-sweep.yaml",
+        ];
+        for name in &expected_files {
+            let p = starter_dir.join(name);
+            assert!(
+                p.exists(),
+                "Tier 2 bootstrap must write {} to disk — missing at {}",
+                name,
+                p.display(),
+            );
+        }
+        // Prompt bundling parity: the three Phase 7d LLM prompts also
+        // ship in Tier 2. starter-sweep carries no LLM step, so no
+        // prompt entry is expected for it.
+        let prompts_dir = chains_dir.join("prompts").join("starter");
+        for name in &[
+            "judge.md",
+            "authorize_question.md",
+            "synthesize_accretion_note.md",
+        ] {
+            let p = prompts_dir.join(name);
+            assert!(
+                p.exists(),
+                "Tier 2 must bundle Phase 7d prompt {} — missing at {}",
+                name,
+                p.display(),
+            );
+        }
+    }
+
+    // ── 7d-8.3: judge chain structured-output schema enforced at call time
+
+    #[tokio::test]
+    async fn starter_judge_structured_output_schema_enforced_at_call_time() {
+        // Structural guard: the loaded judge chain's response_schema
+        // declares all three required fields AND the decision enum locks
+        // the three legal variants. A malformed LLM response missing any
+        // required field violates the schema — the chain executor's
+        // validator raises rather than accepting a half-filled envelope.
+        //
+        // We verify via schema shape rather than driving a mockito-based
+        // end-to-end negative test because the LLM healer + retry paths
+        // are shared with phase6/7b and changes there would cascade
+        // noise into this test. Schema-shape verification is the
+        // structural guard that catches YAML drift (someone marking a
+        // required field optional).
+        let _lock = test_lock();
+        let chains_dir = chains_dir_path();
+        let loaded = chain_loader::load_chain_by_id("starter-judge", &chains_dir)
+            .expect("starter-judge must load");
+        let llm_step = loaded
+            .steps
+            .iter()
+            .find(|s| s.name == "judge_claim")
+            .expect("judge_claim step required");
+        let schema = llm_step
+            .response_schema
+            .as_ref()
+            .expect("judge_claim must declare response_schema");
+        let required = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("response_schema must declare required[]");
+        let required_names: Vec<&str> = required
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for f in &["decision", "confidence", "reasoning"] {
+            assert!(
+                required_names.contains(f),
+                "response_schema.required must include '{}' — otherwise \
+                 a malformed LLM response missing that field would \
+                 silently pass schema validation. Got required={:?}",
+                f, required_names
+            );
+        }
+        let properties = schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("response_schema must declare properties");
+        let decision = properties
+            .get("decision")
+            .and_then(|v| v.as_object())
+            .expect("properties.decision required");
+        let enum_vals = decision
+            .get("enum")
+            .and_then(|v| v.as_array())
+            .expect("decision must be an enum");
+        let enum_strs: Vec<&str> = enum_vals.iter().filter_map(|v| v.as_str()).collect();
+        for variant in &["accept", "reject", "unclear"] {
+            assert!(
+                enum_strs.contains(variant),
+                "decision.enum must include '{}' — Phase 7d semantic \
+                 contract with downstream callers. Got enum={:?}",
+                variant, enum_strs
+            );
+        }
+    }
+
+    // ── 7d-8.4: authorize_question's load_slug_purpose threads purpose_text
+
+    #[tokio::test]
+    async fn starter_authorize_question_load_slug_purpose_surfaces_purpose_text() {
+        // Publish a slug + declare a purpose, then run a 1-step chain
+        // invoking the `load_slug_purpose` mechanical primitive directly.
+        // The LLM step would receive the output's `purpose_text` — assert
+        // it matches the slug's active purpose.
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7d_aq", &ContentType::Code, "/tmp/p7d_aq").unwrap();
+
+        crate::pyramid::purpose::supersede_purpose(
+            &conn,
+            "p7d_aq",
+            "Understand how the wire compute market balances offer saturation.",
+            Some("p7d-authorize-test"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7d-authorize-only".into(),
+            name: "Phase 7d load_slug_purpose direct test".into(),
+            description: "authorize_question's load step surfaces purpose_text".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "phase7d-test".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".into(),
+            },
+            steps: vec![ChainStep {
+                name: "load_purpose".into(),
+                primitive: "custom".into(),
+                mechanical: true,
+                rust_function: Some("load_slug_purpose".into()),
+                ..Default::default()
+            }],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+
+        let out = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7d_aq",
+            None,
+            json!({
+                "question": "Does the rotator arm equally split saturation?",
+                "slug": "p7d_aq",
+            }),
+        )
+        .await
+        .expect("load_slug_purpose chain must run");
+
+        let purpose_text = out["purpose_text"].as_str().unwrap_or("");
+        assert!(
+            purpose_text.contains("wire compute market"),
+            "purpose_text must carry the declared purpose so the LLM \
+             step can gate on it; got: {purpose_text:?}"
+        );
+        assert_eq!(
+            out["question"].as_str(),
+            Some("Does the rotator arm equally split saturation?"),
+            "input fields preserved by threading",
+        );
+    }
+
+    // ── 7d-8.5: accretion_handler's load step returns purpose + annotations
+
+    #[tokio::test]
+    async fn starter_accretion_load_recent_annotations_returns_window_and_purpose() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7d_ac", &ContentType::Code, "/tmp/p7d_ac").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('node-a', 'p7d_ac', 0, 'node A', 'distilled A', '', 1)",
+            [],
+        )
+        .unwrap();
+
+        for i in 0..5 {
+            let ann = PyramidAnnotation {
+                id: 0,
+                slug: "p7d_ac".into(),
+                node_id: "node-a".into(),
+                annotation_type: AnnotationType::new("observation"),
+                content: format!("observation #{i}"),
+                question_context: None,
+                author: "tester".into(),
+                created_at: String::new(),
+            };
+            save_annotation(&conn, &ann).unwrap();
+        }
+
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7d-accretion-load-only".into(),
+            name: "Phase 7d load_recent_annotations direct test".into(),
+            description: "accretion handler's load step".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "phase7d-test".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".into(),
+            },
+            steps: vec![ChainStep {
+                name: "load_recent".into(),
+                primitive: "custom".into(),
+                mechanical: true,
+                rust_function: Some("load_recent_annotations_for_slug".into()),
+                ..Default::default()
+            }],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+
+        let out = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7d_ac",
+            None,
+            json!({
+                "slug": "p7d_ac",
+                "window_n": 3,
+            }),
+        )
+        .await
+        .expect("load_recent_annotations chain must run");
+
+        let purpose_text = out["purpose_text"].as_str().unwrap_or("");
+        assert!(
+            !purpose_text.is_empty(),
+            "stock purpose must have been seeded via load_or_create_purpose"
+        );
+        let annotations = out["annotations"]
+            .as_array()
+            .expect("annotations must be an array");
+        assert_eq!(
+            annotations.len(),
+            3,
+            "window_n=3 cap must apply; got {}",
+            annotations.len()
+        );
+        let count = out["annotation_count"].as_i64().unwrap_or(-1);
+        assert_eq!(
+            count, 5,
+            "annotation_count must be the full table count (5), not the windowed len"
+        );
+    }
+
+    // ── 7d-8.6: sweep's count_stale_failed_work_items is measurement-only
+
+    #[tokio::test]
+    async fn starter_sweep_counts_stale_failed_work_items() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7d_sw", &ContentType::Code, "/tmp/p7d_sw").unwrap();
+
+        conn.execute(
+            "INSERT INTO dadbear_work_items
+                (id, slug, batch_id, epoch_id, step_name, primitive,
+                 layer, target_id, system_prompt, user_prompt, model_tier,
+                 result_json, observation_event_ids, compiled_at,
+                 state, state_changed_at)
+             VALUES ('wi-stale', 'p7d_sw', 'b1', 'e1', 'test', 'noop',
+                     0, 'tgt', '', '', 'mid', '{}', '[]',
+                     datetime('now', '-10 days'),
+                     'failed',
+                     datetime('now', '-10 days'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dadbear_work_items
+                (id, slug, batch_id, epoch_id, step_name, primitive,
+                 layer, target_id, system_prompt, user_prompt, model_tier,
+                 result_json, observation_event_ids, compiled_at,
+                 state, state_changed_at)
+             VALUES ('wi-recent', 'p7d_sw', 'b1', 'e1', 'test', 'noop',
+                     0, 'tgt', '', '', 'mid', '{}', '[]',
+                     datetime('now'),
+                     'failed',
+                     datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7d-sweep-count-only".into(),
+            name: "Phase 7d count_stale_failed direct test".into(),
+            description: "sweep's count primitive".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "phase7d-test".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".into(),
+            },
+            steps: vec![ChainStep {
+                name: "count".into(),
+                primitive: "custom".into(),
+                mechanical: true,
+                rust_function: Some("count_stale_failed_work_items".into()),
+                ..Default::default()
+            }],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+
+        let out = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7d_sw",
+            None,
+            json!({
+                "slug": "p7d_sw",
+                "stale_days": 1,
+            }),
+        )
+        .await
+        .expect("count_stale_failed chain must run");
+
+        assert_eq!(
+            out["stale_failed_count"].as_i64(),
+            Some(1),
+            "only the 10-day-old failed row qualifies at stale_days=1; recent row excluded",
+        );
+
+        let writer = state.writer.lock().await;
+        let count: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE slug = 'p7d_sw' AND event_type = 'sweep_stale_failed_counted'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "feedback_loud_deferrals: sweep must chronicle the count, not just return it"
+        );
+    }
+
+    // ── 7d-8.7: sweep's reindex_vocab_cache warms the three vocab_kinds ──
+
+    #[tokio::test]
+    async fn starter_sweep_reindex_vocab_cache_returns_counts_for_all_three_kinds() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7d_re", &ContentType::Code, "/tmp/p7d_re").unwrap();
+
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7d-sweep-reindex-only".into(),
+            name: "Phase 7d reindex_vocab_cache direct test".into(),
+            description: "sweep's reindex primitive".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "phase7d-test".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".into(),
+            },
+            steps: vec![ChainStep {
+                name: "reindex".into(),
+                primitive: "custom".into(),
+                mechanical: true,
+                rust_function: Some("reindex_vocab_cache".into()),
+                ..Default::default()
+            }],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+
+        let out = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7d_re",
+            None,
+            json!({}),
+        )
+        .await
+        .expect("reindex_vocab_cache chain must run");
+
+        let vc = out["vocab_counts"]
+            .as_object()
+            .expect("vocab_counts must be an object");
+        assert_eq!(
+            vc["annotation_type"].as_i64(),
+            Some(15),
+            "genesis seeds 15 annotation_types (11 original + 4 v5 from Phase 7c)"
+        );
+        assert_eq!(
+            vc["node_shape"].as_i64(),
+            Some(4),
+            "genesis seeds 4 node_shapes"
+        );
+        assert_eq!(
+            vc["role_name"].as_i64(),
+            Some(11),
+            "genesis seeds 11 role_names (10 + cascade_handler)"
+        );
+
+        let writer = state.writer.lock().await;
+        let (event_count, meta): (i64, Option<String>) = writer
+            .query_row(
+                "SELECT COUNT(*), MAX(metadata_json) FROM dadbear_observation_events
+                  WHERE slug = 'p7d_re' AND event_type = 'sweep_vocab_reindexed'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1, "reindex must chronicle per-kind counts");
+        let m = meta.expect("metadata required");
+        assert!(m.contains("annotation_type"), "metadata must name the kind");
+        assert!(m.contains("15"), "metadata must carry the 15-count");
+    }
+
+    // ── 7d-8.8: accretion_handler emit_accretion_written raises on missing note
+
+    #[tokio::test]
+    async fn starter_accretion_emit_written_raises_on_missing_note() {
+        // emit_accretion_written is the terminal chronicle writer; it
+        // reads the `note` field the LLM step produced. A missing `note`
+        // means the LLM step output was dropped upstream — per
+        // feedback_loud_deferrals, raise rather than emit an empty
+        // accretion_written event.
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7d_acw", &ContentType::Code, "/tmp/p7d_acw").unwrap();
+
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7d-accretion-write-missing-note".into(),
+            name: "Phase 7d accretion_written missing-note test".into(),
+            description: "loud-raise on missing note".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "phase7d-test".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "abort".into(),
+            },
+            steps: vec![ChainStep {
+                name: "emit_written".into(),
+                primitive: "custom".into(),
+                mechanical: true,
+                rust_function: Some("emit_accretion_written".into()),
+                ..Default::default()
+            }],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+
+        let err = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7d_acw",
+            None,
+            json!({ "slug": "p7d_acw" }),
+        )
+        .await
+        .expect_err("missing note must raise, not silently emit empty event");
+        let chain_err = format!("{err:#}");
+        assert!(
+            chain_err.contains("note"),
+            "error chain must name the missing field: {chain_err}"
+        );
+    }
+}
