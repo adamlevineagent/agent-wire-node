@@ -357,7 +357,7 @@ server.tool(
       .string()
       .optional()
       .describe(
-        "Optional: annotation type — 'observation', 'correction', 'question', 'friction', 'idea' (default: 'observation')"
+        "Optional: annotation type — 'observation', 'correction', 'question', 'friction', 'idea', 'era', 'transition', 'health_check', 'directory', 'steel_man', 'red_team' (default: 'observation')"
       ),
     author: z
       .string()

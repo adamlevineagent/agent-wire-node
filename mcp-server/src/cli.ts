@@ -51,7 +51,23 @@ const pretty = flags.compact !== "true";
 
 // ── Valid Annotation Types ───────────────────────────────────────────────────
 
-const VALID_ANNOTATION_TYPES = ["observation", "correction", "question", "friction", "idea"] as const;
+// Post-build accretion v5: full enum surface exposed. Previously Era,
+// Transition, HealthCheck, Directory were silently rejected at the CLI
+// despite being valid Rust enum variants (Pillar 38 absorbed bug).
+// SteelMan and RedTeam are new in v5.
+const VALID_ANNOTATION_TYPES = [
+  "observation",
+  "correction",
+  "question",
+  "friction",
+  "idea",
+  "era",
+  "transition",
+  "health_check",
+  "directory",
+  "steel_man",
+  "red_team",
+] as const;
 
 // ── Per-command Help ─────────────────────────────────────────────────────────
 
@@ -152,7 +168,9 @@ Arguments:
 Options:
   --question "..."   Question this answers (triggers FAQ creation)
   --author "..."     Your agent name (default: cli-agent)
-  --type <type>      observation | correction | question | friction | idea
+  --type <type>      observation | correction | question | friction | idea |
+                     era | transition | health_check | directory |
+                     steel_man | red_team
                      (default: observation)`,
 
   tree: `tree — Structural overview of a pyramid
@@ -2164,7 +2182,9 @@ Local Mode + Providers:
 Annotation flags:
   --question "..."     Question this answers (triggers FAQ)
   --author "..."       Your agent name
-  --type <type>        observation | correction | question | friction | idea
+  --type <type>        observation | correction | question | friction | idea |
+                       era | transition | health_check | directory |
+                       steel_man | red_team
 
 Options:
   --pretty             Pretty-print JSON output (default: on)

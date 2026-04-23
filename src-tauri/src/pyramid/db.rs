@@ -21974,3 +21974,87 @@ mod phase1_post_build_tests {
     }
 }
 
+
+#[cfg(test)]
+mod phase2_post_build_tests {
+    //! Post-build accretion v5 Phase 2 tests — new annotation verbs.
+    //! See .lab/architecture/agent-wire-node-post-build-plan-v5.md
+    use super::*;
+    use crate::pyramid::types::{AnnotationType, ContentType, PyramidAnnotation};
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        conn
+    }
+
+    fn make_annotation(slug: &str, node_id: &str, ty: AnnotationType) -> PyramidAnnotation {
+        PyramidAnnotation {
+            id: 0,
+            slug: slug.to_string(),
+            node_id: node_id.to_string(),
+            annotation_type: ty,
+            content: "test annotation content".to_string(),
+            question_context: None,
+            author: "test-author".to_string(),
+            created_at: "".to_string(),
+        }
+    }
+
+    fn seed_target_node(conn: &Connection, slug: &str, node_id: &str) {
+        // Minimal node row so the (slug, node_id) FK on pyramid_annotations
+        // is satisfied. The tests don't exercise node content, just the
+        // annotation_type round-trip.
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES (?1, ?2, 0, '', '', '', 1)",
+            rusqlite::params![node_id, slug],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn save_annotation_round_trip_all_eleven_types() {
+        let conn = mem_conn();
+        create_slug(&conn, "s", &ContentType::Code, "/tmp/s").unwrap();
+        seed_target_node(&conn, "s", "L0-000");
+        let all = [
+            AnnotationType::Observation,
+            AnnotationType::Correction,
+            AnnotationType::Question,
+            AnnotationType::Friction,
+            AnnotationType::Idea,
+            AnnotationType::Era,
+            AnnotationType::Transition,
+            AnnotationType::HealthCheck,
+            AnnotationType::Directory,
+            AnnotationType::SteelMan,
+            AnnotationType::RedTeam,
+        ];
+        for ty in all.iter() {
+            let a = make_annotation("s", "L0-000", ty.clone());
+            let saved = save_annotation(&conn, &a).unwrap();
+            assert_eq!(saved.annotation_type, *ty, "round-trip mismatch for {:?}", ty);
+        }
+        let listed = get_annotations(&conn, "s", "L0-000").unwrap();
+        assert_eq!(listed.len(), 11);
+    }
+
+    #[test]
+    fn annotation_type_from_str_strict_rejects_unknown() {
+        // Pillar 38 absorbed bug: from_str silently defaulted to Observation.
+        // from_str_strict raises so bad input surfaces instead of corrupting data.
+        assert!(AnnotationType::from_str_strict("observation").is_ok());
+        assert!(AnnotationType::from_str_strict("steel_man").is_ok());
+        assert!(AnnotationType::from_str_strict("red_team").is_ok());
+        // Previously-missing variants (Pillar 38 absorb)
+        assert!(AnnotationType::from_str_strict("era").is_ok());
+        assert!(AnnotationType::from_str_strict("transition").is_ok());
+        assert!(AnnotationType::from_str_strict("health_check").is_ok());
+        assert!(AnnotationType::from_str_strict("directory").is_ok());
+        // Unknown raises
+        assert!(AnnotationType::from_str_strict("bogus_type").is_err());
+        assert!(AnnotationType::from_str_strict("").is_err());
+    }
+}
