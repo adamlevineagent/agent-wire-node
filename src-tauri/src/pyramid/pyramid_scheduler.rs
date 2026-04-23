@@ -70,6 +70,14 @@ pub const DEFAULT_ACCRETION_THRESHOLD: u64 = 50;            // 50 annotations
 pub const DEFAULT_ACCRETION_TICK_WINDOW_N: u64 = 50;        // tick-dispatch LLM window
 pub const DEFAULT_SWEEP_STALE_DAYS: u64 = 7;                // failed WI older than 7d
 pub const DEFAULT_SWEEP_RETENTION_DAYS: u64 = 30;           // archive after 30d
+/// Phase 9c-2-3 — post-collapse append cooldown. After a debate node is
+/// collapsed (finalize_debate_node writes a `debate_collapsed` chronicle
+/// event + resets the node to scaffolding), any steel_man / red_team
+/// annotation arriving within this window is REFUSED rather than silently
+/// resurrecting the debate. Operator-editable via SchedulerConfig
+/// supersession — the value is a policy choice per pyramid, not a
+/// hardcoded law (Pillar 37 / feedback_pillar37_no_hedging).
+pub const DEFAULT_COLLAPSE_COOLDOWN_SECS: u64 = 10 * 60;    // 10 minutes
 
 /// Operator-editable scheduler configuration. Persisted as a single
 /// active `scheduler_parameters` contribution (YAML body). All
@@ -106,6 +114,17 @@ pub struct SchedulerConfig {
     /// `archived_at`. Two-stage so operators can still recover rows
     /// within the retention window.
     pub sweep_retention_days: u64,
+    /// Post-collapse append-race cooldown in seconds. See
+    /// `DEFAULT_COLLAPSE_COOLDOWN_SECS`. 0 disables the guard
+    /// (deliberate operator choice: "I want collapse + immediate
+    /// re-open to be a single-click workflow") — guard reports a
+    /// warn! when running with 0 so the disabled state is visible.
+    #[serde(default = "default_collapse_cooldown_secs")]
+    pub collapse_cooldown_secs: u64,
+}
+
+fn default_collapse_cooldown_secs() -> u64 {
+    DEFAULT_COLLAPSE_COOLDOWN_SECS
 }
 
 fn default_accretion_tick_window_n() -> u64 {
@@ -121,6 +140,7 @@ impl Default for SchedulerConfig {
             accretion_tick_window_n: DEFAULT_ACCRETION_TICK_WINDOW_N,
             sweep_stale_days: DEFAULT_SWEEP_STALE_DAYS,
             sweep_retention_days: DEFAULT_SWEEP_RETENTION_DAYS,
+            collapse_cooldown_secs: DEFAULT_COLLAPSE_COOLDOWN_SECS,
         }
     }
 }

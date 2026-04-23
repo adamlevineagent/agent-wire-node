@@ -23455,9 +23455,14 @@ mod phase4_post_build_tests {
         })
         .unwrap();
         let err = parse_shape_payload(&NodeShape::new("debate"), Some(&gap_json)).unwrap_err();
+        // 9c-2-1: the typed-handler error is now wrapped by the
+        // registry-dispatch's anyhow context. Alternate format `{:#}`
+        // includes the full chain so the inner deserialize error
+        // (naming `DebateTopic`) is visible.
+        let chained = format!("{err:#}");
         assert!(
-            err.to_string().contains("DebateTopic"),
-            "misalignment error must name the expected type: {err}"
+            chained.contains("DebateTopic"),
+            "misalignment error must name the expected type in the chain: {chained}"
         );
     }
 
@@ -23750,20 +23755,26 @@ mod phase4_post_build_tests {
         // `null` is neither empty (the trim guard treats it as Some("null"))
         // nor a valid object — serde returns a parse error and we surface
         // it loudly with the expected type name in context.
+        // 9c-2-1: the typed-handler error is wrapped by the
+        // registry-dispatch's anyhow context; use `{:#}` alternate format
+        // to walk the chain so the inner deserialize error surfaces.
         let err = parse_shape_payload(&NodeShape::new("debate"), Some("null")).unwrap_err();
+        let chained = format!("{err:#}");
         assert!(
-            err.to_string().contains("DebateTopic"),
-            "expected DebateTopic in error chain: {err}"
+            chained.contains("DebateTopic"),
+            "expected DebateTopic in error chain: {chained}"
         );
         let err = parse_shape_payload(&NodeShape::new("meta_layer"), Some("null")).unwrap_err();
+        let chained = format!("{err:#}");
         assert!(
-            err.to_string().contains("MetaLayerTopic"),
-            "expected MetaLayerTopic in error chain: {err}"
+            chained.contains("MetaLayerTopic"),
+            "expected MetaLayerTopic in error chain: {chained}"
         );
         let err = parse_shape_payload(&NodeShape::new("gap"), Some("null")).unwrap_err();
+        let chained = format!("{err:#}");
         assert!(
-            err.to_string().contains("GapTopic"),
-            "expected GapTopic in error chain: {err}"
+            chained.contains("GapTopic"),
+            "expected GapTopic in error chain: {chained}"
         );
     }
 
@@ -35632,6 +35643,472 @@ mod phase9c1_post_build_tests {
                 .unwrap_or_else(|| panic!("event '{event}' must be mapped — unmapped events hold the cursor"));
             assert_eq!(mapping.0, *expected_primitive, "event '{event}' primitive");
             assert_eq!(mapping.1, *expected_step, "event '{event}' step_name");
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Post-build accretion v5 Phase 9c-2 — three architectural cleanups:
+//   - 9c-2-1: contribution-driven shape-handler registry + Raw fallback
+//   - 9c-2-2: include_in_cascade_prompt vocab field + cascade loader filter
+//   - 9c-2-3: post-collapse append-race guard via chronicle query
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod phase9c2_post_build_tests {
+    use super::*;
+    use super::post_build_test_support::test_lock;
+    use crate::pyramid::types::{
+        parse_shape_payload, shape_handler_registry, ContentType, DebatePosition, DebateTopic,
+        GapTopic, MetaLayerTopic, MetaLayerTopicEntry, NodeShape, ShapePayload,
+        NODE_SHAPE_DEBATE, NODE_SHAPE_GAP, NODE_SHAPE_META_LAYER,
+    };
+    use crate::pyramid::vocab_entries::{
+        self, VocabEntry, VOCAB_KIND_ANNOTATION_TYPE, VOCAB_KIND_NODE_SHAPE,
+    };
+    use rusqlite::Connection;
+
+    fn fresh_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        conn
+    }
+
+    // ── 9c-2-1.1: all three core handlers registered at boot ────────────
+    #[test]
+    fn shape_handler_registry_has_debate_meta_layer_gap() {
+        let _lock = test_lock();
+        let reg = shape_handler_registry();
+        for shape in &[NODE_SHAPE_DEBATE, NODE_SHAPE_META_LAYER, NODE_SHAPE_GAP] {
+            assert!(
+                reg.contains_key(*shape),
+                "registry must contain '{shape}' handler after boot"
+            );
+            let h = reg.get(*shape).unwrap();
+            assert_eq!(h.shape_name(), *shape, "shape_name() matches registry key");
+        }
+        // Scaffolding is NOT in the registry — it's special-cased above the
+        // dispatch (null payload).
+        assert!(
+            !reg.contains_key("scaffolding"),
+            "scaffolding must not be in the registry — it's special-cased"
+        );
+    }
+
+    // ── 9c-2-1.2: typed handlers deserialize canonical payloads ─────────
+    #[test]
+    fn debate_handler_parses_debate_topic() {
+        let _lock = test_lock();
+        let debate = DebateTopic {
+            concern: "c?".to_string(),
+            positions: vec![DebatePosition {
+                label: "P1".to_string(),
+                steel_manning: "SM1".to_string(),
+                red_teams: vec![],
+                evidence_anchors: vec!["L1-1".to_string()],
+                source_annotation_ids: vec![],
+            }],
+            cross_refs: vec![],
+            vote_lean: None,
+        };
+        let json = serde_json::to_string(&debate).unwrap();
+        let shape = NodeShape::new(NODE_SHAPE_DEBATE);
+        let parsed = parse_shape_payload(&shape, Some(&json)).unwrap();
+        match parsed {
+            Some(ShapePayload::Debate(d)) => assert_eq!(d.concern, "c?"),
+            other => panic!("expected Debate variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn meta_layer_handler_parses_meta_layer_topic() {
+        let _lock = test_lock();
+        let meta = MetaLayerTopic {
+            purpose_question: "What is X?".to_string(),
+            parent_meta_layer_id: None,
+            covered_substrate_nodes: vec!["L1-1".to_string()],
+            topics: vec![MetaLayerTopicEntry {
+                topic: "T1".to_string(),
+                anchor_nodes: vec!["L1-2".to_string()],
+            }],
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let shape = NodeShape::new(NODE_SHAPE_META_LAYER);
+        let parsed = parse_shape_payload(&shape, Some(&json)).unwrap();
+        match parsed {
+            Some(ShapePayload::MetaLayer(m)) => assert_eq!(m.purpose_question, "What is X?"),
+            other => panic!("expected MetaLayer variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gap_handler_parses_gap_topic() {
+        let _lock = test_lock();
+        let gap = GapTopic {
+            concern: "missing-evidence".to_string(),
+            description: "no substrate on X".to_string(),
+            demand_state: "open".to_string(),
+            candidate_resolutions: vec![],
+            evidence_anchors: vec![],
+            source_annotation_ids: vec![],
+        };
+        let json = serde_json::to_string(&gap).unwrap();
+        let shape = NodeShape::new(NODE_SHAPE_GAP);
+        let parsed = parse_shape_payload(&shape, Some(&json)).unwrap();
+        match parsed {
+            Some(ShapePayload::Gap(g)) => assert_eq!(g.concern, "missing-evidence"),
+            other => panic!("expected Gap variant, got {other:?}"),
+        }
+    }
+
+    // ── 9c-2-1.3: Raw fallback for vocab-registered, handler-unregistered ─
+    #[test]
+    fn unknown_shape_with_vocab_entry_parses_as_raw() {
+        let _lock = test_lock();
+        let conn = fresh_conn();
+        let entry = VocabEntry {
+            id: 0,
+            vocab_kind: VOCAB_KIND_NODE_SHAPE.to_string(),
+            name: "agent_published_shape".to_string(),
+            description: "runtime-added via vocab publish".to_string(),
+            handler_chain_id: None,
+            reactive: false,
+            creates_delta: false,
+            include_in_cascade_prompt: true,
+            created_at: String::new(),
+            superseded_by: None,
+            supersede_reason: None,
+        };
+        vocab_entries::publish_vocabulary_entry(&conn, &entry).unwrap();
+        let shape = NodeShape::from_db(&conn, Some("agent_published_shape")).unwrap();
+        let body = r#"{"whatever":"the agent wants","n":42}"#;
+        let parsed = parse_shape_payload(&shape, Some(body)).unwrap();
+        match parsed {
+            Some(ShapePayload::Raw(v)) => {
+                assert_eq!(v["whatever"], serde_json::json!("the agent wants"));
+                assert_eq!(v["n"], serde_json::json!(42));
+            }
+            other => panic!("expected ShapePayload::Raw, got {other:?}"),
+        }
+    }
+
+    // ── 9c-2-1.4: typed handler mismatch is loud (NOT Raw fallback) ──────
+    #[test]
+    fn debate_handler_mismatch_raises_loud() {
+        let _lock = test_lock();
+        let shape = NodeShape::new(NODE_SHAPE_DEBATE);
+        // Gap-shaped JSON body applied to debate — Debate's typed handler
+        // must refuse (not fall through to Raw).
+        let gap_body = r#"{"concern":"c","description":"d","demand_state":"open"}"#;
+        let err = parse_shape_payload(&shape, Some(gap_body)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("DebateTopic") || msg.contains("shape_handler 'debate'"),
+            "mismatched payload must surface the handler's loud error: {msg}"
+        );
+    }
+
+    // ── 9c-2-1.5: registry is Send + Sync (compile-time) ─────────────────
+    #[test]
+    fn shape_handler_registry_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<std::sync::Arc<dyn crate::pyramid::types::ShapeHandler>>();
+    }
+
+    // ── 9c-2-2.1: operational types carry include_in_cascade_prompt=false ─
+    #[test]
+    fn genesis_operational_types_excluded_from_cascade_prompt() {
+        let _lock = test_lock();
+        let conn = fresh_conn();
+        for name in &["gap", "purpose_declaration", "purpose_shift", "debate_collapse"] {
+            let entry = vocab_entries::get_vocabulary_entry(
+                &conn,
+                VOCAB_KIND_ANNOTATION_TYPE,
+                name,
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("genesis '{name}' vocab entry missing"));
+            assert!(
+                !entry.include_in_cascade_prompt,
+                "operational type '{name}' must have include_in_cascade_prompt=false"
+            );
+        }
+    }
+
+    #[test]
+    fn genesis_narrative_types_included_in_cascade_prompt() {
+        let _lock = test_lock();
+        let conn = fresh_conn();
+        for name in &[
+            "observation",
+            "correction",
+            "question",
+            "friction",
+            "idea",
+            "era",
+            "transition",
+            "health_check",
+            "directory",
+            "steel_man",
+            "red_team",
+            "hypothesis",
+        ] {
+            let entry = vocab_entries::get_vocabulary_entry(
+                &conn,
+                VOCAB_KIND_ANNOTATION_TYPE,
+                name,
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("genesis '{name}' vocab entry missing"));
+            assert!(
+                entry.include_in_cascade_prompt,
+                "narrative type '{name}' must have include_in_cascade_prompt=true"
+            );
+        }
+    }
+
+    // ── 9c-2-2.2: cascade loader filters operational out, lets narrative in
+    #[tokio::test]
+    async fn cascade_loader_excludes_debate_collapse_includes_observation() {
+        let _lock = test_lock();
+        let conn = fresh_conn();
+        create_slug(&conn, "p9c22", &ContentType::Code, "/tmp/p9c22").unwrap();
+
+        // Seed a node so save_annotation's FK passes.
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L1-a', 'p9c22', 1, 'hl', 'ds', '', 1)",
+            [],
+        )
+        .unwrap();
+
+        // Write one observation + one debate_collapse annotation on L1-a.
+        save_annotation(
+            &conn,
+            &crate::pyramid::types::PyramidAnnotation {
+                id: 0,
+                slug: "p9c22".to_string(),
+                node_id: "L1-a".to_string(),
+                annotation_type: crate::pyramid::types::AnnotationType::new("observation"),
+                content: "narrative feedback about X".to_string(),
+                question_context: None,
+                author: "alice".to_string(),
+                created_at: String::new(),
+            },
+        )
+        .unwrap();
+        save_annotation(
+            &conn,
+            &crate::pyramid::types::PyramidAnnotation {
+                id: 0,
+                slug: "p9c22".to_string(),
+                node_id: "L1-a".to_string(),
+                annotation_type: crate::pyramid::types::AnnotationType::new("debate_collapse"),
+                content: "Pro wins".to_string(),
+                question_context: None,
+                author: "bob".to_string(),
+                created_at: String::new(),
+            },
+        )
+        .unwrap();
+
+        let loaded = crate::pyramid::stale_helpers_upper::
+            public_load_cascade_annotations_for_target_test_only(
+                &conn,
+                "p9c22",
+                "L1-a",
+                Some(&["L1-a".to_string()]),
+            )
+            .unwrap();
+        let kinds: Vec<&str> = loaded
+            .iter()
+            .map(|a| a.annotation_type.as_str())
+            .collect();
+        assert!(
+            kinds.contains(&"observation"),
+            "narrative 'observation' MUST reach the cascade prompt: got {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&"debate_collapse"),
+            "operational 'debate_collapse' MUST NOT reach the cascade prompt: got {kinds:?}"
+        );
+    }
+
+    // ── 9c-2-3.1: collapse + immediate append raises loud (no resurrect) ─
+    #[tokio::test]
+    async fn post_collapse_immediate_append_raises_within_cooldown() {
+        use crate::pyramid::observation_events;
+        let _lock = test_lock();
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+
+        create_slug(&conn, "p9c23", &ContentType::Code, "/tmp/p9c23").unwrap();
+        // Seed a scaffolding node (post-collapse state).
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L2-X', 'p9c23', 2, 'hl', 'd', '', 1)",
+            [],
+        )
+        .unwrap();
+        // Emit a debate_collapsed event within the cooldown window.
+        observation_events::write_observation_event(
+            &conn,
+            "p9c23",
+            "chain",
+            "debate_collapsed",
+            None, None, None, None,
+            Some("L2-X"),
+            Some(2),
+            Some(r#"{"reason":"Pro wins","positions_remaining":2}"#),
+        )
+        .unwrap();
+
+        // Now call the logic the `append_annotation_to_debate_node` guard
+        // runs: read SchedulerConfig + the most recent collapse event + age.
+        let cfg = crate::pyramid::pyramid_scheduler::load_config(&conn);
+        assert!(cfg.collapse_cooldown_secs > 0, "genesis cooldown must be > 0");
+        let recent: Option<(String, String)> = conn
+            .query_row(
+                "SELECT detected_at, COALESCE(metadata_json, '{}')
+                   FROM dadbear_observation_events
+                  WHERE slug = ?1 AND event_type = 'debate_collapsed'
+                    AND target_node_id = ?2
+                  ORDER BY id DESC LIMIT 1",
+                rusqlite::params!["p9c23", "L2-X"],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok();
+        let recent = recent.expect("collapse event must be findable");
+        let age_secs: i64 = conn
+            .query_row(
+                "SELECT CAST(strftime('%s','now') AS INTEGER)
+                        - CAST(strftime('%s', ?1) AS INTEGER)",
+                rusqlite::params![recent.0],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        // Immediate write → age is 0s (or close to it), well inside default cooldown.
+        assert!(
+            age_secs >= 0 && (age_secs as u64) < cfg.collapse_cooldown_secs,
+            "immediate collapse-then-check should be inside the cooldown window: \
+             age={age_secs}s, cooldown={}s",
+            cfg.collapse_cooldown_secs
+        );
+    }
+
+    // ── 9c-2-3.2: collapse older than cooldown → append allowed ─────────
+    #[tokio::test]
+    async fn post_collapse_append_allowed_after_cooldown_elapses() {
+        use crate::pyramid::observation_events;
+        let _lock = test_lock();
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+
+        create_slug(&conn, "p9c23a", &ContentType::Code, "/tmp/p9c23a").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L2-Y', 'p9c23a', 2, 'hl', 'd', '', 1)",
+            [],
+        )
+        .unwrap();
+
+        // Write a debate_collapsed event with detected_at stamped 24 hours
+        // ago — far outside any reasonable cooldown. We write directly
+        // with an explicit detected_at since the observation_events helper
+        // stamps `now`.
+        conn.execute(
+            "INSERT INTO dadbear_observation_events
+                (slug, source, event_type, target_node_id, layer, detected_at,
+                 metadata_json)
+             VALUES (?1, 'chain', 'debate_collapsed', ?2, 2,
+                     datetime('now', '-86400 seconds'), '{}')",
+            rusqlite::params!["p9c23a", "L2-Y"],
+        )
+        .unwrap();
+
+        let cfg = crate::pyramid::pyramid_scheduler::load_config(&conn);
+        let recent_age: i64 = conn
+            .query_row(
+                "SELECT CAST(strftime('%s','now') AS INTEGER)
+                        - CAST(strftime('%s', detected_at) AS INTEGER)
+                   FROM dadbear_observation_events
+                  WHERE slug = 'p9c23a' AND event_type = 'debate_collapsed'
+                    AND target_node_id = 'L2-Y'
+                  ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert!(
+            recent_age > cfg.collapse_cooldown_secs as i64,
+            "24h-old collapse must be outside cooldown: age={recent_age}s, cooldown={}s",
+            cfg.collapse_cooldown_secs
+        );
+    }
+
+    // ── 9c-2-3.3: SchedulerConfig carries collapse_cooldown_secs ────────
+    #[test]
+    fn scheduler_config_has_collapse_cooldown() {
+        let _lock = test_lock();
+        let conn = fresh_conn();
+        let cfg = crate::pyramid::pyramid_scheduler::load_config(&conn);
+        assert_eq!(
+            cfg.collapse_cooldown_secs,
+            crate::pyramid::pyramid_scheduler::DEFAULT_COLLAPSE_COOLDOWN_SECS,
+            "genesis SchedulerConfig must carry the collapse_cooldown_secs default"
+        );
+    }
+
+    // ── 9c-2 integration: publish a shape via vocab + store a node + read ─
+    #[test]
+    fn end_to_end_agent_publishes_shape_read_returns_raw() {
+        let _lock = test_lock();
+        let conn = fresh_conn();
+        create_slug(&conn, "p9c2i", &ContentType::Code, "/tmp/p9c2i").unwrap();
+
+        // Publish a runtime node_shape.
+        let entry = VocabEntry {
+            id: 0,
+            vocab_kind: VOCAB_KIND_NODE_SHAPE.to_string(),
+            name: "annotation_cluster".to_string(),
+            description: "runtime cluster shape".to_string(),
+            handler_chain_id: None,
+            reactive: false,
+            creates_delta: false,
+            include_in_cascade_prompt: true,
+            created_at: String::new(),
+            superseded_by: None,
+            supersede_reason: None,
+        };
+        vocab_entries::publish_vocabulary_entry(&conn, &entry).unwrap();
+
+        // Insert a node carrying the runtime shape + arbitrary JSON.
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version,
+                 node_shape, shape_payload_json)
+             VALUES ('L1-c1', 'p9c2i', 1, 'hl', 'd', '', 1, 'annotation_cluster',
+                     '{\"cluster_size\":7}')",
+            [],
+        )
+        .unwrap();
+
+        // Read via get_node_shape — the loud-raise prior to 9c-2-1 is gone;
+        // Raw fallback delivers the JSON.
+        let view = crate::pyramid::db::get_node_shape(&conn, "p9c2i", "L1-c1").unwrap();
+        let view = view.expect("node must exist");
+        assert_eq!(view.shape.as_str(), "annotation_cluster");
+        match view.payload {
+            Some(ShapePayload::Raw(v)) => {
+                assert_eq!(v["cluster_size"], serde_json::json!(7));
+            }
+            other => panic!("expected ShapePayload::Raw for runtime shape, got {other:?}"),
         }
     }
 }

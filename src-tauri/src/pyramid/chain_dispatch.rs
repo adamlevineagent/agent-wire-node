@@ -7,7 +7,7 @@
 // See docs/plans/action-chain-refactor-v3.md §Phase 4 for full specification.
 
 use anyhow::{anyhow, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -1343,6 +1343,95 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 .as_ref()
                 .map(|v| v.shape.clone())
                 .unwrap_or_else(NodeShape::scaffolding);
+
+            // Phase 9c-2-3: post-collapse append-race guard.
+            //
+            // finalize_debate_node collapses a Debate → Scaffolding and
+            // NULLs the shape_payload_json. Without this guard, an in-flight
+            // steel_man / red_team annotation arriving moments after the
+            // collapse would take the Scaffolding-branch below and
+            // RESURRECT the debate under a fresh DebateTopic — the lock
+            // prevents DB corruption but semantic ordering is wrong.
+            //
+            // Design: query the chronicle for the most recent
+            // `debate_collapsed` observation event on this (slug, node_id).
+            // If it fires within the operator-editable cooldown window
+            // (SchedulerConfig.collapse_cooldown_secs), loud-raise with
+            // the collapse timestamp + reason. Cooldown=0 disables the
+            // guard (deliberate operator choice).
+            //
+            // Runs only when current_shape is Scaffolding — an active
+            // Debate doesn't need the guard (collapse moved the shape
+            // away from Debate; if we're looking at Debate now, either no
+            // collapse happened or a post-collapse re-open is already
+            // complete).
+            if current_shape.is_scaffolding() {
+                let cooldown_secs = super::pyramid_scheduler::load_config(&conn_guard)
+                    .collapse_cooldown_secs;
+                if cooldown_secs > 0 {
+                    // Most recent debate_collapsed for this (slug, node_id).
+                    // `detected_at` is a SQLite `datetime('now')` string
+                    // (UTC, 1-second resolution). We compute age via
+                    // `strftime('%s','now') - strftime('%s', detected_at)`
+                    // which is seconds apart.
+                    let recent: Option<(String, String)> = conn_guard
+                        .query_row(
+                            "SELECT detected_at, COALESCE(metadata_json, '{}')
+                               FROM dadbear_observation_events
+                              WHERE slug = ?1
+                                AND event_type = 'debate_collapsed'
+                                AND target_node_id = ?2
+                              ORDER BY id DESC
+                              LIMIT 1",
+                            rusqlite::params![ctx.slug, target_node_id],
+                            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                        )
+                        .optional()?;
+                    if let Some((detected_at, metadata)) = recent {
+                        let age_secs: i64 = conn_guard
+                            .query_row(
+                                "SELECT CAST(strftime('%s', 'now') AS INTEGER)
+                                        - CAST(strftime('%s', ?1) AS INTEGER)",
+                                rusqlite::params![detected_at],
+                                |r| r.get::<_, i64>(0),
+                            )
+                            .unwrap_or(i64::MAX);
+                        if age_secs >= 0 && (age_secs as u64) < cooldown_secs {
+                            // Pull reason from the event's metadata_json
+                            // for the error message; default to "unknown"
+                            // if the blob is malformed.
+                            let reason = serde_json::from_str::<serde_json::Value>(&metadata)
+                                .ok()
+                                .and_then(|v| v.get("reason").cloned())
+                                .and_then(|v| v.as_str().map(String::from))
+                                .unwrap_or_else(|| "unknown".to_string());
+                            drop(conn_guard);
+                            return Err(anyhow!(
+                                "append_annotation_to_debate_node: cannot append \
+                                 {annotation_type} annotation to scaffolding node '{}' — \
+                                 debate was collapsed {age_secs}s ago (reason: {reason}) \
+                                 within the post-collapse cooldown window \
+                                 ({cooldown_secs}s). To re-open this debate, operator \
+                                 must wait for the cooldown to elapse OR supersede \
+                                 SchedulerConfig.collapse_cooldown_secs. Feedback: \
+                                 a new annotation during the cooldown would resurrect \
+                                 the just-collapsed debate, inverting finalize_debate_node's \
+                                 semantic (feedback_loud_deferrals + 9c-1 verifier flag).",
+                                target_node_id
+                            ));
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        slug = %ctx.slug,
+                        target_node_id = %target_node_id,
+                        "append_annotation_to_debate_node: collapse_cooldown_secs=0 — \
+                         post-collapse append-race guard is DISABLED by operator config; \
+                         a steel_man/red_team annotation on a just-collapsed node will \
+                         resurrect the debate"
+                    );
+                }
+            }
 
             let position_label_for_steel_man = format!("annotation#{annotation_id}");
             let red_team_from_position = "main";
