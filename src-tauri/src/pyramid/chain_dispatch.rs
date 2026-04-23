@@ -3629,7 +3629,12 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 .unwrap_or_else(|| ctx.slug.clone());
 
             // Load purpose + annotations under a single reader lock.
-            let (purpose_text, annotations, total_count) = {
+            // v5 audit P10: accretion_cursor is now a DB column on
+            // pyramid_slugs. Read it here and filter annotations to
+            // `id > cursor` so repeated invocations don't reprocess the
+            // same rows. A fresh slug has cursor=0 (default) which
+            // matches every annotation.
+            let (purpose_text, annotations, total_count, accretion_cursor) = {
                 let conn_guard = ctx.db_reader.lock().await;
                 let p = super::purpose::load_or_create_purpose(
                     &conn_guard,
@@ -3640,13 +3645,23 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                     slug_for_load, e,
                 ))?;
 
-                // Count total annotations for context (before window trim).
+                // Read the slug's current accretion cursor (default 0).
+                let cursor: i64 = conn_guard
+                    .query_row(
+                        "SELECT COALESCE(accretion_cursor, 0) FROM pyramid_slugs
+                          WHERE slug = ?1",
+                        rusqlite::params![slug_for_load],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+
+                // Count total annotations strictly beyond the cursor.
                 let total: i64 = if let Some(nid) = node_id_filter.as_deref() {
                     conn_guard
                         .query_row(
                             "SELECT COUNT(*) FROM pyramid_annotations
-                              WHERE slug = ?1 AND node_id = ?2",
-                            rusqlite::params![slug_for_load, nid],
+                              WHERE slug = ?1 AND node_id = ?2 AND id > ?3",
+                            rusqlite::params![slug_for_load, nid, cursor],
                             |r| r.get(0),
                         )
                         .unwrap_or(0)
@@ -3654,24 +3669,24 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                     conn_guard
                         .query_row(
                             "SELECT COUNT(*) FROM pyramid_annotations
-                              WHERE slug = ?1",
-                            rusqlite::params![slug_for_load],
+                              WHERE slug = ?1 AND id > ?2",
+                            rusqlite::params![slug_for_load, cursor],
                             |r| r.get(0),
                         )
                         .unwrap_or(0)
                 };
 
-                // Load the window_n most recent annotations.
+                // Load the window_n most recent annotations beyond cursor.
                 let mut anns: Vec<Value> = Vec::new();
                 if let Some(nid) = node_id_filter.as_deref() {
                     let mut stmt = conn_guard.prepare(
                         "SELECT id, node_id, annotation_type, content, author, created_at
                            FROM pyramid_annotations
-                          WHERE slug = ?1 AND node_id = ?2
-                          ORDER BY id DESC LIMIT ?3",
+                          WHERE slug = ?1 AND node_id = ?2 AND id > ?3
+                          ORDER BY id DESC LIMIT ?4",
                     )?;
                     let rows = stmt.query_map(
-                        rusqlite::params![slug_for_load, nid, window_n],
+                        rusqlite::params![slug_for_load, nid, cursor, window_n],
                         |row| {
                             Ok(serde_json::json!({
                                 "id": row.get::<_, i64>(0)?,
@@ -3690,11 +3705,11 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                     let mut stmt = conn_guard.prepare(
                         "SELECT id, node_id, annotation_type, content, author, created_at
                            FROM pyramid_annotations
-                          WHERE slug = ?1
-                          ORDER BY id DESC LIMIT ?2",
+                          WHERE slug = ?1 AND id > ?2
+                          ORDER BY id DESC LIMIT ?3",
                     )?;
                     let rows = stmt.query_map(
-                        rusqlite::params![slug_for_load, window_n],
+                        rusqlite::params![slug_for_load, cursor, window_n],
                         |row| {
                             Ok(serde_json::json!({
                                 "id": row.get::<_, i64>(0)?,
@@ -3710,7 +3725,7 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                         anns.push(r?);
                     }
                 }
-                (p.purpose_text, anns, total)
+                (p.purpose_text, anns, total, cursor)
             };
 
             // Phase 7d verifier fix: compute the maximum annotation id
@@ -3767,6 +3782,12 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                     .map(Value::from)
                     .unwrap_or(Value::Null),
             );
+            // v5 audit P10: thread the cursor value BEFORE this run so
+            // emit_accretion_written can confirm it was advanced.
+            out.insert(
+                "accretion_cursor_before".to_string(),
+                Value::from(accretion_cursor),
+            );
             Ok(Value::Object(out))
         }
         "emit_accretion_written" => {
@@ -3803,42 +3824,46 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 .unwrap_or_else(|| ctx.slug.clone());
             let node_id = input.get("node_id").and_then(|v| v.as_str());
 
-            // Phase 7d verifier fix (target 10): carry the maximum
-            // annotation id from the preceding load step as a cursor
-            // candidate. The 7d MVP has no DB-backed cursor (Phase 9
-            // decides schema + atomic update ordering), so repeated
-            // invocations reprocess the same annotations and produce
-            // duplicate accretion notes. Stamping the cursor on the
-            // event gives Phase 9 wiring a chronicle-reconstructible
-            // path to pick up where the last run left off. Null when
-            // the load step produced zero annotations or when a caller
-            // invokes `emit_accretion_written` without threading the
-            // load-step output through (tested in
-            // `starter_accretion_emit_written_raises_on_missing_note`).
-            let accretion_cursor = input
+            // v5 audit P10: accretion_cursor is a DB column on
+            // pyramid_slugs. Carry the maximum annotation id from the
+            // preceding load step as the new cursor value. The UPDATE +
+            // chronicle insert run in the SAME transaction so replay of
+            // the chronicle (without the UPDATE) can't duplicate-process.
+            // The chronicle metadata continues to stamp the cursor for
+            // audit trail / operator observability, but is no longer the
+            // authoritative source.
+            //
+            // Null max_annotation_id occurs when load_recent_annotations
+            // returned zero rows — in that case we should not advance
+            // the cursor (nothing was processed).
+            let new_cursor: Option<i64> = input
                 .get("max_annotation_id")
-                .cloned()
+                .and_then(|v| v.as_i64());
+            let accretion_cursor_value = new_cursor
+                .map(Value::from)
                 .unwrap_or(Value::Null);
 
             let meta = serde_json::json!({
                 "note": note,
                 "references": references,
-                "accretion_cursor": accretion_cursor,
+                "accretion_cursor": accretion_cursor_value,
             });
             let metadata_json = serde_json::to_string(&meta)?;
 
             info!(
-                "[mechanical] emit_accretion_written slug={} note_len={} references={}",
+                "[mechanical] emit_accretion_written slug={} note_len={} references={} new_cursor={:?}",
                 slug_for_write,
                 note.len(),
                 meta["references"]
                     .as_array()
                     .map(|a| a.len())
                     .unwrap_or(0),
+                new_cursor,
             );
-            let conn_guard = ctx.db_writer.lock().await;
+            let mut conn_guard = ctx.db_writer.lock().await;
+            let tx = conn_guard.transaction()?;
             let event_id = super::observation_events::write_observation_event(
-                &conn_guard,
+                &tx,
                 &slug_for_write,
                 "chain",
                 "accretion_written",
@@ -3850,6 +3875,19 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 None,
                 Some(&metadata_json),
             )?;
+            // Advance the cursor atomically with the chronicle write.
+            // Monotonic-only: never rewind (defensive against out-of-order
+            // callers). NULL max_annotation_id → no advance.
+            if let Some(c) = new_cursor {
+                tx.execute(
+                    "UPDATE pyramid_slugs
+                        SET accretion_cursor = ?1
+                      WHERE slug = ?2
+                        AND COALESCE(accretion_cursor, 0) < ?1",
+                    rusqlite::params![c, slug_for_write],
+                )?;
+            }
+            tx.commit()?;
             drop(conn_guard);
 
             let mut out = if let Value::Object(obj) = input {

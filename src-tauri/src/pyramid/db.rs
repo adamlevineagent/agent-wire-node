@@ -4387,6 +4387,22 @@ fn migrate_online_push_columns(conn: &Connection) -> Result<()> {
         [],
     );
 
+    // ── pyramid_slugs: accretion cursor (post-build accretion v5 audit P10) ──
+    //
+    // Phase 7d stored the per-slug accretion cursor as metadata on every
+    // accretion_written chronicle event ("chronicle-reconstructible" but
+    // non-authoritative). That left duplicate-processing risk on chronicle
+    // replay: a re-run would load the same annotations because the cursor
+    // lived only in the event stream, not in a queryable state column.
+    // Post-audit: accretion_cursor is a first-class column on
+    // pyramid_slugs, atomically updated in the same transaction that
+    // writes the accretion_written event. Chronicle metadata still carries
+    // the value for audit trail but is no longer authoritative.
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_slugs ADD COLUMN accretion_cursor INTEGER DEFAULT 0",
+        [],
+    );
+
     // ── pyramid_web_edges: build_id scoping (WS-ONLINE-S3) ──
     let _ = conn.execute(
         "ALTER TABLE pyramid_web_edges ADD COLUMN build_id TEXT DEFAULT NULL",
@@ -31679,8 +31695,152 @@ mod phase7d_post_build_tests {
             parsed["accretion_cursor"].as_i64(),
             Some(max_id),
             "accretion_cursor must carry the max annotation id the load \
-             step saw, so Phase 9 wiring can reconstruct a cursor from \
-             the chronicle without a schema migration. Got metadata: {meta}"
+             step saw. Post-audit P10 it is also persisted to \
+             pyramid_slugs.accretion_cursor; metadata remains for audit \
+             trail. Got metadata: {meta}"
         );
+
+        // v5 audit P10: cursor was persisted to pyramid_slugs.
+        let persisted: i64 = writer
+            .query_row(
+                "SELECT accretion_cursor FROM pyramid_slugs WHERE slug = 'p7d_cur'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            persisted, max_id,
+            "accretion_cursor must be persisted to pyramid_slugs atomically \
+             with the chronicle event — chronicle replay must not allow \
+             duplicate reprocessing."
+        );
+    }
+
+    // ── v5 audit P10: cursor prevents duplicate processing on replay ────
+
+    #[tokio::test]
+    async fn accretion_cursor_prevents_duplicate_processing_across_runs() {
+        // Run the accretion chain twice against the same slug; the
+        // second run must find zero annotations to process (cursor
+        // advanced by run 1) and must not emit a second accretion note.
+        // Pre-v5-audit this test would have seen 3 annotations on run 2
+        // because the cursor lived only in the event metadata.
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7d_dup", &ContentType::Code, "/tmp/p7d_dup").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('node-dup', 'p7d_dup', 0, 'node', 'distilled', '', 1)",
+            [],
+        )
+        .unwrap();
+        let mut max_id: i64 = 0;
+        for i in 0..3 {
+            let ann = PyramidAnnotation {
+                id: 0,
+                slug: "p7d_dup".into(),
+                node_id: "node-dup".into(),
+                annotation_type: AnnotationType::new("observation"),
+                content: format!("obs #{i}"),
+                question_context: None,
+                author: "tester".into(),
+                created_at: String::new(),
+            };
+            let saved = save_annotation(&conn, &ann).unwrap();
+            max_id = saved.id;
+        }
+
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7d-dup-chain".into(),
+            name: "Phase 7d audit P10 dedup test".into(),
+            description: "run accretion twice, verify cursor blocks replay".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "v5-audit-p10".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "abort".into(),
+            },
+            steps: vec![
+                ChainStep {
+                    name: "load".into(),
+                    primitive: "custom".into(),
+                    mechanical: true,
+                    rust_function: Some("load_recent_annotations_for_slug".into()),
+                    ..Default::default()
+                },
+                ChainStep {
+                    name: "write".into(),
+                    primitive: "custom".into(),
+                    mechanical: true,
+                    rust_function: Some("emit_accretion_written".into()),
+                    ..Default::default()
+                },
+            ],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+
+        // Run 1: processes all 3 annotations, advances cursor to max_id.
+        let out1 = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7d_dup",
+            None,
+            json!({
+                "slug": "p7d_dup",
+                "window_n": 10,
+                "note": "run-1 note",
+                "references": [max_id],
+            }),
+        )
+        .await
+        .expect("run 1 must succeed");
+        assert_eq!(
+            out1["annotation_count"].as_i64(),
+            Some(3),
+            "run 1 sees all 3 annotations (cursor starts at 0)"
+        );
+
+        // Run 2: cursor is now at max_id; should see zero annotations.
+        let out2 = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7d_dup",
+            None,
+            json!({
+                "slug": "p7d_dup",
+                "window_n": 10,
+                "note": "run-2 note",
+                "references": [],
+            }),
+        )
+        .await
+        .expect("run 2 must succeed");
+        assert_eq!(
+            out2["annotation_count"].as_i64(),
+            Some(0),
+            "run 2 sees zero annotations — cursor advanced by run 1"
+        );
+
+        // Cursor persisted at max_id.
+        let writer = state.writer.lock().await;
+        let persisted: i64 = writer
+            .query_row(
+                "SELECT accretion_cursor FROM pyramid_slugs WHERE slug = 'p7d_dup'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, max_id, "cursor must still be at max_id");
     }
 }
