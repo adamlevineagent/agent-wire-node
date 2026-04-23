@@ -27494,5 +27494,96 @@ mod phase6c_d_post_build_tests {
              db::create_slug owns that binding via CASCADE_HANDLER_NEW_DEFAULT"
         );
     }
+
+    // ── Test 8 ─────────────────────────────────────────────────────────
+    // Phase 6c-D verifier-pass drift-guard: the module-level
+    // `NODE_SHAPE_*` consts in `types.rs` must cover every entry in
+    // `GENESIS_NODE_SHAPES`, and the `ANNOTATION_TYPE_*` consts must
+    // cover every entry in `GENESIS_ANNOTATION_TYPES`. These consts
+    // are conveniences (the registry is the source of truth), but
+    // callers that DO use them would silently refer to a stale /
+    // missing const if the genesis table added an entry and the
+    // matching const was forgotten. Drift-guard keeps the two in sync.
+    //
+    // Covers audit target 9: worth a drift check between `GENESIS_*`
+    // and the Rust module consts.
+    #[test]
+    fn genesis_string_constants_match_seed_tables() {
+        use crate::pyramid::types::{
+            ANNOTATION_TYPE_CORRECTION, ANNOTATION_TYPE_DIRECTORY,
+            ANNOTATION_TYPE_ERA, ANNOTATION_TYPE_FRICTION,
+            ANNOTATION_TYPE_HEALTH_CHECK, ANNOTATION_TYPE_IDEA,
+            ANNOTATION_TYPE_OBSERVATION, ANNOTATION_TYPE_QUESTION,
+            ANNOTATION_TYPE_RED_TEAM, ANNOTATION_TYPE_STEEL_MAN,
+            ANNOTATION_TYPE_TRANSITION, NODE_SHAPE_DEBATE, NODE_SHAPE_GAP,
+            NODE_SHAPE_META_LAYER, NODE_SHAPE_SCAFFOLDING,
+        };
+        use crate::pyramid::vocab_genesis::{
+            GENESIS_ANNOTATION_TYPES, GENESIS_NODE_SHAPES,
+        };
+
+        // Every NODE_SHAPE_* const must appear in GENESIS_NODE_SHAPES and
+        // vice versa.
+        let shape_consts = &[
+            NODE_SHAPE_SCAFFOLDING,
+            NODE_SHAPE_DEBATE,
+            NODE_SHAPE_META_LAYER,
+            NODE_SHAPE_GAP,
+        ];
+        let shape_genesis: Vec<&str> =
+            GENESIS_NODE_SHAPES.iter().map(|(n, _)| *n).collect();
+        for c in shape_consts {
+            assert!(
+                shape_genesis.contains(c),
+                "NODE_SHAPE_{} const '{}' is not in GENESIS_NODE_SHAPES — \
+                 either add the vocab seed or delete the stale const",
+                c.to_uppercase(),
+                c,
+            );
+        }
+        for g in &shape_genesis {
+            assert!(
+                shape_consts.contains(g),
+                "GENESIS_NODE_SHAPES entry '{g}' has no matching \
+                 NODE_SHAPE_* const in types.rs — add the const or \
+                 drop the vocab seed",
+            );
+        }
+
+        // Every ANNOTATION_TYPE_* const must appear in GENESIS_ANNOTATION_TYPES.
+        let at_consts = &[
+            ANNOTATION_TYPE_OBSERVATION,
+            ANNOTATION_TYPE_CORRECTION,
+            ANNOTATION_TYPE_QUESTION,
+            ANNOTATION_TYPE_FRICTION,
+            ANNOTATION_TYPE_IDEA,
+            ANNOTATION_TYPE_ERA,
+            ANNOTATION_TYPE_TRANSITION,
+            ANNOTATION_TYPE_HEALTH_CHECK,
+            ANNOTATION_TYPE_DIRECTORY,
+            ANNOTATION_TYPE_STEEL_MAN,
+            ANNOTATION_TYPE_RED_TEAM,
+        ];
+        let at_genesis: Vec<&str> = GENESIS_ANNOTATION_TYPES
+            .iter()
+            .map(|(n, _, _, _, _)| *n)
+            .collect();
+        for c in at_consts {
+            assert!(
+                at_genesis.contains(c),
+                "ANNOTATION_TYPE_* const '{c}' is not in \
+                 GENESIS_ANNOTATION_TYPES — either add the vocab seed \
+                 or delete the stale const",
+            );
+        }
+        for g in &at_genesis {
+            assert!(
+                at_consts.contains(g),
+                "GENESIS_ANNOTATION_TYPES entry '{g}' has no matching \
+                 ANNOTATION_TYPE_* const in types.rs — add the const or \
+                 drop the vocab seed",
+            );
+        }
+    }
 }
 

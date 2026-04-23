@@ -2365,7 +2365,15 @@ pub const NODE_SHAPE_GAP: &str = "gap";
 /// reader raises. FIXME(phase-10+): replace this static match with a
 /// contribution-driven shape-handler registry.
 #[derive(Debug, thiserror::Error)]
-#[error("No payload handler registered for node_shape '{0}' — the vocab entry exists but no typed payload struct has been wired into parse_shape_payload (FIXME phase 10+)")]
+#[error(
+    "No payload handler registered for node_shape '{0}' — the vocab entry \
+exists but no typed payload struct has been wired into parse_shape_payload. \
+Remediation: either (1) add a `NODE_SHAPE_{{name}}` const + payload struct \
++ match arm in `parse_shape_payload` (src-tauri/src/pyramid/types.rs), or \
+(2) wait for the Phase 10+ contribution-driven shape-handler registry that \
+will make payload types first-class contributions. Context (slug + node_id) \
+is attached by the caller via with_context."
+)]
 pub struct UnknownShapePayload(pub String);
 
 /// Node shape discriminator stored in `pyramid_nodes.node_shape`.

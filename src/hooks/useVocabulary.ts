@@ -83,6 +83,38 @@ function fallbackFor(vocabKind: string): VocabEntry[] {
     return [];
 }
 
+// Phase 6c-D verifier pass (Target 5): extend the MCP-side 6c-C fallback
+// drift tripwire to the frontend. When a successful fetch returns a set
+// that diverges from the hardcoded fallback, log a warning pointing
+// operators at the Rust genesis table. Log-only + per-kind-once to keep
+// console noise bounded when the 60s poll re-runs.
+const driftWarned = new Set<string>();
+function checkFallbackDrift(vocabKind: string, fetchedEntries: VocabEntry[]) {
+    if (driftWarned.has(vocabKind)) return;
+    const fallback = fallbackFor(vocabKind);
+    if (fallback.length === 0) return;
+    const fetchedNames = new Set(fetchedEntries.map((e) => e.name));
+    const fallbackNames = new Set(fallback.map((e) => e.name));
+    const missingFromFallback: string[] = [];
+    for (const n of fetchedNames) if (!fallbackNames.has(n)) missingFromFallback.push(n);
+    const missingFromFetch: string[] = [];
+    for (const n of fallbackNames) if (!fetchedNames.has(n)) missingFromFetch.push(n);
+    if (missingFromFallback.length === 0 && missingFromFetch.length === 0) return;
+    driftWarned.add(vocabKind);
+    // eslint-disable-next-line no-console
+    console.warn(
+        `[useVocabulary] FALLBACK drift for vocab_kind='${vocabKind}'. ` +
+            (missingFromFallback.length > 0
+                ? `Present in registry but missing from fallback: ${missingFromFallback.join(', ')}. `
+                : '') +
+            (missingFromFetch.length > 0
+                ? `Present in fallback but missing from registry: ${missingFromFetch.join(', ')}. `
+                : '') +
+            `Update src/hooks/useVocabulary.ts FALLBACK_${vocabKind.toUpperCase()}S to match ` +
+            `src-tauri/src/pyramid/vocab_genesis.rs (GENESIS_${vocabKind.toUpperCase()}S).`,
+    );
+}
+
 export function useVocabulary(
     vocabKind: string,
     pollIntervalMs: number = DEFAULT_POLL_MS,
@@ -106,9 +138,11 @@ export function useVocabulary(
             }
             const body = (await resp.json()) as VocabListResponse;
             if (cancelledRef.current) return;
-            setEntries(Array.isArray(body?.entries) ? body.entries : []);
+            const fetchedEntries = Array.isArray(body?.entries) ? body.entries : [];
+            setEntries(fetchedEntries);
             setIsFallback(false);
             setError(null);
+            checkFallbackDrift(vocabKind, fetchedEntries);
         } catch (e) {
             if (cancelledRef.current) return;
             setEntries(fallbackFor(vocabKind));
