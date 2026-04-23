@@ -22788,6 +22788,7 @@ mod phase3_post_build_tests {
 #[cfg(test)]
 mod phase4_post_build_tests {
     use super::*;
+    use crate::pyramid::dadbear_compiler;
     use crate::pyramid::types::{
         parse_shape_payload, ContentType, DebatePosition, DebateTopic, GapCandidate, GapTopic,
         MetaLayerTopic, NodeShape, RedTeamEntry, ShapePayload, VoteLean,
@@ -23237,6 +23238,148 @@ mod phase4_post_build_tests {
         assert!(
             chain.contains("purpose_shifted") || chain.contains("observation"),
             "error chain should name the failed emit: {chain}"
+        );
+    }
+
+    /// Wanderer-added (Phase 4 thread 3): `supersede_purpose` must be
+    /// atomic across its four writes (three Phase-1 supersede steps plus the
+    /// Phase-4 `purpose_shifted` observation emit). If the observation write
+    /// fails, the supersede writes must roll back — otherwise the DB ends
+    /// up with an active-shifted purpose and no corresponding observation,
+    /// silently diverging the DADBEAR compiler from the purpose state.
+    ///
+    /// This test drops `dadbear_observation_events` after the initial stock
+    /// purpose has been seeded, then calls `supersede_purpose`, then asserts:
+    ///   1. the call returns Err
+    ///   2. the active purpose row is unchanged (no successor was committed)
+    ///   3. no orphan superseded row was left pointing at a non-existent id
+    ///
+    /// Without a surrounding transaction the test fails step 2 — the
+    /// successor row would be committed while the observation write blew up.
+    #[test]
+    fn supersede_purpose_rolls_back_all_writes_on_observation_failure() {
+        let conn = mem_conn();
+        create_slug(&conn, "p4atomic", &ContentType::Code, "/tmp/p4atomic").unwrap();
+
+        // Baseline: initialize_from_content_type seeded a stock purpose.
+        let (baseline_id, baseline_text): (i64, String) = conn
+            .query_row(
+                "SELECT id, purpose_text FROM pyramid_purposes
+                   WHERE slug = ?1 AND superseded_by IS NULL",
+                rusqlite::params!["p4atomic"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        // Drop the observation-events table so the 4th write fails.
+        conn.execute("DROP TABLE dadbear_observation_events", []).unwrap();
+
+        let res = crate::pyramid::purpose::supersede_purpose(
+            &conn,
+            "p4atomic",
+            "A radically different purpose we expect to roll back.",
+            Some("atomicity-probe"),
+            None,
+            None,
+        );
+        assert!(res.is_err(), "supersede must fail when observation write fails");
+
+        // Active purpose should still be the baseline — no successor landed.
+        let (active_id, active_text): (i64, String) = conn
+            .query_row(
+                "SELECT id, purpose_text FROM pyramid_purposes
+                   WHERE slug = ?1 AND superseded_by IS NULL",
+                rusqlite::params!["p4atomic"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(active_id, baseline_id, "active purpose id must not change");
+        assert_eq!(active_text, baseline_text, "active purpose text must not change");
+
+        // No pyramid_purposes row for this slug should exist beyond the baseline.
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_purposes WHERE slug = ?1",
+                rusqlite::params!["p4atomic"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            row_count, 1,
+            "no partial successor row must persist (atomic rollback)"
+        );
+    }
+
+    /// Wanderer-added (Phase 4 thread 1): the full round trip.
+    ///
+    /// `purpose::supersede_purpose` emits a `purpose_shifted` observation
+    /// event. `dadbear_compiler::run_compilation_for_slug` should consume
+    /// that event and produce a `dadbear_work_items` row with
+    /// `primitive='role_bound'`, `step_name='oracle_purpose_shift'`, and
+    /// `resolved_chain_id` set to the `meta_layer_oracle` genesis binding
+    /// (`starter-meta-layer-oracle`).
+    ///
+    /// This is what validates Phase 4 is NOT dead plumbing: the shape reader
+    /// is an independent concern, but `purpose_shifted` is Phase 4's first
+    /// real emitter with a downstream consumer. If the compiler doesn't
+    /// produce a work_item after supersede, the event is plumbing-only.
+    #[test]
+    fn purpose_shifted_round_trips_from_supersede_to_dadbear_work_item() {
+        let conn = mem_conn();
+        create_slug(&conn, "p4rt", &ContentType::Code, "/tmp/p4rt").unwrap();
+
+        // Trigger the shift.
+        crate::pyramid::purpose::supersede_purpose(
+            &conn,
+            "p4rt",
+            "Shifted purpose — expect oracle_purpose_shift work_item.",
+            Some("end-to-end-roundtrip"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Run one compile tick.
+        let result = dadbear_compiler::run_compilation_for_slug(&conn, "p4rt", None, None)
+            .expect("compile tick must succeed");
+        assert!(
+            result.items_compiled >= 1,
+            "at least one work_item must be compiled from purpose_shifted; got {}",
+            result.items_compiled
+        );
+
+        // Verify the work item exists with the expected primitive/step_name/
+        // resolved_chain_id.
+        let (primitive, step_name, resolved_chain_id): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT primitive, step_name, resolved_chain_id
+                   FROM dadbear_work_items
+                  WHERE slug = ?1 AND step_name = 'oracle_purpose_shift'",
+                rusqlite::params!["p4rt"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("work_item for oracle_purpose_shift must exist");
+        assert_eq!(primitive, "role_bound");
+        assert_eq!(step_name, "oracle_purpose_shift");
+        assert_eq!(
+            resolved_chain_id.as_deref(),
+            Some("starter-meta-layer-oracle"),
+            "resolved_chain_id should be the meta_layer_oracle genesis binding"
+        );
+
+        // Cursor must have advanced past the purpose_shifted event.
+        let cursor_after: i64 = conn
+            .query_row(
+                "SELECT last_compiled_observation_id FROM dadbear_compilation_state
+                   WHERE slug = ?1",
+                rusqlite::params!["p4rt"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            cursor_after > 0,
+            "compile cursor must advance past purpose_shifted; got {}",
+            cursor_after
         );
     }
 }

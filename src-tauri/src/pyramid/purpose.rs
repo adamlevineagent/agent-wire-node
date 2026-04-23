@@ -106,6 +106,17 @@ pub fn initialize_from_content_type(
 /// to its own id (self-reference — FK-valid, partial-UNIQUE-exempt), then
 /// inserting the new active row, then redirecting the prior row's pointer
 /// to the successor's id.
+///
+/// v5 Phase 4 wanderer fix: the four writes (Phase 1's three supersede steps
+/// plus the Phase-4-added `purpose_shifted` observation event) are wrapped in
+/// a single `unchecked_transaction`. Without this, a failure on the
+/// observation-event write would leave the DB half-committed: the active
+/// purpose row has shifted to the successor, but no observation event exists
+/// to tell the DADBEAR compiler about it. The downstream `meta_layer_oracle`
+/// chain never fires, AND `supersede_purpose` is not safely retryable —
+/// a second call would treat the already-committed successor as the new
+/// "prior" and duplicate it. Transaction atomicity restores both the
+/// all-or-nothing invariant and idempotent-retry semantics.
 pub fn supersede_purpose(
     conn: &Connection,
     slug: &str,
@@ -114,8 +125,12 @@ pub fn supersede_purpose(
     stock_purpose_key: Option<&str>,
     decomposition_chain_ref: Option<&str>,
 ) -> Result<Purpose> {
+    let tx = conn.unchecked_transaction().with_context(|| {
+        format!("Failed to begin supersede transaction for slug '{slug}'")
+    })?;
+
     // Find active purpose id (if any)
-    let prior_id: Option<i64> = conn
+    let prior_id: Option<i64> = tx
         .query_row(
             "SELECT id FROM pyramid_purposes WHERE slug = ?1 AND superseded_by IS NULL",
             rusqlite::params![slug],
@@ -126,7 +141,7 @@ pub fn supersede_purpose(
     // Step 1: park the prior row outside the active partial index via
     // self-reference so the new row can INSERT without UNIQUE collision.
     if let Some(pid) = prior_id {
-        conn.execute(
+        tx.execute(
             "UPDATE pyramid_purposes SET superseded_by = id WHERE id = ?1",
             rusqlite::params![pid],
         )
@@ -136,7 +151,7 @@ pub fn supersede_purpose(
     }
 
     // Step 2: INSERT new active row
-    conn.execute(
+    tx.execute(
         "INSERT INTO pyramid_purposes
             (slug, purpose_text, stock_purpose_key, decomposition_chain_ref, supersede_reason)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -149,30 +164,26 @@ pub fn supersede_purpose(
         ],
     )
     .with_context(|| format!("Failed to insert successor purpose for slug '{slug}'"))?;
-    let new_id = conn.last_insert_rowid();
+    let new_id = tx.last_insert_rowid();
 
     // Step 3: redirect the prior row's pointer from self to the successor
     if let Some(pid) = prior_id {
-        conn.execute(
+        tx.execute(
             "UPDATE pyramid_purposes SET superseded_by = ?1 WHERE id = ?2",
             rusqlite::params![new_id, pid],
         )
         .with_context(|| format!("Failed to mark prior purpose superseded for slug '{slug}'"))?;
     }
 
-    // Emit a `purpose_shifted` observation event so the DADBEAR compiler can
-    // route it to the purpose-aware meta_layer_oracle role. Metadata carries
-    // the prior id + stock key + reason so downstream chains can reason about
-    // what shifted and why without a second DB query.
+    // Step 4: emit a `purpose_shifted` observation event so the DADBEAR
+    // compiler can route it to the purpose-aware meta_layer_oracle role.
+    // Metadata carries the prior id + stock key + reason so downstream chains
+    // can reason about what shifted and why without a second DB query.
     //
-    // Propagate (no `.ok()` swallow): the supersede dance already committed
-    // three writes to pyramid_purposes above. If the observation write fails
-    // here, the state change has landed but is invisible to downstream chains
-    // — exactly the kind of silent divergence `feedback_loud_deferrals` is
-    // about. Per v5 R5 loud-raise discipline, fail the whole call and let the
-    // caller retry or surface the error. `dadbear_observation_events` is
-    // created unconditionally by `init_pyramid_db`, so the earlier "tolerate
-    // missing table in test harnesses" rationale doesn't apply.
+    // Propagate (no `.ok()` swallow): if the observation write fails, the
+    // supersede writes above roll back via the enclosing transaction — the
+    // caller retries cleanly without a duplicate successor. Per v5 R5 loud-
+    // raise discipline + `feedback_loud_deferrals`.
     let metadata = serde_json::json!({
         "prior_purpose_id": prior_id,
         "new_purpose_id": new_id,
@@ -182,7 +193,7 @@ pub fn supersede_purpose(
     })
     .to_string();
     super::observation_events::write_observation_event(
-        conn,
+        &tx,
         slug,
         "purpose",         // source
         "purpose_shifted", // event_type
@@ -196,6 +207,10 @@ pub fn supersede_purpose(
     )
     .with_context(|| {
         format!("Failed to emit purpose_shifted observation event for slug '{slug}'")
+    })?;
+
+    tx.commit().with_context(|| {
+        format!("Failed to commit supersede transaction for slug '{slug}'")
     })?;
 
     load_purpose(conn, slug)?.ok_or_else(|| {
