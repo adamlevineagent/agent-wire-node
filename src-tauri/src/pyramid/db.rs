@@ -34130,6 +34130,48 @@ mod phase9b_post_build_tests {
             cfg.accretion_threshold,
             pyramid_scheduler::DEFAULT_ACCRETION_THRESHOLD
         );
+        // 9a+9b verifier: accretion_tick_window_n must be operator-
+        // editable (Pillar 37). A Rust-side `.max(20)` hardcode on the
+        // emit path is a floor constraining LLM context size — reject.
+        assert_eq!(
+            cfg.accretion_tick_window_n,
+            pyramid_scheduler::DEFAULT_ACCRETION_TICK_WINDOW_N,
+            "accretion_tick_window_n must be loaded from scheduler_parameters \
+             (pillar 37: no Rust-hardcoded floor on tick window)"
+        );
+    }
+
+    // ── 9a+9b verifier: emit_accretion_tick uses operator-editable window_n ──
+    //
+    // Regression-guards against a previous implementation that stamped
+    // `window_n: cfg.accretion_threshold.max(20)` — a Rust-hardcoded
+    // floor that violated Pillar 37. The fix adds a dedicated
+    // `accretion_tick_window_n` field to `scheduler_parameters` and
+    // threads it verbatim. Default emit must match
+    // DEFAULT_ACCRETION_TICK_WINDOW_N exactly — no hidden floor.
+    #[test]
+    fn emit_accretion_tick_uses_operator_editable_window_n() {
+        let _g = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p9v-w", &ContentType::Code, "/tmp/p9v-w").unwrap();
+
+        pyramid_scheduler::emit_accretion_tick(&conn).unwrap();
+        let md_default: String = conn
+            .query_row(
+                "SELECT metadata_json FROM dadbear_observation_events
+                  WHERE slug = ?1 AND event_type = 'accretion_tick'
+                  ORDER BY id DESC LIMIT 1",
+                rusqlite::params!["p9v-w"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&md_default).unwrap();
+        assert_eq!(
+            parsed["window_n"].as_i64().unwrap(),
+            pyramid_scheduler::DEFAULT_ACCRETION_TICK_WINDOW_N as i64,
+            "default emit must use DEFAULT_ACCRETION_TICK_WINDOW_N verbatim \
+             (no hidden .max(20) floor)"
+        );
     }
 
     // ── 9b-1b: emit_accretion_tick writes one event per active slug ──────

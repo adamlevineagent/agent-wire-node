@@ -67,6 +67,7 @@ const MAX_INTERVAL_SECS: u64 = 30 * 24 * 60 * 60;
 pub const DEFAULT_ACCRETION_INTERVAL_SECS: u64 = 30 * 60;   // 30 minutes
 pub const DEFAULT_SWEEP_INTERVAL_SECS: u64 = 6 * 60 * 60;   // 6 hours
 pub const DEFAULT_ACCRETION_THRESHOLD: u64 = 50;            // 50 annotations
+pub const DEFAULT_ACCRETION_TICK_WINDOW_N: u64 = 50;        // tick-dispatch LLM window
 pub const DEFAULT_SWEEP_STALE_DAYS: u64 = 7;                // failed WI older than 7d
 pub const DEFAULT_SWEEP_RETENTION_DAYS: u64 = 30;           // archive after 30d
 
@@ -85,6 +86,16 @@ pub struct SchedulerConfig {
     /// hook emits an immediate `accretion_threshold_hit` event
     /// instead of waiting for the next accretion tick.
     pub accretion_threshold: u64,
+    /// `window_n` cap the scheduler stamps into `accretion_tick`
+    /// event metadata. The starter-accretion-handler chain reads
+    /// this as required input (Pillar 37 — no Rust-side default),
+    /// so the scheduler is the one that must decide the value for
+    /// scheduler-triggered ticks. Operators override by superseding
+    /// the row. Threshold-hit emissions scale this by the
+    /// `count_since_cursor` at the moment the threshold crossed,
+    /// so the threshold-hit path does NOT consult this field.
+    #[serde(default = "default_accretion_tick_window_n")]
+    pub accretion_tick_window_n: u64,
     /// "Stale" failed-work-item age cutoff in days. Rows in
     /// state='failed' older than this are candidates for archival
     /// (and counted by the sweep chronicle step).
@@ -97,12 +108,17 @@ pub struct SchedulerConfig {
     pub sweep_retention_days: u64,
 }
 
+fn default_accretion_tick_window_n() -> u64 {
+    DEFAULT_ACCRETION_TICK_WINDOW_N
+}
+
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             accretion_interval_secs: DEFAULT_ACCRETION_INTERVAL_SECS,
             sweep_interval_secs: DEFAULT_SWEEP_INTERVAL_SECS,
             accretion_threshold: DEFAULT_ACCRETION_THRESHOLD,
+            accretion_tick_window_n: DEFAULT_ACCRETION_TICK_WINDOW_N,
             sweep_stale_days: DEFAULT_SWEEP_STALE_DAYS,
             sweep_retention_days: DEFAULT_SWEEP_RETENTION_DAYS,
         }
@@ -249,15 +265,17 @@ pub fn emit_accretion_tick(conn: &Connection) -> Result<usize> {
     let slugs = list_active_slugs(conn)?;
     let mut written = 0usize;
     for slug in &slugs {
+        // Chain reads `window_n` as required input (Pillar 37 — no
+        // Rust-side default in the chain primitive). The scheduler
+        // fulfills that contract by stamping the value from the
+        // operator-editable `scheduler_parameters.accretion_tick_window_n`
+        // field — the one authoritative place a number controlling
+        // LLM context lives. Chain-level YAML or per-slug binding
+        // supersession can still override.
         let metadata = serde_json::json!({
             "trigger": "scheduler",
             "tick_kind": "accretion",
-            // Starter-accretion-handler reads `window_n` as required
-            // field. Tie the scheduler default to the threshold so
-            // tick-dispatched accretions load at least `K` annotations
-            // of recent window — matches the threshold-hit semantics.
-            // Operators override per-slug via chain-level YAML.
-            "window_n": cfg.accretion_threshold.max(20) as i64,
+            "window_n": cfg.accretion_tick_window_n as i64,
         })
         .to_string();
         match observation_events::write_observation_event(
@@ -455,10 +473,18 @@ pub fn spawn(db_path: PathBuf) -> SchedulerHandle {
                     // Rebuild the interval if the operator changed
                     // the period. tokio::time::interval doesn't
                     // dynamically re-tune; we swap it instead.
+                    //
+                    // Compare against the CURRENT live interval, not the
+                    // captured `initial_interval`: if the operator ping-
+                    // pongs the value (e.g. 1800 → 3600 → 1800), the
+                    // `initial_interval` comparison skips the second
+                    // re-tune because `1800 == 1800` even though the
+                    // live interval is still sitting at 3600. The only
+                    // authoritative comparison is against what the
+                    // tokio::time::interval is actually running on right
+                    // now.
                     let now_interval = load_config(&conn).accretion_interval_secs;
-                    if now_interval != initial_interval
-                        && now_interval != interval.period().as_secs()
-                    {
+                    if now_interval != interval.period().as_secs() {
                         tracing::info!(
                             old_secs = interval.period().as_secs(),
                             new_secs = now_interval,
@@ -509,10 +535,11 @@ pub fn spawn(db_path: PathBuf) -> SchedulerHandle {
                             "pyramid_scheduler[sweep]: tick emit failed"
                         ),
                     }
+                    // See the accretion loop above for the rationale on
+                    // comparing against the live interval, not the
+                    // captured `initial_interval`.
                     let now_interval = load_config(&conn).sweep_interval_secs;
-                    if now_interval != initial_interval
-                        && now_interval != interval.period().as_secs()
-                    {
+                    if now_interval != interval.period().as_secs() {
                         tracing::info!(
                             old_secs = interval.period().as_secs(),
                             new_secs = now_interval,

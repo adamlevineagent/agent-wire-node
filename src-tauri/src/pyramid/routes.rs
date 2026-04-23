@@ -3005,6 +3005,45 @@ async fn handle_propose_question(
         ));
     }
 
+    // Derive the deterministic child slug id up-front so we can
+    // short-circuit idempotent repeat proposals BEFORE firing the
+    // authorize_question LLM chain. Without this the approved
+    // branch's "already exists" recovery path still costs one full
+    // LLM round-trip per repeat (chain execution happens before
+    // the create_slug collision is observed). Verifier fix: cost +
+    // latency are both paid by the caller — short-circuit is safe
+    // because the decision is already recorded in the parent's
+    // annotation stream and the child slug is the authoritative
+    // signal that the question was approved.
+    let child_slug_id = {
+        let mut hasher = sha2::Sha256::new();
+        use sha2::Digest;
+        hasher.update(body.question.as_bytes());
+        hasher.update(b":");
+        hasher.update(slug_name.as_bytes());
+        let digest = hasher.finalize();
+        format!("q-{}", hex::encode(&digest[..8]))
+    };
+
+    {
+        let conn = state.reader.lock().await;
+        if let Ok(Some(existing)) = db::get_slug(&conn, &child_slug_id) {
+            let payload = serde_json::json!({
+                "approved": true,
+                "reasoning": "idempotent repeat proposal — chain skipped; \
+                              existing child slug returned",
+                "child_slug_id": existing.slug,
+                "parent_slug": slug_name,
+                "idempotent": true,
+            });
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&payload),
+                warp::http::StatusCode::OK,
+            )
+            .into_response());
+        }
+    }
+
     // Gate through authorize_question chain.
     let decision = match run_authorize_question_chain(
         &state,
@@ -3035,19 +3074,6 @@ async fn handle_propose_question(
         )
         .into_response());
     }
-
-    // Approved: create a Question-typed child slug. The slug id is
-    // derived by hashing the question text so repeat proposals land
-    // on the same slug (idempotency) without surfacing collisions.
-    let child_slug_id = {
-        let mut hasher = sha2::Sha256::new();
-        use sha2::Digest;
-        hasher.update(body.question.as_bytes());
-        hasher.update(b":");
-        hasher.update(slug_name.as_bytes());
-        let digest = hasher.finalize();
-        format!("q-{}", hex::encode(&digest[..8]))
-    };
 
     let new_slug_info = {
         let conn = state.writer.lock().await;
