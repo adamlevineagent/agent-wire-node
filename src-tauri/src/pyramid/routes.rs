@@ -3277,13 +3277,66 @@ async fn handle_search(
     if hits.is_empty() && params.semantic.unwrap_or(false) {
         let config = state.config.read().await;
         if !config.api_key.is_empty() {
-            let llm_config = config.clone();
+            let base_llm_config = config.clone();
             drop(config);
 
             let system = "You extract search keywords from natural language questions. Given a question, output 3-5 keyword phrases that would match technical documentation. Output one phrase per line, nothing else.";
             let user = &params.q;
 
-            match super::llm::call_model_unified(&llm_config, system, user, 0.0, 200, None).await {
+            // walker-v3-completion Wave 2: canonical dispatch via Decision spine.
+            // Query-time endpoint — attach ephemeral cache_access with a synthetic
+            // build_id, resolve "mid" tier through provider_registry, use the
+            // canonical make_step_ctx_from_llm_config so walker's full cascade
+            // (Market/Fleet/OR/Local) is available.
+            let query_build_id = format!(
+                "query-search-{}-{}",
+                slug_name,
+                chrono::Utc::now().timestamp()
+            );
+            let llm_config =
+                state.attach_cache_access(base_llm_config, &slug_name, &query_build_id);
+            let resolved_opt = llm_config
+                .provider_registry
+                .as_ref()
+                .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+            let cache_ctx = match &resolved_opt {
+                Some(resolved) => {
+                    super::step_context::make_step_ctx_from_llm_config(
+                        &llm_config,
+                        "search_keyword_rewrite",
+                        "query_search",
+                        0,
+                        None,
+                        system,
+                        "mid",
+                        Some(&resolved.tier.model_id),
+                        Some(&resolved.provider.id),
+                    )
+                    .await
+                }
+                None => {
+                    tracing::warn!(
+                        event = "search_keyword_rewrite_no_mid_tier",
+                        slug = %slug_name,
+                        "walker-v3-completion: no 'mid' tier routing; falling through to empty results"
+                    );
+                    None
+                }
+            };
+            // If no tier resolved, cache_ctx is None → walker runtime guard
+            // will fire and we'll land in the Err branch below (falls through
+            // to normal-path empty-results return).
+            match super::llm::call_model_unified_and_ctx(
+                &llm_config,
+                cache_ctx.as_ref(),
+                system,
+                user,
+                0.0,
+                200,
+                None,
+            )
+            .await
+            {
                 Ok(response) => {
                     // Re-acquire reader lock for keyword searches
                     let conn = state.reader.lock().await;
@@ -8342,26 +8395,44 @@ async fn handle_navigate(
             .join("\n\n---\n\n")
     );
 
-    // Phase C fix: Construct a synthetic StepContext so navigate gets caching.
+    // walker-v3-completion Wave 2: canonical dispatch via Decision spine.
+    // Previously: manual StepContext::new with empty model_tier → Decision
+    // attach early-returned → walker saw no cascade. Now: attach ephemeral
+    // cache_access, resolve "max" tier (judgment work), canonical helper.
     let navigate_build_id = format!("navigate-{}-{}", slug_name, chrono::Utc::now().timestamp());
-    let db_path = state
-        .data_dir
+    let navigate_llm_config = state.attach_cache_access(llm_config.clone(), &slug_name, &navigate_build_id);
+    let resolved_opt = navigate_llm_config
+        .provider_registry
         .as_ref()
-        .and_then(|d| d.join("pyramid.db").to_str().map(String::from))
-        .unwrap_or_default();
-    let ctx = super::step_context::StepContext::new(
-        slug_name.clone(),
-        navigate_build_id,
-        "navigate",
-        "navigate",
-        0,
-        None,
-        db_path,
-    );
+        .and_then(|reg| reg.resolve_tier("max", None, None, None).ok());
+    let cache_ctx = match &resolved_opt {
+        Some(resolved) => {
+            super::step_context::make_step_ctx_from_llm_config(
+                &navigate_llm_config,
+                "navigate",
+                "navigate",
+                0,
+                None,
+                system,
+                "max",
+                Some(&resolved.tier.model_id),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => {
+            tracing::warn!(
+                event = "navigate_synthesis_no_max_tier",
+                slug = %slug_name,
+                "walker-v3-completion: no 'max' tier routing; navigate synthesis will fall back to error path"
+            );
+            None
+        }
+    };
 
     match super::llm::call_model_unified_and_ctx(
-        &llm_config,
-        Some(&ctx),
+        &navigate_llm_config,
+        cache_ctx.as_ref(),
         system,
         &user,
         0.2,

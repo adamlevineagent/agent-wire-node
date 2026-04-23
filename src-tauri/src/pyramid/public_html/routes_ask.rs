@@ -370,148 +370,16 @@ fn render_preview_page(
     page("Preview — Wire Node", &body, "no-store")
 }
 
-#[allow(dead_code)]
-fn render_answer_page(
-    slug: &str,
-    question: &str,
-    answer: &str,
-    cited_nodes: &[String],
-) -> warp::reply::Response {
-    let mut cites_html = String::new();
-    if !cited_nodes.is_empty() {
-        cites_html.push_str("<h2>Cited nodes</h2>\n<ul>\n");
-        for nid in cited_nodes {
-            cites_html.push_str(&format!(
-                "<li><a href=\"/p/{slug}/{nid}\">{nid}</a></li>\n",
-                slug = esc(slug),
-                nid = esc(nid),
-            ));
-        }
-        cites_html.push_str("</ul>\n");
-    }
-    let body = format!(
-        "<h1>Answer</h1>\n\
-         <blockquote class=\"question\">{q}</blockquote>\n\
-         <article class=\"answer\"><pre>{a}</pre></article>\n\
-         {cites}\n\
-         <p><a href=\"/p/{slug}\">Back to pyramid</a></p>\n",
-        q = esc(question),
-        a = esc(answer),
-        cites = cites_html,
-        slug = esc(slug),
-    );
-    page("Answer — Wire Node", &body, "no-store")
-}
-
-#[allow(dead_code)]
-fn render_no_results_page(slug: &str, question: &str) -> warp::reply::Response {
-    let body = format!(
-        "<h1>No relevant nodes</h1>\n\
-         <blockquote class=\"question\">{q}</blockquote>\n\
-         <p class=\"empty\">No relevant nodes found for this question.</p>\n\
-         <p><a href=\"/p/{slug}\">Back to pyramid</a></p>\n",
-        q = esc(question),
-        slug = esc(slug),
-    );
-    page("No results — Wire Node", &body, "no-store")
-}
-
 // ── Core synthesis (legacy — kept for reference; question-pyramid path
 //    bypasses inline synthesis entirely). ───────────────────────────────
-
-#[allow(dead_code)]
-struct SynthesisOutput {
-    answer: String,
-    cited_nodes: Vec<String>,
-    is_empty: bool,
-}
-
-#[allow(dead_code)]
-async fn run_synthesis(
-    state: &PyramidState,
-    slug: &str,
-    question: &str,
-) -> Result<SynthesisOutput, String> {
-    let llm_config = {
-        let config = state.config.read().await;
-        if config.api_key.is_empty() {
-            return Err("LLM not configured on this Wire Node.".to_string());
-        }
-        config.clone()
-    };
-
-    let search_results = {
-        let conn = state.reader.lock().await;
-        match crate::pyramid::query::search(&conn, slug, question) {
-            Ok(r) => r,
-            Err(e) => return Err(format!("search failed: {}", e)),
-        }
-    };
-
-    if search_results.is_empty() {
-        return Ok(SynthesisOutput {
-            answer: String::new(),
-            cited_nodes: Vec::new(),
-            is_empty: true,
-        });
-    }
-
-    let top: Vec<_> = search_results.iter().take(TOP_K).collect();
-    let mut node_contents: Vec<(String, String)> = Vec::new();
-    {
-        let conn = state.reader.lock().await;
-        for hit in &top {
-            if let Ok(Some(node)) = crate::pyramid::db::get_node(&conn, slug, &hit.node_id) {
-                let mut distilled = node.distilled.clone();
-                if distilled.len() > 800 {
-                    let mut end = 800;
-                    while end < distilled.len() && !distilled.is_char_boundary(end) {
-                        end += 1;
-                    }
-                    distilled.truncate(end);
-                }
-                let content = format!("Node {}: {}\n{}", node.id, node.headline, distilled);
-                node_contents.push((node.id.clone(), content));
-            }
-        }
-    }
-
-    if node_contents.is_empty() {
-        return Ok(SynthesisOutput {
-            answer: String::new(),
-            cited_nodes: Vec::new(),
-            is_empty: true,
-        });
-    }
-
-    let system = "You answer questions using knowledge pyramid nodes. Cite the node ID (e.g. L1-xxx) that supports each claim. Be concise and direct. If the nodes don't contain enough information to fully answer, say what you can and note what's missing.";
-    let user = format!(
-        "Question: {}\n\nKnowledge nodes:\n{}",
-        question,
-        node_contents
-            .iter()
-            .map(|(_, c)| c.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n---\n\n")
-    );
-
-    match crate::pyramid::llm::call_model_unified(&llm_config, system, &user, 0.2, 600, None).await
-    {
-        Ok(response) => {
-            let cited: Vec<String> = node_contents
-                .iter()
-                .filter(|(id, _)| response.content.contains(id))
-                .map(|(id, _)| id.clone())
-                .collect();
-            Ok(SynthesisOutput {
-                answer: response.content,
-                cited_nodes: cited,
-                is_empty: false,
-            })
-        }
-        Err(e) => Err(format!("LLM call failed: {}", e)),
-    }
-}
+//
+// DELETED (walker-v3-completion Wave 2): render_answer_page,
+// render_no_results_page, SynthesisOutput, run_synthesis,
+// synthesize_and_render — all were #[allow(dead_code)] with zero live
+// callers. The live ask flow uses `create_question_pyramid_and_redirect`
+// at line ~842 which does not call these. Deleting removes a
+// Category-A walker-v3-completion bypass site (ctx=None LLM call at
+// former line 498) without needing migration.
 
 async fn load_preview_candidates(
     state: &PyramidState,
@@ -840,25 +708,6 @@ async fn handle_ask_post(
     }
 
     Ok(create_question_pyramid_and_redirect(&state, &slug, &question).await)
-}
-
-#[allow(dead_code)]
-async fn synthesize_and_render(
-    state: &PyramidState,
-    slug: &str,
-    question: &str,
-) -> warp::reply::Response {
-    match run_synthesis(state, slug, question).await {
-        Ok(out) if out.is_empty => render_no_results_page(slug, question),
-        Ok(out) => render_answer_page(slug, question, &out.answer, &out.cited_nodes),
-        Err(msg) => {
-            let body = format!(
-                "<h1>Synthesis failed</h1>\n<p class=\"err\">{}</p>\n",
-                esc(&msg)
-            );
-            status_page(500, "Error — Wire Node", &body)
-        }
-    }
 }
 
 // ── Filter assembly ─────────────────────────────────────────────────────
