@@ -1162,17 +1162,29 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
             // Pull annotation content + author, preferring the threaded
             // `annotation` object from load_annotation_and_target; fall back
             // to a DB read when absent.
-            let (ann_content, ann_author) = {
-                let content = annotation_obj
+            //
+            // Verifier fix (Phase 7a): a missing annotation row was previously
+            // papered over with `unwrap_or_default()` → empty content/author.
+            // That's a silent deferral per feedback_loud_deferrals — the
+            // caller only saw the downstream "unsupported annotation_type ''"
+            // error without any pointer to the root cause (deleted / bad
+            // annotation_id). Loud-raise here so the operator sees the real
+            // issue.
+            let ann_content: String;
+            let ann_author: String;
+            let mut annotation_type_from_db: Option<String> = None;
+            {
+                let threaded_content = annotation_obj
                     .get("content")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                let author = annotation_obj
+                let threaded_author = annotation_obj
                     .get("author")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                if let (Some(c), Some(a)) = (content.clone(), author.clone()) {
-                    (c, a)
+                if let (Some(c), Some(a)) = (threaded_content, threaded_author) {
+                    ann_content = c;
+                    ann_author = a;
                 } else {
                     let conn_guard = ctx.db_reader.lock().await;
                     let row: Option<(String, String, String)> = conn_guard
@@ -1183,29 +1195,55 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                         )
                         .ok();
                     drop(conn_guard);
-                    let (c, a) = row
-                        .as_ref()
-                        .map(|(c, a, _)| (c.clone(), a.clone()))
-                        .unwrap_or_default();
-                    (c, a)
+                    match row {
+                        Some((c, a, aty)) => {
+                            ann_content = c;
+                            ann_author = a;
+                            annotation_type_from_db = Some(aty);
+                        }
+                        None => {
+                            return Err(anyhow!(
+                                "append_annotation_to_debate_node: annotation_id={} not \
+                                 found in pyramid_annotations — stale event or deleted row. \
+                                 Target '{}' will not be mutated.",
+                                annotation_id,
+                                target_node_id,
+                            ));
+                        }
+                    }
                 }
             };
 
-            // Resolve annotation_type the same way — prefer input, fall back
-            // to a DB read.
-            let annotation_type = if let Some(t) = annotation_type {
-                t
-            } else {
-                let conn_guard = ctx.db_reader.lock().await;
-                let row: Option<String> = conn_guard
-                    .query_row(
-                        "SELECT annotation_type FROM pyramid_annotations WHERE id = ?1",
-                        rusqlite::params![annotation_id],
-                        |r| r.get(0),
-                    )
-                    .ok();
-                drop(conn_guard);
-                row.unwrap_or_default()
+            // Resolve annotation_type: prefer threaded input, otherwise the
+            // DB-row capture above, otherwise a final direct lookup. Loud
+            // raise if all three paths yield None (bad id) or an empty string.
+            let annotation_type = match annotation_type
+                .or(annotation_type_from_db)
+            {
+                Some(t) if !t.is_empty() => t,
+                _ => {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let row: Option<String> = conn_guard
+                        .query_row(
+                            "SELECT annotation_type FROM pyramid_annotations WHERE id = ?1",
+                            rusqlite::params![annotation_id],
+                            |r| r.get(0),
+                        )
+                        .ok();
+                    drop(conn_guard);
+                    match row {
+                        Some(t) if !t.is_empty() => t,
+                        _ => {
+                            return Err(anyhow!(
+                                "append_annotation_to_debate_node: annotation_id={} has no \
+                                 annotation_type (row missing or empty). Target '{}' will \
+                                 not be mutated.",
+                                annotation_id,
+                                target_node_id,
+                            ));
+                        }
+                    }
+                }
             };
 
             // Hardcoded debate-role mapping (future: vocab-driven).
@@ -1249,6 +1287,10 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 } else {
                     // Red team without any existing position: seed an
                     // empty "main" position carrying the red_team.
+                    // Carry the `annotation#{id}` tag as an evidence anchor
+                    // so the append-path idempotency check can dedup by
+                    // annotation_id consistently across both code paths.
+                    let annotation_anchor = format!("annotation#{annotation_id}");
                     (
                         vec![DebatePosition {
                             label: red_team_from_position.to_string(),
@@ -1256,7 +1298,7 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                             red_teams: vec![RedTeamEntry {
                                 from_position: red_team_from_position.to_string(),
                                 argument: ann_content.clone(),
-                                evidence_anchors: vec![],
+                                evidence_anchors: vec![annotation_anchor],
                             }],
                             evidence_anchors: vec![],
                         }],
@@ -1310,6 +1352,17 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 } else {
                     // red_team → append to the first (or "main") position's
                     // red_teams[]. If none exist yet, seed one.
+                    //
+                    // Verifier fix (Phase 7a): `from_position` is a POSITION
+                    // LABEL per the schema (see the round-trip test at
+                    // `db::tests::parse_shape_payload_round_trips_populated_debate_with_red_teams_and_votes`
+                    // — "Pro" red-teams "Con", "Con" red-teams "Pro"). An
+                    // external (annotation-sourced) red_team has no opposing
+                    // position to attribute to, so we stamp the LABEL of the
+                    // position being red-teamed. This matches the
+                    // Scaffolding→Debate seed path (line below, `red_team_from_position = "main"`),
+                    // keeps the schema semantics consistent, and avoids
+                    // leaking the author's name into a position-label slot.
                     if debate.positions.is_empty() {
                         debate.positions.push(DebatePosition {
                             label: red_team_from_position.to_string(),
@@ -1319,14 +1372,20 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                         });
                     }
                     let pos = debate.positions.first_mut().unwrap();
+                    let from_position_label = pos.label.clone();
+                    // Idempotency: collision on (argument, annotation#{id}
+                    // evidence anchor) — the evidence_anchors slot carries a
+                    // stable annotation_id tag so re-runs don't duplicate.
+                    let annotation_anchor = format!("annotation#{annotation_id}");
                     let already = pos.red_teams.iter().any(|r| {
-                        r.argument == ann_content && r.from_position == ann_author
+                        r.argument == ann_content
+                            && r.evidence_anchors.iter().any(|a| a == &annotation_anchor)
                     });
                     if !already {
                         pos.red_teams.push(RedTeamEntry {
-                            from_position: ann_author.clone(),
+                            from_position: from_position_label,
                             argument: ann_content.clone(),
-                            evidence_anchors: vec![],
+                            evidence_anchors: vec![annotation_anchor],
                         });
                     }
                     if already { "no_op" } else { "appended_red_team" }

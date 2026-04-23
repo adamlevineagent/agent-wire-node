@@ -27916,7 +27916,26 @@ mod phase7a_post_build_tests {
                     d.positions[0].red_teams[0].argument,
                     "But have you considered the counter-example?"
                 );
-                assert_eq!(d.positions[0].red_teams[0].from_position, "bob");
+                // `from_position` is a POSITION LABEL per the schema
+                // (see parse_shape_payload_round_trips_populated_debate_*
+                // above for canonical use — "Pro" red-teams "Con"). An
+                // external annotation-sourced red_team has no opposing
+                // position, so the primitive stamps the LABEL of the
+                // position being red-teamed ("pos-1" here). The author's
+                // identity is carried in the `annotation#{id}` evidence
+                // anchor, not in from_position.
+                assert_eq!(
+                    d.positions[0].red_teams[0].from_position, "pos-1",
+                    "from_position must carry the target position's label, not the author's name"
+                );
+                assert!(
+                    d.positions[0].red_teams[0]
+                        .evidence_anchors
+                        .iter()
+                        .any(|a| a.starts_with("annotation#")),
+                    "red_team must be tagged with `annotation#{{id}}` evidence anchor \
+                     for idempotency dedup"
+                );
             }
             other => panic!("expected Debate payload, got {other:?}"),
         }
