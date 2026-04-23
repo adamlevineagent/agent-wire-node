@@ -11597,11 +11597,16 @@ fn main() {
     let data_dir = config.data_dir();
     let initial_tunnel = tunnel::load_tunnel_state(&data_dir).unwrap_or_default();
 
-    // Hoist auth + tunnel into shared Arcs early so the ConfigSynced
-    // listener (spawned before AppState construction) can announce to
-    // fleet with real node_id and tunnel_url.
+    // Hoist auth + tunnel + credits into shared Arcs early so the
+    // ConfigSynced listener (spawned before AppState construction) can
+    // announce to fleet with real node_id and tunnel_url, and so the
+    // walker-v3 Phase 3 market-probe task (spawned alongside the
+    // MarketSurfaceCache poller) can read the live credit balance
+    // without reaching through AppState.
     let shared_auth: Arc<RwLock<auth::AuthState>> = Arc::new(RwLock::new(initial_auth.clone()));
     let shared_tunnel: Arc<RwLock<tunnel::TunnelState>> = Arc::new(RwLock::new(initial_tunnel));
+    let shared_credits_tracker: Arc<RwLock<credits::CreditTracker>> =
+        Arc::new(RwLock::new(initial_credits.clone()));
 
     // Hoist the shared WireNodeConfig and compute-market pending-jobs
     // map so the Phase B market integration has the same handles the
@@ -12089,6 +12094,106 @@ fn main() {
                     );
                 });
                 cfg.market_surface_cache = Some(cache);
+            }
+
+            // Walker v3 Phase 3 (plan §2.6 + §3): spawn the market-probe
+            // refresh task. The sync walker_market_probe cache is what
+            // `MarketReadiness` reads synchronously during Decision
+            // build; this task projects the async MarketSurfaceCache
+            // snapshot + node handles + credit balance into that
+            // sync cache at a bounded cadence.
+            //
+            // Cadence: 60s matches the MarketSurfaceCache poll period
+            // (reading at higher frequency would be wasteful — the
+            // source data changes at 60s). The task also syncs
+            // self-handles + credit balance on every tick so handle
+            // rotation + balance drift land in readiness without a
+            // separate listener.
+            if let Some(surface_cache) = cfg.market_surface_cache.clone() {
+                let auth_for_probe = shared_auth.clone();
+                let credit_tracker = shared_credits_tracker.clone();
+                tauri::async_runtime::spawn(async move {
+                    // Run one initial refresh before the interval ticks.
+                    //
+                    // Self-handle for the self-dealing filter: the
+                    // MarketSurfaceOffer carries `node_handle`
+                    // (operator-scoped string). We populate the probe
+                    // with a composite that falls back to node_id when
+                    // the operator hasn't yet surfaced a public handle.
+                    {
+                        let auth = auth_for_probe.read().await;
+                        let node_handle = auth.node_id.clone().unwrap_or_default();
+                        let operator_handle =
+                            auth.operator_handle.clone().unwrap_or_default();
+                        drop(auth);
+                        wire_node_lib::pyramid::walker_market_probe::set_self_handles(
+                            &node_handle,
+                            &operator_handle,
+                        );
+                    }
+                    {
+                        let cr = credit_tracker.read().await;
+                        let balance = cr.server_credit_balance;
+                        drop(cr);
+                        // f64 credits → i64 for the integer-typed gate.
+                        // Negative balances (oversettlement edge-case)
+                        // clamp to 0 so "insufficient" gate fires.
+                        let bal_i64 = balance.max(0.0).round() as i64;
+                        wire_node_lib::pyramid::walker_market_probe::set_credit_balance(
+                            Some(bal_i64),
+                        );
+                    }
+                    wire_node_lib::pyramid::walker_market_probe::refresh_from_surface_cache(
+                        &surface_cache,
+                    )
+                    .await;
+                    wire_node_lib::pyramid::walker_market_probe::record_network_success();
+
+                    let mut interval = tokio::time::interval(
+                        std::time::Duration::from_secs(60),
+                    );
+                    // First tick fires immediately; skip.
+                    interval.tick().await;
+                    loop {
+                        interval.tick().await;
+                        // Re-read handles (operator might have rotated).
+                        let (node_handle, operator_handle) = {
+                            let auth = auth_for_probe.read().await;
+                            (
+                                auth.node_id.clone().unwrap_or_default(),
+                                auth.operator_handle.clone().unwrap_or_default(),
+                            )
+                        };
+                        wire_node_lib::pyramid::walker_market_probe::set_self_handles(
+                            &node_handle,
+                            &operator_handle,
+                        );
+                        // Re-read balance.
+                        let bal_i64 = {
+                            let cr = credit_tracker.read().await;
+                            cr.server_credit_balance.max(0.0).round() as i64
+                        };
+                        wire_node_lib::pyramid::walker_market_probe::set_credit_balance(
+                            Some(bal_i64),
+                        );
+                        // Project the surface cache into the sync cache.
+                        wire_node_lib::pyramid::walker_market_probe::refresh_from_surface_cache(
+                            &surface_cache,
+                        )
+                        .await;
+                        // We don't attempt network here directly — the
+                        // MarketSurfaceCache poller + heartbeat own the
+                        // reachability signal. Record a success so the
+                        // counter stays clear during steady-state.
+                        wire_node_lib::pyramid::walker_market_probe::record_network_success();
+                    }
+                });
+                tracing::info!(
+                    event = "boot_step",
+                    step = "7.6",
+                    name = "walker_market_probe_task_spawned",
+                    "Walker v3 Phase 3 market-probe refresh task is up (60s cadence)"
+                );
             }
         }
     }
@@ -12959,7 +13064,7 @@ fn main() {
         sync_state: Arc::new(RwLock::new(
             sync::load_sync_state(&config.data_dir()).unwrap_or_default(),
         )),
-        credits: Arc::new(RwLock::new(initial_credits)),
+        credits: shared_credits_tracker.clone(),
         tunnel_state: shared_tunnel.clone(),
         market_state: Arc::new(RwLock::new(
             market::load_market_state(&config.data_dir()).unwrap_or_default(),

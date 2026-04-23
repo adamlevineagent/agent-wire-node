@@ -670,12 +670,40 @@ struct MarketDispatchArgs<'a> {
     /// timer.
     max_wait_ms: u64,
     /// Wall-clock patience budget per chunk for the saturation-retry
-    /// loop. Drawn from
-    /// `compute_participation_policy.market_saturation_patience_secs`.
+    /// loop. Walker v3 Phase 3 sources this from the DispatchDecision's
+    /// per_provider[Market].patience_secs (SYSTEM_DEFAULT 3600), falling
+    /// back to `compute_participation_policy.market_saturation_patience_secs`
+    /// only when no Decision is in scope (legacy preview paths).
+    ///
     /// When the cumulative backoff across retries exceeds this,
     /// `dispatch_market_entry` bubbles RouteSkipped with reason
     /// `market_saturation_patience_exhausted` and the cascade advances.
     market_saturation_patience_secs: u64,
+    /// Walker v3 Phase 3: if true, the saturation-retry patience clock
+    /// resets every time walker re-quotes with a different `model_id`
+    /// (e.g. after cascading through a multi-slug model_list). If
+    /// false (SYSTEM_DEFAULT), the patience clock is cumulative across
+    /// all retries for the chunk.
+    ///
+    /// Currently `dispatch_market_entry` is invoked per-model-slug from
+    /// the walker's outer loop, so this parameter is consumed there
+    /// (not inside the saturation loop). The field is threaded through
+    /// for chronicle visibility and to keep the plumbing consistent
+    /// with §3's "Decision carries all params" contract.
+    patience_clock_resets_per_model: bool,
+    /// Walker v3 Phase 3: grace window subtracted from Wire's
+    /// `dispatch_deadline_at` when computing the /quote pre-gate's
+    /// usable deadline. SYSTEM_DEFAULT 10s. Same value drives the
+    /// /fill-await safety rail.
+    dispatch_deadline_grace_secs: u64,
+    /// Walker v3 Phase 3 consumer: the resolver-supplied breaker_reset
+    /// variant. Phase 3 only THREADS this through — Phase 5 owns the
+    /// per-build circuit breaker state machine; when that lands it
+    /// reads `args.breaker_reset` to decide whether a failure trips
+    /// the breaker permanently (`PerBuild`), on the next probe
+    /// (`ProbeBased`), or after a timer (`TimeSecs`).
+    #[allow(dead_code)]
+    breaker_reset: crate::pyramid::walker_resolver::BreakerReset,
     max_tokens: i64,
     temperature: f32,
     input_tokens_est: i64,
@@ -811,6 +839,9 @@ async fn dispatch_market_entry(
         max_budget,
         max_wait_ms,
         market_saturation_patience_secs,
+        patience_clock_resets_per_model: _patience_clock_resets_per_model,
+        dispatch_deadline_grace_secs: _dispatch_deadline_grace_secs,
+        breaker_reset: _breaker_reset,
         max_tokens,
         temperature,
         input_tokens_est,
@@ -2301,15 +2332,78 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 // Cache miss / cold → fall through and let /quote speak.
             }
 
-            // Read the participation policy's market_dispatch_max_wait_ms
-            // out of the DB once per market entry. On any failure we fall
-            // back to the default (60s) — absence of a policy row means
-            // "use defaults", not "block market".
+            // Walker v3 Phase 3: resolve patience budget + max_wait_ms
+            // from the Decision (per_provider[Market]) with legacy
+            // compute_participation_policy as fallback. The Decision
+            // values are the single-source-of-truth in §3's parameter
+            // catalog; the legacy DB read stays as a safety rail for
+            // synthetic / preview paths that may not carry a Decision
+            // yet (full migration is Phase 1 W2).
+            let market_max_wait_ms: u64 = ctx
+                .and_then(|c| c.dispatch_decision.as_ref())
+                .and_then(|d| {
+                    d.per_provider
+                        .get(&crate::pyramid::walker_resolver::ProviderType::Market)
+                })
+                .map(|p| {
+                    // Phase 3 walker_provider_market does not yet surface
+                    // a distinct max_wait_ms param — reuse
+                    // dispatch_deadline_grace_secs + the legacy
+                    // participation-policy value below. Set a harmless
+                    // sentinel and let the policy read overwrite.
+                    let _ = p;
+                    0u64
+                })
+                .unwrap_or(0);
+            let market_saturation_patience_secs_from_decision: Option<u64> = ctx
+                .and_then(|c| c.dispatch_decision.as_ref())
+                .and_then(|d| {
+                    d.per_provider
+                        .get(&crate::pyramid::walker_resolver::ProviderType::Market)
+                })
+                .map(|p| p.patience_secs);
+            let market_max_budget_from_decision: Option<i64> = ctx
+                .and_then(|c| c.dispatch_decision.as_ref())
+                .and_then(|d| {
+                    d.per_provider
+                        .get(&crate::pyramid::walker_resolver::ProviderType::Market)
+                })
+                .and_then(|p| p.max_budget_credits);
+            let market_breaker_reset_from_decision =
+                ctx.and_then(|c| c.dispatch_decision.as_ref())
+                    .and_then(|d| {
+                        d.per_provider
+                            .get(&crate::pyramid::walker_resolver::ProviderType::Market)
+                    })
+                    .map(|p| p.breaker_reset.clone())
+                    .unwrap_or(
+                        crate::pyramid::walker_resolver::BreakerReset::PerBuild,
+                    );
+            let market_patience_clock_resets_per_model = ctx
+                .and_then(|c| c.dispatch_decision.as_ref())
+                .and_then(|d| {
+                    d.per_provider
+                        .get(&crate::pyramid::walker_resolver::ProviderType::Market)
+                })
+                .map(|p| p.patience_clock_resets_per_model)
+                .unwrap_or(false);
+            let market_dispatch_deadline_grace_secs = ctx
+                .and_then(|c| c.dispatch_decision.as_ref())
+                .and_then(|d| {
+                    d.per_provider
+                        .get(&crate::pyramid::walker_resolver::ProviderType::Market)
+                })
+                .map(|p| p.dispatch_deadline_grace_secs)
+                .unwrap_or(10);
+
+            // Fall back to the participation-policy values for
+            // `market_max_wait_ms` (deadline safety rail) and, when the
+            // Decision doesn't supply patience, for patience_secs too.
             let (market_max_wait_ms, market_saturation_patience_secs): (u64, u64) = {
                 let db_path = ctx
                     .map(|c| c.db_path.clone())
                     .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
-                match db_path {
+                let policy = match db_path {
                     Some(dbp) => tokio::task::spawn_blocking(move || {
                         rusqlite::Connection::open(&dbp)
                             .ok()
@@ -2330,22 +2424,131 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     .flatten()
                     .unwrap_or((900_000, 3600)),
                     None => (900_000, 3600),
-                }
+                };
+                // If the Decision supplied a patience value, use it;
+                // otherwise use the legacy policy value.
+                let patience = market_saturation_patience_secs_from_decision
+                    .unwrap_or(policy.1);
+                let _ = market_max_wait_ms; // reserved for future per-step deadline
+                (policy.0, patience)
             };
+
+            // ── Walker v3 Phase 3: /quote pre-gate ────────────────────
+            //
+            // BEFORE /quote, check the sync market-probe cache: for the
+            // offers we know about, is there any offer whose
+            // `typical_serve_ms_p50_7d × peer_queue_depth` fits inside
+            // the usable dispatch deadline
+            // (`market_max_wait_ms − dispatch_deadline_grace_secs`)?
+            // If NO cached offer passes, skip this entry without
+            // paying a reservation fee — walker would otherwise burn
+            // credits on an offer it can't rationally hit.
+            //
+            // Cache miss OR Indeterminate verdicts are treated as
+            // "might work" — the static deadline is load-bearing and
+            // we never synthesize a skip on missing data. This is
+            // project_compute_market_saturation_fix.md's contract: the
+            // pre-gate DETECTS unviability, never stretches the
+            // deadline, and never over-skips on cold caches.
+            {
+                use crate::pyramid::walker_market_probe::{
+                    evaluate_pre_gate, read_cached_model, PreGateVerdict,
+                };
+                // Dispatch-deadline grace from the Decision (SYSTEM_DEFAULT
+                // 10s). Fall through to SYSTEM_DEFAULT when the Decision
+                // isn't populated (legacy paths pre-W2 migration).
+                let grace_secs = ctx
+                    .and_then(|c| c.dispatch_decision.as_ref())
+                    .and_then(|d| {
+                        d.per_provider
+                            .get(&crate::pyramid::walker_resolver::ProviderType::Market)
+                    })
+                    .map(|p| p.dispatch_deadline_grace_secs)
+                    .unwrap_or(10);
+
+                if let Some(cached_model) =
+                    crate::pyramid::walker_market_probe::read_cached_model(&market_model_id)
+                        .or_else(|| {
+                            // Fallback: projector hasn't run against the
+                            // async cache yet — skip pre-gate rather than
+                            // synthesizing unviability on a cold probe.
+                            let _ = read_cached_model; // grep anchor
+                            None
+                        })
+                {
+                    if !cached_model.offers_detail.is_empty() {
+                        let mut any_passes = false;
+                        let mut first_skip: Option<(u64, u64, String)> = None;
+                        for offer in &cached_model.offers_detail {
+                            match evaluate_pre_gate(
+                                market_max_wait_ms,
+                                grace_secs,
+                                offer,
+                                cached_model.model_typical_serve_ms_p50_7d,
+                            ) {
+                                PreGateVerdict::Proceed | PreGateVerdict::Indeterminate => {
+                                    any_passes = true;
+                                    break;
+                                }
+                                PreGateVerdict::Skip {
+                                    estimated_serve_ms,
+                                    usable_deadline_ms,
+                                } => {
+                                    if first_skip.is_none() {
+                                        first_skip = Some((
+                                            estimated_serve_ms,
+                                            usable_deadline_ms,
+                                            offer.offer_id.clone(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        if !any_passes {
+                            let (est, usable, offer_id) = first_skip.unwrap_or((0, 0, String::new()));
+                            emit_walker_chronicle(
+                                ctx,
+                                config,
+                                super::compute_chronicle::EVENT_OFFER_SKIPPED_PRE_GATE_DEADLINE,
+                                &walker_source_label,
+                                &entry.provider_id,
+                                serde_json::json!({
+                                    "offer_id": offer_id,
+                                    "estimated_serve_ms": est,
+                                    "usable_deadline_ms": usable,
+                                    "dispatch_deadline_grace_secs": grace_secs,
+                                    "model_id": market_model_id,
+                                    "branch": "market",
+                                }),
+                            );
+                            skip_reasons.push(format!(
+                                "{}:offer_skipped_pre_gate_deadline",
+                                entry.provider_id
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            }
 
             last_attempted_provider_id = Some(entry.provider_id.clone());
 
             // ── Dispatch via helper ──────────────────────────────────
             //
-            // Per-entry `max_budget_credits` cap fed into Wire's /quote
-            // `max_budget` field. Absent → NO_BUDGET_CAP sentinel
-            // (2^53 - 1, JS Number.MAX_SAFE_INTEGER; round-trips f64
-            // cleanly). Wire's 409 budget_exceeded fires when the
-            // estimated total exceeds this — walker advances via
+            // Per-dispatch `max_budget_credits` cap. Two sources in
+            // precedence order:
+            //   1. DispatchDecision.per_provider[Market].max_budget_credits
+            //      (walker v3 §3) — resolver-sourced, per-slot.
+            //   2. Legacy RouteEntry.max_budget_credits — retained as a
+            //      fallback during the Phase 1 W2 migration.
+            // Missing both → NO_BUDGET_CAP sentinel (2^53 - 1, JS
+            // Number.MAX_SAFE_INTEGER; round-trips f64 cleanly). Wire's
+            // 409 budget_exceeded fires when the estimated total
+            // exceeds max_budget; walker advances via
             // EntryError::RouteSkipped, network_rate_above_budget
             // chronicle, next entry tried.
-            let max_budget = entry
-                .max_budget_credits
+            let max_budget = market_max_budget_from_decision
+                .or(entry.max_budget_credits)
                 .unwrap_or(crate::pyramid::dispatch_policy::NO_BUDGET_CAP);
 
             let max_tokens_i64 = if _max_tokens == 0 {
@@ -2362,6 +2565,9 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 max_budget,
                 max_wait_ms: market_max_wait_ms,
                 market_saturation_patience_secs,
+                patience_clock_resets_per_model: market_patience_clock_resets_per_model,
+                dispatch_deadline_grace_secs: market_dispatch_deadline_grace_secs,
+                breaker_reset: market_breaker_reset_from_decision,
                 max_tokens: max_tokens_i64,
                 temperature,
                 input_tokens_est: est_input_tokens as i64,
@@ -5614,6 +5820,9 @@ routing_rules:
             max_budget: (1i64 << 53) - 1,
             max_wait_ms: 60_000,
             market_saturation_patience_secs: 3600,
+            patience_clock_resets_per_model: false,
+            dispatch_deadline_grace_secs: 10,
+            breaker_reset: crate::pyramid::walker_resolver::BreakerReset::PerBuild,
             max_tokens: 0,
             temperature: 0.0,
             input_tokens_est: 0,

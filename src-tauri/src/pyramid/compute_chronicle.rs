@@ -233,6 +233,33 @@ pub const EVENT_NETWORK_AUTH_EXPIRED: &str = "network_auth_expired";
 #[allow(dead_code)]
 pub const EVENT_MARKET_BACKOFF_WAITING: &str = "market_backoff_waiting";
 
+/// Walker v3 Phase 3: /quote pre-gate skipped an offer. Emitted when
+/// `typical_serve_ms_p50_7d × peer_queue_depth` exceeds the usable
+/// dispatch deadline (`dispatch_deadline - dispatch_deadline_grace_secs`).
+/// Walker advances to the next market entry instead of paying a
+/// reservation fee on an offer that can't meet the deadline.
+///
+/// Payload fields:
+///   - offer_id
+///   - typical_serve_ms_p50_7d (per-offer or model-level fallback)
+///   - peer_queue_depth (current_queue_depth + execution_concurrency)
+///   - estimated_serve_ms (product above)
+///   - usable_deadline_ms (dispatch_deadline − grace)
+///   - branch: "market"
+#[allow(dead_code)]
+pub const EVENT_OFFER_SKIPPED_PRE_GATE_DEADLINE: &str =
+    "offer_skipped_pre_gate_deadline";
+
+/// Walker v3 Phase 3: /quote pre-gate skipped an offer because the
+/// quote would exceed the per-dispatch `max_budget_credits` cap. Rare
+/// — the static max_budget is also passed to Wire's /quote and surfaces
+/// as `network_rate_above_budget` when Wire 409s — but Phase 3's
+/// resolver-driven `max_budget_credits` comes from per-provider config
+/// (not RouteEntry), so a pre-gate check avoids the HTTP round-trip
+/// when the resolver is stricter than the RouteEntry default.
+#[allow(dead_code)]
+pub const EVENT_OFFER_SKIPPED_OVER_BUDGET: &str = "offer_skipped_over_budget";
+
 #[allow(dead_code)]
 pub const EVENT_DISPATCH_POLICY_SUPERSEDED: &str = "dispatch_policy_superseded";
 

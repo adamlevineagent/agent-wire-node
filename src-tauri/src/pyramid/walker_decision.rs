@@ -47,7 +47,7 @@ use crate::pyramid::compute_chronicle::{
 };
 use crate::pyramid::walker_cache::ScopeCache;
 use crate::pyramid::walker_readiness::{
-    FleetReadinessStub, LocalReadiness, MarketReadinessStub, NotReadyReason,
+    FleetReadinessStub, LocalReadiness, MarketReadiness, NotReadyReason,
     OpenRouterReadinessStub, ProviderReadiness, ReadinessResult, ResolvedProviderParams,
 };
 use crate::pyramid::walker_resolver::{
@@ -454,12 +454,14 @@ fn resolve_all_params(
 /// Returned as a boxed trait object so callers can uniformly dispatch.
 fn readiness_for(pt: ProviderType) -> Box<dyn ProviderReadiness> {
     match pt {
-        // Phase 2 (plan §2.6): real probe-cache-backed LocalReadiness.
-        // OpenRouter/Fleet/Market still Phase 3/4 stubs returning Ready.
+        // Phase 2: real probe-cache-backed LocalReadiness.
+        // Phase 3: real market-surface + balance + reachability
+        //          MarketReadiness.
+        // OpenRouter + Fleet still stubs (Fleet → Phase 4).
         ProviderType::Local => Box::new(LocalReadiness::new()),
         ProviderType::OpenRouter => Box::new(OpenRouterReadinessStub),
         ProviderType::Fleet => Box::new(FleetReadinessStub),
-        ProviderType::Market => Box::new(MarketReadinessStub),
+        ProviderType::Market => Box::new(MarketReadiness::new()),
     }
 }
 
@@ -620,14 +622,18 @@ mod tests {
 
     #[test]
     fn test_decision_build_all_providers_ready() {
-        // Empty DB = SYSTEM_DEFAULTS everywhere. OpenRouter/Fleet/Market
-        // stubs return Ready unconditionally; Local (Phase 2 real impl)
-        // consults the Ollama probe cache — an unseeded cache returns
-        // OllamaOffline, which would drop Local from the call order.
-        // Seed a walker_provider_local contribution pointing at a
-        // test-unique base_url AND seed the cache entry for that url.
-        // Using a unique url per test avoids cross-contamination with
-        // tests that invalidate the SYSTEM_DEFAULT url.
+        // Empty DB = SYSTEM_DEFAULTS everywhere. OpenRouter/Fleet stubs
+        // return Ready unconditionally; Local (Phase 2 real impl)
+        // consults the Ollama probe cache; Market (Phase 3 real impl)
+        // consults the market-surface probe cache.
+        //
+        // For this "all providers ready" smoke, we need BOTH probe
+        // caches seeded with a model that matches the declared
+        // model_list and BOTH providers' configs declaring that slug
+        // at slot "mid".
+        use crate::pyramid::walker_market_probe::{
+            invalidate_cached_model, write_cached_model, CachedMarketModel, CachedOffer,
+        };
         use crate::pyramid::walker_ollama_probe::{
             invalidate_cached_probe, write_cached_probe, CachedProbe,
         };
@@ -637,6 +643,26 @@ mod tests {
             CachedProbe {
                 reachable: true,
                 models: vec!["gemma3:27b".into()],
+                at: std::time::Instant::now(),
+            },
+        );
+        let market_slug = "test-decision-allready/market-model";
+        write_cached_model(
+            market_slug,
+            CachedMarketModel {
+                active_offers: 1,
+                all_offers_saturated: false,
+                only_self_offers: false,
+                model_typical_serve_ms_p50_7d: Some(1000.0),
+                offers_detail: vec![CachedOffer {
+                    offer_id: "o1".into(),
+                    node_handle: "other".into(),
+                    operator_handle: "op".into(),
+                    typical_serve_ms_p50_7d: Some(1000.0),
+                    execution_concurrency: 1,
+                    current_queue_depth: 0,
+                    max_queue_depth: 5,
+                }],
                 at: std::time::Instant::now(),
             },
         );
@@ -658,6 +684,22 @@ overrides:
 "#
             ),
         );
+        insert_active(
+            &conn,
+            "c-wpm-mid",
+            "walker_provider_market",
+            None,
+            &format!(
+                r#"
+schema_type: walker_provider_market
+version: 1
+overrides:
+  active: true
+  model_list:
+    mid: ["{market_slug}"]
+"#
+            ),
+        );
         let d = DispatchDecision::build("mid", &conn).expect("build must succeed");
         assert!(!d.synthetic);
         assert_eq!(d.slot, "mid");
@@ -666,6 +708,7 @@ overrides:
             assert!(d.per_provider.contains_key(&pt));
         }
         invalidate_cached_probe(base_url);
+        invalidate_cached_model(market_slug);
     }
 
     #[test]
@@ -785,7 +828,34 @@ slots:
     fn test_resolved_provider_params_populated_from_resolver() {
         // Seed walker_provider_openrouter with patience_secs=900.
         // per_provider[OpenRouter].patience_secs must be 900.
-        // per_provider[Market].patience_secs stays at SYSTEM_DEFAULT 3600.
+        // per_provider[Market].patience_secs stays at SYSTEM_DEFAULT 3600,
+        // but MarketReadiness (Phase 3) only surfaces Market in the
+        // Decision when a surface-cache entry with headroom exists, so
+        // seed one for a test-scoped slug + declare it in the market
+        // config at slot "mid".
+        use crate::pyramid::walker_market_probe::{
+            invalidate_cached_model, write_cached_model, CachedMarketModel, CachedOffer,
+        };
+        let market_slug = "test-resolved-params/market-model";
+        write_cached_model(
+            market_slug,
+            CachedMarketModel {
+                active_offers: 1,
+                all_offers_saturated: false,
+                only_self_offers: false,
+                model_typical_serve_ms_p50_7d: Some(1000.0),
+                offers_detail: vec![CachedOffer {
+                    offer_id: "o1".into(),
+                    node_handle: "other".into(),
+                    operator_handle: "op".into(),
+                    typical_serve_ms_p50_7d: Some(1000.0),
+                    execution_concurrency: 1,
+                    current_queue_depth: 0,
+                    max_queue_depth: 5,
+                }],
+                at: std::time::Instant::now(),
+            },
+        );
         let (_dir, conn) = make_db();
         insert_active(
             &conn,
@@ -799,6 +869,22 @@ overrides:
   patience_secs: 900
 "#,
         );
+        insert_active(
+            &conn,
+            "c-wpm-ps",
+            "walker_provider_market",
+            None,
+            &format!(
+                r#"
+schema_type: walker_provider_market
+version: 1
+overrides:
+  active: true
+  model_list:
+    mid: ["{market_slug}"]
+"#
+            ),
+        );
         let d = DispatchDecision::build("mid", &conn).unwrap();
         let or = d
             .per_provider
@@ -810,6 +896,7 @@ overrides:
             .get(&ProviderType::Market)
             .expect("market must be present");
         assert_eq!(mkt.patience_secs, 3600);
+        invalidate_cached_model(market_slug);
     }
 
     /// Compile-time: `DispatchDecision` MUST NOT be `Serialize`.
@@ -830,18 +917,59 @@ overrides:
         // included — max_budget_credits=5000 at scope 4, ollama_base_url
         // carried via SYSTEM_DEFAULT. Chronicle view must NOT expose
         // these as top-level keys.
+        //
+        // Market must pass readiness for the cap to ride along, so
+        // seed the surface-cache + declare an active market config
+        // with a test-scoped slug. A big enough default balance keeps
+        // the budget cap from tripping the InsufficientCredit gate in
+        // readiness (we want the cap to survive into the chronicle
+        // view, not be short-circuited to NotReady).
+        use crate::pyramid::walker_market_probe::{
+            clear_node_state_for_tests, invalidate_cached_model, node_state_test_lock,
+            set_credit_balance, write_cached_model, CachedMarketModel, CachedOffer,
+        };
+        let _g = node_state_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        clear_node_state_for_tests();
+        set_credit_balance(Some(1_000_000));
+        let market_slug = "test-chronicle-redact/market-model";
+        write_cached_model(
+            market_slug,
+            CachedMarketModel {
+                active_offers: 1,
+                all_offers_saturated: false,
+                only_self_offers: false,
+                model_typical_serve_ms_p50_7d: Some(1000.0),
+                offers_detail: vec![CachedOffer {
+                    offer_id: "o1".into(),
+                    node_handle: "other".into(),
+                    operator_handle: "op".into(),
+                    typical_serve_ms_p50_7d: Some(1000.0),
+                    execution_concurrency: 1,
+                    current_queue_depth: 0,
+                    max_queue_depth: 5,
+                }],
+                at: std::time::Instant::now(),
+            },
+        );
         let (_dir, conn) = make_db();
         insert_active(
             &conn,
             "c-mkt-cap",
             "walker_provider_market",
             None,
-            r#"
+            &format!(
+                r#"
 schema_type: walker_provider_market
 version: 1
 overrides:
+  active: true
   max_budget_credits: 5000
-"#,
+  model_list:
+    mid: ["{market_slug}"]
+"#
+            ),
         );
         let d = DispatchDecision::build("mid", &conn).unwrap();
         let view = d.for_chronicle();
@@ -870,6 +998,8 @@ overrides:
         assert!(s.contains("on_partial_failure"));
         assert!(s.contains("synthetic"));
         assert!(s.contains("source_contribution_ids"));
+        invalidate_cached_model(market_slug);
+        clear_node_state_for_tests();
     }
 
     #[test]
@@ -938,6 +1068,37 @@ slots:
         // If a provider isn't in effective_call_order, it also isn't
         // reflected in the chronicle view's per_provider array — per
         // §2.9 the chronicle mirrors what the dispatcher saw.
+        //
+        // Slot-scope order=[market] + MarketReadiness (Phase 3) requires
+        // an active market config + a surface-cache entry with headroom.
+        use crate::pyramid::walker_market_probe::{
+            clear_node_state_for_tests, invalidate_cached_model, node_state_test_lock,
+            write_cached_model, CachedMarketModel, CachedOffer,
+        };
+        let _g = node_state_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        clear_node_state_for_tests();
+        let market_slug = "test-chronicle-omit/market-model";
+        write_cached_model(
+            market_slug,
+            CachedMarketModel {
+                active_offers: 1,
+                all_offers_saturated: false,
+                only_self_offers: false,
+                model_typical_serve_ms_p50_7d: Some(1000.0),
+                offers_detail: vec![CachedOffer {
+                    offer_id: "o1".into(),
+                    node_handle: "other".into(),
+                    operator_handle: "op".into(),
+                    typical_serve_ms_p50_7d: Some(1000.0),
+                    execution_concurrency: 1,
+                    current_queue_depth: 0,
+                    max_queue_depth: 5,
+                }],
+                at: std::time::Instant::now(),
+            },
+        );
         let (_dir, conn) = make_db();
         insert_active(
             &conn,
@@ -952,11 +1113,28 @@ slots:
     order: [market]
 "#,
         );
+        insert_active(
+            &conn,
+            "c-wpm-narrow",
+            "walker_provider_market",
+            None,
+            &format!(
+                r#"
+schema_type: walker_provider_market
+version: 1
+overrides:
+  active: true
+  model_list:
+    mid: ["{market_slug}"]
+"#
+            ),
+        );
         let d = DispatchDecision::build("mid", &conn).unwrap();
         let view = d.for_chronicle();
         assert_eq!(view.per_provider.len(), 1);
         assert_eq!(view.per_provider[0].provider_type, "market");
         assert_eq!(view.effective_call_order, vec!["market".to_string()]);
+        invalidate_cached_model(market_slug);
     }
 
     #[test]

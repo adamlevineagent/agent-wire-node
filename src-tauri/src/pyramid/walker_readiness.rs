@@ -51,6 +51,12 @@ pub enum NotReadyReason {
     /// Market: MarketSurfaceCache shows 0 offers matching any slug in the
     /// resolved model_list.
     NoMarketOffersForSlot,
+    /// Market: at least one offer exists for the model_list, but every
+    /// offer's queue is full (current_queue_depth >= max_queue_depth).
+    /// Distinct from `NoMarketOffersForSlot` because the condition is
+    /// transient — operator guidance differs ("wait for drain" vs
+    /// "the market doesn't serve this model").
+    AllOffersSaturatedForModel,
     /// Market: only available offers come from this node's own publisher
     /// OR from this node's `node_identity_history` (§2.16.7).
     SelfDealing,
@@ -185,8 +191,6 @@ pub trait ProviderReadiness {
 pub struct OpenRouterReadinessStub;
 #[allow(dead_code)]
 pub struct FleetReadinessStub;
-#[allow(dead_code)]
-pub struct MarketReadinessStub;
 
 impl ProviderReadiness for OpenRouterReadinessStub {
     fn can_dispatch_now(&self, _params: &ResolvedProviderParams) -> ReadinessResult {
@@ -200,9 +204,167 @@ impl ProviderReadiness for FleetReadinessStub {
     }
 }
 
-impl ProviderReadiness for MarketReadinessStub {
-    fn can_dispatch_now(&self, _params: &ResolvedProviderParams) -> ReadinessResult {
-        ReadinessResult::Ready
+// ── MarketReadiness (§2.6 Phase 3 real impl) ───────────────────────────────
+//
+// Replaces the Phase 0a-1 MarketReadinessStub. Readiness ladder:
+//   1. params.active == false                  → Inactive
+//   2. params.model_list absent/empty          → NoMarketOffersForSlot
+//   3. Wire unreachable (consecutive failures
+//      >= network_failure_backoff_threshold)   → WireUnreachable
+//   4. credit balance < max_budget_credits     → InsufficientCredit
+//   5. every model in model_list has cache
+//      entry with active_offers == 0           → NoMarketOffersForSlot
+//   6. every model's cache entry flags
+//      only_self_offers == true                → SelfDealing
+//   7. every model's cache entry flags
+//      all_offers_saturated == true            → AllOffersSaturatedForModel
+//   8. otherwise                               → Ready
+//
+// The market-surface + balance + Wire-reachability caches are the sync-
+// read shared state populated by the boot-spawned background task.
+// MarketReadiness never blocks on network I/O — it only reads what the
+// task has already observed.
+//
+// The credit check runs BEFORE the per-model-liquidity checks so an
+// operator whose balance zeroed out sees `InsufficientCredit` regardless
+// of whether a given slug is saturated or missing offers.
+//
+// `AllOffersSaturatedForModel` is strictly weaker than the slot-level
+// short-circuit from NoMarketOffersForSlot — we only report saturation
+// when offers exist for every model, so "mixed-saturation" (some slugs
+// cold, others saturated) still yields NoMarketOffersForSlot for the
+// cold ones. The strictest per-model verdict wins: if any declared
+// model has headroom, MarketReadiness returns Ready.
+#[allow(dead_code)]
+pub struct MarketReadiness;
+
+impl MarketReadiness {
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for MarketReadiness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProviderReadiness for MarketReadiness {
+    fn can_dispatch_now(&self, params: &ResolvedProviderParams) -> ReadinessResult {
+        use crate::pyramid::walker_market_probe::{read_cached_model, read_node_state};
+
+        // 1. Operator-disabled market provider (bundled default is
+        //    active=false — operator opts in).
+        if !params.active {
+            return ReadinessResult::NotReady {
+                reason: NotReadyReason::Inactive,
+            };
+        }
+
+        // 2. No model declared at this (slot, Market) scope.
+        let model_list = match params.model_list.as_ref() {
+            Some(list) if !list.is_empty() => list,
+            _ => {
+                return ReadinessResult::NotReady {
+                    reason: NotReadyReason::NoMarketOffersForSlot,
+                };
+            }
+        };
+
+        // 3. Wire reachability — check the node-state failure counter.
+        let node_state = read_node_state();
+        if node_state.consecutive_network_failures
+            >= params.network_failure_backoff_threshold
+        {
+            return ReadinessResult::NotReady {
+                reason: NotReadyReason::WireUnreachable,
+            };
+        }
+
+        // 4. Budget check. `max_budget_credits = None` means "no cap" —
+        //    skip. `Some(cap)` + cached balance < cap → InsufficientCredit.
+        //    Unknown balance (None) is permissive — the Phase 3 probe
+        //    hasn't observed the balance yet, so the readiness gate
+        //    must not fail closed during cold-cache.
+        if let (Some(cap), Some(balance)) =
+            (params.max_budget_credits, node_state.credit_balance)
+        {
+            if balance < cap {
+                return ReadinessResult::NotReady {
+                    reason: NotReadyReason::InsufficientCredit,
+                };
+            }
+        }
+
+        // 5-7. Per-model cache consultation. Strictest verdict wins —
+        //      if ANY model has headroom, we return Ready immediately.
+        //      Otherwise aggregate the reasons: if every model says
+        //      SelfDealing, that beats saturation (operator should see
+        //      the self-deal diagnosis first); if every model says
+        //      AllOffersSaturatedForModel, that beats NoMarketOffersForSlot.
+        let mut any_headroom = false;
+        let mut every_self_dealing = true;
+        let mut every_all_saturated = true;
+        let mut any_has_cache = false;
+
+        for model_id in model_list {
+            match read_cached_model(model_id) {
+                Some(entry) => {
+                    any_has_cache = true;
+                    if entry.active_offers == 0 {
+                        every_self_dealing = false;
+                        every_all_saturated = false;
+                        continue;
+                    }
+                    if entry.only_self_offers {
+                        // All offers are self-dealing; doesn't contribute
+                        // to "saturation" accounting but does count as
+                        // "no usable offer" for headroom purposes.
+                        every_all_saturated = false;
+                        continue;
+                    } else {
+                        every_self_dealing = false;
+                    }
+                    if entry.all_offers_saturated {
+                        continue;
+                    }
+                    every_all_saturated = false;
+                    any_headroom = true;
+                }
+                None => {
+                    // Cache miss for this slug → no offer data. Treat as
+                    // "no offers" for the aggregate verdict but DON'T
+                    // early-fail: another model in the list may have
+                    // headroom.
+                    every_self_dealing = false;
+                    every_all_saturated = false;
+                }
+            }
+        }
+
+        if any_headroom {
+            return ReadinessResult::Ready;
+        }
+
+        // No headroom anywhere. Pick the most specific reason.
+        // Precedence: SelfDealing > AllOffersSaturated > NoOffers.
+        // Only report SelfDealing / AllSaturated if we actually saw
+        // cache entries — otherwise it's cold-cache → NoOffers.
+        if any_has_cache && every_self_dealing {
+            return ReadinessResult::NotReady {
+                reason: NotReadyReason::SelfDealing,
+            };
+        }
+        if any_has_cache && every_all_saturated {
+            return ReadinessResult::NotReady {
+                reason: NotReadyReason::AllOffersSaturatedForModel,
+            };
+        }
+        ReadinessResult::NotReady {
+            reason: NotReadyReason::NoMarketOffersForSlot,
+        }
     }
 }
 
@@ -318,16 +480,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn three_non_local_stubs_return_ready() {
+    fn two_non_local_stubs_return_ready() {
         // LocalReadinessStub was replaced in Phase 2 by LocalReadiness,
-        // which is cache-aware and NOT unconditionally Ready. The three
-        // remaining stubs (OpenRouter/Fleet/Market) stay Ready until
-        // Phases 3/4 replace them with real impls.
+        // and MarketReadinessStub was replaced in Phase 3 by
+        // MarketReadiness. OpenRouter + Fleet stay Ready until Phase 4
+        // replaces FleetReadiness with a real impl.
         let p = ResolvedProviderParams::default();
         for r in [
             OpenRouterReadinessStub.can_dispatch_now(&p),
             FleetReadinessStub.can_dispatch_now(&p),
-            MarketReadinessStub.can_dispatch_now(&p),
         ] {
             assert!(matches!(r, ReadinessResult::Ready));
         }
@@ -490,13 +651,14 @@ mod tests {
         invalidate_cached_probe(url);
     }
 
-    // Clear the cache at the end of the test module as a belt-and-
-    // suspenders against other integration tests running in the same
-    // process seeing our entries.
-    #[test]
-    fn zzz_local_readiness_cache_cleanup() {
-        clear_cache_for_tests();
-    }
+    // NOTE: Phase 3 intentionally does NOT reintroduce a
+    // `zzz_local_readiness_cache_cleanup` helper that wiped the whole
+    // Ollama probe cache at the end of the module. That helper was a
+    // race against parallel tests in the same module — it would clear
+    // probe entries mid-run of a sibling test. Each LocalReadiness test
+    // already owns a unique base_url + calls `invalidate_cached_probe`
+    // on exit, so the integration-test isolation it was intended to
+    // provide is redundant.
 
     #[test]
     fn not_ready_reason_variants_exhaustive_compile() {
@@ -516,12 +678,13 @@ mod tests {
                 last_success_at: now,
             },
             NotReadyReason::NoMarketOffersForSlot,
+            NotReadyReason::AllOffersSaturatedForModel,
             NotReadyReason::SelfDealing,
             NotReadyReason::NoReachablePeer,
             NotReadyReason::NoPeerHasModel,
             NotReadyReason::PeerIsV1Announcer,
         ];
-        assert_eq!(variants.len(), 12);
+        assert_eq!(variants.len(), 13);
     }
 
     #[test]
@@ -534,5 +697,228 @@ mod tests {
         assert!(p.max_completion_tokens.is_none());
         assert!(p.pricing_json.is_none());
         assert!(p.supported_parameters.is_none());
+    }
+
+    // ── MarketReadiness (Phase 3) ────────────────────────────────────────────
+    //
+    // Unit tests for the real impl. Each test sets up a minimal world
+    // via the walker_market_probe test helpers. Tests that mutate the
+    // shared global node_state cache (credit balance, network failure
+    // counters, self-handles) must serialize access — parallel test
+    // execution would otherwise have one test clear state mid-run of
+    // another. Use a static Mutex acquired at the top of every
+    // MarketReadiness test that touches node_state.
+    //
+    // Per-model entries (`write_cached_model`) are safe to exercise in
+    // parallel because every test uses a unique model_id string.
+
+    use crate::pyramid::walker_market_probe::{
+        clear_model_cache_for_tests, clear_node_state_for_tests, invalidate_cached_model,
+        node_state_test_lock, record_network_failure, set_credit_balance, set_self_handles,
+        write_cached_model, CachedMarketModel, CachedOffer,
+    };
+
+    /// Serialize MarketReadiness tests that mutate `node_state_cache`
+    /// (credit balance, failure counter, self-handles) through the
+    /// shared module-level `node_state_test_lock` so sibling tests in
+    /// walker_decision + walker_market_probe see the same ordering.
+    fn market_test_lock() -> &'static std::sync::Mutex<()> {
+        node_state_test_lock()
+    }
+
+    fn params_for_market(
+        active: bool,
+        model_list: Option<Vec<String>>,
+        max_budget: Option<i64>,
+    ) -> ResolvedProviderParams {
+        ResolvedProviderParams {
+            active,
+            model_list,
+            max_budget_credits: max_budget,
+            // Tight threshold so WireUnreachable tests can drive the
+            // counter to breach without excessive iteration.
+            network_failure_backoff_threshold: 3,
+            ..ResolvedProviderParams::default()
+        }
+    }
+
+    fn cached_with_offers(
+        active_offers: i64,
+        all_saturated: bool,
+        only_self: bool,
+    ) -> CachedMarketModel {
+        // Synthesize offers_detail that MATCHES the flags — the flag
+        // computation runs in walker_market_probe::project_model; tests
+        // here build CachedMarketModel directly to exercise readiness
+        // without driving the projector.
+        let offers = if active_offers > 0 {
+            vec![CachedOffer {
+                offer_id: "o1".into(),
+                node_handle: if only_self { "me".into() } else { "other".into() },
+                operator_handle: "op".into(),
+                typical_serve_ms_p50_7d: Some(1000.0),
+                execution_concurrency: 1,
+                current_queue_depth: if all_saturated { 5 } else { 0 },
+                max_queue_depth: 5,
+            }]
+        } else {
+            vec![]
+        };
+        CachedMarketModel {
+            active_offers,
+            all_offers_saturated: all_saturated,
+            only_self_offers: only_self,
+            model_typical_serve_ms_p50_7d: Some(1000.0),
+            offers_detail: offers,
+            at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn test_market_readiness_inactive_returns_not_ready_inactive() {
+        let _g = market_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_model_cache_for_tests();
+        clear_node_state_for_tests();
+        let p = params_for_market(false, Some(vec!["m1".into()]), None);
+        match MarketReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::NotReady { reason: NotReadyReason::Inactive } => {}
+            other => panic!("expected Inactive, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_market_readiness_no_model_list_returns_not_ready_no_market_offers_for_slot() {
+        let _g = market_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_model_cache_for_tests();
+        clear_node_state_for_tests();
+        // None
+        let p = params_for_market(true, None, None);
+        match MarketReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::NotReady { reason: NotReadyReason::NoMarketOffersForSlot } => {}
+            other => panic!("expected NoMarketOffersForSlot (None), got {:?}", other),
+        }
+        // Empty
+        let p2 = params_for_market(true, Some(vec![]), None);
+        match MarketReadiness::new().can_dispatch_now(&p2) {
+            ReadinessResult::NotReady { reason: NotReadyReason::NoMarketOffersForSlot } => {}
+            other => panic!("expected NoMarketOffersForSlot (empty), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_market_readiness_surface_empty_returns_not_ready_no_market_offers_for_slot() {
+        let _g = market_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_model_cache_for_tests();
+        clear_node_state_for_tests();
+        let slug = "market-readiness-empty-surface";
+        invalidate_cached_model(slug);
+        // Cache has the slug, but active_offers == 0.
+        write_cached_model(slug, cached_with_offers(0, false, false));
+        let p = params_for_market(true, Some(vec![slug.into()]), None);
+        match MarketReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::NotReady { reason: NotReadyReason::NoMarketOffersForSlot } => {}
+            other => panic!("expected NoMarketOffersForSlot, got {:?}", other),
+        }
+        invalidate_cached_model(slug);
+    }
+
+    #[test]
+    fn test_market_readiness_all_offers_saturated_returns_all_saturated_variant() {
+        let _g = market_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_model_cache_for_tests();
+        clear_node_state_for_tests();
+        let slug = "market-readiness-all-saturated";
+        invalidate_cached_model(slug);
+        write_cached_model(slug, cached_with_offers(1, true, false));
+        let p = params_for_market(true, Some(vec![slug.into()]), None);
+        match MarketReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::AllOffersSaturatedForModel,
+            } => {}
+            other => panic!("expected AllOffersSaturatedForModel, got {:?}", other),
+        }
+        invalidate_cached_model(slug);
+    }
+
+    #[test]
+    fn test_market_readiness_insufficient_credit_returns_insufficient_credit() {
+        let _g = market_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_model_cache_for_tests();
+        clear_node_state_for_tests();
+        let slug = "market-readiness-insufficient-credit";
+        invalidate_cached_model(slug);
+        // Cache says offers exist with headroom, but balance < cap.
+        write_cached_model(slug, cached_with_offers(1, false, false));
+        set_credit_balance(Some(100));
+        let p = params_for_market(true, Some(vec![slug.into()]), Some(1_000));
+        match MarketReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::InsufficientCredit,
+            } => {}
+            other => panic!("expected InsufficientCredit, got {:?}", other),
+        }
+        clear_node_state_for_tests();
+        invalidate_cached_model(slug);
+    }
+
+    #[test]
+    fn test_market_readiness_wire_unreachable_returns_wire_unreachable() {
+        let _g = market_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_model_cache_for_tests();
+        clear_node_state_for_tests();
+        // Drive the failure counter over the default threshold (3).
+        record_network_failure();
+        record_network_failure();
+        record_network_failure();
+        let slug = "market-readiness-wire-unreachable";
+        write_cached_model(slug, cached_with_offers(1, false, false));
+        let p = params_for_market(true, Some(vec![slug.into()]), None);
+        match MarketReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::NotReady { reason: NotReadyReason::WireUnreachable } => {}
+            other => panic!("expected WireUnreachable, got {:?}", other),
+        }
+        clear_node_state_for_tests();
+        invalidate_cached_model(slug);
+    }
+
+    #[test]
+    fn test_market_readiness_self_dealing_filters_own_offers() {
+        let _g = market_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_model_cache_for_tests();
+        clear_node_state_for_tests();
+        set_self_handles("me", "op");
+        let slug = "market-readiness-self-dealing";
+        invalidate_cached_model(slug);
+        // Cache says offers exist, but flagged only_self_offers.
+        write_cached_model(slug, cached_with_offers(1, false, true));
+        let p = params_for_market(true, Some(vec![slug.into()]), None);
+        match MarketReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::NotReady { reason: NotReadyReason::SelfDealing } => {}
+            other => panic!("expected SelfDealing, got {:?}", other),
+        }
+        clear_node_state_for_tests();
+        invalidate_cached_model(slug);
+    }
+
+    #[test]
+    fn test_market_readiness_ready_when_any_model_has_headroom() {
+        let _g = market_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_model_cache_for_tests();
+        clear_node_state_for_tests();
+        let a = "market-readiness-headroom-a";
+        let b = "market-readiness-headroom-b";
+        invalidate_cached_model(a);
+        invalidate_cached_model(b);
+        // One saturated, one with headroom → Ready (strictest-wins does
+        // NOT mean strictest-aggregates; ANY headroom → Ready).
+        write_cached_model(a, cached_with_offers(1, true, false));
+        write_cached_model(b, cached_with_offers(1, false, false));
+        let p = params_for_market(true, Some(vec![a.into(), b.into()]), None);
+        match MarketReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::Ready => {}
+            other => panic!("expected Ready (any-model-headroom), got {:?}", other),
+        }
+        invalidate_cached_model(a);
+        invalidate_cached_model(b);
     }
 }
