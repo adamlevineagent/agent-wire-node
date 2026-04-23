@@ -784,6 +784,12 @@ impl DadbearSupervisor {
                             work_item_id = %item.id,
                             "role_bound work item missing resolved_chain_id — compiler bug"
                         );
+                        // Phase 5 wanderer fix: CAS previewed→failed before returning
+                        // Err. Without this, `find_committed_previewed_items` re-selects
+                        // this same row every tick, repeating the error log + DB read
+                        // forever until operator intervention. Matches the load-failure
+                        // + exec-failure paths below which already mark_role_bound_failed.
+                        mark_role_bound_failed(&db_path, &wi_id, &slug, &event_bus).await;
                         return Err(anyhow::anyhow!(
                             "role_bound work_item '{}' missing resolved_chain_id",
                             item.id
@@ -2123,7 +2129,13 @@ fn reconstruct_step_context(
 /// We don't propagate this helper's own errors — the caller is already
 /// returning an Err on the original failure; a CAS blip here becomes a
 /// follow-up concern, not a cascade of nested errors.
-async fn mark_role_bound_failed(
+///
+/// Phase 5 wanderer: exposed as `pub(crate)` so the missing-resolved_chain_id
+/// regression test at phase5_post_build_tests can call this directly. The
+/// arm is inline in apply_mechanical_primitive so the test verifies the
+/// helper's CAS behavior that the inline match-arm now depends on for
+/// the resolved_chain_id==None path.
+pub(crate) async fn mark_role_bound_failed(
     db_path: &str,
     wi_id: &str,
     slug: &str,

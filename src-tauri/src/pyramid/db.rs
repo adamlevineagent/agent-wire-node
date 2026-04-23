@@ -24040,4 +24040,81 @@ mod phase5_post_build_tests {
             .unwrap();
         assert_eq!(target_id.as_deref(), Some("L1-THREADED"));
     }
+
+    // ── 13. Phase 5 wanderer regression: role_bound arm CAS-on-missing-chain_id
+    //
+    // The supervisor's role_bound arm at dadbear_supervisor.rs:755 re-queries
+    // resolved_chain_id from the work_items row. If the compiler failed to
+    // stamp it (or it's been cleared), the arm previously returned Err without
+    // transitioning the work item to `failed`. The next tick's
+    // `find_committed_previewed_items` query re-selected the same row, and the
+    // arm looped forever on the missing-chain-id error — wasting log cycles +
+    // DB reads + spamming the tracing::error every tick until an operator saw.
+    //
+    // The wanderer fix invokes `mark_role_bound_failed(...)` before the Err,
+    // mirroring the existing load-failure and exec-failure paths. This test
+    // verifies the helper itself does the previewed→failed CAS that the fix
+    // relies on for the missing-chain-id case.
+    //
+    // (The arm itself is inline in apply_mechanical_primitive and requires
+    // full supervisor plumbing to invoke directly — a supervisor-tick harness
+    // remains flagged for cross-phase work per the verifier report. This
+    // narrower test proves the CAS helper is correct; the arm's new call
+    // site uses exactly this helper.)
+    #[tokio::test]
+    async fn mark_role_bound_failed_transitions_previewed_to_failed() {
+        use crate::pyramid::event_bus::BuildEventBus;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("pyramid.db");
+        let db_path_str = db_path.to_str().unwrap().to_string();
+
+        // Seed a slug + a work item in `previewed` state — same shape the
+        // supervisor's role_bound arm would have at dispatch time.
+        let conn = Connection::open(&db_path).unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p5w", &ContentType::Code, "/tmp/p5w").unwrap();
+        let wi_id = "wi-role-bound-missing-chain".to_string();
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        conn.execute(
+            "INSERT INTO dadbear_work_items
+                (id, slug, batch_id, epoch_id, step_name, primitive,
+                 layer, target_id, system_prompt, user_prompt, model_tier,
+                 result_json, observation_event_ids, compiled_at,
+                 state, state_changed_at, resolved_chain_id)
+             VALUES (?1, ?2, 'batch-w', 'epoch-w', 'cascade_reacted', 'role_bound',
+                     1, 'L1-X', '', '', 'mid',
+                     NULL, '[]', ?3,
+                     'previewed', ?3, NULL)",
+            rusqlite::params![wi_id, "p5w", now],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Call the helper — same call site the arm now uses when
+        // resolved_chain_id is NULL / empty.
+        let event_bus = Arc::new(BuildEventBus::new());
+        crate::pyramid::dadbear_supervisor::mark_role_bound_failed(
+            &db_path_str,
+            &wi_id,
+            "p5w",
+            &event_bus,
+        )
+        .await;
+
+        // CAS happened — state is now `failed`.
+        let conn = Connection::open(&db_path).unwrap();
+        let state_col: String = conn
+            .query_row(
+                "SELECT state FROM dadbear_work_items WHERE id = ?1",
+                rusqlite::params![wi_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            state_col, "failed",
+            "mark_role_bound_failed must CAS previewed→failed; without this CAS \
+             the work item loops forever in find_committed_previewed_items"
+        );
+    }
 }
