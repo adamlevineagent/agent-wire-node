@@ -18,7 +18,7 @@ use tracing::{info, warn};
 
 use super::llm::{self, LlmConfig};
 use super::question_decomposition;
-use super::step_context::{compute_prompt_hash, StepContext};
+use super::step_context::make_step_ctx_from_llm_config;
 use super::types::CharacterizationResult;
 use super::Tier1Config;
 
@@ -183,38 +183,18 @@ Analyze this material and produce the characterization."#,
     for attempt in 0..2u32 {
         let temp = if attempt == 0 { temperature } else { 0.1 };
 
-        // Build StepContext inline so the resolved tier + model id are
-        // stamped correctly. The retrofit helper labels everything as
-        // tier="primary" with model=primary_model, which is the hardwiring
-        // this fix exists to bypass.
-        let cache_ctx: Option<StepContext> = call_config.cache_access.as_ref().and_then(|cache| {
-            if system_prompt.is_empty() {
-                return None;
-            }
-            let prompt_hash = compute_prompt_hash(&system_prompt);
-            let mut ctx = StepContext::new(
-                cache.slug.clone(),
-                cache.build_id.clone(),
-                "characterize",
-                "characterize",
-                0,
-                None,
-                cache.db_path.to_string(),
-            )
-            .with_model_resolution(resolved_tier_name, resolved_model_id.clone())
-            .with_prompt_hash(prompt_hash);
-            if let Some(ref pid) = resolved_provider_id {
-                ctx = ctx.with_provider(pid.clone());
-            }
-            if let Some(ref bus) = cache.bus {
-                ctx = ctx.with_bus(bus.clone());
-            }
-            if let Some(ref cn) = cache.chain_name {
-                let ct = cache.content_type.as_deref().unwrap_or("");
-                ctx = ctx.with_chain_context(cn.clone(), ct.to_string());
-            }
-            Some(ctx)
-        });
+        let cache_ctx = make_step_ctx_from_llm_config(
+            &call_config,
+            "characterize",
+            "characterize",
+            0,
+            None,
+            &system_prompt,
+            resolved_tier_name,
+            Some(&resolved_model_id),
+            resolved_provider_id.as_deref(),
+        )
+        .await;
 
         let response = llm::call_model_unified_and_ctx(
             &call_config,

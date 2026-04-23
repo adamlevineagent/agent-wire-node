@@ -968,6 +968,14 @@ mod tests {
             ("DEFAULT_CONVERSATION_CHAIN", "mid"),
             ("DEFAULT_CODE_CHAIN", "mid"),
             ("DEFAULT_DOCUMENT_CHAIN", "mid"),
+            // Walker v3 completion (2026-04-23): Rust-side Pattern-4
+            // dispatch sites declare these tier names via the canonical
+            // make_step_ctx_from_llm_config slot parameter. Each must
+            // resolve to a non-empty model_list in the bundled seed.
+            ("evidence_answering.rs (Pattern-4)", "evidence_loop"),
+            ("stale_helpers.rs (Pattern-4)", "stale_l0"),
+            ("stale_helpers_upper.rs (Pattern-4)", "stale_upper"),
+            ("reroll.rs (Pattern-4)", "reroll"),
         ];
 
         let mut uncovered: Vec<(&str, &str)> = Vec::new();

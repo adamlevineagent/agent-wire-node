@@ -27,6 +27,8 @@ use super::llm::{self, LlmConfig};
 use super::question_yaml::{Question, QuestionDefaults, QuestionSet};
 use super::step_context::make_step_ctx_from_llm_config;
 
+const QUESTION_DECOMPOSITION_SLOT: &str = "max";
+
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 /// Configuration for a question decomposition run.
@@ -352,7 +354,11 @@ Return ONLY the JSON object."#
         0,
         None,
         &system_prompt,
-    );
+        QUESTION_DECOMPOSITION_SLOT,
+        None,
+        None,
+    )
+    .await;
     let response = llm::call_model_unified_and_ctx(
         llm_config,
         cache_ctx.as_ref(),
@@ -1269,7 +1275,11 @@ What are the genuinely distinct sub-questions needed to answer this? Only create
             depth as i64,
             None,
             &system_prompt,
-        );
+            QUESTION_DECOMPOSITION_SLOT,
+            None,
+            None,
+        )
+        .await;
         let response = llm::call_model_unified_and_ctx(
             llm_config,
             cache_ctx.as_ref(),
@@ -1971,7 +1981,11 @@ The merges array can be empty if no questions overlap. Return ONLY the JSON obje
         0,
         None,
         &system_prompt,
-    );
+        QUESTION_DECOMPOSITION_SLOT,
+        None,
+        None,
+    )
+    .await;
     let response = llm::call_model_unified_and_ctx(
         llm_config,
         cache_ctx.as_ref(),

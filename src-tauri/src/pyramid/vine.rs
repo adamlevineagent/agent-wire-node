@@ -1241,6 +1241,7 @@ pub async fn build_vine_l1(
         super::vine_prompts::VINE_CLUSTER_PROMPT,
         &inventory_json,
         "vine-l1-cluster",
+        "mid",
     )
     .await?;
 
@@ -1372,6 +1373,7 @@ pub async fn build_vine_l1(
             SYNTHESIZE_RECURSIVE_PROMPT,
             &user_prompt,
             &format!("vine-l1-{cluster_idx}"),
+            "mid",
         )
         .await
         {
@@ -1540,6 +1542,7 @@ pub async fn build_vine_upper(
                         SYNTHESIZE_RECURSIVE_PROMPT,
                         &user_prompt,
                         &format!("vine-synth-d{next_depth}-{pair_idx}"),
+                        "mid",
                     )
                     .await
                     {
@@ -2054,6 +2057,7 @@ async fn detect_vine_eras(
             super::vine_prompts::VINE_PHASE_CHECK_PROMPT,
             &user_prompt,
             &format!("vine-era-check-{idx}"),
+            "mid",
         )
         .await
         {
@@ -2222,6 +2226,7 @@ async fn classify_vine_transitions(
             super::vine_prompts::VINE_TRANSITION_PROMPT,
             &user_prompt,
             &format!("vine-transition-{i}"),
+            "mid",
         )
         .await
         {
@@ -2342,6 +2347,7 @@ async fn resolve_vine_entities(
         super::vine_prompts::VINE_ENTITY_RESOLUTION_PROMPT,
         &clusters_json,
         "vine-entity-resolution",
+        "mid",
     )
     .await
     {

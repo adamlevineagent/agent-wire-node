@@ -70,12 +70,35 @@ pub enum WriteOp {
 
 /// Call the LLM and parse JSON from the response.  On parse failure, retry once
 /// at temperature 0.1.  Returns the parsed JSON value.
+///
+/// `slot` is the walker-v3 tier name (e.g. "mid", "max", "synth_heavy") — the
+/// caller declares the intent, this helper resolves it through the provider
+/// registry and threads a slot-aware StepContext so the walker builds a
+/// DispatchDecision for dispatch routing. Fails loud if the registry has no
+/// routing for the slot: walker-v3 W3c deleted the legacy primary_model
+/// fallback, and silently bypassing the walker would mean Market / Fleet /
+/// Ollama-local branches never get consulted.
 pub(crate) async fn call_and_parse(
     config: &LlmConfig,
     system: &str,
     user: &str,
     fallback_key: &str,
+    slot: &str,
 ) -> Result<Value> {
+    let resolved = config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier(slot, None, None, None).ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "build::call_and_parse ({fallback_key}): provider registry has no \
+                 '{slot}' tier routing. Configure a walker_provider_openrouter \
+                 contribution with a '{slot}' slot model_list entry."
+            )
+        })?;
+    let resolved_model_id = resolved.tier.model_id.clone();
+    let resolved_provider_id = Some(resolved.provider.id.clone());
+
     let cache_ctx = make_step_ctx_from_llm_config(
         config,
         fallback_key,
@@ -83,7 +106,11 @@ pub(crate) async fn call_and_parse(
         0,
         None,
         system,
-    );
+        slot,
+        Some(&resolved_model_id),
+        resolved_provider_id.as_deref(),
+    )
+    .await;
     let resp = call_model_and_ctx(config, cache_ctx.as_ref(), system, user, 0.3, 50_000).await?;
     match extract_json(&resp) {
         Ok(v) => Ok(v),
@@ -91,14 +118,19 @@ pub(crate) async fn call_and_parse(
             info!("  JSON parse error on {fallback_key}, retrying at temp 0.1...");
             // Retry at lower temperature uses the same StepContext so
             // cache key is different but provenance is consistent.
+            let retry_key = format!("{}_retry", fallback_key);
             let retry_ctx = make_step_ctx_from_llm_config(
                 config,
-                &format!("{}_retry", fallback_key),
+                &retry_key,
                 "build_call_and_parse",
                 0,
                 None,
                 system,
-            );
+                slot,
+                Some(&resolved_model_id),
+                resolved_provider_id.as_deref(),
+            )
+            .await;
             let resp2 =
                 call_model_and_ctx(config, retry_ctx.as_ref(), system, user, 0.1, 50_000).await?;
             extract_json(&resp2)

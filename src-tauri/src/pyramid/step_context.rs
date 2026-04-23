@@ -550,44 +550,6 @@ pub fn make_step_context_from_slug(
     ctx
 }
 
-/// Phase 12 retrofit helper: construct a cache-usable StepContext
-/// from an LlmConfig that carries cache plumbing (see
-/// `LlmConfig::cache_access`) plus a step identity and the system
-/// prompt body. Returns `None` if the config has no cache_access
-/// (the caller then bypasses the cache naturally).
-///
-/// The `resolved_model_id` is taken from `config.primary_model` —
-/// this is the simplest consistent choice since every retrofit site
-/// that calls `call_model` implicitly uses whatever model the config
-/// routes to. For sites that use `call_model_unified_with_options_and_ctx`
-/// with an explicit tier, the direct construction path
-/// (`StepContext::new` + `with_model_resolution`) remains available.
-///
-/// TODO(W3/Phase 1): walker v3 — `primary_model` is retired in W3 along
-/// with `fallback_model_{1,2}`. This retrofit helper fills a transition
-/// role; callers with a Decision in scope should prefer a direct
-/// construction path that stamps the Decision-resolved model id. This
-/// helper stays behind the field deletion until W3's global rewrite of
-/// caller sites, which is when a Decision-aware replacement lands.
-pub fn make_step_ctx_from_llm_config(
-    config: &LlmConfig,
-    step_name: &str,
-    primitive: &str,
-    depth: i64,
-    chunk_index: Option<i64>,
-    system_prompt: &str,
-) -> Option<StepContext> {
-    make_step_ctx_from_llm_config_with_model(
-        config,
-        step_name,
-        primitive,
-        depth,
-        chunk_index,
-        system_prompt,
-        None,
-    )
-}
-
 /// W3c variant: explicitly thread the model slug used for this call,
 /// replacing the deleted `config.primary_model` read. Maintenance
 /// subsystem callers that used to clone LlmConfig via
@@ -639,6 +601,161 @@ pub fn make_step_ctx_from_llm_config_with_model(
     Some(ctx)
 }
 
+/// Canonical StepContext constructor for LLM dispatch. Always attaches
+/// a runtime DispatchDecision from the DB via `with_dispatch_decision_if_available`
+/// so walker v3's full cascade (Market → Fleet → OpenRouter → Local) routes
+/// correctly. The `slot` parameter MUST name a walker tier defined in
+/// `walker_provider_*` contributions (see walker-provider-configs-and-slot-policy-v3).
+///
+/// `model` + `provider_id` may be pre-resolved via `provider_registry.resolve_tier(slot)`
+/// — if omitted, the Decision's model_list[0] fills the cache-row provenance.
+///
+/// Silent-bypass prevention: `call_model_unified_with_audit_and_ctx` fails loud
+/// if it receives a ctx with no Decision AND no `LlmCallOptions.model_override`.
+/// This constructor is the primary route through which Decision reaches it.
+pub async fn make_step_ctx_from_llm_config(
+    config: &LlmConfig,
+    step_name: &str,
+    primitive: &str,
+    depth: i64,
+    chunk_index: Option<i64>,
+    system_prompt: &str,
+    slot: &str,
+    model: Option<&str>,
+    provider_id: Option<&str>,
+) -> Option<StepContext> {
+    let cache = config.cache_access.as_ref()?;
+    if system_prompt.is_empty() {
+        return None;
+    }
+
+    let prompt_hash = compute_prompt_hash(system_prompt);
+    let registry_resolution = if model.is_some() {
+        None
+    } else {
+        config
+            .provider_registry
+            .as_ref()
+            .and_then(|reg| reg.resolve_tier(slot, None, None, None).ok())
+    };
+    let resolved_model = model
+        .map(|s| s.to_string())
+        .or_else(|| {
+            registry_resolution
+                .as_ref()
+                .map(|resolved| resolved.tier.model_id.clone())
+        })
+        .or_else(|| config.model_aliases.get(slot).cloned())
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                event = "make_step_ctx_slot_model_unknown",
+                step = %step_name,
+                slot = %slot,
+                "walker-v3: no resolved model for slot-aware StepContext; using '<unknown>'",
+            );
+            "<unknown>".to_string()
+        });
+    let resolved_provider_id = provider_id.map(|s| s.to_string()).or_else(|| {
+        registry_resolution
+            .as_ref()
+            .map(|resolved| resolved.provider.id.clone())
+    });
+
+    let mut ctx = StepContext::new(
+        cache.slug.clone(),
+        cache.build_id.clone(),
+        step_name.to_string(),
+        primitive.to_string(),
+        depth,
+        chunk_index,
+        cache.db_path.to_string(),
+    )
+    .with_model_resolution(slot.to_string(), resolved_model)
+    .with_prompt_hash(prompt_hash);
+    if let Some(pid) = resolved_provider_id {
+        ctx = ctx.with_provider(pid);
+    }
+    if let Some(bus) = &cache.bus {
+        ctx = ctx.with_bus(bus.clone());
+    }
+    if let Some(ref cn) = cache.chain_name {
+        let ct = cache.content_type.as_deref().unwrap_or("");
+        ctx = ctx.with_chain_context(cn.clone(), ct.to_string());
+    }
+
+    Some(with_dispatch_decision_if_available(ctx).await)
+}
+
+/// Attach a runtime DispatchDecision to a StepContext when the caller has
+/// already stamped a real walker slot on `model_tier`.
+///
+/// Permissive-on-failure: if the DB cannot be opened or the Decision build
+/// fails, the original context is returned unchanged so legacy behavior
+/// continues. This mirrors the outer chain executor's W1b policy.
+pub async fn with_dispatch_decision_if_available(mut ctx: StepContext) -> StepContext {
+    if ctx.dispatch_decision.is_some() {
+        return ctx;
+    }
+    let slot = ctx.model_tier.trim().to_string();
+    if slot.is_empty() || slot == "primary" {
+        return ctx;
+    }
+
+    let db_path = ctx.db_path.clone();
+    let build_id = if ctx.build_id.is_empty() {
+        None
+    } else {
+        Some(ctx.build_id.clone())
+    };
+    let decision = tokio::task::spawn_blocking(move || {
+        let conn = match rusqlite::Connection::open(&db_path) {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::warn!(
+                    event = "step_ctx_dispatch_decision_db_open_failed",
+                    slot = %slot,
+                    db_path = %db_path,
+                    error = %err,
+                    "walker-v3: failed to open DB for slot-aware DispatchDecision attach",
+                );
+                return None;
+            }
+        };
+        match crate::pyramid::walker_decision::DispatchDecision::build_with_build_id(
+            &slot,
+            build_id.as_deref(),
+            &conn,
+        ) {
+            Ok(decision) => Some(Arc::new(decision)),
+            Err(err) => {
+                tracing::warn!(
+                    event = "step_ctx_dispatch_decision_build_failed",
+                    slot = %slot,
+                    error = ?err,
+                    "walker-v3: slot-aware DispatchDecision build failed; continuing without Decision",
+                );
+                None
+            }
+        }
+    })
+    .await;
+
+    match decision {
+        Ok(Some(decision)) => ctx = ctx.with_dispatch_decision(decision),
+        Ok(None) => {}
+        Err(err) => {
+            tracing::warn!(
+                event = "step_ctx_dispatch_decision_join_failed",
+                slot = %ctx.model_tier,
+                error = %err,
+                "walker-v3: slot-aware DispatchDecision attach task failed; continuing without Decision",
+            );
+        }
+    }
+
+    ctx
+}
+
 /// Derive a human-readable task label from step context fields.
 /// Conditional formatting: if chain_name is non-empty, include it in
 /// parentheses. If empty (stale checks, tests), omit to avoid garbled
@@ -656,6 +773,7 @@ pub fn derive_task_label(step_name: &str, depth: i64, chain_name: &str) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::NamedTempFile;
 
     // ── Hash helpers ─────────────────────────────────────────────────
 
@@ -861,5 +979,63 @@ mod tests {
     fn test_step_context_force_fresh_toggle() {
         let ctx = StepContext::new("s", "b", "n", "p", 0, None, "/db").with_force_fresh(true);
         assert!(ctx.force_fresh);
+    }
+
+    #[tokio::test]
+    async fn test_make_step_ctx_from_llm_config_for_slot_attaches_dispatch_decision() {
+        let temp_db = NamedTempFile::new().expect("temp db");
+        let conn = rusqlite::Connection::open(temp_db.path()).expect("open temp db");
+        conn.execute_batch(
+            "CREATE TABLE pyramid_config_contributions (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 contribution_id TEXT NOT NULL UNIQUE,
+                 slug TEXT,
+                 schema_type TEXT NOT NULL,
+                 yaml_content TEXT NOT NULL,
+                 wire_native_metadata_json TEXT NOT NULL DEFAULT '{}',
+                 wire_publication_state_json TEXT NOT NULL DEFAULT '{}',
+                 supersedes_id TEXT,
+                 superseded_by_id TEXT,
+                 triggering_note TEXT,
+                 status TEXT NOT NULL DEFAULT 'active',
+                 source TEXT NOT NULL DEFAULT 'local',
+                 wire_contribution_id TEXT,
+                 created_by TEXT,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 accepted_at TEXT
+             );",
+        )
+        .expect("create contributions table");
+
+        let mut config = LlmConfig::default().clone_with_cache_access(
+            "slot-aware-test",
+            "build-slot-aware-test",
+            temp_db.path().to_string_lossy().to_string(),
+            None,
+        );
+        config
+            .model_aliases
+            .insert("mid".to_string(), "test-model-id".to_string());
+
+        let ctx = make_step_ctx_from_llm_config(
+            &config,
+            "slot_aware_step",
+            "slot_aware_primitive",
+            0,
+            None,
+            "system prompt",
+            "mid",
+            None,
+            None,
+        )
+        .await
+        .expect("slot-aware step ctx");
+
+        assert_eq!(ctx.model_tier, "mid");
+        assert_eq!(ctx.resolved_model_id.as_deref(), Some("test-model-id"));
+        assert!(
+            ctx.dispatch_decision.is_some(),
+            "slot-aware helper should attach a runtime DispatchDecision when DB is available",
+        );
     }
 }
