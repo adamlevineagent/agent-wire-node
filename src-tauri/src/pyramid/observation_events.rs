@@ -118,3 +118,55 @@ pub fn write_observation_event(
     })?;
     Ok(conn.last_insert_rowid())
 }
+
+/// v5 Phase 8-3: emit a `debate_collapsed` observation event.
+///
+/// Deliberately a standalone helper (not inline at a call site) so the
+/// trigger logic can live wherever it makes sense — an annotation handler,
+/// an operator HTTP route, a v6 collapse chain, etc. — without each caller
+/// rewriting the metadata shape.
+///
+/// `reason`: short machine-friendly token (e.g. `"last_position_abandoned"`,
+/// `"operator_collapsed"`, `"steel_man_superseded"`).
+/// `positions_remaining`: integer count at the moment of collapse (0 for
+/// the abandonment case; >0 for an explicit operator collapse that leaves
+/// a winner).
+/// `collapsed_by`: human- or agent-identifier (author, operator id, chain id).
+///
+/// FIXME(v6 debate collapse design): the MVP trigger hasn't been wired yet.
+/// `append_annotation_to_debate_node` only APPENDS positions/red_teams —
+/// it never removes them, so the "positions.is_empty() after append"
+/// trigger is dead code today. A real collapse needs either:
+///   (a) a `debate_collapse` annotation type + vocab entry + handler,
+///   (b) position supersession (annotation supersedes a SteelMan), or
+///   (c) a `starter-debate-collapse` chain the operator or meta-layer
+///       oracle invokes explicitly.
+/// This helper exists so whichever path ships in v6 is a one-line call.
+/// Leaving it dormant here is intentional and loud per feedback_loud_deferrals.
+pub fn emit_debate_collapsed(
+    conn: &Connection,
+    slug: &str,
+    debate_node_id: &str,
+    layer: Option<i64>,
+    reason: &str,
+    positions_remaining: usize,
+    collapsed_by: &str,
+) -> Result<i64> {
+    let metadata = serde_json::json!({
+        "debate_node_id": debate_node_id,
+        "reason": reason,
+        "positions_remaining": positions_remaining,
+        "collapsed_by": collapsed_by,
+    })
+    .to_string();
+    write_observation_event(
+        conn,
+        slug,
+        "chain",
+        "debate_collapsed",
+        None, None, None, None,
+        Some(debate_node_id),
+        layer,
+        Some(&metadata),
+    )
+}
