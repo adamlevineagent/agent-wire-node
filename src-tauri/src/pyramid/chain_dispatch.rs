@@ -143,6 +143,37 @@ pub struct ChainDispatchContext {
     /// `min(step.concurrency, concurrency_cap)`. Local mode sets this to 1
     /// because Ollama processes one request at a time.
     pub concurrency_cap: Option<usize>,
+    /// Post-build accretion v5 Phase 6b: handle to the full `PyramidState`
+    /// so mechanical primitives can recurse into the starter-chain runner.
+    /// `call_starter_chain` is the first consumer — it re-invokes
+    /// `chain_executor::execute_chain_for_target` with a library chain
+    /// (e.g. `starter-evidence-tester`, `starter-reconciler`) so Phase 7
+    /// consumers like `debate_steward` / `meta_layer_oracle` can delegate
+    /// weighing evidence / merging positions to focused library chains.
+    ///
+    /// `None` on every dispatch path OTHER than the starter runner. The
+    /// full chain executor, IR executor, and dead-letter retry do not
+    /// invoke library chains. `call_starter_chain` raises loudly when
+    /// this field is `None` — see `feedback_loud_deferrals`.
+    pub state: Option<Arc<super::PyramidState>>,
+    /// Post-build accretion v5 Phase 6b: chains directory override. When
+    /// present, sub-chain invocation resolves `starter-*.yaml` via
+    /// `chain_loader::load_chain_by_id(chain_id, chains_dir)`. In practice
+    /// this always duplicates `ctx.state.as_ref().unwrap().chains_dir`,
+    /// but threading it explicitly keeps the dispatch-time call site one
+    /// hop away from the read.
+    pub chains_dir: Option<std::path::PathBuf>,
+    /// Post-build accretion v5 Phase 6b: the `target_id` that the starter
+    /// runner was invoked with. Sub-chain calls inherit this by default so
+    /// chain body steps that depend on `target_node_id` (e.g.,
+    /// `queue_re_distill_for_target`) keep working across the recursion.
+    pub target_id: Option<String>,
+    /// Post-build accretion v5 Phase 6b: current sub-chain nesting depth
+    /// as observed at THIS dispatch context. The runner increments this
+    /// by one when invoking a sub-chain, and the depth-guard in
+    /// `call_starter_chain` short-circuits at `MAX_SUB_CHAIN_DEPTH`.
+    /// `None` at the top level is treated as depth `0`.
+    pub sub_chain_depth: Option<usize>,
 }
 
 impl CacheDispatchBase {
@@ -564,11 +595,16 @@ fn short_model_name(model: &str) -> &str {
 
 /// Known mechanical function names for the v1 registry.
 ///
-/// Post-build accretion v5 Phase 5 adds three v5 targets (last three) used by
+/// Post-build accretion v5 Phase 5 adds three v5 targets used by
 /// the starter chains that back role_bound dispatches (cascade handlers, the
 /// meta-layer oracle, etc.). These are invoked from
 /// `chain_executor::execute_chain_for_target` via `dispatch_step` /
 /// `dispatch_mechanical`.
+///
+/// Post-build accretion v5 Phase 6b adds `call_starter_chain` — a sub-chain
+/// invocation primitive. Phase 7 consumers (debate_steward, meta-layer
+/// oracle, synthesizer) will author chains that call the library chains
+/// `starter-evidence-tester` and `starter-reconciler` through this primitive.
 const MECHANICAL_FUNCTIONS: &[&str] = &[
     "extract_import_graph",
     "extract_mechanical_metadata",
@@ -578,7 +614,25 @@ const MECHANICAL_FUNCTIONS: &[&str] = &[
     "emit_cascade_handler_invoked",
     "queue_re_distill_for_target",
     "log_and_complete",
+    // Post-build accretion v5 Phase 6b — sub-chain invocation primitive.
+    "call_starter_chain",
 ];
+
+/// Post-build accretion v5 Phase 6b: hard ceiling on sub-chain recursion.
+///
+/// `call_starter_chain` lets one chain invoke another by id. Without a depth
+/// guard a cyclic chain graph (chain_A calls chain_B which calls chain_A)
+/// would recurse indefinitely. The guard is checked *before* the nested
+/// `execute_chain_for_target` invocation and raises loudly when the
+/// current `sub_chain_depth` reaches this ceiling.
+///
+/// This is a constraint on CHAIN BEHAVIOR (recursion depth of the orchestrator),
+/// NOT a constraint on LLM output — `feedback_pillar37_no_hedging` specifically
+/// exempts such mechanical guards. 5 is deep enough for any realistic
+/// evidence-tester→reconciler→synthesizer nesting the Phase 7 consumers
+/// would author, and shallow enough to surface a cycle long before it eats
+/// the stack.
+pub const MAX_SUB_CHAIN_DEPTH: usize = 5;
 
 /// Dispatch a mechanical step to a named Rust function.
 ///
@@ -786,6 +840,158 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 ctx.slug, summary
             );
             Ok(input.clone())
+        }
+        // ── Post-build accretion v5 Phase 6b: sub-chain invocation ──────────
+        //
+        // Lets a parent chain call a library chain by id. Phase 7's
+        // debate_steward / meta_layer_oracle / synthesizer chains drive the
+        // post-build accretion judgement flow by wiring the two library
+        // chains `starter-evidence-tester` and `starter-reconciler` into
+        // their step graphs through `call_starter_chain` steps.
+        //
+        // Expected input envelope:
+        //
+        //     {
+        //       "chain_id": "starter-evidence-tester",
+        //       "input": { /* sub-chain's input object */ }
+        //     }
+        //
+        // Optional fields carried inside `input.input`:
+        //     - `_sub_chain_depth: usize` — recursion counter; absent → 0.
+        //
+        // Raises loudly (see `feedback_loud_deferrals`) when:
+        //     - `chain_id` is missing / non-string.
+        //     - `ctx.state` is None (the dispatch path wasn't created by the
+        //       starter runner — library chains are only callable from there).
+        //     - `MAX_SUB_CHAIN_DEPTH` would be reached or exceeded by the
+        //       nested call (cycle detected).
+        //     - `chain_loader::load_chain_by_id` returns an error (unknown
+        //       chain id OR ambiguity).
+        //     - The nested `execute_chain_for_target` call errors — the error
+        //       is propagated with a context prefix naming the chain.
+        "call_starter_chain" => {
+            let sub_chain_id = input
+                .get("chain_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "call_starter_chain: input missing required string field \
+                     `chain_id` (e.g. \"starter-evidence-tester\")"
+                ))?
+                .to_string();
+
+            // Pull the sub-chain's input envelope. `input.input` is what
+            // will be threaded to the library chain's first step; default
+            // to `{}` when unset (some library chains tolerate empty input).
+            let mut sub_input = input
+                .get("input")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+
+            // Depth guard: read `_sub_chain_depth` from the nested input if
+            // the caller already set one, otherwise from the dispatch ctx.
+            // The higher wins so a chain cannot reset the counter.
+            let ctx_depth = ctx.sub_chain_depth.unwrap_or(0);
+            let input_depth = sub_input
+                .get("_sub_chain_depth")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(0);
+            let current_depth = std::cmp::max(ctx_depth, input_depth);
+
+            if current_depth >= MAX_SUB_CHAIN_DEPTH {
+                return Err(anyhow!(
+                    "call_starter_chain: sub-chain recursion depth {} reached \
+                     MAX_SUB_CHAIN_DEPTH={} while invoking '{}' — probable chain cycle. \
+                     Document the intended parent/child chain graph; break the cycle \
+                     at the chain-authorship level.",
+                    current_depth, MAX_SUB_CHAIN_DEPTH, sub_chain_id,
+                ));
+            }
+
+            // ctx.state is threaded in only by the starter runner. The IR
+            // executor, legacy full executor, and dead-letter retry all set
+            // ctx.state = None — library-chain invocation is only available
+            // from the starter runner. feedback_loud_deferrals: raise
+            // instead of silently dropping.
+            let sub_state = ctx.state.as_ref().ok_or_else(|| anyhow!(
+                "call_starter_chain: no PyramidState wired into the dispatch \
+                 context — library-chain invocation is only available under \
+                 `chain_executor::execute_chain_for_target`. Cannot invoke \
+                 sub-chain '{}' from this dispatch path.",
+                sub_chain_id,
+            ))?;
+            let chains_dir = ctx.chains_dir.as_ref().cloned().unwrap_or_else(|| {
+                sub_state.chains_dir.clone()
+            });
+
+            // Load the sub-chain via chain_loader::load_chain_by_id so the
+            // same discovery semantics (defaults/ + defaults/starter/ +
+            // variants/ + ambiguity detection) apply at sub-chain entry.
+            let sub_chain = super::chain_loader::load_chain_by_id(
+                &sub_chain_id,
+                chains_dir.as_path(),
+            )
+            .map_err(|e| anyhow!(
+                "call_starter_chain: failed to load sub-chain '{}': {}",
+                sub_chain_id, e,
+            ))?;
+
+            // Stamp the incremented depth on the sub-input so nested
+            // `call_starter_chain` steps see a monotonic counter even when
+            // the dispatch ctx doesn't get rebuilt in between.
+            let new_depth = current_depth + 1;
+            if let Value::Object(ref mut map) = sub_input {
+                map.insert(
+                    "_sub_chain_depth".to_string(),
+                    Value::from(new_depth as u64),
+                );
+                // Carry forward the parent's target_node_id / target_id
+                // context if the parent had one and the sub-input doesn't
+                // already override it.
+                if let Some(ref tid) = ctx.target_id {
+                    map.entry("target_node_id".to_string())
+                        .or_insert_with(|| Value::String(tid.clone()));
+                }
+            }
+
+            info!(
+                "[mechanical] call_starter_chain slug={} sub_chain_id={} depth={}→{}",
+                ctx.slug, sub_chain_id, current_depth, new_depth,
+            );
+
+            // Recurse into the starter runner. The nested call builds a
+            // fresh ChainDispatchContext internally from `sub_state`, so the
+            // Arc is shared but no state mutation escapes the sub-chain.
+            //
+            // Box::pin is required by E0733: `dispatch_step → dispatch_mechanical
+            // → call_starter_chain → execute_chain_for_target → dispatch_step`
+            // is a recursive async-fn cycle, and Rust needs the returned future
+            // to be heap-allocated so the compiler can resolve its size. The
+            // depth guard above bounds the recursion so boxing cost is O(1)
+            // per level (max MAX_SUB_CHAIN_DEPTH boxes on the stack).
+            let sub_state_clone = sub_state.clone();
+            let slug_clone = ctx.slug.clone();
+            let target_id_clone = ctx.target_id.clone();
+            let sub_chain_id_for_err = sub_chain_id.clone();
+            let sub_output = Box::pin(async move {
+                super::chain_executor::execute_chain_for_target(
+                    &sub_state_clone,
+                    &sub_chain,
+                    &slug_clone,
+                    target_id_clone.as_deref(),
+                    sub_input,
+                )
+                .await
+            })
+            .await
+            .map_err(|e| anyhow!(
+                "call_starter_chain: sub-chain '{}' failed: {}",
+                sub_chain_id_for_err, e,
+            ))?;
+
+            // The parent chain sees the sub-chain's final output verbatim —
+            // threading behavior is the same as any other mechanical step.
+            Ok(sub_output)
         }
         unknown => Err(anyhow!("Unknown mechanical function: {}", unknown)),
     }
@@ -1790,6 +1996,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let result = dispatch_mechanical("nonexistent", &serde_json::json!({}), &ctx).await;
         assert!(result.is_err());
@@ -1811,6 +2021,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let input = serde_json::json!({"files": ["main.rs"]});
         let result = dispatch_mechanical("extract_import_graph", &input, &ctx).await.unwrap();
@@ -2056,6 +2270,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let mut step = ir_step("mech_step", StepOperation::Mechanical);
         step.rust_function = Some("extract_import_graph".into());
@@ -2078,6 +2296,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let step = ir_step("no_fn", StepOperation::Mechanical);
         // rust_function is None
@@ -2101,6 +2323,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let mut step = ir_step("bad_fn", StepOperation::Mechanical);
         step.rust_function = Some("nonexistent_fn".into());
@@ -2124,6 +2350,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let mut step = ir_step("count_step", StepOperation::Transform);
         step.transform = Some(TransformSpec {
@@ -2149,6 +2379,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let mut step = ir_step("coalesce_step", StepOperation::Transform);
         step.transform = Some(TransformSpec {
@@ -2178,6 +2412,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let step = ir_step("bad_transform", StepOperation::Transform);
         // transform is None
@@ -2201,6 +2439,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let step = ir_step("wire_step", StepOperation::Wire);
         let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
@@ -2220,6 +2462,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let step = ir_step("task_step", StepOperation::Task);
         let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
@@ -2239,6 +2485,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let step = ir_step("game_step", StepOperation::Game);
         let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
@@ -2258,6 +2508,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let mut step = ir_step("mech", StepOperation::Mechanical);
         step.rust_function = Some("extract_mechanical_metadata".into());

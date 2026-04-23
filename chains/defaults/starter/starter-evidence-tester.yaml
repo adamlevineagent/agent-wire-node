@@ -1,0 +1,62 @@
+schema_version: 1
+id: starter-evidence-tester
+name: Evidence Tester (v5 library chain)
+description: >
+  Library chain invoked via `call_starter_chain` by Phase 7 consumers like
+  `debate_steward` and `meta_layer_oracle`. Given a claim and a list of
+  evidence references, the LLM produces a single structured judgement
+  `{ supports, strength, reasoning, citations }` so callers can weight
+  claim survival or eviction by a numeric strength score.
+
+  The `verify` primitive is deliberate (vs. `evaluate`): this chain is
+  answering a constrained yes/no-with-calibration question — does the
+  evidence, as given, support the claim — rather than scoring open-ended
+  quality. The structured response_schema enforces the shape; the prompt
+  grounds the `strength` scale so the number is legible across callers.
+
+  Input envelope (supplied by the parent step's `input` block):
+
+      {
+        "claim": "<the claim under test>",
+        "evidence": [
+          {"ref": "<stable id>", "content": "<text>", "source": "<where from>"},
+          ...
+        ]
+      }
+
+  This chain is bound to the `evidence_tester` role via GENESIS_BINDINGS
+  (see pyramid/role_binding.rs). Operators may supersede the binding to
+  route evidence testing through a different chain per slug.
+content_type: code
+version: "1.0.0"
+author: post-build-accretion-v5
+
+defaults:
+  model_tier: mid
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  - name: test_evidence
+    primitive: verify
+    instruction: $prompts/starter/evidence_tester.md
+    model_tier: mid
+    response_schema:
+      type: object
+      additionalProperties: false
+      required: [supports, strength, reasoning, citations]
+      properties:
+        supports:
+          type: boolean
+        strength:
+          type: number
+          minimum: 0
+          maximum: 1
+        reasoning:
+          type: string
+        citations:
+          type: array
+          items:
+            type: string
+
+post_build: []

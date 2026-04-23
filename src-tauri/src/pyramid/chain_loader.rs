@@ -386,6 +386,20 @@ pub fn ensure_default_chains(
             "starter-meta-layer-oracle.yaml",
             include_str!("../../../chains/defaults/starter/starter-meta-layer-oracle.yaml"),
         ),
+        // Post-build accretion v5 Phase 6b: two library chains Phase 7
+        // consumers (debate_steward, meta_layer_oracle, synthesizer)
+        // invoke via `call_starter_chain`. Genesis bindings point the
+        // `evidence_tester` and `reconciler` roles at these IDs; bundling
+        // them keeps release builds from failing to resolve their chain
+        // at sub-chain invocation time.
+        (
+            "starter-evidence-tester.yaml",
+            include_str!("../../../chains/defaults/starter/starter-evidence-tester.yaml"),
+        ),
+        (
+            "starter-reconciler.yaml",
+            include_str!("../../../chains/defaults/starter/starter-reconciler.yaml"),
+        ),
     ];
     for (filename, content) in starter_chains {
         let path = chains_dir.join("defaults").join("starter").join(filename);
@@ -431,6 +445,17 @@ pub fn ensure_default_chains(
         (
             "judge_cascade_relevance.md",
             include_str!("../../../chains/prompts/starter/judge_cascade_relevance.md"),
+        ),
+        // Phase 6b library-chain prompts. Bundled alongside the YAMLs
+        // above so a standalone release can resolve `$prompts/starter/...`
+        // without a source tree.
+        (
+            "evidence_tester.md",
+            include_str!("../../../chains/prompts/starter/evidence_tester.md"),
+        ),
+        (
+            "reconciler.md",
+            include_str!("../../../chains/prompts/starter/reconciler.md"),
         ),
     ];
     for (filename, content) in starter_prompts {

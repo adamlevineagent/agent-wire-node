@@ -3861,6 +3861,11 @@ pub async fn retry_dead_letter_entry(
         // bad outputs that should not be cache-hit on retry.
         cache_base: None,
         concurrency_cap: None, // dead letter retries are single-call
+        // Phase 6b: `call_starter_chain` is not used by dead-letter retries.
+        state: None,
+        chains_dir: None,
+        target_id: None,
+        sub_chain_depth: None,
     };
 
     match chain_dispatch::dispatch_step(
@@ -4147,6 +4152,12 @@ pub async fn execute_chain_from(
         }),
         cache_base,
         concurrency_cap,
+        // Phase 6b: `call_starter_chain` not used by the full chain executor
+        // — only the starter runner (`execute_chain_for_target`) wires it.
+        state: None,
+        chains_dir: None,
+        target_id: None,
+        sub_chain_depth: None,
     };
 
     // Set up writer channel + drain task
@@ -11298,6 +11309,13 @@ pub async fn execute_plan(
         }),
         cache_base,
         concurrency_cap,
+        // Phase 6b: `call_starter_chain` not used by the IR executor —
+        // library-chain invocation is only available from the starter
+        // runner (`execute_chain_for_target`).
+        state: None,
+        chains_dir: None,
+        target_id: None,
+        sub_chain_depth: None,
     };
 
     exec_state.send_progress().await;
@@ -13067,7 +13085,7 @@ fn classify_ir_step_path(step: &IrStep) -> IrStepExecutionPath {
 // When the guard is false the step is skipped — threading continues with
 // the prior step's output. When omitted the guard is treated as true.
 pub async fn execute_chain_for_target(
-    state: &PyramidState,
+    state: &Arc<PyramidState>,
     chain: &ChainDefinition,
     slug: &str,
     target_id: Option<&str>,
@@ -13120,6 +13138,15 @@ pub async fn execute_chain_for_target(
         audit: None,
         cache_base: None,
         concurrency_cap: None,
+        // Post-build accretion v5 Phase 6b: wire the state through so
+        // `call_starter_chain` (a mechanical primitive dispatched via
+        // `chain_dispatch`) can recurse back into `execute_chain_for_target`
+        // to invoke library chains (evidence_tester / reconciler) that
+        // Phase 7 consumers like debate_steward call into.
+        state: Some(state.clone()),
+        chains_dir: Some(state.chains_dir.clone()),
+        target_id: target_id.map(|s| s.to_string()),
+        sub_chain_depth: None,
     };
 
     // Thread inputs through each step. `current` is what the next step sees

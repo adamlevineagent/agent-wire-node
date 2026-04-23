@@ -23440,10 +23440,15 @@ mod phase5_post_build_tests {
         PathBuf::from(manifest).parent().unwrap().join("chains")
     }
 
-    fn test_pyramid_state(conn: Connection) -> crate::pyramid::PyramidState {
+    // Phase 6b (post-build accretion v5): `execute_chain_for_target` takes
+    // `&Arc<PyramidState>` so the starter runner can thread the state into
+    // the dispatch context for `call_starter_chain`'s recursion. Test
+    // helpers now return `Arc<PyramidState>` directly so the downstream
+    // `&state` call sites keep working with auto-deref.
+    fn test_pyramid_state(conn: Connection) -> Arc<crate::pyramid::PyramidState> {
         let db = Arc::new(Mutex::new(conn));
         let config = crate::pyramid::llm::LlmConfig::default();
-        crate::pyramid::PyramidState {
+        Arc::new(crate::pyramid::PyramidState {
             reader: db.clone(),
             writer: db,
             config: Arc::new(tokio::sync::RwLock::new(config)),
@@ -23488,7 +23493,7 @@ mod phase5_post_build_tests {
             ),
             ollama_pull_cancel: Arc::new(AtomicBool::new(false)),
             ollama_pull_in_progress: Arc::new(Mutex::new(None)),
-        }
+        })
     }
 
     fn minimal_chain_with_steps(id: &str, steps: Vec<ChainStep>) -> ChainDefinition {
@@ -24176,12 +24181,16 @@ mod phase6_post_build_tests {
     /// Build a default PyramidState that uses `config` as its LlmConfig.
     /// Separate from phase5's test_pyramid_state so we can inject an LLM
     /// config with a mocked provider registry attached.
+    ///
+    /// Phase 6b: returns `Arc<PyramidState>` so the updated
+    /// `execute_chain_for_target(&Arc<PyramidState>, ...)` signature
+    /// works without per-test-site Arc-wrapping.
     fn pyramid_state_with_llm_config(
         conn: Connection,
         config: crate::pyramid::llm::LlmConfig,
-    ) -> crate::pyramid::PyramidState {
+    ) -> Arc<crate::pyramid::PyramidState> {
         let db = Arc::new(Mutex::new(conn));
-        crate::pyramid::PyramidState {
+        Arc::new(crate::pyramid::PyramidState {
             reader: db.clone(),
             writer: db,
             config: Arc::new(tokio::sync::RwLock::new(config)),
@@ -24226,7 +24235,7 @@ mod phase6_post_build_tests {
             ),
             ollama_pull_cancel: Arc::new(AtomicBool::new(false)),
             ollama_pull_in_progress: Arc::new(Mutex::new(None)),
-        }
+        })
     }
 
     /// Wire an LlmConfig that routes every call at a mockito HTTP server.
@@ -24878,6 +24887,601 @@ mod phase6_post_build_tests {
             msg.contains("nope") || msg.contains("template"),
             "error must mention the bad variable or the template failure: {}",
             msg
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Post-build accretion v5 Phase 6b — evidence_tester + reconciler library
+// chains + `call_starter_chain` sub-chain invocation.
+//
+// Phase 6b ships two changes:
+//   1. Two library chains (`starter-evidence-tester`, `starter-reconciler`)
+//      that Phase 7 consumers (debate_steward, meta_layer_oracle,
+//      synthesizer) call via a new mechanical primitive.
+//   2. The primitive itself — `call_starter_chain` — which re-enters
+//      `execute_chain_for_target` with a named chain id + input envelope.
+//
+// The tests here exercise:
+//   - YAML load + structural validity of both library chains.
+//   - `call_starter_chain` round-trips a parent chain → library chain call
+//     with a mocked LLM (structured-output).
+//   - Depth guard fires loudly at MAX_SUB_CHAIN_DEPTH.
+//   - Unknown `chain_id` raises loud with the bad id in the error.
+//   - Unknown-chain AND missing-state arms share the loud-deferral policy.
+//   - Tier 2 bootstrap installs the two new YAMLs + two new prompts.
+//
+// LLM mocking: inherits the pattern phase6_post_build_tests established —
+// `pyramid_state_with_llm_config` + `mocked_llm_config(server.url())`, a
+// mockito server returning a canned JSON response body. No change to the
+// pattern; we just reuse its helpers. Phase 7 consumers that author
+// parent chains with `call_starter_chain` steps can reuse the same mock
+// setup with zero scaffolding changes.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod phase6b_post_build_tests {
+    use super::*;
+    use crate::pyramid::chain_engine::{ChainDefaults, ChainDefinition, ChainStep};
+    use crate::pyramid::types::ContentType;
+    use crate::pyramid::{chain_dispatch, chain_executor, chain_loader};
+    use rusqlite::Connection;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+
+    // Small helpers mirror phase6_post_build_tests so the two modules share
+    // zero live dependency — test modules are compiled separately and
+    // `super::phase6_post_build_tests` items are private to that module.
+
+    fn chains_dir_path() -> PathBuf {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        PathBuf::from(manifest).parent().unwrap().join("chains")
+    }
+
+    fn pyramid_state_with_llm_config(
+        conn: Connection,
+        config: crate::pyramid::llm::LlmConfig,
+    ) -> Arc<crate::pyramid::PyramidState> {
+        let db = Arc::new(Mutex::new(conn));
+        Arc::new(crate::pyramid::PyramidState {
+            reader: db.clone(),
+            writer: db,
+            config: Arc::new(tokio::sync::RwLock::new(config)),
+            active_build: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            data_dir: None,
+            stale_engines: Arc::new(Mutex::new(HashMap::new())),
+            file_watchers: Arc::new(Mutex::new(HashMap::new())),
+            vine_builds: Arc::new(Mutex::new(HashMap::new())),
+            use_chain_engine: AtomicBool::new(false),
+            use_ir_executor: AtomicBool::new(true),
+            event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
+            operational: Arc::new(crate::pyramid::OperationalConfig::default()),
+            chains_dir: chains_dir_path(),
+            remote_query_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            absorption_gate: Arc::new(Mutex::new(crate::pyramid::AbsorptionGate::new())),
+            build_event_bus: Arc::new(crate::pyramid::event_bus::BuildEventBus::new()),
+            supabase_url: None,
+            supabase_anon_key: None,
+            csrf_secret: [0u8; 32],
+            dadbear_handle: Arc::new(Mutex::new(None)),
+            dadbear_supervisor_handle: Arc::new(Mutex::new(None)),
+            dadbear_in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            provider_registry: {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                Arc::new(crate::pyramid::provider::ProviderRegistry::new(store))
+            },
+            credential_store: {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                store
+            },
+            schema_registry: Arc::new(crate::pyramid::schema_registry::SchemaRegistry::new()),
+            cross_pyramid_router: Arc::new(
+                crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
+            ),
+            ollama_pull_cancel: Arc::new(AtomicBool::new(false)),
+            ollama_pull_in_progress: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Wire an LlmConfig that routes every call at a mockito HTTP server.
+    /// Same shape as phase6's `mocked_llm_config` — inherited verbatim so
+    /// library-chain call_sites test with identical provider wiring.
+    async fn mocked_llm_config(base_url: String) -> crate::pyramid::llm::LlmConfig {
+        use crate::pyramid::credentials::CredentialStore;
+        use crate::pyramid::dispatch_policy::{
+            BuildCoordinationConfig, DispatchPolicy, EscalationConfig, MatchConfig,
+            ProviderPoolConfig, RouteEntry, RoutingRule,
+        };
+        use crate::pyramid::provider::{Provider, ProviderRegistry, ProviderType};
+
+        let cred_tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(CredentialStore::load(cred_tmp.path()).unwrap());
+        store.set("P6B_KEY", "sk-or-test-p6b").unwrap();
+        std::mem::forget(cred_tmp);
+
+        let reg_conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_pyramid_db(&reg_conn).unwrap();
+        let registry = Arc::new(ProviderRegistry::new(store));
+        registry
+            .save_provider(
+                &reg_conn,
+                Provider {
+                    id: "openrouter".into(),
+                    display_name: "OpenRouter (phase6b mock)".into(),
+                    provider_type: ProviderType::Openrouter,
+                    base_url,
+                    api_key_ref: Some("P6B_KEY".into()),
+                    auto_detect_context: false,
+                    supports_broadcast: false,
+                    broadcast_config_json: None,
+                    config_json: "{}".into(),
+                    enabled: true,
+                },
+            )
+            .unwrap();
+
+        let mut pool_configs = std::collections::BTreeMap::new();
+        pool_configs.insert(
+            "openrouter".into(),
+            ProviderPoolConfig {
+                concurrency: 1,
+                rate_limit: None,
+            },
+        );
+        let policy = Arc::new(DispatchPolicy {
+            rules: vec![RoutingRule {
+                name: "phase6b_mock".into(),
+                match_config: MatchConfig {
+                    work_type: None,
+                    min_depth: None,
+                    step_pattern: None,
+                },
+                route_to: vec![RouteEntry {
+                    provider_id: "openrouter".into(),
+                    model_id: Some("openai/gpt-4o-mini".into()),
+                    tier_name: None,
+                    is_local: false,
+                    max_budget_credits: None,
+                }],
+                bypass_pool: false,
+                sequential: false,
+            }],
+            escalation: EscalationConfig::default(),
+            build_coordination: BuildCoordinationConfig::default(),
+            pool_configs,
+            max_batch_cost_usd: None,
+            max_daily_cost_usd: None,
+        });
+        let pools = Arc::new(
+            crate::pyramid::provider_pools::ProviderPools::new(policy.as_ref()),
+        );
+
+        crate::pyramid::llm::LlmConfig {
+            api_key: "sk-or-test-p6b".into(),
+            auth_token: String::new(),
+            primary_model: "openai/gpt-4o-mini".into(),
+            fallback_model_1: "openai/gpt-4o-mini".into(),
+            fallback_model_2: "openai/gpt-4o-mini".into(),
+            provider_registry: Some(registry),
+            dispatch_policy: Some(policy),
+            provider_pools: Some(pools),
+            max_retries: 1,
+            retry_base_sleep_secs: 0,
+            ..Default::default()
+        }
+    }
+
+    fn openrouter_body(content: &str) -> String {
+        let escaped = serde_json::to_string(content).unwrap();
+        format!(
+            r#"{{
+                "id":"resp-p6b",
+                "model":"openai/gpt-4o-mini",
+                "choices":[{{
+                    "index":0,
+                    "message":{{"role":"assistant","content":{escaped}}},
+                    "finish_reason":"stop"
+                }}],
+                "usage":{{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}
+            }}"#
+        )
+    }
+
+    fn minimal_chain_with_steps(id: &str, steps: Vec<ChainStep>) -> ChainDefinition {
+        ChainDefinition {
+            schema_version: 1,
+            id: id.to_string(),
+            name: format!("Test {}", id),
+            description: "Phase 6b test chain".to_string(),
+            content_type: "code".to_string(),
+            version: "0.0.1".to_string(),
+            author: "phase6b-test".to_string(),
+            defaults: ChainDefaults {
+                model_tier: "mid".to_string(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".to_string(),
+            },
+            steps,
+            post_build: vec![],
+            audience: Default::default(),
+        }
+    }
+
+    // ── 6b-F.1: starter-evidence-tester YAML loads and is structurally valid ────
+
+    #[test]
+    fn starter_evidence_tester_loads_and_structurally_valid() {
+        let chains_dir = chains_dir_path();
+        let chain = chain_loader::load_chain_by_id(
+            "starter-evidence-tester",
+            &chains_dir,
+        )
+        .expect("starter-evidence-tester must load");
+        assert_eq!(chain.id, "starter-evidence-tester");
+        assert_eq!(chain.steps.len(), 1, "evidence_tester is a single-step chain");
+        assert_eq!(chain.steps[0].primitive, "verify",
+            "evidence_tester uses the `verify` primitive — it's answering a \
+             calibrated yes/no-with-strength question, not free-form evaluation");
+        assert!(!chain.steps[0].mechanical);
+        let instr = chain.steps[0]
+            .instruction
+            .as_deref()
+            .expect("evidence_tester step must carry a resolved instruction body");
+        assert!(
+            !instr.starts_with("$prompts/"),
+            "chain_loader must resolve the $prompts/starter/evidence_tester.md ref"
+        );
+        assert!(
+            instr.contains("Evidence Tester"),
+            "resolved instruction must be the evidence_tester.md body"
+        );
+        let schema = chain.steps[0]
+            .response_schema
+            .as_ref()
+            .expect("evidence_tester must define a response_schema");
+        for field in ["supports", "strength", "reasoning", "citations"] {
+            assert!(
+                schema["properties"][field].is_object(),
+                "schema must define property `{}`: got {}",
+                field, schema,
+            );
+        }
+        let required = schema["required"].as_array().unwrap();
+        for field in ["supports", "strength", "reasoning", "citations"] {
+            assert!(
+                required.contains(&serde_json::json!(field)),
+                "schema must require field `{}`", field
+            );
+        }
+    }
+
+    // ── 6b-F.2: starter-reconciler YAML loads and is structurally valid ─────────
+
+    #[test]
+    fn starter_reconciler_loads_and_structurally_valid() {
+        let chains_dir = chains_dir_path();
+        let chain = chain_loader::load_chain_by_id(
+            "starter-reconciler",
+            &chains_dir,
+        )
+        .expect("starter-reconciler must load");
+        assert_eq!(chain.id, "starter-reconciler");
+        assert_eq!(chain.steps.len(), 1, "reconciler is a single-step chain");
+        assert_eq!(chain.steps[0].primitive, "fuse",
+            "reconciler uses the `fuse` primitive — fuse says `merge these inputs \
+             into outputs that preserve provenance`; synthesize would mean \
+             `produce a new thing`, which is not what the reconciler does");
+        assert!(!chain.steps[0].mechanical);
+        let instr = chain.steps[0]
+            .instruction
+            .as_deref()
+            .expect("reconciler step must carry a resolved instruction body");
+        assert!(
+            !instr.starts_with("$prompts/"),
+            "chain_loader must resolve the $prompts/starter/reconciler.md ref"
+        );
+        assert!(
+            instr.contains("Reconciler"),
+            "resolved instruction must be the reconciler.md body"
+        );
+        let schema = chain.steps[0]
+            .response_schema
+            .as_ref()
+            .expect("reconciler must define a response_schema");
+        for field in ["merged_positions", "unmerged_positions", "reasoning"] {
+            assert!(
+                schema["properties"][field].is_object(),
+                "schema must define property `{}`: got {}",
+                field, schema,
+            );
+        }
+        // merged_positions items must require merged_from + evidence_refs
+        // so downstream consumers can rewire provenance.
+        let merged_items_required = &schema["properties"]["merged_positions"]["items"]["required"];
+        let required_arr = merged_items_required.as_array()
+            .expect("merged_positions.items.required must be an array");
+        for field in ["label", "content", "merged_from", "evidence_refs"] {
+            assert!(
+                required_arr.contains(&serde_json::json!(field)),
+                "merged_positions items must require `{}` (provenance preservation): {:?}",
+                field, required_arr,
+            );
+        }
+    }
+
+    // ── 6b-F.3: call_starter_chain dispatches a sub-chain end-to-end ────────────
+
+    #[tokio::test]
+    async fn call_starter_chain_dispatches_sub_chain_mock_llm() {
+        // The parent chain has a single mechanical step that invokes
+        // starter-evidence-tester via call_starter_chain. The sub-chain's
+        // one LLM step hits the mocked OpenRouter endpoint. Final output
+        // of the parent chain is the sub-chain's parsed LLM JSON.
+        let mut server = mockito::Server::new_async().await;
+        let mock_content = r#"{
+            "supports": true,
+            "strength": 0.85,
+            "reasoning": "evidence item ev-1 directly supports the claim",
+            "citations": ["ev-1"]
+        }"#;
+        let _m = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openrouter_body(mock_content))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p6b_sub", &ContentType::Code, "/tmp/p6b_sub").unwrap();
+        let config = mocked_llm_config(server.url()).await;
+        let state = pyramid_state_with_llm_config(conn, config);
+
+        // Parent chain: one mechanical step, `call_starter_chain` invoking
+        // starter-evidence-tester with a synthetic claim + evidence input.
+        // step.input is the envelope expected by the dispatch arm.
+        let parent_step = ChainStep {
+            name: "invoke_evidence_tester".into(),
+            primitive: "custom".into(),
+            mechanical: true,
+            rust_function: Some("call_starter_chain".into()),
+            input: Some(serde_json::json!({
+                "chain_id": "starter-evidence-tester",
+                "input": {
+                    "claim": "The pyramid supports annotation-typed contributions.",
+                    "evidence": [
+                        {"ref": "ev-1", "content": "Docs show typed contributions.", "source": "docs"}
+                    ]
+                }
+            })),
+            ..Default::default()
+        };
+        let chain = minimal_chain_with_steps("test-call-subchain", vec![parent_step]);
+
+        let out = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p6b_sub",
+            Some("L1-SUB"),
+            serde_json::json!({}),
+        )
+        .await
+        .expect("parent chain with call_starter_chain must run end-to-end");
+
+        // Parent's final output is the sub-chain's parsed LLM JSON.
+        assert_eq!(out["supports"], serde_json::json!(true));
+        assert_eq!(out["strength"], serde_json::json!(0.85));
+        assert_eq!(
+            out["citations"],
+            serde_json::json!(["ev-1"]),
+            "sub-chain's LLM output must thread as parent's final value: {out}"
+        );
+    }
+
+    // ── 6b-F.4: depth guard fires loudly at MAX_SUB_CHAIN_DEPTH ─────────────────
+
+    #[tokio::test]
+    async fn call_starter_chain_depth_guard_fires_at_max_depth() {
+        // Invoke call_starter_chain with `_sub_chain_depth` already at
+        // MAX_SUB_CHAIN_DEPTH-1. The arm increments to MAX before invoking
+        // the sub-chain, so it must raise loud before loading any chain.
+        // We use a non-existent chain id so that a missed guard would
+        // surface as a different error — proving the guard fired, not the
+        // loader.
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p6b_dg", &ContentType::Code, "/tmp/p6b_dg").unwrap();
+        let state = pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        let parent_step = ChainStep {
+            name: "would_recurse_too_deep".into(),
+            primitive: "custom".into(),
+            mechanical: true,
+            rust_function: Some("call_starter_chain".into()),
+            input: Some(serde_json::json!({
+                "chain_id": "starter-evidence-tester",
+                "input": {
+                    "_sub_chain_depth": chain_dispatch::MAX_SUB_CHAIN_DEPTH,
+                    "claim": "x",
+                    "evidence": []
+                }
+            })),
+            ..Default::default()
+        };
+        let chain = minimal_chain_with_steps("test-depth-guard", vec![parent_step]);
+
+        let err = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p6b_dg",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("depth guard must fire loudly at MAX_SUB_CHAIN_DEPTH");
+
+        let msg = err.to_string() + " " + &err.root_cause().to_string();
+        assert!(
+            msg.to_lowercase().contains("depth")
+                || msg.contains("MAX_SUB_CHAIN_DEPTH")
+                || msg.contains("recursion"),
+            "depth-guard error must mention depth / MAX_SUB_CHAIN_DEPTH / recursion: {}",
+            msg,
+        );
+    }
+
+    // ── 6b-F.5: unknown chain_id raises loud with the bad id in the error ──────
+
+    #[tokio::test]
+    async fn call_starter_chain_raises_on_unknown_chain_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p6b_unk", &ContentType::Code, "/tmp/p6b_unk").unwrap();
+        let state = pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        let parent_step = ChainStep {
+            name: "call_nothing".into(),
+            primitive: "custom".into(),
+            mechanical: true,
+            rust_function: Some("call_starter_chain".into()),
+            input: Some(serde_json::json!({
+                "chain_id": "definitely-not-a-chain-that-exists",
+                "input": {}
+            })),
+            ..Default::default()
+        };
+        let chain = minimal_chain_with_steps("test-unknown-sub", vec![parent_step]);
+
+        let err = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p6b_unk",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("unknown chain_id must raise loud");
+
+        let msg = err.to_string() + " " + &err.root_cause().to_string();
+        assert!(
+            msg.contains("definitely-not-a-chain-that-exists"),
+            "error must name the missing chain id: {}", msg,
+        );
+        assert!(
+            msg.to_lowercase().contains("not found")
+                || msg.to_lowercase().contains("failed to load"),
+            "error must describe the load failure, not a silent drop: {}", msg,
+        );
+    }
+
+    // ── 6b-F.6: Tier 2 bootstrap installs both library chains + both prompts ───
+
+    #[test]
+    fn tier2_bootstrap_installs_evidence_tester_and_reconciler() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chains_dir = tmp.path();
+        // No source_chains_dir → forces Tier 2 embedded bootstrap.
+        chain_loader::ensure_default_chains(chains_dir, None)
+            .expect("Tier 2 bootstrap must succeed");
+
+        // Both YAMLs must be loadable by id.
+        for id in ["starter-evidence-tester", "starter-reconciler"] {
+            let loaded = chain_loader::load_chain_by_id(id, chains_dir).unwrap_or_else(|e| {
+                panic!(
+                    "library chain '{id}' must be bootstrapped in Tier 2 so \
+                     `call_starter_chain` resolves on a standalone release: {e}"
+                )
+            });
+            assert_eq!(loaded.id, id);
+            assert_eq!(
+                loaded.steps.len(),
+                1,
+                "{id} is a single-step library chain"
+            );
+        }
+
+        // Both prompt files must exist on disk.
+        for prompt in ["evidence_tester.md", "reconciler.md"] {
+            let path = chains_dir.join("prompts").join("starter").join(prompt);
+            assert!(
+                path.exists(),
+                "library-chain prompt '{prompt}' must be written to disk by \
+                 Tier 2 bootstrap at {}", path.display(),
+            );
+            // Not empty (trivial regression guard).
+            let body = std::fs::read_to_string(&path).unwrap();
+            assert!(!body.trim().is_empty(), "{prompt} must not be empty");
+        }
+    }
+
+    // ── Supplementary: call_starter_chain missing chain_id raises loud ──────────
+
+    #[tokio::test]
+    async fn call_starter_chain_raises_on_missing_chain_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p6b_noid", &ContentType::Code, "/tmp/p6b_noid").unwrap();
+        let state = pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        let parent_step = ChainStep {
+            name: "no_chain_id".into(),
+            primitive: "custom".into(),
+            mechanical: true,
+            rust_function: Some("call_starter_chain".into()),
+            // Missing chain_id.
+            input: Some(serde_json::json!({"input": {}})),
+            ..Default::default()
+        };
+        let chain = minimal_chain_with_steps("test-missing-chain-id", vec![parent_step]);
+
+        let err = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p6b_noid",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("missing chain_id must raise loud");
+
+        let msg = err.to_string() + " " + &err.root_cause().to_string();
+        assert!(
+            msg.contains("chain_id"),
+            "error must name the missing `chain_id` field: {}", msg,
+        );
+    }
+
+    // ── Supplementary: MECHANICAL_FUNCTIONS registry includes call_starter_chain ─
+
+    #[test]
+    fn call_starter_chain_is_registered() {
+        assert!(
+            chain_dispatch::is_known_mechanical_function("call_starter_chain"),
+            "call_starter_chain must be in MECHANICAL_FUNCTIONS so validators \
+             accept chains that use it"
         );
     }
 }
