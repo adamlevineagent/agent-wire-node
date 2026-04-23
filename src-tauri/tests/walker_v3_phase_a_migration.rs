@@ -26,7 +26,9 @@
 use rusqlite::Connection;
 use tempfile::TempDir;
 
-use wire_node_lib::pyramid::v3_migration::{run_v3_phase_a_migration, V3MigrationError};
+use wire_node_lib::pyramid::v3_migration::{
+    run_v3_phase_a_migration, run_v3_phase_b_migration, V3MigrationError,
+};
 use wire_node_lib::pyramid::walker_resolver::{
     build_scope_cache, resolve_context_limit, resolve_model_list, ProviderType,
 };
@@ -332,4 +334,167 @@ fn phase_a_migration_hard_fails_on_unknown_provider_id() {
         )
         .unwrap();
     assert_eq!(walker_count, 0, "no walker_provider_* rows on rollback");
+}
+
+// ── Phase A + Phase B end-to-end ────────────────────────────────────
+
+/// Drives the full two-phase migration against a test DB seeded with:
+///   * legacy `pyramid_tier_routing` rows across openrouter + local + market
+///   * active `dispatch_policy` contribution with `routing_rules.route_to`
+///   * `pyramid_config.json` on disk containing the legacy model fields
+///   * `migration_marker` body = `v2`
+///
+/// Asserts the final state after Phase A → Phase B:
+///   (a) walker_provider_openrouter body carries the migrated routing
+///       data AND the folded primary/fallback chain from the JSON.
+///   (b) pyramid_config.json has the legacy keys stripped and other
+///       keys preserved verbatim.
+///   (c) migration_marker body is `"v3"` and exactly one active row.
+///   (d) Both snapshots (`_pre_v3_snapshot_pyramid_tier_routing` and
+///       `_pre_v3_snapshot_config`) hold pre-migration state.
+#[test]
+fn phase_a_then_phase_b_end_to_end() {
+    let (_dir, path) = make_integration_db();
+    // TempDir for pyramid_config.json location. Use a second TempDir
+    // rather than reusing `_dir` so the DB and config file are side-by-
+    // side as they would be in production (data_dir holds both).
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let mut conn = Connection::open(&path).unwrap();
+    seed_realistic_legacy_state(&conn);
+
+    // Seed pyramid_config.json on disk with legacy fields + non-legacy
+    // survivors.
+    let original_config = serde_json::json!({
+        "auth_token": "bearer-xyz",
+        "openrouter_api_key": "sk-or-v1-test",
+        "primary_model": "inception/mercury-2",
+        "fallback_model_1": "x-ai/grok-4.20-beta",
+        "fallback_model_2": "moonshotai/kimi-k2.6",
+        "primary_context_limit": 200000,
+        "fallback_1_context_limit": 1000000,
+        "partner_model": "xiaomi/mimo-v2-pro",
+        "operational": {},
+    });
+    let original_bytes = serde_json::to_string_pretty(&original_config).unwrap();
+    std::fs::write(data_dir.path().join("pyramid_config.json"), &original_bytes).unwrap();
+
+    // Phase A.
+    let report_a = run_v3_phase_a_migration(&mut conn, Some(data_dir.path()))
+        .expect("Phase A must succeed");
+    assert_eq!(
+        report_a.marker_transitioned_to,
+        "v3-db-migrated-config-pending"
+    );
+
+    // Phase B.
+    let report_b =
+        run_v3_phase_b_migration(&mut conn, data_dir.path()).expect("Phase B must succeed");
+    assert!(report_b.bytes_before > 0, "Phase B must see the seeded config");
+    assert!(report_b.bytes_after > 0);
+    assert!(
+        report_b.bytes_after < report_b.bytes_before,
+        "stripped config must be smaller (before={}, after={})",
+        report_b.bytes_before,
+        report_b.bytes_after
+    );
+
+    // (a) walker_provider_openrouter body has migrated data AND the
+    // folded primary/fallback chain (via Phase A reading the JSON).
+    let or_body: String = conn
+        .query_row(
+            "SELECT yaml_content FROM pyramid_config_contributions \
+             WHERE schema_type = 'walker_provider_openrouter' AND status = 'active' \
+               AND superseded_by_id IS NULL LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        or_body.contains("inception/mercury-2"),
+        "openrouter body must carry migrated mid slug: {or_body}"
+    );
+    assert!(
+        or_body.contains("x-ai/grok-4.20-beta"),
+        "openrouter body must carry grok slug from routing table: {or_body}"
+    );
+
+    // (b) pyramid_config.json stripped of legacy keys, non-legacy preserved.
+    let rewritten: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(data_dir.path().join("pyramid_config.json")).unwrap(),
+    )
+    .unwrap();
+    for legacy_key in [
+        "primary_model",
+        "fallback_model_1",
+        "fallback_model_2",
+        "primary_context_limit",
+        "fallback_1_context_limit",
+    ] {
+        assert!(
+            rewritten.get(legacy_key).is_none(),
+            "legacy key `{legacy_key}` must be stripped: {rewritten}"
+        );
+    }
+    assert_eq!(
+        rewritten.get("auth_token").and_then(|v| v.as_str()),
+        Some("bearer-xyz")
+    );
+    assert_eq!(
+        rewritten.get("partner_model").and_then(|v| v.as_str()),
+        Some("xiaomi/mimo-v2-pro")
+    );
+
+    // (c) migration_marker body is `v3` and exactly one active row.
+    let active_marker: String = conn
+        .query_row(
+            "SELECT yaml_content FROM pyramid_config_contributions \
+             WHERE schema_type = 'migration_marker' AND status = 'active' \
+               AND superseded_by_id IS NULL LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(active_marker.contains("\"v3\""), "marker: {active_marker}");
+    assert!(
+        !active_marker.contains("v3-db-migrated-config-pending"),
+        "pending body must not remain active: {active_marker}"
+    );
+    let active_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pyramid_config_contributions \
+             WHERE schema_type = 'migration_marker' AND status = 'active' \
+               AND superseded_by_id IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active_count, 1, "exactly one active marker row");
+
+    // (d) Both snapshots populated.
+    let routing_snap_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM _pre_v3_snapshot_pyramid_tier_routing",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(routing_snap_rows, 4, "routing snapshot row count");
+    let config_snap_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM _pre_v3_snapshot_config",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(config_snap_rows, 1, "config snapshot must have one row");
+
+    // Snapshot row carries the pre-rewrite body bytes verbatim.
+    let snap_body: String = conn
+        .query_row(
+            "SELECT body FROM _pre_v3_snapshot_config LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(snap_body, original_bytes);
 }

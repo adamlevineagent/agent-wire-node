@@ -353,3 +353,145 @@ fn phase_0b_scope_cache_populates_from_live_db() {
         "openrouter mid model_list from bundled seed"
     );
 }
+
+/// W4 live-DB smoke: drives the full Phase A + Phase B migration
+/// against a copy of the real pyramid DB + pyramid_config.json. Tests
+/// that:
+///   * the two-phase sequence completes inside 500ms on real data,
+///   * pyramid_config.json ends without the legacy model fields,
+///   * migration_marker ends at body `v3`.
+///
+/// Run with:
+///   PYRAMID_DB=/tmp/walker-v3-smoke-XXXXX/pyramid.db \
+///   PYRAMID_CONFIG_JSON=/tmp/walker-v3-smoke-XXXXX/pyramid_config.json \
+///   cargo test --test walker_v3_smoke_live_db \
+///     phase_b_rewrites_live_config_json -- --nocapture --ignored
+///
+/// NOTE: copy the real files to a tempdir FIRST. This test rewrites
+/// the config file referenced by `PYRAMID_CONFIG_JSON` and mutates
+/// the DB referenced by `PYRAMID_DB` — pointing either at a live file
+/// will corrupt operator state.
+#[test]
+#[ignore]
+fn phase_b_rewrites_live_config_json() {
+    use wire_node_lib::pyramid::v3_migration::{
+        run_v3_phase_a_migration, run_v3_phase_b_migration, should_run_phase_a,
+        should_run_phase_b, V3MigrationError,
+    };
+
+    let db_path = std::env::var("PYRAMID_DB")
+        .expect("set PYRAMID_DB=/tmp/walker-v3-smoke-XXXXX/pyramid.db");
+    let config_path_str = std::env::var("PYRAMID_CONFIG_JSON")
+        .expect("set PYRAMID_CONFIG_JSON=/tmp/walker-v3-smoke-XXXXX/pyramid_config.json");
+    let config_path = std::path::PathBuf::from(&config_path_str);
+    let data_dir = config_path
+        .parent()
+        .expect("PYRAMID_CONFIG_JSON must have a parent dir")
+        .to_path_buf();
+
+    let bytes_before_smoke = std::fs::read_to_string(&config_path)
+        .expect("read seeded pyramid_config.json copy")
+        .len();
+
+    let mut conn = Connection::open(&db_path).expect("open db copy");
+
+    // ── Phase A (if needed) ─────────────────────────────────────────
+    let marker_before_a = should_run_phase_a(&conn).expect("marker probe");
+    let t_a = std::time::Instant::now();
+    let phase_a_ran = match run_v3_phase_a_migration(&mut conn, Some(&data_dir)) {
+        Ok(report) => {
+            println!(
+                "[phase_a] committed; marker {} -> {}; routing_snapshot_rows={}",
+                report.marker_transitioned_from,
+                report.marker_transitioned_to,
+                report.snapshot_rows_dumped
+            );
+            true
+        }
+        Err(V3MigrationError::AlreadyMigrated { body }) => {
+            println!("[phase_a] already migrated (marker body = {body})");
+            false
+        }
+        Err(e) => panic!("Phase A must not hard-fail on smoke copy: {e:?}"),
+    };
+    let dur_a = t_a.elapsed();
+    println!(
+        "[phase_a] took {:?}; marker_before_a = {:?}",
+        dur_a, marker_before_a
+    );
+
+    // ── Phase B ─────────────────────────────────────────────────────
+    let marker_before_b = should_run_phase_b(&conn).expect("marker probe");
+    let t_b = std::time::Instant::now();
+    let phase_b_result = run_v3_phase_b_migration(&mut conn, &data_dir);
+    let dur_b = t_b.elapsed();
+
+    match phase_b_result {
+        Ok(report) => {
+            println!(
+                "[phase_b] committed; bytes_before={} bytes_after={} marker_transition={}",
+                report.bytes_before, report.bytes_after, report.marker_transition
+            );
+            assert!(report.bytes_after > 0, "rewrite must land a non-empty file");
+            assert!(
+                report.bytes_after <= report.bytes_before,
+                "stripped config must not grow"
+            );
+        }
+        Err(wire_node_lib::pyramid::v3_migration::V3PhaseBError::AlreadyMigrated { body }) => {
+            println!("[phase_b] already migrated (marker body = {body})");
+        }
+        Err(other) => panic!("Phase B must not hard-fail on smoke copy: {other:?}"),
+    }
+    println!(
+        "[phase_b] took {:?}; marker_before_b = {:?}; phase_a_ran_this_pass = {}",
+        dur_b, marker_before_b, phase_a_ran
+    );
+
+    // ── Assertions on final on-disk state ──────────────────────────
+    let rewritten: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&config_path).expect("read rewritten config"),
+    )
+    .expect("parse rewritten config");
+    for legacy_key in [
+        "primary_model",
+        "fallback_model_1",
+        "fallback_model_2",
+        "primary_context_limit",
+        "fallback_1_context_limit",
+    ] {
+        assert!(
+            rewritten.get(legacy_key).is_none(),
+            "legacy key `{legacy_key}` must be absent after Phase B"
+        );
+    }
+
+    // Marker is at `v3`.
+    let active_marker: String = conn
+        .query_row(
+            "SELECT yaml_content FROM pyramid_config_contributions \
+             WHERE schema_type = 'migration_marker' AND status = 'active' \
+               AND superseded_by_id IS NULL LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read active marker");
+    assert!(
+        active_marker.contains("\"v3\"")
+            && !active_marker.contains("v3-db-migrated-config-pending"),
+        "marker must be `v3` post-Phase-B: {active_marker}"
+    );
+
+    // Phase A + B cumulative budget: <500ms on the 227MB real DB.
+    // Only enforce when Phase A actually ran (idempotent re-runs
+    // should be well under this).
+    let cumulative = dur_a + dur_b;
+    println!(
+        "[smoke] phase_a + phase_b cumulative = {:?}; bytes_before_smoke = {}",
+        cumulative, bytes_before_smoke
+    );
+    assert!(
+        cumulative < Duration::from_millis(500),
+        "Phase A + B must complete in <500ms on real DB (got {cumulative:?})"
+    );
+}

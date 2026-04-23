@@ -80,6 +80,23 @@ fn make_test_db() -> (TempDir, String) {
         "#,
     )
     .expect("create pyramid_config_contributions");
+
+    // Seed an active `migration_marker` at body `v3` so the v3
+    // migration (Phase A + Phase B) short-circuits as `AlreadyMigrated`
+    // and the boot coordinator does NOT touch `default_data_dir()` (the
+    // user's real `pyramid_config.json`). W5 walker-cache boot tests
+    // are about the coordinator, not migration — migration has its own
+    // dedicated integration test under `walker_v3_phase_a_migration.rs`.
+    let marker_id = uuid::Uuid::new_v4().to_string();
+    let marker_yaml = "schema_type: migration_marker\nbody: \"v3\"\n";
+    conn.execute(
+        "INSERT INTO pyramid_config_contributions \
+           (contribution_id, schema_type, yaml_content, status, source) \
+         VALUES (?1, 'migration_marker', ?2, 'active', 'migration')",
+        rusqlite::params![marker_id, marker_yaml],
+    )
+    .expect("seed v3 migration_marker");
+
     let path_str = path.to_string_lossy().to_string();
     (dir, path_str)
 }

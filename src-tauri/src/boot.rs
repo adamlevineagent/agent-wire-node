@@ -32,7 +32,9 @@ use tokio::task::JoinHandle;
 
 use crate::app_mode::{transition_to, AppMode};
 use crate::pyramid::event_bus::{BuildEventBus, TaggedKind};
-use crate::pyramid::v3_migration::{self, V3MigrationError, V3MigrationReport};
+use crate::pyramid::v3_migration::{
+    self, V3MigrationError, V3MigrationReport, V3PhaseBError, V3PhaseBReport,
+};
 use crate::pyramid::walker_cache::{
     spawn_scope_cache_reloader, AppModeTransition, RebuildTrigger, ScopeCache,
 };
@@ -364,6 +366,87 @@ pub async fn run_walker_cache_boot(
                     event = "boot_aborted",
                     step = 4,
                     name = "migration_phase",
+                    error = %join_err,
+                    "{}", msg
+                );
+                return BootResult::Aborted(msg);
+            }
+        }
+    }
+
+    // Step 4.5: Phase B — rewrite pyramid_config.json + supersede
+    // marker `v3-db-migrated-config-pending` → `v3`. Runs after Phase A
+    // commits and before the final cache rebuild.
+    //
+    // Idempotent: when the active marker is already `v3`, Phase B
+    // returns `AlreadyMigrated` and we log at debug. `PhaseANotRun` is
+    // warn-only (shouldn't happen in production; Phase A runs above).
+    // Any other error aborts boot with `v3_phase_b_failed` — the temp
+    // file (`pyramid_config.json.walker_v3_tmp`) stays on disk for
+    // forensics; next boot retries from the marker's pending state.
+    {
+        let db_probe = db_path.clone();
+        let phase_b_result = tokio::task::spawn_blocking(
+            move || -> std::result::Result<Option<V3PhaseBReport>, V3PhaseBError> {
+                let mut conn = Connection::open(&db_probe)?;
+                let Some(data_dir) = v3_migration::default_data_dir() else {
+                    tracing::debug!(
+                        event = "boot_step",
+                        step = 4.5,
+                        name = "phase_b_skipped_no_data_dir",
+                        "platform data_dir unresolved; Phase B cannot locate \
+                         pyramid_config.json — skipping (test mode)"
+                    );
+                    return Ok(None);
+                };
+                let report = v3_migration::run_v3_phase_b_migration(&mut conn, &data_dir)?;
+                Ok(Some(report))
+            },
+        )
+        .await;
+
+        match phase_b_result {
+            Ok(Ok(Some(report))) => {
+                tracing::info!(
+                    event = "v3_phase_b_complete",
+                    bytes_before = report.bytes_before,
+                    bytes_after = report.bytes_after,
+                    snapshot_id = %report.snapshot_id,
+                    marker_transition = %report.marker_transition,
+                    "v3 migration Phase B committed"
+                );
+            }
+            Ok(Ok(None)) => { /* test path — no data_dir */ }
+            Ok(Err(V3PhaseBError::AlreadyMigrated { body })) => {
+                tracing::debug!(
+                    event = "v3_phase_b_already_migrated",
+                    marker_body = %body,
+                    "Phase B skipped — marker already v3"
+                );
+            }
+            Ok(Err(V3PhaseBError::PhaseANotRun)) => {
+                tracing::warn!(
+                    event = "v3_phase_b_skipped_phase_a_not_run",
+                    "Phase B reached with marker pre-migration — Phase A should \
+                     have run above; this indicates a boot-order bug, skipping"
+                );
+            }
+            Ok(Err(other)) => {
+                let msg = format!(
+                    "Phase B failed: {other:?} — pyramid_config.json may still \
+                     contain legacy fields; next boot will retry from pending marker"
+                );
+                tracing::error!(
+                    event = "v3_phase_b_failed",
+                    error = ?other,
+                    "{}", msg
+                );
+                return BootResult::Aborted(msg);
+            }
+            Err(join_err) => {
+                let msg = format!("Phase B task failed: {join_err}");
+                tracing::error!(
+                    event = "v3_phase_b_failed",
                     error = %join_err,
                     "{}", msg
                 );

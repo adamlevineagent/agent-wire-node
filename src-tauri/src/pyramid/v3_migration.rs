@@ -1,4 +1,5 @@
-// Walker v3 — Phase A DDL migration (plan rev 1.0.2 §5.3).
+// Walker v3 — Phase A DDL migration + Phase B config-file rewrite
+// (plan rev 1.0.2 §5.3).
 //
 // Absorbs the legacy `pyramid_tier_routing` table, the active
 // `dispatch_policy` contribution's `routing_rules.route_to`, and the
@@ -1070,6 +1071,473 @@ pub fn should_run_phase_a(conn: &Connection) -> anyhow::Result<Option<String>> {
     }
 }
 
+// ── Phase B ──────────────────────────────────────────────────────────
+//
+// Phase B rewrites `pyramid_config.json` to remove the legacy model
+// fields and transitions the `migration_marker` contribution body from
+// `v3-db-migrated-config-pending` to `v3`. See plan rev 1.0.2 §5.3
+// Phase B (steps 8–10) + §2.17 step 4.5 + §2.17.3 + §5.6.1.
+//
+// Contract with Phase A:
+//   * Phase A leaves the marker at `v3-db-migrated-config-pending`
+//     after committing the SQL transaction. Phase B is the only code
+//     path that moves it to `v3`.
+//   * Phase A snapshotted nothing into `_pre_v3_snapshot_config`
+//     because the config file lives on disk, not in SQL. Phase B
+//     captures the pre-rewrite JSON body in a single-row dump before
+//     touching the file.
+//   * A crash between A and B leaves the marker at
+//     `v3-db-migrated-config-pending` — the next boot's Phase A sees
+//     `AlreadyMigrated` and returns; Phase B is called
+//     unconditionally by boot.rs and picks up from the pending state.
+
+/// Per-boot Phase-B migration report. Surfaces the transition details
+/// boot.rs logs for operator visibility.
+#[derive(Debug, Clone)]
+pub struct V3PhaseBReport {
+    /// Bytes on disk before the rewrite (0 when the file was absent).
+    pub bytes_before: usize,
+    /// Bytes on disk after the rewrite (0 when no file was written —
+    /// i.e. the file was absent at Phase B entry).
+    pub bytes_after: usize,
+    /// `contribution_id` of the new `migration_marker` (`v3`) row.
+    pub snapshot_id: String,
+    /// Human-readable summary of the transition, e.g.
+    /// `"v3-db-migrated-config-pending -> v3"`.
+    pub marker_transition: String,
+}
+
+/// Failure modes for `run_v3_phase_b_migration`. Each variant maps to
+/// an operator-visible modal once Phase-6 UI lands; boot.rs translates
+/// these into `BootResult::Aborted` messages in the meantime.
+#[derive(Debug, thiserror::Error)]
+pub enum V3PhaseBError {
+    /// Active migration_marker already says `v3` — Phase B previously
+    /// committed. Idempotent no-op for the caller.
+    #[error("migration_marker body `{body}` — Phase B already ran")]
+    AlreadyMigrated { body: String },
+    /// Active marker says `v2` or is absent — Phase A hasn't run yet.
+    /// Boot sequence runs A before B, so this shouldn't happen in
+    /// production; surfaced loudly so it does not silently eat state.
+    #[error("Phase A has not run (marker body indicates pre-migration state)")]
+    PhaseANotRun,
+    /// Marker body is a value neither this module nor Phase A
+    /// recognizes. Hard-fails rather than guessing.
+    #[error("unexpected migration_marker body `{body}`")]
+    UnexpectedMarkerBody { body: String },
+    /// IO failure reading or renaming the config file. The temp file
+    /// may still be on disk for forensics.
+    #[error("pyramid_config.json IO error: {0}")]
+    ConfigFileIoError(#[source] std::io::Error),
+    /// `pyramid_config.json` contents could not be parsed as JSON.
+    /// Phase B refuses to rewrite a corrupt file.
+    #[error("pyramid_config.json parse error: {0}")]
+    ConfigFileParseError(#[source] serde_json::Error),
+    /// `_pre_v3_snapshot_config` insert failed.
+    #[error("snapshot insert failed: {0}")]
+    SnapshotFailed(#[source] rusqlite::Error),
+    /// SQLite error outside the snapshot path.
+    #[error("db error: {0}")]
+    Db(#[from] rusqlite::Error),
+    /// Anyhow-flavored errors from envelope writes.
+    #[error("{0}")]
+    Other(#[from] anyhow::Error),
+}
+
+/// Legacy top-level keys Phase B strips out of `pyramid_config.json`.
+/// Anything else in the file (auth_token, openrouter_api_key,
+/// operational, etc.) is preserved verbatim.
+const PHASE_B_LEGACY_KEYS: &[&str] = &[
+    "primary_model",
+    "fallback_model_1",
+    "fallback_model_2",
+    "primary_context_limit",
+    "fallback_1_context_limit",
+];
+
+/// Phase B entry point. Runs inside ONE SQL transaction (for the
+/// snapshot + marker supersession). The file rewrite is a separate
+/// atomic rename(2) outside the SQL transaction — per §5.3 Phase B
+/// the two stores are independent and the intermediate marker body
+/// (`v3-db-migrated-config-pending`) exists precisely to signal a
+/// resume point if we crash between them.
+///
+/// Sequence:
+///   1. Idempotency gate — read active migration_marker body.
+///   2. Read `pyramid_config.json` as raw JSON (if present).
+///   3. Snapshot the pre-rewrite body into `_pre_v3_snapshot_config`.
+///   4. Strip the legacy keys from the top-level JSON object.
+///   5. Rewrite via temp-file + atomic rename.
+///   6. Supersede migration_marker `v3-db-migrated-config-pending` → `v3`.
+///
+/// The SQL transaction covers steps 3 + 6. Step 5 (file rename) runs
+/// between them deliberately: if the rename fails, the marker remains
+/// at `v3-db-migrated-config-pending` and the next boot retries. If
+/// the rename succeeds but the marker supersession fails (SQLite
+/// error), the next boot sees a clean config file + pending marker and
+/// the rewrite step is a no-op (file already lacks the legacy keys),
+/// so the retry converges.
+pub fn run_v3_phase_b_migration(
+    conn: &mut Connection,
+    data_dir: &Path,
+) -> std::result::Result<V3PhaseBReport, V3PhaseBError> {
+    // ── 1. Idempotency gate ──────────────────────────────────────────
+    let marker_body_yaml: Option<String> = conn
+        .query_row(
+            "SELECT yaml_content FROM pyramid_config_contributions \
+             WHERE schema_type = 'migration_marker' \
+               AND status = 'active' \
+               AND superseded_by_id IS NULL \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let prior_marker_contribution_id: Option<String> = conn
+        .query_row(
+            "SELECT contribution_id FROM pyramid_config_contributions \
+             WHERE schema_type = 'migration_marker' \
+               AND status = 'active' \
+               AND superseded_by_id IS NULL \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    let current_body = marker_body_yaml
+        .as_deref()
+        .map(|b| extract_marker_body_field(b).unwrap_or_else(|| b.to_string()))
+        .unwrap_or_default();
+
+    match current_body.as_str() {
+        "v3-db-migrated-config-pending" => { /* proceed */ }
+        "v3" => {
+            return Err(V3PhaseBError::AlreadyMigrated {
+                body: current_body,
+            });
+        }
+        "" | "v2" => {
+            return Err(V3PhaseBError::PhaseANotRun);
+        }
+        _ => {
+            return Err(V3PhaseBError::UnexpectedMarkerBody {
+                body: current_body,
+            });
+        }
+    }
+
+    // ── 2. Read pyramid_config.json (if present) ─────────────────────
+    let config_path = data_dir.join("pyramid_config.json");
+    let tmp_path = data_dir.join("pyramid_config.json.walker_v3_tmp");
+
+    let (pre_bytes, parsed_value): (Option<String>, Option<serde_json::Value>) =
+        match std::fs::read_to_string(&config_path) {
+            Ok(raw) => {
+                let v: serde_json::Value = serde_json::from_str(&raw)
+                    .map_err(V3PhaseBError::ConfigFileParseError)?;
+                (Some(raw), Some(v))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // Treat missing config as "already clean" — fresh
+                // install where nothing has written the JSON yet.
+                (None, None)
+            }
+            Err(err) => {
+                return Err(V3PhaseBError::ConfigFileIoError(err));
+            }
+        };
+
+    let bytes_before = pre_bytes.as_ref().map(|s| s.len()).unwrap_or(0);
+
+    // ── 3 + 6: SQL-side transaction (snapshot + marker supersession) ─
+    //
+    // Open the transaction first so we can roll back on any failure
+    // before the file rename. Step 5 (file rename) is performed between
+    // the snapshot insert and the marker supersession but OUTSIDE the
+    // SQL transaction — SQLite cannot rollback a rename(2).
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+    // ── 3. Snapshot the pre-rewrite body ─────────────────────────────
+    //
+    // Ensure the table exists (Phase A creates it, but a fresh-test
+    // path could hit Phase B without Phase A's snapshot_legacy_state
+    // having run). Columns extended beyond Phase A's minimal legacy
+    // column list to hold the raw JSON body; old rows (none today —
+    // Phase A has never populated this table) use NULL in the new
+    // columns.
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _pre_v3_snapshot_config (
+           snapshot_at TEXT NOT NULL,
+           primary_model TEXT,
+           fallback_model_1 TEXT,
+           fallback_model_2 TEXT,
+           source_table TEXT NOT NULL
+         );",
+    )
+    .map_err(V3PhaseBError::SnapshotFailed)?;
+    // Add the body + source_file columns if the table predates them.
+    // `ALTER TABLE ADD COLUMN` is idempotent via pragma check; simpler
+    // to query sqlite_master's column list and emit the ADDs for keys
+    // that aren't present yet.
+    ensure_snapshot_config_columns(&tx).map_err(V3PhaseBError::SnapshotFailed)?;
+
+    // Only insert a snapshot row when we actually have a pre-rewrite
+    // body to capture. If the file is absent, nothing to snapshot.
+    if let Some(raw) = &pre_bytes {
+        // Pull the three legacy model fields into their dedicated
+        // columns so rollback can reconstruct without reparsing.
+        let (pm, fb1, fb2) = if let Some(v) = &parsed_value {
+            (
+                v.get("primary_model").and_then(|x| x.as_str()).map(String::from),
+                v.get("fallback_model_1").and_then(|x| x.as_str()).map(String::from),
+                v.get("fallback_model_2").and_then(|x| x.as_str()).map(String::from),
+            )
+        } else {
+            (None, None, None)
+        };
+        tx.execute(
+            "INSERT INTO _pre_v3_snapshot_config \
+               (snapshot_at, primary_model, fallback_model_1, fallback_model_2, \
+                source_table, body, source_file) \
+             VALUES (datetime('now'), ?1, ?2, ?3, 'pyramid_config.json', ?4, 'pyramid_config.json')",
+            rusqlite::params![pm, fb1, fb2, raw],
+        )
+        .map_err(V3PhaseBError::SnapshotFailed)?;
+    }
+
+    // ── 4. Strip legacy keys from the parsed JSON ────────────────────
+    //
+    // If the top level isn't a JSON object, log warn and skip the file
+    // rewrite (defensive — a corrupt/unexpected shape shouldn't be
+    // silently destroyed). The marker supersession still runs so the
+    // next boot doesn't infinite-loop on Phase B.
+    let (bytes_after, rewrite_skipped) = match parsed_value {
+        Some(mut v) if v.is_object() => {
+            let mut removed_keys: Vec<&str> = Vec::new();
+            if let Some(obj) = v.as_object_mut() {
+                for key in PHASE_B_LEGACY_KEYS {
+                    if obj.remove(*key).is_some() {
+                        removed_keys.push(*key);
+                    }
+                }
+            }
+            // Serialize with pretty-print so the file stays
+            // human-readable (matches the existing save shape).
+            let serialized = serde_json::to_string_pretty(&v)
+                .map_err(V3PhaseBError::ConfigFileParseError)?;
+
+            // ── 5. Atomic rewrite: temp-file + rename(2) ─────────────
+            //
+            // NOTE: this happens between snapshot insert (committed
+            // below) and marker supersession. If it fails, we roll
+            // back the SQL tx so the snapshot doesn't get half-stored.
+            if let Err(e) = write_temp_and_rename(&tmp_path, &config_path, &serialized) {
+                tx.rollback().ok();
+                return Err(V3PhaseBError::ConfigFileIoError(e));
+            }
+            tracing::info!(
+                event = "v3_phase_b_config_rewritten",
+                removed_keys = ?removed_keys,
+                bytes_before,
+                bytes_after = serialized.len(),
+                "pyramid_config.json rewritten (legacy keys stripped)"
+            );
+            (serialized.len(), false)
+        }
+        Some(_) => {
+            tracing::warn!(
+                event = "v3_phase_b_config_shape_unexpected",
+                "pyramid_config.json top-level is not an object; skipping rewrite \
+                 (marker supersession still proceeds — next boot will not retry)"
+            );
+            (bytes_before, true)
+        }
+        None => {
+            // No file on disk — nothing to rewrite. Proceed to marker.
+            tracing::debug!(
+                event = "v3_phase_b_config_absent",
+                path = %config_path.display(),
+                "pyramid_config.json absent; no rewrite needed"
+            );
+            (0, true)
+        }
+    };
+    let _ = rewrite_skipped;
+
+    // ── 6. Supersede marker v3-db-migrated-config-pending → v3 ───────
+    let new_marker_id =
+        supersede_marker_to_v3_in_tx(&tx, prior_marker_contribution_id.as_deref())?;
+
+    tx.commit()?;
+
+    Ok(V3PhaseBReport {
+        bytes_before,
+        bytes_after,
+        snapshot_id: new_marker_id,
+        marker_transition: "v3-db-migrated-config-pending -> v3".to_string(),
+    })
+}
+
+/// Ensure `_pre_v3_snapshot_config` has the `body TEXT` + `source_file
+/// TEXT` columns. Phase A creates the table with the legacy-field
+/// columns only; Phase B extends it idempotently.
+fn ensure_snapshot_config_columns(
+    tx: &rusqlite::Transaction<'_>,
+) -> std::result::Result<(), rusqlite::Error> {
+    let mut has_body = false;
+    let mut has_source_file = false;
+    let mut stmt = tx.prepare("PRAGMA table_info(_pre_v3_snapshot_config)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for r in rows {
+        let name = r?;
+        if name == "body" {
+            has_body = true;
+        } else if name == "source_file" {
+            has_source_file = true;
+        }
+    }
+    drop(stmt);
+    if !has_body {
+        tx.execute(
+            "ALTER TABLE _pre_v3_snapshot_config ADD COLUMN body TEXT",
+            [],
+        )?;
+    }
+    if !has_source_file {
+        tx.execute(
+            "ALTER TABLE _pre_v3_snapshot_config ADD COLUMN source_file TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Write `contents` to `tmp_path`, fsync, then rename to `final_path`.
+/// Leaves the temp file behind on any error (operator forensics).
+fn write_temp_and_rename(
+    tmp_path: &Path,
+    final_path: &Path,
+    contents: &str,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    {
+        // Open (truncate if the temp file from a prior aborted pass is
+        // still around), write, sync.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(tmp_path)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(tmp_path, final_path)?;
+    Ok(())
+}
+
+/// Supersede the active `migration_marker` row (expected body
+/// `v3-db-migrated-config-pending`) with a new row carrying body `v3`.
+/// Mirrors `supersede_marker_in_tx` from Phase A but targets the Phase
+/// B body transition.
+fn supersede_marker_to_v3_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    prior_contribution_id: Option<&str>,
+) -> std::result::Result<String, V3PhaseBError> {
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let body = "schema_type: migration_marker\nbody: \"v3\"\n";
+
+    // UPDATE prior → superseded BEFORE INSERT so the unique-active
+    // index never sees two active migration_marker rows.
+    if let Some(prior) = prior_contribution_id {
+        tx.execute(
+            "UPDATE pyramid_config_contributions \
+             SET status = 'superseded' \
+             WHERE contribution_id = ?1",
+            rusqlite::params![prior],
+        )?;
+    }
+
+    write_envelope_in_tx_phase_b(
+        tx,
+        ContributionEnvelopeInput {
+            contribution_id: new_id.clone(),
+            slug: None,
+            schema_type: "migration_marker".to_string(),
+            body: body.to_string(),
+            wire_native_metadata_json: None,
+            supersedes_id: prior_contribution_id.map(|s| s.to_string()),
+            triggering_note: Some(
+                "Walker v3 Phase B — config-file rewrite complete; schema_version=v3"
+                    .to_string(),
+            ),
+            status: "active".to_string(),
+            source: "migration".to_string(),
+            wire_contribution_id: None,
+            created_by: None,
+            accepted_at: AcceptedAt::Now,
+            needs_migration: None,
+            write_mode: WriteMode::Strict,
+        },
+    )?;
+
+    if let Some(prior) = prior_contribution_id {
+        tx.execute(
+            "UPDATE pyramid_config_contributions \
+             SET superseded_by_id = ?1 \
+             WHERE contribution_id = ?2",
+            rusqlite::params![new_id, prior],
+        )?;
+    }
+
+    Ok(new_id)
+}
+
+/// Phase B flavor of `write_envelope_in_tx` — identical to Phase A's
+/// helper but returns `V3PhaseBError`. Kept local so the two phases
+/// stay independently typed.
+fn write_envelope_in_tx_phase_b(
+    tx: &rusqlite::Transaction<'_>,
+    input: ContributionEnvelopeInput,
+) -> std::result::Result<String, V3PhaseBError> {
+    crate::pyramid::config_contributions::write_contribution_envelope(
+        tx,
+        input,
+        TransactionMode::JoinAmbient,
+    )
+    .map_err(|e| V3PhaseBError::Other(anyhow::anyhow!("envelope write: {e}")))
+}
+
+/// Read-only probe for boot.rs: does the active migration_marker say
+/// we need to run Phase B? Returns `Some(body)` if Phase B should run
+/// (`v3-db-migrated-config-pending`), `None` otherwise.
+#[allow(dead_code)]
+pub fn should_run_phase_b(conn: &Connection) -> anyhow::Result<Option<String>> {
+    let body: Option<String> = conn
+        .query_row(
+            "SELECT yaml_content FROM pyramid_config_contributions \
+             WHERE schema_type = 'migration_marker' \
+               AND status = 'active' \
+               AND superseded_by_id IS NULL \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("read migration_marker")?;
+    let current = body
+        .as_deref()
+        .map(|b| extract_marker_body_field(b).unwrap_or_else(|| b.to_string()))
+        .unwrap_or_default();
+    match current.as_str() {
+        "v3-db-migrated-config-pending" => Ok(Some(current)),
+        _ => Ok(None),
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1398,5 +1866,200 @@ routing_rules:
         let body_has_primary = body.matches("inception/mercury-2").count();
         assert_eq!(body_has_primary, 1, "body: {body}\nmid lines: {mid_lines:?}");
         assert!(body.contains("fallback/one"));
+    }
+
+    // ── Phase B tests ────────────────────────────────────────────────
+
+    /// Seed `pyramid_config.json` with the legacy fields alongside
+    /// other keys that must survive the rewrite.
+    fn write_seeded_config_json(dir: &Path) {
+        let body = serde_json::json!({
+            "auth_token": "bearer-abc",
+            "openrouter_api_key": "sk-or-v1-xxx",
+            "primary_model": "inception/mercury-2",
+            "fallback_model_1": "x-ai/grok-4.20-beta",
+            "fallback_model_2": "moonshotai/kimi-k2.6",
+            "primary_context_limit": 200000,
+            "fallback_1_context_limit": 1000000,
+            "partner_model": "xiaomi/mimo-v2-pro",
+            "collapse_model": "x-ai/grok-4.20-beta",
+            "use_chain_engine": true,
+            "operational": {},
+        });
+        std::fs::write(
+            dir.join("pyramid_config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Move the marker from `v3-db-migrated-config-pending` to `v3`
+    /// state is what Phase A leaves behind. This test helper mimics
+    /// that state without running the full Phase A.
+    fn insert_pending_marker(conn: &Connection) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let yaml =
+            "schema_type: migration_marker\nbody: \"v3-db-migrated-config-pending\"\n".to_string();
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions \
+               (contribution_id, schema_type, yaml_content, status, source) \
+             VALUES (?1, 'migration_marker', ?2, 'active', 'migration')",
+            rusqlite::params![id, yaml],
+        )
+        .unwrap();
+        id
+    }
+
+    #[test]
+    fn test_phase_b_strips_legacy_keys_from_config_file() {
+        let (dir, mut conn) = make_test_db();
+        insert_pending_marker(&conn);
+        write_seeded_config_json(dir.path());
+
+        let report =
+            run_v3_phase_b_migration(&mut conn, dir.path()).expect("Phase B must succeed");
+        assert!(report.bytes_after > 0);
+        assert!(report.bytes_before > report.bytes_after);
+
+        let rewritten: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("pyramid_config.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(rewritten.get("primary_model").is_none());
+        assert!(rewritten.get("fallback_model_1").is_none());
+        assert!(rewritten.get("fallback_model_2").is_none());
+        assert!(rewritten.get("primary_context_limit").is_none());
+        assert!(rewritten.get("fallback_1_context_limit").is_none());
+        // Non-legacy fields preserved.
+        assert_eq!(
+            rewritten.get("auth_token").and_then(|v| v.as_str()),
+            Some("bearer-abc")
+        );
+        assert_eq!(
+            rewritten.get("partner_model").and_then(|v| v.as_str()),
+            Some("xiaomi/mimo-v2-pro")
+        );
+    }
+
+    #[test]
+    fn test_phase_b_idempotent_on_rerun() {
+        let (dir, mut conn) = make_test_db();
+        insert_pending_marker(&conn);
+        write_seeded_config_json(dir.path());
+
+        let _ = run_v3_phase_b_migration(&mut conn, dir.path()).unwrap();
+
+        let err = run_v3_phase_b_migration(&mut conn, dir.path()).unwrap_err();
+        match err {
+            V3PhaseBError::AlreadyMigrated { body } => {
+                assert_eq!(body, "v3");
+            }
+            other => panic!("expected AlreadyMigrated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_phase_b_refuses_when_phase_a_not_run() {
+        let (dir, mut conn) = make_test_db();
+        // Marker at `v2` → Phase A hasn't run.
+        insert_active_marker(&conn, "v2");
+
+        let err = run_v3_phase_b_migration(&mut conn, dir.path()).unwrap_err();
+        match err {
+            V3PhaseBError::PhaseANotRun => { /* ok */ }
+            other => panic!("expected PhaseANotRun, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_phase_b_transitions_marker_to_v3() {
+        let (dir, mut conn) = make_test_db();
+        let prior_id = insert_pending_marker(&conn);
+        write_seeded_config_json(dir.path());
+
+        let _ = run_v3_phase_b_migration(&mut conn, dir.path()).unwrap();
+
+        // Active marker body is now `v3`.
+        let body = get_active_body(&conn, "migration_marker").unwrap();
+        assert!(body.contains("\"v3\""), "body: {body}");
+        assert!(
+            !body.contains("v3-db-migrated-config-pending"),
+            "body: {body}"
+        );
+        assert_eq!(count_active(&conn, "migration_marker"), 1);
+
+        // Prior row is superseded with `superseded_by_id` pointing at
+        // the new active row.
+        let (prior_status, prior_sb): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, superseded_by_id FROM pyramid_config_contributions \
+                 WHERE contribution_id = ?1",
+                rusqlite::params![prior_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(prior_status, "superseded");
+        assert!(prior_sb.is_some(), "prior row must have superseded_by_id");
+    }
+
+    #[test]
+    fn test_phase_b_handles_missing_config_file() {
+        let (dir, mut conn) = make_test_db();
+        insert_pending_marker(&conn);
+        // Do not write pyramid_config.json.
+
+        let report = run_v3_phase_b_migration(&mut conn, dir.path()).unwrap();
+        assert_eq!(report.bytes_before, 0);
+        assert_eq!(report.bytes_after, 0);
+
+        // Marker still transitions.
+        let body = get_active_body(&conn, "migration_marker").unwrap();
+        assert!(body.contains("\"v3\""));
+    }
+
+    #[test]
+    fn test_phase_b_snapshot_captures_pre_rewrite_body() {
+        let (dir, mut conn) = make_test_db();
+        insert_pending_marker(&conn);
+        write_seeded_config_json(dir.path());
+        let original = std::fs::read_to_string(dir.path().join("pyramid_config.json")).unwrap();
+
+        let _ = run_v3_phase_b_migration(&mut conn, dir.path()).unwrap();
+
+        let (snap_body, pm, fb1, fb2, source_file): (String, Option<String>, Option<String>, Option<String>, String) =
+            conn.query_row(
+                "SELECT body, primary_model, fallback_model_1, fallback_model_2, source_file \
+                 FROM _pre_v3_snapshot_config ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(snap_body, original);
+        assert_eq!(pm.as_deref(), Some("inception/mercury-2"));
+        assert_eq!(fb1.as_deref(), Some("x-ai/grok-4.20-beta"));
+        assert_eq!(fb2.as_deref(), Some("moonshotai/kimi-k2.6"));
+        assert_eq!(source_file, "pyramid_config.json");
+    }
+
+    #[test]
+    fn test_phase_b_rejects_unexpected_marker_body() {
+        let (dir, mut conn) = make_test_db();
+        insert_active_marker(&conn, "v99-garbage");
+
+        let err = run_v3_phase_b_migration(&mut conn, dir.path()).unwrap_err();
+        match err {
+            V3PhaseBError::UnexpectedMarkerBody { body } => {
+                assert_eq!(body, "v99-garbage");
+            }
+            other => panic!("expected UnexpectedMarkerBody, got {:?}", other),
+        }
     }
 }
