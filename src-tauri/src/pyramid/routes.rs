@@ -4382,7 +4382,16 @@ async fn handle_annotate(
         )
         .await
         {
-            tracing::warn!("[annotation] post-save hook failed: {}", e);
+            // Phase 6c-B verifier: this log level matters — the vocab-
+            // dispatch hook now RAISES on missing vocab entry at hook
+            // time (race-or-direct-DB-write per the hook's contract).
+            // Use error! not warn! so a supersession-mid-flight is
+            // visible in the standard operator log tier; the warning
+            // stream is reserved for recoverable anomalies.
+            tracing::error!(
+                "[annotation] post-save hook failed: {} (annotation saved but dispatch skipped)",
+                e
+            );
         }
     });
 
@@ -6296,7 +6305,7 @@ async fn handle_vine_eras(
     state: Arc<PyramidState>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
-    match db::get_annotations_by_type(&conn, &slug_name, "era") {
+    match db::get_annotations_by_type(&conn, &slug_name, ANNOTATION_TYPE_ERA) {
         Ok(annotations) => Ok(json_ok(&annotations)),
         Err(e) => Ok(json_error(
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -6358,7 +6367,8 @@ async fn handle_vine_drill(
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
     // Read Directory annotations on sub-apex nodes and return as navigation structure
-    let directory_annotations = db::get_annotations_by_type(&conn, &slug_name, "directory");
+    let directory_annotations =
+        db::get_annotations_by_type(&conn, &slug_name, ANNOTATION_TYPE_DIRECTORY);
     match directory_annotations {
         Ok(dirs) => {
             // Build navigation structure from directory annotations

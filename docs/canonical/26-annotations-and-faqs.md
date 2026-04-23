@@ -19,7 +19,7 @@ Annotations are immutable. You never edit an annotation; if you want to change w
 
 ### The annotation types
 
-Canonical list of annotation types (mirrored in `src-tauri/src/pyramid/types.rs` as `AnnotationType::ALL` and `mcp-server/src/lib.ts` as `ANNOTATION_TYPES`). Unknown types are refused at the ingress — the MCP Zod enum rejects them before they reach the Wire Node, and the HTTP write path uses `from_str_strict` so drift fails loud.
+Canonical list of annotation types. As of post-build accretion v5 Phase 6c-B, the source of truth is the vocabulary registry (`pyramid_config_contributions` rows with `schema_type LIKE 'vocabulary_entry:annotation_type:%'`), seeded from `vocab_genesis::GENESIS_ANNOTATION_TYPES` and read via `AnnotationType::all(&conn)` + `AnnotationType::from_str_strict(&conn, s)`. Publishing a new vocab entry makes the new type accepted at runtime with no code deploy. Unknown types are refused at the ingress — the MCP Zod enum rejects them before they reach the Wire Node, and the HTTP write path uses `from_str_strict` so drift fails loud.
 
 - **Observation** — *"The retry logic caps at 3 attempts with exponential backoff."* Factual. Most common type. Observations get folded into the FAQ when they answer a question.
 - **Correction** — *"This says the cache TTL is 60s but the code says 120s."* Marks the node as containing an inaccuracy. Triggers DADBEAR to re-evaluate the node and creates a delta on the matching thread.

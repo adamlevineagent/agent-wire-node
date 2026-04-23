@@ -26994,5 +26994,89 @@ mod phase6c_b_post_build_tests {
         .await
         .expect("hook must complete Ok on covered branches");
     }
+
+    // ── Verifier-added: serde transparent round-trip ────────────────────
+    //
+    // Phase 6c-B flipped AnnotationType from a serde-tagged enum to a
+    // `#[serde(transparent)]` newtype over String. Wire compatibility with
+    // pre-v5 JSON payloads depends on this transparency: the on-the-wire
+    // form is the bare string (`"steel_man"`), NOT a wrapper object. This
+    // test pins that so a future `#[derive(Serialize)]` change that drops
+    // `transparent` gets caught immediately.
+    #[test]
+    fn annotation_type_serializes_as_bare_string_and_round_trips() {
+        // Serialize
+        let at = AnnotationType::new("steel_man");
+        let json = serde_json::to_string(&at).unwrap();
+        assert_eq!(
+            json, "\"steel_man\"",
+            "newtype must serialize as bare string, not object wrapper"
+        );
+
+        // Deserialize
+        let back: AnnotationType = serde_json::from_str("\"correction\"").unwrap();
+        assert_eq!(back.as_str(), "correction");
+
+        // Pre-v5 wire compat: legacy clients sending plain strings for
+        // every genesis name must still parse.
+        for name in &[
+            "observation",
+            "correction",
+            "question",
+            "friction",
+            "idea",
+            "era",
+            "transition",
+            "health_check",
+            "directory",
+            "steel_man",
+            "red_team",
+        ] {
+            let json = format!("\"{}\"", name);
+            let parsed: AnnotationType =
+                serde_json::from_str(&json).expect("legacy JSON string must deserialize");
+            assert_eq!(parsed.as_str(), *name);
+        }
+    }
+
+    // ── Verifier-added: AnnotationType::new bypass is intentional ──────
+    //
+    // Documents the call-site split: `from_str_strict` validates against
+    // the vocabulary, `new` is the controlled bypass for call sites that
+    // already hold a canonical genesis string constant (or a DB-read
+    // value guaranteed to be valid at write time). A `new(user_input)`
+    // call outside those two cases would be a vocab-bypass vulnerability.
+    // This test documents the contract so reviewers know when `new`
+    // is acceptable.
+    #[test]
+    fn new_constructor_bypasses_vocab_check_by_design() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+        // `new` accepts any string without hitting the vocab.
+        let fake = AnnotationType::new("this_is_not_vocab");
+        assert_eq!(fake.as_str(), "this_is_not_vocab");
+        // But `from_str_strict` refuses it.
+        assert!(AnnotationType::from_str_strict(&conn, "this_is_not_vocab").is_err());
+    }
+
+    // ── Verifier-added: from_db_string wraps legacy values verbatim ────
+    //
+    // If a pre-6c-B deploy wrote an annotation_type string that has since
+    // been superseded OUT of the active vocab set, the DB row's
+    // annotation_type column will contain that legacy string. Read paths
+    // use `from_db_string` which wraps the value without validation —
+    // trust-at-rest per the AnnotationType docs. This test proves that
+    // behavior. If a future phase adds validation on read, this test
+    // should fail loud rather than silently corrupt legacy data.
+    #[test]
+    fn from_db_string_wraps_legacy_value_without_vocab_check() {
+        let _lock = test_lock();
+        let _conn = mem_conn();
+        // Simulate a legacy DB value that is not in genesis.
+        let legacy = AnnotationType::from_db_string("retired_verb".to_string());
+        assert_eq!(legacy.as_str(), "retired_verb");
+        // It is distinct from a newtype-constructed value of the same string.
+        assert_eq!(legacy, AnnotationType::new("retired_verb"));
+    }
 }
 

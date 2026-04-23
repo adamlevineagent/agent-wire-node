@@ -6186,7 +6186,8 @@ async fn pyramid_vine_eras(
 ) -> Result<serde_json::Value, String> {
     let conn = state.pyramid.reader.lock().await;
     let eras =
-        pyramid_db::get_annotations_by_type(&conn, &slug, "era").map_err(|e| e.to_string())?;
+        pyramid_db::get_annotations_by_type(&conn, &slug, ANNOTATION_TYPE_ERA)
+            .map_err(|e| e.to_string())?;
     Ok(serde_json::to_value(&eras).map_err(|e| e.to_string())?)
 }
 
@@ -6256,7 +6257,7 @@ async fn pyramid_vine_drill(
     slug: String,
 ) -> Result<serde_json::Value, String> {
     let conn = state.pyramid.reader.lock().await;
-    let annotations = pyramid_db::get_annotations_by_type(&conn, &slug, "directory")
+    let annotations = pyramid_db::get_annotations_by_type(&conn, &slug, ANNOTATION_TYPE_DIRECTORY)
         .map_err(|e| e.to_string())?;
     Ok(serde_json::to_value(&annotations).map_err(|e| e.to_string())?)
 }
