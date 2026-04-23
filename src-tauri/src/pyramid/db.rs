@@ -25869,12 +25869,27 @@ mod phase6c_a_post_build_tests {
         self, VocabEntry, VOCAB_KIND_ANNOTATION_TYPE, VOCAB_KIND_NODE_SHAPE, VOCAB_KIND_ROLE_NAME,
     };
     use rusqlite::Connection;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// The process-wide vocab cache is shared across parallel tests, and
+    /// each test opens its own in-memory DB. Without a test-level lock,
+    /// one test's `invalidate_cache()` → `ensure_cache(other_conn)` can
+    /// splat another test's DB state into the cache mid-assertion.
+    /// Serialize the whole mod behind this mutex so each test sees a
+    /// consistent cache scoped to its own connection.
+    fn test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
 
     fn mem_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         init_pyramid_db(&conn).unwrap();
         // Invalidate cache so tests that run in-parallel see fresh state
-        // from each test's own in-memory DB.
+        // from each test's own in-memory DB. (The `test_lock()` at the
+        // top of each test also ensures serialization.)
         vocab_entries::invalidate_cache();
         conn
     }
@@ -25896,6 +25911,7 @@ mod phase6c_a_post_build_tests {
 
     #[test]
     fn genesis_seeds_11_annotation_types_4_shapes_10_roles() {
+        let _lock = test_lock();
         let conn = mem_conn();
         // 11 annotation types: observation, correction, question, friction,
         // idea, era, transition, health_check, directory, steel_man, red_team.
@@ -25910,6 +25926,7 @@ mod phase6c_a_post_build_tests {
 
     #[test]
     fn genesis_is_idempotent() {
+        let _lock = test_lock();
         let conn = mem_conn();
         let before_at = count_active(&conn, "annotation_type");
         let before_ns = count_active(&conn, "node_shape");
@@ -25926,6 +25943,7 @@ mod phase6c_a_post_build_tests {
 
     #[test]
     fn list_vocabulary_returns_active_only() {
+        let _lock = test_lock();
         let mut conn = mem_conn();
         // Publish a custom annotation_type entry.
         let custom = VocabEntry {
@@ -25968,6 +25986,7 @@ mod phase6c_a_post_build_tests {
 
     #[test]
     fn supersede_dance_preserves_chain() {
+        let _lock = test_lock();
         let mut conn = mem_conn();
         let custom = VocabEntry {
             id: 0,
@@ -26024,6 +26043,7 @@ mod phase6c_a_post_build_tests {
 
     #[test]
     fn publish_new_annotation_type_emits_vocabulary_published() {
+        let _lock = test_lock();
         let conn = mem_conn();
 
         // Count vocab_published events BEFORE (genesis seed emits many).
@@ -26079,6 +26099,7 @@ mod phase6c_a_post_build_tests {
 
     #[test]
     fn supersede_emits_vocabulary_superseded() {
+        let _lock = test_lock();
         let mut conn = mem_conn();
         let custom = VocabEntry {
             id: 0,
@@ -26126,6 +26147,7 @@ mod phase6c_a_post_build_tests {
 
     #[test]
     fn cache_invalidates_on_publish() {
+        let _lock = test_lock();
         let conn = mem_conn();
         // Prime the cache by a list call.
         let before = vocab_entries::list_vocabulary(&conn, VOCAB_KIND_ANNOTATION_TYPE).unwrap();
@@ -26156,6 +26178,7 @@ mod phase6c_a_post_build_tests {
 
     #[test]
     fn http_get_vocabulary_annotation_type_returns_11_genesis_entries() {
+        let _lock = test_lock();
         let conn = mem_conn();
         let response =
             vocab_entries::handle_get_vocabulary(&conn, VOCAB_KIND_ANNOTATION_TYPE).unwrap();
@@ -26189,6 +26212,7 @@ mod phase6c_a_post_build_tests {
 
     #[test]
     fn steel_man_and_red_team_genesis_entries_are_reactive_with_debate_steward_handler() {
+        let _lock = test_lock();
         let conn = mem_conn();
         for name in &["steel_man", "red_team"] {
             let entry = vocab_entries::get_vocabulary_entry(
@@ -26212,6 +26236,7 @@ mod phase6c_a_post_build_tests {
 
     #[test]
     fn role_name_genesis_handler_chains_match_phase1_genesis_bindings() {
+        let _lock = test_lock();
         let conn = mem_conn();
         // Phase 1's GENESIS_BINDINGS: (role_name, starter_chain_id). The
         // Phase 6c-A registry must mirror these exactly (plus include
@@ -26240,6 +26265,247 @@ mod phase6c_a_post_build_tests {
                 entry.handler_chain_id
             );
         }
+    }
+
+    // ── Phase 6c-A verifier-pass regression tests ──────────────────────
+
+    /// Verifier target 1: publishing with `:` in name must fail loud.
+    /// A colon in `name` would break the compound schema_type's
+    /// `vocabulary_entry:<kind>:<name>` separator and could collide
+    /// with a legitimate entry on the partial unique index.
+    #[test]
+    fn publish_rejects_name_with_colon() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+        let bad = VocabEntry {
+            id: 0,
+            vocab_kind: VOCAB_KIND_ANNOTATION_TYPE.to_string(),
+            name: "foo:bar".to_string(),
+            description: "colon injection attempt".to_string(),
+            handler_chain_id: None,
+            reactive: false,
+            created_at: String::new(),
+            superseded_by: None,
+            supersede_reason: None,
+        };
+        let err = vocab_entries::publish_vocabulary_entry(&conn, &bad).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("must not contain ':'"),
+            "expected colon-rejection error, got: {msg}"
+        );
+    }
+
+    /// Verifier target 1: empty name must fail loud.
+    #[test]
+    fn publish_rejects_empty_name() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+        let bad = VocabEntry {
+            id: 0,
+            vocab_kind: VOCAB_KIND_ANNOTATION_TYPE.to_string(),
+            name: String::new(),
+            description: "empty name".to_string(),
+            handler_chain_id: None,
+            reactive: false,
+            created_at: String::new(),
+            superseded_by: None,
+            supersede_reason: None,
+        };
+        let err = vocab_entries::publish_vocabulary_entry(&conn, &bad).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("must not be empty"),
+            "expected empty-name rejection, got: {msg}"
+        );
+    }
+
+    /// Verifier target 1: second publish of the same (kind, name) must
+    /// fail via the partial unique index `uq_config_contrib_active`.
+    /// Ensures the compound schema_type really constrains single-active
+    /// per (kind, name).
+    #[test]
+    fn publish_duplicate_active_fails() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+        let entry = VocabEntry {
+            id: 0,
+            vocab_kind: VOCAB_KIND_ANNOTATION_TYPE.to_string(),
+            name: "dup_test_verb".to_string(),
+            description: "first publish".to_string(),
+            handler_chain_id: None,
+            reactive: false,
+            created_at: String::new(),
+            superseded_by: None,
+            supersede_reason: None,
+        };
+        vocab_entries::publish_vocabulary_entry(&conn, &entry).unwrap();
+        // Second publish with the same (kind, name) — must error on the
+        // partial unique index `uq_config_contrib_active`, which the
+        // contribution writer translates into "supersession conflict".
+        let err = vocab_entries::publish_vocabulary_entry(&conn, &entry).unwrap_err();
+        let msg = format!("{err:?}").to_lowercase();
+        assert!(
+            msg.contains("supersession conflict")
+                || msg.contains("another active row")
+                || msg.contains("unique")
+                || msg.contains("constraint"),
+            "expected supersession/unique-constraint error, got: {msg}"
+        );
+    }
+
+    /// Verifier target 4: unknown vocab_kind must return loud error via
+    /// `handle_get_vocabulary` (which the HTTP route maps to 400).
+    #[test]
+    fn handle_get_vocabulary_rejects_unknown_kind() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+        let err = vocab_entries::handle_get_vocabulary(&conn, "annotatin_type").unwrap_err();
+        assert!(
+            err.downcast_ref::<vocab_entries::UnknownVocabKind>().is_some(),
+            "expected UnknownVocabKind, got: {err}"
+        );
+    }
+
+    /// Verifier target 9: supersede observation event must carry the
+    /// `reason` in metadata so DADBEAR can surface WHY a vocab entry
+    /// changed (previous commit only stored reason in triggering_note
+    /// on the contribution row).
+    #[test]
+    fn supersede_event_metadata_carries_reason() {
+        let _lock = test_lock();
+        let mut conn = mem_conn();
+        let custom = VocabEntry {
+            id: 0,
+            vocab_kind: VOCAB_KIND_ANNOTATION_TYPE.to_string(),
+            name: "reason_test_verb".to_string(),
+            description: "v1".to_string(),
+            handler_chain_id: None,
+            reactive: false,
+            created_at: String::new(),
+            superseded_by: None,
+            supersede_reason: None,
+        };
+        vocab_entries::publish_vocabulary_entry(&conn, &custom).unwrap();
+        vocab_entries::supersede_vocabulary_entry(
+            &mut conn,
+            VOCAB_KIND_ANNOTATION_TYPE,
+            "reason_test_verb",
+            Some("v2"),
+            None,
+            None,
+            Some("refining wording for clarity"),
+        )
+        .unwrap();
+
+        let metadata_json: String = conn
+            .query_row(
+                "SELECT metadata_json FROM dadbear_observation_events
+                  WHERE source = 'vocabulary' AND event_type = 'vocabulary_superseded'
+                  ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_json).unwrap();
+        assert_eq!(metadata["vocab_kind"], "annotation_type");
+        assert_eq!(metadata["name"], "reason_test_verb");
+        assert_eq!(metadata["reason"], "refining wording for clarity");
+    }
+
+    /// Verifier target 11: publish → supersede → get_vocabulary_entry
+    /// must return the NEW entry (not the superseded one) — exercises
+    /// cache invalidation + re-read path correctness for the
+    /// point-lookup API, not just list_vocabulary.
+    #[test]
+    fn get_after_supersede_returns_new_active_entry() {
+        let _lock = test_lock();
+        let mut conn = mem_conn();
+        let custom = VocabEntry {
+            id: 0,
+            vocab_kind: VOCAB_KIND_ANNOTATION_TYPE.to_string(),
+            name: "reread_probe".to_string(),
+            description: "v1".to_string(),
+            handler_chain_id: Some("starter-v1".to_string()),
+            reactive: false,
+            created_at: String::new(),
+            superseded_by: None,
+            supersede_reason: None,
+        };
+        let v1 = vocab_entries::publish_vocabulary_entry(&conn, &custom).unwrap();
+
+        // Prime cache with a get.
+        let fetched_v1 =
+            vocab_entries::get_vocabulary_entry(&conn, VOCAB_KIND_ANNOTATION_TYPE, "reread_probe")
+                .unwrap()
+                .unwrap();
+        assert_eq!(fetched_v1.description, "v1");
+
+        vocab_entries::supersede_vocabulary_entry(
+            &mut conn,
+            VOCAB_KIND_ANNOTATION_TYPE,
+            "reread_probe",
+            Some("v2"),
+            Some(Some("starter-v2")),
+            None,
+            Some("updated"),
+        )
+        .unwrap();
+
+        // Re-get after supersede — must see v2, not v1. Cache
+        // invalidation broke if this returns v1.
+        let fetched_v2 =
+            vocab_entries::get_vocabulary_entry(&conn, VOCAB_KIND_ANNOTATION_TYPE, "reread_probe")
+                .unwrap()
+                .unwrap();
+        assert_eq!(fetched_v2.description, "v2");
+        assert_eq!(fetched_v2.handler_chain_id.as_deref(), Some("starter-v2"));
+        assert!(fetched_v2.id > v1.id);
+    }
+
+    /// Verifier target 3: re-seed after operator supersession must NOT
+    /// un-do the supersession. The existence check (status='active')
+    /// matches the OPERATOR's successor, so seed_if_missing sees an
+    /// active row and skips — preserving the operator's change.
+    #[test]
+    fn reseed_preserves_operator_supersession() {
+        let _lock = test_lock();
+        let mut conn = mem_conn();
+        // Operator supersedes genesis 'observation' with a richer
+        // description.
+        let operator_reason = "clarify observation semantics";
+        vocab_entries::supersede_vocabulary_entry(
+            &mut conn,
+            VOCAB_KIND_ANNOTATION_TYPE,
+            "observation",
+            Some("operator-edited description"),
+            None,
+            None,
+            Some(operator_reason),
+        )
+        .unwrap();
+
+        // Sanity: active row now has operator's description.
+        let after_op =
+            vocab_entries::get_vocabulary_entry(&conn, VOCAB_KIND_ANNOTATION_TYPE, "observation")
+                .unwrap()
+                .unwrap();
+        assert_eq!(after_op.description, "operator-edited description");
+
+        // Re-run init (idempotent) — seeder must see the active operator
+        // row and skip re-insertion.
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+
+        let after_reseed =
+            vocab_entries::get_vocabulary_entry(&conn, VOCAB_KIND_ANNOTATION_TYPE, "observation")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            after_reseed.description, "operator-edited description",
+            "re-seed must NOT overwrite operator's supersession"
+        );
+        assert_eq!(after_reseed.id, after_op.id, "no new row created on re-seed");
     }
 }
 

@@ -2797,10 +2797,24 @@ async fn handle_vocab_registry_list(
     let conn = state.reader.lock().await;
     match crate::pyramid::vocab_entries::handle_get_vocabulary(&conn, &vocab_kind) {
         Ok(response) => Ok(json_ok(&response)),
-        Err(e) => Ok(json_error(
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            &e.to_string(),
-        )),
+        Err(e) => {
+            // Unknown vocab_kind → 400 Bad Request with the list of
+            // valid kinds enumerated, per feedback_loud_deferrals. Any
+            // other error → 500.
+            if e.downcast_ref::<crate::pyramid::vocab_entries::UnknownVocabKind>()
+                .is_some()
+            {
+                Ok(json_error(
+                    warp::http::StatusCode::BAD_REQUEST,
+                    &e.to_string(),
+                ))
+            } else {
+                Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ))
+            }
+        }
     }
 }
 

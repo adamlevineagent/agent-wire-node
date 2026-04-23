@@ -73,6 +73,23 @@ pub const VOCAB_KINDS: &[&str] = &[
     VOCAB_KIND_ROLE_NAME,
 ];
 
+/// Returns true if `kind` is one of the three whitelisted vocab_kinds.
+/// Used by the HTTP handler to reject unknown kinds loud (feedback_loud_deferrals)
+/// — an unknown kind is almost always a typo, not a valid request.
+pub fn is_known_vocab_kind(kind: &str) -> bool {
+    VOCAB_KINDS.iter().any(|k| *k == kind)
+}
+
+/// Error raised when an HTTP caller requests a vocab_kind that isn't in
+/// `VOCAB_KINDS`. Carries the list of valid kinds so the HTTP layer can
+/// enumerate them in the 400 response.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown vocab_kind '{kind}': valid kinds are {valid:?}")]
+pub struct UnknownVocabKind {
+    pub kind: String,
+    pub valid: &'static [&'static str],
+}
+
 // ── Types ───────────────────────────────────────────────────────────
 
 /// A single vocabulary entry — the registry row behind AnnotationType,
@@ -239,11 +256,41 @@ fn validate_schema_type_matches_body(schema_type: &str, body: &VocabBody, id: i6
 
 /// Build the compound schema_type `vocabulary_entry:<kind>:<name>`.
 /// Callers must not include colons in `vocab_kind` or `name` — that
-/// would break round-trip parsing. Genesis seeds and all public APIs
-/// use simple identifiers (snake_case), so this is a code-level
-/// invariant, not a runtime validation.
+/// would break round-trip parsing AND collide under the partial unique
+/// index (e.g. `(annotation_type, foo:bar)` would share a schema_type
+/// with `(annotation_type:foo, bar)`). Publish / supersede paths
+/// validate via `validate_vocab_identifiers` before calling this helper.
 fn compound_schema_type(vocab_kind: &str, name: &str) -> String {
     format!("{VOCAB_SCHEMA_PREFIX}{vocab_kind}:{name}")
+}
+
+/// Defensive runtime check: neither `vocab_kind` nor `name` may contain
+/// `:` because `compound_schema_type` uses `:` as its separator. Empty
+/// strings are also rejected (empty name would collapse to ambiguous
+/// schema_types like `vocabulary_entry:annotation_type:`).
+///
+/// Loud-raises via `anyhow::bail!` per `feedback_loud_deferrals` — a
+/// caller sending a colon-bearing name would otherwise silently write a
+/// row that collides with some other legitimate entry on the partial
+/// unique index.
+fn validate_vocab_identifiers(vocab_kind: &str, name: &str) -> Result<()> {
+    if vocab_kind.is_empty() {
+        anyhow::bail!("vocab_kind must not be empty");
+    }
+    if name.is_empty() {
+        anyhow::bail!("vocab_entry name must not be empty");
+    }
+    if vocab_kind.contains(':') {
+        anyhow::bail!(
+            "vocab_kind '{vocab_kind}' must not contain ':' — the compound schema_type uses ':' as a separator"
+        );
+    }
+    if name.contains(':') {
+        anyhow::bail!(
+            "vocab_entry name '{name}' must not contain ':' — the compound schema_type uses ':' as a separator"
+        );
+    }
+    Ok(())
 }
 
 /// Serialize a VocabBody to YAML. Used both by the writer and by the
@@ -373,6 +420,7 @@ pub fn publish_vocabulary_entry(
     conn: &Connection,
     entry: &VocabEntry,
 ) -> Result<VocabEntry> {
+    validate_vocab_identifiers(&entry.vocab_kind, &entry.name)?;
     let body = VocabBody {
         vocab_kind: entry.vocab_kind.clone(),
         name: entry.name.clone(),
@@ -443,6 +491,7 @@ pub fn supersede_vocabulary_entry(
     new_reactive: Option<bool>,
     reason: Option<&str>,
 ) -> Result<VocabEntry> {
+    validate_vocab_identifiers(vocab_kind, name)?;
     let prior = get_vocabulary_entry(conn, vocab_kind, name)?.ok_or_else(|| {
         anyhow::anyhow!(
             "cannot supersede vocabulary_entry ({vocab_kind}, {name}): no active entry"
@@ -497,14 +546,14 @@ pub fn supersede_vocabulary_entry(
         )
     })?;
 
-    emit_vocabulary_event(
+    emit_vocabulary_superseded(
         conn,
-        "vocabulary_superseded",
         vocab_kind,
         name,
         new_body.handler_chain_id.as_deref(),
         new_body.reactive,
-        Some(prior.id),
+        prior.id,
+        effective_reason,
     )?;
 
     invalidate_cache();
@@ -527,12 +576,61 @@ fn emit_vocabulary_event(
     reactive: bool,
     prior_id: Option<i64>,
 ) -> Result<()> {
+    emit_vocabulary_event_with_reason(
+        conn,
+        event_type,
+        vocab_kind,
+        name,
+        handler_chain_id,
+        reactive,
+        prior_id,
+        None,
+    )
+}
+
+/// Supersede-specific emitter that carries the caller-supplied `reason`
+/// as metadata alongside the prior_id. DADBEAR consumers use `reason`
+/// to explain why an annotation type / role changed. Phase 6c-A verifier
+/// pass addition: prior commit dropped `reason` into `triggering_note`
+/// on the contribution row but never surfaced it on the event.
+fn emit_vocabulary_superseded(
+    conn: &Connection,
+    vocab_kind: &str,
+    name: &str,
+    handler_chain_id: Option<&str>,
+    reactive: bool,
+    prior_id: i64,
+    reason: &str,
+) -> Result<()> {
+    emit_vocabulary_event_with_reason(
+        conn,
+        "vocabulary_superseded",
+        vocab_kind,
+        name,
+        handler_chain_id,
+        reactive,
+        Some(prior_id),
+        Some(reason),
+    )
+}
+
+fn emit_vocabulary_event_with_reason(
+    conn: &Connection,
+    event_type: &str,
+    vocab_kind: &str,
+    name: &str,
+    handler_chain_id: Option<&str>,
+    reactive: bool,
+    prior_id: Option<i64>,
+    reason: Option<&str>,
+) -> Result<()> {
     let metadata = serde_json::json!({
         "vocab_kind": vocab_kind,
         "name": name,
         "handler_chain_id": handler_chain_id,
         "reactive": reactive,
         "prior_id": prior_id,
+        "reason": reason,
     })
     .to_string();
     // Vocabulary events are global (no slug). DADBEAR observation
@@ -612,7 +710,73 @@ pub fn seed_genesis_vocabulary(conn: &Connection) -> Result<()> {
     // populate from the DB; invalidation is safe to run before
     // the first read too.
     invalidate_cache();
+
+    // Parity check: until Phase 6c-D flips `GENESIS_BINDINGS` to read
+    // from this registry, an agent extending the role catalog must
+    // update BOTH tables (`role_binding::GENESIS_BINDINGS` +
+    // `vocab_genesis::GENESIS_ROLE_NAMES`). Drift is a silent bug:
+    // the role_binding table ships stale starter chains while the
+    // registry advertises a new role with no binding. Raise loud
+    // so it surfaces on the next boot, not in prod.
+    //
+    // The ONE permitted drift: `cascade_handler` lives in
+    // GENESIS_ROLE_NAMES but NOT in GENESIS_BINDINGS (it's seeded by
+    // `db::create_slug` per-slug, not by the global backfill).
+    check_genesis_role_parity();
+
     Ok(())
+}
+
+fn check_genesis_role_parity() {
+    use super::role_binding::GENESIS_BINDINGS;
+    let binding_names: std::collections::HashSet<&str> =
+        GENESIS_BINDINGS.iter().map(|(n, _)| *n).collect();
+    let vocab_names: std::collections::HashSet<&str> = GENESIS_ROLE_NAMES
+        .iter()
+        .map(|(n, _, _)| *n)
+        .collect();
+
+    // Roles in vocab but not GENESIS_BINDINGS: cascade_handler is the
+    // documented exception. Any OTHER drift is a bug.
+    for name in &vocab_names {
+        if !binding_names.contains(name) && *name != "cascade_handler" {
+            tracing::error!(
+                "vocab parity drift: role '{name}' in GENESIS_ROLE_NAMES but not in \
+                 role_binding::GENESIS_BINDINGS — update both tables (Phase 6c-D will \
+                 eliminate this by flipping GENESIS_BINDINGS to read from the registry)"
+            );
+        }
+    }
+
+    // Roles in GENESIS_BINDINGS but not vocab: always a bug — the
+    // role_binding table ships a starter chain but the registry
+    // doesn't know the role exists.
+    for name in &binding_names {
+        if !vocab_names.contains(name) {
+            tracing::error!(
+                "vocab parity drift: role '{name}' in role_binding::GENESIS_BINDINGS but \
+                 not in vocab_genesis::GENESIS_ROLE_NAMES — registry is missing a role"
+            );
+        }
+    }
+
+    // Chain-id parity: a role listed in BOTH must have the same
+    // handler_chain_id. Drift here is the nastiest case — per-slug
+    // role_bindings seed with one chain while the registry advertises
+    // another.
+    for (binding_name, binding_chain) in GENESIS_BINDINGS {
+        if let Some((_, _, vocab_chain)) =
+            GENESIS_ROLE_NAMES.iter().find(|(n, _, _)| n == binding_name)
+        {
+            if binding_chain != vocab_chain {
+                tracing::error!(
+                    "vocab parity drift: role '{binding_name}' starter chain \
+                     mismatch — GENESIS_BINDINGS says '{binding_chain}', \
+                     GENESIS_ROLE_NAMES says '{vocab_chain}'"
+                );
+            }
+        }
+    }
 }
 
 fn seed_if_missing(
@@ -623,6 +787,7 @@ fn seed_if_missing(
     handler_chain_id: Option<&str>,
     reactive: bool,
 ) -> Result<()> {
+    validate_vocab_identifiers(vocab_kind, name)?;
     let schema_type = compound_schema_type(vocab_kind, name);
     // Idempotency check: is there already an active row for this
     // compound schema_type? If so, skip.
@@ -694,12 +859,22 @@ fn seed_if_missing(
 /// }
 /// ```
 ///
+/// Rejects unknown `vocab_kind` with `UnknownVocabKind` (mapped to HTTP
+/// 400 by the route handler). `feedback_loud_deferrals` — an unknown
+/// kind is a typo, not a valid absent-registry signal.
+///
 /// Callers (HTTP route + tests) pass a fresh Connection. Zero auth
 /// required — vocabulary is public read per the 6c-A spec.
 pub fn handle_get_vocabulary(
     conn: &Connection,
     vocab_kind: &str,
 ) -> Result<VocabListResponse> {
+    if !is_known_vocab_kind(vocab_kind) {
+        return Err(anyhow::Error::new(UnknownVocabKind {
+            kind: vocab_kind.to_string(),
+            valid: VOCAB_KINDS,
+        }));
+    }
     let entries = list_vocabulary(conn, vocab_kind)?;
     let items: Vec<VocabListItem> = entries
         .into_iter()
