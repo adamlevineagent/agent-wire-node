@@ -2918,14 +2918,33 @@ async fn planner_call(
         intent.len(),
     );
 
-    // Call LLM for plan generation — single call with full vocabulary
-    let response = llm::call_model_unified(
+    // walker-v3-completion Wave 7 hotfix: canonical dispatch via Decision
+    // spine. Previously bare call_model_unified with no ctx + no
+    // model_override → Wave 5 guard fires loud. Now resolves "max" tier
+    // via provider_registry and threads model_override through the
+    // unified path with ctx=None. Planner is judgment work → "max" tier.
+    let resolved = config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("max", None, None, None).ok())
+        .ok_or_else(|| {
+            "Planner: provider registry has no 'max' tier routing. \
+             Configure a walker_provider_openrouter contribution with \
+             a 'max' slot model_list entry."
+                .to_string()
+        })?;
+    let response = llm::call_model_unified_with_options_and_ctx(
         &config,
+        None, // one-shot planner call; no cache context
         &system_prompt,
         &intent,
         0.3,
         100_000, // Pillar 43: max_tokens is a safety ceiling, not a behavior control
         Some(&serde_json::json!({"type": "json_object"})), // Pillar 43: prompt controls output, not max_tokens
+        llm::LlmCallOptions {
+            model_override: Some(resolved.tier.model_id.clone()),
+            ..Default::default()
+        },
     )
     .await
     .map_err(|e| format!("Planner LLM call failed: {}", e))?;
