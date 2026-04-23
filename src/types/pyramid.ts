@@ -32,10 +32,24 @@ export const FALLBACK_ANNOTATION_TYPES: string[] = [
 ];
 
 // ── Node shape ──────────────────────────────────────────────────────────
-// NULL in DB maps to "scaffolding" (existing behavior). New shape nodes are
-// written by role handlers (reconciler → debate, synthesizer → meta_layer,
-// gap_dispatcher → gap). Not user-creatable from the wizard.
-export type NodeShape = "scaffolding" | "debate" | "meta_layer" | "gap";
+// Phase 6c-D: node shape is now sourced from the vocab registry (vocab_kind
+// = "node_shape"). The prior 4-variant literal union blocked operator-
+// published shapes from reaching the UI — an agent who publishes a new
+// node-shape vocab entry (e.g. "annotation_cluster") can immediately write
+// rows with that shape; the UI fetches the full list via `useNodeShapes()`
+// from `src/hooks/useVocabulary.ts`.
+//
+// NULL in DB maps to "scaffolding" (existing behavior). `FALLBACK_NODE_SHAPES`
+// is the minimal starter set for loading-state rendering before the network
+// fetch completes.
+export type NodeShape = string;
+
+export const FALLBACK_NODE_SHAPES: string[] = [
+  "scaffolding",
+  "debate",
+  "meta_layer",
+  "gap",
+];
 
 // ── Purpose ─────────────────────────────────────────────────────────────
 export interface Purpose {
@@ -64,7 +78,18 @@ export interface RoleBinding {
   superseded_by?: number | null;
 }
 
-export const ROLE_NAMES = [
+// Phase 6c-D: role names are sourced from the vocab registry (vocab_kind =
+// "role_name"). The prior `ROLE_NAMES` literal union blocked operator-
+// published roles — an agent who publishes a new role vocab entry can bind
+// a handler chain to it the moment the entry is active. Use `useRoleNames()`
+// from `src/hooks/useVocabulary.ts` for runtime lookups.
+//
+// `FALLBACK_ROLE_NAMES` is the minimal starter set for loading-state
+// rendering before the network fetch completes; it mirrors the genesis
+// seed in `src-tauri/src/pyramid/vocab_genesis.rs::GENESIS_ROLE_NAMES`.
+export type RoleName = string;
+
+export const FALLBACK_ROLE_NAMES: string[] = [
   "accretion_handler",
   "reconciler",
   "evidence_tester",
@@ -76,9 +101,7 @@ export const ROLE_NAMES = [
   "sweep",
   "authorize_question",
   "cascade_handler",
-] as const;
-
-export type RoleName = (typeof ROLE_NAMES)[number];
+];
 
 export const CASCADE_HANDLER_VARIANTS = [
   "starter-cascade-judge-gated",

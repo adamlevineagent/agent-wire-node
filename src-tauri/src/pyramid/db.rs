@@ -2643,6 +2643,26 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         );",
     )?;
 
+    // ── Post-build accretion v5 Phase 6c-A/D: vocabulary genesis seed ─────
+    //
+    // Seed the 25 genesis vocabulary entries (11 annotation types,
+    // 4 node shapes, 10 role names) as `vocabulary_entry:<kind>:<name>`
+    // rows in `pyramid_config_contributions`. Idempotent via existence
+    // check on the compound schema_type — existing active rows are
+    // left alone; only missing entries are inserted.
+    //
+    // Phase 6c-D ordering flip: MUST run BEFORE the role-binding backfill
+    // because `backfill_genesis_bindings` now reads the registry instead of
+    // a hardcoded const. If we backfilled first we'd seed zero bindings on
+    // a fresh DB (the vocab doesn't exist yet). Same error-handling shape
+    // as the sibling backfill calls: loud log on failure, don't abort init
+    // (vocab can re-seed on next boot).
+    if let Err(e) = super::vocab_entries::seed_genesis_vocabulary(conn) {
+        tracing::error!(
+            "post-build-v5 Phase 6c-A vocabulary genesis seed failed during init_pyramid_db: {e}"
+        );
+    }
+
     // ── Post-build accretion v5 Phase 5: role-binding backfill ────────────
     //
     // Backfill genesis bindings + cascade_handler for any pre-v5 slug that
@@ -2660,6 +2680,9 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // shouldn't prevent the app from booting; the slugs just keep their
     // pre-v5 state until the next successful init. Loud log message so
     // operators see the drift.
+    //
+    // Phase 6c-D: runs AFTER `seed_genesis_vocabulary` because
+    // `backfill_genesis_bindings` reads the role_name vocab registry.
     if let Err(e) = super::role_binding::backfill_existing_cascade_handlers(conn) {
         tracing::error!(
             "post-build-v5 cascade_handler backfill failed during init_pyramid_db: {e}"
@@ -2668,24 +2691,6 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     if let Err(e) = super::role_binding::backfill_genesis_bindings(conn) {
         tracing::error!(
             "post-build-v5 genesis bindings backfill failed during init_pyramid_db: {e}"
-        );
-    }
-
-    // ── Post-build accretion v5 Phase 6c-A: vocabulary genesis seed ─────
-    //
-    // Seed the 25 genesis vocabulary entries (11 annotation types,
-    // 4 node shapes, 10 role names) as `vocabulary_entry:<kind>:<name>`
-    // rows in `pyramid_config_contributions`. Idempotent via existence
-    // check on the compound schema_type — existing active rows are
-    // left alone; only missing entries are inserted.
-    //
-    // Runs AFTER the Phase 5 role-binding backfill so the role_binding
-    // table's state matches what the vocab registry enumerates. Same
-    // error-handling shape as the sibling backfill calls: loud log on
-    // failure, don't abort init (vocab can re-seed on next boot).
-    if let Err(e) = super::vocab_entries::seed_genesis_vocabulary(conn) {
-        tracing::error!(
-            "post-build-v5 Phase 6c-A vocabulary genesis seed failed during init_pyramid_db: {e}"
         );
     }
 
@@ -6580,7 +6585,12 @@ pub fn get_node_shape(
     let Some((shape_str, payload_json)) = row else {
         return Ok(None);
     };
-    let shape = super::types::NodeShape::from_db(shape_str.as_deref())
+    // Phase 6c-D: `NodeShape::from_db` now vocab-validates (NodeShape is
+    // a newtype wrapper, not an enum). Unknown strings still raise loud
+    // via `UnknownNodeShape`; `parse_shape_payload` raises
+    // `UnknownShapePayload` for shapes accepted by the registry but
+    // without a typed payload struct wired in.
+    let shape = super::types::NodeShape::from_db(conn, shape_str.as_deref())
         .with_context(|| format!("slug='{slug}' node='{node_id}'"))?;
     let payload = super::types::parse_shape_payload(&shape, payload_json.as_deref())
         .with_context(|| format!("slug='{slug}' node='{node_id}'"))?;
@@ -22330,12 +22340,21 @@ mod phase3_post_build_tests {
 
     #[test]
     fn role_for_event_matches_genesis_bindings() {
-        // Every role_bound event must map to a role that's in GENESIS_BINDINGS
-        // (or cascade_handler, which is seeded separately) — otherwise
-        // resolve_binding always raises and the event is permanently stuck.
-        use crate::pyramid::role_binding::GENESIS_BINDINGS;
-        let genesis: std::collections::HashSet<&str> =
-            GENESIS_BINDINGS.iter().map(|(role, _)| *role).collect();
+        // Every role_bound event must map to a role that's in the genesis
+        // role_name vocabulary (or cascade_handler, which is seeded
+        // separately per-slug) — otherwise resolve_binding always raises
+        // and the event is permanently stuck.
+        //
+        // Phase 6c-D: reads the vocab registry instead of the deleted
+        // `GENESIS_BINDINGS` const.
+        let conn = mem_conn();
+        let genesis_entries = crate::pyramid::vocab_entries::list_vocabulary(
+            &conn,
+            crate::pyramid::vocab_entries::VOCAB_KIND_ROLE_NAME,
+        )
+        .unwrap();
+        let genesis: std::collections::HashSet<String> =
+            genesis_entries.iter().map(|e| e.name.clone()).collect();
         let role_bound_events = &[
             "annotation_reacted",
             "debate_spawned",
@@ -22348,8 +22367,7 @@ mod phase3_post_build_tests {
         for ev in role_bound_events {
             let role = dadbear_compiler::role_for_event(ev)
                 .unwrap_or_else(|| panic!("role_bound event '{}' has no role", ev));
-            // cascade_handler is seeded in db::create_slug, not in GENESIS_BINDINGS
-            let ok = genesis.contains(role) || role == "cascade_handler";
+            let ok = genesis.contains(role);
             assert!(ok, "role '{}' for event '{}' is not genesis-seeded", role, ev);
         }
     }
@@ -22860,11 +22878,24 @@ mod phase4_post_build_tests {
         parse_shape_payload, ContentType, DebatePosition, DebateTopic, GapCandidate, GapTopic,
         MetaLayerTopic, NodeShape, RedTeamEntry, ShapePayload, VoteLean,
     };
+    use crate::pyramid::vocab_entries;
     use rusqlite::Connection;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Phase 6c-D: NodeShape::from_db now reads the process-wide vocab
+    /// cache; serialize tests so each test sees a consistent cache scoped
+    /// to its own in-memory DB.
+    fn test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
 
     fn mem_conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();
         init_pyramid_db(&c).unwrap();
+        vocab_entries::invalidate_cache();
         c
     }
 
@@ -22890,22 +22921,29 @@ mod phase4_post_build_tests {
 
     #[test]
     fn node_shape_from_db_strict_accepts_known_and_raises_unknown() {
-        // NULL, empty, and explicit "scaffolding" all normalize to Scaffolding.
-        assert_eq!(NodeShape::from_db(None).unwrap(), NodeShape::Scaffolding);
-        assert_eq!(NodeShape::from_db(Some("")).unwrap(), NodeShape::Scaffolding);
+        // Phase 6c-D: NodeShape is a newtype and `from_db` vocab-validates.
+        // Use an in-memory DB so the genesis vocab is seeded (4 shapes).
+        let _lock = test_lock();
+        let conn = mem_conn();
+        // NULL, empty, and explicit "scaffolding" all normalize to scaffolding
+        // WITHOUT a registry lookup (scaffolding is the DB default).
+        assert!(NodeShape::from_db(&conn, None).unwrap().is_scaffolding());
+        assert!(NodeShape::from_db(&conn, Some("")).unwrap().is_scaffolding());
+        assert!(NodeShape::from_db(&conn, Some("scaffolding"))
+            .unwrap()
+            .is_scaffolding());
         assert_eq!(
-            NodeShape::from_db(Some("scaffolding")).unwrap(),
-            NodeShape::Scaffolding
+            NodeShape::from_db(&conn, Some("debate")).unwrap().as_str(),
+            "debate"
         );
-        assert_eq!(NodeShape::from_db(Some("debate")).unwrap(), NodeShape::Debate);
         assert_eq!(
-            NodeShape::from_db(Some("meta_layer")).unwrap(),
-            NodeShape::MetaLayer
+            NodeShape::from_db(&conn, Some("meta_layer")).unwrap().as_str(),
+            "meta_layer"
         );
-        assert_eq!(NodeShape::from_db(Some("gap")).unwrap(), NodeShape::Gap);
+        assert_eq!(NodeShape::from_db(&conn, Some("gap")).unwrap().as_str(), "gap");
         // Unknown strings raise loudly — silent-default-to-scaffolding is a
         // Pillar 38 bug that would mask real data corruption.
-        let err = NodeShape::from_db(Some("bogus_shape")).unwrap_err();
+        let err = NodeShape::from_db(&conn, Some("bogus_shape")).unwrap_err();
         assert!(
             err.to_string().contains("bogus_shape"),
             "error must surface the offending value: {err}"
@@ -22922,7 +22960,7 @@ mod phase4_post_build_tests {
             vote_lean: None,
         };
         let json = serde_json::to_string(&d).unwrap();
-        match parse_shape_payload(&NodeShape::Debate, Some(&json)).unwrap().unwrap() {
+        match parse_shape_payload(&NodeShape::new("debate"), Some(&json)).unwrap().unwrap() {
             ShapePayload::Debate(round) => assert_eq!(round.concern, "Should we X?"),
             other => panic!("expected Debate, got {other:?}"),
         }
@@ -22934,7 +22972,7 @@ mod phase4_post_build_tests {
             covered_substrate_nodes: vec!["L1-1".into(), "L1-2".into()],
         };
         let json = serde_json::to_string(&m).unwrap();
-        match parse_shape_payload(&NodeShape::MetaLayer, Some(&json)).unwrap().unwrap() {
+        match parse_shape_payload(&NodeShape::new("meta_layer"), Some(&json)).unwrap().unwrap() {
             ShapePayload::MetaLayer(round) => {
                 assert_eq!(round.purpose_question, "Why X?");
                 assert_eq!(round.covered_substrate_nodes.len(), 2);
@@ -22950,7 +22988,7 @@ mod phase4_post_build_tests {
             candidate_resolutions: vec![],
         };
         let json = serde_json::to_string(&g).unwrap();
-        match parse_shape_payload(&NodeShape::Gap, Some(&json)).unwrap().unwrap() {
+        match parse_shape_payload(&NodeShape::new("gap"), Some(&json)).unwrap().unwrap() {
             ShapePayload::Gap(round) => assert_eq!(round.concern, "missing-evidence"),
             other => panic!("expected Gap, got {other:?}"),
         }
@@ -22960,13 +22998,13 @@ mod phase4_post_build_tests {
     fn parse_shape_payload_misalignment_raises() {
         // Scaffolding + non-null payload is a data bug — raise, don't
         // silently drop the payload (might mask real shape corruption).
-        let err = parse_shape_payload(&NodeShape::Scaffolding, Some("{\"any\": 1}"))
+        let err = parse_shape_payload(&NodeShape::scaffolding(), Some("{\"any\": 1}"))
             .unwrap_err();
         assert!(err.to_string().contains("Scaffolding"), "expected shape-name in error: {err}");
 
         // Non-scaffolding shape + NULL payload is a data bug (writer bug or
         // truncation) — raise rather than returning empty payload.
-        let err = parse_shape_payload(&NodeShape::Debate, None).unwrap_err();
+        let err = parse_shape_payload(&NodeShape::new("debate"), None).unwrap_err();
         assert!(err.to_string().contains("debate"), "expected shape-name in error: {err}");
 
         // Shape says Debate but JSON is a Gap-only shape — serde parse error
@@ -22979,7 +23017,7 @@ mod phase4_post_build_tests {
             candidate_resolutions: vec![],
         })
         .unwrap();
-        let err = parse_shape_payload(&NodeShape::Debate, Some(&gap_json)).unwrap_err();
+        let err = parse_shape_payload(&NodeShape::new("debate"), Some(&gap_json)).unwrap_err();
         assert!(
             err.to_string().contains("DebateTopic"),
             "misalignment error must name the expected type: {err}"
@@ -22988,6 +23026,7 @@ mod phase4_post_build_tests {
 
     #[test]
     fn get_node_shape_returns_none_for_missing_node_and_scaffolding_for_plain() {
+        let _lock = test_lock();
         let conn = mem_conn();
         create_slug(&conn, "p4a", &ContentType::Code, "/tmp/p4a").unwrap();
 
@@ -22997,12 +23036,13 @@ mod phase4_post_build_tests {
         // Plain seeded node (both columns NULL) → Scaffolding + no payload.
         insert_node_with_shape_raw(&conn, "p4a", "L0-000", None, None);
         let view = get_node_shape(&conn, "p4a", "L0-000").unwrap().unwrap();
-        assert_eq!(view.shape, NodeShape::Scaffolding);
+        assert!(view.shape.is_scaffolding());
         assert!(view.payload.is_none());
     }
 
     #[test]
     fn get_node_shape_reads_typed_debate_payload() {
+        let _lock = test_lock();
         let conn = mem_conn();
         create_slug(&conn, "p4b", &ContentType::Code, "/tmp/p4b").unwrap();
 
@@ -23022,7 +23062,7 @@ mod phase4_post_build_tests {
         );
 
         let view = get_node_shape(&conn, "p4b", "L1-DBT-1").unwrap().unwrap();
-        assert_eq!(view.shape, NodeShape::Debate);
+        assert_eq!(view.shape.as_str(), "debate");
         match view.payload.unwrap() {
             ShapePayload::Debate(d) => assert_eq!(d.concern, "Should we X?"),
             other => panic!("expected Debate payload, got {other:?}"),
@@ -23031,6 +23071,7 @@ mod phase4_post_build_tests {
 
     #[test]
     fn get_node_shape_propagates_loud_error_on_unknown_db_shape() {
+        let _lock = test_lock();
         let conn = mem_conn();
         create_slug(&conn, "p4c", &ContentType::Code, "/tmp/p4c").unwrap();
 
@@ -23178,7 +23219,7 @@ mod phase4_post_build_tests {
             }),
         };
         let json = serde_json::to_string(&d).unwrap();
-        match parse_shape_payload(&NodeShape::Debate, Some(&json)).unwrap().unwrap() {
+        match parse_shape_payload(&NodeShape::new("debate"), Some(&json)).unwrap().unwrap() {
             ShapePayload::Debate(r) => {
                 assert_eq!(r.concern, "Should we adopt X?");
                 assert_eq!(r.positions.len(), 2);
@@ -23226,7 +23267,7 @@ mod phase4_post_build_tests {
             ],
         };
         let json = serde_json::to_string(&g).unwrap();
-        match parse_shape_payload(&NodeShape::Gap, Some(&json)).unwrap().unwrap() {
+        match parse_shape_payload(&NodeShape::new("gap"), Some(&json)).unwrap().unwrap() {
             ShapePayload::Gap(r) => {
                 assert_eq!(r.concern, "missing-evidence");
                 assert_eq!(r.candidate_resolutions.len(), 2);
@@ -23258,17 +23299,17 @@ mod phase4_post_build_tests {
         // `null` is neither empty (the trim guard treats it as Some("null"))
         // nor a valid object — serde returns a parse error and we surface
         // it loudly with the expected type name in context.
-        let err = parse_shape_payload(&NodeShape::Debate, Some("null")).unwrap_err();
+        let err = parse_shape_payload(&NodeShape::new("debate"), Some("null")).unwrap_err();
         assert!(
             err.to_string().contains("DebateTopic"),
             "expected DebateTopic in error chain: {err}"
         );
-        let err = parse_shape_payload(&NodeShape::MetaLayer, Some("null")).unwrap_err();
+        let err = parse_shape_payload(&NodeShape::new("meta_layer"), Some("null")).unwrap_err();
         assert!(
             err.to_string().contains("MetaLayerTopic"),
             "expected MetaLayerTopic in error chain: {err}"
         );
-        let err = parse_shape_payload(&NodeShape::Gap, Some("null")).unwrap_err();
+        let err = parse_shape_payload(&NodeShape::new("gap"), Some("null")).unwrap_err();
         assert!(
             err.to_string().contains("GapTopic"),
             "expected GapTopic in error chain: {err}"
@@ -23934,19 +23975,29 @@ mod phase5_post_build_tests {
                 "backfill for existing slug uses immediate-redistill default"
             );
 
-            // Genesis bindings must also be backfilled.
-            for (role, expected_chain) in
-                crate::pyramid::role_binding::GENESIS_BINDINGS.iter()
-            {
+            // Genesis bindings must also be backfilled. Phase 6c-D reads
+            // expectations from the vocab registry (cascade_handler is
+            // verified above with its EXISTING policy and is skipped here).
+            let entries = crate::pyramid::vocab_entries::list_vocabulary(
+                &conn,
+                crate::pyramid::vocab_entries::VOCAB_KIND_ROLE_NAME,
+            ).unwrap();
+            for entry in entries {
+                if entry.name == "cascade_handler" {
+                    continue;
+                }
+                let expected_chain = entry.handler_chain_id
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("vocab role '{}' missing handler_chain_id", entry.name));
                 let b = crate::pyramid::role_binding::resolve_binding(
-                    &conn, "legacy5", role,
+                    &conn, "legacy5", &entry.name,
                 ).unwrap_or_else(|e| panic!(
-                    "genesis binding '{}' must be backfilled: {}", role, e
+                    "genesis binding '{}' must be backfilled: {}", entry.name, e
                 ));
                 assert_eq!(
-                    b.handler_chain_id, *expected_chain,
-                    "genesis backfill for '{}' must use the GENESIS_BINDINGS chain id",
-                    role
+                    b.handler_chain_id, expected_chain,
+                    "genesis backfill for '{}' must use the vocab-registry chain id",
+                    entry.name
                 );
             }
         }
@@ -25939,9 +25990,10 @@ mod phase6c_a_post_build_tests {
         assert_eq!(count_active(&conn, "annotation_type"), 11);
         // 4 node shapes: scaffolding, debate, meta_layer, gap.
         assert_eq!(count_active(&conn, "node_shape"), 4);
-        // 11 role names: 10 from Phase 1 GENESIS_BINDINGS + cascade_handler.
-        // The genesis seed table includes cascade_handler even though Phase 1's
-        // GENESIS_BINDINGS doesn't (it's separately seeded per-slug by create_slug).
+        // 11 role names: 10 Phase-1 genesis roles + cascade_handler.
+        // The genesis vocab table includes cascade_handler; the per-slug
+        // binding for cascade_handler is seeded separately by create_slug
+        // with the NEW default (policy depends on slug age).
         assert_eq!(count_active(&conn, "role_name"), 11);
     }
 
@@ -26267,9 +26319,12 @@ mod phase6c_a_post_build_tests {
     fn role_name_genesis_handler_chains_match_phase1_genesis_bindings() {
         let _lock = test_lock();
         let conn = mem_conn();
-        // Phase 1's GENESIS_BINDINGS: (role_name, starter_chain_id). The
-        // Phase 6c-A registry must mirror these exactly (plus include
-        // cascade_handler, which Phase 1 seeds separately).
+        // Phase 6c-D: the vocab registry IS the source of truth for
+        // (role_name, starter_chain_id) pairs. This test pins the canonical
+        // genesis handler chains so a rogue vocab supersession can't
+        // silently re-route a genesis role. `cascade_handler` is included
+        // with its fresh-pyramid default; slug-age policy is tested
+        // separately in the backfill suite.
         let expected: &[(&str, &str)] = &[
             ("accretion_handler", "starter-accretion-handler"),
             ("reconciler", "starter-reconciler"),
@@ -27077,6 +27132,367 @@ mod phase6c_b_post_build_tests {
         assert_eq!(legacy.as_str(), "retired_verb");
         // It is distinct from a newtype-constructed value of the same string.
         assert_eq!(legacy, AnnotationType::new("retired_verb"));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 6c-D (post-build accretion v5): NodeShape + GENESIS_BINDINGS
+// vocab-driven flip. Tests verify:
+//
+//   1. NodeShape::from_db vocab-validates + raises loud on unknown strings
+//   2. parse_shape_payload raises UnknownShapePayload on vocab-known but
+//      payload-unhandled shapes (the phase-10+ limitation)
+//   3. Publishing a new node_shape vocab entry makes NodeShape::from_db
+//      accept it (without unlocking its payload)
+//   4. backfill_genesis_bindings reads from the vocab registry, not a const
+//   5. No source file still references `GENESIS_BINDINGS`
+//   6. init_pyramid_db orders seed-before-backfill so fresh DBs get
+//      bindings correctly on first boot
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod phase6c_d_post_build_tests {
+    use super::*;
+    use crate::pyramid::types::{
+        parse_shape_payload, ContentType, NodeShape, UnknownShapePayload,
+    };
+    use crate::pyramid::vocab_entries::{
+        self, VocabEntry, VOCAB_KIND_NODE_SHAPE, VOCAB_KIND_ROLE_NAME,
+    };
+    use rusqlite::Connection;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Serialize tests behind this mutex so the process-wide vocab cache
+    /// stays scoped to each test's own in-memory DB. Same pattern as the
+    /// earlier 6c-A / 6c-B modules.
+    fn test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        conn
+    }
+
+    /// Insert a pyramid_nodes row with arbitrary node_shape + payload.
+    fn insert_node_raw(
+        conn: &Connection,
+        slug: &str,
+        node_id: &str,
+        node_shape: Option<&str>,
+        shape_payload_json: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version,
+                 node_shape, shape_payload_json)
+             VALUES (?1, ?2, 0, '', '', '', 1, ?3, ?4)",
+            rusqlite::params![node_id, slug, node_shape, shape_payload_json],
+        )
+        .unwrap();
+    }
+
+    // ── Test 1 ─────────────────────────────────────────────────────────
+    // A raw DB row whose node_shape is not in the vocab registry raises
+    // loud via `UnknownNodeShape` — silent-default-to-scaffolding would
+    // mask forward-drift / corruption.
+    #[test]
+    fn node_shape_from_db_rejects_unknown_loud() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+        create_slug(&conn, "p6dd1", &ContentType::Code, "/tmp/p6dd1").unwrap();
+
+        // Use a string that is NOT in genesis AND has not been published —
+        // vocab-validation should refuse.
+        insert_node_raw(
+            &conn,
+            "p6dd1",
+            "L1-UNKNOWN-SHAPE",
+            Some("forward_drift_shape"),
+            Some("{}"),
+        );
+
+        let err = get_node_shape(&conn, "p6dd1", "L1-UNKNOWN-SHAPE").unwrap_err();
+        let msg = format!("{err}") + " " + &format!("{:?}", err);
+        assert!(
+            msg.contains("forward_drift_shape"),
+            "error must surface the offending shape string: {msg}"
+        );
+    }
+
+    // ── Test 2 ─────────────────────────────────────────────────────────
+    // `parse_shape_payload` raises `UnknownShapePayload` for a shape the
+    // registry accepts but no typed payload struct is wired for. This
+    // documents the phase-10+ FIXME: vocab accepts but the parser does not.
+    #[test]
+    fn parse_shape_payload_unknown_shape_raises() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+
+        // Publish a new node_shape vocab entry — vocab accepts it.
+        let entry = VocabEntry {
+            id: 0,
+            vocab_kind: VOCAB_KIND_NODE_SHAPE.to_string(),
+            name: "custom_shape".to_string(),
+            description: "Agent-published shape without a typed payload yet".to_string(),
+            handler_chain_id: None,
+            reactive: false,
+            creates_delta: false,
+            created_at: String::new(),
+            superseded_by: None,
+            supersede_reason: None,
+        };
+        vocab_entries::publish_vocabulary_entry(&conn, &entry).unwrap();
+
+        // NodeShape::from_db now accepts it (Test 3 proves this separately).
+        let shape = NodeShape::from_db(&conn, Some("custom_shape")).unwrap();
+        assert_eq!(shape.as_str(), "custom_shape");
+
+        // parse_shape_payload refuses — no typed payload handler wired in.
+        // The phase-10+ FIXME in types.rs documents that contribution-driven
+        // shape-handler registration is future work.
+        let err = parse_shape_payload(&shape, Some("{}")).unwrap_err();
+        let root = err.root_cause();
+        let down = root.downcast_ref::<UnknownShapePayload>();
+        assert!(
+            down.is_some(),
+            "expected UnknownShapePayload at root, got chain: {err:?}"
+        );
+        assert_eq!(down.unwrap().0, "custom_shape");
+    }
+
+    // ── Test 3 ─────────────────────────────────────────────────────────
+    // Publishing a new node_shape vocab entry makes NodeShape::from_db
+    // accept it. This is the core "agent publishes new shape → ingress
+    // works" claim of 6c-D.
+    #[test]
+    fn publish_new_node_shape_vocab_entry_allows_from_db() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+
+        // Before publish: rejected.
+        let err = NodeShape::from_db(&conn, Some("annotation_cluster")).unwrap_err();
+        assert!(
+            err.to_string().contains("annotation_cluster"),
+            "pre-publish must reject: {err}"
+        );
+
+        // Publish the vocab entry.
+        let entry = VocabEntry {
+            id: 0,
+            vocab_kind: VOCAB_KIND_NODE_SHAPE.to_string(),
+            name: "annotation_cluster".to_string(),
+            description: "Runtime-added shape".to_string(),
+            handler_chain_id: None,
+            reactive: false,
+            creates_delta: false,
+            created_at: String::new(),
+            superseded_by: None,
+            supersede_reason: None,
+        };
+        vocab_entries::publish_vocabulary_entry(&conn, &entry).unwrap();
+
+        // After publish: accepted.
+        let shape = NodeShape::from_db(&conn, Some("annotation_cluster")).unwrap();
+        assert_eq!(shape.as_str(), "annotation_cluster");
+        assert!(!shape.is_scaffolding());
+    }
+
+    // ── Test 4 ─────────────────────────────────────────────────────────
+    // `backfill_genesis_bindings` reads the vocab registry, NOT a const.
+    // Publishing a new role + running backfill must seed the new role's
+    // binding — proving the flip is wired.
+    #[test]
+    fn backfill_genesis_bindings_reads_from_vocab_not_const() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+
+        // Seed a slug. create_slug already runs initialize_genesis_bindings
+        // for the 10 baseline genesis roles + cascade_handler.
+        create_slug(&conn, "p6dd4", &ContentType::Code, "/tmp/p6dd4").unwrap();
+
+        // Publish a brand-new role vocab entry.
+        let new_role = VocabEntry {
+            id: 0,
+            vocab_kind: VOCAB_KIND_ROLE_NAME.to_string(),
+            name: "custom_oracle".to_string(),
+            description: "Agent-published role".to_string(),
+            handler_chain_id: Some("starter-custom-oracle".to_string()),
+            reactive: false,
+            creates_delta: false,
+            created_at: String::new(),
+            superseded_by: None,
+            supersede_reason: None,
+        };
+        vocab_entries::publish_vocabulary_entry(&conn, &new_role).unwrap();
+
+        // Before backfill: the new role has no binding for p6dd4.
+        let pre = crate::pyramid::role_binding::resolve_binding(
+            &conn, "p6dd4", "custom_oracle",
+        );
+        assert!(
+            pre.is_err(),
+            "custom_oracle should have no binding before backfill"
+        );
+
+        // Run backfill — reads the vocab, seeds custom_oracle.
+        let count = crate::pyramid::role_binding::backfill_genesis_bindings(&conn)
+            .unwrap();
+        assert!(count >= 1, "at least one slug processed: {count}");
+
+        // After backfill: custom_oracle is bound to its vocab chain.
+        let post = crate::pyramid::role_binding::resolve_binding(
+            &conn, "p6dd4", "custom_oracle",
+        )
+        .unwrap();
+        assert_eq!(post.handler_chain_id, "starter-custom-oracle");
+    }
+
+    // ── Test 5 ─────────────────────────────────────────────────────────
+    // Grep-equivalent: no source file in the pyramid module still
+    // references the `GENESIS_BINDINGS` identifier (comments ok; the
+    // test searches for the ident in role_binding.rs specifically).
+    #[test]
+    fn genesis_bindings_deleted_no_stale_refs() {
+        let rb = include_str!("role_binding.rs");
+        // The const was `pub const GENESIS_BINDINGS: ...`. A stale const
+        // would re-introduce the identifier at definition site.
+        assert!(
+            !rb.contains("pub const GENESIS_BINDINGS"),
+            "role_binding.rs must not redefine the deleted GENESIS_BINDINGS const"
+        );
+        // Also: no live code reference (comments about history are allowed
+        // but a `for ... in GENESIS_BINDINGS` loop would be live code).
+        assert!(
+            !rb.contains("in GENESIS_BINDINGS"),
+            "role_binding.rs must not iterate GENESIS_BINDINGS"
+        );
+    }
+
+    // ── Test 6 ─────────────────────────────────────────────────────────
+    // `init_pyramid_db` orders `seed_genesis_vocabulary` BEFORE the
+    // `backfill_genesis_bindings` call. Without this ordering, a fresh
+    // DB would backfill against an empty registry and seed zero bindings.
+    //
+    // Test: start fresh, truncate both vocab + bindings for a specific
+    // role after create_slug, re-init, and assert BOTH were re-seeded AND
+    // the binding references the re-seeded vocab entry's chain (proving
+    // the backfill read the vocab AFTER re-seed).
+    #[test]
+    fn init_pyramid_db_orders_vocab_seed_before_binding_backfill() {
+        let _lock = test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("pyramid.db");
+
+        // First init + create a slug with genesis bindings.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            init_pyramid_db(&conn).unwrap();
+            vocab_entries::invalidate_cache();
+            create_slug(&conn, "ord1", &ContentType::Code, "/tmp/ord1").unwrap();
+            // Baseline: both the vocab entry + the binding exist for
+            // `reconciler`.
+            let vocab = vocab_entries::get_vocabulary_entry(
+                &conn, VOCAB_KIND_ROLE_NAME, "reconciler",
+            )
+            .unwrap();
+            assert!(vocab.is_some(), "reconciler vocab seeded");
+            let binding = crate::pyramid::role_binding::resolve_binding(
+                &conn, "ord1", "reconciler",
+            );
+            assert!(binding.is_ok(), "reconciler binding seeded");
+        }
+
+        // Delete the vocab entry AND the binding — simulate a corrupted
+        // prior state. Next init must re-seed both, with vocab first so
+        // binding backfill reads the vocab we just restored.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "DELETE FROM pyramid_config_contributions
+                   WHERE schema_type = 'vocabulary_entry:role_name:reconciler'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM pyramid_role_bindings
+                   WHERE slug = 'ord1' AND role_name = 'reconciler'",
+                [],
+            )
+            .unwrap();
+            vocab_entries::invalidate_cache();
+        }
+
+        // Re-init. seed_genesis_vocabulary runs BEFORE backfill — so the
+        // vocab re-seed completes, then backfill_genesis_bindings reads
+        // the re-seeded vocab and populates the binding.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            init_pyramid_db(&conn).unwrap();
+            vocab_entries::invalidate_cache();
+            // Vocab re-seeded.
+            let vocab = vocab_entries::get_vocabulary_entry(
+                &conn, VOCAB_KIND_ROLE_NAME, "reconciler",
+            )
+            .unwrap();
+            assert!(vocab.is_some(), "reconciler vocab must be re-seeded");
+            // Binding re-seeded from vocab, pointing at the canonical
+            // starter chain.
+            let binding = crate::pyramid::role_binding::resolve_binding(
+                &conn, "ord1", "reconciler",
+            )
+            .unwrap();
+            assert_eq!(
+                binding.handler_chain_id, "starter-reconciler",
+                "binding must be backfilled with the vocab-registry chain"
+            );
+        }
+    }
+
+    // ── Test 7 ─────────────────────────────────────────────────────────
+    // initialize_genesis_bindings iterates vocab and SKIPS cascade_handler
+    // (that's seeded by db::create_slug's explicit policy call). Without
+    // the skip, two writes would race on the same binding and the second
+    // INSERT OR IGNORE would silently lose to the first; we want to
+    // confirm the explicit separation is preserved.
+    #[test]
+    fn initialize_genesis_bindings_skips_cascade_handler() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+        // Create a fresh slug WITHOUT going through create_slug's full
+        // seed so we can observe initialize_genesis_bindings in isolation.
+        conn.execute(
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path, created_at)
+             VALUES ('p6dd7', 'code', '/tmp/p6dd7', CURRENT_TIMESTAMP)",
+            [],
+        )
+        .unwrap();
+
+        crate::pyramid::role_binding::initialize_genesis_bindings(&conn, "p6dd7").unwrap();
+
+        // 10 non-cascade genesis roles bound. cascade_handler NOT bound.
+        let ten_roles = &[
+            "accretion_handler", "reconciler", "evidence_tester", "judge",
+            "debate_steward", "meta_layer_oracle", "synthesizer",
+            "gap_dispatcher", "sweep", "authorize_question",
+        ];
+        for role in ten_roles {
+            crate::pyramid::role_binding::resolve_binding(&conn, "p6dd7", role)
+                .unwrap_or_else(|e| panic!("{role} must be bound: {e}"));
+        }
+        let cascade = crate::pyramid::role_binding::resolve_binding(
+            &conn, "p6dd7", "cascade_handler",
+        );
+        assert!(
+            cascade.is_err(),
+            "cascade_handler must NOT be bound by initialize_genesis_bindings — \
+             db::create_slug owns that binding via CASCADE_HANDLER_NEW_DEFAULT"
+        );
     }
 }
 

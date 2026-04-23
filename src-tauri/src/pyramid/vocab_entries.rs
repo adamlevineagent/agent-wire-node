@@ -741,72 +741,14 @@ pub fn seed_genesis_vocabulary(conn: &Connection) -> Result<()> {
     // the first read too.
     invalidate_cache();
 
-    // Parity check: until Phase 6c-D flips `GENESIS_BINDINGS` to read
-    // from this registry, an agent extending the role catalog must
-    // update BOTH tables (`role_binding::GENESIS_BINDINGS` +
-    // `vocab_genesis::GENESIS_ROLE_NAMES`). Drift is a silent bug:
-    // the role_binding table ships stale starter chains while the
-    // registry advertises a new role with no binding. Raise loud
-    // so it surfaces on the next boot, not in prod.
-    //
-    // The ONE permitted drift: `cascade_handler` lives in
-    // GENESIS_ROLE_NAMES but NOT in GENESIS_BINDINGS (it's seeded by
-    // `db::create_slug` per-slug, not by the global backfill).
-    check_genesis_role_parity();
+    // Phase 6c-D: `check_genesis_role_parity` is DELETED. It was the
+    // drift-guard between the (now-removed) `role_binding::GENESIS_BINDINGS`
+    // const and `vocab_genesis::GENESIS_ROLE_NAMES`. Now that
+    // `role_binding::initialize_genesis_bindings` + `backfill_genesis_bindings`
+    // read the vocab registry directly, there's no const to drift against —
+    // the registry IS the source of truth.
 
     Ok(())
-}
-
-fn check_genesis_role_parity() {
-    use super::role_binding::GENESIS_BINDINGS;
-    let binding_names: std::collections::HashSet<&str> =
-        GENESIS_BINDINGS.iter().map(|(n, _)| *n).collect();
-    let vocab_names: std::collections::HashSet<&str> = GENESIS_ROLE_NAMES
-        .iter()
-        .map(|(n, _, _)| *n)
-        .collect();
-
-    // Roles in vocab but not GENESIS_BINDINGS: cascade_handler is the
-    // documented exception. Any OTHER drift is a bug.
-    for name in &vocab_names {
-        if !binding_names.contains(name) && *name != "cascade_handler" {
-            tracing::error!(
-                "vocab parity drift: role '{name}' in GENESIS_ROLE_NAMES but not in \
-                 role_binding::GENESIS_BINDINGS — update both tables (Phase 6c-D will \
-                 eliminate this by flipping GENESIS_BINDINGS to read from the registry)"
-            );
-        }
-    }
-
-    // Roles in GENESIS_BINDINGS but not vocab: always a bug — the
-    // role_binding table ships a starter chain but the registry
-    // doesn't know the role exists.
-    for name in &binding_names {
-        if !vocab_names.contains(name) {
-            tracing::error!(
-                "vocab parity drift: role '{name}' in role_binding::GENESIS_BINDINGS but \
-                 not in vocab_genesis::GENESIS_ROLE_NAMES — registry is missing a role"
-            );
-        }
-    }
-
-    // Chain-id parity: a role listed in BOTH must have the same
-    // handler_chain_id. Drift here is the nastiest case — per-slug
-    // role_bindings seed with one chain while the registry advertises
-    // another.
-    for (binding_name, binding_chain) in GENESIS_BINDINGS {
-        if let Some((_, _, vocab_chain)) =
-            GENESIS_ROLE_NAMES.iter().find(|(n, _, _)| n == binding_name)
-        {
-            if binding_chain != vocab_chain {
-                tracing::error!(
-                    "vocab parity drift: role '{binding_name}' starter chain \
-                     mismatch — GENESIS_BINDINGS says '{binding_chain}', \
-                     GENESIS_ROLE_NAMES says '{vocab_chain}'"
-                );
-            }
-        }
-    }
 }
 
 fn seed_if_missing(

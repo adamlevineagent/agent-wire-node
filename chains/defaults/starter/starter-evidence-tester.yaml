@@ -24,9 +24,10 @@ description: >
         ]
       }
 
-  This chain is bound to the `evidence_tester` role via GENESIS_BINDINGS
-  (see pyramid/role_binding.rs). Operators may supersede the binding to
-  route evidence testing through a different chain per slug.
+  This chain is bound to the `evidence_tester` role via the role_name vocab
+  registry (see vocab_genesis.rs + role_binding.rs). Operators may
+  supersede the binding to route evidence testing through a different
+  chain per slug.
 content_type: code
 version: "1.0.0"
 author: post-build-accretion-v5

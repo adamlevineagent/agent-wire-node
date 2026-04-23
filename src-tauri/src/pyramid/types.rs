@@ -2329,61 +2329,160 @@ impl std::error::Error for ManifestValidationError {}
 // string primitive "role_bound" + dadbear_work_items.resolved_chain_id column.
 
 /// Error raised when a DB row contains a `node_shape` string value that
-/// is not a recognized `NodeShape` variant. Emitted by `NodeShape::from_db`
-/// so readers fail loud on typos / future-schema drift rather than
-/// silently rendering a shaped node as plain scaffolding.
+/// the vocabulary registry does not know about. Emitted by
+/// `NodeShape::from_db` so readers fail loud on typos / registry drift
+/// rather than silently rendering a shaped node as plain scaffolding.
+///
+/// Phase 6c-D: the enum-variant form of this error (4 hardcoded shapes)
+/// was replaced with a newtype wrapper around a vocabulary-validated
+/// string — an agent can publish a new `NodeShape` vocab entry without
+/// a code deploy. Unknown shapes at read time still raise loud because
+/// the registry is the authoritative list; a DB row whose `node_shape`
+/// string has no active vocab entry is either a forward-drift migration
+/// in progress or a data bug.
 #[derive(Debug, thiserror::Error)]
 #[error("Unknown node_shape value in DB: '{0}'")]
 pub struct UnknownNodeShape(pub String);
 
+// ── Canonical string constants for the 4 genesis node shapes ──
+//
+// Mirror of the AnnotationType convention above. Not an authoritative
+// list — the vocabulary registry is — but internal callers that already
+// know a specific genesis shape string (tests, compiler arms) can refer
+// to these constants instead of repeating the literal.
+pub const NODE_SHAPE_SCAFFOLDING: &str = "scaffolding";
+pub const NODE_SHAPE_DEBATE: &str = "debate";
+pub const NODE_SHAPE_META_LAYER: &str = "meta_layer";
+pub const NODE_SHAPE_GAP: &str = "gap";
+
+/// Error raised when `parse_shape_payload` encounters a shape string that
+/// is known to the vocabulary registry but has no typed payload struct
+/// wired into the parser. Phase 6c-D limitation: the payload-handler
+/// registry is NOT contribution-driven yet (Phase 10+ will add that) —
+/// so an agent CAN publish a new node-shape vocab entry (`annotation_cluster`,
+/// say), and `NodeShape::from_db` will accept it as a valid discriminator,
+/// but until the payload struct + match arm here are added, the shape
+/// reader raises. FIXME(phase-10+): replace this static match with a
+/// contribution-driven shape-handler registry.
+#[derive(Debug, thiserror::Error)]
+#[error("No payload handler registered for node_shape '{0}' — the vocab entry exists but no typed payload struct has been wired into parse_shape_payload (FIXME phase 10+)")]
+pub struct UnknownShapePayload(pub String);
+
 /// Node shape discriminator stored in `pyramid_nodes.node_shape`.
-/// NULL maps to `Scaffolding` — existing behavior preserved.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeShape {
-    Scaffolding,
-    Debate,
-    #[serde(rename = "meta_layer")]
-    MetaLayer,
-    Gap,
-}
+/// NULL / empty / "scaffolding" all normalize to the scaffolding shape.
+///
+/// Phase 6c-D: flipped from a 4-variant enum to a newtype wrapper around
+/// the canonical string — per `feedback_generalize_not_enumerate`.
+/// The vocabulary registry (`pyramid_config_contributions` rows with
+/// `schema_type LIKE 'vocabulary_entry:node_shape:%'`) is the
+/// authoritative catalog. `from_db` validates against it so an agent
+/// who publishes a new node-shape vocab entry can point rows at that
+/// shape the moment the entry is active.
+///
+/// Serde transparent keeps wire compat: serializes to / deserializes from
+/// the plain string. The `node_shape` DB column stores the same string
+/// via `to_db()` (NULL for scaffolding).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NodeShape(String);
 
 impl NodeShape {
+    /// Raw constructor — wraps an arbitrary string. Use for internal call
+    /// sites that already know the string is a canonical genesis shape
+    /// (tests, shape-writer handlers). Write paths that accept external
+    /// input (HTTP, MCP CLI) MUST use `from_db` so unknown strings raise.
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    /// The canonical string form. Stored in `pyramid_nodes.node_shape`
+    /// (NULL for scaffolding via `to_db`) and used as the wire-protocol
+    /// discriminator in JSON.
+    pub fn as_str(&self) -> &str {
+        if self.is_scaffolding() {
+            NODE_SHAPE_SCAFFOLDING
+        } else {
+            &self.0
+        }
+    }
+
+    /// True for the default scaffolding shape (empty inner string OR
+    /// literal "scaffolding"). Empty normalizes to scaffolding so
+    /// `NodeShape::new("")` and `NodeShape::from_db(None)` round-trip
+    /// to the same semantic shape.
+    pub fn is_scaffolding(&self) -> bool {
+        self.0.is_empty() || self.0 == NODE_SHAPE_SCAFFOLDING
+    }
+
+    /// Convenience: the canonical scaffolding sentinel. Equivalent to
+    /// `NodeShape::new("scaffolding")` / `NodeShape::from_db(None)`.
+    pub fn scaffolding() -> Self {
+        Self(String::new())
+    }
+
     /// Convert to the string value stored in `pyramid_nodes.node_shape`.
-    /// `Scaffolding` maps to None (NULL in DB) — no row write needed for the
-    /// default case.
-    pub fn to_db(&self) -> Option<&'static str> {
-        match self {
-            NodeShape::Scaffolding => None,
-            NodeShape::Debate => Some("debate"),
-            NodeShape::MetaLayer => Some("meta_layer"),
-            NodeShape::Gap => Some("gap"),
+    /// Scaffolding maps to None (NULL in DB) — no row write needed for the
+    /// default case; every other shape stores its canonical string.
+    pub fn to_db(&self) -> Option<&str> {
+        if self.is_scaffolding() {
+            None
+        } else {
+            Some(&self.0)
         }
     }
 
-    /// Parse from the optional string stored in the DB column.
-    /// None (NULL) parses as `Scaffolding`. Unknown string values raise
-    /// `UnknownNodeShape` — silent-default-to-scaffolding would let a typo'd
-    /// or future-variant shape silently render as plain scaffolding while
-    /// still holding a payload in `shape_payload_json`, masking a real
-    /// data bug. Per `feedback_loud_deferrals`, fail loud.
-    pub fn from_db(s: Option<&str>) -> Result<Self, UnknownNodeShape> {
-        Ok(match s {
-            None | Some("") | Some("scaffolding") => NodeShape::Scaffolding,
-            Some("debate") => NodeShape::Debate,
-            Some("meta_layer") => NodeShape::MetaLayer,
-            Some("gap") => NodeShape::Gap,
-            Some(other) => return Err(UnknownNodeShape(other.to_string())),
-        })
+    /// Parse from the optional string stored in the DB column, validating
+    /// against the vocabulary registry.
+    ///
+    /// None / empty / "scaffolding" normalize to the scaffolding shape
+    /// WITHOUT hitting the registry (scaffolding is the default, and a
+    /// NULL column existed before the `node_shape` column was added).
+    ///
+    /// Anything else is validated against the `node_shape` vocab kind —
+    /// unknown strings raise `UnknownNodeShape`. Silent-default-to-
+    /// scaffolding would let a typo'd or forward-drift shape silently
+    /// render as plain scaffolding while still holding a payload in
+    /// `shape_payload_json`, masking a real data bug. Per
+    /// `feedback_loud_deferrals`, fail loud.
+    pub fn from_db(
+        conn: &rusqlite::Connection,
+        s: Option<&str>,
+    ) -> Result<Self, UnknownNodeShape> {
+        match s {
+            None | Some("") | Some(NODE_SHAPE_SCAFFOLDING) => Ok(Self::scaffolding()),
+            Some(other) => {
+                match super::vocab_entries::get_vocabulary_entry(
+                    conn,
+                    super::vocab_entries::VOCAB_KIND_NODE_SHAPE,
+                    other,
+                ) {
+                    Ok(Some(_)) => Ok(Self(other.to_string())),
+                    Ok(None) => Err(UnknownNodeShape(other.to_string())),
+                    Err(e) => {
+                        // Registry read failure must NOT silently-accept
+                        // unknown strings — log + refuse.
+                        tracing::error!(
+                            "vocabulary lookup failed while validating node_shape '{other}': {e}"
+                        );
+                        Err(UnknownNodeShape(other.to_string()))
+                    }
+                }
+            }
+        }
     }
 
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            NodeShape::Scaffolding => "scaffolding",
-            NodeShape::Debate => "debate",
-            NodeShape::MetaLayer => "meta_layer",
-            NodeShape::Gap => "gap",
-        }
+    /// Unchecked wrapper — wraps whatever the DB had without vocab
+    /// validation. Callers must only use this in read paths where the
+    /// string was validated at write time (matches the AnnotationType
+    /// `from_db_string` pattern).
+    pub fn from_db_string(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+}
+
+impl std::fmt::Display for NodeShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -2529,45 +2628,59 @@ pub fn parse_shape_payload(
     json: Option<&str>,
 ) -> anyhow::Result<Option<ShapePayload>> {
     let json_str = json.and_then(|s| if s.trim().is_empty() { None } else { Some(s) });
-    match (shape, json_str) {
-        (NodeShape::Scaffolding, None) => Ok(None),
-        (NodeShape::Scaffolding, Some(_)) => {
-            // Scaffolding nodes must not carry a payload. A stray payload
-            // signals a data bug: either the writer was wrong about shape,
-            // or the shape column was corrupted after payload was written.
-            // Fail loud rather than silently discarding the payload.
-            Err(anyhow::anyhow!(
+    let shape_str = shape.as_str();
+
+    // Scaffolding handled first — scaffolding nodes must not carry a payload.
+    if shape.is_scaffolding() {
+        return match json_str {
+            None => Ok(None),
+            Some(_) => Err(anyhow::anyhow!(
                 "pyramid_nodes.shape_payload_json is non-empty but node_shape is Scaffolding — \
                  data bug: shape and payload columns are misaligned"
-            ))
-        }
-        (NodeShape::Debate, None)
-        | (NodeShape::MetaLayer, None)
-        | (NodeShape::Gap, None) => Err(anyhow::anyhow!(
+            )),
+        };
+    }
+
+    // Non-scaffolding shapes require a payload.
+    let payload = json_str.ok_or_else(|| {
+        anyhow::anyhow!(
             "node_shape is '{}' but shape_payload_json is NULL — \
              non-scaffolding shapes require a payload",
-            shape.as_str()
-        )),
-        (NodeShape::Debate, Some(s)) => serde_json::from_str::<DebateTopic>(s)
+            shape_str
+        )
+    })?;
+
+    // Phase 6c-D: match on the canonical string because NodeShape is now
+    // a newtype not an enum. Anything not in the genesis-known set raises
+    // `UnknownShapePayload` loud — the agent can publish a new node-shape
+    // vocab entry (accepted by `NodeShape::from_db`), but until someone
+    // writes the payload struct + extends this match, the parser refuses.
+    //
+    // FIXME(phase-10+): replace this static match with a contribution-driven
+    // shape-handler registry so payload types are first-class contributions
+    // too. Today this is the one spot where NodeShape is NOT fully generalized.
+    match shape_str {
+        NODE_SHAPE_DEBATE => serde_json::from_str::<DebateTopic>(payload)
             .map(|t| Some(ShapePayload::Debate(t)))
             .map_err(|e| {
                 anyhow::anyhow!(
                     "shape_payload_json failed to parse as DebateTopic (node_shape='debate'): {e}"
                 )
             }),
-        (NodeShape::MetaLayer, Some(s)) => serde_json::from_str::<MetaLayerTopic>(s)
+        NODE_SHAPE_META_LAYER => serde_json::from_str::<MetaLayerTopic>(payload)
             .map(|t| Some(ShapePayload::MetaLayer(t)))
             .map_err(|e| {
                 anyhow::anyhow!(
                     "shape_payload_json failed to parse as MetaLayerTopic (node_shape='meta_layer'): {e}"
                 )
             }),
-        (NodeShape::Gap, Some(s)) => serde_json::from_str::<GapTopic>(s)
+        NODE_SHAPE_GAP => serde_json::from_str::<GapTopic>(payload)
             .map(|t| Some(ShapePayload::Gap(t)))
             .map_err(|e| {
                 anyhow::anyhow!(
                     "shape_payload_json failed to parse as GapTopic (node_shape='gap'): {e}"
                 )
             }),
+        other => Err(anyhow::Error::new(UnknownShapePayload(other.to_string()))),
     }
 }

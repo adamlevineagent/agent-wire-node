@@ -9,9 +9,24 @@
 // CRITICAL: this table is ONLY for NEW roles. Existing dispatch in
 // `dadbear_compiler` / `stale_engine` / `build_runner` stays hardcoded.
 //
-// Genesis bindings ship with starter chain IDs. New slugs get them
-// synchronously in `db::create_slug` via `initialize_genesis_bindings`.
-// Existing slugs are backfilled at startup (Phase 8 WS8-E).
+// Phase 6c-D: role-name genesis is no longer an enumerated `GENESIS_BINDINGS`
+// const here — it lives in the `pyramid_config_contributions` vocabulary
+// registry (`vocabulary_entry:role_name:*` rows seeded by
+// `vocab_entries::seed_genesis_vocabulary`). New slugs get genesis bindings
+// synchronously in `db::create_slug` via `initialize_genesis_bindings`, which
+// iterates the registry. Existing slugs are backfilled at startup. An agent
+// can publish a new role with a contribution write and every subsequent
+// `create_slug` / backfill pass picks it up — no code deploy.
+//
+// The `cascade_handler` role is the ONE genesis role with per-slug-age
+// policy (new slugs get judge-gated; backfilled-existing slugs get
+// immediate-redistill). `CASCADE_HANDLER_NEW_DEFAULT` +
+// `CASCADE_HANDLER_EXISTING_DEFAULT` are KEPT as consts because they encode
+// new-vs-existing SLUG SEMANTICS, not role-vocab. These aren't vocabulary
+// entries — they're policy defaults for the `cascade_handler` role depending
+// on slug age. The `cascade_handler` vocab entry documents the canonical
+// fresh-pyramid chain; the backfill consts encode the separate
+// existing-pyramid policy.
 //
 // Resolution semantics (v5 binding decision 9): unresolved binding RAISES.
 // `resolve_binding` returns a typed error; callers should NOT silently skip.
@@ -20,31 +35,18 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use super::types::RoleBinding;
+use super::vocab_entries::{self, VOCAB_KIND_ROLE_NAME};
 
-/// Genesis bindings — role name → starter chain id. Inserted on every new
-/// slug created via `db::create_slug`. `cascade_handler` is seeded separately
-/// by `db::create_slug` itself because its value depends on whether the slug
-/// is being created fresh (judge-gated) or backfilled for pre-existing rows
-/// (immediate-redistill).
-pub const GENESIS_BINDINGS: &[(&str, &str)] = &[
-    ("accretion_handler", "starter-accretion-handler"),
-    ("reconciler", "starter-reconciler"),
-    ("evidence_tester", "starter-evidence-tester"),
-    ("judge", "starter-judge"),
-    ("debate_steward", "starter-debate-steward"),
-    ("meta_layer_oracle", "starter-meta-layer-oracle"),
-    ("synthesizer", "starter-synthesizer"),
-    ("gap_dispatcher", "starter-gap-dispatcher"),
-    ("sweep", "starter-sweep"),
-    ("authorize_question", "starter-authorize-question"),
-];
-
-/// Cascade handler default for NEW pyramids (binding decision 1).
+/// Cascade handler default for NEW pyramids (binding decision 1). Kept as
+/// a const — this is a slug-age policy value, not a vocab entry.
+/// The matching `cascade_handler` vocab entry documents this same string as
+/// the canonical fresh-pyramid chain; the two are deliberately linked.
 pub const CASCADE_HANDLER_NEW_DEFAULT: &str = "starter-cascade-judge-gated";
 
 /// Cascade handler default for EXISTING pyramids backfilled at upgrade
-/// (binding decision 10). Preserves pre-upgrade cascade intent while the
-/// new primitive `annotation_ancestor_redistill` fixes the pre-existing
+/// (binding decision 10). Kept as a const for the same reason: slug-age
+/// policy, not vocab. Preserves pre-upgrade cascade intent while the new
+/// primitive `annotation_ancestor_redistill` fixes the pre-existing
 /// re_distill dead-dispatch bug.
 pub const CASCADE_HANDLER_EXISTING_DEFAULT: &str = "starter-cascade-immediate-redistill";
 
@@ -197,12 +199,26 @@ pub fn list_bindings(conn: &Connection, slug: &str) -> Result<Vec<RoleBinding>> 
 }
 
 /// Populate genesis bindings for a freshly-created slug. Idempotent.
-/// Does NOT set `cascade_handler` — `db::create_slug` sets that separately
-/// using `CASCADE_HANDLER_NEW_DEFAULT` because the new-vs-backfilled
-/// distinction is known at the call site.
+///
+/// Phase 6c-D: reads the vocabulary registry (`role_name` kind). Every
+/// active role_name entry with a non-None `handler_chain_id` is seeded.
+/// `cascade_handler` is EXCLUDED here — `db::create_slug` sets that
+/// separately using `CASCADE_HANDLER_NEW_DEFAULT` because the new-vs-
+/// backfilled distinction is known at the call site and the vocab entry
+/// can't represent both policies.
 pub fn initialize_genesis_bindings(conn: &Connection, slug: &str) -> Result<()> {
-    for (role, chain) in GENESIS_BINDINGS {
-        set_binding_ignore_existing(conn, slug, role, chain)?;
+    let entries = vocab_entries::list_vocabulary(conn, VOCAB_KIND_ROLE_NAME)
+        .with_context(|| format!("failed to list role_name vocab for initialize_genesis_bindings (slug={slug})"))?;
+    for entry in entries {
+        // cascade_handler policy is per-slug-age, not per-vocab — skip it
+        // here so create_slug's explicit CASCADE_HANDLER_NEW_DEFAULT call
+        // owns that binding.
+        if entry.name == "cascade_handler" {
+            continue;
+        }
+        if let Some(chain) = entry.handler_chain_id.as_deref() {
+            set_binding_ignore_existing(conn, slug, &entry.name, chain)?;
+        }
     }
     Ok(())
 }
@@ -238,6 +254,11 @@ pub fn backfill_existing_cascade_handlers(conn: &Connection) -> Result<usize> {
 /// them. Separate from the cascade backfill so an operator's bespoke
 /// cascade choice isn't disturbed — but the other genesis roles do need
 /// to exist before their events can dispatch.
+///
+/// Phase 6c-D: like `initialize_genesis_bindings`, this reads the
+/// vocabulary registry rather than a hardcoded const — so a role an agent
+/// publishes via contribution write is picked up on the next backfill pass
+/// without a code deploy.
 pub fn backfill_genesis_bindings(conn: &Connection) -> Result<usize> {
     let mut stmt = conn.prepare("SELECT slug FROM pyramid_slugs")?;
     let slugs: Vec<String> = stmt

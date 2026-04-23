@@ -1,18 +1,18 @@
 // pyramid/vocab_genesis.rs — Genesis vocabulary seed tables for Phase 6c-A.
 //
 // Hardcoded-vocabulary kill: the 11 AnnotationType variants, 4 NodeShape
-// variants, and 10 role names in `GENESIS_BINDINGS` all live here as
-// const tables. `vocab_entries::seed_genesis_vocabulary` iterates these
-// on every `init_pyramid_db` and idempotently publishes each missing
-// entry into `pyramid_config_contributions` as a `vocabulary_entry`
-// subtype row.
+// variants, and 11 role names (formerly split across `GENESIS_BINDINGS` +
+// the cascade_handler per-slug seed) all live here as const tables.
+// `vocab_entries::seed_genesis_vocabulary` iterates these on every
+// `init_pyramid_db` and idempotently publishes each missing entry into
+// `pyramid_config_contributions` as a `vocabulary_entry` subtype row.
 //
 // Per the architectural-lens principle (Wire's build pipeline is itself
 // contributions — an agent should be able to improve the system), these
 // seed tables are the ONLY place the genesis strings are hardcoded.
-// Phase 6c-B / C / D flip the consumers (AnnotationType enum, MCP/FE
-// constants, NodeShape enum / GENESIS_BINDINGS) to read from the
-// contribution-driven registry that Phase 6c-A ships.
+// Phase 6c-B / C / D flipped the consumers (AnnotationType enum, MCP/FE
+// constants, NodeShape enum, role_binding::GENESIS_BINDINGS) to read from
+// the contribution-driven registry that Phase 6c-A shipped.
 //
 // Shape notes:
 //   - annotation types carry a `reactive` flag. `steel_man` + `red_team`
@@ -26,12 +26,13 @@
 //   - annotation types also carry a `creates_delta` flag (6c-B). True
 //     for `correction` only in genesis; lifts the pre-v5 hardcoded
 //     `AnnotationType::Correction => create_delta(...)` arm into vocab.
-//   - role names carry `handler_chain_id` values matching Phase 1's
-//     `GENESIS_BINDINGS` table in `role_binding.rs`. `cascade_handler`
-//     is also included here — it was previously seeded separately by
-//     `db::create_slug` because its default depends on fresh-vs-
-//     backfilled; the vocab entry documents its canonical default
-//     (judge-gated for fresh pyramids).
+//   - role names carry `handler_chain_id` values. Phase 6c-D deleted the
+//     parallel `GENESIS_BINDINGS` const in `role_binding.rs`; role-binding
+//     seeding now reads this registry directly. `cascade_handler` is
+//     included here too — `db::create_slug` still seeds it separately
+//     per-slug because its default depends on fresh-vs-backfilled; the
+//     vocab entry documents its canonical fresh-pyramid default
+//     (judge-gated).
 //   - node shapes have no `handler_chain_id` today (shapes don't
 //     dispatch on their own — they govern how nodes render / what
 //     payload a node carries).
@@ -161,11 +162,13 @@ pub const GENESIS_NODE_SHAPES: &[(&str, &str)] = &[
 //
 // Tuple shape: (name, description, handler_chain_id)
 //
-// Phase 1's `GENESIS_BINDINGS` ships the first 10; `cascade_handler`
-// was seeded separately by `db::create_slug` with a per-new-vs-
-// backfilled default (see `role_binding::CASCADE_HANDLER_NEW_DEFAULT`).
-// The vocab entry for cascade_handler documents the canonical fresh-
-// pyramid default so the registry represents the full role catalog.
+// Phase 6c-D deleted `role_binding::GENESIS_BINDINGS`; this table is the
+// ONLY hardcoded role-name source now. `cascade_handler` is seeded
+// separately per-slug by `db::create_slug` with a per-new-vs-backfilled
+// default (see `role_binding::CASCADE_HANDLER_NEW_DEFAULT` +
+// `CASCADE_HANDLER_EXISTING_DEFAULT`). The vocab entry for cascade_handler
+// documents the canonical fresh-pyramid default so the registry
+// represents the full role catalog.
 pub const GENESIS_ROLE_NAMES: &[(&str, &str, &str)] = &[
     (
         "accretion_handler",
