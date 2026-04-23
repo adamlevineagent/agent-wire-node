@@ -10225,17 +10225,89 @@ pub fn get_gaps_for_question(
 }
 
 /// Mark a gap as resolved after successful targeted re-examination.
+///
+/// v5 Phase 8-4: also emits a `gap_resolved` observation event so the
+/// `open → dispatched → closed` demand_state transition is observable in
+/// the chronicle. The compiler (map_event_to_primitive) routes the event
+/// via `role_bound` → `meta_layer_oracle` role — the oracle chain is
+/// responsible for deciding what downstream work (if any) the closure
+/// implies (e.g. collapse/replace a Gap-shaped node, retire a Scaffolding
+/// placeholder).
+///
+/// `resolved_by` identifies the caller for audit purposes (chain id,
+/// operator id, "process_gaps_chain_step_f", etc.). Pass a stable token,
+/// not a user-supplied string. Current callers:
+///   - chain_executor::process_gaps (two sites) → "process_gaps_chain_step"
+///   - Phase 9 will add HTTP admin route + meta-layer crystallization
+///     trigger; both one-liners on top of this signature.
 pub fn mark_gap_resolved(
     conn: &Connection,
     slug: &str,
     question_id: &str,
     description: &str,
 ) -> Result<()> {
+    mark_gap_resolved_with_reason(
+        conn,
+        slug,
+        question_id,
+        description,
+        "targeted_reexamination",
+        "process_gaps_chain_step",
+    )
+}
+
+/// Phase 8-4: parameterized variant so Phase 9 callers (HTTP admin,
+/// meta-layer-crystallization) can stamp their own reason/resolved_by.
+/// `mark_gap_resolved` remains the convenience shim with defaults so
+/// the existing callers don't churn.
+pub fn mark_gap_resolved_with_reason(
+    conn: &Connection,
+    slug: &str,
+    question_id: &str,
+    description: &str,
+    resolution_reason: &str,
+    resolved_by: &str,
+) -> Result<()> {
     conn.execute(
         "UPDATE pyramid_gaps SET resolved = 1, resolution_confidence = 1.0
          WHERE slug = ?1 AND question_id = ?2 AND description = ?3",
         rusqlite::params![slug, question_id, description],
     )?;
+
+    // Emit the `gap_resolved` observation event regardless of whether the
+    // UPDATE touched a row — the caller believes the gap is closed, and
+    // the chronicle should reflect that intent even if the row was missing
+    // (e.g. vocab-driven gap that never landed in the legacy table). The
+    // compiler routes this event via role_bound/meta_layer_oracle.
+    let metadata = serde_json::json!({
+        "gap_question_id": question_id,
+        "gap_description": description,
+        "resolution_reason": resolution_reason,
+        "resolved_by": resolved_by,
+    })
+    .to_string();
+
+    // Best-effort write. If observation_events table is missing (partial
+    // schema, test env) we don't want to poison the caller's intent —
+    // they've already marked resolved=1 in pyramid_gaps.
+    if let Err(e) = super::observation_events::write_observation_event(
+        conn,
+        slug,
+        "dadbear",
+        "gap_resolved",
+        None, None, None, None,
+        None, // target_node_id unknown — gap is question-keyed, not node-keyed
+        None, // layer unknown
+        Some(&metadata),
+    ) {
+        tracing::warn!(
+            slug = %slug,
+            question_id = %question_id,
+            error = %e,
+            "mark_gap_resolved: failed to emit gap_resolved observation event (UPDATE succeeded)"
+        );
+    }
+
     Ok(())
 }
 
