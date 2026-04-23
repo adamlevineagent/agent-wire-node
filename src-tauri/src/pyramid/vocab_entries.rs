@@ -63,10 +63,10 @@ pub const VOCAB_KIND_NODE_SHAPE: &str = "node_shape";
 pub const VOCAB_KIND_ROLE_NAME: &str = "role_name";
 
 /// All three genesis-supported vocab_kinds. Callers that want to iterate
-/// every namespace (e.g. tests asserting 11 + 4 + 10 = 25 genesis
-/// entries, the HTTP route that rejects unknown kinds) read from this
-/// list. Adding a fourth vocab_kind means a code-level change — the
-/// namespace dimension is not itself a contribution.
+/// every namespace (e.g. tests asserting 15 + 4 + 11 = 30 genesis
+/// entries after Phase 7c, the HTTP route that rejects unknown kinds)
+/// read from this list. Adding a fourth vocab_kind means a code-level
+/// change — the namespace dimension is not itself a contribution.
 pub const VOCAB_KINDS: &[&str] = &[
     VOCAB_KIND_ANNOTATION_TYPE,
     VOCAB_KIND_NODE_SHAPE,
@@ -684,10 +684,15 @@ fn emit_vocabulary_event_with_reason(
 
 // ── Genesis seeder ──────────────────────────────────────────────────
 
-/// Seed the 25 genesis vocabulary entries (11 annotation types, 4 node
-/// shapes, 10 role names) into the contribution store. Idempotent —
-/// existing active entries are left alone; only missing entries are
-/// inserted. Called from `db::init_pyramid_db` after Phase 5 backfills.
+/// Seed the 30 genesis vocabulary entries (15 annotation types, 4 node
+/// shapes, 11 role names incl. cascade_handler) into the contribution
+/// store. Idempotent — existing active entries are left alone; only
+/// missing entries are inserted. Called from `db::init_pyramid_db` after
+/// Phase 5 backfills.
+///
+/// Phase 7c added 4 pure-vocab annotation types (gap, hypothesis,
+/// purpose_declaration, purpose_shift) — they have no `ANNOTATION_TYPE_*`
+/// const because the enum is vocab-driven post-6c-B.
 ///
 /// Failures on individual entries do not abort the whole seed pass —
 /// each entry is wrapped in a best-effort `if let Err` per the pattern
@@ -695,7 +700,7 @@ fn emit_vocabulary_event_with_reason(
 /// in `init_pyramid_db`. Loud `tracing::error!` on individual failures
 /// so operators see the drift.
 pub fn seed_genesis_vocabulary(conn: &Connection) -> Result<()> {
-    // Annotation types (11)
+    // Annotation types (15 — 11 original + Phase 7c verbs)
     for (name, description, handler_chain_id, reactive, creates_delta) in
         GENESIS_ANNOTATION_TYPES
     {

@@ -419,6 +419,15 @@ pub fn ensure_default_chains(
             "starter-synthesizer.yaml",
             include_str!("../../../chains/defaults/starter/starter-synthesizer.yaml"),
         ),
+        // Post-build accretion v5 Phase 7c: gap_dispatcher role handler.
+        // Dispatched when a `gap` annotation fires annotation_reacted —
+        // vocab handler_chain_id is `starter-gap-dispatcher`. The chain
+        // materializes a Gap node (Scaffolding→Gap upgrade or merge into
+        // existing Gap payload).
+        (
+            "starter-gap-dispatcher.yaml",
+            include_str!("../../../chains/defaults/starter/starter-gap-dispatcher.yaml"),
+        ),
     ];
     for (filename, content) in starter_chains {
         let path = chains_dir.join("defaults").join("starter").join(filename);
@@ -839,6 +848,9 @@ mod phase5_ensure_default_chains_tests {
             "starter-cascade-immediate-redistill",
             "starter-cascade-judge-gated",
             "starter-meta-layer-oracle",
+            // Phase 7c addition: starter-gap-dispatcher must also ship in
+            // Tier 2 so `gap` annotations route correctly in release builds.
+            "starter-gap-dispatcher",
         ] {
             let loaded = load_chain_by_id(id, chains_dir).unwrap_or_else(|e| {
                 panic!(

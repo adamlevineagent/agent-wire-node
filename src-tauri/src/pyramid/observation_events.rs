@@ -45,6 +45,7 @@ use rusqlite::Connection;
 ///                  | "meta_layer_oracle_invoked"     // v5 Phase 7b: meta_layer_oracle chain fired
 ///                  | "meta_layer_oracle_skipped"     // v5 Phase 7b: oracle decided no crystallization
 ///                  | "synthesizer_invoked"           // v5 Phase 7b: synthesizer chain fired
+///                  | "gap_dispatcher_invoked"        // v5 Phase 7c: gap_dispatcher chain fired
 ///                  | "vocabulary_published"          // v5 6c-A: vocab entry publish
 ///                  | "vocabulary_superseded"         // v5 6c-A: vocab entry supersede
 /// - `source_path`: filesystem path for the observation source (NULL for internal events)

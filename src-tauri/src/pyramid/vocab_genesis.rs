@@ -112,14 +112,13 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool)] = 
         false,
         false,
     ),
-    // v5 Phase 7 reactives — steel_man + red_team are the two Phase 7 will
-    // wire to emit `annotation_reacted` observation events. The other two
-    // reactives (`hypothesis`, `gap`, `purpose_declaration`, `purpose_shift`)
-    // are listed in the PLAN but do not exist in the AnnotationType enum
-    // today; this seeder ships ONLY the 11 enum variants so registry
-    // parity with the enum is exact. 6c-B/C will flip consumers to read
-    // from the registry; future phases that extend the 4 v5 verbs will
-    // simply publish additional vocab entries — no code deploy needed.
+    // v5 Phase 7 reactives — steel_man + red_team are the two Phase 7a
+    // wire to emit `annotation_reacted` observation events. Phase 7c adds
+    // the 4 missing v5 verbs (`gap`, `hypothesis`, `purpose_declaration`,
+    // `purpose_shift`) as pure vocab entries — no Rust enum change
+    // required post-6c-B. 6c-B flipped the consumers to vocab lookups, so
+    // these four are picked up on the very next `init_pyramid_db` tick
+    // (and any running slug after `invalidate_cache()`).
     (
         "steel_man",
         "Good-faith reconstruction of an opposing position. Triggers debate_steward.",
@@ -131,6 +130,42 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool)] = 
         "red_team",
         "Adversarial challenge to a position. Triggers debate_steward.",
         Some("starter-debate-steward"),
+        true,
+        false,
+    ),
+    // Phase 7c — 4 v5 reactive verbs added as pure vocab entries.
+    // Per project_convergence_decision.md + project_wire_canonical_vocabulary.md
+    // the enum is vocab-driven post-6c-B, so these ship without an enum
+    // edit. Handler-chain routing maps:
+    //   gap                  → starter-gap-dispatcher   (Phase 7c materializes Gap nodes)
+    //   hypothesis           → starter-debate-steward  (shares debate substrate with steel_man)
+    //   purpose_declaration  → starter-meta-layer-oracle (declaration may trigger crystallization)
+    //   purpose_shift        → starter-meta-layer-oracle (existing oracle path via purpose_shifted events)
+    (
+        "gap",
+        "Explicit missing evidence or open question. Triggers gap_dispatcher to create a Gap node with demand state.",
+        Some("starter-gap-dispatcher"),
+        true,
+        false,
+    ),
+    (
+        "hypothesis",
+        "Proposed causal or structural claim awaiting evidence. Triggers debate_steward for substrate gathering.",
+        Some("starter-debate-steward"),
+        true,
+        false,
+    ),
+    (
+        "purpose_declaration",
+        "Declaration of intended purpose for a pyramid. Triggers meta_layer_oracle to check for crystallization.",
+        Some("starter-meta-layer-oracle"),
+        true,
+        false,
+    ),
+    (
+        "purpose_shift",
+        "Explicit purpose change annotation. Triggers meta_layer_oracle to re-evaluate meta-layer coverage.",
+        Some("starter-meta-layer-oracle"),
         true,
         false,
     ),

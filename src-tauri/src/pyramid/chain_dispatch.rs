@@ -23,8 +23,9 @@ use super::naming::headline_from_analysis;
 use super::step_context::{compute_prompt_hash, StepContext as CacheStepContext};
 use super::transform_runtime;
 use super::types::{
-    Correction, DebatePosition, DebateTopic, Decision, MetaLayerTopic, MetaLayerTopicEntry,
-    NodeShape, PyramidNode, RedTeamEntry, Term, Topic, NODE_SHAPE_DEBATE, NODE_SHAPE_META_LAYER,
+    Correction, DebatePosition, DebateTopic, Decision, GapTopic, MetaLayerTopic,
+    MetaLayerTopicEntry, NodeShape, PyramidNode, RedTeamEntry, ShapePayload, Term, Topic,
+    NODE_SHAPE_DEBATE, NODE_SHAPE_GAP, NODE_SHAPE_META_LAYER,
 };
 use super::{OperationalConfig, Tier1Config};
 
@@ -631,6 +632,10 @@ const MECHANICAL_FUNCTIONS: &[&str] = &[
     "emit_synthesizer_invoked",
     "load_substrate_nodes",
     "create_meta_layer_node",
+    // Post-build accretion v5 Phase 7c — gap_dispatcher chain primitives.
+    "emit_dispatcher_invoked",
+    "load_gap_context",
+    "materialize_gap_node",
 ];
 
 /// Post-build accretion v5 Phase 6b: hard ceiling on sub-chain recursion.
@@ -2508,6 +2513,539 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 Value::from(event_id),
             );
             Ok(Value::Object(out))
+        }
+        // ── Post-build accretion v5 Phase 7c: gap_dispatcher primitives ─────
+        //
+        // Back starter-gap-dispatcher.yaml, the chain dispatched when a `gap`
+        // annotation fires annotation_reacted (vocab handler_chain_id points
+        // here). Mirrors the 7a debate_steward shape:
+        //   emit_dispatcher_invoked → load_gap_context → materialize_gap_node
+        //   → log_and_complete.
+        //
+        // Idempotency: `materialize_gap_node` keys off annotation id via an
+        // `annotation#{id}` evidence-anchor tag on each GapCandidate (same
+        // dedup pattern Phase 7a uses on RedTeamEntry.evidence_anchors). A
+        // re-compile of the same annotation will find the existing anchor
+        // and fall to no_op without re-emitting `gap_detected`.
+        //
+        // role_for_event(gap_detected) is intentionally left unchanged
+        // (returns Some("gap_dispatcher") today). The chain's gap_detected
+        // emission happens AFTER the Gap node is materialized; if the
+        // compiler re-routes it to gap_dispatcher, the second pass finds
+        // the target already Gap-shaped AND no annotation context in the
+        // compiled work item, and the arm falls through to a no_op —
+        // wasted cycle but no data corruption. The `feedback_loud_deferrals`
+        // compromise: leaving the role_for_event arm intact keeps the
+        // compiler's event-map symmetrical (every role-emitted event has
+        // an explicit role mapping, documented at the mapping site), and
+        // the wasted cycle is logged at info! level so operators see it.
+        // See project_auto_stale_system.md for the broader map.
+        "emit_dispatcher_invoked" => {
+            // Chronicle-only observability event — one row in
+            // dadbear_observation_events naming the target + annotation.
+            // Same threading discipline as emit_debate_steward_invoked: the
+            // input envelope's work_item_id / annotation_id / annotation_type
+            // fields are passed through so later steps can back-fill.
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str());
+            let annotation_id = input.get("annotation_id").and_then(|v| v.as_i64());
+            let annotation_type = input
+                .get("annotation_type")
+                .and_then(|v| v.as_str());
+            let mut meta = serde_json::Map::new();
+            if let Some(tid) = target_node_id {
+                meta.insert(
+                    "target_node_id".to_string(),
+                    Value::String(tid.to_string()),
+                );
+            }
+            if let Some(aid) = annotation_id {
+                meta.insert("annotation_id".to_string(), Value::from(aid));
+            }
+            if let Some(at) = annotation_type {
+                meta.insert(
+                    "annotation_type".to_string(),
+                    Value::String(at.to_string()),
+                );
+            }
+            let metadata_json = if meta.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&Value::Object(meta))?)
+            };
+            info!(
+                "[mechanical] emit_dispatcher_invoked slug={} target={:?} annotation_id={:?} annotation_type={:?}",
+                ctx.slug, target_node_id, annotation_id, annotation_type
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "gap_dispatcher_invoked",
+                None,
+                None,
+                None,
+                None,
+                target_node_id,
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            Ok(Value::Object(out))
+        }
+        "load_gap_context" => {
+            // Resolves the triggering annotation + target shape + existing
+            // GapTopic payload (if present). Similar pattern to
+            // load_annotation_and_target (7a) but also reads the Gap
+            // payload so the writer can dedup-append in place.
+            //
+            // annotation_id / annotation_type may arrive on the input
+            // envelope directly, OR be back-filled via the work_item's
+            // observation_event_ids column (matching the debate_steward
+            // backfill path).
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "load_gap_context: missing target_node_id"
+                ))?
+                .to_string();
+
+            let mut annotation_id = input.get("annotation_id").and_then(|v| v.as_i64());
+            let mut annotation_type = input
+                .get("annotation_type")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            if annotation_id.is_none() || annotation_type.is_none() {
+                let work_item_id = input
+                    .get("work_item_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                if let Some(wid) = work_item_id.as_deref() {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let obs_ids_json: Option<String> = conn_guard
+                        .query_row(
+                            "SELECT observation_event_ids FROM dadbear_work_items WHERE id = ?1",
+                            rusqlite::params![wid],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    if let Some(ids_json) = obs_ids_json {
+                        if let Ok(ids) = serde_json::from_str::<Vec<i64>>(&ids_json) {
+                            if let Some(eid) = ids.first() {
+                                let meta: Option<String> = conn_guard
+                                    .query_row(
+                                        "SELECT metadata_json FROM dadbear_observation_events WHERE id = ?1",
+                                        rusqlite::params![eid],
+                                        |row| row.get(0),
+                                    )
+                                    .ok()
+                                    .flatten();
+                                if let Some(m) = meta {
+                                    if let Ok(v) = serde_json::from_str::<Value>(&m) {
+                                        if annotation_id.is_none() {
+                                            annotation_id =
+                                                v.get("annotation_id").and_then(|x| x.as_i64());
+                                        }
+                                        if annotation_type.is_none() {
+                                            annotation_type = v
+                                                .get("annotation_type")
+                                                .and_then(|x| x.as_str())
+                                                .map(String::from);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    drop(conn_guard);
+                }
+            }
+
+            let conn_guard = ctx.db_reader.lock().await;
+
+            let annotation_obj: Value = if let Some(aid) = annotation_id {
+                let row: Option<(i64, String, String, String, Option<String>, String, String, String)> = conn_guard
+                    .query_row(
+                        "SELECT id, slug, node_id, annotation_type, question_context, author,
+                                content, created_at
+                         FROM pyramid_annotations WHERE id = ?1",
+                        rusqlite::params![aid],
+                        |r| Ok((
+                            r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?,
+                            r.get(5)?, r.get(6)?, r.get(7)?,
+                        )),
+                    )
+                    .ok();
+                if let Some((id, slug, node_id, aty, qctx, author, content, created_at)) = row {
+                    if annotation_type.as_deref() != Some(aty.as_str()) {
+                        annotation_type = Some(aty.clone());
+                    }
+                    serde_json::json!({
+                        "id": id,
+                        "slug": slug,
+                        "node_id": node_id,
+                        "annotation_type": aty,
+                        "question_context": qctx,
+                        "author": author,
+                        "content": content,
+                        "created_at": created_at,
+                    })
+                } else {
+                    Value::Null
+                }
+            } else {
+                Value::Null
+            };
+
+            let node_row: Option<(i64, String, String)> = conn_guard
+                .query_row(
+                    "SELECT depth, headline, distilled FROM pyramid_nodes
+                     WHERE slug = ?1 AND id = ?2",
+                    rusqlite::params![ctx.slug, target_node_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok();
+            let shape_view = super::db::get_node_shape(&conn_guard, &ctx.slug, &target_node_id)?;
+            drop(conn_guard);
+
+            let (current_shape, existing_gap_payload_json, target_obj) =
+                if let Some((depth, headline, distilled)) = node_row {
+                    let current_shape = shape_view
+                        .as_ref()
+                        .map(|v| v.shape.as_str().to_string())
+                        .unwrap_or_else(|| "scaffolding".to_string());
+                    let existing_gap_payload = match shape_view.as_ref().and_then(|v| v.payload.as_ref()) {
+                        Some(ShapePayload::Gap(g)) => serde_json::to_value(g).ok(),
+                        _ => None,
+                    };
+                    let current_payload = shape_view
+                        .as_ref()
+                        .and_then(|v| v.payload.as_ref())
+                        .and_then(|p| serde_json::to_value(p).ok())
+                        .unwrap_or(Value::Null);
+                    let target = serde_json::json!({
+                        "id": target_node_id,
+                        "depth": depth,
+                        "headline": headline,
+                        "distilled": distilled,
+                        "current_shape": current_shape,
+                        "current_payload": current_payload,
+                    });
+                    (current_shape, existing_gap_payload, target)
+                } else {
+                    ("scaffolding".to_string(), None, Value::Null)
+                };
+
+            info!(
+                "[mechanical] load_gap_context slug={} target={} annotation_id={:?} annotation_type={:?} current_shape={}",
+                ctx.slug, target_node_id, annotation_id, annotation_type, current_shape,
+            );
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert(
+                "target_node_id".to_string(),
+                Value::String(target_node_id.clone()),
+            );
+            out.insert(
+                "annotation_id".to_string(),
+                annotation_id.map(Value::from).unwrap_or(Value::Null),
+            );
+            out.insert(
+                "annotation_type".to_string(),
+                annotation_type
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+            out.insert("annotation".to_string(), annotation_obj);
+            out.insert("target_node".to_string(), target_obj);
+            out.insert("target_shape".to_string(), Value::String(current_shape));
+            out.insert(
+                "existing_gap_payload".to_string(),
+                existing_gap_payload_json.unwrap_or(Value::Null),
+            );
+            Ok(Value::Object(out))
+        }
+        "materialize_gap_node" => {
+            // Core Gap writer. Given a `gap` annotation + target node:
+            //   - Scaffolding → upgrade to Gap shape with a fresh GapTopic
+            //     seeded from the annotation, emit `gap_detected`.
+            //   - Gap → merge the annotation into the existing payload
+            //     (append a GapCandidate carrying an `annotation#{id}`
+            //     evidence tag for dedup). Do NOT re-emit `gap_detected`.
+            //   - Debate / MetaLayer → skip loud: these typed nodes have
+            //     semantic meaning the Gap writer can't safely overwrite.
+            //     Phase 8+ decides whether to create a sibling Gap node;
+            //     for now we return a no_op action with a reason so the
+            //     operator sees it in the chronicle.
+            //   - Unknown shape → raise (feedback_loud_deferrals).
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "materialize_gap_node: missing target_node_id"
+                ))?
+                .to_string();
+            let annotation_id: Option<i64> = input.get("annotation_id").and_then(|v| v.as_i64());
+            let annotation_obj = input.get("annotation").cloned().unwrap_or(Value::Null);
+
+            if annotation_id.is_none() {
+                info!(
+                    "[mechanical] materialize_gap_node slug={} target={} → no_op (no annotation_id in input — likely gap_detected retrigger)",
+                    ctx.slug, target_node_id
+                );
+                return Ok(serde_json::json!({
+                    "action": "no_op",
+                    "reason": "no annotation_id in input",
+                }));
+            }
+            let annotation_id = annotation_id.unwrap();
+
+            // Pull annotation content + author, preferring threaded
+            // `annotation` object. Loud-raise on missing row per
+            // feedback_loud_deferrals (the verifier fix applied to Phase
+            // 7a's append_annotation_to_debate_node — same discipline here).
+            let ann_content: String;
+            let ann_author: String;
+            let ann_question_context: Option<String>;
+            {
+                let threaded_content = annotation_obj
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let threaded_author = annotation_obj
+                    .get("author")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let threaded_qctx = annotation_obj
+                    .get("question_context")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                if let (Some(c), Some(a)) = (threaded_content, threaded_author) {
+                    ann_content = c;
+                    ann_author = a;
+                    ann_question_context = threaded_qctx;
+                } else {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let row: Option<(String, String, Option<String>)> = conn_guard
+                        .query_row(
+                            "SELECT content, author, question_context FROM pyramid_annotations WHERE id = ?1",
+                            rusqlite::params![annotation_id],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        )
+                        .ok();
+                    drop(conn_guard);
+                    match row {
+                        Some((c, a, q)) => {
+                            ann_content = c;
+                            ann_author = a;
+                            ann_question_context = q;
+                        }
+                        None => {
+                            return Err(anyhow!(
+                                "materialize_gap_node: annotation_id={} not \
+                                 found in pyramid_annotations — stale event or deleted row. \
+                                 Target '{}' will not be mutated.",
+                                annotation_id,
+                                target_node_id,
+                            ));
+                        }
+                    }
+                }
+            };
+
+            // Concern line: prefer question_context (tends to be a
+            // question), fall back to target node's headline, fall back
+            // to a synthesized string. Description is the annotation body.
+            let concern_line = ann_question_context
+                .filter(|q| !q.is_empty())
+                .or_else(|| {
+                    input
+                        .get("target_node")
+                        .and_then(|t| t.get("headline"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or_else(|| format!("Gap at node {}", target_node_id));
+            let description = ann_content.clone();
+
+            // Serialize the transition under the writer mutex so
+            // concurrent `gap` annotations on the same target serialize.
+            let conn_guard = ctx.db_writer.lock().await;
+            let shape_view =
+                super::db::get_node_shape(&conn_guard, &ctx.slug, &target_node_id)?;
+            let current_shape = shape_view
+                .as_ref()
+                .map(|v| v.shape.clone())
+                .unwrap_or_else(NodeShape::scaffolding);
+
+            // The annotation-anchor marker is embedded as a synthetic
+            // GapCandidate whose `resolution_type` field starts with the
+            // reserved prefix `annotation#`. This gives us a stable key
+            // for idempotency without adding a new field to GapCandidate.
+            //
+            // feedback_generalize_not_enumerate: if the annotation-anchor
+            // pattern proliferates beyond 2 use sites, lift it to a
+            // first-class `evidence_anchors: Vec<String>` on GapTopic
+            // (mirroring DebatePosition.evidence_anchors). For Phase 7c
+            // one use site = no schema change warranted.
+            let annotation_anchor_resolution_type = format!("annotation#{annotation_id}");
+
+            let (action, updated_gap, shape_was_upgraded) = if current_shape.is_scaffolding() {
+                // Fresh Gap. Seed a single candidate carrying the anchor.
+                let gap = GapTopic {
+                    concern: concern_line,
+                    description: description.clone(),
+                    demand_state: "open".to_string(),
+                    candidate_resolutions: vec![super::types::GapCandidate {
+                        resolution_type: annotation_anchor_resolution_type.clone(),
+                        cost_estimate: None,
+                        authorization_required: false,
+                    }],
+                };
+                ("created_gap", gap, true)
+            } else if current_shape.as_str() == NODE_SHAPE_GAP {
+                // Merge into existing GapTopic. Idempotent on the anchor.
+                let mut gap = match shape_view.unwrap().payload {
+                    Some(ShapePayload::Gap(g)) => g,
+                    other => {
+                        return Err(anyhow!(
+                            "materialize_gap_node: target '{}' is shape 'gap' but \
+                             payload does not deserialize as GapTopic (got {:?})",
+                            target_node_id,
+                            other.is_some()
+                        ));
+                    }
+                };
+                let already = gap
+                    .candidate_resolutions
+                    .iter()
+                    .any(|c| c.resolution_type == annotation_anchor_resolution_type);
+                if !already {
+                    // Append the anchor candidate. Don't mutate concern /
+                    // description of an existing gap (the original
+                    // concern is load-bearing for operators).
+                    gap.candidate_resolutions.push(super::types::GapCandidate {
+                        resolution_type: annotation_anchor_resolution_type.clone(),
+                        cost_estimate: None,
+                        authorization_required: false,
+                    });
+                }
+                let action_label = if already { "no_op" } else { "appended_anchor" };
+                (action_label, gap, false)
+            } else if current_shape.as_str() == NODE_SHAPE_DEBATE
+                || current_shape.as_str() == NODE_SHAPE_META_LAYER
+            {
+                // Don't destroy typed nodes — no_op loud. Phase 8 decides
+                // whether to create a sibling Gap node (new id).
+                warn!(
+                    "[mechanical] materialize_gap_node slug={} target={} shape={} → skip (Phase 8 will decide sibling-Gap policy)",
+                    ctx.slug, target_node_id, current_shape,
+                );
+                drop(conn_guard);
+                return Ok(serde_json::json!({
+                    "action": "skipped_shape_incompatible",
+                    "reason": format!(
+                        "target '{}' is shape '{}' — gap_dispatcher will not overwrite \
+                         a typed node. Phase 8 may create a sibling Gap node.",
+                        target_node_id, current_shape,
+                    ),
+                    "target_node_id": target_node_id,
+                    "annotation_id": annotation_id,
+                }));
+            } else {
+                // Unknown shape (scaffolding / debate / meta_layer / gap are
+                // the genesis shapes; any other value is a vocab extension
+                // the writer doesn't know how to handle yet).
+                drop(conn_guard);
+                return Err(anyhow!(
+                    "materialize_gap_node: target '{}' has unknown shape '{}' — \
+                     only scaffolding / gap / debate / meta_layer are handled \
+                     (debate + meta_layer skip-loud; scaffolding + gap mutate). \
+                     Publish a gap_dispatcher extension before introducing new \
+                     node shapes.",
+                    target_node_id,
+                    current_shape
+                ));
+            };
+
+            // Write back (scaffolding → gap sets node_shape = 'gap';
+            // existing gap just updates shape_payload_json).
+            let payload_json = serde_json::to_string(&updated_gap)?;
+            conn_guard.execute(
+                "UPDATE pyramid_nodes
+                 SET node_shape = ?1, shape_payload_json = ?2
+                 WHERE slug = ?3 AND id = ?4",
+                rusqlite::params![
+                    NODE_SHAPE_GAP,
+                    payload_json,
+                    ctx.slug,
+                    target_node_id,
+                ],
+            )?;
+
+            // Emit gap_detected only on the shape upgrade (scaffolding→gap).
+            // Append-to-existing-gap does NOT re-emit (the chronicle already
+            // carries the original gap_detected).
+            let mut gap_detected_event_id: Option<i64> = None;
+            if shape_was_upgraded {
+                let meta = serde_json::json!({
+                    "target_node_id": target_node_id,
+                    "annotation_id": annotation_id,
+                    "author": ann_author,
+                    "demand_state": updated_gap.demand_state,
+                })
+                .to_string();
+                let eid = super::observation_events::write_observation_event(
+                    &conn_guard,
+                    &ctx.slug,
+                    "chain",
+                    "gap_detected",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&target_node_id),
+                    None,
+                    Some(&meta),
+                )?;
+                gap_detected_event_id = Some(eid);
+            }
+            drop(conn_guard);
+
+            info!(
+                "[mechanical] materialize_gap_node slug={} target={} action={} gap_detected_event_id={:?}",
+                ctx.slug, target_node_id, action, gap_detected_event_id
+            );
+
+            let updated_payload_value =
+                serde_json::to_value(&updated_gap).unwrap_or(Value::Null);
+            Ok(serde_json::json!({
+                "action": action,
+                "target_node_id": target_node_id,
+                "annotation_id": annotation_id,
+                "shape_was_upgraded": shape_was_upgraded,
+                "gap_detected_event_id": gap_detected_event_id,
+                "updated_payload": updated_payload_value,
+            }))
         }
         // ── Post-build accretion v5 Phase 6b: sub-chain invocation ──────────
         //

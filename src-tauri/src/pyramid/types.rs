@@ -766,7 +766,7 @@ pub struct PyramidAnnotation {
 #[serde(transparent)]
 pub struct AnnotationType(String);
 
-// ── Canonical string constants for the 11 genesis annotation types ──
+// ── Canonical string constants for the 11 pre-Phase-7c genesis types ─
 //
 // These are NOT an authoritative list (the vocabulary registry is) — they
 // exist so internal Rust call sites that already know a specific genesis
@@ -775,6 +775,12 @@ pub struct AnnotationType(String);
 // the canonical string. Adding a new vocab type via contribution does NOT
 // require adding a constant here; these are convenience for the baked-in
 // names that predate the registry.
+//
+// Phase 7c intentionally did NOT add ANNOTATION_TYPE_GAP /
+// ANNOTATION_TYPE_HYPOTHESIS / ANNOTATION_TYPE_PURPOSE_DECLARATION /
+// ANNOTATION_TYPE_PURPOSE_SHIFT consts — the new verbs are pure vocab
+// additions (project_wire_canonical_vocabulary.md). Internal call sites
+// that need to name them read from vocab_entries or use string literals.
 pub const ANNOTATION_TYPE_OBSERVATION: &str = "observation";
 pub const ANNOTATION_TYPE_CORRECTION: &str = "correction";
 pub const ANNOTATION_TYPE_QUESTION: &str = "question";

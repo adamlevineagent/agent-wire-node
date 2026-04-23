@@ -766,12 +766,44 @@ pub fn compile_observations(
 ///
 /// Returns None if the event_type is not a role_bound event (caller should
 /// handle via map_event_to_primitive's primitive string instead).
+///
+/// Phase 7c decision on `gap_detected → gap_dispatcher`:
+///   The `gap` annotation type's vocab entry (Phase 7c addition) nominates
+///   `starter-gap-dispatcher` as its handler_chain_id, so the FIRST
+///   dispatch on a `gap` annotation already routes via the
+///   annotation_reacted → handler_chain_id path (6c-B flip) — not via this
+///   map. The `gap_detected` event is emitted BY the gap_dispatcher chain
+///   AFTER the Gap node is materialized; if the compiler re-routes it
+///   here, a second gap_dispatcher work item gets compiled. That second
+///   run finds:
+///     (a) the target already Gap-shaped, and
+///     (b) no annotation_id in the input (gap_detected events carry
+///         target_node_id only, no annotation context).
+///   `materialize_gap_node` handles (b) with a loud no_op (logged,
+///   returning {action: "no_op"}). So the cost is one wasted work item
+///   per gap-shape upgrade; the correctness property holds (no
+///   double-writes, no infinite recursion — Phase 7a's debate_spawned
+///   arm relies on the same idempotency guard via the semantic-path-id
+///   dedup in `has_active_work_item`).
+///
+///   This is the alternative to option 1 (returning None here for
+///   gap_detected). We chose option 2 because:
+///     - keeps event-map symmetry: every role-emitted event has an
+///       explicit role mapping, documented at the mapping site
+///     - idempotency is already load-bearing for Phase 7a's twin
+///       debate_spawned / annotation_reacted routing; extending the
+///       same pattern to Phase 7c minimizes cross-phase cognitive load
+///     - Phase 8 may add LLM-driven gap enrichment that WANTS a second
+///       dispatch on gap_detected (to kick off candidate generation);
+///       removing the mapping here would be a deferred-work footgun.
 pub(crate) fn role_for_event(event_type: &str) -> Option<&'static str> {
     match event_type {
         // annotation_written + annotation_superseded stay mapped to re_distill
         // in Phase 3 — Phase 8 flips them to role_bound with cascade_handler.
         "annotation_reacted" => Some("cascade_handler"),
         "debate_spawned" | "debate_collapsed" => Some("debate_steward"),
+        // Kept per Phase 7c decision above — gap_dispatcher is idempotent
+        // on the gap_detected retrigger (see materialize_gap_node).
         "gap_detected" => Some("gap_dispatcher"),
         "gap_resolved" | "purpose_shifted" => Some("meta_layer_oracle"),
         "meta_layer_crystallized" => Some("synthesizer"),

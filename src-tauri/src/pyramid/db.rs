@@ -2645,11 +2645,12 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
 
     // ── Post-build accretion v5 Phase 6c-A/D: vocabulary genesis seed ─────
     //
-    // Seed the 25 genesis vocabulary entries (11 annotation types,
-    // 4 node shapes, 10 role names) as `vocabulary_entry:<kind>:<name>`
-    // rows in `pyramid_config_contributions`. Idempotent via existence
-    // check on the compound schema_type — existing active rows are
-    // left alone; only missing entries are inserted.
+    // Seed the 30 genesis vocabulary entries (15 annotation types — 11
+    // pre-7c + 4 Phase 7c verbs, 4 node shapes, 11 role names) as
+    // `vocabulary_entry:<kind>:<name>` rows in `pyramid_config_contributions`.
+    // Idempotent via existence check on the compound schema_type —
+    // existing active rows are left alone; only missing entries are
+    // inserted.
     //
     // Phase 6c-D ordering flip: MUST run BEFORE the role-binding backfill
     // because `backfill_genesis_bindings` now reads the registry instead of
@@ -22222,11 +22223,12 @@ mod phase2_post_build_tests {
             vocab_sorted, all_sorted,
             "AnnotationType::all(conn) must equal the vocab registry's active annotation_type set"
         );
-        // Spot check: 11 genesis entries seeded.
+        // Spot check: 15 genesis entries seeded (Phase 7c: 11 original +
+        // gap / hypothesis / purpose_declaration / purpose_shift).
         assert_eq!(
             all_sorted.len(),
-            11,
-            "genesis seeds 11 annotation_type entries; length drift means the seeder lost one"
+            15,
+            "genesis seeds 15 annotation_type entries; length drift means the seeder lost one"
         );
     }
 
@@ -26034,12 +26036,16 @@ mod phase6c_a_post_build_tests {
     }
 
     #[test]
-    fn genesis_seeds_11_annotation_types_4_shapes_10_roles() {
+    fn genesis_seeds_15_annotation_types_4_shapes_11_roles() {
         let _lock = test_lock();
         let conn = mem_conn();
-        // 11 annotation types: observation, correction, question, friction,
-        // idea, era, transition, health_check, directory, steel_man, red_team.
-        assert_eq!(count_active(&conn, "annotation_type"), 11);
+        // Phase 7c: 15 annotation types.
+        //   11 original (observation, correction, question, friction,
+        //   idea, era, transition, health_check, directory, steel_man,
+        //   red_team) +
+        //   4 Phase 7c verbs (gap, hypothesis, purpose_declaration,
+        //   purpose_shift) published as pure vocab entries.
+        assert_eq!(count_active(&conn, "annotation_type"), 15);
         // 4 node shapes: scaffolding, debate, meta_layer, gap.
         assert_eq!(count_active(&conn, "node_shape"), 4);
         // 11 role names: 10 Phase-1 genesis roles + cascade_handler.
@@ -26310,16 +26316,18 @@ mod phase6c_a_post_build_tests {
     }
 
     #[test]
-    fn http_get_vocabulary_annotation_type_returns_11_genesis_entries() {
+    fn http_get_vocabulary_annotation_type_returns_15_genesis_entries() {
         let _lock = test_lock();
         let conn = mem_conn();
         let response =
             vocab_entries::handle_get_vocabulary(&conn, VOCAB_KIND_ANNOTATION_TYPE).unwrap();
         assert_eq!(response.vocab_kind, "annotation_type");
+        // Phase 7c: 11 original + gap / hypothesis / purpose_declaration /
+        // purpose_shift = 15.
         assert_eq!(
             response.entries.len(),
-            11,
-            "genesis ships 11 annotation types, got {}",
+            15,
+            "genesis ships 15 annotation types, got {}",
             response.entries.len()
         );
         // Spot-check: observation is non-reactive, steel_man is reactive.
@@ -27585,7 +27593,16 @@ mod phase6c_d_post_build_tests {
             );
         }
 
-        // Every ANNOTATION_TYPE_* const must appear in GENESIS_ANNOTATION_TYPES.
+        // Every ANNOTATION_TYPE_* const must appear in
+        // GENESIS_ANNOTATION_TYPES. The reverse direction is NOT required
+        // post-6c-B — the `ANNOTATION_TYPE_*` consts are documented as a
+        // convenience for internal Rust call sites that predate the
+        // registry, NOT an authoritative list (see the long comment above
+        // the const block in types.rs). Phase 7c adds 4 new vocab entries
+        // (`gap`, `hypothesis`, `purpose_declaration`, `purpose_shift`)
+        // as pure vocab additions — they don't get matching consts, and
+        // that's the point of the vocab-driven flip: an agent can publish
+        // a new annotation type without a code deploy.
         let at_consts = &[
             ANNOTATION_TYPE_OBSERVATION,
             ANNOTATION_TYPE_CORRECTION,
@@ -27611,14 +27628,8 @@ mod phase6c_d_post_build_tests {
                  or delete the stale const",
             );
         }
-        for g in &at_genesis {
-            assert!(
-                at_consts.contains(g),
-                "GENESIS_ANNOTATION_TYPES entry '{g}' has no matching \
-                 ANNOTATION_TYPE_* const in types.rs — add the const or \
-                 drop the vocab seed",
-            );
-        }
+        // NB: no reverse check. Vocab-only entries (Phase 7c verbs) are
+        // legitimate and must not cause a drift-guard fail.
     }
 }
 
@@ -29157,6 +29168,905 @@ mod phase7b_post_build_tests {
         }
 
         // CAS the oracle work item to applied to mirror the supervisor arm.
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let rows = writer
+            .execute(
+                "UPDATE dadbear_work_items
+                    SET state = 'applied', state_changed_at = ?1, applied_at = ?1
+                  WHERE id = ?2 AND state = 'compiled'",
+                rusqlite::params![now, wi_id],
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "applied CAS must succeed");
+        let final_state: String = writer
+            .query_row(
+                "SELECT state FROM dadbear_work_items WHERE id = ?1",
+                rusqlite::params![wi_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(final_state, "applied");
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Post-build accretion v5 Phase 7c: starter-gap-dispatcher + Gap writer + 4 v5 verbs.
+//
+// Covers 7c-1 through 7c-7:
+//   * GENESIS_ANNOTATION_TYPES has 15 entries after the 4 pure-vocab
+//     additions (gap, hypothesis, purpose_declaration, purpose_shift).
+//   * starter-gap-dispatcher.yaml parses as the canonical 4-step chain.
+//   * materialize_gap_node handles Scaffolding / Gap / Debate|MetaLayer
+//     / unknown shapes per the feedback_loud_deferrals discipline.
+//   * gap_detected fires exactly once per shape upgrade (not on append).
+//   * Crown jewel — a `gap` annotation flows through
+//     process_annotation_hook → compile tick → execute chain → Gap
+//     node + gap_detected event + work item CAS.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod phase7c_post_build_tests {
+    use super::*;
+    use super::post_build_test_support::test_lock;
+    use crate::pyramid::types::{
+        AnnotationType, ContentType, DebatePosition, DebateTopic, GapCandidate, GapTopic,
+        MetaLayerTopic, PyramidAnnotation, ShapePayload, NODE_SHAPE_DEBATE, NODE_SHAPE_GAP,
+        NODE_SHAPE_META_LAYER,
+    };
+    use crate::pyramid::{chain_executor, chain_loader, dadbear_compiler, observation_events, vocab_entries};
+    use rusqlite::Connection;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex as TokioMutex;
+
+    fn chains_dir_path() -> PathBuf {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        PathBuf::from(manifest).parent().unwrap().join("chains")
+    }
+
+    fn test_pyramid_state(conn: Connection) -> Arc<crate::pyramid::PyramidState> {
+        let db = Arc::new(TokioMutex::new(conn));
+        let config = crate::pyramid::llm::LlmConfig::default();
+        Arc::new(crate::pyramid::PyramidState {
+            reader: db.clone(),
+            writer: db,
+            config: Arc::new(tokio::sync::RwLock::new(config)),
+            active_build: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            data_dir: None,
+            stale_engines: Arc::new(TokioMutex::new(HashMap::new())),
+            file_watchers: Arc::new(TokioMutex::new(HashMap::new())),
+            vine_builds: Arc::new(TokioMutex::new(HashMap::new())),
+            use_chain_engine: AtomicBool::new(false),
+            use_ir_executor: AtomicBool::new(true),
+            event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
+            operational: Arc::new(crate::pyramid::OperationalConfig::default()),
+            chains_dir: chains_dir_path(),
+            remote_query_rate_limiter: Arc::new(TokioMutex::new(HashMap::new())),
+            absorption_gate: Arc::new(TokioMutex::new(crate::pyramid::AbsorptionGate::new())),
+            build_event_bus: Arc::new(crate::pyramid::event_bus::BuildEventBus::new()),
+            supabase_url: None,
+            supabase_anon_key: None,
+            csrf_secret: [0u8; 32],
+            dadbear_handle: Arc::new(TokioMutex::new(None)),
+            dadbear_supervisor_handle: Arc::new(TokioMutex::new(None)),
+            dadbear_in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            provider_registry: {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                Arc::new(crate::pyramid::provider::ProviderRegistry::new(store))
+            },
+            credential_store: {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                store
+            },
+            schema_registry: Arc::new(crate::pyramid::schema_registry::SchemaRegistry::new()),
+            cross_pyramid_router: Arc::new(
+                crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
+            ),
+            ollama_pull_cancel: Arc::new(AtomicBool::new(false)),
+            ollama_pull_in_progress: Arc::new(TokioMutex::new(None)),
+        })
+    }
+
+    fn fresh_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        conn
+    }
+
+    fn seed_scaffolding_node(conn: &Connection, slug: &str, node_id: &str) {
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES (?1, ?2, 1, 'gap target headline', 'distilled body', '', 1)",
+            rusqlite::params![node_id, slug],
+        )
+        .unwrap();
+    }
+
+    fn seed_existing_gap_node(
+        conn: &Connection,
+        slug: &str,
+        node_id: &str,
+        gap: &GapTopic,
+    ) {
+        let payload = serde_json::to_string(gap).unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version,
+                 node_shape, shape_payload_json)
+             VALUES (?1, ?2, 1, 'existing gap', 'existing gap distilled', '', 1, ?3, ?4)",
+            rusqlite::params![node_id, slug, NODE_SHAPE_GAP, payload],
+        )
+        .unwrap();
+    }
+
+    fn seed_existing_debate_node(
+        conn: &Connection,
+        slug: &str,
+        node_id: &str,
+        debate: &DebateTopic,
+    ) {
+        let payload = serde_json::to_string(debate).unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version,
+                 node_shape, shape_payload_json)
+             VALUES (?1, ?2, 1, 'existing debate', 'existing debate distilled', '', 1, ?3, ?4)",
+            rusqlite::params![node_id, slug, NODE_SHAPE_DEBATE, payload],
+        )
+        .unwrap();
+    }
+
+    fn seed_existing_meta_layer_node(
+        conn: &Connection,
+        slug: &str,
+        node_id: &str,
+    ) {
+        let ml = MetaLayerTopic {
+            purpose_question: "Some purpose".to_string(),
+            parent_meta_layer_id: None,
+            covered_substrate_nodes: vec!["L0-A".to_string()],
+            topics: vec![],
+        };
+        let payload = serde_json::to_string(&ml).unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version,
+                 node_shape, shape_payload_json)
+             VALUES (?1, ?2, 2, 'meta layer', 'ml distilled', '', 1, ?3, ?4)",
+            rusqlite::params![node_id, slug, NODE_SHAPE_META_LAYER, payload],
+        )
+        .unwrap();
+    }
+
+    fn save_ann(conn: &Connection, slug: &str, node_id: &str, ty: &str, content: &str, author: &str) -> PyramidAnnotation {
+        let ann = PyramidAnnotation {
+            id: 0,
+            slug: slug.to_string(),
+            node_id: node_id.to_string(),
+            annotation_type: AnnotationType::new(ty),
+            content: content.to_string(),
+            question_context: None,
+            author: author.to_string(),
+            created_at: String::new(),
+        };
+        save_annotation(conn, &ann).unwrap()
+    }
+
+    fn emit_annotation_reacted(
+        conn: &Connection,
+        slug: &str,
+        annotation: &PyramidAnnotation,
+        handler_chain_id: &str,
+    ) -> i64 {
+        let metadata = serde_json::json!({
+            "annotation_id": annotation.id,
+            "annotation_type": annotation.annotation_type.as_str(),
+            "target_node_id": annotation.node_id,
+            "handler_chain_id": handler_chain_id,
+            "author": annotation.author,
+        })
+        .to_string();
+        observation_events::write_observation_event(
+            conn,
+            slug,
+            "annotation",
+            "annotation_reacted",
+            None,
+            None,
+            None,
+            None,
+            Some(&annotation.node_id),
+            None,
+            Some(&metadata),
+        )
+        .unwrap()
+    }
+
+    // ── 7c-7.1: gap_dispatcher chain loads via chain_loader ────────────
+
+    #[test]
+    fn gap_dispatcher_chain_loads_via_chain_loader() {
+        let chains_dir = chains_dir_path();
+        let loaded = chain_loader::load_chain_by_id("starter-gap-dispatcher", &chains_dir)
+            .expect("starter-gap-dispatcher must load");
+        assert_eq!(loaded.id, "starter-gap-dispatcher");
+        assert!(!loaded.steps.is_empty());
+        for step in &loaded.steps {
+            assert!(step.mechanical, "Phase 7c ships mechanical-only");
+            assert!(step.rust_function.is_some());
+        }
+        let names: Vec<&str> = loaded.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["emit_invoked", "load_context", "materialize_gap", "complete"],
+            "canonical 4-step mechanical graph"
+        );
+        let fns: Vec<Option<&str>> = loaded
+            .steps
+            .iter()
+            .map(|s| s.rust_function.as_deref())
+            .collect();
+        assert_eq!(
+            fns,
+            vec![
+                Some("emit_dispatcher_invoked"),
+                Some("load_gap_context"),
+                Some("materialize_gap_node"),
+                Some("log_and_complete"),
+            ],
+            "each step must bind the expected mechanical function"
+        );
+    }
+
+    // ── 7c-7.2: genesis seeds 15 annotation types after Phase 7c ───────
+
+    #[test]
+    fn genesis_seeds_15_annotation_types_after_phase7c() {
+        let _lock = test_lock();
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+
+        let active = vocab_entries::list_vocabulary(
+            &conn,
+            vocab_entries::VOCAB_KIND_ANNOTATION_TYPE,
+        )
+        .unwrap();
+        assert_eq!(
+            active.len(),
+            15,
+            "Phase 7c adds 4 verbs to the 11 original — got {}",
+            active.len()
+        );
+
+        for name in &["gap", "hypothesis", "purpose_declaration", "purpose_shift"] {
+            let entry = vocab_entries::get_vocabulary_entry(
+                &conn,
+                vocab_entries::VOCAB_KIND_ANNOTATION_TYPE,
+                name,
+            )
+            .unwrap();
+            assert!(
+                entry.is_some(),
+                "Phase 7c vocab verb '{}' must be present",
+                name
+            );
+        }
+    }
+
+    // ── 7c-7.3: gap vocab entry points at starter-gap-dispatcher ───────
+
+    #[test]
+    fn gap_annotation_type_vocab_is_reactive_with_dispatcher_handler() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        let entry = vocab_entries::get_vocabulary_entry(
+            &conn,
+            vocab_entries::VOCAB_KIND_ANNOTATION_TYPE,
+            "gap",
+        )
+        .unwrap()
+        .expect("gap vocab entry must exist after genesis");
+        assert_eq!(entry.reactive, true, "gap must be reactive");
+        assert_eq!(entry.creates_delta, false, "gap does not create deltas");
+        assert_eq!(
+            entry.handler_chain_id.as_deref(),
+            Some("starter-gap-dispatcher"),
+            "gap handler_chain_id must nominate starter-gap-dispatcher"
+        );
+    }
+
+    // ── 7c-7.4: hypothesis → debate_steward (shares substrate w/ steel_man)
+
+    #[test]
+    fn hypothesis_routes_to_debate_steward_like_steel_man() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        let entry = vocab_entries::get_vocabulary_entry(
+            &conn,
+            vocab_entries::VOCAB_KIND_ANNOTATION_TYPE,
+            "hypothesis",
+        )
+        .unwrap()
+        .expect("hypothesis vocab entry must exist");
+        assert_eq!(entry.reactive, true);
+        assert_eq!(
+            entry.handler_chain_id.as_deref(),
+            Some("starter-debate-steward"),
+            "hypothesis shares debate substrate routing with steel_man / red_team"
+        );
+    }
+
+    // ── 7c-7.5: purpose_declaration + purpose_shift → meta_layer_oracle
+
+    #[test]
+    fn purpose_declaration_and_purpose_shift_route_to_oracle() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        for name in &["purpose_declaration", "purpose_shift"] {
+            let entry = vocab_entries::get_vocabulary_entry(
+                &conn,
+                vocab_entries::VOCAB_KIND_ANNOTATION_TYPE,
+                name,
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name} must exist in genesis"));
+            assert_eq!(entry.reactive, true, "{name} must be reactive");
+            assert_eq!(
+                entry.handler_chain_id.as_deref(),
+                Some("starter-meta-layer-oracle"),
+                "{name} must route to the oracle"
+            );
+        }
+    }
+
+    // ── 7c-7.6: materialize_gap_node upgrades Scaffolding to Gap ───────
+
+    #[tokio::test]
+    async fn materialize_gap_node_upgrades_scaffolding() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7c1", &ContentType::Code, "/tmp/p7c1").unwrap();
+        seed_scaffolding_node(&conn, "p7c1", "node-gap-1");
+        let ann = save_ann(
+            &conn,
+            "p7c1",
+            "node-gap-1",
+            "gap",
+            "We don't have evidence for the performance cliff at 10k nodes.",
+            "alice",
+        );
+        emit_annotation_reacted(&conn, "p7c1", &ann, "starter-gap-dispatcher");
+
+        let result =
+            dadbear_compiler::run_compilation_for_slug(&conn, "p7c1", None, None).unwrap();
+        assert!(result.items_compiled >= 1, "annotation_reacted must compile");
+        let wi_id: String = conn
+            .query_row(
+                "SELECT id FROM dadbear_work_items
+                  WHERE slug = 'p7c1' AND step_name = 'cascade_reacted'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let state_pyr = test_pyramid_state(conn);
+        let chain = chain_loader::load_chain_by_id(
+            "starter-gap-dispatcher",
+            &state_pyr.chains_dir,
+        )
+        .expect("starter-gap-dispatcher must load");
+        chain_executor::execute_chain_for_target(
+            &state_pyr,
+            &chain,
+            "p7c1",
+            Some("node-gap-1"),
+            serde_json::json!({
+                "work_item_id": wi_id,
+                "target_id": "node-gap-1",
+                "step_name": "cascade_reacted",
+                "layer": 1,
+            }),
+        )
+        .await
+        .expect("gap_dispatcher chain must succeed");
+
+        let writer = state_pyr.writer.lock().await;
+        let view = get_node_shape(&writer, "p7c1", "node-gap-1").unwrap().unwrap();
+        assert_eq!(view.shape.as_str(), NODE_SHAPE_GAP);
+        match view.payload {
+            Some(ShapePayload::Gap(g)) => {
+                assert_eq!(g.demand_state, "open", "fresh gap is demand_state=open");
+                assert!(
+                    g.candidate_resolutions
+                        .iter()
+                        .any(|c| c.resolution_type.starts_with("annotation#")),
+                    "GapTopic must carry the annotation anchor for dedup"
+                );
+                assert!(
+                    !g.description.is_empty(),
+                    "description populated from annotation content"
+                );
+            }
+            other => panic!("expected Gap payload, got {other:?}"),
+        }
+    }
+
+    // ── 7c-7.7: append-to-existing-gap is idempotent, no re-emit ───────
+
+    #[tokio::test]
+    async fn materialize_gap_node_appends_to_existing_gap_without_reemitting_gap_detected() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7c2", &ContentType::Code, "/tmp/p7c2").unwrap();
+        // Pre-existing Gap already carries one anchor (annotation#99) so
+        // the later materialize call is the "second" author adding theirs.
+        let existing = GapTopic {
+            concern: "Pre-existing concern".to_string(),
+            description: "Pre-existing description".to_string(),
+            demand_state: "open".to_string(),
+            candidate_resolutions: vec![GapCandidate {
+                resolution_type: "annotation#99".to_string(),
+                cost_estimate: None,
+                authorization_required: false,
+            }],
+        };
+        seed_existing_gap_node(&conn, "p7c2", "node-gap-2", &existing);
+
+        let ann = save_ann(
+            &conn,
+            "p7c2",
+            "node-gap-2",
+            "gap",
+            "Second gap annotation on the same target.",
+            "bob",
+        );
+        emit_annotation_reacted(&conn, "p7c2", &ann, "starter-gap-dispatcher");
+        dadbear_compiler::run_compilation_for_slug(&conn, "p7c2", None, None).unwrap();
+        let wi_id: String = conn
+            .query_row(
+                "SELECT id FROM dadbear_work_items
+                  WHERE slug = 'p7c2' AND step_name = 'cascade_reacted'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let state_pyr = test_pyramid_state(conn);
+        let chain = chain_loader::load_chain_by_id(
+            "starter-gap-dispatcher",
+            &state_pyr.chains_dir,
+        )
+        .unwrap();
+
+        let inputs = serde_json::json!({
+            "work_item_id": wi_id,
+            "target_id": "node-gap-2",
+            "step_name": "cascade_reacted",
+            "layer": 1,
+        });
+
+        // Run twice.
+        chain_executor::execute_chain_for_target(
+            &state_pyr,
+            &chain,
+            "p7c2",
+            Some("node-gap-2"),
+            inputs.clone(),
+        )
+        .await
+        .unwrap();
+        chain_executor::execute_chain_for_target(
+            &state_pyr,
+            &chain,
+            "p7c2",
+            Some("node-gap-2"),
+            inputs,
+        )
+        .await
+        .unwrap();
+
+        let writer = state_pyr.writer.lock().await;
+        let view = get_node_shape(&writer, "p7c2", "node-gap-2").unwrap().unwrap();
+        match view.payload {
+            Some(ShapePayload::Gap(g)) => {
+                // Exactly 2 anchors: the pre-seeded annotation#99 + the
+                // one from ann.id. Idempotent re-run does NOT duplicate.
+                let anchor_count = g
+                    .candidate_resolutions
+                    .iter()
+                    .filter(|c| c.resolution_type.starts_with("annotation#"))
+                    .count();
+                assert_eq!(
+                    anchor_count, 2,
+                    "re-running must not duplicate the annotation anchor"
+                );
+            }
+            other => panic!("expected Gap payload, got {other:?}"),
+        }
+        // No gap_detected events: the target was already Gap-shaped before
+        // the dispatcher ran.
+        let spawn_count: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE slug = 'p7c2' AND event_type = 'gap_detected'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            spawn_count, 0,
+            "append-to-existing-gap does NOT re-emit gap_detected"
+        );
+    }
+
+    // ── 7c-7.8: skip on debate / meta_layer shape ──────────────────────
+
+    #[tokio::test]
+    async fn materialize_gap_node_skips_on_debate_or_meta_layer_shape() {
+        let _lock = test_lock();
+        // Case A: Debate target
+        {
+            let conn = fresh_db();
+            create_slug(&conn, "p7c3a", &ContentType::Code, "/tmp/p7c3a").unwrap();
+            let existing = DebateTopic {
+                concern: "existing".into(),
+                positions: vec![DebatePosition {
+                    label: "P1".into(),
+                    steel_manning: "sm".into(),
+                    red_teams: vec![],
+                    evidence_anchors: vec![],
+                }],
+                cross_refs: vec![],
+                vote_lean: None,
+            };
+            seed_existing_debate_node(&conn, "p7c3a", "node-debate-on-gap", &existing);
+            let ann = save_ann(
+                &conn,
+                "p7c3a",
+                "node-debate-on-gap",
+                "gap",
+                "should not destroy debate payload",
+                "charlie",
+            );
+            emit_annotation_reacted(&conn, "p7c3a", &ann, "starter-gap-dispatcher");
+            dadbear_compiler::run_compilation_for_slug(&conn, "p7c3a", None, None).unwrap();
+            let wi_id: String = conn
+                .query_row(
+                    "SELECT id FROM dadbear_work_items
+                      WHERE slug = 'p7c3a' AND step_name = 'cascade_reacted'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+
+            let state_pyr = test_pyramid_state(conn);
+            let chain = chain_loader::load_chain_by_id(
+                "starter-gap-dispatcher",
+                &state_pyr.chains_dir,
+            )
+            .unwrap();
+            chain_executor::execute_chain_for_target(
+                &state_pyr,
+                &chain,
+                "p7c3a",
+                Some("node-debate-on-gap"),
+                serde_json::json!({
+                    "work_item_id": wi_id,
+                    "target_id": "node-debate-on-gap",
+                    "step_name": "cascade_reacted",
+                    "layer": 1,
+                }),
+            )
+            .await
+            .expect("chain should run cleanly but skip the write");
+
+            let writer = state_pyr.writer.lock().await;
+            let view = get_node_shape(&writer, "p7c3a", "node-debate-on-gap").unwrap().unwrap();
+            assert_eq!(
+                view.shape.as_str(),
+                NODE_SHAPE_DEBATE,
+                "shape must remain debate — gap_dispatcher must NOT overwrite"
+            );
+            // No gap_detected
+            let gd: i64 = writer
+                .query_row(
+                    "SELECT COUNT(*) FROM dadbear_observation_events
+                      WHERE slug = 'p7c3a' AND event_type = 'gap_detected'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(gd, 0, "skip path must not emit gap_detected");
+        }
+
+        // Case B: MetaLayer target
+        {
+            let conn = fresh_db();
+            create_slug(&conn, "p7c3b", &ContentType::Code, "/tmp/p7c3b").unwrap();
+            seed_existing_meta_layer_node(&conn, "p7c3b", "node-ml-on-gap");
+            let ann = save_ann(
+                &conn,
+                "p7c3b",
+                "node-ml-on-gap",
+                "gap",
+                "should not destroy meta-layer payload",
+                "dana",
+            );
+            emit_annotation_reacted(&conn, "p7c3b", &ann, "starter-gap-dispatcher");
+            dadbear_compiler::run_compilation_for_slug(&conn, "p7c3b", None, None).unwrap();
+            let wi_id: String = conn
+                .query_row(
+                    "SELECT id FROM dadbear_work_items
+                      WHERE slug = 'p7c3b' AND step_name = 'cascade_reacted'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let state_pyr = test_pyramid_state(conn);
+            let chain = chain_loader::load_chain_by_id(
+                "starter-gap-dispatcher",
+                &state_pyr.chains_dir,
+            )
+            .unwrap();
+            chain_executor::execute_chain_for_target(
+                &state_pyr,
+                &chain,
+                "p7c3b",
+                Some("node-ml-on-gap"),
+                serde_json::json!({
+                    "work_item_id": wi_id,
+                    "target_id": "node-ml-on-gap",
+                    "step_name": "cascade_reacted",
+                    "layer": 1,
+                }),
+            )
+            .await
+            .expect("chain should run cleanly but skip the write");
+
+            let writer = state_pyr.writer.lock().await;
+            let view = get_node_shape(&writer, "p7c3b", "node-ml-on-gap").unwrap().unwrap();
+            assert_eq!(
+                view.shape.as_str(),
+                NODE_SHAPE_META_LAYER,
+                "shape must remain meta_layer"
+            );
+        }
+    }
+
+    // ── 7c-7.9: gap_detected fires exactly once on first upgrade ───────
+
+    #[tokio::test]
+    async fn gap_detected_event_emitted_on_first_upgrade() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7c4", &ContentType::Code, "/tmp/p7c4").unwrap();
+        seed_scaffolding_node(&conn, "p7c4", "node-gap-4");
+        let ann = save_ann(&conn, "p7c4", "node-gap-4", "gap", "g", "a");
+        emit_annotation_reacted(&conn, "p7c4", &ann, "starter-gap-dispatcher");
+        dadbear_compiler::run_compilation_for_slug(&conn, "p7c4", None, None).unwrap();
+        let wi_id: String = conn
+            .query_row(
+                "SELECT id FROM dadbear_work_items
+                  WHERE slug = 'p7c4' AND step_name = 'cascade_reacted'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let state_pyr = test_pyramid_state(conn);
+        let chain = chain_loader::load_chain_by_id(
+            "starter-gap-dispatcher",
+            &state_pyr.chains_dir,
+        )
+        .unwrap();
+        chain_executor::execute_chain_for_target(
+            &state_pyr,
+            &chain,
+            "p7c4",
+            Some("node-gap-4"),
+            serde_json::json!({
+                "work_item_id": wi_id,
+                "target_id": "node-gap-4",
+                "step_name": "cascade_reacted",
+                "layer": 1,
+            }),
+        )
+        .await
+        .unwrap();
+        let writer = state_pyr.writer.lock().await;
+        let (count, metadata): (i64, Option<String>) = writer
+            .query_row(
+                "SELECT COUNT(*), MAX(metadata_json) FROM dadbear_observation_events
+                  WHERE slug = 'p7c4' AND event_type = 'gap_detected'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "one gap_detected on Scaffolding→Gap upgrade");
+        let m = metadata.expect("metadata required");
+        assert!(m.contains("node-gap-4"), "metadata must carry target_node_id: {m}");
+        assert!(
+            m.contains("demand_state"),
+            "metadata must carry demand_state: {m}"
+        );
+    }
+
+    // ── 7c-7.10 (crown jewel): end-to-end `gap` annotation flow ────────
+
+    #[tokio::test]
+    async fn gap_annotation_flows_to_gap_node_end_to_end() {
+        // Full path: save_annotation → process_annotation_hook →
+        // annotation_reacted emitted with handler_chain_id=starter-gap-dispatcher
+        // → compile tick resolves the work item → chain_executor builds a
+        // Gap node + gap_detected event → work item CAS to applied.
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7ccj", &ContentType::Code, "/tmp/p7ccj").unwrap();
+        seed_scaffolding_node(&conn, "p7ccj", "node-crown");
+
+        let state_pyr = test_pyramid_state(conn);
+
+        // Save the gap annotation via the canonical write path, then run
+        // the hook (Phase 6c-B logic — emits annotation_reacted with the
+        // vocab handler_chain_id stamped).
+        let ann_to_save = PyramidAnnotation {
+            id: 0,
+            slug: "p7ccj".to_string(),
+            node_id: "node-crown".to_string(),
+            annotation_type: AnnotationType::new("gap"),
+            content: "Missing evidence for the crown-jewel assertion.".to_string(),
+            question_context: Some(
+                "What happens at scale when the pyramid exceeds 100k nodes?".to_string(),
+            ),
+            author: "eve".to_string(),
+            created_at: String::new(),
+        };
+        let saved = {
+            let writer = state_pyr.writer.lock().await;
+            save_annotation(&writer, &ann_to_save).unwrap()
+        };
+
+        // Run the annotation hook — this is what HTTP + MCP invoke in prod.
+        let base_config = state_pyr.config.read().await.clone();
+        let ops = crate::pyramid::OperationalConfig::default();
+        crate::pyramid::routes::test_hooks::run_process_annotation_hook(
+            &state_pyr.reader,
+            &state_pyr.writer,
+            "p7ccj",
+            &saved,
+            &base_config,
+            "",
+            &ops,
+        )
+        .await
+        .expect("annotation hook must succeed");
+
+        // Assert annotation_reacted was emitted with the gap_dispatcher handler.
+        {
+            let reader = state_pyr.reader.lock().await;
+            let (count, meta): (i64, Option<String>) = reader
+                .query_row(
+                    "SELECT COUNT(*), MAX(metadata_json) FROM dadbear_observation_events
+                      WHERE slug = 'p7ccj' AND event_type = 'annotation_reacted'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "exactly one annotation_reacted");
+            let m = meta.expect("metadata required");
+            assert!(
+                m.contains("starter-gap-dispatcher"),
+                "handler_chain_id must be stamped: {m}"
+            );
+        }
+
+        // Compile tick routes annotation_reacted → work item.
+        {
+            let writer = state_pyr.writer.lock().await;
+            dadbear_compiler::run_compilation_for_slug(&writer, "p7ccj", None, None).unwrap();
+        }
+        let wi_id: String;
+        let resolved_chain: Option<String>;
+        {
+            let reader = state_pyr.reader.lock().await;
+            let row: (String, Option<String>) = reader
+                .query_row(
+                    "SELECT id, resolved_chain_id FROM dadbear_work_items
+                      WHERE slug = 'p7ccj' AND step_name = 'cascade_reacted'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("work item must exist");
+            wi_id = row.0;
+            resolved_chain = row.1;
+        }
+        assert_eq!(
+            resolved_chain.as_deref(),
+            Some("starter-gap-dispatcher"),
+            "vocab handler_chain_id must route to starter-gap-dispatcher"
+        );
+
+        // Execute the chain.
+        let chain = chain_loader::load_chain_by_id(
+            "starter-gap-dispatcher",
+            &state_pyr.chains_dir,
+        )
+        .unwrap();
+        chain_executor::execute_chain_for_target(
+            &state_pyr,
+            &chain,
+            "p7ccj",
+            Some("node-crown"),
+            serde_json::json!({
+                "work_item_id": wi_id,
+                "target_id": "node-crown",
+                "step_name": "cascade_reacted",
+                "layer": 1,
+            }),
+        )
+        .await
+        .expect("gap_dispatcher chain must succeed end-to-end");
+
+        // Target node is now Gap-shaped with a GapTopic payload.
+        let writer = state_pyr.writer.lock().await;
+        let view = get_node_shape(&writer, "p7ccj", "node-crown").unwrap().unwrap();
+        assert_eq!(view.shape.as_str(), NODE_SHAPE_GAP);
+        match view.payload {
+            Some(ShapePayload::Gap(g)) => {
+                assert_eq!(g.demand_state, "open");
+                assert!(
+                    g.description.contains("crown-jewel assertion"),
+                    "description must carry annotation content: {}",
+                    g.description
+                );
+                // The question_context was populated, so it must be the
+                // concern line.
+                assert!(
+                    g.concern.contains("100k nodes"),
+                    "concern must carry question_context when present: {}",
+                    g.concern
+                );
+                assert!(
+                    g.candidate_resolutions
+                        .iter()
+                        .any(|c| c.resolution_type.starts_with("annotation#")),
+                    "annotation anchor must be present for dedup"
+                );
+            }
+            other => panic!("expected Gap payload, got {other:?}"),
+        }
+
+        // Chronicle carries: gap_dispatcher_invoked + gap_detected +
+        // annotation_reacted.
+        for event_type in ["gap_dispatcher_invoked", "gap_detected", "annotation_reacted"] {
+            let count: i64 = writer
+                .query_row(
+                    "SELECT COUNT(*) FROM dadbear_observation_events
+                      WHERE slug = 'p7ccj' AND event_type = ?1",
+                    rusqlite::params![event_type],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                count >= 1,
+                "'{event_type}' must appear at least once"
+            );
+        }
+
+        // CAS the work item to applied to mirror the supervisor arm.
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let rows = writer
             .execute(
