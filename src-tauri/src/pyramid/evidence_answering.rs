@@ -27,7 +27,7 @@ use rusqlite;
 use super::db;
 use super::llm::{self, AuditContext, LlmConfig};
 use super::question_decomposition::render_prompt_template;
-use super::step_context::{compute_prompt_hash, StepContext};
+use super::step_context::make_step_ctx_from_llm_config;
 use super::types::{
     AnswerBatchResult, AnsweredNode, CandidateMap, EvidenceLink, EvidenceSet, EvidenceVerdict,
     FailedQuestion, LayerQuestion, PyramidNode,
@@ -293,34 +293,33 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
             questions_text, nodes_text
         );
 
-        // Phase 18b: build a cache-usable StepContext from llm_config's
-        // cache_access (when available) and thread it together with the
-        // optional AuditContext through the unified entry point. This
-        // collapses the previous "audit branch (no cache) vs non-audit
-        // branch (with cache)" split into a single call where audited
-        // builds also benefit from the Phase 6 content-addressable
-        // cache. Matches the Phase 18b L8 retrofit pattern.
-        let pre_map_ctx = llm_config.cache_access.as_ref().map(|ca| {
-            let mut c = StepContext::new(
-                ca.slug.clone(),
-                ca.build_id.clone(),
-                format!("evidence_pre_map_{}", batch_idx),
-                "evidence_pre_map",
-                0,
-                Some(batch_idx as i64),
-                ca.db_path.to_string(),
-            )
-            // W3c: legacy primary_model fallback removed. Cache-row
-            // model_resolution gets `<unknown>` when no outer
-            // chain-step carries the Decision — this is a provenance
-            // stamp, not a dispatch-load-bearing value.
-            .with_model_resolution("fast_extract", "<unknown>".to_string())
-            .with_prompt_hash(compute_prompt_hash(&system_prompt));
-            if let Some(bus) = &ca.bus {
-                c = c.with_bus(bus.clone());
+        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+        // Previously: manual StepContext::new + with_model_resolution("fast_extract")
+        // without with_dispatch_decision_if_available → Decision=None → walker
+        // skipped every provider silently. Now: canonical helper with slot=
+        // "evidence_loop" (Rust rename of "fast_extract"; first-class walker
+        // tier per bundled walker_provider_openrouter → xiaomi/mimo-v2.5-pro).
+        let pre_map_resolved = llm_config
+            .provider_registry
+            .as_ref()
+            .and_then(|reg| reg.resolve_tier("evidence_loop", None, None, None).ok());
+        let pre_map_ctx = match &pre_map_resolved {
+            Some(resolved) => {
+                make_step_ctx_from_llm_config(
+                    llm_config,
+                    &format!("evidence_pre_map_{}", batch_idx),
+                    "evidence_pre_map",
+                    0,
+                    Some(batch_idx as i64),
+                    &system_prompt,
+                    "evidence_loop",
+                    Some(&resolved.tier.model_id),
+                    Some(&resolved.provider.id),
+                )
+                .await
             }
-            c
-        });
+            None => None,
+        };
         let pre_map_audit_ctx = audit.map(|ctx| AuditContext {
             call_purpose: format!("pre_map_batch_{}", batch_idx),
             step_name: "evidence_pre_map".to_string(),
@@ -483,7 +482,7 @@ pub async fn answer_questions(
                 step_name: step_name_for_events.clone(),
                 question_count: questions.len() as i64,
                 action: "triage".to_string(),
-                model_tier: "fast_extract".to_string(),
+                model_tier: "evidence_loop".to_string(),
             },
         });
     }
@@ -1033,27 +1032,28 @@ Respond with ONLY a JSON object:
         // builds also benefit from the Phase 6 content-addressable
         // cache. Audited cache hits write a `cache_hit = 1` audit row
         // so the audit trail stays contiguous.
-        let answer_ctx = llm_config.cache_access.as_ref().map(|ca| {
-            let mut c = StepContext::new(
-                ca.slug.clone(),
-                ca.build_id.clone(),
-                format!("evidence_answer_batch_{}", batch_idx),
-                "evidence_answer",
-                question.layer as i64,
-                Some(batch_idx as i64),
-                ca.db_path.to_string(),
-            )
-            // W3c: legacy primary_model fallback removed. Cache-row
-            // model_resolution gets `<unknown>` when no outer
-            // chain-step carries the Decision — this is a provenance
-            // stamp, not a dispatch-load-bearing value.
-            .with_model_resolution("fast_extract", "<unknown>".to_string())
-            .with_prompt_hash(compute_prompt_hash(&system_prompt));
-            if let Some(bus) = &ca.bus {
-                c = c.with_bus(bus.clone());
+        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+        let answer_resolved = llm_config
+            .provider_registry
+            .as_ref()
+            .and_then(|reg| reg.resolve_tier("evidence_loop", None, None, None).ok());
+        let answer_ctx = match &answer_resolved {
+            Some(resolved) => {
+                make_step_ctx_from_llm_config(
+                    llm_config,
+                    &format!("evidence_answer_batch_{}", batch_idx),
+                    "evidence_answer",
+                    question.layer as i64,
+                    Some(batch_idx as i64),
+                    &system_prompt,
+                    "evidence_loop",
+                    Some(&resolved.tier.model_id),
+                    Some(&resolved.provider.id),
+                )
+                .await
             }
-            c
-        });
+            None => None,
+        };
         let answer_audit_ctx = audit.map(|ctx| {
             ctx.for_node(
                 &node_id,
@@ -1534,26 +1534,28 @@ Respond with ONLY a JSON object:
         serde_json::to_string_pretty(items).unwrap_or_default(),
     );
 
-    // Phase 18b L8 retrofit: cache + audit unified path. See pre_map
-    // and answer_batch sites above for the rationale.
-    let merge_ctx = llm_config.cache_access.as_ref().map(|ca| {
-        let mut c = StepContext::new(
-            ca.slug.clone(),
-            ca.build_id.clone(),
-            "evidence_answer_merge",
-            "evidence_answer_merge",
-            question.layer as i64,
-            None,
-            ca.db_path.to_string(),
-        )
-        // W3c: legacy primary_model fallback removed. Provenance stamp.
-        .with_model_resolution("fast_extract", "<unknown>".to_string())
-        .with_prompt_hash(compute_prompt_hash(&merge_system));
-        if let Some(bus) = &ca.bus {
-            c = c.with_bus(bus.clone());
+    // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+    let merge_resolved = llm_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("evidence_loop", None, None, None).ok());
+    let merge_ctx = match &merge_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                llm_config,
+                "evidence_answer_merge",
+                "evidence_answer_merge",
+                question.layer as i64,
+                None,
+                &merge_system,
+                "evidence_loop",
+                Some(&resolved.tier.model_id),
+                Some(&resolved.provider.id),
+            )
+            .await
         }
-        c
-    });
+        None => None,
+    };
     let merge_audit_ctx =
         audit.map(|ctx| ctx.for_node(node_id, "answer_merge", question.layer as i64));
     let response = llm::call_model_unified_with_audit_and_ctx(
@@ -1748,29 +1750,28 @@ Respond with ONLY a JSON object:
     for (file_path, content) in source_candidates {
         let user_prompt = format!("SOURCE FILE: {}\n\n{}", file_path, content);
 
-        // Phase 18b L8 retrofit: cache + audit unified path. See pre_map
-        // and answer_batch sites above for the rationale.
-        let target_ctx = llm_config.cache_access.as_ref().map(|ca| {
-            let mut c = StepContext::new(
-                ca.slug.clone(),
-                ca.build_id.clone(),
-                "targeted_reexamination",
-                "evidence_answer",
-                0,
-                None,
-                ca.db_path.to_string(),
-            )
-            // W3c: legacy primary_model fallback removed. Cache-row
-            // model_resolution gets `<unknown>` when no outer
-            // chain-step carries the Decision — this is a provenance
-            // stamp, not a dispatch-load-bearing value.
-            .with_model_resolution("fast_extract", "<unknown>".to_string())
-            .with_prompt_hash(compute_prompt_hash(&system_prompt));
-            if let Some(bus) = &ca.bus {
-                c = c.with_bus(bus.clone());
+        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+        let target_resolved = llm_config
+            .provider_registry
+            .as_ref()
+            .and_then(|reg| reg.resolve_tier("evidence_loop", None, None, None).ok());
+        let target_ctx = match &target_resolved {
+            Some(resolved) => {
+                make_step_ctx_from_llm_config(
+                    llm_config,
+                    "targeted_reexamination",
+                    "evidence_answer",
+                    0,
+                    None,
+                    &system_prompt,
+                    "evidence_loop",
+                    Some(&resolved.tier.model_id),
+                    Some(&resolved.provider.id),
+                )
+                .await
             }
-            c
-        });
+            None => None,
+        };
         let target_audit_ctx = audit.map(|ctx| AuditContext {
             call_purpose: "gap_answer".to_string(),
             step_name: "targeted_reexamination".to_string(),
@@ -2257,7 +2258,7 @@ pub fn run_triage_gate(
                     "triage DSL evaluation failed; defaulting to Answer"
                 );
                 TriageDecision::Answer {
-                    model_tier: "fast_extract".to_string(),
+                    model_tier: "evidence_loop".to_string(),
                 }
             }
         };
