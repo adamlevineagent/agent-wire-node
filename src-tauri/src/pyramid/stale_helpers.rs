@@ -23,7 +23,7 @@ use super::naming::{headline_from_path, tombstone_headline};
 use super::stale_helpers_upper::{
     resolve_evidence_targets_for_node_ids, resolve_live_canonical_node_id,
 };
-use super::step_context::{compute_prompt_hash, StepContext};
+use super::step_context::make_step_ctx_from_llm_config;
 use super::types::{FileStaleResult, PendingMutation, RenameResult, StaleCheckResult};
 
 // ── Utility Functions ────────────────────────────────────────────────────────
@@ -296,22 +296,34 @@ Output JSON only. Array of objects, one per file:
         ));
     }
 
-    // W3c: legacy clone_with_model_override removed. Model now
-    // threads into dispatch via LlmCallOptions.model_override below.
-    let ctx = StepContext::new(
-        slug.clone(),
-        format!("stale-file-check-{}", slug),
-        "file_stale_check",
-        "stale_check",
-        0,
-        None,
-        db_path.to_string(),
-    )
-    .with_model_resolution("stale_local", model.to_string())
-    .with_prompt_hash(compute_prompt_hash(system_prompt));
+    // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+    // slot="stale_l0" (Rust rename of "stale_local"; first-class walker tier
+    // → minimax/minimax-m2.7). model_override preserves the caller's pre-
+    // resolved slug pin within the Decision-driven cascade.
+    let stale_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+    let ctx = match &stale_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "file_stale_check",
+                "stale_check",
+                0,
+                None,
+                system_prompt,
+                "stale_l0",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
     let llm_resp = call_model_unified_with_options_and_ctx(
         base_config,
-        Some(&ctx),
+        ctx.as_ref(),
         system_prompt,
         &user_prompt,
         0.1,
@@ -792,22 +804,31 @@ Output JSON only:
         old_path, old_distilled, new_path, new_content_head
     );
 
-    // W3c: legacy clone_with_model_override removed. Model now
-    // threads into dispatch via LlmCallOptions.model_override below.
-    let ctx = StepContext::new(
-        slug.clone(),
-        format!("stale-rename-check-{}", slug),
-        "rename_check",
-        "stale_check",
-        0,
-        None,
-        db_path.to_string(),
-    )
-    .with_model_resolution("stale_local", model.to_string())
-    .with_prompt_hash(compute_prompt_hash(system_prompt));
+    // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+    let stale_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+    let ctx = match &stale_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "rename_check",
+                "stale_check",
+                0,
+                None,
+                system_prompt,
+                "stale_l0",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
     let llm_resp = call_model_unified_with_options_and_ctx(
         base_config,
-        Some(&ctx),
+        ctx.as_ref(),
         system_prompt,
         &user_prompt,
         0.1,
@@ -1238,22 +1259,31 @@ Output JSON only:
             context
         );
 
-        // W3c: legacy clone_with_model_override removed. Model threads
-        // via LlmCallOptions.model_override below.
-        let ctx = StepContext::new(
-            slug.clone(),
-            format!("stale-evidence-apex-{}", slug),
-            "evidence_apex_synthesis",
-            "stale_check",
-            0,
-            None,
-            db_path.to_string(),
-        )
-        .with_model_resolution("stale_local", model.to_string())
-        .with_prompt_hash(compute_prompt_hash(system_prompt));
+        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+        let stale_resolved = base_config
+            .provider_registry
+            .as_ref()
+            .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+        let ctx = match &stale_resolved {
+            Some(resolved) => {
+                make_step_ctx_from_llm_config(
+                    base_config,
+                    "evidence_apex_synthesis",
+                    "stale_check",
+                    0,
+                    None,
+                    system_prompt,
+                    "stale_l0",
+                    Some(model),
+                    Some(&resolved.provider.id),
+                )
+                .await
+            }
+            None => None,
+        };
         let llm_resp = call_model_unified_with_options_and_ctx(
             base_config,
-            Some(&ctx),
+            ctx.as_ref(),
             system_prompt,
             &user_prompt,
             0.2,
@@ -1524,22 +1554,31 @@ Output JSON only:
             self_prompt, distilled, file_content
         );
 
-        // W3c: legacy clone_with_model_override removed. Model threads
-        // via LlmCallOptions.model_override below.
-        let ctx = StepContext::new(
-            slug.clone(),
-            format!("stale-targeted-l0-{}", slug),
-            "targeted_l0_stale_check",
-            "stale_check",
-            0,
-            None,
-            db_path.to_string(),
-        )
-        .with_model_resolution("stale_local", model.to_string())
-        .with_prompt_hash(compute_prompt_hash(system_prompt));
+        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+        let stale_resolved = base_config
+            .provider_registry
+            .as_ref()
+            .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+        let ctx = match &stale_resolved {
+            Some(resolved) => {
+                make_step_ctx_from_llm_config(
+                    base_config,
+                    "targeted_l0_stale_check",
+                    "stale_check",
+                    0,
+                    None,
+                    system_prompt,
+                    "stale_l0",
+                    Some(model),
+                    Some(&resolved.provider.id),
+                )
+                .await
+            }
+            None => None,
+        };
         let llm_resp = call_model_unified_with_options_and_ctx(
             base_config,
-            Some(&ctx),
+            ctx.as_ref(),
             system_prompt,
             &user_prompt,
             0.1,
