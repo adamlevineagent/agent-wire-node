@@ -1422,14 +1422,26 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                         }
                     }
                 } else {
-                    tracing::warn!(
-                        slug = %ctx.slug,
-                        target_node_id = %target_node_id,
-                        "append_annotation_to_debate_node: collapse_cooldown_secs=0 — \
-                         post-collapse append-race guard is DISABLED by operator config; \
-                         a steel_man/red_team annotation on a just-collapsed node will \
-                         resurrect the debate"
-                    );
+                    // 9c-2 verifier Target 9: cooldown=0 fires on EVERY append
+                    // in the scaffolding branch — that's log-spam. Once per
+                    // process is enough to surface the disabled state per
+                    // feedback_loud_deferrals (loud enough to see, quiet
+                    // enough not to flood).
+                    static COOLDOWN_DISABLED_WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !COOLDOWN_DISABLED_WARNED
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        tracing::warn!(
+                            slug = %ctx.slug,
+                            target_node_id = %target_node_id,
+                            "append_annotation_to_debate_node: collapse_cooldown_secs=0 — \
+                             post-collapse append-race guard is DISABLED by operator config; \
+                             a steel_man/red_team annotation on a just-collapsed node will \
+                             resurrect the debate. This warning fires once per process \
+                             lifetime."
+                        );
+                    }
                 }
             }
 
