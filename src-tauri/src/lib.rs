@@ -115,7 +115,16 @@ impl Default for WireNodeConfig {
             mesh_hosting_enabled: false,
             auto_update_enabled: false,
             document_cache_dir: document_cache_dir.to_string_lossy().to_string(),
-            server_port: 8765,
+            // Default 8765; respects WIRE_NODE_PORT env var for sidecar
+            // dev binaries that need to coexist with the installed app
+            // already holding 8765. The override applies at process
+            // start; runtime supersession via Settings still writes
+            // the persisted value as before (which then takes
+            // precedence on next launch).
+            server_port: std::env::var("WIRE_NODE_PORT")
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(8765),
             jwt_public_key: String::new(),
             supabase_url: "https://supabase.newsbleach.com".to_string(),
             supabase_anon_key: "eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9.eyJyb2xlIjogImFub24iLCAiaXNzIjogInN1cGFiYXNlIiwgImlhdCI6IDE3NDAwMDAwMDAsICJleHAiOiAyMDg3MTI3MzM4fQ.5Og0cJw4IkDdCQVYztlzJSoptuyeWjjtKjwOKUukd-Y".to_string(),
