@@ -52,8 +52,7 @@ struct SmokeFixture {
 }
 
 fn snapshot_live_db_for_smoke() -> SmokeFixture {
-    let src_db = std::env::var("PYRAMID_DB")
-        .expect("set PYRAMID_DB=<path-to-real-pyramid.db>");
+    let src_db = std::env::var("PYRAMID_DB").expect("set PYRAMID_DB=<path-to-real-pyramid.db>");
     let td = tempfile::tempdir().expect("create per-test tempdir");
     let dst_db = td.path().join("pyramid.db");
     std::fs::copy(&src_db, &dst_db).expect("copy pyramid.db into tempdir");
@@ -106,7 +105,11 @@ fn migration_runs_cleanly_on_live_db_copy() {
         )
         .unwrap();
     let pre_total: i64 = conn
-        .query_row("SELECT COUNT(*) FROM pyramid_config_contributions", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM pyramid_config_contributions",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     let pre_dup: i64 = conn
         .query_row(
@@ -153,7 +156,9 @@ fn migration_runs_cleanly_on_live_db_copy() {
         )
         .unwrap();
     let snapshot_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM _pre_v3_dedup_snapshot", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM _pre_v3_dedup_snapshot", [], |r| {
+            r.get(0)
+        })
         .unwrap_or(-1);
 
     println!(
@@ -161,10 +166,16 @@ fn migration_runs_cleanly_on_live_db_copy() {
         post_active, index_exists, snapshot_exists, snapshot_rows
     );
 
-    assert_eq!(pre_active, post_active, "no active rows should move with 0 dup pairs");
+    assert_eq!(
+        pre_active, post_active,
+        "no active rows should move with 0 dup pairs"
+    );
     assert_eq!(index_exists, 1, "unique index must exist after migration");
     assert_eq!(snapshot_exists, 1, "snapshot table must exist");
-    assert_eq!(snapshot_rows, 0, "snapshot must be empty (no dups to record)");
+    assert_eq!(
+        snapshot_rows, 0,
+        "snapshot must be empty (no dups to record)"
+    );
 
     // Idempotency: second call must not blow up.
     let t1 = std::time::Instant::now();
@@ -200,10 +211,7 @@ fn migration_runs_cleanly_on_live_db_copy() {
     tx.rollback().unwrap();
     println!("DUP INSERT (expected SQLITE_CONSTRAINT): {:?}", dup_insert);
     assert!(
-        matches!(
-            dup_insert,
-            Err(rusqlite::Error::SqliteFailure(_, _))
-        ),
+        matches!(dup_insert, Err(rusqlite::Error::SqliteFailure(_, _))),
         "duplicate-active insert must be rejected by unique index"
     );
 
@@ -261,7 +269,10 @@ async fn boot_coordinator_runs_clean_against_live_db_copy() {
         !handles.config_sync_bridge_handle.is_finished(),
         "config_sync_bridge must be live"
     );
-    println!("SMOKE: boot coordinator Booting → Ready on live DB copy in {:?}", dur);
+    println!(
+        "SMOKE: boot coordinator Booting → Ready on live DB copy in {:?}",
+        dur
+    );
 }
 
 /// Phase 0b WS-E live-DB smoke: drive `walker_resolver::build_scope_cache`
@@ -438,9 +449,7 @@ fn phase_0b_scope_cache_populates_from_live_db() {
     // returns Inactive → dropped. Verify the bundled `active=false` via
     // the resolver directly (Decision can't surface it for dropped
     // providers).
-    use wire_node_lib::pyramid::walker_resolver::{
-        build_scope_cache_pair, resolve_active,
-    };
+    use wire_node_lib::pyramid::walker_resolver::{build_scope_cache_pair, resolve_active};
     let scope_pair = build_scope_cache_pair(&conn).expect("rebuild scope chain");
     assert!(
         !resolve_active(&scope_pair.chain, "mid", ProviderType::Market),
@@ -484,8 +493,8 @@ fn phase_0b_scope_cache_populates_from_live_db() {
 #[ignore]
 fn phase_b_rewrites_live_config_json() {
     use wire_node_lib::pyramid::v3_migration::{
-        run_v3_phase_a_migration, run_v3_phase_b_migration, should_run_phase_a,
-        should_run_phase_b, V3MigrationError,
+        run_v3_phase_a_migration, run_v3_phase_b_migration, should_run_phase_a, should_run_phase_b,
+        V3MigrationError,
     };
 
     let fx = snapshot_live_db_for_smoke();

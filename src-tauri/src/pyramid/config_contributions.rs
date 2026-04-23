@@ -392,11 +392,7 @@ pub fn write_contribution_envelope(
     // has no shape rules yet, or the load fails, the body is passed
     // through unchanged (commit-4 parity). Walker-v3 annotations land
     // in Phase 0b; until then the validator is infrastructure only.
-    let normalized_body = match normalize_and_validate_body(
-        conn,
-        &input.schema_type,
-        &input.body,
-    ) {
+    let normalized_body = match normalize_and_validate_body(conn, &input.schema_type, &input.body) {
         Ok(body) => body,
         Err(details) => match input.write_mode {
             WriteMode::Strict => {
@@ -447,9 +443,7 @@ pub fn write_contribution_envelope(
     let accepted_at_sql = match input.accepted_at {
         AcceptedAt::Now => "datetime('now')",
         AcceptedAt::Null => "NULL",
-        AcceptedAt::ActiveOnly => {
-            "CASE WHEN ?8 = 'active' THEN datetime('now') ELSE NULL END"
-        }
+        AcceptedAt::ActiveOnly => "CASE WHEN ?8 = 'active' THEN datetime('now') ELSE NULL END",
     };
 
     // The `needs_migration` column is omitted from the INSERT when the
@@ -616,8 +610,8 @@ fn normalize_and_validate_body(
         None => return Ok(body.to_string()), // annotation declares no shape rules
     };
 
-    let mut body_value: serde_yaml::Value = serde_yaml::from_str(body)
-        .map_err(|e| format!("body is not well-formed YAML: {e}"))?;
+    let mut body_value: serde_yaml::Value =
+        serde_yaml::from_str(body).map_err(|e| format!("body is not well-formed YAML: {e}"))?;
 
     // Walk the declared parameters. Normalization can mutate the body
     // in-place; validation errors short-circuit with a path-prefixed
@@ -626,12 +620,8 @@ fn normalize_and_validate_body(
         let Some(param_name_str) = param_name.as_str() else {
             continue;
         };
-        normalize_and_validate_parameter(
-            &mut body_value,
-            param_name_str,
-            shape_decl,
-        )
-        .map_err(|e| format!("parameter `{param_name_str}`: {e}"))?;
+        normalize_and_validate_parameter(&mut body_value, param_name_str, shape_decl)
+            .map_err(|e| format!("parameter `{param_name_str}`: {e}"))?;
     }
 
     // Re-serialize. If the normalization walk mutated the body,
@@ -771,10 +761,7 @@ fn validate_scalar(
     Ok(())
 }
 
-fn validate_list(
-    value: &serde_yaml::Value,
-    _shape_decl: &serde_yaml::Value,
-) -> Result<(), String> {
+fn validate_list(value: &serde_yaml::Value, _shape_decl: &serde_yaml::Value) -> Result<(), String> {
     // §2.11 normalization: "empty list → None" is expressed at read
     // time via typed accessor; at validation time we just require the
     // value to be a sequence (or null, which the typed accessor treats
@@ -811,17 +798,14 @@ fn normalize_and_validate_tagged_union(
                         // suffix — see tests for the two supported
                         // forms. Callers with richer patterns can
                         // post-normalize in Phase 0b.
-                        let stripped =
-                            &pattern[1..pattern.len() - 1];
+                        let stripped = &pattern[1..pattern.len() - 1];
                         if let Some(literals) = stripped.strip_prefix("(") {
                             // alternation of bare names, e.g.
                             // ^(per_build|probe_based)$
                             let literals = literals.trim_end_matches(')');
                             if literals.split('|').any(|lit| lit == s) {
-                                *value = serde_yaml::from_str(&format!(
-                                    "kind: {s}\n"
-                                ))
-                                .map_err(|e| format!("normalize tagged union: {e}"))?;
+                                *value = serde_yaml::from_str(&format!("kind: {s}\n"))
+                                    .map_err(|e| format!("normalize tagged union: {e}"))?;
                                 return validate_tagged_union_struct(value, shape_decl);
                             }
                         } else if let Some((name, rest)) = stripped.split_once(":(") {
@@ -860,9 +844,7 @@ fn validate_tagged_union_struct(
         .get(&serde_yaml::Value::String("kind".to_string()))
         .and_then(|v| v.as_str())
         .ok_or_else(|| "tagged_union missing `kind`".to_string())?;
-    let variants = shape_decl
-        .get("variants")
-        .and_then(|v| v.as_mapping());
+    let variants = shape_decl.get("variants").and_then(|v| v.as_mapping());
     if let Some(variants) = variants {
         if !variants.contains_key(&serde_yaml::Value::String(kind.to_string())) {
             let declared: Vec<String> = variants
@@ -1013,8 +995,7 @@ fn contribution_from_row(row: &rusqlite::Row) -> rusqlite::Result<ConfigContribu
     })
 }
 
-const CONTRIBUTION_SELECT: &str =
-    "SELECT id, contribution_id, slug, schema_type, yaml_content,
+const CONTRIBUTION_SELECT: &str = "SELECT id, contribution_id, slug, schema_type, yaml_content,
             wire_native_metadata_json, wire_publication_state_json,
             supersedes_id, superseded_by_id, triggering_note,
             status, source, wire_contribution_id, created_by,
@@ -1168,19 +1149,17 @@ pub fn supersede_config_contribution(
     // version's handle-path if it was Wire-published. Falls back to
     // the default metadata if the prior row has an empty/invalid JSON
     // blob (Phase 4 stored `'{}'`).
-    let mut new_metadata = WireNativeMetadata::from_json(&prior_metadata_json).unwrap_or_else(|_| {
-        default_wire_native_metadata(&schema_type, slug.as_deref())
-    });
+    let mut new_metadata = WireNativeMetadata::from_json(&prior_metadata_json)
+        .unwrap_or_else(|_| default_wire_native_metadata(&schema_type, slug.as_deref()));
     new_metadata.maturity = crate::pyramid::wire_native_metadata::WireMaturity::Draft;
 
     // If the prior was Wire-published, point `supersedes` at its
     // handle-path so publishing the new version creates the next
     // entry in the Wire supersession chain. Publication state is
     // stored separately from metadata per the spec.
-    if let Ok(prior_pub_state) =
-        serde_json::from_str::<crate::pyramid::wire_native_metadata::WirePublicationState>(
-            &prior_pub_state_json,
-        )
+    if let Ok(prior_pub_state) = serde_json::from_str::<
+        crate::pyramid::wire_native_metadata::WirePublicationState,
+    >(&prior_pub_state_json)
     {
         if let Some(handle_path) = prior_pub_state.handle_path {
             new_metadata.supersedes = Some(handle_path);
@@ -1474,12 +1453,8 @@ pub fn load_active_config_contribution(
              ORDER BY created_at DESC, id DESC
              LIMIT 1"
         );
-        conn.query_row(
-            &sql,
-            rusqlite::params![schema_type],
-            contribution_from_row,
-        )
-        .optional()?
+        conn.query_row(&sql, rusqlite::params![schema_type], contribution_from_row)
+            .optional()?
     };
     Ok(row)
 }
@@ -1641,13 +1616,11 @@ pub fn accept_proposal(conn: &mut Connection, contribution_id: &str) -> Result<(
         )
         .optional()?;
 
-    let (schema_type, slug, status) = proposal
-        .ok_or_else(|| anyhow::anyhow!("contribution {contribution_id} not found"))?;
+    let (schema_type, slug, status) =
+        proposal.ok_or_else(|| anyhow::anyhow!("contribution {contribution_id} not found"))?;
 
     if status != "proposed" {
-        anyhow::bail!(
-            "contribution {contribution_id} is in status `{status}`, not `proposed`"
-        );
+        anyhow::bail!("contribution {contribution_id} is in status `{status}`, not `proposed`");
     }
 
     // Find the prior active contribution (if any) and supersede it.
@@ -1858,8 +1831,7 @@ pub fn sync_config_to_operational_with_registry(
             // This is NOT `wire_auto_update_settings` (which controls
             // Wire discovery polling) — this governs the local stale
             // engine's per-pyramid file-watching behavior.
-            let yaml: db::AutoUpdatePolicyYaml =
-                serde_yaml::from_str(&contribution.yaml_content)?;
+            let yaml: db::AutoUpdatePolicyYaml = serde_yaml::from_str(&contribution.yaml_content)?;
             db::upsert_auto_update_policy(conn, &slug_opt, &yaml, &contribution.contribution_id)?;
             // Note: debounce_minutes is baked at engine construction
             // time. Changes take effect on next engine restart (toggle
@@ -1872,7 +1844,12 @@ pub fn sync_config_to_operational_with_registry(
             // build coordination. The operational table stores the YAML; the
             // runtime ProviderPools + DispatchPolicy are rebuilt from it via
             // a ConfigSynced event listener in server.rs.
-            db::upsert_dispatch_policy(conn, &slug_opt, &contribution.yaml_content, &contribution.contribution_id)?;
+            db::upsert_dispatch_policy(
+                conn,
+                &slug_opt,
+                &contribution.yaml_content,
+                &contribution.contribution_id,
+            )?;
         }
         "fleet_delivery_policy" => {
             // Async fleet dispatch operational policy: ACK/callback timeouts,
@@ -1918,12 +1895,9 @@ pub fn sync_config_to_operational_with_registry(
             // `chain_id: "default"` removes the override, causing the
             // build runner to fall through to the tier 2 content-type
             // defaults.
-            let yaml: db::ChainAssignmentYaml =
-                serde_yaml::from_str(&contribution.yaml_content)?;
+            let yaml: db::ChainAssignmentYaml = serde_yaml::from_str(&contribution.yaml_content)?;
             let slug = contribution.slug.as_deref().ok_or_else(|| {
-                ConfigSyncError::ValidationFailed(
-                    "chain_assignment requires a pyramid slug".into(),
-                )
+                ConfigSyncError::ValidationFailed("chain_assignment requires a pyramid slug".into())
             })?;
             if yaml.chain_id == "default" {
                 chain_registry::remove_assignment(conn, slug)?;
@@ -1936,8 +1910,7 @@ pub fn sync_config_to_operational_with_registry(
             // `pyramid_chain_defaults` operational table. Ships bundled,
             // updatable via Wire, supersedable locally. Replaces the
             // former hardcoded `default_chain_id()` match statement.
-            let yaml: db::ChainDefaultsYaml =
-                serde_yaml::from_str(&contribution.yaml_content)?;
+            let yaml: db::ChainDefaultsYaml = serde_yaml::from_str(&contribution.yaml_content)?;
             chain_registry::upsert_chain_defaults(
                 conn,
                 &yaml.mappings,
@@ -1983,9 +1956,7 @@ pub fn sync_config_to_operational_with_registry(
             if let Some(registry) = schema_registry {
                 invalidate_schema_registry_cache(conn, registry);
             } else {
-                debug!(
-                    "schema_definition supersession: no registry passed, skipping invalidate"
-                );
+                debug!("schema_definition supersession: no registry passed, skipping invalidate");
             }
         }
         "schema_annotation" => {
@@ -2035,7 +2006,9 @@ pub fn sync_config_to_operational_with_registry(
             // Pyramid visualization engine configuration.
             // No operational table needed — the viz engine reads the
             // active contribution directly via viz_config::get_pyramid_viz_config.
-            debug!("pyramid_viz_config synced; no operational table — read from contribution store");
+            debug!(
+                "pyramid_viz_config synced; no operational table — read from contribution store"
+            );
         }
         "reconciliation_result" => {
             // Post-evidence-loop reconciliation summary (orphans, central
@@ -2051,12 +2024,11 @@ pub fn sync_config_to_operational_with_registry(
         // dispatcher branches coexist with the old `dadbear_policy` branch
         // (kept for rollback safety — removed in Phase 7).
         "watch_root" => {
-            let yaml: db::WatchRootYaml =
-                serde_yaml::from_str(&contribution.yaml_content)?;
+            let yaml: db::WatchRootYaml = serde_yaml::from_str(&contribution.yaml_content)?;
             // Resolve norms for this slug via the layered resolver.
             // resolve_dadbear_norms returns db::DadbearNormsYaml directly.
-            let resolved_norms = resolve_dadbear_norms(conn, contribution.slug.as_deref())
-                .unwrap_or_default();
+            let resolved_norms =
+                resolve_dadbear_norms(conn, contribution.slug.as_deref()).unwrap_or_default();
             db::upsert_watch_root(
                 conn,
                 &slug_opt,
@@ -2075,8 +2047,7 @@ pub fn sync_config_to_operational_with_registry(
                 rebuild_all_dadbear_norms_cache(conn, bus)?;
             } else if let Some(slug_str) = contribution.slug.as_deref() {
                 // Per-slug norms changed — rebuild just this slug's rows.
-                let norms = resolve_dadbear_norms(conn, Some(slug_str))
-                    .unwrap_or_default();
+                let norms = resolve_dadbear_norms(conn, Some(slug_str)).unwrap_or_default();
                 // Update all dadbear_config rows for this slug with new norms.
                 conn.execute(
                     "UPDATE pyramid_dadbear_config SET
@@ -2226,9 +2197,7 @@ fn invalidate_wire_discovery_cache() {
 /// explicit reload is required — this function exists as a hook point
 /// for future phases that may add a push-based reconfig signal.
 fn reconfigure_wire_update_scheduler(_conn: &Connection) -> Result<()> {
-    debug!(
-        "reconfigure_wire_update_scheduler: poller will re-read settings on next cycle"
-    );
+    debug!("reconfigure_wire_update_scheduler: poller will re-read settings on next cycle");
     Ok(())
 }
 
@@ -2325,10 +2294,7 @@ fn reevaluate_deferred_questions(conn: &Connection, slug: Option<&str>) -> Resul
 /// active policy for the slug, lists its deferred rows, and
 /// re-triages each against the new policy. Answer → remove, Defer →
 /// update next_check_at, Skip → remove.
-fn reevaluate_deferred_questions_for_slug(
-    conn: &Connection,
-    slug: &str,
-) -> Result<()> {
+fn reevaluate_deferred_questions_for_slug(conn: &Connection, slug: &str) -> Result<()> {
     use crate::pyramid::triage::{resolve_decision, TriageDecision, TriageFacts};
     use crate::pyramid::types::LayerQuestion;
 
@@ -2439,9 +2405,7 @@ fn normalize_window_modifier(window: &str) -> String {
     if w.starts_with('-') || w.contains(' ') {
         return w.to_string();
     }
-    let (num_part, unit_part): (String, String) = w
-        .chars()
-        .partition(|c| c.is_ascii_digit());
+    let (num_part, unit_part): (String, String) = w.chars().partition(|c| c.is_ascii_digit());
     let n: i64 = num_part.parse().unwrap_or(14);
     let unit = match unit_part.as_str() {
         "d" => "days",
@@ -2512,9 +2476,7 @@ pub fn rollback_config(
     if target.schema_type == "tier_routing" || target.schema_type == "build_strategy" {
         let local_state = db::load_local_mode_state(conn)?;
         if local_state.enabled {
-            anyhow::bail!(
-                "Disable local mode before rolling back tier routing configuration."
-            );
+            anyhow::bail!("Disable local mode before rolling back tier routing configuration.");
         }
     }
 
@@ -2525,17 +2487,14 @@ pub fn rollback_config(
     validate_rollback_yaml(&target.yaml_content, &target.schema_type)?;
 
     // 4. Find the current active contribution for this schema_type.
-    let current_active = load_active_config_contribution(
-        conn,
-        &target.schema_type,
-        target.slug.as_deref(),
-    )?
-    .ok_or_else(|| {
-        anyhow::anyhow!(
-            "no active {} contribution to roll back from",
-            target.schema_type
-        )
-    })?;
+    let current_active =
+        load_active_config_contribution(conn, &target.schema_type, target.slug.as_deref())?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no active {} contribution to roll back from",
+                    target.schema_type
+                )
+            })?;
 
     // 5. Create a new contribution superseding the active one with
     //    the target's yaml_content.
@@ -2550,10 +2509,9 @@ pub fn rollback_config(
     )?;
 
     // 6. Sync the new contribution to operational.
-    let new_contribution = load_contribution_by_id(conn, &new_id)?
-        .ok_or_else(|| {
-            anyhow::anyhow!("rollback contribution disappeared immediately after create")
-        })?;
+    let new_contribution = load_contribution_by_id(conn, &new_id)?.ok_or_else(|| {
+        anyhow::anyhow!("rollback contribution disappeared immediately after create")
+    })?;
     sync_config_to_operational(conn, bus, &new_contribution)?;
 
     // 7. Refresh the provider registry so downstream resolvers
@@ -2569,72 +2527,82 @@ pub fn rollback_config(
 fn validate_rollback_yaml(yaml_content: &str, schema_type: &str) -> Result<()> {
     match schema_type {
         "tier_routing" => {
-            serde_yaml::from_str::<db::TierRoutingYaml>(yaml_content)
-                .map_err(|e| anyhow::anyhow!(
+            serde_yaml::from_str::<db::TierRoutingYaml>(yaml_content).map_err(|e| {
+                anyhow::anyhow!(
                     "Cannot roll back — configuration schema has changed since this version: {e}"
-                ))?;
+                )
+            })?;
         }
         "build_strategy" => {
-            serde_yaml::from_str::<db::BuildStrategyYaml>(yaml_content)
-                .map_err(|e| anyhow::anyhow!(
+            serde_yaml::from_str::<db::BuildStrategyYaml>(yaml_content).map_err(|e| {
+                anyhow::anyhow!(
                     "Cannot roll back — configuration schema has changed since this version: {e}"
-                ))?;
+                )
+            })?;
         }
         "dadbear_policy" => {
-            serde_yaml::from_str::<db::DadbearPolicyYaml>(yaml_content)
-                .map_err(|e| anyhow::anyhow!(
+            serde_yaml::from_str::<db::DadbearPolicyYaml>(yaml_content).map_err(|e| {
+                anyhow::anyhow!(
                     "Cannot roll back — configuration schema has changed since this version: {e}"
-                ))?;
+                )
+            })?;
         }
         "evidence_policy" => {
-            serde_yaml::from_str::<db::EvidencePolicyYaml>(yaml_content)
-                .map_err(|e| anyhow::anyhow!(
+            serde_yaml::from_str::<db::EvidencePolicyYaml>(yaml_content).map_err(|e| {
+                anyhow::anyhow!(
                     "Cannot roll back — configuration schema has changed since this version: {e}"
-                ))?;
+                )
+            })?;
         }
         "custom_prompts" => {
-            serde_yaml::from_str::<db::CustomPromptsYaml>(yaml_content)
-                .map_err(|e| anyhow::anyhow!(
+            serde_yaml::from_str::<db::CustomPromptsYaml>(yaml_content).map_err(|e| {
+                anyhow::anyhow!(
                     "Cannot roll back — configuration schema has changed since this version: {e}"
-                ))?;
+                )
+            })?;
         }
         "step_overrides" => {
-            serde_yaml::from_str::<db::StepOverridesBundleYaml>(yaml_content)
-                .map_err(|e| anyhow::anyhow!(
+            serde_yaml::from_str::<db::StepOverridesBundleYaml>(yaml_content).map_err(|e| {
+                anyhow::anyhow!(
                     "Cannot roll back — configuration schema has changed since this version: {e}"
-                ))?;
+                )
+            })?;
         }
         "folder_ingestion_heuristics" => {
-            serde_yaml::from_str::<db::FolderIngestionHeuristicsYaml>(yaml_content)
-                .map_err(|e| anyhow::anyhow!(
+            serde_yaml::from_str::<db::FolderIngestionHeuristicsYaml>(yaml_content).map_err(
+                |e| {
+                    anyhow::anyhow!(
                     "Cannot roll back — configuration schema has changed since this version: {e}"
-                ))?;
+                )
+                },
+            )?;
         }
         "auto_update_policy" => {
-            serde_yaml::from_str::<db::AutoUpdatePolicyYaml>(yaml_content)
-                .map_err(|e| anyhow::anyhow!(
+            serde_yaml::from_str::<db::AutoUpdatePolicyYaml>(yaml_content).map_err(|e| {
+                anyhow::anyhow!(
                     "Cannot roll back — configuration schema has changed since this version: {e}"
-                ))?;
+                )
+            })?;
         }
         "watch_root" => {
-            serde_yaml::from_str::<db::WatchRootYaml>(yaml_content)
-                .map_err(|e| anyhow::anyhow!(
+            serde_yaml::from_str::<db::WatchRootYaml>(yaml_content).map_err(|e| {
+                anyhow::anyhow!(
                     "Cannot roll back — configuration schema has changed since this version: {e}"
-                ))?;
+                )
+            })?;
         }
         "dadbear_norms" => {
-            serde_yaml::from_str::<db::DadbearNormsYaml>(yaml_content)
-                .map_err(|e| anyhow::anyhow!(
+            serde_yaml::from_str::<db::DadbearNormsYaml>(yaml_content).map_err(|e| {
+                anyhow::anyhow!(
                     "Cannot roll back — configuration schema has changed since this version: {e}"
-                ))?;
+                )
+            })?;
         }
         _ => {
             // For schema types without a dedicated struct (stubs,
             // future types), basic YAML validity check is sufficient.
             serde_yaml::from_str::<serde_yaml::Value>(yaml_content)
-                .map_err(|e| anyhow::anyhow!(
-                    "Cannot roll back — YAML is malformed: {e}"
-                ))?;
+                .map_err(|e| anyhow::anyhow!("Cannot roll back — YAML is malformed: {e}"))?;
         }
     }
     Ok(())
@@ -2672,8 +2640,8 @@ pub fn resolve_dadbear_norms(
     let Some(slug_str) = slug else {
         return match global {
             Some(g) => {
-                let norms: db::DadbearNormsYaml = serde_yaml::from_str(&g.yaml_content)
-                    .unwrap_or_default();
+                let norms: db::DadbearNormsYaml =
+                    serde_yaml::from_str(&g.yaml_content).unwrap_or_default();
                 Ok(norms)
             }
             None => Ok(db::DadbearNormsYaml::default()),
@@ -2708,15 +2676,14 @@ pub fn resolve_dadbear_norms(
 
     // Deserialize the merged YAML into the typed struct.
     // serde defaults fill any fields missing from both layers.
-    let resolved: db::DadbearNormsYaml = serde_yaml::from_value(merged_value)
-        .unwrap_or_else(|e| {
-            warn!(
-                slug = ?slug,
-                error = %e,
-                "resolve_dadbear_norms: failed to deserialize merged norms, using defaults"
-            );
-            db::DadbearNormsYaml::default()
-        });
+    let resolved: db::DadbearNormsYaml = serde_yaml::from_value(merged_value).unwrap_or_else(|e| {
+        warn!(
+            slug = ?slug,
+            error = %e,
+            "resolve_dadbear_norms: failed to deserialize merged norms, using defaults"
+        );
+        db::DadbearNormsYaml::default()
+    });
     Ok(resolved)
 }
 
@@ -2749,10 +2716,7 @@ fn merge_yaml_values(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {
 /// Called by the dispatcher when a global `dadbear_norms` contribution
 /// syncs — a global change potentially affects every slug's resolved
 /// norms.
-pub fn rebuild_all_dadbear_norms_cache(
-    conn: &Connection,
-    bus: &Arc<BuildEventBus>,
-) -> Result<()> {
+pub fn rebuild_all_dadbear_norms_cache(conn: &Connection, bus: &Arc<BuildEventBus>) -> Result<()> {
     // Collect all distinct slugs that have active DADBEAR-related
     // contributions (dadbear_policy or dadbear_norms with a non-NULL slug).
     let slugs: Vec<String> = {
@@ -2760,7 +2724,7 @@ pub fn rebuild_all_dadbear_norms_cache(
             "SELECT DISTINCT slug FROM pyramid_config_contributions
              WHERE slug IS NOT NULL
                AND schema_type IN ('dadbear_policy', 'dadbear_norms', 'watch_root')
-               AND status = 'active'"
+               AND status = 'active'",
         )?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         rows.filter_map(|r| r.ok()).collect()
@@ -2866,7 +2830,7 @@ pub fn migrate_dadbear_policy_to_split(conn: &Connection) -> Result<()> {
              WHERE schema_type = 'dadbear_policy'
                AND status = 'active'
                AND superseded_by_id IS NULL
-             ORDER BY created_at ASC"
+             ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -2883,10 +2847,8 @@ pub fn migrate_dadbear_policy_to_split(conn: &Connection) -> Result<()> {
     // All slugs with a dadbear config are considered enabled.
     let disabled_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    let mut slug_policies: std::collections::HashMap<
-        String,
-        Vec<(String, db::DadbearPolicyYaml)>,
-    > = std::collections::HashMap::new();
+    let mut slug_policies: std::collections::HashMap<String, Vec<(String, db::DadbearPolicyYaml)>> =
+        std::collections::HashMap::new();
 
     for (contribution_id, slug_opt, yaml_content) in &policies {
         let Some(slug) = slug_opt.as_deref() else {
@@ -2918,15 +2880,17 @@ pub fn migrate_dadbear_policy_to_split(conn: &Connection) -> Result<()> {
                     source_path: policy_yaml.source_path.clone(),
                     content_type: policy_yaml.content_type.clone(),
                 };
-                let yaml_str = serde_yaml::to_string(&watch_root)
-                    .unwrap_or_else(|_| format!(
+                let yaml_str = serde_yaml::to_string(&watch_root).unwrap_or_else(|_| {
+                    format!(
                         "source_path: {:?}\ncontent_type: {:?}\n",
                         watch_root.source_path, watch_root.content_type,
-                    ));
-                let mut metadata = crate::pyramid::wire_native_metadata::default_wire_native_metadata(
-                    "watch_root",
-                    Some(slug),
-                );
+                    )
+                });
+                let mut metadata =
+                    crate::pyramid::wire_native_metadata::default_wire_native_metadata(
+                        "watch_root",
+                        Some(slug),
+                    );
                 metadata.maturity = crate::pyramid::wire_native_metadata::WireMaturity::Canon;
                 let metadata_json = metadata.to_json().unwrap_or_else(|_| "{}".to_string());
 
@@ -2940,9 +2904,7 @@ pub fn migrate_dadbear_policy_to_split(conn: &Connection) -> Result<()> {
                         body: yaml_str,
                         wire_native_metadata_json: Some(metadata_json),
                         supersedes_id: None,
-                        triggering_note: Some(
-                            "Split from dadbear_policy contribution".to_string(),
-                        ),
+                        triggering_note: Some("Split from dadbear_policy contribution".to_string()),
                         status: "active".to_string(),
                         source: "migration".to_string(),
                         wire_contribution_id: None,
@@ -2974,10 +2936,18 @@ pub fn migrate_dadbear_policy_to_split(conn: &Connection) -> Result<()> {
             max_session_timeout = max_session_timeout.max(policy_yaml.session_timeout_secs);
             max_batch_size = max_batch_size.max(policy_yaml.batch_size);
         }
-        if min_scan == i64::MAX { min_scan = 10; }
-        if max_debounce == i64::MIN { max_debounce = 30; }
-        if max_session_timeout == i64::MIN { max_session_timeout = 1800; }
-        if max_batch_size == i64::MIN { max_batch_size = 1; }
+        if min_scan == i64::MAX {
+            min_scan = 10;
+        }
+        if max_debounce == i64::MIN {
+            max_debounce = 30;
+        }
+        if max_session_timeout == i64::MIN {
+            max_session_timeout = 1800;
+        }
+        if max_batch_size == i64::MIN {
+            max_batch_size = 1;
+        }
 
         let norms = db::DadbearNormsYaml {
             scan_interval_secs: min_scan,
@@ -3007,9 +2977,7 @@ pub fn migrate_dadbear_policy_to_split(conn: &Connection) -> Result<()> {
                 body: norms_yaml_str,
                 wire_native_metadata_json: Some(metadata_json),
                 supersedes_id: None,
-                triggering_note: Some(
-                    "Split from dadbear_policy contribution".to_string(),
-                ),
+                triggering_note: Some("Split from dadbear_policy contribution".to_string()),
                 status: "active".to_string(),
                 source: "migration".to_string(),
                 wire_contribution_id: None,
@@ -3082,7 +3050,7 @@ pub fn migrate_auto_update_into_norms(conn: &Connection) -> Result<()> {
              WHERE schema_type = 'auto_update_policy'
                AND status = 'active'
                AND superseded_by_id IS NULL
-             ORDER BY created_at ASC"
+             ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -3124,8 +3092,8 @@ pub fn migrate_auto_update_into_norms(conn: &Connection) -> Result<()> {
                 norms.debounce_secs = debounce_from_auto;
             }
 
-            let norms_yaml_str = serde_yaml::to_string(&norms)
-                .unwrap_or_else(|_| norms_row.yaml_content.clone());
+            let norms_yaml_str =
+                serde_yaml::to_string(&norms).unwrap_or_else(|_| norms_row.yaml_content.clone());
 
             let mut metadata = crate::pyramid::wire_native_metadata::default_wire_native_metadata(
                 "dadbear_norms",
@@ -3193,9 +3161,7 @@ pub fn migrate_auto_update_into_norms(conn: &Connection) -> Result<()> {
                     body: norms_yaml_str,
                     wire_native_metadata_json: Some(metadata_json),
                     supersedes_id: None,
-                    triggering_note: Some(
-                        "Created from auto_update_policy migration".to_string(),
-                    ),
+                    triggering_note: Some("Created from auto_update_policy migration".to_string()),
                     status: "active".to_string(),
                     source: "migration".to_string(),
                     wire_contribution_id: None,
@@ -3485,11 +3451,12 @@ mod tests {
 
         accept_proposal(&mut conn, &proposal_id).unwrap();
 
-        let prior = load_contribution_by_id(&conn, &active_id)
-            .unwrap()
-            .unwrap();
+        let prior = load_contribution_by_id(&conn, &active_id).unwrap().unwrap();
         assert_eq!(prior.status, "superseded");
-        assert_eq!(prior.superseded_by_id.as_deref(), Some(proposal_id.as_str()));
+        assert_eq!(
+            prior.superseded_by_id.as_deref(),
+            Some(proposal_id.as_str())
+        );
 
         let accepted = load_contribution_by_id(&conn, &proposal_id)
             .unwrap()
@@ -3654,8 +3621,11 @@ mod tests {
         // Phase 4.
         conn.execute("DELETE FROM pyramid_config_contributions", [])
             .unwrap();
-        conn.execute("UPDATE pyramid_dadbear_config SET contribution_id = NULL", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE pyramid_dadbear_config SET contribution_id = NULL",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO pyramid_dadbear_config
                 (slug, source_path, content_type, scan_interval_secs, debounce_secs,
@@ -3695,7 +3665,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(marker_count, 1, "migration marker should exist after first pass");
+        assert_eq!(
+            marker_count, 1,
+            "migration marker should exist after first pass"
+        );
 
         // Second migration pass.
         crate::pyramid::db::migrate_legacy_dadbear_to_contributions(&conn).unwrap();
@@ -3721,10 +3694,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(
-            marker_count_after, 1,
-            "marker must not duplicate on re-run"
-        );
+        assert_eq!(marker_count_after, 1, "marker must not duplicate on re-run");
 
         // The legacy DADBEAR row should have gained its contribution_id.
         let legacy_contribution_id: Option<String> = conn
@@ -3933,14 +3903,14 @@ mod tests {
         assert_eq!(config.max_recursion_depth, 6);
         assert_eq!(config.max_file_size_bytes, 5_000_000);
         assert_eq!(config.default_scan_interval_secs, 60);
-        assert_eq!(config.code_extensions, vec![".rs".to_string(), ".ts".to_string()]);
+        assert_eq!(
+            config.code_extensions,
+            vec![".rs".to_string(), ".ts".to_string()]
+        );
         assert_eq!(config.document_extensions, vec![".md".to_string()]);
         assert!(!config.claude_code_auto_include);
         assert_eq!(config.claude_code_conversation_path, "/tmp/my-cc");
-        assert!(config
-            .ignore_patterns
-            .iter()
-            .any(|p| p == "node_modules/"));
+        assert!(config.ignore_patterns.iter().any(|p| p == "node_modules/"));
     }
 
     #[test]
@@ -3988,7 +3958,10 @@ mod tests {
             ("tier_routing", WireContributionType::Template),
             ("step_overrides", WireContributionType::Template),
             ("custom_prompts", WireContributionType::Template),
-            ("folder_ingestion_heuristics", WireContributionType::Template),
+            (
+                "folder_ingestion_heuristics",
+                WireContributionType::Template,
+            ),
             ("custom_chain", WireContributionType::Action),
             ("custom_chains", WireContributionType::Action),
             ("wire_discovery_weights", WireContributionType::Template),
@@ -4193,8 +4166,7 @@ mod tests {
         .unwrap();
 
         let loaded = load_contribution_by_id(&conn, &id).unwrap().unwrap();
-        let loaded_meta =
-            WireNativeMetadata::from_json(&loaded.wire_native_metadata_json).unwrap();
+        let loaded_meta = WireNativeMetadata::from_json(&loaded.wire_native_metadata_json).unwrap();
         assert_eq!(loaded_meta.maturity, WireMaturity::Canon);
         assert_eq!(loaded_meta.price, Some(2));
     }
@@ -4309,9 +4281,7 @@ mod tests {
     /// metadata's derived_from weights.
     #[test]
     fn phase5_dry_run_publish_allocates_28_slots_from_derived_from() {
-        use crate::pyramid::wire_native_metadata::{
-            WireNativeMetadata, WireRef,
-        };
+        use crate::pyramid::wire_native_metadata::{WireNativeMetadata, WireRef};
         use crate::pyramid::wire_publish::PyramidPublisher;
 
         let conn = mem_conn();
@@ -4463,7 +4433,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(after, 1, "flag_configs_for_migration should have set the flag");
+        assert_eq!(
+            after, 1,
+            "flag_configs_for_migration should have set the flag"
+        );
     }
 
     // ── Phase 14: new schema_type dispatcher branches ──────────────────
@@ -4819,9 +4792,7 @@ mod tests {
     /// target schema_type. Writes directly via the envelope (the test
     /// is itself exercising the writer).
     fn seed_annotation(conn: &Connection, target_schema_type: &str, parameters_yaml: &str) {
-        let yaml = format!(
-            "applies_to: {target_schema_type}\nparameters:\n{parameters_yaml}"
-        );
+        let yaml = format!("applies_to: {target_schema_type}\nparameters:\n{parameters_yaml}");
         write_contribution_envelope(
             conn,
             ContributionEnvelopeInput {
@@ -5183,7 +5154,11 @@ mod tests {
             },
             TransactionMode::OwnTransaction,
         );
-        assert!(result.is_ok(), "empty body must pass validation: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "empty body must pass validation: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -5221,7 +5196,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(stored, body, "body must round-trip unchanged when no annotation applies");
+        assert_eq!(
+            stored, body,
+            "body must round-trip unchanged when no annotation applies"
+        );
     }
 
     #[test]
@@ -5269,7 +5247,10 @@ mod tests {
             &conn, &entry, &metadata,
         )
         .expect("pre-check should succeed with Ok(false)");
-        assert!(!inserted, "bundled row must be skipped when user-active exists");
+        assert!(
+            !inserted,
+            "bundled row must be skipped when user-active exists"
+        );
         let cnt: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pyramid_config_contributions WHERE contribution_id = 'bundled-would-lose'",
@@ -5319,7 +5300,13 @@ mod tests {
     fn retract_reactivates_immediate_parent() {
         let mut conn = mem_conn();
         seed_retract_row(&conn, "floor", "superseded", "bundled", None);
-        seed_retract_row(&conn, "active", "active", "operator_authored", Some("floor"));
+        seed_retract_row(
+            &conn,
+            "active",
+            "active",
+            "operator_authored",
+            Some("floor"),
+        );
 
         let outcome = retract_config_contribution(&mut conn, "active", "operator retract").unwrap();
         match outcome {
@@ -5343,7 +5330,13 @@ mod tests {
         let mut conn = mem_conn();
         // chain: floor (bundled, superseded) <- mid (retracted) <- top (active)
         seed_retract_row(&conn, "floor", "superseded", "bundled", None);
-        seed_retract_row(&conn, "mid", "retracted", "operator_authored", Some("floor"));
+        seed_retract_row(
+            &conn,
+            "mid",
+            "retracted",
+            "operator_authored",
+            Some("floor"),
+        );
         seed_retract_row(&conn, "top", "active", "operator_authored", Some("mid"));
 
         let outcome = retract_config_contribution(&mut conn, "top", "walk deep").unwrap();
@@ -5354,7 +5347,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(reactivated_id, "floor");
-                assert_eq!(walked_hops, 2, "should walk past retracted mid to find floor");
+                assert_eq!(
+                    walked_hops, 2,
+                    "should walk past retracted mid to find floor"
+                );
             }
             other => panic!("expected ReactivatedAncestor, got {other:?}"),
         }
@@ -5368,10 +5364,17 @@ mod tests {
         let mut conn = mem_conn();
         // chain: floor (bundled, retracted) <- mid (retracted) <- top (active)
         seed_retract_row(&conn, "floor", "retracted", "bundled", None);
-        seed_retract_row(&conn, "mid", "retracted", "operator_authored", Some("floor"));
+        seed_retract_row(
+            &conn,
+            "mid",
+            "retracted",
+            "operator_authored",
+            Some("floor"),
+        );
         seed_retract_row(&conn, "top", "active", "operator_authored", Some("mid"));
 
-        let outcome = retract_config_contribution(&mut conn, "top", "full retract cascade").unwrap();
+        let outcome =
+            retract_config_contribution(&mut conn, "top", "full retract cascade").unwrap();
         match outcome {
             RetractionOutcome::ReactivatedBundledFloor {
                 retracted_id,
@@ -5438,7 +5441,13 @@ mod tests {
         // then each child whose parent already exists. Chain is
         // retracted_19 (root, no parent) <- retracted_18 <- ... <- retracted_0 <- top (active).
         // No bundled floor; every ancestor retracted; walk hits depth ceiling.
-        seed_retract_row(&conn, "retracted_19", "retracted", "operator_authored", None);
+        seed_retract_row(
+            &conn,
+            "retracted_19",
+            "retracted",
+            "operator_authored",
+            None,
+        );
         for i in (0..19u32).rev() {
             let id = format!("retracted_{i}");
             let parent = format!("retracted_{}", i + 1);
@@ -5468,13 +5477,7 @@ mod tests {
         let mut conn = mem_conn();
         // Every ancestor retracted AND root is operator-authored, not bundled.
         seed_retract_row(&conn, "root", "retracted", "operator_authored", None);
-        seed_retract_row(
-            &conn,
-            "top",
-            "active",
-            "operator_authored",
-            Some("root"),
-        );
+        seed_retract_row(&conn, "top", "active", "operator_authored", Some("root"));
 
         let err = retract_config_contribution(&mut conn, "top", "dead end").unwrap_err();
         assert!(
@@ -5489,8 +5492,7 @@ mod tests {
     #[test]
     fn retract_nonexistent_returns_not_found() {
         let mut conn = mem_conn();
-        let err =
-            retract_config_contribution(&mut conn, "does-not-exist", "probe").unwrap_err();
+        let err = retract_config_contribution(&mut conn, "does-not-exist", "probe").unwrap_err();
         assert!(
             matches!(err, ContributionWriterError::ContributionNotFound { .. }),
             "got {err:?}"
@@ -5507,6 +5509,9 @@ mod tests {
         seed_retract_row(&conn, "top", "active", "operator_authored", Some("floor"));
 
         let outcome = retract_config_contribution(&mut conn, "top", "").unwrap();
-        assert!(matches!(outcome, RetractionOutcome::ReactivatedAncestor { .. }));
+        assert!(matches!(
+            outcome,
+            RetractionOutcome::ReactivatedAncestor { .. }
+        ));
     }
 }

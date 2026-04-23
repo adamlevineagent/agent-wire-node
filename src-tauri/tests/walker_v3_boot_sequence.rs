@@ -253,8 +253,7 @@ async fn boot_injected_panic_drives_quarantined() {
         while let Some(transition) = mode_rx.recv().await {
             match transition {
                 AppModeTransition::Quarantined { .. } => {
-                    wire_node_lib::app_mode::transition_to(&relay_mode, AppMode::Quarantined)
-                        .await;
+                    wire_node_lib::app_mode::transition_to(&relay_mode, AppMode::Quarantined).await;
                 }
             }
         }

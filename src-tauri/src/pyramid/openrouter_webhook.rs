@@ -65,9 +65,7 @@ use subtle::ConstantTimeEq;
 
 use super::db::{self, CorrelatedCostLogRow};
 use super::event_bus::{BuildEventBus, TaggedBuildEvent, TaggedKind};
-use super::provider_health::{
-    record_provider_error, CostReconciliationPolicy, ProviderErrorKind,
-};
+use super::provider_health::{record_provider_error, CostReconciliationPolicy, ProviderErrorKind};
 
 /// Broadcast payload decoded from the OTLP span attributes. The
 /// webhook parses every span in the request and produces one
@@ -155,8 +153,8 @@ pub fn verify_webhook_secret(
     provider_id: &str,
     header_value: Option<&str>,
 ) -> std::result::Result<(), WebhookAuthError> {
-    let expected = load_webhook_secret(conn, provider_id)
-        .map_err(|_| WebhookAuthError::NoSecretConfigured)?;
+    let expected =
+        load_webhook_secret(conn, provider_id).map_err(|_| WebhookAuthError::NoSecretConfigured)?;
     let Some(expected) = expected else {
         return Err(WebhookAuthError::NoSecretConfigured);
     };
@@ -174,13 +172,9 @@ pub fn verify_webhook_secret(
 /// Load the shared secret from `pyramid_providers.broadcast_config_json`.
 /// Schema: `{ "secret": "<value>" }`. Returns `Ok(None)` when no
 /// provider row exists or the config does not set a secret yet.
-fn load_webhook_secret(
-    conn: &rusqlite::Connection,
-    provider_id: &str,
-) -> Result<Option<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT broadcast_config_json FROM pyramid_providers WHERE id = ?1",
-    )?;
+fn load_webhook_secret(conn: &rusqlite::Connection, provider_id: &str) -> Result<Option<String>> {
+    let mut stmt =
+        conn.prepare("SELECT broadcast_config_json FROM pyramid_providers WHERE id = ?1")?;
     let mut rows = stmt.query(rusqlite::params![provider_id])?;
     let Some(row) = rows.next()? else {
         return Ok(None);
@@ -350,9 +344,8 @@ fn extract_int_value(value: Option<&Value>) -> Option<i64> {
     if let Some(n) = v.get("intValue").and_then(|x| x.as_i64()) {
         return Some(n);
     }
-    v.as_i64().or_else(|| {
-        v.as_str().and_then(|s| s.parse::<i64>().ok())
-    })
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
 }
 
 fn extract_float_value(value: Option<&Value>) -> Option<f64> {
@@ -389,10 +382,12 @@ pub fn process_trace(
 
     // Pull slug for fallback correlation. Prefer the explicit
     // pyramid_slug attribute; otherwise split the session_id.
-    let slug_for_lookup = trace
-        .pyramid_slug
-        .clone()
-        .or_else(|| trace.session_id.as_ref().and_then(|s| s.split_once('/').map(|p| p.0.to_string())));
+    let slug_for_lookup = trace.pyramid_slug.clone().or_else(|| {
+        trace
+            .session_id
+            .as_ref()
+            .and_then(|s| s.split_once('/').map(|p| p.0.to_string()))
+    });
 
     let matched = db::correlate_broadcast_to_cost_log(
         conn,
@@ -419,7 +414,9 @@ pub fn process_trace(
                 trace.completion_tokens,
                 &trace.raw_attributes_json,
             )?;
-            return Ok(BroadcastOutcome::Recovered { cost_log_id: row.id });
+            return Ok(BroadcastOutcome::Recovered {
+                cost_log_id: row.id,
+            });
         }
     }
 
@@ -428,9 +425,7 @@ pub fn process_trace(
     let sync_cost = row.actual_cost;
     let broadcast_cost = trace.cost_usd;
     let ratio = match (sync_cost, broadcast_cost) {
-        (Some(ac), Some(bc)) if ac.abs() > f64::EPSILON => {
-            Some(((ac - bc).abs() / ac.abs()).abs())
-        }
+        (Some(ac), Some(bc)) if ac.abs() > f64::EPSILON => Some(((ac - bc).abs() / ac.abs()).abs()),
         (Some(ac), Some(bc)) if ac.abs() <= f64::EPSILON => {
             // Divide-by-zero: if the sync cost is zero and the
             // broadcast says nonzero, the ratio is effectively
@@ -445,9 +440,7 @@ pub fn process_trace(
         _ => None,
     };
 
-    let is_discrepancy = ratio
-        .map(|r| r > policy.discrepancy_ratio)
-        .unwrap_or(false);
+    let is_discrepancy = ratio.map(|r| r > policy.discrepancy_ratio).unwrap_or(false);
 
     db::record_broadcast_confirmation(
         conn,
@@ -481,7 +474,9 @@ pub fn process_trace(
         });
     }
 
-    Ok(BroadcastOutcome::Confirmed { cost_log_id: row.id })
+    Ok(BroadcastOutcome::Confirmed {
+        cost_log_id: row.id,
+    })
 }
 
 fn insert_orphan_and_emit(
@@ -571,8 +566,7 @@ pub fn run_leak_sweep(
     if !policy.broadcast_required {
         return Ok(0);
     }
-    let flipped =
-        db::sweep_broadcast_missing(conn, policy.broadcast_grace_period_secs)?;
+    let flipped = db::sweep_broadcast_missing(conn, policy.broadcast_grace_period_secs)?;
     if flipped > 0 {
         if let Some(bus) = bus {
             let _ = bus.tx.send(TaggedBuildEvent {
@@ -761,8 +755,7 @@ mod tests {
         );
         let traces = parse_otlp_payload(&payload).unwrap();
         let policy = CostReconciliationPolicy::default();
-        let outcome =
-            process_trace(&conn, &traces[0], "openrouter", &policy, None).unwrap();
+        let outcome = process_trace(&conn, &traces[0], "openrouter", &policy, None).unwrap();
         assert_eq!(outcome, BroadcastOutcome::Confirmed { cost_log_id: id });
 
         // Verify the row is now confirmed.
@@ -806,8 +799,7 @@ mod tests {
         });
         let traces = parse_otlp_payload(&payload).unwrap();
         let policy = CostReconciliationPolicy::default();
-        let outcome =
-            process_trace(&conn, &traces[0], "openrouter", &policy, None).unwrap();
+        let outcome = process_trace(&conn, &traces[0], "openrouter", &policy, None).unwrap();
         assert_eq!(outcome, BroadcastOutcome::Confirmed { cost_log_id: id });
     }
 
@@ -825,17 +817,14 @@ mod tests {
         );
         let traces = parse_otlp_payload(&payload).unwrap();
         let policy = CostReconciliationPolicy::default();
-        let outcome =
-            process_trace(&conn, &traces[0], "openrouter", &policy, None).unwrap();
+        let outcome = process_trace(&conn, &traces[0], "openrouter", &policy, None).unwrap();
         match outcome {
             BroadcastOutcome::Orphan { orphan_id } => {
                 assert!(orphan_id > 0);
                 let count: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM pyramid_orphan_broadcasts",
-                        [],
-                        |r| r.get(0),
-                    )
+                    .query_row("SELECT COUNT(*) FROM pyramid_orphan_broadcasts", [], |r| {
+                        r.get(0)
+                    })
                     .unwrap();
                 assert_eq!(count, 1);
             }
@@ -866,10 +855,11 @@ mod tests {
         );
         let traces = parse_otlp_payload(&payload).unwrap();
         let policy = CostReconciliationPolicy::default();
-        let outcome =
-            process_trace(&conn, &traces[0], "openrouter", &policy, None).unwrap();
+        let outcome = process_trace(&conn, &traces[0], "openrouter", &policy, None).unwrap();
         match outcome {
-            BroadcastOutcome::Discrepancy { cost_log_id, ratio, .. } => {
+            BroadcastOutcome::Discrepancy {
+                cost_log_id, ratio, ..
+            } => {
                 assert_eq!(cost_log_id, id);
                 assert!(ratio.unwrap() > 0.10);
                 let status: String = conn
@@ -925,8 +915,7 @@ mod tests {
         );
         let traces = parse_otlp_payload(&payload).unwrap();
         let policy = CostReconciliationPolicy::default();
-        let outcome =
-            process_trace(&conn, &traces[0], "openrouter", &policy, None).unwrap();
+        let outcome = process_trace(&conn, &traces[0], "openrouter", &policy, None).unwrap();
         assert_eq!(outcome, BroadcastOutcome::Confirmed { cost_log_id: id });
     }
 
@@ -993,8 +982,7 @@ mod tests {
         let conn = mem_conn();
         let policy = CostReconciliationPolicy::default();
         let trace = BroadcastTrace::default();
-        let outcome =
-            process_trace(&conn, &trace, "openrouter", &policy, None).unwrap();
+        let outcome = process_trace(&conn, &trace, "openrouter", &policy, None).unwrap();
         assert_eq!(outcome, BroadcastOutcome::TestPing);
     }
 
@@ -1081,8 +1069,7 @@ mod tests {
         );
         let traces = parse_otlp_payload(&payload).unwrap();
         let policy = CostReconciliationPolicy::default();
-        let outcome =
-            process_trace(&conn, &traces[0], "openrouter", &policy, None).unwrap();
+        let outcome = process_trace(&conn, &traces[0], "openrouter", &policy, None).unwrap();
         assert_eq!(outcome, BroadcastOutcome::Recovered { cost_log_id: id });
         let status: String = conn
             .query_row(

@@ -213,10 +213,7 @@ pub struct MirrorTaskContext {
 ///   - Unblocking call sites — a mutation site never awaits on the
 ///     HTTP push, it just drops a nudge token and continues. HTTP
 ///     slowness can't back-pressure the dispatch handler.
-pub fn spawn_market_mirror_task(
-    ctx: MirrorTaskContext,
-    rx: mpsc::UnboundedReceiver<()>,
-) {
+pub fn spawn_market_mirror_task(ctx: MirrorTaskContext, rx: mpsc::UnboundedReceiver<()>) {
     tauri::async_runtime::spawn(async move {
         supervise_mirror_loop(ctx, rx).await;
     });
@@ -233,10 +230,7 @@ pub fn spawn_market_mirror_task(
 /// visibility (loud chronicle), not self-smoothing. The bounded
 /// backoff keeps the chronicle from filling up if something is truly
 /// wedged.
-async fn supervise_mirror_loop(
-    ctx: MirrorTaskContext,
-    mut rx: mpsc::UnboundedReceiver<()>,
-) {
+async fn supervise_mirror_loop(ctx: MirrorTaskContext, mut rx: mpsc::UnboundedReceiver<()>) {
     const PANIC_BACKOFF_SECS: u64 = 5;
 
     loop {
@@ -614,16 +608,13 @@ async fn push_snapshot(ctx: &MirrorTaskContext) -> Result<(), String> {
     let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let conn = rusqlite::Connection::open(&db_path)?;
         let job_path = format!("market/mirror/{}", chrono::Utc::now().timestamp());
-        let ctx_ev = ChronicleEventContext::minimal(
-            &job_path,
-            "queue_mirror_pushed",
-            SOURCE_MARKET,
-        )
-        .with_metadata(serde_json::json!({
-            "snapshot_seq": snap_seq,
-            "offers": offers_count,
-            "is_serving": push_is_serving,
-        }));
+        let ctx_ev =
+            ChronicleEventContext::minimal(&job_path, "queue_mirror_pushed", SOURCE_MARKET)
+                .with_metadata(serde_json::json!({
+                    "snapshot_seq": snap_seq,
+                    "offers": offers_count,
+                    "is_serving": push_is_serving,
+                }));
         let _ = record_event(&conn, &ctx_ev);
         Ok(())
     })

@@ -148,10 +148,7 @@ pub trait LlmProvider: Send + Sync {
     /// requirements. The `secret` argument is `None` when the provider's
     /// `api_key_ref` is unset (local Ollama, or a custom endpoint with
     /// auth provided via `config_json.extra_headers` instead).
-    fn prepare_headers(
-        &self,
-        secret: Option<&ResolvedSecret>,
-    ) -> Result<Vec<(String, String)>>;
+    fn prepare_headers(&self, secret: Option<&ResolvedSecret>) -> Result<Vec<(String, String)>>;
 
     /// Parse the provider's response body into the unified shape.
     fn parse_response(&self, body: &str) -> Result<ParsedLlmResponse>;
@@ -356,10 +353,7 @@ impl LlmProvider for OpenRouterProvider {
         format!("{base}/chat/completions")
     }
 
-    fn prepare_headers(
-        &self,
-        secret: Option<&ResolvedSecret>,
-    ) -> Result<Vec<(String, String)>> {
+    fn prepare_headers(&self, secret: Option<&ResolvedSecret>) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(6 + self.extra_headers.len());
         let secret = secret.ok_or_else(|| {
             anyhow!(
@@ -412,7 +406,9 @@ impl LlmProvider for OpenRouterProvider {
     }
 
     fn augment_request_body(&self, body: &mut Value, metadata: &RequestMetadata) {
-        let Some(map) = body.as_object_mut() else { return };
+        let Some(map) = body.as_object_mut() else {
+            return;
+        };
 
         // Phase 11: the `trace` object carries BOTH OpenRouter's
         // recognized hierarchy keys (trace_id / trace_name / span_name
@@ -496,12 +492,14 @@ impl LlmProvider for OpenRouterProvider {
         // the explicit override, otherwise synthesize from slug+build.
         // The webhook correlator splits on `/` and uses the first
         // half as the slug filter for its fallback correlation path.
-        let session_id = metadata.session_id.clone().or_else(|| {
-            match (&metadata.slug, &metadata.build_id) {
-                (Some(slug), Some(bid)) => Some(format!("{slug}/{bid}")),
-                _ => None,
-            }
-        });
+        let session_id =
+            metadata
+                .session_id
+                .clone()
+                .or_else(|| match (&metadata.slug, &metadata.build_id) {
+                    (Some(slug), Some(bid)) => Some(format!("{slug}/{bid}")),
+                    _ => None,
+                });
         if let Some(sid) = session_id {
             map.insert("session_id".into(), Value::String(sid));
         }
@@ -551,10 +549,7 @@ impl LlmProvider for OpenAiCompatProvider {
         format!("{base}/chat/completions")
     }
 
-    fn prepare_headers(
-        &self,
-        secret: Option<&ResolvedSecret>,
-    ) -> Result<Vec<(String, String)>> {
+    fn prepare_headers(&self, secret: Option<&ResolvedSecret>) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(2 + self.extra_headers.len());
         out.push(("Content-Type".to_string(), "application/json".to_string()));
 
@@ -629,10 +624,7 @@ pub fn parse_ollama_context_length(v: &Value) -> Option<usize> {
     let model_info = v.get("model_info")?;
     let obj = model_info.as_object()?;
 
-    if let Some(arch) = obj
-        .get("general.architecture")
-        .and_then(|v| v.as_str())
-    {
+    if let Some(arch) = obj.get("general.architecture").and_then(|v| v.as_str()) {
         let key = format!("{arch}.context_length");
         if let Some(n) = obj.get(&key).and_then(|v| v.as_u64()) {
             return Some(n as usize);
@@ -695,9 +687,7 @@ fn parse_openai_shaped_response(body: &str, expect_cost_field: bool) -> Result<P
         // back to estimated cost. We log at debug (not warn) to avoid
         // spamming on providers that have started returning null for
         // free-promotional calls.
-        tracing::debug!(
-            "openrouter response missing usage.cost, falling back to estimated cost"
-        );
+        tracing::debug!("openrouter response missing usage.cost, falling back to estimated cost");
     }
 
     let finish_reason = data
@@ -809,10 +799,7 @@ impl ProviderRegistry {
         for p in providers {
             map.insert(p.id.clone(), p);
         }
-        *self
-            .providers
-            .write()
-            .expect("providers RwLock poisoned") = map;
+        *self.providers.write().expect("providers RwLock poisoned") = map;
 
         let tier = super::db::get_tier_routing(conn)?;
         *self
@@ -920,7 +907,9 @@ impl ProviderRegistry {
         // `model_tier` — which renames the tier we look up.
         let mut effective_tier = tier_name.to_string();
         if let (Some(slug), Some(chain_id), Some(step_name)) = (slug, chain_id, step_name) {
-            if let Some(override_row) = self.get_step_override(slug, chain_id, step_name, "model_tier") {
+            if let Some(override_row) =
+                self.get_step_override(slug, chain_id, step_name, "model_tier")
+            {
                 if let Ok(v) = serde_json::from_str::<String>(&override_row.value_json) {
                     effective_tier = v;
                 }
@@ -954,10 +943,7 @@ impl ProviderRegistry {
     /// Resolve the credential referenced by a provider, substituting
     /// `${VAR_NAME}` as needed. Returns `None` (not an Err) when
     /// `api_key_ref` is unset — the provider does not require auth.
-    pub fn resolve_credential_for(
-        &self,
-        provider: &Provider,
-    ) -> Result<Option<ResolvedSecret>> {
+    pub fn resolve_credential_for(&self, provider: &Provider) -> Result<Option<ResolvedSecret>> {
         let Some(key_ref) = provider.api_key_ref.as_deref() else {
             return Ok(None);
         };
@@ -1029,11 +1015,7 @@ impl ProviderRegistry {
     /// responsible for providing a DB connection — the registry does
     /// not hold one itself so it can be shared across reader/writer
     /// mutexes.
-    pub fn save_provider(
-        &self,
-        conn: &rusqlite::Connection,
-        provider: Provider,
-    ) -> Result<()> {
+    pub fn save_provider(&self, conn: &rusqlite::Connection, provider: Provider) -> Result<()> {
         super::db::save_provider(conn, &provider)?;
         self.providers
             .write()
@@ -1043,11 +1025,7 @@ impl ProviderRegistry {
     }
 
     /// Delete a provider row from memory and the database.
-    pub fn delete_provider(
-        &self,
-        conn: &rusqlite::Connection,
-        id: &str,
-    ) -> Result<()> {
+    pub fn delete_provider(&self, conn: &rusqlite::Connection, id: &str) -> Result<()> {
         super::db::delete_provider(conn, id)?;
         self.providers
             .write()
@@ -1071,11 +1049,7 @@ impl ProviderRegistry {
     }
 
     /// Delete a tier routing row.
-    pub fn delete_tier_routing(
-        &self,
-        conn: &rusqlite::Connection,
-        tier_name: &str,
-    ) -> Result<()> {
+    pub fn delete_tier_routing(&self, conn: &rusqlite::Connection, tier_name: &str) -> Result<()> {
         super::db::delete_tier_routing(conn, tier_name)?;
         self.tier_routing
             .write()
@@ -1467,9 +1441,7 @@ mod tests {
             context_limit: None,
             max_completion_tokens: None,
             pricing_json: "{}".into(),
-            supported_parameters_json: Some(
-                r#"["tools","response_format","temperature"]"#.into(),
-            ),
+            supported_parameters_json: Some(r#"["tools","response_format","temperature"]"#.into()),
             notes: None,
         };
         assert!(tier.supports_response_format());
@@ -1579,11 +1551,15 @@ mod tests {
         assert_eq!(web_resolved.tier.context_limit, Some(2_000_000));
 
         // synth_heavy → minimax/minimax-m2.7
-        let sh = registry.resolve_tier("synth_heavy", None, None, None).unwrap();
+        let sh = registry
+            .resolve_tier("synth_heavy", None, None, None)
+            .unwrap();
         assert_eq!(sh.tier.model_id, "minimax/minimax-m2.7");
 
         // stale_remote → minimax/minimax-m2.7
-        let sr = registry.resolve_tier("stale_remote", None, None, None).unwrap();
+        let sr = registry
+            .resolve_tier("stale_remote", None, None, None)
+            .unwrap();
         assert_eq!(sr.tier.model_id, "minimax/minimax-m2.7");
 
         // stale_local must NOT exist in the seeded set — Adam's

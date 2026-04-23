@@ -370,9 +370,8 @@ fn resolve_scope_slugs(
         "all" => {
             if currently_frozen {
                 // Return slugs that HAVE a 'frozen' hold
-                let mut stmt = conn.prepare(
-                    "SELECT slug FROM dadbear_holds_projection WHERE hold = 'frozen'",
-                )?;
+                let mut stmt = conn
+                    .prepare("SELECT slug FROM dadbear_holds_projection WHERE hold = 'frozen'")?;
                 let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
                 let mut slugs = Vec::new();
                 for row in rows {
@@ -401,8 +400,8 @@ fn resolve_scope_slugs(
             }
         }
         "slug" => {
-            let slug = scope_value
-                .ok_or_else(|| anyhow::anyhow!("scope='slug' requires scope_value"))?;
+            let slug =
+                scope_value.ok_or_else(|| anyhow::anyhow!("scope='slug' requires scope_value"))?;
             if currently_frozen {
                 // Check if this slug has a 'frozen' hold
                 let count: i64 = conn.query_row(
@@ -456,10 +455,9 @@ fn resolve_scope_slugs(
                            WHERE h.slug = s.slug AND h.hold = 'frozen'
                        )",
                 )?;
-                let rows = stmt.query_map(
-                    rusqlite::params![folder, like_pattern],
-                    |row| row.get::<_, String>(0),
-                )?;
+                let rows = stmt.query_map(rusqlite::params![folder, like_pattern], |row| {
+                    row.get::<_, String>(0)
+                })?;
                 let mut slugs = Vec::new();
                 for row in rows {
                     slugs.push(row?);
@@ -477,10 +475,9 @@ fn resolve_scope_slugs(
                            WHERE h.slug = s.slug AND h.hold = 'frozen'
                        )",
                 )?;
-                let rows = stmt.query_map(
-                    rusqlite::params![folder, like_pattern],
-                    |row| row.get::<_, String>(0),
-                )?;
+                let rows = stmt.query_map(rusqlite::params![folder, like_pattern], |row| {
+                    row.get::<_, String>(0)
+                })?;
                 let mut slugs = Vec::new();
                 for row in rows {
                     slugs.push(row?);

@@ -98,9 +98,7 @@ pub enum V3MigrationError {
     /// post-v2 body (e.g. `v3-db-migrated-config-pending` or `v3`). The
     /// caller should skip Phase A; idempotent re-runs return this, not
     /// silently re-migrate.
-    #[error(
-        "migration_marker body `{body}` — Phase A already ran (expected `v2` or missing)"
-    )]
+    #[error("migration_marker body `{body}` — Phase A already ran (expected `v2` or missing)")]
     AlreadyMigrated { body: String },
     /// Active builds block the migration (§2.16.4). Boot coordinator
     /// surfaces the recovery modal; this variant carries the slug set so
@@ -392,19 +390,12 @@ pub fn run_v3_phase_a_migration(
     // operator has primary_model / fallbacks set in pyramid_config.json,
     // still emit a walker_provider_openrouter carrier so the fold lands
     // somewhere instead of being discarded.
-    if !config_fallback_chain.is_empty()
-        && !grouped.contains_key(&ProviderType::OpenRouter)
-    {
-        let body = build_walker_provider_body(
-            ProviderType::OpenRouter,
-            &[],
-            &config_fallback_chain,
-        );
+    if !config_fallback_chain.is_empty() && !grouped.contains_key(&ProviderType::OpenRouter) {
+        let body =
+            build_walker_provider_body(ProviderType::OpenRouter, &[], &config_fallback_chain);
         let id = uuid::Uuid::new_v4().to_string();
-        let prior_id = supersede_prior_active_pre_insert(
-            &tx,
-            ProviderType::OpenRouter.schema_type(),
-        )?;
+        let prior_id =
+            supersede_prior_active_pre_insert(&tx, ProviderType::OpenRouter.schema_type())?;
         write_envelope_in_tx(
             &tx,
             ContributionEnvelopeInput {
@@ -576,9 +567,7 @@ fn build_walker_provider_body(
                 // fallback; the legacy column was free-form.
                 let parsed: Option<Vec<String>> = serde_json::from_str::<Vec<String>>(trimmed)
                     .ok()
-                    .or_else(|| {
-                        serde_yaml::from_str::<Vec<String>>(trimmed).ok()
-                    });
+                    .or_else(|| serde_yaml::from_str::<Vec<String>>(trimmed).ok());
                 if let Some(list) = parsed {
                     if supported_parameters.is_none() {
                         supported_parameters = Some(list);
@@ -749,7 +738,10 @@ fn migrate_walker_call_order(
             if let Some(route_to) = rule.get("route_to").and_then(|v| v.as_sequence()) {
                 for entry in route_to {
                     // provider_id in legacy → provider_type in v3
-                    let pid = entry.get("provider_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let pid = entry
+                        .get("provider_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     if pid.is_empty() {
                         continue;
                     }
@@ -832,8 +824,7 @@ fn migrate_walker_call_order(
             wire_native_metadata_json: None,
             supersedes_id: prior_id.clone(),
             triggering_note: Some(
-                "Walker v3 Phase A migration — dispatch_policy.routing_rules.route_to"
-                    .to_string(),
+                "Walker v3 Phase A migration — dispatch_policy.routing_rules.route_to".to_string(),
             ),
             status: "active".to_string(),
             source: "migration".to_string(),
@@ -1256,17 +1247,13 @@ pub fn run_v3_phase_b_migration(
     match current_body.as_str() {
         "v3-db-migrated-config-pending" => { /* proceed */ }
         "v3" => {
-            return Err(V3PhaseBError::AlreadyMigrated {
-                body: current_body,
-            });
+            return Err(V3PhaseBError::AlreadyMigrated { body: current_body });
         }
         "" | "v2" => {
             return Err(V3PhaseBError::PhaseANotRun);
         }
         _ => {
-            return Err(V3PhaseBError::UnexpectedMarkerBody {
-                body: current_body,
-            });
+            return Err(V3PhaseBError::UnexpectedMarkerBody { body: current_body });
         }
     }
 
@@ -1277,8 +1264,8 @@ pub fn run_v3_phase_b_migration(
     let (pre_bytes, parsed_value): (Option<String>, Option<serde_json::Value>) =
         match std::fs::read_to_string(&config_path) {
             Ok(raw) => {
-                let v: serde_json::Value = serde_json::from_str(&raw)
-                    .map_err(V3PhaseBError::ConfigFileParseError)?;
+                let v: serde_json::Value =
+                    serde_json::from_str(&raw).map_err(V3PhaseBError::ConfigFileParseError)?;
                 (Some(raw), Some(v))
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1310,8 +1297,7 @@ pub fn run_v3_phase_b_migration(
     // `WHERE NOT EXISTS` so a retry after a mid-run failure doesn't
     // append a second snapshot row.
     {
-        let snap_tx =
-            conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let snap_tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         snap_tx
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS _pre_v3_snapshot_config (
@@ -1328,9 +1314,15 @@ pub fn run_v3_phase_b_migration(
         if let Some(raw) = &pre_bytes {
             let (pm, fb1, fb2) = if let Some(v) = &parsed_value {
                 (
-                    v.get("primary_model").and_then(|x| x.as_str()).map(String::from),
-                    v.get("fallback_model_1").and_then(|x| x.as_str()).map(String::from),
-                    v.get("fallback_model_2").and_then(|x| x.as_str()).map(String::from),
+                    v.get("primary_model")
+                        .and_then(|x| x.as_str())
+                        .map(String::from),
+                    v.get("fallback_model_1")
+                        .and_then(|x| x.as_str())
+                        .map(String::from),
+                    v.get("fallback_model_2")
+                        .and_then(|x| x.as_str())
+                        .map(String::from),
                 )
             } else {
                 (None, None, None)
@@ -1374,8 +1366,8 @@ pub fn run_v3_phase_b_migration(
             }
             // Serialize with pretty-print so the file stays
             // human-readable (matches the existing save shape).
-            let serialized = serde_json::to_string_pretty(&v)
-                .map_err(V3PhaseBError::ConfigFileParseError)?;
+            let serialized =
+                serde_json::to_string_pretty(&v).map_err(V3PhaseBError::ConfigFileParseError)?;
 
             // ── 5. Atomic rewrite: temp-file + rename(2) ─────────────
             //
@@ -1421,8 +1413,7 @@ pub fn run_v3_phase_b_migration(
     let _ = rewrite_skipped;
 
     // ── 6. Supersede marker v3-db-migrated-config-pending → v3 ───────
-    let new_marker_id =
-        supersede_marker_to_v3_in_tx(&tx, prior_marker_contribution_id.as_deref())?;
+    let new_marker_id = supersede_marker_to_v3_in_tx(&tx, prior_marker_contribution_id.as_deref())?;
 
     tx.commit()?;
 
@@ -1523,8 +1514,7 @@ fn supersede_marker_to_v3_in_tx(
             wire_native_metadata_json: None,
             supersedes_id: prior_contribution_id.map(|s| s.to_string()),
             triggering_note: Some(
-                "Walker v3 Phase B — config-file rewrite complete; schema_version=v3"
-                    .to_string(),
+                "Walker v3 Phase B — config-file rewrite complete; schema_version=v3".to_string(),
             ),
             status: "active".to_string(),
             source: "migration".to_string(),
@@ -1891,22 +1881,23 @@ routing_rules:
     fn test_build_walker_provider_body_dedups_model_list() {
         // Two openrouter rows for the same tier with the same model_id —
         // defensive dedup via BTreeMap grouping + per-tier seen set.
-        let rows = vec![
-            TierRoutingRow {
-                tier_name: "mid".into(),
-                provider_id: "openrouter".into(),
-                model_id: "inception/mercury-2".into(),
-                context_limit: Some(200_000),
-                max_completion_tokens: None,
-                pricing_json: Some("{}".into()),
-                supported_parameters_json: None,
-                notes: None,
-            },
-        ];
+        let rows = vec![TierRoutingRow {
+            tier_name: "mid".into(),
+            provider_id: "openrouter".into(),
+            model_id: "inception/mercury-2".into(),
+            context_limit: Some(200_000),
+            max_completion_tokens: None,
+            pricing_json: Some("{}".into()),
+            supported_parameters_json: None,
+            notes: None,
+        }];
         let body = build_walker_provider_body(
             ProviderType::OpenRouter,
             &rows,
-            &["inception/mercury-2".to_string(), "fallback/one".to_string()],
+            &[
+                "inception/mercury-2".to_string(),
+                "fallback/one".to_string(),
+            ],
         );
         // Primary already in list; only fallback/one appears as addition.
         let lines: Vec<&str> = body.lines().collect();
@@ -1917,7 +1908,10 @@ routing_rules:
             .collect();
         // Model list should have inception/mercury-2 once plus fallback/one.
         let body_has_primary = body.matches("inception/mercury-2").count();
-        assert_eq!(body_has_primary, 1, "body: {body}\nmid lines: {mid_lines:?}");
+        assert_eq!(
+            body_has_primary, 1,
+            "body: {body}\nmid lines: {mid_lines:?}"
+        );
         assert!(body.contains("fallback/one"));
     }
 
@@ -1969,8 +1963,7 @@ routing_rules:
         insert_pending_marker(&conn);
         write_seeded_config_json(dir.path());
 
-        let report =
-            run_v3_phase_b_migration(&mut conn, dir.path()).expect("Phase B must succeed");
+        let report = run_v3_phase_b_migration(&mut conn, dir.path()).expect("Phase B must succeed");
         assert!(report.bytes_after > 0);
         assert!(report.bytes_before > report.bytes_after);
 
@@ -2079,8 +2072,14 @@ routing_rules:
 
         let _ = run_v3_phase_b_migration(&mut conn, dir.path()).unwrap();
 
-        let (snap_body, pm, fb1, fb2, source_file): (String, Option<String>, Option<String>, Option<String>, String) =
-            conn.query_row(
+        let (snap_body, pm, fb1, fb2, source_file): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
                 "SELECT body, primary_model, fallback_model_1, fallback_model_2, source_file \
                  FROM _pre_v3_snapshot_config ORDER BY rowid DESC LIMIT 1",
                 [],

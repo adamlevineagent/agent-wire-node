@@ -68,7 +68,10 @@ mod wanderer_tests {
             )
             .unwrap();
 
-        println!("Active evidence_policy count after direct-YAML accept: {}", active_count);
+        println!(
+            "Active evidence_policy count after direct-YAML accept: {}",
+            active_count
+        );
         println!("Response contribution_id: {}", resp.contribution_id);
         println!("Response version: {}", resp.version);
 
@@ -131,8 +134,7 @@ mod wanderer_tests {
         .unwrap();
 
         // 2. Simulate LLM call by faking an output.
-        let fake_output =
-            "schema_type: evidence_policy\nbudget:\n  max_concurrent_evidence: 1\n";
+        let fake_output = "schema_type: evidence_policy\nbudget:\n  max_concurrent_evidence: 1\n";
 
         // 3. Persist refined draft.
         let resp = persist_refined_draft(&mut conn, &inputs, fake_output).unwrap();
@@ -200,7 +202,8 @@ mod wanderer_tests {
 
         // Use a slug that has no bundled default.
         let yaml = serde_json::Value::String(
-            "schema_type: evidence_policy\ntriage_rules: []\ndemand_signals: []\nbudget: {}\n".to_string(),
+            "schema_type: evidence_policy\ntriage_rules: []\ndemand_signals: []\nbudget: {}\n"
+                .to_string(),
         );
         let resp = accept_config_draft(
             &mut conn,

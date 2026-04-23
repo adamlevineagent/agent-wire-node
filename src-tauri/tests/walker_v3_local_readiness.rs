@@ -146,13 +146,7 @@ fn phase2_decision_drops_local_when_ollama_probe_missing() {
     // No cache entry for this URL — simulates "background probe task
     // hasn't yet observed this base_url" or "Ollama is down".
     invalidate_cached_probe(base_url);
-    seed_walker_provider_local(
-        &conn,
-        "c-phase2-offline",
-        base_url,
-        "mid",
-        &["gemma3:27b"],
-    );
+    seed_walker_provider_local(&conn, "c-phase2-offline", base_url, "mid", &["gemma3:27b"]);
 
     let d = DispatchDecision::build("mid", &conn)
         .expect("non-Local providers (Ready stubs) still build the Decision");
@@ -171,13 +165,7 @@ fn phase2_decision_drops_local_when_ollama_probe_missing() {
 fn phase2_decision_drops_local_when_declared_model_not_installed() {
     let (_dir, conn) = make_it_db();
     let base_url = "http://test-phase2-it-nomatch.invalid:11434/v1";
-    seed_walker_provider_local(
-        &conn,
-        "c-phase2-nomatch",
-        base_url,
-        "mid",
-        &["gemma3:27b"],
-    );
+    seed_walker_provider_local(&conn, "c-phase2-nomatch", base_url, "mid", &["gemma3:27b"]);
 
     // Ollama is up but has a different model installed.
     write_cached_probe(

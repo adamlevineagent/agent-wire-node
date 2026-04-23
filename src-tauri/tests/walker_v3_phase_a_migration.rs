@@ -379,8 +379,8 @@ fn phase_a_then_phase_b_end_to_end() {
     std::fs::write(data_dir.path().join("pyramid_config.json"), &original_bytes).unwrap();
 
     // Phase A.
-    let report_a = run_v3_phase_a_migration(&mut conn, Some(data_dir.path()))
-        .expect("Phase A must succeed");
+    let report_a =
+        run_v3_phase_a_migration(&mut conn, Some(data_dir.path())).expect("Phase A must succeed");
     assert_eq!(
         report_a.marker_transitioned_to,
         "v3-db-migrated-config-pending"
@@ -389,7 +389,10 @@ fn phase_a_then_phase_b_end_to_end() {
     // Phase B.
     let report_b =
         run_v3_phase_b_migration(&mut conn, data_dir.path()).expect("Phase B must succeed");
-    assert!(report_b.bytes_before > 0, "Phase B must see the seeded config");
+    assert!(
+        report_b.bytes_before > 0,
+        "Phase B must see the seeded config"
+    );
     assert!(report_b.bytes_after > 0);
     assert!(
         report_b.bytes_after < report_b.bytes_before,
@@ -480,11 +483,9 @@ fn phase_a_then_phase_b_end_to_end() {
         .unwrap();
     assert_eq!(routing_snap_rows, 4, "routing snapshot row count");
     let config_snap_rows: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM _pre_v3_snapshot_config",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM _pre_v3_snapshot_config", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(config_snap_rows, 1, "config snapshot must have one row");
 

@@ -336,8 +336,7 @@ pub struct StepContext {
     /// the resolver — the Decision is compute-once, immutable for its
     /// own lifetime (pins one `Arc<ScopeCache>` against mid-step
     /// ArcSwap updates).
-    pub dispatch_decision:
-        Option<Arc<crate::pyramid::walker_decision::DispatchDecision>>,
+    pub dispatch_decision: Option<Arc<crate::pyramid::walker_decision::DispatchDecision>>,
 }
 
 impl std::fmt::Debug for StepContext {
@@ -792,10 +791,19 @@ mod tests {
     #[test]
     fn test_reason_tags() {
         assert_eq!(CacheHitResult::Valid.reason_tag(), "valid");
-        assert_eq!(CacheHitResult::MismatchInputs.reason_tag(), "mismatch_inputs");
-        assert_eq!(CacheHitResult::MismatchPrompt.reason_tag(), "mismatch_prompt");
+        assert_eq!(
+            CacheHitResult::MismatchInputs.reason_tag(),
+            "mismatch_inputs"
+        );
+        assert_eq!(
+            CacheHitResult::MismatchPrompt.reason_tag(),
+            "mismatch_prompt"
+        );
         assert_eq!(CacheHitResult::MismatchModel.reason_tag(), "mismatch_model");
-        assert_eq!(CacheHitResult::CorruptedOutput.reason_tag(), "corrupted_output");
+        assert_eq!(
+            CacheHitResult::CorruptedOutput.reason_tag(),
+            "corrupted_output"
+        );
     }
 
     // ── StepContext construction ─────────────────────────────────────
@@ -825,7 +833,10 @@ mod tests {
         assert_eq!(ctx.db_path, "/tmp/pyramid.db");
         assert!(!ctx.force_fresh);
         assert_eq!(ctx.model_tier, "fast_extract");
-        assert_eq!(ctx.resolved_model_id.as_deref(), Some("inception/mercury-2"));
+        assert_eq!(
+            ctx.resolved_model_id.as_deref(),
+            Some("inception/mercury-2")
+        );
         assert_eq!(ctx.resolved_provider_id.as_deref(), Some("openrouter"));
         assert_eq!(ctx.prompt_hash, "abc123");
         assert!(ctx.bus.is_none());

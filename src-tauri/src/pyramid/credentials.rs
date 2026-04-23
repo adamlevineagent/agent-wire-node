@@ -134,8 +134,7 @@ pub fn credentials_file_path(data_dir: &Path) -> PathBuf {
 #[cfg(unix)]
 fn check_permissions_are_safe(path: &Path) -> Result<bool> {
     use std::os::unix::fs::PermissionsExt;
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("stat({})", path.display()))?;
+    let meta = std::fs::metadata(path).with_context(|| format!("stat({})", path.display()))?;
     let mode = meta.permissions().mode();
     // Only the low 12 bits are the file-perm portion.
     let perm_bits = mode & 0o777;
@@ -173,8 +172,8 @@ fn apply_safe_permissions(_path: &Path) -> Result<()> {
 #[cfg(unix)]
 fn format_file_mode(path: &Path) -> Result<String> {
     use std::os::unix::fs::PermissionsExt;
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("stat({}) for mode", path.display()))?;
+    let meta =
+        std::fs::metadata(path).with_context(|| format!("stat({}) for mode", path.display()))?;
     Ok(format!("{:04o}", meta.permissions().mode() & 0o777))
 }
 
@@ -387,8 +386,9 @@ impl CredentialStore {
                 if j >= bytes.len() {
                     bail!("unterminated credential reference at byte offset {i}");
                 }
-                let name = std::str::from_utf8(&bytes[name_start..j])
-                    .with_context(|| format!("credential name at offset {name_start} is not utf-8"))?;
+                let name = std::str::from_utf8(&bytes[name_start..j]).with_context(|| {
+                    format!("credential name at offset {name_start} is not utf-8")
+                })?;
                 if name.is_empty() {
                     bail!("empty credential reference `${{}}` at byte offset {i}");
                 }
@@ -578,8 +578,8 @@ fn parse_credentials_yaml(raw: &str) -> Result<BTreeMap<String, String>> {
     if raw.trim().is_empty() {
         return Ok(BTreeMap::new());
     }
-    let parsed: serde_yaml::Value = serde_yaml::from_str(raw)
-        .context("parsing .credentials as YAML")?;
+    let parsed: serde_yaml::Value =
+        serde_yaml::from_str(raw).context("parsing .credentials as YAML")?;
 
     let mapping = match parsed {
         serde_yaml::Value::Null => return Ok(BTreeMap::new()),
@@ -756,16 +756,15 @@ mod tests {
     #[test]
     fn substitutes_simple_var() {
         let (_tmp, store) = store_in_temp(&[("OPENROUTER_KEY", "sk-or-v1-abc")]);
-        let out = store.substitute_to_string("Bearer ${OPENROUTER_KEY}").unwrap();
+        let out = store
+            .substitute_to_string("Bearer ${OPENROUTER_KEY}")
+            .unwrap();
         assert_eq!(out, "Bearer sk-or-v1-abc");
     }
 
     #[test]
     fn substitutes_multiple_vars() {
-        let (_tmp, store) = store_in_temp(&[
-            ("A", "111"),
-            ("B", "222"),
-        ]);
+        let (_tmp, store) = store_in_temp(&[("A", "111"), ("B", "222")]);
         let out = store
             .substitute_to_string("prefix ${A} middle ${B} suffix")
             .unwrap();
@@ -910,6 +909,10 @@ mod tests {
         store.set("OPENROUTER_KEY", "sk-or-v1-abc").unwrap();
         let path = tmp.path().join(".credentials");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "credentials file should be 0600, got {:o}", mode);
+        assert_eq!(
+            mode, 0o600,
+            "credentials file should be 0600, got {:o}",
+            mode
+        );
     }
 }

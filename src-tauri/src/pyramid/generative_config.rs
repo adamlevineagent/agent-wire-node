@@ -49,8 +49,8 @@ use tracing::{debug, info, warn};
 
 use crate::pyramid::config_contributions::{
     create_config_contribution_with_metadata, load_active_config_contribution,
-    load_config_version_history, load_contribution_by_id,
-    sync_config_to_operational_with_registry, validate_note, ConfigContribution,
+    load_config_version_history, load_contribution_by_id, sync_config_to_operational_with_registry,
+    validate_note, ConfigContribution,
 };
 use crate::pyramid::event_bus::BuildEventBus;
 use crate::pyramid::llm::{call_model_unified_with_options_and_ctx, LlmCallOptions, LlmConfig};
@@ -440,7 +440,13 @@ pub async fn generate_config_from_intent(
     slug: Option<String>,
     intent: String,
 ) -> Result<GenerateConfigResponse> {
-    let inputs = load_generation_inputs(conn, schema_registry, &schema_type, slug.as_deref(), &intent)?;
+    let inputs = load_generation_inputs(
+        conn,
+        schema_registry,
+        &schema_type,
+        slug.as_deref(),
+        &intent,
+    )?;
     let llm_output =
         run_generation_llm_call(llm_config, bus, provider_registry, db_path, &inputs).await?;
     persist_generated_draft(conn, &inputs, &llm_output)
@@ -592,7 +598,13 @@ pub async fn refine_config_with_note(
     current_yaml: String,
     note: String,
 ) -> Result<RefineConfigResponse> {
-    let inputs = load_refinement_inputs(conn, schema_registry, &contribution_id, &current_yaml, &note)?;
+    let inputs = load_refinement_inputs(
+        conn,
+        schema_registry,
+        &contribution_id,
+        &current_yaml,
+        &note,
+    )?;
     let llm_output =
         run_refinement_llm_call(llm_config, bus, provider_registry, db_path, &inputs).await?;
     persist_refined_draft(conn, &inputs, &llm_output)
@@ -634,11 +646,10 @@ fn create_draft_supersession(
 
     // Carry forward the prior's canonical metadata with maturity reset
     // to Draft (matching supersede_config_contribution semantics).
-    let mut new_metadata =
-        crate::pyramid::wire_native_metadata::WireNativeMetadata::from_json(
-            &prior.wire_native_metadata_json,
-        )
-        .unwrap_or_else(|_| default_wire_native_metadata(&prior.schema_type, prior.slug.as_deref()));
+    let mut new_metadata = crate::pyramid::wire_native_metadata::WireNativeMetadata::from_json(
+        &prior.wire_native_metadata_json,
+    )
+    .unwrap_or_else(|_| default_wire_native_metadata(&prior.schema_type, prior.slug.as_deref()));
     new_metadata.maturity = WireMaturity::Draft;
 
     let metadata_json = new_metadata
@@ -768,9 +779,7 @@ pub fn accept_config_draft(
                 .map_err(|e| anyhow!("failed to serialize accepted YAML: {e}"))?,
         };
 
-        let note = triggering_note.unwrap_or_else(|| {
-            format!("Accepted {} config", schema_type)
-        });
+        let note = triggering_note.unwrap_or_else(|| format!("Accepted {} config", schema_type));
         if note.trim().is_empty() {
             return Err(anyhow!("triggering_note must not be empty or whitespace"));
         }
@@ -879,8 +888,8 @@ pub fn accept_config_draft(
         (new_id, yaml_str, note)
     } else {
         // Look for the latest draft contribution for this (type, slug).
-        let latest_draft = find_latest_draft(conn, &schema_type, slug.as_deref())?
-            .ok_or_else(|| {
+        let latest_draft =
+            find_latest_draft(conn, &schema_type, slug.as_deref())?.ok_or_else(|| {
                 anyhow!(
                     "no draft contribution found for schema_type={schema_type:?}, slug={slug:?}"
                 )
@@ -980,7 +989,11 @@ fn find_latest_draft(
     };
 
     let row = if let Some(slug_val) = slug {
-        conn.query_row(&sql, rusqlite::params![slug_val, schema_type], row_to_contribution)
+        conn.query_row(
+            &sql,
+            rusqlite::params![slug_val, schema_type],
+            row_to_contribution,
+        )
     } else {
         conn.query_row(&sql, rusqlite::params![schema_type], row_to_contribution)
     };
@@ -1016,10 +1029,7 @@ fn row_to_contribution(row: &rusqlite::Row) -> rusqlite::Result<ConfigContributi
 /// Promote a draft contribution to `active`. Flips the draft's status,
 /// sets `accepted_at`, and supersedes any prior active row for the
 /// same (schema_type, slug).
-fn promote_draft_to_active(
-    conn: &mut Connection,
-    draft: &ConfigContribution,
-) -> Result<()> {
+fn promote_draft_to_active(conn: &mut Connection, draft: &ConfigContribution) -> Result<()> {
     // Phase 0a-1 commit 5 / §2.16.1: BEGIN IMMEDIATE so draft promotion
     // serializes on write intent against concurrent supersessions.
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1297,9 +1307,7 @@ mod placeholder_engine_v2 {
         fn is_network(self) -> bool {
             matches!(
                 self,
-                Self::OpenrouterLiveSlugs
-                    | Self::OllamaAvailableModels
-                    | Self::MarketSurfaceSlugs
+                Self::OpenrouterLiveSlugs | Self::OllamaAvailableModels | Self::MarketSurfaceSlugs
             )
         }
     }
@@ -1432,8 +1440,7 @@ mod placeholder_engine_v2 {
         // string in a single-field map, serialize, then extract the
         // rendered value segment. This round-trips through a proper
         // YAML emitter without us hand-writing quote-escape rules.
-        let wrapper: HashMap<&str, &str> =
-            [("v", s)].iter().cloned().collect::<HashMap<_, _>>();
+        let wrapper: HashMap<&str, &str> = [("v", s)].iter().cloned().collect::<HashMap<_, _>>();
         let rendered = serde_yaml::to_string(&wrapper)
             .map_err(|e| InterpolationError::YamlEncode(e.to_string()))?;
         // `rendered` is one of:
@@ -1491,10 +1498,7 @@ mod placeholder_engine_v2 {
         #[error("placeholder {key} fetch failed: {message}")]
         FetchFailed { key: &'static str, message: String },
         #[error("placeholder value contains a {kind} at index {at}")]
-        ControlChar {
-            kind: &'static str,
-            at: usize,
-        },
+        ControlChar { kind: &'static str, at: usize },
         #[error("post-substitution YAML did not parse: {0}")]
         PostSubstitutionYaml(String),
         #[error("YAML encoder rejected value: {0}")]
@@ -1718,10 +1722,7 @@ mod placeholder_engine_v2 {
         /// SYSTEM_DEFAULTS resolves synchronously from the struct
         /// borrow; the three network kinds hit their respective
         /// providers with a 10s timeout cap.
-        async fn fetch(
-            &self,
-            key: PlaceholderKey,
-        ) -> Result<PlaceholderValue, InterpolationError> {
+        async fn fetch(&self, key: PlaceholderKey) -> Result<PlaceholderValue, InterpolationError> {
             match key {
                 PlaceholderKey::OpenrouterLiveSlugs => self.fetch_openrouter_slugs().await,
                 PlaceholderKey::OllamaAvailableModels => self.fetch_ollama_models().await,
@@ -1738,14 +1739,14 @@ mod placeholder_engine_v2 {
             }
         }
 
-        async fn fetch_openrouter_slugs(
-            &self,
-        ) -> Result<PlaceholderValue, InterpolationError> {
+        async fn fetch_openrouter_slugs(&self) -> Result<PlaceholderValue, InterpolationError> {
             let client = self
                 .inputs
                 .http_client
                 .as_ref()
-                .ok_or(InterpolationError::NoHandle { key: "openrouter_live_slugs" })?;
+                .ok_or(InterpolationError::NoHandle {
+                    key: "openrouter_live_slugs",
+                })?;
 
             let mut req = client
                 .get("https://openrouter.ai/api/v1/models")
@@ -1770,22 +1771,24 @@ mod placeholder_engine_v2 {
                 });
             }
             let body: OrModelsResponse =
-                resp.json().await.map_err(|e| InterpolationError::FetchFailed {
-                    key: "openrouter_live_slugs",
-                    message: format!("json parse: {e}"),
-                })?;
+                resp.json()
+                    .await
+                    .map_err(|e| InterpolationError::FetchFailed {
+                        key: "openrouter_live_slugs",
+                        message: format!("json parse: {e}"),
+                    })?;
             let slugs: Vec<String> = body.data.into_iter().map(|m| m.id).collect();
             Ok(PlaceholderValue::StringList(slugs))
         }
 
-        async fn fetch_ollama_models(
-            &self,
-        ) -> Result<PlaceholderValue, InterpolationError> {
-            let base_url = self
-                .inputs
-                .ollama_base_url
-                .as_deref()
-                .ok_or(InterpolationError::NoHandle { key: "ollama_available_models" })?;
+        async fn fetch_ollama_models(&self) -> Result<PlaceholderValue, InterpolationError> {
+            let base_url =
+                self.inputs
+                    .ollama_base_url
+                    .as_deref()
+                    .ok_or(InterpolationError::NoHandle {
+                        key: "ollama_available_models",
+                    })?;
             // Reuse local_mode::probe_ollama — single source of truth
             // for the Ollama tag shape. `reachable: false` maps to a
             // FetchFailed so the breaker counts it.
@@ -1801,15 +1804,17 @@ mod placeholder_engine_v2 {
             Ok(PlaceholderValue::StringList(probe.available_models))
         }
 
-        async fn fetch_market_surface_slugs(
-            &self,
-        ) -> Result<PlaceholderValue, InterpolationError> {
+        async fn fetch_market_surface_slugs(&self) -> Result<PlaceholderValue, InterpolationError> {
             if let Some(slugs) = &self.inputs.market_surface_slugs_override {
                 return Ok(PlaceholderValue::StringList(slugs.clone()));
             }
-            let cache = self.inputs.market_surface.as_ref().ok_or(
-                InterpolationError::NoHandle { key: "market_surface_slugs" },
-            )?;
+            let cache =
+                self.inputs
+                    .market_surface
+                    .as_ref()
+                    .ok_or(InterpolationError::NoHandle {
+                        key: "market_surface_slugs",
+                    })?;
             let rows = cache.snapshot_ui_models().await;
             Ok(PlaceholderValue::StringList(
                 rows.into_iter().map(|m| m.model_id).collect(),
@@ -1878,9 +1883,7 @@ mod placeholder_engine_v2 {
                 let start = i + 2;
                 let rest = &template[start..];
                 let rel_end = rest.find("}}").ok_or_else(|| {
-                    InterpolationError::UnknownPlaceholder(
-                        "<unterminated {{ ... }}>".to_string(),
-                    )
+                    InterpolationError::UnknownPlaceholder("<unterminated {{ ... }}>".to_string())
                 })?;
                 let raw = rest[..rel_end].trim();
                 let key = PlaceholderKey::from_token(raw)
@@ -1903,9 +1906,7 @@ mod placeholder_engine_v2 {
         // about — we parse the output as a generic Value to enforce
         // round-trippability.
         serde_yaml::from_str::<serde_yaml::Value>(&out).map_err(|e| {
-            InterpolationError::PostSubstitutionYaml(format!(
-                "{e}; output was:\n{out}"
-            ))
+            InterpolationError::PostSubstitutionYaml(format!("{e}; output was:\n{out}"))
         })?;
 
         Ok(SubstitutionOutput {
@@ -1915,14 +1916,14 @@ mod placeholder_engine_v2 {
     }
 }
 
-pub use placeholder_engine_v2::{
-    InterpolationError, PlaceholderKey, PlaceholderResolver, PlaceholderResolverInputs,
-    PlaceholderValue, ResolvedValue, SubstitutionOutput, SystemDefaults,
-};
 /// Double-brace `{{placeholder}}` substituter re-exported at the
 /// module scope so walker + skill runtime callers can
 /// `use crate::pyramid::generative_config::substitute_prompt_v2`.
 pub use placeholder_engine_v2::substitute_prompt_v2;
+pub use placeholder_engine_v2::{
+    InterpolationError, PlaceholderKey, PlaceholderResolver, PlaceholderResolverInputs,
+    PlaceholderValue, ResolvedValue, SubstitutionOutput, SystemDefaults,
+};
 
 // ── Tests ────────────────────────────────────────────────────────────
 
@@ -2071,7 +2072,7 @@ mod tests {
         // sync dispatcher round-trips this YAML into
         // pyramid_evidence_policy via db::upsert_evidence_policy.
         let yaml = serde_json::Value::String(
-            "triage_rules: []\ndemand_signals: []\nbudget: {}\n".to_string()
+            "triage_rules: []\ndemand_signals: []\nbudget: {}\n".to_string(),
         );
 
         let resp = accept_config_draft(
@@ -2087,7 +2088,10 @@ mod tests {
 
         assert_eq!(resp.status, "active");
         assert!(!resp.contribution_id.is_empty());
-        assert_eq!(resp.sync_result.operational_table, "pyramid_evidence_policy");
+        assert_eq!(
+            resp.sync_result.operational_table,
+            "pyramid_evidence_policy"
+        );
 
         // Verify the contribution landed with active status.
         let contribution = load_contribution_by_id(&conn, &resp.contribution_id)
@@ -2123,10 +2127,9 @@ mod tests {
         let registry = SchemaRegistry::hydrate_from_contributions(&conn).unwrap();
 
         // Seed a prior draft to refine.
-        let bundled_active =
-            load_active_config_contribution(&conn, "evidence_policy", None)
-                .unwrap()
-                .unwrap();
+        let bundled_active = load_active_config_contribution(&conn, "evidence_policy", None)
+            .unwrap()
+            .unwrap();
 
         // Empty string rejected.
         let err = load_refinement_inputs(
@@ -2162,8 +2165,7 @@ mod tests {
         assert!(err.to_string().contains("intent must not be empty"));
 
         let err =
-            load_generation_inputs(&conn, &registry, "evidence_policy", None, "   ")
-                .unwrap_err();
+            load_generation_inputs(&conn, &registry, "evidence_policy", None, "   ").unwrap_err();
         assert!(err.to_string().contains("intent must not be empty"));
     }
 
@@ -2173,8 +2175,8 @@ mod tests {
         walk_bundled_contributions_manifest(&conn).unwrap();
         let registry = SchemaRegistry::hydrate_from_contributions(&conn).unwrap();
 
-        let err = load_generation_inputs(&conn, &registry, "totally_made_up", None, "x")
-            .unwrap_err();
+        let err =
+            load_generation_inputs(&conn, &registry, "totally_made_up", None, "x").unwrap_err();
         assert!(err.to_string().contains("no active schema"));
     }
 
@@ -2236,7 +2238,10 @@ mod tests {
 
         assert_eq!(resp.contribution_id, draft_id);
         assert_eq!(resp.status, "active");
-        assert_eq!(resp.sync_result.operational_table, "pyramid_evidence_policy");
+        assert_eq!(
+            resp.sync_result.operational_table,
+            "pyramid_evidence_policy"
+        );
 
         // Verify the draft was flipped to active.
         let draft_row = load_contribution_by_id(&conn, &draft_id).unwrap().unwrap();
@@ -2268,8 +2273,12 @@ mod tests {
         let tmpl = "schema: walker\nallowed: {{market_surface_slugs}}\npatience: {{patience_secs_default}}\nretries: {{retry_http_count_default}}\nbudget: {{max_budget_credits_default}}\n";
         let out = substitute_prompt_v2(tmpl, &resolver).await.unwrap();
 
-        assert!(out.text.contains("[\"mercury-2\", \"grok-2\"]") || out.text.contains("[mercury-2, grok-2]"),
-            "market slugs not rendered in flow form; got: {}", out.text);
+        assert!(
+            out.text.contains("[\"mercury-2\", \"grok-2\"]")
+                || out.text.contains("[mercury-2, grok-2]"),
+            "market slugs not rendered in flow form; got: {}",
+            out.text
+        );
         assert!(out.text.contains("patience: 30"));
         assert!(out.text.contains("retries: 3"));
         assert!(out.text.contains("budget: 10000"));
@@ -2322,8 +2331,11 @@ mod tests {
         // v1 token in a YAML-valid context (string scalar).
         let tmpl = "schema: '{schema}'\nallowed: {{market_surface_slugs}}\n";
         let out = substitute_prompt_v2(tmpl, &resolver).await.unwrap();
-        assert!(out.text.contains("{schema}"),
-            "v2 must not touch single-brace v1 tokens; got: {}", out.text);
+        assert!(
+            out.text.contains("{schema}"),
+            "v2 must not touch single-brace v1 tokens; got: {}",
+            out.text
+        );
     }
 
     #[tokio::test]
@@ -2336,7 +2348,12 @@ mod tests {
 
         let parsed: serde_yaml::Value = serde_yaml::from_str(&out.text).unwrap();
         let map = parsed.as_mapping().unwrap();
-        assert_eq!(map.len(), 2, "exactly allowed + other; slug must not inject a 3rd key; got: {}", out.text);
+        assert_eq!(
+            map.len(),
+            2,
+            "exactly allowed + other; slug must not inject a 3rd key; got: {}",
+            out.text
+        );
         assert!(map.contains_key(&serde_yaml::Value::from("allowed")));
         assert!(map.contains_key(&serde_yaml::Value::from("other")));
         // The slug value survives inside the list as a single string.
@@ -2435,7 +2452,10 @@ mod tests {
         }
         let first = &outputs[0];
         for o in &outputs {
-            assert_eq!(o, first, "single-flight must serialize to a consistent result");
+            assert_eq!(
+                o, first,
+                "single-flight must serialize to a consistent result"
+            );
         }
     }
 

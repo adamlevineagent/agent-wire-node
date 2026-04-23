@@ -107,7 +107,10 @@ pub fn get_leftmost_slope(conn: &Connection, slug: &str) -> Result<Vec<PyramidNo
 
 /// Pick the "leftmost" child: highest chunk_index, then most recent created_at.
 fn pick_leftmost_child(children: &[&PyramidNode]) -> PyramidNode {
-    debug_assert!(!children.is_empty(), "pick_leftmost_child called with empty slice");
+    debug_assert!(
+        !children.is_empty(),
+        "pick_leftmost_child called with empty slice"
+    );
 
     (*children
         .iter()
@@ -231,14 +234,15 @@ pub fn build_primer(
     let mut primer_nodes: Vec<PrimerNode> = slope
         .iter()
         .map(|node| {
-            let time_range_str = node.time_range.as_ref().map(|tr| {
-                match (&tr.start, &tr.end) {
+            let time_range_str = node
+                .time_range
+                .as_ref()
+                .map(|tr| match (&tr.start, &tr.end) {
                     (Some(s), Some(e)) => format!("{} .. {}", s, e),
                     (Some(s), None) => format!("{} ..", s),
                     (None, Some(e)) => format!(".. {}", e),
                     (None, None) => String::new(),
-                }
-            });
+                });
 
             PrimerNode {
                 node_id: node.id.clone(),
@@ -354,10 +358,7 @@ pub fn format_primer_for_prompt(primer: &PrimerContext) -> String {
         out.push_str("### Topics\n");
         for topic in &primer.canonical_vocabulary.topics {
             if let Some(name) = topic.get("name").and_then(|v| v.as_str()) {
-                let current = topic
-                    .get("current")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let current = topic.get("current").and_then(|v| v.as_str()).unwrap_or("");
                 if current.is_empty() {
                     out.push_str(&format!("- {}\n", name));
                 } else {
@@ -628,7 +629,10 @@ mod tests {
             .topics
             .iter()
             .any(|t| t.get("name").and_then(|v| v.as_str()) == Some("topic-a"));
-        assert!(has_topic_a, "Canonical vocabulary should include topic-a from apex");
+        assert!(
+            has_topic_a,
+            "Canonical vocabulary should include topic-a from apex"
+        );
 
         // Verify entity
         let has_adam = primer
@@ -636,7 +640,10 @@ mod tests {
             .entities
             .iter()
             .any(|e| e.get("name").and_then(|v| v.as_str()) == Some("Adam"));
-        assert!(has_adam, "Canonical vocabulary should include entity Adam from apex");
+        assert!(
+            has_adam,
+            "Canonical vocabulary should include entity Adam from apex"
+        );
     }
 
     #[test]
@@ -671,7 +678,10 @@ mod tests {
         let primer = build_primer(&conn, "test-primer", None).unwrap();
         let formatted = format_primer_for_prompt(&primer);
 
-        assert!(!formatted.is_empty(), "Formatted primer should be non-empty");
+        assert!(
+            !formatted.is_empty(),
+            "Formatted primer should be non-empty"
+        );
 
         // Should contain the vocabulary section
         assert!(

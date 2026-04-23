@@ -155,10 +155,7 @@ impl SchemaRegistry {
         )?;
 
         let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-            ))
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })?;
 
         for row in rows {
@@ -177,12 +174,9 @@ impl SchemaRegistry {
                 continue;
             }
 
-            let schema_annotation_id =
-                find_active_annotation_id(conn, &target_schema_type)?;
-            let generation_skill_id =
-                find_active_generation_skill_id(conn, &target_schema_type)?;
-            let default_seed_id =
-                find_bundled_default_id(conn, &target_schema_type)?;
+            let schema_annotation_id = find_active_annotation_id(conn, &target_schema_type)?;
+            let generation_skill_id = find_active_generation_skill_id(conn, &target_schema_type)?;
+            let default_seed_id = find_bundled_default_id(conn, &target_schema_type)?;
 
             let display_name = display_name_for(&target_schema_type);
             let description = description_for(&target_schema_type);
@@ -194,10 +188,8 @@ impl SchemaRegistry {
                     display_name,
                     description,
                     schema_definition_contribution_id: schema_definition_id,
-                    schema_annotation_contribution_id: schema_annotation_id
-                        .unwrap_or_default(),
-                    generation_skill_contribution_id: generation_skill_id
-                        .unwrap_or_default(),
+                    schema_annotation_contribution_id: schema_annotation_id.unwrap_or_default(),
+                    generation_skill_contribution_id: generation_skill_id.unwrap_or_default(),
                     default_seed_contribution_id: default_seed_id,
                     version: 1,
                 },
@@ -221,10 +213,7 @@ impl SchemaRegistry {
     /// resolved entry or `None` if no active schemas exist for that
     /// type.
     pub fn get(&self, schema_type: &str) -> Option<ConfigSchema> {
-        let guard = self
-            .entries
-            .read()
-            .expect("SchemaRegistry RwLock poisoned");
+        let guard = self.entries.read().expect("SchemaRegistry RwLock poisoned");
         guard.get(schema_type).cloned()
     }
 
@@ -232,10 +221,7 @@ impl SchemaRegistry {
     /// `pyramid_config_schemas` IPC to populate the frontend's schema
     /// picker.
     pub fn list(&self) -> Vec<ConfigSchemaSummary> {
-        let guard = self
-            .entries
-            .read()
-            .expect("SchemaRegistry RwLock poisoned");
+        let guard = self.entries.read().expect("SchemaRegistry RwLock poisoned");
         let mut summaries: Vec<ConfigSchemaSummary> =
             guard.values().map(ConfigSchemaSummary::from).collect();
         // Stable ordering by schema_type so the UI doesn't reshuffle
@@ -247,10 +233,7 @@ impl SchemaRegistry {
     /// List all known schemas as full `ConfigSchema` entries. Useful
     /// for tests and for callers that need the contribution_ids.
     pub fn list_full(&self) -> Vec<ConfigSchema> {
-        let guard = self
-            .entries
-            .read()
-            .expect("SchemaRegistry RwLock poisoned");
+        let guard = self.entries.read().expect("SchemaRegistry RwLock poisoned");
         let mut schemas: Vec<ConfigSchema> = guard.values().cloned().collect();
         schemas.sort_by(|a, b| a.schema_type.cmp(&b.schema_type));
         schemas
@@ -434,10 +417,7 @@ fn metadata_has_both_topics(json: &str, topic_a: &str, topic_b: &str) -> bool {
 /// `source = 'bundled'` and the matching schema_type. May be `None` if
 /// no bundled default exists (which is valid — some schema types don't
 /// need a seed default).
-fn find_bundled_default_id(
-    conn: &Connection,
-    target_schema_type: &str,
-) -> Result<Option<String>> {
+fn find_bundled_default_id(conn: &Connection, target_schema_type: &str) -> Result<Option<String>> {
     let id: Option<String> = conn
         .query_row(
             "SELECT contribution_id FROM pyramid_config_contributions
@@ -554,9 +534,7 @@ mod tests {
     use crate::pyramid::config_contributions::create_config_contribution_with_metadata;
     use crate::pyramid::db::init_pyramid_db;
     use crate::pyramid::wire_migration::walk_bundled_contributions_manifest;
-    use crate::pyramid::wire_native_metadata::{
-        default_wire_native_metadata, WireMaturity,
-    };
+    use crate::pyramid::wire_native_metadata::{default_wire_native_metadata, WireMaturity};
 
     fn mem_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -585,9 +563,8 @@ mod tests {
     fn seed_schema_annotation(conn: &Connection, target: &str) -> String {
         let mut meta = default_wire_native_metadata("schema_annotation", Some(target));
         meta.maturity = WireMaturity::Canon;
-        let body = format!(
-            "schema_type: {target}\napplies_to: {target}\nversion: 1\nfields: {{}}\n"
-        );
+        let body =
+            format!("schema_type: {target}\napplies_to: {target}\nversion: 1\nfields: {{}}\n");
         create_config_contribution_with_metadata(
             conn,
             "schema_annotation",
@@ -673,7 +650,10 @@ mod tests {
         assert_eq!(entry.schema_definition_contribution_id, definition_id);
         assert_eq!(entry.schema_annotation_contribution_id, annotation_id);
         assert_eq!(entry.generation_skill_contribution_id, skill_id);
-        assert_eq!(entry.default_seed_contribution_id.as_deref(), Some(default_id.as_str()));
+        assert_eq!(
+            entry.default_seed_contribution_id.as_deref(),
+            Some(default_id.as_str())
+        );
     }
 
     #[test]
@@ -686,7 +666,10 @@ mod tests {
         let registry = SchemaRegistry::hydrate_from_contributions(&conn).unwrap();
         let summaries = registry.list();
         let names: Vec<&str> = summaries.iter().map(|s| s.schema_type.as_str()).collect();
-        assert_eq!(names, vec!["build_strategy", "dadbear_policy", "evidence_policy"]);
+        assert_eq!(
+            names,
+            vec!["build_strategy", "dadbear_policy", "evidence_policy"]
+        );
         assert_eq!(summaries[0].display_name, "Build Strategy");
     }
 
@@ -720,8 +703,7 @@ mod tests {
 
         let registry = SchemaRegistry::hydrate_from_contributions(&conn).unwrap();
         let summaries = registry.list();
-        let schema_types: Vec<&str> =
-            summaries.iter().map(|s| s.schema_type.as_str()).collect();
+        let schema_types: Vec<&str> = summaries.iter().map(|s| s.schema_type.as_str()).collect();
         assert!(schema_types.contains(&"evidence_policy"));
         assert!(schema_types.contains(&"build_strategy"));
         assert!(schema_types.contains(&"dadbear_policy"));
@@ -934,8 +916,7 @@ mod tests {
         // scope-4 seed coverage as of WS-B. Kept narrow because
         // extending walker_provider_openrouter's model_list is WS-A /
         // WS-B follow-up scope, not WS-C's.
-        let tiers_from_bundled_chains_that_are_covered: &[&str] =
-            &["mid", "extractor"];
+        let tiers_from_bundled_chains_that_are_covered: &[&str] = &["mid", "extractor"];
 
         for tier in tiers_from_bundled_chains_that_are_covered {
             assert!(
@@ -1102,10 +1083,7 @@ mod tests {
     /// every `overrides_by_provider.<provider>.model_list` entry. The
     /// YAML's top-level `model_list` is not a valid field for this
     /// schema; tiers only live under per-provider override maps.
-    fn extend_with_call_order_tier_keys(
-        yaml: &str,
-        out: &mut std::collections::HashSet<String>,
-    ) {
+    fn extend_with_call_order_tier_keys(yaml: &str, out: &mut std::collections::HashSet<String>) {
         let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
             return;
         };
@@ -1268,8 +1246,16 @@ mod tests {
     #[test]
     fn test_metadata_has_both_topics_matches() {
         let json = r#"{"contribution_type":"skill","topics":["generation","evidence_policy","wire-node"]}"#;
-        assert!(metadata_has_both_topics(json, "generation", "evidence_policy"));
-        assert!(!metadata_has_both_topics(json, "generation", "build_strategy"));
+        assert!(metadata_has_both_topics(
+            json,
+            "generation",
+            "evidence_policy"
+        ));
+        assert!(!metadata_has_both_topics(
+            json,
+            "generation",
+            "build_strategy"
+        ));
     }
 
     #[test]

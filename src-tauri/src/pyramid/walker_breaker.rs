@@ -246,11 +246,7 @@ pub fn clear_build(build_id: &str) {
 /// Read-only snapshot for observability / tests. Returns `None` when
 /// no entry exists for the key.
 #[allow(dead_code)]
-pub fn peek_state(
-    build_id: &str,
-    slot: &str,
-    provider_type: ProviderType,
-) -> Option<BreakerState> {
+pub fn peek_state(build_id: &str, slot: &str, provider_type: ProviderType) -> Option<BreakerState> {
     let key = BreakerKey::new(build_id, slot, provider_type);
     map_handle().lock().ok()?.get(&key).cloned()
 }
@@ -333,10 +329,7 @@ use crate::pyramid::step_context::StepContext;
 /// model_tier if present. No-op when `ctx` is None or the tier is
 /// empty.
 #[allow(dead_code)]
-pub fn record_failure_from_ctx(
-    ctx: Option<&StepContext>,
-    provider_type: ProviderType,
-) {
+pub fn record_failure_from_ctx(ctx: Option<&StepContext>, provider_type: ProviderType) {
     let Some(ctx) = ctx else {
         return;
     };
@@ -350,10 +343,7 @@ pub fn record_failure_from_ctx(
 /// model_tier if present. No-op when `ctx` is None or the tier is
 /// empty.
 #[allow(dead_code)]
-pub fn record_success_from_ctx(
-    ctx: Option<&StepContext>,
-    provider_type: ProviderType,
-) {
+pub fn record_success_from_ctx(ctx: Option<&StepContext>, provider_type: ProviderType) {
     let Some(ctx) = ctx else {
         return;
     };
@@ -443,7 +433,9 @@ mod tests {
 
     #[test]
     fn test_breaker_starts_untripped() {
-        let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _g = breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         clear_all_for_tests();
         assert!(!is_tripped(
             "build-start",
@@ -456,17 +448,29 @@ mod tests {
 
     #[test]
     fn test_breaker_trips_after_threshold_failures() {
-        let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _g = breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         clear_all_for_tests();
         let bid = "build-trip";
         // Below threshold — not tripped.
         for _ in 0..(TRIP_THRESHOLD - 1) {
             record_failure(bid, "mid", ProviderType::Market);
         }
-        assert!(!is_tripped(bid, "mid", ProviderType::Market, BreakerReset::PerBuild));
+        assert!(!is_tripped(
+            bid,
+            "mid",
+            ProviderType::Market,
+            BreakerReset::PerBuild
+        ));
         // Crossing the threshold flips the flag.
         record_failure(bid, "mid", ProviderType::Market);
-        assert!(is_tripped(bid, "mid", ProviderType::Market, BreakerReset::PerBuild));
+        assert!(is_tripped(
+            bid,
+            "mid",
+            ProviderType::Market,
+            BreakerReset::PerBuild
+        ));
         let st = peek_state(bid, "mid", ProviderType::Market).unwrap();
         assert!(st.tripped);
         assert_eq!(st.consecutive_failures, TRIP_THRESHOLD);
@@ -474,7 +478,9 @@ mod tests {
 
     #[test]
     fn test_breaker_reset_per_build_persists_across_decision_builds() {
-        let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _g = breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         clear_all_for_tests();
         let bid = "build-perbuild";
         for _ in 0..TRIP_THRESHOLD {
@@ -483,14 +489,26 @@ mod tests {
         // Simulate a second Decision build for the same (build, slot,
         // provider) — breaker state has to persist, and `PerBuild`
         // reset never untrips.
-        assert!(is_tripped(bid, "mid", ProviderType::Market, BreakerReset::PerBuild));
+        assert!(is_tripped(
+            bid,
+            "mid",
+            ProviderType::Market,
+            BreakerReset::PerBuild
+        ));
         // A fresh check still says tripped.
-        assert!(is_tripped(bid, "mid", ProviderType::Market, BreakerReset::PerBuild));
+        assert!(is_tripped(
+            bid,
+            "mid",
+            ProviderType::Market,
+            BreakerReset::PerBuild
+        ));
     }
 
     #[test]
     fn test_breaker_reset_time_secs_untrips_after_interval() {
-        let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _g = breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         clear_all_for_tests();
         let bid = "build-timesecs";
         for _ in 0..TRIP_THRESHOLD {
@@ -519,22 +537,36 @@ mod tests {
 
     #[test]
     fn test_breaker_reset_probe_based_placeholder() {
-        let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _g = breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         clear_all_for_tests();
         let bid = "build-probe";
         for _ in 0..TRIP_THRESHOLD {
             record_failure(bid, "mid", ProviderType::Market);
         }
         // Scaffold: stays tripped without an explicit probe-success.
-        assert!(is_tripped(bid, "mid", ProviderType::Market, BreakerReset::ProbeBased));
+        assert!(is_tripped(
+            bid,
+            "mid",
+            ProviderType::Market,
+            BreakerReset::ProbeBased
+        ));
         // Explicit probe-success untrips.
         note_probe_success(bid, "mid", ProviderType::Market);
-        assert!(!is_tripped(bid, "mid", ProviderType::Market, BreakerReset::ProbeBased));
+        assert!(!is_tripped(
+            bid,
+            "mid",
+            ProviderType::Market,
+            BreakerReset::ProbeBased
+        ));
     }
 
     #[test]
     fn test_breaker_clear_build_removes_state() {
-        let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _g = breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         clear_all_for_tests();
         let bid = "build-clear";
         for _ in 0..TRIP_THRESHOLD {
@@ -552,7 +584,9 @@ mod tests {
 
     #[test]
     fn test_breaker_clear_build_leaves_other_builds_intact() {
-        let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _g = breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         clear_all_for_tests();
         let keep_bid = "build-keep";
         let drop_bid = "build-drop";
@@ -565,13 +599,19 @@ mod tests {
 
     #[test]
     fn test_breaker_record_success_resets_counter_but_not_tripped_flag() {
-        let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _g = breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         clear_all_for_tests();
         let bid = "build-record-success";
         for _ in 0..TRIP_THRESHOLD {
             record_failure(bid, "mid", ProviderType::Market);
         }
-        assert!(peek_state(bid, "mid", ProviderType::Market).unwrap().tripped);
+        assert!(
+            peek_state(bid, "mid", ProviderType::Market)
+                .unwrap()
+                .tripped
+        );
         // record_success resets counter; tripped flag persists under
         // PerBuild semantics.
         record_success(bid, "mid", ProviderType::Market);
@@ -579,7 +619,12 @@ mod tests {
         assert_eq!(st.consecutive_failures, 0);
         assert!(st.tripped);
         // Still reads tripped under PerBuild.
-        assert!(is_tripped(bid, "mid", ProviderType::Market, BreakerReset::PerBuild));
+        assert!(is_tripped(
+            bid,
+            "mid",
+            ProviderType::Market,
+            BreakerReset::PerBuild
+        ));
     }
 
     #[test]
@@ -611,7 +656,9 @@ mod tests {
     #[test]
     fn test_on_partial_failure_retry_same_stays_on_provider() {
         use crate::pyramid::walker_resolver::PartialFailurePolicy;
-        let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _g = breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         clear_all_for_tests();
         let action = on_partial_failure_action(
             PartialFailurePolicy::RetrySame,
@@ -626,7 +673,9 @@ mod tests {
     #[test]
     fn test_on_partial_failure_retry_same_degrades_to_fail_loud_when_tripped() {
         use crate::pyramid::walker_resolver::PartialFailurePolicy;
-        let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _g = breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         clear_all_for_tests();
         let bid = "build-retry-tripped";
         for _ in 0..TRIP_THRESHOLD {
@@ -645,16 +694,38 @@ mod tests {
 
     #[test]
     fn test_breaker_key_isolates_by_tuple() {
-        let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _g = breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         clear_all_for_tests();
         // Three failures on (b, mid, Market) must NOT trip (b, mid, Local).
         let bid = "build-iso";
         for _ in 0..TRIP_THRESHOLD {
             record_failure(bid, "mid", ProviderType::Market);
         }
-        assert!(is_tripped(bid, "mid", ProviderType::Market, BreakerReset::PerBuild));
-        assert!(!is_tripped(bid, "mid", ProviderType::Local, BreakerReset::PerBuild));
-        assert!(!is_tripped(bid, "high", ProviderType::Market, BreakerReset::PerBuild));
-        assert!(!is_tripped("other", "mid", ProviderType::Market, BreakerReset::PerBuild));
+        assert!(is_tripped(
+            bid,
+            "mid",
+            ProviderType::Market,
+            BreakerReset::PerBuild
+        ));
+        assert!(!is_tripped(
+            bid,
+            "mid",
+            ProviderType::Local,
+            BreakerReset::PerBuild
+        ));
+        assert!(!is_tripped(
+            bid,
+            "high",
+            ProviderType::Market,
+            BreakerReset::PerBuild
+        ));
+        assert!(!is_tripped(
+            "other",
+            "mid",
+            ProviderType::Market,
+            BreakerReset::PerBuild
+        ));
     }
 }

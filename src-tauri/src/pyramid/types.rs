@@ -2175,27 +2175,15 @@ pub enum ManifestValidationError {
     /// provided — invalid per spec.
     IdentityChangedWithoutRewrite,
     /// A topic/term/decision op is missing a required field.
-    InvalidContentOp {
-        field: String,
-        detail: String,
-    },
+    InvalidContentOp { field: String, detail: String },
     /// A topic/term/decision op uses an unknown action string.
-    InvalidContentOpAction {
-        field: String,
-        action: String,
-    },
+    InvalidContentOpAction { field: String, action: String },
     /// A "remove" op targets an entry that does not exist on the current node.
-    RemovingNonexistentEntry {
-        field: String,
-        name: String,
-    },
+    RemovingNonexistentEntry { field: String, name: String },
     /// The LLM-authored `reason` field is empty or whitespace only.
     EmptyReason,
     /// The manifest's `build_version` is not exactly `current + 1`.
-    NonContiguousVersion {
-        expected: i64,
-        got: i64,
-    },
+    NonContiguousVersion { expected: i64, got: i64 },
 }
 
 impl std::fmt::Display for ManifestValidationError {

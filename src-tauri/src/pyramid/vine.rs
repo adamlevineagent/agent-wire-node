@@ -80,9 +80,11 @@ fn spawn_write_drain(
                         ref parent_id,
                     } => db::update_parent(&conn, slug, node_id, parent_id),
                     build::WriteOp::UpdateStats { ref slug } => db::update_slug_stats(&conn, slug),
-                    build::WriteOp::UpdateFileHash { ref slug, ref file_path, ref node_id } => {
-                        db::append_node_id_to_file_hash(&conn, slug, file_path, node_id)
-                    }
+                    build::WriteOp::UpdateFileHash {
+                        ref slug,
+                        ref file_path,
+                        ref node_id,
+                    } => db::append_node_id_to_file_hash(&conn, slug, file_path, node_id),
                     build::WriteOp::Flush { done } => {
                         let _ = done.send(());
                         Ok(())
@@ -796,11 +798,13 @@ pub async fn build_bunch(
         let mut idx = bunch_index;
         loop {
             let candidate = format!("{vine_slug}--bunch-{idx:03}");
-            let has_chunks = conn.query_row(
-                "SELECT COUNT(*) FROM pyramid_chunks WHERE slug = ?1",
-                rusqlite::params![candidate],
-                |row| row.get::<_, i64>(0),
-            ).unwrap_or(0);
+            let has_chunks = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pyramid_chunks WHERE slug = ?1",
+                    rusqlite::params![candidate],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0);
             if has_chunks == 0 {
                 break candidate;
             }
@@ -863,10 +867,14 @@ pub async fn build_bunch(
             file_watchers: state.file_watchers.clone(),
             vine_builds: state.vine_builds.clone(),
             use_chain_engine: std::sync::atomic::AtomicBool::new(
-                state.use_chain_engine.load(std::sync::atomic::Ordering::Relaxed),
+                state
+                    .use_chain_engine
+                    .load(std::sync::atomic::Ordering::Relaxed),
             ),
             use_ir_executor: std::sync::atomic::AtomicBool::new(
-                state.use_ir_executor.load(std::sync::atomic::Ordering::Relaxed),
+                state
+                    .use_ir_executor
+                    .load(std::sync::atomic::Ordering::Relaxed),
             ),
             event_bus: state.event_bus.clone(),
             operational: state.operational.clone(),
@@ -895,21 +903,41 @@ pub async fn build_bunch(
         while let Some(op) = write_rx.recv().await {
             let conn = write_writer.lock().await;
             let result = match op {
-                build::WriteOp::SaveNode { ref node, ref topics_json } => {
-                    db::save_node(&conn, node, topics_json.as_deref())
-                }
-                build::WriteOp::SaveStep { ref slug, ref step_type, chunk_index, depth, ref node_id, ref output_json, ref model, elapsed } => {
-                    db::save_step(&conn, slug, step_type, chunk_index, depth, node_id, output_json, model, elapsed)
-                }
-                build::WriteOp::UpdateParent { ref slug, ref node_id, ref parent_id } => {
-                    db::update_parent(&conn, slug, node_id, parent_id)
-                }
-                build::WriteOp::UpdateStats { ref slug } => {
-                    db::update_slug_stats(&conn, slug)
-                }
-                build::WriteOp::UpdateFileHash { ref slug, ref file_path, ref node_id } => {
-                    db::append_node_id_to_file_hash(&conn, slug, file_path, node_id)
-                }
+                build::WriteOp::SaveNode {
+                    ref node,
+                    ref topics_json,
+                } => db::save_node(&conn, node, topics_json.as_deref()),
+                build::WriteOp::SaveStep {
+                    ref slug,
+                    ref step_type,
+                    chunk_index,
+                    depth,
+                    ref node_id,
+                    ref output_json,
+                    ref model,
+                    elapsed,
+                } => db::save_step(
+                    &conn,
+                    slug,
+                    step_type,
+                    chunk_index,
+                    depth,
+                    node_id,
+                    output_json,
+                    model,
+                    elapsed,
+                ),
+                build::WriteOp::UpdateParent {
+                    ref slug,
+                    ref node_id,
+                    ref parent_id,
+                } => db::update_parent(&conn, slug, node_id, parent_id),
+                build::WriteOp::UpdateStats { ref slug } => db::update_slug_stats(&conn, slug),
+                build::WriteOp::UpdateFileHash {
+                    ref slug,
+                    ref file_path,
+                    ref node_id,
+                } => db::append_node_id_to_file_hash(&conn, slug, file_path, node_id),
                 build::WriteOp::Flush { done } => {
                     let _ = done.send(());
                     Ok(())
@@ -950,9 +978,7 @@ pub async fn build_bunch(
             // the chain build fails here, surface it — no silent
             // fallback to the removed build_conversation/build_code/
             // build_docs path.
-            return Err(anyhow!(
-                "Vine bunch '{bunch_slug}' chain build failed: {e}"
-            ));
+            return Err(anyhow!("Vine bunch '{bunch_slug}' chain build failed: {e}"));
         }
     }
 
@@ -1374,11 +1400,7 @@ pub async fn build_vine_l1(
 
                 let children: Vec<String> = l0_nodes.iter().map(|n| n.id.clone()).collect();
                 let mut node = match chain_dispatch::build_node_from_output(
-                    &analysis,
-                    &l1_id,
-                    vine_slug,
-                    1,
-                    None,
+                    &analysis, &l1_id, vine_slug, 1, None,
                 ) {
                     Ok(n) => n,
                     Err(e) => {
@@ -1388,7 +1410,12 @@ pub async fn build_vine_l1(
                 };
                 node.children = children.clone();
                 // Backfill distilled from narrative for downstream consumers
-                node.distilled = node.narrative.levels.first().map(|l| l.text.clone()).unwrap_or_default();
+                node.distilled = node
+                    .narrative
+                    .levels
+                    .first()
+                    .map(|l| l.text.clone())
+                    .unwrap_or_default();
                 build::send_save_node(&write_tx, node, Some(topics_json)).await;
 
                 // Set parent pointers on L0 nodes
@@ -1558,11 +1585,7 @@ pub async fn build_vine_upper(
                     .await;
 
                     let mut node = match chain_dispatch::build_node_from_output(
-                        &analysis,
-                        &node_id,
-                        vine_slug,
-                        next_depth,
-                        None,
+                        &analysis, &node_id, vine_slug, next_depth, None,
                     ) {
                         Ok(n) => n,
                         Err(e) => {
@@ -1574,8 +1597,10 @@ pub async fn build_vine_upper(
                             fallback.chunk_index = None;
                             fallback.children = vec![left.id.clone(), right.id.clone()];
                             build::send_save_node(&write_tx, fallback, None).await;
-                            build::send_update_parent(&write_tx, vine_slug, &left.id, &node_id).await;
-                            build::send_update_parent(&write_tx, vine_slug, &right.id, &node_id).await;
+                            build::send_update_parent(&write_tx, vine_slug, &left.id, &node_id)
+                                .await;
+                            build::send_update_parent(&write_tx, vine_slug, &right.id, &node_id)
+                                .await;
                             i += 2;
                             pair_idx += 1;
                             continue;
@@ -1583,7 +1608,12 @@ pub async fn build_vine_upper(
                     };
                     node.children = vec![left.id.clone(), right.id.clone()];
                     // Backfill distilled from narrative for downstream consumers
-                    node.distilled = node.narrative.levels.first().map(|l| l.text.clone()).unwrap_or_default();
+                    node.distilled = node
+                        .narrative
+                        .levels
+                        .first()
+                        .map(|l| l.text.clone())
+                        .unwrap_or_default();
                     build::send_save_node(&write_tx, node, Some(topics_json)).await;
                     build::send_update_parent(&write_tx, vine_slug, &left.id, &node_id).await;
                     build::send_update_parent(&write_tx, vine_slug, &right.id, &node_id).await;
@@ -1642,21 +1672,35 @@ pub async fn build_vine_upper(
         if top_nodes.len() > 1 {
             let apex_depth = depth + 1;
             let forced_id = format!("L{apex_depth}-000");
-            info!("Forcing apex: merging {} L{depth} nodes into {forced_id}", top_nodes.len());
+            info!(
+                "Forcing apex: merging {} L{depth} nodes into {forced_id}",
+                top_nodes.len()
+            );
 
-            let combined_headline = top_nodes.iter()
+            let combined_headline = top_nodes
+                .iter()
                 .map(|n| n.headline.as_str())
                 .collect::<Vec<_>>()
                 .join(" / ");
-            let combined_distilled = top_nodes.iter()
-                .filter_map(|n| if n.distilled.is_empty() { None } else { Some(n.distilled.as_str()) })
+            let combined_distilled = top_nodes
+                .iter()
+                .filter_map(|n| {
+                    if n.distilled.is_empty() {
+                        None
+                    } else {
+                        Some(n.distilled.as_str())
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n\n");
             let children: Vec<String> = top_nodes.iter().map(|n| n.id.clone()).collect();
             let mut merged_topics = Vec::new();
             for n in &top_nodes {
                 for t in &n.topics {
-                    if !merged_topics.iter().any(|mt: &super::types::Topic| mt.name == t.name) {
+                    if !merged_topics
+                        .iter()
+                        .any(|mt: &super::types::Topic| mt.name == t.name)
+                    {
                         merged_topics.push(t.clone());
                     }
                 }
@@ -1665,7 +1709,10 @@ pub async fn build_vine_upper(
             // Merge episodic fields from the best top node (first non-empty)
             let best = top_nodes.first().unwrap(); // top_nodes.len() > 1 guaranteed
             let truncated_headline = if combined_headline.chars().count() > 200 {
-                format!("{}...", combined_headline.chars().take(197).collect::<String>())
+                format!(
+                    "{}...",
+                    combined_headline.chars().take(197).collect::<String>()
+                )
             } else {
                 combined_headline
             };

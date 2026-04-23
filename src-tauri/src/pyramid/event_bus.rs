@@ -36,22 +36,53 @@ pub struct TaggedBuildEvent {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TaggedKind {
     // ── Existing ──────────────────────────────────────────────────────
-    Progress { done: i64, total: i64 },
+    Progress {
+        done: i64,
+        total: i64,
+    },
     V2Snapshot(BuildProgressV2),
     Resync,
 
     // ── Episodic memory v4 §15.21 ─────────────────────────────────────
-    SlopeChanged { affected_layers: Vec<i64> },
-    DeltaLanded { depth: i64, node_id: String },
-    ApexHeadlineChanged { new_headline: String },
-    CostUpdate { cost_so_far_usd: f64, estimate_usd: f64 },
-    DeadLetterEnqueued { dead_letter_id: i64 },
-    VocabularyPromoted { vocabulary_pyramid_slug: String },
-    ProvisionalNodeAdded { node_id: String },
-    ProvisionalPromoted { provisional_id: String, canonical_id: String },
-    DemandGenStarted { sub_question: String, job_id: String },
-    DemandGenCompleted { job_id: String, new_node_ids: Vec<String> },
-    ChainProposalReceived { chain_id: String, proposal_id: i64 },
+    SlopeChanged {
+        affected_layers: Vec<i64>,
+    },
+    DeltaLanded {
+        depth: i64,
+        node_id: String,
+    },
+    ApexHeadlineChanged {
+        new_headline: String,
+    },
+    CostUpdate {
+        cost_so_far_usd: f64,
+        estimate_usd: f64,
+    },
+    DeadLetterEnqueued {
+        dead_letter_id: i64,
+    },
+    VocabularyPromoted {
+        vocabulary_pyramid_slug: String,
+    },
+    ProvisionalNodeAdded {
+        node_id: String,
+    },
+    ProvisionalPromoted {
+        provisional_id: String,
+        canonical_id: String,
+    },
+    DemandGenStarted {
+        sub_question: String,
+        job_id: String,
+    },
+    DemandGenCompleted {
+        job_id: String,
+        new_node_ids: Vec<String>,
+    },
+    ChainProposalReceived {
+        chain_id: String,
+        proposal_id: i64,
+    },
 
     // ── WS-INGEST-PRIMITIVE (Phase 1.5): ingest lifecycle events ──
     IngestScanComplete {
@@ -228,7 +259,6 @@ pub enum TaggedKind {
     // only see the inner `TaggedKind` still have the full correlation
     // keys at hand. Keeping the field on each struct matches the
     // convention established by Phase 6's CacheHit/CacheMiss variants.
-
     /// Emitted just before `call_model_unified_with_options_and_ctx`
     /// dispatches the HTTP request for an LLM call. Carries the
     /// cache_key (so the UI can correlate with a prior CacheMiss),
@@ -414,7 +444,6 @@ pub enum TaggedKind {
     // Per-edge, per-verdict, per-skip, and reconciliation events that
     // supplement the coarser step-level events above. All four are
     // discrete (low-frequency, individually meaningful).
-
     /// Per-edge event during webbing steps. Supplements WebEdgeStarted/Completed.
     EdgeCreated {
         slug: String,
@@ -498,7 +527,6 @@ pub enum TaggedKind {
     // processing loop in main.rs. Outer `TaggedBuildEvent.slug` is set
     // to `"__compute__"` (reserved non-pyramid slug, same pattern as
     // `"__ollama__"` for pull events).
-
     /// Emitted when an LLM call is enqueued for GPU processing.
     /// `queue_depth` is the depth of the specific model queue AFTER
     /// the enqueue (including this item).
@@ -529,7 +557,6 @@ pub enum TaggedKind {
     // loop subscribes to for hot-reload. `DadbearHoldsChanged` and
     // `WorkItemStateChanged` are consumed by the future oversight UI
     // and supervisor (Phases 2+).
-
     /// Emitted by `sync_config_to_operational` when a `dadbear_norms`
     /// or `watch_root` contribution activates. The tick loop subscribes
     /// to this event and forces an immediate config reload on the next
@@ -568,9 +595,7 @@ impl TaggedKind {
     pub fn is_discrete(&self) -> bool {
         !matches!(
             self,
-            TaggedKind::Progress { .. }
-                | TaggedKind::V2Snapshot(_)
-                | TaggedKind::OllamaPull { .. }
+            TaggedKind::Progress { .. } | TaggedKind::V2Snapshot(_) | TaggedKind::OllamaPull { .. }
         )
     }
 }
@@ -662,8 +687,14 @@ mod phase13_tests {
             edges_created: 340,
             latency_ms: 2800,
         };
-        assert_eq!(serde_json::to_value(&started).unwrap()["type"], "web_edge_started");
-        assert_eq!(serde_json::to_value(&completed).unwrap()["type"], "web_edge_completed");
+        assert_eq!(
+            serde_json::to_value(&started).unwrap()["type"],
+            "web_edge_started"
+        );
+        assert_eq!(
+            serde_json::to_value(&completed).unwrap()["type"],
+            "web_edge_completed"
+        );
     }
 
     #[test]
@@ -684,7 +715,10 @@ mod phase13_tests {
             decision: "defer".into(),
             reason: "low_value".into(),
         };
-        assert_eq!(serde_json::to_value(&ev).unwrap()["type"], "evidence_processing");
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap()["type"],
+            "evidence_processing"
+        );
         assert_eq!(serde_json::to_value(&td).unwrap()["decision"], "defer");
     }
 
@@ -706,7 +740,10 @@ mod phase13_tests {
             node_count: 24,
             cluster_count: 5,
         };
-        assert_eq!(serde_json::to_value(&gap).unwrap()["type"], "gap_processing");
+        assert_eq!(
+            serde_json::to_value(&gap).unwrap()["type"],
+            "gap_processing"
+        );
         assert_eq!(serde_json::to_value(&cluster).unwrap()["cluster_count"], 5);
     }
 
@@ -734,10 +771,22 @@ mod phase13_tests {
             depth: 1,
             node_id: "L1-003".into(),
         };
-        assert_eq!(serde_json::to_value(&reroll).unwrap()["type"], "node_rerolled");
-        assert_eq!(serde_json::to_value(&reroll).unwrap()["new_cache_entry_id"], 42);
-        assert_eq!(serde_json::to_value(&inv).unwrap()["type"], "cache_invalidated");
-        assert_eq!(serde_json::to_value(&man).unwrap()["type"], "manifest_generated");
+        assert_eq!(
+            serde_json::to_value(&reroll).unwrap()["type"],
+            "node_rerolled"
+        );
+        assert_eq!(
+            serde_json::to_value(&reroll).unwrap()["new_cache_entry_id"],
+            42
+        );
+        assert_eq!(
+            serde_json::to_value(&inv).unwrap()["type"],
+            "cache_invalidated"
+        );
+        assert_eq!(
+            serde_json::to_value(&man).unwrap()["type"],
+            "manifest_generated"
+        );
     }
 
     #[test]
@@ -747,22 +796,38 @@ mod phase13_tests {
         // Only Progress + V2Snapshot should be coalesced.
         let variants = vec![
             TaggedKind::LlmCallStarted {
-                slug: "s".into(), build_id: "b".into(), step_name: "n".into(),
-                primitive: "p".into(), model_tier: "t".into(), model_id: "m".into(),
-                cache_key: "k".into(), depth: 0, chunk_index: None,
+                slug: "s".into(),
+                build_id: "b".into(),
+                step_name: "n".into(),
+                primitive: "p".into(),
+                model_tier: "t".into(),
+                model_id: "m".into(),
+                cache_key: "k".into(),
+                depth: 0,
+                chunk_index: None,
             },
             TaggedKind::WebEdgeStarted {
-                slug: "s".into(), build_id: "b".into(), step_name: "n".into(),
+                slug: "s".into(),
+                build_id: "b".into(),
+                step_name: "n".into(),
                 source_node_count: 1,
             },
             TaggedKind::ClusterAssignment {
-                slug: "s".into(), build_id: "b".into(), step_name: "n".into(),
-                depth: 0, node_count: 1, cluster_count: 1,
+                slug: "s".into(),
+                build_id: "b".into(),
+                step_name: "n".into(),
+                depth: 0,
+                node_count: 1,
+                cluster_count: 1,
             },
             TaggedKind::NodeRerolled {
-                slug: "s".into(), build_id: "b".into(), node_id: None,
-                step_name: "n".into(), note: "".into(),
-                new_cache_entry_id: 1, manifest_id: None,
+                slug: "s".into(),
+                build_id: "b".into(),
+                node_id: None,
+                step_name: "n".into(),
+                note: "".into(),
+                new_cache_entry_id: 1,
+                manifest_id: None,
             },
         ];
         for v in variants {

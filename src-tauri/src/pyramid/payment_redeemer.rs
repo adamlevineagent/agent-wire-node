@@ -56,10 +56,7 @@ pub enum RedeemOutcome {
 /// Body: { "payment_token": "<JWT>" }
 ///
 /// No Authorization header — the token is self-authenticating.
-pub async fn redeem_payment_token(
-    wire_url: &str,
-    payment_token: &str,
-) -> RedeemOutcome {
+pub async fn redeem_payment_token(wire_url: &str, payment_token: &str) -> RedeemOutcome {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(REDEEM_TIMEOUT_SECS))
         .build()
@@ -217,8 +214,8 @@ pub async fn fire_and_forget_redeem(
 ///   1. Expire tokens past their TTL (server already released credits)
 ///   2. Retry pending tokens with exponential backoff
 pub async fn spawn_redemption_sweeper(state: Arc<PyramidState>) {
-    let wire_url = std::env::var("WIRE_URL")
-        .unwrap_or_else(|_| "https://newsbleach.com".to_string());
+    let wire_url =
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
 
     // Wait one full interval before the first run (let the app finish starting)
     tokio::time::sleep(Duration::from_secs(SWEEP_INTERVAL_SECS)).await;
@@ -258,8 +255,11 @@ pub async fn spawn_redemption_sweeper(state: Arc<PyramidState>) {
             for token in &tokens {
                 // Exponential backoff check
                 if let Some(ref last_retry) = token.last_retry_at {
-                    let backoff_secs = BASE_BACKOFF_SECS * (1u64 << token.retry_count.min(10) as u32);
-                    if let Ok(last) = chrono::NaiveDateTime::parse_from_str(last_retry, "%Y-%m-%d %H:%M:%S") {
+                    let backoff_secs =
+                        BASE_BACKOFF_SECS * (1u64 << token.retry_count.min(10) as u32);
+                    if let Ok(last) =
+                        chrono::NaiveDateTime::parse_from_str(last_retry, "%Y-%m-%d %H:%M:%S")
+                    {
                         let elapsed = chrono::Utc::now()
                             .naive_utc()
                             .signed_duration_since(last)
@@ -355,7 +355,11 @@ pub fn insert_before_serve(
 ) -> Result<i64, String> {
     let nonce = match claims.nonce.as_deref() {
         Some(n) if !n.is_empty() => n,
-        _ => return Err("Payment token missing nonce — cannot guarantee replay protection".to_string()),
+        _ => {
+            return Err(
+                "Payment token missing nonce — cannot guarantee replay protection".to_string(),
+            )
+        }
     };
     let expires_at = match claims.exp {
         Some(exp) => exp_to_sqlite_datetime(exp),

@@ -192,7 +192,9 @@ pub fn load_schema_annotation_for(
     if let Some(contribution) =
         load_active_config_contribution(conn, "schema_annotation", Some(target_schema_type))?
     {
-        if let Some(annotation) = try_parse_annotation(&contribution.yaml_content, target_schema_type) {
+        if let Some(annotation) =
+            try_parse_annotation(&contribution.yaml_content, target_schema_type)
+        {
             return Ok(Some(annotation));
         } else {
             warn!(
@@ -218,10 +220,9 @@ pub fn load_schema_annotation_for(
          ORDER BY created_at DESC, id DESC",
     )?;
 
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
 
     for row in rows {
         let (contribution_id, yaml_content) = row?;
@@ -312,7 +313,11 @@ pub fn resolve_option_source(
 ) -> Result<Vec<OptionValue>> {
     // Handle parameterized `model_list:{provider_id}` form first.
     if let Some(provider_id) = source.strip_prefix("model_list:") {
-        return Ok(resolve_model_list_sync(Some(conn), provider_registry, provider_id));
+        return Ok(resolve_model_list_sync(
+            Some(conn),
+            provider_registry,
+            provider_id,
+        ));
     }
 
     match source {
@@ -439,17 +444,13 @@ pub fn clear_ollama_tags_cache_for_tests() {
 /// Falls back to the legacy `ProviderRegistry::list_tier_routing()` view
 /// only when the walker scope cache is empty (pre-bootstrap) OR the
 /// connection read fails — preserves UI liveness during first-run migration.
-fn resolve_tier_registry(
-    conn: &Connection,
-    registry: &ProviderRegistry,
-) -> Vec<OptionValue> {
+fn resolve_tier_registry(conn: &Connection, registry: &ProviderRegistry) -> Vec<OptionValue> {
     // Walker-first: build the scope chain from active walker_* contributions
     // and derive the tier set + per-tier rich metadata.
     match crate::pyramid::walker_resolver::build_scope_cache_pair(conn) {
         Ok(data) => {
             let chain = &data.chain;
-            let tier_names =
-                crate::pyramid::walker_resolver::tier_set_from_chain(chain);
+            let tier_names = crate::pyramid::walker_resolver::tier_set_from_chain(chain);
             if !tier_names.is_empty() {
                 let mut out: Vec<OptionValue> = tier_names
                     .into_iter()
@@ -573,10 +574,7 @@ fn walker_tier_to_option(
 /// from the walker `pricing_json` blob. Pricing is stored as a
 /// string-encoded decimal (e.g. `"0.0000015"`) per §5.1. Returns `None`
 /// on missing or unparseable field.
-fn parse_price_from_walker_json(
-    value: &serde_json::Value,
-    field: &str,
-) -> Option<f64> {
+fn parse_price_from_walker_json(value: &serde_json::Value, field: &str) -> Option<f64> {
     value
         .get(field)
         .and_then(|v| v.as_str())
@@ -739,8 +737,7 @@ fn resolve_model_list_from_tier_table(
         if let Some(pt) = provider_type_from_id(provider_id) {
             if let Ok(data) = crate::pyramid::walker_resolver::build_scope_cache_pair(conn) {
                 let chain = &data.chain;
-                let tier_names =
-                    crate::pyramid::walker_resolver::tier_set_from_chain(chain);
+                let tier_names = crate::pyramid::walker_resolver::tier_set_from_chain(chain);
                 let mut out: Vec<OptionValue> = Vec::new();
                 let mut seen = std::collections::HashSet::new();
                 for tier in &tier_names {
@@ -750,9 +747,7 @@ fn resolve_model_list_from_tier_table(
                         continue;
                     };
                     let context_limit =
-                        crate::pyramid::walker_resolver::resolve_context_limit(
-                            chain, tier, pt,
-                        );
+                        crate::pyramid::walker_resolver::resolve_context_limit(chain, tier, pt);
                     let max_completion_tokens =
                         crate::pyramid::walker_resolver::resolve_max_completion_tokens(
                             chain, tier, pt,
@@ -764,8 +759,7 @@ fn resolve_model_list_from_tier_table(
                         out.push(OptionValue {
                             value: model_id.clone(),
                             label: model_id.clone(),
-                            description: context_limit
-                                .map(|n| format!("context: {n} tokens")),
+                            description: context_limit.map(|n| format!("context: {n} tokens")),
                             meta: Some(serde_json::json!({
                                 "provider_id": provider_id,
                                 "context_limit": context_limit,
@@ -797,11 +791,10 @@ fn resolve_model_list_from_tier_table(
         out.push(OptionValue {
             value: entry.model_id.clone(),
             label: entry.model_id.clone(),
-            description: entry.notes.clone().or_else(|| {
-                entry
-                    .context_limit
-                    .map(|n| format!("context: {n} tokens"))
-            }),
+            description: entry
+                .notes
+                .clone()
+                .or_else(|| entry.context_limit.map(|n| format!("context: {n} tokens"))),
             meta: Some(serde_json::json!({
                 "provider_id": entry.provider_id,
                 "context_limit": entry.context_limit,
@@ -876,10 +869,9 @@ fn resolve_chain_list(conn: &Connection) -> Result<Vec<OptionValue>> {
            AND superseded_by_id IS NULL
          ORDER BY slug",
     )?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
-        })?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+    })?;
 
     let mut out = Vec::new();
     for row in rows {
@@ -1004,8 +996,7 @@ pub fn estimate_cost(
     let Some(entry) = tier_entry else {
         warn!(
             provider_id,
-            model_id,
-            "yaml_renderer_estimate_cost: no matching tier_routing row; returning 0.0"
+            model_id, "yaml_renderer_estimate_cost: no matching tier_routing row; returning 0.0"
         );
         return 0.0;
     };
@@ -1034,7 +1025,9 @@ mod tests {
 
     fn empty_registry() -> ProviderRegistry {
         let cred_dir = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(CredentialStore::load_from_path(cred_dir.path().join(".credentials")).unwrap());
+        let store = Arc::new(
+            CredentialStore::load_from_path(cred_dir.path().join(".credentials")).unwrap(),
+        );
         // Leak the TempDir so the credentials file path stays valid for
         // the life of the test (TempDir drops on end-of-scope which
         // would break later registry reads).
@@ -1175,8 +1168,7 @@ fields:
             model_id: "openai/gpt-4o-mini".into(),
             context_limit: Some(128_000),
             max_completion_tokens: Some(16_000),
-            pricing_json: r#"{"prompt":"0.0000015","completion":"0.0000060","request":"0"}"#
-                .into(),
+            pricing_json: r#"{"prompt":"0.0000015","completion":"0.0000060","request":"0"}"#.into(),
             supported_parameters_json: None,
             notes: Some("Cheap extraction".into()),
         };
@@ -1222,8 +1214,7 @@ fields:
         let model_options =
             resolve_option_source(&conn, &registry, "model_list:openrouter").unwrap();
         assert!(!model_options.is_empty());
-        let model_ids: Vec<String> =
-            model_options.iter().map(|o| o.value.clone()).collect();
+        let model_ids: Vec<String> = model_options.iter().map(|o| o.value.clone()).collect();
         assert!(model_ids.contains(&"openai/gpt-4o-mini".to_string()));
 
         let none_options =
@@ -1343,8 +1334,7 @@ fields:
         // Async call: hits the network and caches the empty failure.
         let _ = resolve_model_list_only(&registry, "ollama-local").await;
         // Sync call: must see the cached empty list.
-        let cached =
-            resolve_option_source(&conn, &registry, "model_list:ollama-local").unwrap();
+        let cached = resolve_option_source(&conn, &registry, "model_list:ollama-local").unwrap();
         assert!(cached.is_empty(), "expected cached empty list");
         clear_ollama_tags_cache_for_tests();
     }
@@ -1450,10 +1440,10 @@ fields:
             .parent()
             .expect("crate parent must exist")
             .join("chains/schemas/dadbear.schema.yaml");
-        let body = std::fs::read_to_string(&seed_path)
-            .expect("seed dadbear annotation should exist");
-        let parsed: SchemaAnnotation = serde_yaml::from_str(&body)
-            .expect("seed dadbear annotation should parse");
+        let body =
+            std::fs::read_to_string(&seed_path).expect("seed dadbear annotation should exist");
+        let parsed: SchemaAnnotation =
+            serde_yaml::from_str(&body).expect("seed dadbear annotation should parse");
         assert_eq!(parsed.applies_to.as_deref(), Some("dadbear_policy"));
         // Every field name below must exist in `DadbearPolicyYaml` in
         // `pyramid::db`. Keep this list in sync if the struct changes.
@@ -1492,10 +1482,10 @@ fields:
             .parent()
             .expect("crate parent must exist")
             .join("chains/schemas/chain-step.schema.yaml");
-        let body = std::fs::read_to_string(&seed_path)
-            .expect("seed chain-step annotation should exist");
-        let parsed: SchemaAnnotation = serde_yaml::from_str(&body)
-            .expect("seed chain-step annotation should parse");
+        let body =
+            std::fs::read_to_string(&seed_path).expect("seed chain-step annotation should exist");
+        let parsed: SchemaAnnotation =
+            serde_yaml::from_str(&body).expect("seed chain-step annotation should parse");
         assert_eq!(parsed.applies_to.as_deref(), Some("chain_step_config"));
         // Field names that must correspond to real `ChainStep` fields.
         let real_chain_step_fields: std::collections::HashSet<&str> = [

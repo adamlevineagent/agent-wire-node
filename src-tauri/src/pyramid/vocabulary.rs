@@ -33,10 +33,7 @@ pub fn extract_vocabulary_catalog(conn: &Connection, slug: &str) -> Result<Vocab
         .topics
         .iter()
         .map(|t| {
-            let importance = t
-                .extra
-                .get("importance")
-                .and_then(|v| v.as_f64());
+            let importance = t.extra.get("importance").and_then(|v| v.as_f64());
             let liveness = t
                 .extra
                 .get("liveness")
@@ -188,7 +185,11 @@ pub fn persist_vocabulary_catalog(
 
     let mut stmt = conn.prepare(sql)?;
 
-    let persist_entries = |entries: &[VocabEntry], entry_type: &str, stmt: &mut rusqlite::Statement, count: &mut usize| -> Result<()> {
+    let persist_entries = |entries: &[VocabEntry],
+                           entry_type: &str,
+                           stmt: &mut rusqlite::Statement,
+                           count: &mut usize|
+     -> Result<()> {
         for entry in entries {
             let detail_json = serde_json::to_string(&entry.detail).unwrap_or_default();
             stmt.execute(rusqlite::params![
@@ -323,11 +324,7 @@ pub fn vocab_recognition_query(
 ///
 /// Matches against the `category` column (exact match, case-insensitive).
 /// For entities, category is the role. For decisions, category is the stance.
-pub fn vocab_drill_query(
-    conn: &Connection,
-    slug: &str,
-    category: &str,
-) -> Result<Vec<VocabEntry>> {
+pub fn vocab_drill_query(conn: &Connection, slug: &str, category: &str) -> Result<Vec<VocabEntry>> {
     let mut stmt = conn.prepare(
         "SELECT entry_name, entry_type, category, importance, liveness, detail
          FROM pyramid_vocabulary_catalog
@@ -389,8 +386,13 @@ pub fn vocab_reverse_query(
         .optional()
         .context("Failed to execute reverse query")?;
 
-    let entry = entry_row
-        .ok_or_else(|| anyhow::anyhow!("Identity '{}' not found in vocabulary for slug '{}'", identity, slug))?;
+    let entry = entry_row.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Identity '{}' not found in vocabulary for slug '{}'",
+            identity,
+            slug
+        )
+    })?;
 
     let category = entry.category.clone();
 
@@ -431,11 +433,7 @@ pub fn vocab_reverse_query(
 /// Diff query: what's new or changed since a given ISO timestamp?
 ///
 /// Returns entries whose `updated_at` is after the given timestamp.
-pub fn vocab_diff_query(
-    conn: &Connection,
-    slug: &str,
-    since: &str,
-) -> Result<Vec<VocabEntry>> {
+pub fn vocab_diff_query(conn: &Connection, slug: &str, since: &str) -> Result<Vec<VocabEntry>> {
     let mut stmt = conn.prepare(
         "SELECT entry_name, entry_type, category, importance, liveness, detail
          FROM pyramid_vocabulary_catalog
@@ -484,8 +482,7 @@ pub fn refresh_vocabulary(conn: &Connection, slug: &str) -> Result<(VocabularyCa
     let catalog = extract_vocabulary_catalog(conn, slug)?;
 
     // Get the apex node id for source tracking
-    let apex_node_id = query::get_apex(conn, slug)?
-        .map(|n| n.id);
+    let apex_node_id = query::get_apex(conn, slug)?.map(|n| n.id);
 
     let count = persist_vocabulary_catalog(conn, &catalog, apex_node_id.as_deref())?;
     Ok((catalog, count))
@@ -637,7 +634,11 @@ mod tests {
         assert_eq!(catalog.entities.len(), 2, "Expected 2 entities");
         assert_eq!(catalog.decisions.len(), 2, "Expected 2 decisions");
         assert_eq!(catalog.terms.len(), 2, "Expected 2 terms");
-        assert_eq!(catalog.practices.len(), 1, "Expected 1 practice (Daily Standups)");
+        assert_eq!(
+            catalog.practices.len(),
+            1,
+            "Expected 1 practice (Daily Standups)"
+        );
         assert_eq!(
             catalog.total_entries,
             3 + 2 + 2 + 2 + 1,
@@ -645,7 +646,11 @@ mod tests {
         );
 
         // Verify topic details
-        let wire_topic = catalog.topics.iter().find(|t| t.name == "Wire Protocol").unwrap();
+        let wire_topic = catalog
+            .topics
+            .iter()
+            .find(|t| t.name == "Wire Protocol")
+            .unwrap();
         assert_eq!(wire_topic.importance, Some(0.9));
         assert_eq!(wire_topic.liveness, "live");
         assert_eq!(wire_topic.category.as_deref(), Some("protocols"));
@@ -689,10 +694,7 @@ mod tests {
 
         // Partial match (case-insensitive)
         let results = vocab_recognition_query(&conn, "test-slug", "wire").unwrap();
-        assert!(
-            !results.is_empty(),
-            "Should find partial match for 'wire'"
-        );
+        assert!(!results.is_empty(), "Should find partial match for 'wire'");
 
         // No match
         let results = vocab_recognition_query(&conn, "test-slug", "nonexistent-term-xyz").unwrap();

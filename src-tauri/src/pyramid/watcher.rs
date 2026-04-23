@@ -296,7 +296,15 @@ fn handle_event_with_rename_tracking(
         .paths
         .iter()
         .map(|p| p.to_string_lossy().to_string())
-        .filter(|p| is_trackable_path(p, tracked_paths, ingested_extensions, ingested_config_files, exclude_patterns))
+        .filter(|p| {
+            is_trackable_path(
+                p,
+                tracked_paths,
+                ingested_extensions,
+                ingested_config_files,
+                exclude_patterns,
+            )
+        })
         .collect();
 
     if trackable_paths.is_empty() {
@@ -658,13 +666,13 @@ pub fn write_mutation(
         slug,
         "watcher",
         obs_event_type,
-        None,            // source_path
+        None,             // source_path
         Some(target_ref), // file_path = target_ref for watcher mutations
-        None,            // content_hash (not available at WAL write time)
-        None,            // previous_hash
-        None,            // target_node_id
+        None,             // content_hash (not available at WAL write time)
+        None,             // previous_hash
+        None,             // target_node_id
         Some(layer as i64),
-        detail,          // metadata_json = detail
+        detail, // metadata_json = detail
     )?;
 
     Ok(event_id)

@@ -74,7 +74,11 @@ fn read_marker_body(conn: &Connection) -> std::result::Result<Option<String>, ru
     // Parse: try YAML-with-body-field first; fall back to trimmed whole.
     let trimmed: Option<String> = serde_yaml::from_str::<serde_yaml::Value>(&yaml)
         .ok()
-        .and_then(|v| v.get("body").and_then(|b| b.as_str()).map(|s| s.trim().to_string()))
+        .and_then(|v| {
+            v.get("body")
+                .and_then(|b| b.as_str())
+                .map(|s| s.trim().to_string())
+        })
         .or_else(|| Some(yaml.trim().to_string()));
     Ok(trimmed.filter(|s| !s.is_empty()))
 }
@@ -271,10 +275,8 @@ pub async fn run_walker_cache_boot(
                     // v2 or missing: run Phase A.
                     Some("v2") | None | Some("") => {
                         let data_dir = v3_migration::default_data_dir();
-                        let report = v3_migration::run_v3_phase_a_migration(
-                            &mut conn,
-                            data_dir.as_deref(),
-                        )?;
+                        let report =
+                            v3_migration::run_v3_phase_a_migration(&mut conn, data_dir.as_deref())?;
                         Ok(MigrationStepOutcome::Ran(report))
                     }
                     // Unknown marker body — log, skip migration, continue.
@@ -571,14 +573,10 @@ pub async fn run_walker_cache_boot(
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::debug!(
-                        "scope_cache rebuild bridge lagged by {n} events"
-                    );
+                    tracing::debug!("scope_cache rebuild bridge lagged by {n} events");
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    tracing::debug!(
-                        "scope_cache rebuild bridge: bus closed, exiting"
-                    );
+                    tracing::debug!("scope_cache rebuild bridge: bus closed, exiting");
                     break;
                 }
             }

@@ -113,7 +113,8 @@ impl CachedOffer {
     /// engine_occupancy (execution_concurrency). Per
     /// project_compute_market_saturation_fix.md rev 2.1.1.
     pub fn peer_queue_depth(&self) -> i64 {
-        self.current_queue_depth.saturating_add(self.execution_concurrency)
+        self.current_queue_depth
+            .saturating_add(self.execution_concurrency)
     }
 
     /// True if the offer's queue is at or beyond `max_queue_depth`.
@@ -199,10 +200,7 @@ pub fn clear_model_cache_for_tests() {
 
 /// Read the current node-state snapshot.
 pub fn read_node_state() -> CachedNodeState {
-    node_cache()
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default()
+    node_cache().lock().map(|g| g.clone()).unwrap_or_default()
 }
 
 /// Overwrite the whole node-state snapshot. Called by the background
@@ -216,8 +214,7 @@ pub fn write_node_state(state: CachedNodeState) {
 /// Increment the consecutive-failure counter; return the new value.
 pub fn record_network_failure() -> u32 {
     if let Ok(mut guard) = node_cache().lock() {
-        guard.consecutive_network_failures =
-            guard.consecutive_network_failures.saturating_add(1);
+        guard.consecutive_network_failures = guard.consecutive_network_failures.saturating_add(1);
         return guard.consecutive_network_failures;
     }
     0
@@ -304,7 +301,10 @@ pub enum PreGateVerdict {
     /// without paying a reservation fee. `estimated_serve_ms` is the
     /// computed `typical_serve_ms_p50_7d × peer_queue_depth` product
     /// so the chronicle event can record why.
-    Skip { estimated_serve_ms: u64, usable_deadline_ms: u64 },
+    Skip {
+        estimated_serve_ms: u64,
+        usable_deadline_ms: u64,
+    },
     /// Neither per-offer nor model-level typical_serve_ms_p50_7d is
     /// populated. Walker trusts the static deadline; do not pre-gate.
     /// (Equivalent to Proceed for control flow — separate variant so
@@ -387,8 +387,8 @@ pub fn project_model(
     // Saturation = every offer is saturated AND at least one offer
     // exists. Zero offers → not "all saturated", just "none at all"
     // (distinct semantic via active_offers).
-    let all_offers_saturated = !offers_detail.is_empty()
-        && offers_detail.iter().all(CachedOffer::is_saturated);
+    let all_offers_saturated =
+        !offers_detail.is_empty() && offers_detail.iter().all(CachedOffer::is_saturated);
 
     // Self-deal = every offer points at us. Ignore empty offer lists
     // (can't self-deal when nothing is published).
@@ -396,8 +396,7 @@ pub fn project_model(
         && !self_node_handle.is_empty()
         && offers_detail.iter().all(|o| {
             o.node_handle == self_node_handle
-                && (self_operator_handle.is_empty()
-                    || o.operator_handle == self_operator_handle)
+                && (self_operator_handle.is_empty() || o.operator_handle == self_operator_handle)
         });
 
     CachedMarketModel {
@@ -441,9 +440,7 @@ pub async fn refresh_from_surface_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_wire_contracts::{
-        MarketSurfaceModel, MarketSurfaceOffer, MarketSurfaceProviderType,
-    };
+    use agent_wire_contracts::{MarketSurfaceModel, MarketSurfaceOffer, MarketSurfaceProviderType};
 
     fn make_offer(
         offer_id: &str,
@@ -531,8 +528,8 @@ mod tests {
     #[test]
     fn project_model_partial_saturation_is_not_all_saturated() {
         let offers = vec![
-            make_offer("o1", "a", "op", 5, 5, None, 1),       // saturated
-            make_offer("o2", "b", "op", 1, 10, None, 1),      // has headroom
+            make_offer("o1", "a", "op", 5, 5, None, 1),  // saturated
+            make_offer("o2", "b", "op", 1, 10, None, 1), // has headroom
         ];
         let m = make_model("foo/bar", 2, Some(offers), None);
         let p = project_model(&m, "me", "meop");
@@ -660,7 +657,10 @@ mod tests {
         let offer = mk_offer(Some(30_000.0), 3, 2);
         let verdict = evaluate_pre_gate(60_000, 10, &offer, None);
         match verdict {
-            PreGateVerdict::Skip { estimated_serve_ms, usable_deadline_ms } => {
+            PreGateVerdict::Skip {
+                estimated_serve_ms,
+                usable_deadline_ms,
+            } => {
                 assert_eq!(estimated_serve_ms, 150_000);
                 assert_eq!(usable_deadline_ms, 50_000);
             }
@@ -698,8 +698,8 @@ mod tests {
     fn test_pre_gate_falls_back_to_model_p50_when_offer_is_null() {
         // Per-offer p50 None; model-level provided. Fallback path.
         let offer = mk_offer(None, 5, 1); // peer_depth = 6
-        // Model p50 = 5_000 → estimated = 30_000 → Proceed at 60s/10s grace
-        // (usable=50_000).
+                                          // Model p50 = 5_000 → estimated = 30_000 → Proceed at 60s/10s grace
+                                          // (usable=50_000).
         let verdict = evaluate_pre_gate(60_000, 10, &offer, Some(5_000.0));
         assert_eq!(verdict, PreGateVerdict::Proceed);
     }

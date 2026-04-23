@@ -109,17 +109,11 @@ fn phase4_decision_includes_fleet_when_matching_v2_peer_is_fresh() {
     let _g = fleet_it_lock().lock().unwrap_or_else(|p| p.into_inner());
     clear_fleet_cache_for_tests();
     let slug = "phase4-fleet-readiness-happy:latest";
-    write_cached_peer(make_peer(
-        "peer-happy",
-        &[slug],
-        chrono::Utc::now(),
-        false,
-    ));
+    write_cached_peer(make_peer("peer-happy", &[slug], chrono::Utc::now(), false));
     let (_dir, conn) = make_it_db();
     seed_walker_provider_fleet(&conn, "c-wpf-happy", "mid", &[slug]);
 
-    let d = DispatchDecision::build("mid", &conn)
-        .expect("Decision must build with fleet ready");
+    let d = DispatchDecision::build("mid", &conn).expect("Decision must build with fleet ready");
     assert!(
         d.effective_call_order.contains(&ProviderType::Fleet),
         "Fleet MUST be in effective_call_order; got {:?}",
@@ -239,12 +233,7 @@ fn phase4_decision_chronicle_view_redacts_fleet_local_only_fields() {
     clear_fleet_cache_for_tests();
     clear_node_state_for_tests();
     let slug = "phase4-fleet-readiness-redact:latest";
-    write_cached_peer(make_peer(
-        "peer-redact",
-        &[slug],
-        chrono::Utc::now(),
-        false,
-    ));
+    write_cached_peer(make_peer("peer-redact", &[slug], chrono::Utc::now(), false));
     let (_dir, conn) = make_it_db();
     seed_walker_provider_fleet(&conn, "c-wpf-redact", "mid", &[slug]);
 

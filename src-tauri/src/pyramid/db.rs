@@ -43,7 +43,9 @@ pub fn open_pyramid_connection(path: &std::path::Path) -> Result<Connection> {
 /// Enables WAL mode and foreign keys, then creates all five tables with
 /// proper constraints and indices.
 pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=10000;")?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=10000;",
+    )?;
 
     // 11-R: CASCADE DELETEs on FK constraints below only fire when a slug row is
     // physically DELETEd, which only happens via admin-only `purge_slug`.
@@ -1120,10 +1122,7 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // walker marks this row stale. Carries the originating cache_key
     // so operators can trace back to the root cause. Cache lookup
     // treats any non-NULL `invalidated_by` as a forced miss.
-    let _ = conn.execute(
-        "ALTER TABLE pyramid_step_cache ADD COLUMN note TEXT",
-        [],
-    );
+    let _ = conn.execute("ALTER TABLE pyramid_step_cache ADD COLUMN note TEXT", []);
     let _ = conn.execute(
         "ALTER TABLE pyramid_step_cache ADD COLUMN invalidated_by TEXT",
         [],
@@ -1956,7 +1955,7 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             yaml_content TEXT NOT NULL DEFAULT '',
             contribution_id TEXT,
             updated_at TEXT DEFAULT (datetime('now'))
-        )"
+        )",
     )?;
 
     // Fleet delivery policy operational table — async fleet dispatch.
@@ -1970,7 +1969,7 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             yaml_content TEXT NOT NULL DEFAULT '',
             contribution_id TEXT,
             updated_at TEXT DEFAULT (datetime('now'))
-        )"
+        )",
     )?;
 
     // ── DADBEAR Canonical State Model tables ────────────────────────────────
@@ -2807,10 +2806,7 @@ pub struct OutboxLookup {
 /// Returns an [`OutboxLookup`] or `None`. The `last_error` field is populated
 /// when the row's `last_error` column is non-NULL so the Phase 3 handler can
 /// include it in the 410 Gone body for already-failed rows.
-pub fn fleet_outbox_lookup(
-    conn: &Connection,
-    job_id: &str,
-) -> Result<Option<OutboxLookup>> {
+pub fn fleet_outbox_lookup(conn: &Connection, job_id: &str) -> Result<Option<OutboxLookup>> {
     let row = conn
         .query_row(
             "SELECT dispatcher_node_id, status, delivery_attempts, last_error
@@ -3147,9 +3143,7 @@ pub fn fleet_outbox_sweep_expired(conn: &Connection) -> Result<Vec<OutboxRow>> {
     // Filter to `callback_kind = 'Fleet'`: market/relay rows are owned by
     // compute market Phase 2+ delivery paths (not this sweeper).
     // See architecture §VIII.6 DD-D / DD-Q for the outbox reuse decision.
-    let mut stmt = conn.prepare(
-        OUTBOX_SELECT_PROJECTION_WHERE_EXPIRED_FLEET,
-    )?;
+    let mut stmt = conn.prepare(OUTBOX_SELECT_PROJECTION_WHERE_EXPIRED_FLEET)?;
     let rows = stmt
         .query_map([], map_outbox_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3212,10 +3206,7 @@ pub fn market_outbox_sweep_expired(conn: &Connection) -> Result<Vec<OutboxRow>> 
 /// writes centralized in Predicate A.
 ///
 /// Returns the number of rows pushed into the past.
-pub fn market_outbox_expire_exhausted(
-    conn: &Connection,
-    max_attempts: u64,
-) -> Result<usize> {
+pub fn market_outbox_expire_exhausted(conn: &Connection, max_attempts: u64) -> Result<usize> {
     // SQLite integers are signed 64-bit; `MarketDeliveryPolicy.max_delivery_attempts`
     // is `u64`. Saturate at `i64::MAX` before the cast — saturation is a
     // belt-and-suspenders guard, not a real operating condition (default
@@ -3652,9 +3643,7 @@ pub fn market_outbox_check_both_legs_complete_and_mark_delivered(
 ///
 /// Covers both MarketStandard and Relay callback_kinds for forward-compat
 /// with the deferred relay market per spec §Scope.
-pub fn market_outbox_startup_recovery_clear_leg_leases(
-    conn: &Connection,
-) -> Result<usize> {
+pub fn market_outbox_startup_recovery_clear_leg_leases(conn: &Connection) -> Result<usize> {
     let n = conn.execute(
         "UPDATE fleet_result_outbox
             SET content_lease_until = NULL,
@@ -3673,10 +3662,7 @@ pub fn market_outbox_startup_recovery_clear_leg_leases(
 /// `row_predates_migration` helper to distinguish deploy-artifact orphans
 /// (NULL `callback_auth_token` on a row whose `created_at` is before the
 /// migration's apply-time) from genuine token-plumbing bugs.
-pub fn pyramid_schema_version_applied_at(
-    conn: &Connection,
-    name: &str,
-) -> Result<Option<String>> {
+pub fn pyramid_schema_version_applied_at(conn: &Connection, name: &str) -> Result<Option<String>> {
     match conn.query_row(
         "SELECT applied_at FROM pyramid_schema_versions WHERE name = ?1",
         rusqlite::params![name],
@@ -3810,9 +3796,7 @@ pub fn migrate_legacy_dadbear_to_contributions(conn: &Connection) -> Result<()> 
             Some(cfg.slug.as_str()),
         );
         metadata.maturity = crate::pyramid::wire_native_metadata::WireMaturity::Canon;
-        let metadata_json = metadata
-            .to_json()
-            .unwrap_or_else(|_| "{}".to_string());
+        let metadata_json = metadata.to_json().unwrap_or_else(|_| "{}".to_string());
 
         let contribution_id = uuid::Uuid::new_v4().to_string();
         crate::pyramid::config_contributions::write_contribution_envelope(
@@ -3824,9 +3808,7 @@ pub fn migrate_legacy_dadbear_to_contributions(conn: &Connection) -> Result<()> 
                 body: yaml,
                 wire_native_metadata_json: Some(metadata_json),
                 supersedes_id: None,
-                triggering_note: Some(
-                    "Migrated from legacy pyramid_dadbear_config".to_string(),
-                ),
+                triggering_note: Some("Migrated from legacy pyramid_dadbear_config".to_string()),
                 status: "active".to_string(),
                 source: "migration".to_string(),
                 wire_contribution_id: None,
@@ -3949,9 +3931,7 @@ pub fn migrate_legacy_auto_update_to_contributions(conn: &Connection) -> Result<
             Some(cfg.slug.as_str()),
         );
         metadata.maturity = crate::pyramid::wire_native_metadata::WireMaturity::Canon;
-        let metadata_json = metadata
-            .to_json()
-            .unwrap_or_else(|_| "{}".to_string());
+        let metadata_json = metadata.to_json().unwrap_or_else(|_| "{}".to_string());
 
         let contribution_id = uuid::Uuid::new_v4().to_string();
         crate::pyramid::config_contributions::write_contribution_envelope(
@@ -4118,10 +4098,7 @@ pub fn list_pending_wire_updates(
 /// the badge). Sets `acknowledged_at` to NOW. The row is preserved so
 /// the next poller sweep can detect if a newer version arrives and
 /// re-trigger the badge; it's not deleted.
-pub fn acknowledge_wire_update(
-    conn: &Connection,
-    local_contribution_id: &str,
-) -> Result<bool> {
+pub fn acknowledge_wire_update(conn: &Connection, local_contribution_id: &str) -> Result<bool> {
     let changed = conn.execute(
         "UPDATE pyramid_wire_update_cache
          SET acknowledged_at = datetime('now')
@@ -4134,10 +4111,7 @@ pub fn acknowledge_wire_update(
 /// Delete a row from `pyramid_wire_update_cache`. Called when the user
 /// pulls the update — after the pull flow writes the new local
 /// contribution, the cache entry is no longer relevant.
-pub fn delete_wire_update_cache(
-    conn: &Connection,
-    local_contribution_id: &str,
-) -> Result<bool> {
+pub fn delete_wire_update_cache(conn: &Connection, local_contribution_id: &str) -> Result<bool> {
     let changed = conn.execute(
         "DELETE FROM pyramid_wire_update_cache WHERE local_contribution_id = ?1",
         rusqlite::params![local_contribution_id],
@@ -4148,9 +4122,7 @@ pub fn delete_wire_update_cache(
 /// List contributions that are tracked on the Wire (have a non-null
 /// `wire_contribution_id`) and are currently active. Used by the
 /// update poller to build its supersession-check payload.
-pub fn list_wire_tracked_contributions(
-    conn: &Connection,
-) -> Result<Vec<(String, String, String)>> {
+pub fn list_wire_tracked_contributions(conn: &Connection) -> Result<Vec<(String, String, String)>> {
     let mut stmt = conn.prepare(
         "SELECT contribution_id, wire_contribution_id, schema_type
          FROM pyramid_config_contributions
@@ -4822,10 +4794,7 @@ pub fn get_slug_referrers(conn: &Connection, slug: &str) -> Result<Vec<String>> 
 /// Return all question pyramids that reference `source_slug`. Used by the
 /// public web surface to render the "Questions asked" section on a source
 /// pyramid's home page. Newest first.
-pub fn get_questions_referencing(
-    conn: &Connection,
-    source_slug: &str,
-) -> Result<Vec<SlugInfo>> {
+pub fn get_questions_referencing(conn: &Connection, source_slug: &str) -> Result<Vec<SlugInfo>> {
     let mut stmt = conn.prepare(
         "SELECT s.slug, s.content_type, s.source_path, s.node_count, s.max_depth,
                 s.last_built_at, s.created_at, s.archived_at
@@ -5194,7 +5163,10 @@ pub fn node_from_row(row: &rusqlite::Row) -> rusqlite::Result<PyramidNode> {
                 .get::<_, Option<String>>("time_range_start")
                 .ok()
                 .flatten();
-            let end = row.get::<_, Option<String>>("time_range_end").ok().flatten();
+            let end = row
+                .get::<_, Option<String>>("time_range_end")
+                .ok()
+                .flatten();
             if start.is_some() || end.is_some() {
                 Some(TimeRange { start, end })
             } else {
@@ -5212,10 +5184,7 @@ pub fn node_from_row(row: &rusqlite::Row) -> rusqlite::Result<PyramidNode> {
             .flatten()
             .map(|v| v != 0)
             .unwrap_or(false),
-        promoted_from: row
-            .get::<_, Option<String>>("promoted_from")
-            .ok()
-            .flatten(),
+        promoted_from: row.get::<_, Option<String>>("promoted_from").ok().flatten(),
         narrative: row
             .get::<_, Option<String>>("narrative_json")
             .ok()
@@ -5280,12 +5249,11 @@ pub fn save_node(conn: &Connection, node: &PyramidNode, topics_json: Option<&str
         .unwrap_or(false);
 
     if row_exists {
-        let (is_provisional, existing_depth): (bool, i64) = conn
-            .query_row(
-                "SELECT COALESCE(provisional, 0), depth FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
-                rusqlite::params![node.slug, node.id],
-                |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)?)),
-            )?;
+        let (is_provisional, existing_depth): (bool, i64) = conn.query_row(
+            "SELECT COALESCE(provisional, 0), depth FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
+            rusqlite::params![node.slug, node.id],
+            |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)?)),
+        )?;
         if is_provisional {
             mutate_provisional_node(conn, &node.slug, &node.id, node)?;
         } else {
@@ -5462,8 +5430,8 @@ pub fn apply_supersession(
         let terms = serde_json::to_string(&new_node.terms)?;
         let dead_ends = serde_json::to_string(&new_node.dead_ends)?;
         let children = serde_json::to_string(&new_node.children)?;
-        let headline = clean_headline(&new_node.headline)
-            .unwrap_or_else(|| headline_for_node(new_node, None));
+        let headline =
+            clean_headline(&new_node.headline).unwrap_or_else(|| headline_for_node(new_node, None));
         let (time_range_start, time_range_end) = match &new_node.time_range {
             Some(tr) => (tr.start.clone(), tr.end.clone()),
             None => (None, None),
@@ -5472,7 +5440,11 @@ pub fn apply_supersession(
         let entities_json = serde_json::to_string(&new_node.entities)?;
         let key_quotes_json = serde_json::to_string(&new_node.key_quotes)?;
         let transitions_json = serde_json::to_string(&new_node.transitions)?;
-        let weight = if new_node.weight == 0.0 { 1.0 } else { new_node.weight };
+        let weight = if new_node.weight == 0.0 {
+            1.0
+        } else {
+            new_node.weight
+        };
 
         // 3. UPDATE the live row. Clears the legacy `superseded_by` tombstone
         //    so a previously build-swept row doesn't ghost out of
@@ -5580,8 +5552,8 @@ pub fn mutate_provisional_node(
     let terms = serde_json::to_string(&new_node.terms)?;
     let dead_ends = serde_json::to_string(&new_node.dead_ends)?;
     let children = serde_json::to_string(&new_node.children)?;
-    let headline = clean_headline(&new_node.headline)
-        .unwrap_or_else(|| headline_for_node(new_node, None));
+    let headline =
+        clean_headline(&new_node.headline).unwrap_or_else(|| headline_for_node(new_node, None));
     let (time_range_start, time_range_end) = match &new_node.time_range {
         Some(tr) => (tr.start.clone(), tr.end.clone()),
         None => (None, None),
@@ -5590,7 +5562,11 @@ pub fn mutate_provisional_node(
     let entities_json = serde_json::to_string(&new_node.entities)?;
     let key_quotes_json = serde_json::to_string(&new_node.key_quotes)?;
     let transitions_json = serde_json::to_string(&new_node.transitions)?;
-    let weight = if new_node.weight == 0.0 { 1.0 } else { new_node.weight };
+    let weight = if new_node.weight == 0.0 {
+        1.0
+    } else {
+        new_node.weight
+    };
 
     let updated = conn.execute(
         "UPDATE pyramid_nodes SET
@@ -5703,9 +5679,7 @@ pub fn update_node_in_place(
     // outer transaction, use a SAVEPOINT instead so we can roll back just
     // this in-place update without torching the outer tx. We detect nesting
     // by attempting a BEGIN IMMEDIATE and falling back to a SAVEPOINT.
-    let using_savepoint = conn
-        .execute_batch("BEGIN IMMEDIATE;")
-        .is_err();
+    let using_savepoint = conn.execute_batch("BEGIN IMMEDIATE;").is_err();
     if using_savepoint {
         conn.execute_batch("SAVEPOINT update_node_in_place_sp;")?;
     }
@@ -5791,9 +5765,7 @@ pub fn update_node_in_place(
                 },
             )
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "update_node_in_place: load of ({slug}, {node_id}) failed: {e}"
-                )
+                anyhow::anyhow!("update_node_in_place: load of ({slug}, {node_id}) failed: {e}")
             })?;
 
         // 2. Snapshot prior state into pyramid_node_versions BEFORE applying
@@ -5846,20 +5818,12 @@ pub fn update_node_in_place(
         // 3. Apply per-entry operations to topics, terms, decisions, dead_ends.
         let new_topics_json = apply_topic_ops(&snap.topics, updates.topics.as_deref())?;
         let new_terms_json = apply_term_ops(&snap.terms, updates.terms.as_deref())?;
-        let new_decisions_json =
-            apply_decision_ops(&snap.decisions, updates.decisions.as_deref())?;
-        let new_dead_ends_json =
-            apply_dead_end_ops(&snap.dead_ends, updates.dead_ends.as_deref())?;
+        let new_decisions_json = apply_decision_ops(&snap.decisions, updates.decisions.as_deref())?;
+        let new_dead_ends_json = apply_dead_end_ops(&snap.dead_ends, updates.dead_ends.as_deref())?;
 
         // 4. Apply wholesale replacements where present.
-        let new_distilled = updates
-            .distilled
-            .clone()
-            .unwrap_or(snap.distilled.clone());
-        let new_headline = updates
-            .headline
-            .clone()
-            .unwrap_or(snap.headline.clone());
+        let new_distilled = updates.distilled.clone().unwrap_or(snap.distilled.clone());
+        let new_headline = updates.headline.clone().unwrap_or(snap.headline.clone());
 
         // 5. Apply children_swapped to the children JSON array.
         let mut children_vec: Vec<String> =
@@ -5998,18 +5962,14 @@ pub fn update_node_in_place(
 // forgiving about malformed stored JSON — an unparseable current value is
 // treated as an empty array so the manifest can still rebuild from scratch.
 
-fn apply_topic_ops(
-    current_json: &str,
-    ops: Option<&[super::types::TopicOp]>,
-) -> Result<String> {
+fn apply_topic_ops(current_json: &str, ops: Option<&[super::types::TopicOp]>) -> Result<String> {
     use super::types::Topic;
     let ops = match ops {
         Some(ops) => ops,
         None => return Ok(current_json.to_string()),
     };
 
-    let mut topics: Vec<Topic> =
-        serde_json::from_str(current_json).unwrap_or_default();
+    let mut topics: Vec<Topic> = serde_json::from_str(current_json).unwrap_or_default();
 
     for op in ops {
         match op.action.as_str() {
@@ -6049,10 +6009,7 @@ fn apply_topic_ops(
     Ok(serde_json::to_string(&topics)?)
 }
 
-fn apply_term_ops(
-    current_json: &str,
-    ops: Option<&[super::types::TermOp]>,
-) -> Result<String> {
+fn apply_term_ops(current_json: &str, ops: Option<&[super::types::TermOp]>) -> Result<String> {
     use super::types::Term;
     let ops = match ops {
         Some(ops) => ops,
@@ -6099,8 +6056,7 @@ fn apply_decision_ops(
         None => return Ok(current_json.to_string()),
     };
 
-    let mut decisions: Vec<Decision> =
-        serde_json::from_str(current_json).unwrap_or_default();
+    let mut decisions: Vec<Decision> = serde_json::from_str(current_json).unwrap_or_default();
 
     for op in ops {
         match op.action.as_str() {
@@ -6119,9 +6075,7 @@ fn apply_decision_ops(
                 });
             }
             "update" => {
-                if let Some(existing) =
-                    decisions.iter_mut().find(|d| d.decided == op.decided)
-                {
+                if let Some(existing) = decisions.iter_mut().find(|d| d.decided == op.decided) {
                     if !op.why.is_empty() {
                         existing.why = op.why.clone();
                     }
@@ -6162,8 +6116,7 @@ fn apply_dead_end_ops(
         None => return Ok(current_json.to_string()),
     };
 
-    let mut dead_ends: Vec<String> =
-        serde_json::from_str(current_json).unwrap_or_default();
+    let mut dead_ends: Vec<String> = serde_json::from_str(current_json).unwrap_or_default();
 
     for op in ops {
         match op.action.as_str() {
@@ -7829,13 +7782,20 @@ pub fn get_auto_update_config(
             |row| row.get::<_, String>(0),
         )
         .ok()
-        .and_then(|yaml| {
-            serde_yaml::from_str::<serde_json::Value>(&yaml).ok()
-        })
+        .and_then(|yaml| serde_yaml::from_str::<serde_json::Value>(&yaml).ok())
         .map(|v| {
-            let debounce = v.get("debounce_minutes").and_then(|d| d.as_i64()).unwrap_or(5) as i32;
-            let min_changed = v.get("min_changed_files").and_then(|m| m.as_i64()).unwrap_or(1) as i32;
-            let threshold = v.get("runaway_threshold").and_then(|t| t.as_f64()).unwrap_or(0.5);
+            let debounce = v
+                .get("debounce_minutes")
+                .and_then(|d| d.as_i64())
+                .unwrap_or(5) as i32;
+            let min_changed = v
+                .get("min_changed_files")
+                .and_then(|m| m.as_i64())
+                .unwrap_or(1) as i32;
+            let threshold = v
+                .get("runaway_threshold")
+                .and_then(|t| t.as_f64())
+                .unwrap_or(0.5);
             (debounce, min_changed, threshold)
         })
         .unwrap_or((5, 1, 0.5));
@@ -8100,8 +8060,15 @@ pub fn insert_llm_audit_pending(
           system_prompt, user_prompt, status)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending')",
         rusqlite::params![
-            slug, build_id, node_id, step_name, call_purpose, depth,
-            model, sys_ref, user_prompt,
+            slug,
+            build_id,
+            node_id,
+            step_name,
+            call_purpose,
+            depth,
+            model,
+            sys_ref,
+            user_prompt,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -8144,9 +8111,14 @@ pub fn complete_llm_audit(
          status = 'complete', completed_at = datetime('now')
          WHERE id = ?8",
         rusqlite::params![
-            raw_response, parsed_ok as i32,
-            prompt_tokens, completion_tokens,
-            latency_ms, generation_id, provider_id, audit_id,
+            raw_response,
+            parsed_ok as i32,
+            prompt_tokens,
+            completion_tokens,
+            latency_ms,
+            generation_id,
+            provider_id,
+            audit_id,
         ],
     )?;
     Ok(())
@@ -8217,9 +8189,20 @@ pub fn insert_llm_audit_cache_hit(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1,
                  ?11, ?12, ?13, ?14, 'complete', datetime('now'), 1)",
         rusqlite::params![
-            slug, build_id, node_id, step_name, call_purpose, depth,
-            model, sys_ref, user_prompt, raw_response,
-            prompt_tokens, completion_tokens, latency_ms, generation_id,
+            slug,
+            build_id,
+            node_id,
+            step_name,
+            call_purpose,
+            depth,
+            model,
+            sys_ref,
+            user_prompt,
+            raw_response,
+            prompt_tokens,
+            completion_tokens,
+            latency_ms,
+            generation_id,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -8251,10 +8234,7 @@ pub fn get_node_audit_records(
 
 /// Get a single audit record by id.
 /// Hash-referenced system prompts are resolved to full text.
-pub fn get_llm_audit_by_id(
-    conn: &Connection,
-    audit_id: i64,
-) -> Result<Option<LlmAuditRecord>> {
+pub fn get_llm_audit_by_id(conn: &Connection, audit_id: i64) -> Result<Option<LlmAuditRecord>> {
     let mut stmt = conn.prepare(
         "SELECT id, slug, build_id, node_id, step_name, call_purpose, depth, model,
                 system_prompt, user_prompt, raw_response, parsed_ok,
@@ -8572,7 +8552,10 @@ pub fn check_cache(
          LIMIT 1",
     )?;
     let row = stmt
-        .query_row(rusqlite::params![slug, cache_key], cached_step_output_from_row)
+        .query_row(
+            rusqlite::params![slug, cache_key],
+            cached_step_output_from_row,
+        )
         .optional()?;
     Ok(row)
 }
@@ -8597,7 +8580,10 @@ pub fn check_cache_including_invalidated(
          LIMIT 1",
     )?;
     let row = stmt
-        .query_row(rusqlite::params![slug, cache_key], cached_step_output_from_row)
+        .query_row(
+            rusqlite::params![slug, cache_key],
+            cached_step_output_from_row,
+        )
         .optional()?;
     Ok(row)
 }
@@ -8791,7 +8777,9 @@ pub fn find_downstream_cache_keys(
           WHERE slug = ?1 AND depth > ?2 AND invalidated_by IS NULL
           ORDER BY depth ASC, id ASC",
     )?;
-    let rows = stmt.query_map(rusqlite::params![slug, depth], |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map(rusqlite::params![slug, depth], |row| {
+        row.get::<_, String>(0)
+    })?;
     let mut out = Vec::new();
     for r in rows {
         out.push(r?);
@@ -9108,19 +9096,14 @@ pub fn create_import_state(
         rusqlite::params![target_slug, wire_pyramid_id, source_path],
     )
     .with_context(|| {
-        format!(
-            "create_import_state(target_slug={target_slug}, wire_pyramid_id={wire_pyramid_id})"
-        )
+        format!("create_import_state(target_slug={target_slug}, wire_pyramid_id={wire_pyramid_id})")
     })?;
     Ok(())
 }
 
 /// Load the import state for a given target slug. Returns `None` if no row
 /// exists (i.e. no in-flight or completed import for this slug).
-pub fn load_import_state(
-    conn: &Connection,
-    target_slug: &str,
-) -> Result<Option<ImportState>> {
+pub fn load_import_state(conn: &Connection, target_slug: &str) -> Result<Option<ImportState>> {
     let mut stmt = conn.prepare(
         "SELECT target_slug, wire_pyramid_id, source_path, status,
                 nodes_total, nodes_processed,
@@ -9537,7 +9520,9 @@ pub fn save_question_tree_with_build_id(
 
 /// Get the question tree for a slug.
 pub fn get_question_tree(conn: &Connection, slug: &str) -> Result<Option<serde_json::Value>> {
-    let mut stmt = conn.prepare("SELECT tree FROM pyramid_question_tree WHERE slug = ?1 ORDER BY updated_at DESC LIMIT 1")?;
+    let mut stmt = conn.prepare(
+        "SELECT tree FROM pyramid_question_tree WHERE slug = ?1 ORDER BY updated_at DESC LIMIT 1",
+    )?;
     let result = stmt.query_row(rusqlite::params![slug], |row| {
         let json_str: String = row.get(0)?;
         Ok(json_str)
@@ -9976,12 +9961,7 @@ pub fn mark_gap_resolved(
 /// The `prefix` parameter allows callers to use a sub-prefix (e.g. "T" for
 /// targeted extractions), producing IDs like `L0-T042`. Pass "" for standard
 /// sequential IDs like `L1-003`.
-pub fn next_sequential_node_id(
-    conn: &Connection,
-    slug: &str,
-    depth: i64,
-    prefix: &str,
-) -> String {
+pub fn next_sequential_node_id(conn: &Connection, slug: &str, depth: i64, prefix: &str) -> String {
     let pattern = format!("L{}-{}%", depth, prefix);
     let max_idx: i64 = conn
         .query_row(
@@ -10059,8 +10039,7 @@ pub fn resolve_to_absolute(conn: &Connection, slug: &str, path: &str) -> String 
         )
         .ok();
     if let Some(sp) = source_path {
-        let dirs: Vec<String> =
-            serde_json::from_str(&sp).unwrap_or_else(|_| vec![sp]);
+        let dirs: Vec<String> = serde_json::from_str(&sp).unwrap_or_else(|_| vec![sp]);
         for dir in &dirs {
             let candidate = std::path::Path::new(dir).join(path);
             if candidate.exists() {
@@ -11251,7 +11230,11 @@ pub fn register_agent_session(conn: &Connection, slug: &str, agent_id: &str) -> 
 }
 
 /// Get recent agent sessions for a slug.
-pub fn get_agent_sessions(conn: &Connection, slug: &str, limit: i64) -> Result<Vec<serde_json::Value>> {
+pub fn get_agent_sessions(
+    conn: &Connection,
+    slug: &str,
+    limit: i64,
+) -> Result<Vec<serde_json::Value>> {
     let mut stmt = conn.prepare(
         "SELECT id, slug, agent_id, started_at, last_activity, actions_count, summary
          FROM pyramid_agent_sessions WHERE slug = ?1
@@ -12080,10 +12063,8 @@ mod tests {
         // Third write: apply_supersession directly with a custom reason.
         let mut v3 = node.clone();
         v3.headline = "third".to_string();
-        let new_version = apply_supersession(
-            &conn, "vt", "n-1", &v3, "delta", "delta", "test-chain",
-        )
-        .unwrap();
+        let new_version =
+            apply_supersession(&conn, "vt", "n-1", &v3, "delta", "delta", "test-chain").unwrap();
         assert_eq!(new_version, 3);
 
         let live3 = get_node(&conn, "vt", "n-1").unwrap().unwrap();
@@ -12146,7 +12127,10 @@ mod tests {
         let mut updated = node.clone();
         updated.distilled = "mutated".to_string();
         let err = save_node(&conn, &updated, None);
-        assert!(err.is_err(), "Expected immutability error for canonical L0 update");
+        assert!(
+            err.is_err(),
+            "Expected immutability error for canonical L0 update"
+        );
         let msg = err.unwrap_err().to_string();
         assert!(
             msg.contains("Cannot mutate immutable bedrock node"),
@@ -12234,7 +12218,10 @@ mod tests {
 
         // Attempt to update via apply_supersession — should also fail.
         let err2 = apply_supersession(&conn, "s", "prom-l0", &updated, "rebuild", "rebuild", "");
-        assert!(err2.is_err(), "apply_supersession should also reject immutable bedrock");
+        assert!(
+            err2.is_err(),
+            "apply_supersession should also reject immutable bedrock"
+        );
     }
 
     /// Test 4: Save an L2 node, update via apply_supersession — should succeed.
@@ -12257,7 +12244,13 @@ mod tests {
         let mut updated = node.clone();
         updated.distilled = "superseded L2".to_string();
         let new_version = apply_supersession(
-            &conn, "s", "l2-node", &updated, "delta", "delta", "test-chain",
+            &conn,
+            "s",
+            "l2-node",
+            &updated,
+            "delta",
+            "delta",
+            "test-chain",
         )
         .unwrap();
         assert_eq!(new_version, 2, "L2 supersession should bump version");
@@ -12294,11 +12287,17 @@ mod tests {
 
         // Attempt promotion on a non-provisional node.
         let result = promote_provisional_node(&conn, "s", "canon-l0").unwrap();
-        assert!(!result, "Promoting a non-provisional node should return false");
+        assert!(
+            !result,
+            "Promoting a non-provisional node should return false"
+        );
 
         // Also test promoting a non-existent node.
         let result2 = promote_provisional_node(&conn, "s", "does-not-exist").unwrap();
-        assert!(!result2, "Promoting a non-existent node should return false");
+        assert!(
+            !result2,
+            "Promoting a non-existent node should return false"
+        );
     }
 
     // ── WS-PROVISIONAL (Phase 2b): Provisional session lifecycle tests ──────
@@ -12379,14 +12378,23 @@ mod tests {
 
         // Verify nodes are now canonical (provisional=false)
         let after_a = get_node(&conn, "ps2", "prov-a").unwrap().unwrap();
-        assert!(!after_a.provisional, "Node A should be canonical after promotion");
+        assert!(
+            !after_a.provisional,
+            "Node A should be canonical after promotion"
+        );
         let after_b = get_node(&conn, "ps2", "prov-b").unwrap().unwrap();
-        assert!(!after_b.provisional, "Node B should be canonical after promotion");
+        assert!(
+            !after_b.provisional,
+            "Node B should be canonical after promotion"
+        );
 
         // Verify session status
         let session = get_provisional_session(&conn, sid).unwrap().unwrap();
         assert_eq!(session.status, "promoted");
-        assert_eq!(session.canonical_build_id, Some("build-canonical-001".to_string()));
+        assert_eq!(
+            session.canonical_build_id,
+            Some("build-canonical-001".to_string())
+        );
     }
 
     /// Test 3: Promoted provisional nodes reject subsequent mutations (immutability).
@@ -12519,7 +12527,10 @@ mod tests {
             ..Default::default()
         };
         let err = save_provisional_node(&conn, &bad_node, sid, None);
-        assert!(err.is_err(), "save_provisional_node should reject non-provisional node");
+        assert!(
+            err.is_err(),
+            "save_provisional_node should reject non-provisional node"
+        );
     }
 
     // ── Walker Re-Plan Wire 2.1 Wave 1 task 11: provider_id audit column ─────
@@ -12534,18 +12545,30 @@ mod tests {
 
         // Complete path: legacy caller, provider_id = None
         let id_ok = insert_llm_audit_pending(
-            &conn, "s", "b1", Some("n1"),
-            "step_a", "distill", Some(0),
+            &conn,
+            "s",
+            "b1",
+            Some("n1"),
+            "step_a",
+            "distill",
+            Some(0),
             "anthropic/claude-3.5-sonnet",
-            "you are helpful", "do the thing",
-        ).unwrap();
+            "you are helpful",
+            "do the thing",
+        )
+        .unwrap();
         complete_llm_audit(
-            &conn, id_ok,
-            "{\"ok\":true}", true,
-            100, 50, 1234,
+            &conn,
+            id_ok,
+            "{\"ok\":true}",
+            true,
+            100,
+            50,
+            1234,
             Some("gen-abc"),
             None, // legacy caller
-        ).unwrap();
+        )
+        .unwrap();
 
         let (model, provider_id, status): (String, Option<String>, String) = conn
             .query_row(
@@ -12560,11 +12583,18 @@ mod tests {
 
         // Fail path: legacy caller, provider_id = None
         let id_fail = insert_llm_audit_pending(
-            &conn, "s", "b1", Some("n2"),
-            "step_b", "distill", Some(0),
+            &conn,
+            "s",
+            "b1",
+            Some("n2"),
+            "step_b",
+            "distill",
+            Some(0),
             "anthropic/claude-3.5-sonnet",
-            "sys", "user",
-        ).unwrap();
+            "sys",
+            "user",
+        )
+        .unwrap();
         fail_llm_audit(&conn, id_fail, "timeout", None).unwrap();
 
         let (model_f, provider_id_f, status_f): (String, Option<String>, String) = conn
@@ -12574,7 +12604,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(model_f, "anthropic/claude-3.5-sonnet", "model preserved on fail");
+        assert_eq!(
+            model_f, "anthropic/claude-3.5-sonnet",
+            "model preserved on fail"
+        );
         assert_eq!(provider_id_f, None, "legacy fail provider_id = NULL");
         assert_eq!(status_f, "failed");
     }
@@ -12589,18 +12622,30 @@ mod tests {
 
         // Success path: walker stamps the WINNING entry's provider_id.
         let id_ok = insert_llm_audit_pending(
-            &conn, "s", "b1", Some("n1"),
-            "step_a", "distill", Some(0),
+            &conn,
+            "s",
+            "b1",
+            Some("n1"),
+            "step_a",
+            "distill",
+            Some(0),
             "anthropic/claude-3.5-sonnet",
-            "sys", "user",
-        ).unwrap();
+            "sys",
+            "user",
+        )
+        .unwrap();
         complete_llm_audit(
-            &conn, id_ok,
-            "{\"ok\":true}", true,
-            100, 50, 1234,
+            &conn,
+            id_ok,
+            "{\"ok\":true}",
+            true,
+            100,
+            50,
+            1234,
             Some("gen-abc"),
             Some("openrouter"), // WINNING entry provider_id
-        ).unwrap();
+        )
+        .unwrap();
 
         let (model, provider_id): (String, Option<String>) = conn
             .query_row(
@@ -12609,20 +12654,32 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(model, "anthropic/claude-3.5-sonnet",
-                   "model must NEVER be overwritten by provider_id");
-        assert_eq!(provider_id.as_deref(), Some("openrouter"),
-                   "walker success stamps WINNING entry provider_id");
+        assert_eq!(
+            model, "anthropic/claude-3.5-sonnet",
+            "model must NEVER be overwritten by provider_id"
+        );
+        assert_eq!(
+            provider_id.as_deref(),
+            Some("openrouter"),
+            "walker success stamps WINNING entry provider_id"
+        );
 
         // CallTerminal path: walker stamps LAST-ATTEMPTED entry's provider_id.
         // Also verifies routing sentinels ("fleet" / "market") are accepted
         // as values — column is nullable TEXT, no CHECK constraint.
         let id_fail = insert_llm_audit_pending(
-            &conn, "s", "b1", Some("n2"),
-            "step_b", "distill", Some(0),
+            &conn,
+            "s",
+            "b1",
+            Some("n2"),
+            "step_b",
+            "distill",
+            Some(0),
             "anthropic/claude-3.5-sonnet",
-            "sys", "user",
-        ).unwrap();
+            "sys",
+            "user",
+        )
+        .unwrap();
         fail_llm_audit(&conn, id_fail, "terminal", Some("market")).unwrap();
 
         let (model_f, provider_id_f): (String, Option<String>) = conn
@@ -12632,10 +12689,15 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(model_f, "anthropic/claude-3.5-sonnet",
-                   "model must NEVER be overwritten by routing sentinel");
-        assert_eq!(provider_id_f.as_deref(), Some("market"),
-                   "walker CallTerminal stamps LAST-ATTEMPTED provider_id");
+        assert_eq!(
+            model_f, "anthropic/claude-3.5-sonnet",
+            "model must NEVER be overwritten by routing sentinel"
+        );
+        assert_eq!(
+            provider_id_f.as_deref(),
+            Some("market"),
+            "walker CallTerminal stamps LAST-ATTEMPTED provider_id"
+        );
 
         // parse_llm_audit_row round-trip: the record projection reads
         // provider_id back through get_llm_audit_by_id.
@@ -12653,7 +12715,7 @@ mod tests {
     #[test]
     fn test_provider_id_migration_idempotent() {
         let conn = test_conn(); // runs init_pyramid_db once
-        // Second init — must not re-add the column or error.
+                                // Second init — must not re-add the column or error.
         init_pyramid_db(&conn).expect("second init_pyramid_db should be a no-op");
 
         // Confirm column exists (exactly one row per column in pragma_table_info).
@@ -12664,7 +12726,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n_provider_id, 1, "provider_id column exists exactly once after double-init");
+        assert_eq!(
+            n_provider_id, 1,
+            "provider_id column exists exactly once after double-init"
+        );
     }
 }
 
@@ -12866,11 +12931,7 @@ pub fn list_dead_letter(
 
 /// Fetch a single dead-letter entry by `(slug, id)`. Slug is part of the key
 /// so a malicious/buggy caller can't inspect another slug's entries.
-pub fn get_dead_letter(
-    conn: &Connection,
-    slug: &str,
-    id: i64,
-) -> Result<Option<DeadLetterEntry>> {
+pub fn get_dead_letter(conn: &Connection, slug: &str, id: i64) -> Result<Option<DeadLetterEntry>> {
     let sql = format!(
         "SELECT {DEAD_LETTER_COLUMNS} FROM pyramid_dead_letter \
          WHERE slug = ?1 AND id = ?2"
@@ -12985,7 +13046,11 @@ pub fn get_ingest_record(
          WHERE slug = ?1 AND source_path = ?2 AND ingest_signature = ?3"
     );
     let result = conn
-        .query_row(&sql, rusqlite::params![slug, source_path, sig], parse_ingest_record)
+        .query_row(
+            &sql,
+            rusqlite::params![slug, source_path, sig],
+            parse_ingest_record,
+        )
         .optional()?;
     Ok(result)
 }
@@ -13178,11 +13243,7 @@ pub fn mark_session_promoted(
 }
 
 /// Mark a provisional session as 'failed' with an error description.
-pub fn mark_session_failed(
-    conn: &Connection,
-    session_id: &str,
-    error_msg: &str,
-) -> Result<()> {
+pub fn mark_session_failed(conn: &Connection, session_id: &str, error_msg: &str) -> Result<()> {
     // Store the error in the canonical_build_id field (repurposed for error
     // text when status is 'failed') to avoid adding another column. The
     // canonical_build_id is meaningless for failed sessions.
@@ -13319,9 +13380,7 @@ pub fn promote_session(
         if let Some(bus) = bus {
             let _ = bus.tx.send(crate::pyramid::event_bus::TaggedBuildEvent {
                 slug: slug.clone(),
-                kind: crate::pyramid::event_bus::TaggedKind::SlopeChanged {
-                    affected_layers,
-                },
+                kind: crate::pyramid::event_bus::TaggedKind::SlopeChanged { affected_layers },
             });
         }
     }
@@ -13454,7 +13513,9 @@ pub fn save_dadbear_config_with_contributions(
     conn: &Connection,
     config: &DadbearWatchConfig,
 ) -> Result<i64> {
-    use super::config_contributions::{create_config_contribution, load_active_config_contribution};
+    use super::config_contributions::{
+        create_config_contribution, load_active_config_contribution,
+    };
 
     // 1. Operational write (upsert).
     let rowid = save_dadbear_config(conn, config)?;
@@ -13474,11 +13535,12 @@ pub fn save_dadbear_config_with_contributions(
                 source_path: config.source_path.clone(),
                 content_type: config.content_type.clone(),
             };
-            let yaml_str = serde_yaml::to_string(&watch_root)
-                .unwrap_or_else(|_| format!(
+            let yaml_str = serde_yaml::to_string(&watch_root).unwrap_or_else(|_| {
+                format!(
                     "source_path: {:?}\ncontent_type: {:?}\n",
                     watch_root.source_path, watch_root.content_type,
-                ));
+                )
+            });
             create_config_contribution(
                 conn,
                 "watch_root",
@@ -13495,11 +13557,12 @@ pub fn save_dadbear_config_with_contributions(
             source_path: config.source_path.clone(),
             content_type: config.content_type.clone(),
         };
-        let yaml_str = serde_yaml::to_string(&watch_root)
-            .unwrap_or_else(|_| format!(
+        let yaml_str = serde_yaml::to_string(&watch_root).unwrap_or_else(|_| {
+            format!(
                 "source_path: {:?}\ncontent_type: {:?}\n",
                 watch_root.source_path, watch_root.content_type,
-            ));
+            )
+        });
         create_config_contribution(
             conn,
             "watch_root",
@@ -13575,8 +13638,7 @@ pub fn get_dadbear_configs(conn: &Connection, slug: &str) -> Result<Vec<DadbearW
 ///
 /// Column order matches `DADBEAR_CONFIG_COLUMNS` for `parse_dadbear_config()`.
 pub fn get_enabled_dadbear_configs(conn: &Connection) -> Result<Vec<DadbearWatchConfig>> {
-    let sql =
-        "SELECT d.id, d.slug, d.source_path, d.content_type, d.scan_interval_secs,
+    let sql = "SELECT d.id, d.slug, d.source_path, d.content_type, d.scan_interval_secs,
                 d.debounce_secs, d.session_timeout_secs, d.batch_size, d.enabled,
                 d.last_scan_at, d.created_at, d.updated_at
          FROM pyramid_dadbear_config d
@@ -13590,7 +13652,6 @@ pub fn get_enabled_dadbear_configs(conn: &Connection) -> Result<Vec<DadbearWatch
     }
     Ok(configs)
 }
-
 
 // ── Phase 18c (L9): Scoped pause/resume for DADBEAR ──────────────────────────
 //
@@ -13621,7 +13682,6 @@ fn normalize_dadbear_folder(folder: &str) -> String {
         folder.to_string()
     }
 }
-
 
 /// Phase 18c: distinct list of `source_path` values across all
 /// DADBEAR configs. Used by the frontend scope picker to populate the
@@ -13797,9 +13857,7 @@ pub struct DadbearOverviewRowDb {
 
 /// Phase 15: build every per-slug overview row (test-only, no production callers).
 #[cfg(test)]
-pub fn build_dadbear_overview_rows(
-    conn: &Connection,
-) -> Result<Vec<DadbearOverviewRowDb>> {
+pub fn build_dadbear_overview_rows(conn: &Connection) -> Result<Vec<DadbearOverviewRowDb>> {
     let mut stmt = conn.prepare(
         "SELECT id, slug, enabled, scan_interval_secs, debounce_secs, last_scan_at
          FROM pyramid_dadbear_config
@@ -13984,11 +14042,13 @@ pub fn build_dadbear_overview_rows(
             rusqlite::params![slug],
             |row| row.get(0),
         ).unwrap_or(false);
-        let auto_update_enabled: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pyramid_dadbear_config WHERE slug = ?1)",
-            rusqlite::params![slug],
-            |row| row.get(0),
-        ).unwrap_or(false);
+        let auto_update_enabled: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pyramid_dadbear_config WHERE slug = ?1)",
+                rusqlite::params![slug],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
 
         rows.push(DadbearOverviewRowDb {
             slug,
@@ -14127,7 +14187,11 @@ pub fn get_dadbear_config(
          WHERE slug = ?1 AND source_path = ?2"
     );
     let result = conn
-        .query_row(&sql, rusqlite::params![slug, source_path], parse_dadbear_config)
+        .query_row(
+            &sql,
+            rusqlite::params![slug, source_path],
+            parse_dadbear_config,
+        )
         .optional()?;
     Ok(result)
 }
@@ -14226,10 +14290,7 @@ pub fn get_vine_bedrocks(conn: &Connection, vine_slug: &str) -> Result<Vec<VineC
 
 /// Phase 16: list all children (bedrock + vine) for a vine, ordered by
 /// position. Active entries only.
-pub fn list_vine_compositions(
-    conn: &Connection,
-    vine_slug: &str,
-) -> Result<Vec<VineComposition>> {
+pub fn list_vine_compositions(conn: &Connection, vine_slug: &str) -> Result<Vec<VineComposition>> {
     let sql = format!(
         "SELECT {VINE_COMP_COLUMNS} FROM pyramid_vine_compositions
          WHERE vine_slug = ?1 AND status = 'active'
@@ -14331,15 +14392,11 @@ pub fn get_vines_for_child(conn: &Connection, child_slug: &str) -> Result<Vec<St
 ///
 /// Ordering is BFS — nearer ancestors come before distant ancestors. The
 /// starting `child_slug` is NOT included in the result.
-pub fn get_parent_vines_recursive(
-    conn: &Connection,
-    child_slug: &str,
-) -> Result<Vec<String>> {
+pub fn get_parent_vines_recursive(conn: &Connection, child_slug: &str) -> Result<Vec<String>> {
     const MAX_DEPTH: usize = 32;
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut order: Vec<String> = Vec::new();
-    let mut frontier: std::collections::VecDeque<String> =
-        std::collections::VecDeque::new();
+    let mut frontier: std::collections::VecDeque<String> = std::collections::VecDeque::new();
 
     visited.insert(child_slug.to_string());
     frontier.push_back(child_slug.to_string());
@@ -14461,7 +14518,11 @@ pub fn mark_demand_gen_running(conn: &Connection, job_id: &str) -> Result<()> {
 }
 
 /// Mark a demand-gen job complete with the generated node IDs.
-pub fn mark_demand_gen_complete(conn: &Connection, job_id: &str, node_ids: &[String]) -> Result<()> {
+pub fn mark_demand_gen_complete(
+    conn: &Connection,
+    job_id: &str,
+    node_ids: &[String],
+) -> Result<()> {
     let ids_json = serde_json::to_string(node_ids)?;
     let count = conn.execute(
         "UPDATE pyramid_demand_gen_jobs
@@ -14508,7 +14569,11 @@ pub fn get_pending_demand_gen_jobs(conn: &Connection, slug: &str) -> Result<Vec<
 }
 
 /// List recent demand-gen jobs for a slug (all statuses, most recent first).
-pub fn list_demand_gen_jobs(conn: &Connection, slug: &str, limit: i64) -> Result<Vec<DemandGenJob>> {
+pub fn list_demand_gen_jobs(
+    conn: &Connection,
+    slug: &str,
+    limit: i64,
+) -> Result<Vec<DemandGenJob>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {DEMAND_GEN_COLUMNS} FROM pyramid_demand_gen_jobs
          WHERE slug = ?1
@@ -14555,7 +14620,9 @@ const CHAIN_PUB_COLUMNS: &str =
     "id, chain_id, version, wire_handle_path, wire_uuid, published_at, description, author, forked_from, status, created_at, updated_at";
 
 /// Parse a row from `pyramid_chain_publications` into a `ChainPublication`.
-fn map_chain_publication_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<super::types::ChainPublication> {
+fn map_chain_publication_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<super::types::ChainPublication> {
     Ok(super::types::ChainPublication {
         id: row.get(0)?,
         chain_id: row.get(1)?,
@@ -14573,7 +14640,10 @@ fn map_chain_publication_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<super:
 }
 
 /// Save (insert or update) a chain publication record.
-pub fn save_chain_publication(conn: &Connection, pub_record: &super::types::ChainPublication) -> Result<()> {
+pub fn save_chain_publication(
+    conn: &Connection,
+    pub_record: &super::types::ChainPublication,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO pyramid_chain_publications
             (chain_id, version, wire_handle_path, wire_uuid, published_at, description, author, forked_from, status)
@@ -14603,7 +14673,10 @@ pub fn save_chain_publication(conn: &Connection, pub_record: &super::types::Chai
 }
 
 /// Get the latest chain publication for a given chain_id (highest version).
-pub fn get_chain_publication(conn: &Connection, chain_id: &str) -> Result<Option<super::types::ChainPublication>> {
+pub fn get_chain_publication(
+    conn: &Connection,
+    chain_id: &str,
+) -> Result<Option<super::types::ChainPublication>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {CHAIN_PUB_COLUMNS} FROM pyramid_chain_publications
          WHERE chain_id = ?1
@@ -14628,7 +14701,10 @@ pub fn get_chain_publication_by_version(
         "SELECT {CHAIN_PUB_COLUMNS} FROM pyramid_chain_publications
          WHERE chain_id = ?1 AND version = ?2"
     ))?;
-    let mut rows = stmt.query_map(rusqlite::params![chain_id, version], map_chain_publication_row)?;
+    let mut rows = stmt.query_map(
+        rusqlite::params![chain_id, version],
+        map_chain_publication_row,
+    )?;
     match rows.next() {
         Some(Ok(record)) => Ok(Some(record)),
         Some(Err(e)) => Err(e.into()),
@@ -14730,10 +14806,12 @@ const CHAIN_PROPOSAL_COLUMNS: &str =
     "id, proposal_id, chain_id, proposer, proposal_type, description, reasoning, patch, status, operator_notes, created_at, reviewed_at";
 
 /// Parse a row from `pyramid_chain_proposals` into a `ChainProposal`.
-fn map_chain_proposal_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<super::types::ChainProposal> {
+fn map_chain_proposal_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<super::types::ChainProposal> {
     let patch_str: String = row.get(7)?;
-    let patch: serde_json::Value = serde_json::from_str(&patch_str)
-        .unwrap_or(serde_json::Value::Null);
+    let patch: serde_json::Value =
+        serde_json::from_str(&patch_str).unwrap_or(serde_json::Value::Null);
     Ok(super::types::ChainProposal {
         id: row.get(0)?,
         proposal_id: row.get(1)?,
@@ -14751,9 +14829,11 @@ fn map_chain_proposal_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<super::ty
 }
 
 /// Insert a new chain proposal. Returns the database row ID.
-pub fn create_chain_proposal(conn: &Connection, proposal: &super::types::ChainProposal) -> Result<i64> {
-    let patch_str = serde_json::to_string(&proposal.patch)
-        .unwrap_or_else(|_| "{}".to_string());
+pub fn create_chain_proposal(
+    conn: &Connection,
+    proposal: &super::types::ChainProposal,
+) -> Result<i64> {
+    let patch_str = serde_json::to_string(&proposal.patch).unwrap_or_else(|_| "{}".to_string());
     conn.execute(
         "INSERT INTO pyramid_chain_proposals
             (proposal_id, chain_id, proposer, proposal_type, description, reasoning, patch, status)
@@ -14773,7 +14853,10 @@ pub fn create_chain_proposal(conn: &Connection, proposal: &super::types::ChainPr
 }
 
 /// Get a single chain proposal by its text proposal_id.
-pub fn get_chain_proposal(conn: &Connection, proposal_id: &str) -> Result<Option<super::types::ChainProposal>> {
+pub fn get_chain_proposal(
+    conn: &Connection,
+    proposal_id: &str,
+) -> Result<Option<super::types::ChainProposal>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {CHAIN_PROPOSAL_COLUMNS} FROM pyramid_chain_proposals
          WHERE proposal_id = ?1"
@@ -14823,7 +14906,11 @@ pub fn list_chain_proposals(
 }
 
 /// Accept a chain proposal: set status to 'accepted' and reviewed_at to now.
-pub fn accept_chain_proposal(conn: &Connection, proposal_id: &str, operator_notes: Option<&str>) -> Result<()> {
+pub fn accept_chain_proposal(
+    conn: &Connection,
+    proposal_id: &str,
+    operator_notes: Option<&str>,
+) -> Result<()> {
     let affected = conn.execute(
         "UPDATE pyramid_chain_proposals
          SET status = 'accepted', operator_notes = ?2, reviewed_at = datetime('now')
@@ -14847,7 +14934,11 @@ pub fn accept_chain_proposal(conn: &Connection, proposal_id: &str, operator_note
 
 /// Reject a chain proposal: set status to 'rejected' and reviewed_at to now.
 /// Idempotent: re-rejecting an already-rejected proposal is a no-op success.
-pub fn reject_chain_proposal(conn: &Connection, proposal_id: &str, operator_notes: Option<&str>) -> Result<()> {
+pub fn reject_chain_proposal(
+    conn: &Connection,
+    proposal_id: &str,
+    operator_notes: Option<&str>,
+) -> Result<()> {
     let affected = conn.execute(
         "UPDATE pyramid_chain_proposals
          SET status = 'rejected', operator_notes = COALESCE(?2, operator_notes), reviewed_at = COALESCE(reviewed_at, datetime('now'))
@@ -14869,7 +14960,11 @@ pub fn reject_chain_proposal(conn: &Connection, proposal_id: &str, operator_note
 }
 
 /// Defer a chain proposal: set status to 'deferred' and reviewed_at to now.
-pub fn defer_chain_proposal(conn: &Connection, proposal_id: &str, operator_notes: Option<&str>) -> Result<()> {
+pub fn defer_chain_proposal(
+    conn: &Connection,
+    proposal_id: &str,
+    operator_notes: Option<&str>,
+) -> Result<()> {
     let affected = conn.execute(
         "UPDATE pyramid_chain_proposals
          SET status = 'deferred', operator_notes = ?2, reviewed_at = datetime('now')
@@ -14903,7 +14998,10 @@ fn provider_from_row(row: &rusqlite::Row) -> rusqlite::Result<Provider> {
         rusqlite::Error::FromSqlConversionFailure(
             0,
             rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e.to_string(),
+            )),
         )
     })?;
     let auto_detect: i64 = row.get("auto_detect_context")?;
@@ -15206,11 +15304,9 @@ pub fn delete_step_override(
 /// Idempotent: the seed only fires when `pyramid_providers` is empty
 /// so existing rows are never overwritten.
 pub fn seed_default_provider_registry(conn: &Connection) -> Result<()> {
-    let existing: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pyramid_providers",
-        [],
-        |row| row.get(0),
-    )?;
+    let existing: i64 = conn.query_row("SELECT COUNT(*) FROM pyramid_providers", [], |row| {
+        row.get(0)
+    })?;
     if existing > 0 {
         return Ok(());
     }
@@ -15339,14 +15435,54 @@ pub fn seed_default_provider_registry(conn: &Connection) -> Result<()> {
 /// overwritten. Called on every boot after seed_default_provider_registry.
 pub fn ensure_standard_tiers_exist(conn: &Connection) -> Result<()> {
     let standard_tiers: &[(&str, &str, i64, &str)] = &[
-        ("fast_extract", "inception/mercury-2", 120_000, "Default extraction tier"),
-        ("web", "x-ai/grok-4.1-fast", 2_000_000, "2M context for relational work"),
-        ("synth_heavy", "minimax/minimax-m2.7", 200_000, "Near-frontier synthesis"),
-        ("stale_remote", "minimax/minimax-m2.7", 200_000, "Upper-layer stale checks"),
-        ("mid", "inception/mercury-2", 120_000, "Default tier for code/document chains"),
-        ("extractor", "inception/mercury-2", 120_000, "Conversation extraction tier"),
-        ("high", "qwen/qwen3.5-flash-02-23", 900_000, "Large-context fallback tier for cascade"),
-        ("max", "x-ai/grok-4.20-beta", 1_000_000, "Maximum-context fallback tier for cascade"),
+        (
+            "fast_extract",
+            "inception/mercury-2",
+            120_000,
+            "Default extraction tier",
+        ),
+        (
+            "web",
+            "x-ai/grok-4.1-fast",
+            2_000_000,
+            "2M context for relational work",
+        ),
+        (
+            "synth_heavy",
+            "minimax/minimax-m2.7",
+            200_000,
+            "Near-frontier synthesis",
+        ),
+        (
+            "stale_remote",
+            "minimax/minimax-m2.7",
+            200_000,
+            "Upper-layer stale checks",
+        ),
+        (
+            "mid",
+            "inception/mercury-2",
+            120_000,
+            "Default tier for code/document chains",
+        ),
+        (
+            "extractor",
+            "inception/mercury-2",
+            120_000,
+            "Conversation extraction tier",
+        ),
+        (
+            "high",
+            "qwen/qwen3.5-flash-02-23",
+            900_000,
+            "Large-context fallback tier for cascade",
+        ),
+        (
+            "max",
+            "x-ai/grok-4.20-beta",
+            1_000_000,
+            "Maximum-context fallback tier for cascade",
+        ),
     ];
     for &(tier_name, model_id, context_limit, notes) in standard_tiers {
         conn.execute(
@@ -15685,24 +15821,21 @@ pub fn load_active_evidence_policy(
     // Re-parse JSON blobs into typed structs. `triage_rules_json` is
     // an `Option<Vec<TriageRuleYaml>>` in `EvidencePolicyYaml`, so the
     // stored JSON looks like `null`, `[]`, or `[...]`.
-    let triage_rules: Vec<TriageRuleYaml> = serde_json::from_str::<
-        Option<Vec<TriageRuleYaml>>,
-    >(&triage_json)
-    .ok()
-    .flatten()
-    .unwrap_or_default();
-    let demand_signals: Vec<DemandSignalRuleYaml> = serde_json::from_str::<
-        Option<Vec<DemandSignalRuleYaml>>,
-    >(&demand_json)
-    .ok()
-    .flatten()
-    .unwrap_or_default();
+    let triage_rules: Vec<TriageRuleYaml> =
+        serde_json::from_str::<Option<Vec<TriageRuleYaml>>>(&triage_json)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+    let demand_signals: Vec<DemandSignalRuleYaml> =
+        serde_json::from_str::<Option<Vec<DemandSignalRuleYaml>>>(&demand_json)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
     // Budget JSON may be `null`, `{}`, or a full object.
-    let budget_raw: Option<PolicyBudgetYaml> = serde_json::from_str::<
-        Option<PolicyBudgetYaml>,
-    >(&budget_json)
-    .ok()
-    .flatten();
+    let budget_raw: Option<PolicyBudgetYaml> =
+        serde_json::from_str::<Option<PolicyBudgetYaml>>(&budget_json)
+            .ok()
+            .flatten();
     let budget = budget_raw.unwrap_or_default();
 
     // demand_signal_attenuation isn't stored in a dedicated column —
@@ -15823,9 +15956,8 @@ pub fn sum_slug_demand_weight(
 /// every affected slug instead of silently matching zero rows on
 /// `slug = ''`.
 pub fn list_slugs_with_deferred_questions(conn: &Connection) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT slug FROM pyramid_deferred_questions ORDER BY slug ASC",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT slug FROM pyramid_deferred_questions ORDER BY slug ASC")?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
     let mut out = Vec::new();
     for row in rows {
@@ -15894,8 +16026,7 @@ pub fn load_parents_via_evidence(
         "SELECT DISTINCT target_node_id FROM pyramid_evidence
          WHERE slug = ?1 AND source_node_id = ?2 AND verdict = 'KEEP'",
     )?;
-    let rows = stmt
-        .query_map(rusqlite::params![slug, node_id], |r| r.get::<_, String>(0))?;
+    let rows = stmt.query_map(rusqlite::params![slug, node_id], |r| r.get::<_, String>(0))?;
     let mut parents = Vec::new();
     for row in rows {
         parents.push(row?);
@@ -16019,10 +16150,7 @@ pub fn defer_question(
 /// List every deferred question whose `next_check_at` is on or before
 /// the current time AND whose `check_interval` is not "never" or
 /// "on_demand" (those are reactivated only by demand signals).
-pub fn list_expired_deferred(
-    conn: &Connection,
-    slug: &str,
-) -> Result<Vec<DeferredQuestion>> {
+pub fn list_expired_deferred(conn: &Connection, slug: &str) -> Result<Vec<DeferredQuestion>> {
     let mut stmt = conn.prepare(
         "SELECT id, slug, question_id, question_json, deferred_at, next_check_at,
                 check_interval, triage_reason, contribution_id
@@ -16054,10 +16182,7 @@ pub fn list_expired_deferred(
 
 /// List ALL deferred questions for a slug, regardless of next_check_at
 /// or interval. Used by the policy-change re-evaluation flow.
-pub fn list_all_deferred(
-    conn: &Connection,
-    slug: &str,
-) -> Result<Vec<DeferredQuestion>> {
+pub fn list_all_deferred(conn: &Connection, slug: &str) -> Result<Vec<DeferredQuestion>> {
     let mut stmt = conn.prepare(
         "SELECT id, slug, question_id, question_json, deferred_at, next_check_at,
                 check_interval, triage_reason, contribution_id
@@ -16140,11 +16265,7 @@ pub fn list_deferred_by_question_target(
 
 /// Remove a deferred question (called when triage decides to answer
 /// or skip it on re-evaluation).
-pub fn remove_deferred(
-    conn: &Connection,
-    slug: &str,
-    question_id: &str,
-) -> Result<()> {
+pub fn remove_deferred(conn: &Connection, slug: &str, question_id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM pyramid_deferred_questions WHERE slug = ?1 AND question_id = ?2",
         rusqlite::params![slug, question_id],
@@ -16205,10 +16326,8 @@ pub fn upsert_build_strategy(
     yaml: &BuildStrategyYaml,
     contribution_id: &str,
 ) -> Result<()> {
-    let initial_json =
-        serde_json::to_string(&yaml.initial_build).unwrap_or_else(|_| "{}".into());
-    let maintenance_json =
-        serde_json::to_string(&yaml.maintenance).unwrap_or_else(|_| "{}".into());
+    let initial_json = serde_json::to_string(&yaml.initial_build).unwrap_or_else(|_| "{}".into());
+    let maintenance_json = serde_json::to_string(&yaml.maintenance).unwrap_or_else(|_| "{}".into());
     let quality_json = serde_json::to_string(&yaml.quality).unwrap_or_else(|_| "{}".into());
 
     conn.execute(
@@ -16396,8 +16515,8 @@ impl Default for FolderIngestionConfig {
 /// Phase 17: seed list of code file extensions (lowercase, with leading dot).
 pub fn default_code_extensions() -> Vec<String> {
     [
-        ".rs", ".ts", ".tsx", ".py", ".go", ".js", ".jsx", ".java", ".rb",
-        ".c", ".cpp", ".h", ".hpp", ".cs", ".swift", ".kt",
+        ".rs", ".ts", ".tsx", ".py", ".go", ".js", ".jsx", ".java", ".rb", ".c", ".cpp", ".h",
+        ".hpp", ".cs", ".swift", ".kt",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -16493,7 +16612,18 @@ pub fn default_ignore_patterns() -> Vec<String> {
 ///    ingester always has a workable config even on a pristine DB.
 pub fn load_active_folder_ingestion_heuristics(conn: &Connection) -> Result<FolderIngestionConfig> {
     let row: Option<(
-        i64, i64, i64, String, String, i64, i64, i64, i64, String, String, String,
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+        String,
     )> = conn
         .query_row(
             "SELECT min_files_for_pyramid, max_file_size_bytes, max_recursion_depth,
@@ -16995,11 +17125,13 @@ pub fn upsert_dispatch_policy(
 
 /// Read the active dispatch policy YAML. Returns None if no policy is set.
 pub fn read_dispatch_policy(conn: &Connection) -> Result<Option<String>> {
-    let result: Option<String> = conn.query_row(
-        "SELECT yaml_content FROM pyramid_dispatch_policy WHERE id = 1",
-        [],
-        |row| row.get(0),
-    ).optional()?;
+    let result: Option<String> = conn
+        .query_row(
+            "SELECT yaml_content FROM pyramid_dispatch_policy WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
     Ok(result.filter(|s| !s.is_empty()))
 }
 
@@ -17076,8 +17208,7 @@ pub fn upsert_tier_routing_from_contribution(
     _contribution_id: &str,
 ) -> Result<()> {
     // Phase 18a: drop tiers not present in the incoming contribution.
-    let incoming_names: Vec<String> =
-        yaml.entries.iter().map(|e| e.tier_name.clone()).collect();
+    let incoming_names: Vec<String> = yaml.entries.iter().map(|e| e.tier_name.clone()).collect();
     if incoming_names.is_empty() {
         // Empty contribution = wipe the table.
         conn.execute("DELETE FROM pyramid_tier_routing", [])?;
@@ -17087,9 +17218,8 @@ pub fn upsert_tier_routing_from_contribution(
             .map(|_| "?")
             .collect::<Vec<_>>()
             .join(",");
-        let sql = format!(
-            "DELETE FROM pyramid_tier_routing WHERE tier_name NOT IN ({placeholders})"
-        );
+        let sql =
+            format!("DELETE FROM pyramid_tier_routing WHERE tier_name NOT IN ({placeholders})");
         let params: Vec<&dyn rusqlite::ToSql> = incoming_names
             .iter()
             .map(|s| s as &dyn rusqlite::ToSql)
@@ -17450,7 +17580,13 @@ pub fn record_broadcast_confirmation(
                  broadcast_discrepancy_ratio = ?4,
                  reconciliation_status = 'discrepancy'
              WHERE id = ?5",
-            rusqlite::params![now, payload_json, broadcast_cost_usd, discrepancy_ratio, cost_log_id],
+            rusqlite::params![
+                now,
+                payload_json,
+                broadcast_cost_usd,
+                discrepancy_ratio,
+                cost_log_id
+            ],
         )?;
     } else {
         conn.execute(
@@ -17461,7 +17597,13 @@ pub fn record_broadcast_confirmation(
                  broadcast_discrepancy_ratio = ?4
              WHERE id = ?5
                AND reconciliation_status != 'discrepancy'",
-            rusqlite::params![now, payload_json, broadcast_cost_usd, discrepancy_ratio, cost_log_id],
+            rusqlite::params![
+                now,
+                payload_json,
+                broadcast_cost_usd,
+                discrepancy_ratio,
+                cost_log_id
+            ],
         )?;
     }
     Ok(())
@@ -17552,10 +17694,7 @@ pub fn insert_orphan_broadcast(
 /// broadcast confirmation via `broadcast_required: false`.
 ///
 /// Returns the number of rows flipped.
-pub fn sweep_broadcast_missing(
-    conn: &Connection,
-    grace_period_secs: i64,
-) -> Result<usize> {
+pub fn sweep_broadcast_missing(conn: &Connection, grace_period_secs: i64) -> Result<usize> {
     // SQLite datetime modifier format. The column was written with
     // `datetime('now')` (UTC) so we compare against the same epoch.
     let modifier = format!("-{} seconds", grace_period_secs.max(0));
@@ -17652,7 +17791,10 @@ pub fn acknowledge_provider_health(conn: &Connection, provider_id: &str) -> Resu
 }
 
 /// Read the current health state for a single provider.
-pub fn get_provider_health(conn: &Connection, provider_id: &str) -> Result<Option<(String, Option<String>, Option<String>, Option<String>)>> {
+pub fn get_provider_health(
+    conn: &Connection,
+    provider_id: &str,
+) -> Result<Option<(String, Option<String>, Option<String>, Option<String>)>> {
     let mut stmt = conn.prepare(
         "SELECT provider_health, health_reason, health_since, health_acknowledged_at
          FROM pyramid_providers WHERE id = ?1",
@@ -17660,7 +17802,8 @@ pub fn get_provider_health(conn: &Connection, provider_id: &str) -> Result<Optio
     let mut rows = stmt.query(rusqlite::params![provider_id])?;
     if let Some(row) = rows.next()? {
         Ok(Some((
-            row.get::<_, Option<String>>(0)?.unwrap_or_else(|| "healthy".into()),
+            row.get::<_, Option<String>>(0)?
+                .unwrap_or_else(|| "healthy".into()),
             row.get(1)?,
             row.get(2)?,
             row.get(3)?,
@@ -17690,7 +17833,8 @@ pub fn list_provider_health(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "healthy".into()),
+                row.get::<_, Option<String>>(3)?
+                    .unwrap_or_else(|| "healthy".into()),
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
@@ -18094,11 +18238,9 @@ mod step_cache_tests {
         let conn = mem_conn();
         // Schema check: SELECT against the table should not error.
         let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pyramid_step_cache",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM pyramid_step_cache", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -18188,8 +18330,12 @@ mod step_cache_tests {
         store_cache(&conn, &entry).unwrap();
         let fetched = check_cache(&conn, "ts", &entry.cache_key).unwrap().unwrap();
         // Different inputs hash → mismatch.
-        let verdict =
-            verify_cache_hit(&fetched, "different-inputs", &entry.prompt_hash, &entry.model_id);
+        let verdict = verify_cache_hit(
+            &fetched,
+            "different-inputs",
+            &entry.prompt_hash,
+            &entry.model_id,
+        );
         assert_eq!(verdict, CacheHitResult::MismatchInputs);
     }
 
@@ -18199,8 +18345,12 @@ mod step_cache_tests {
         let entry = make_entry("ts", "mismatch_prompt");
         store_cache(&conn, &entry).unwrap();
         let fetched = check_cache(&conn, "ts", &entry.cache_key).unwrap().unwrap();
-        let verdict =
-            verify_cache_hit(&fetched, &entry.inputs_hash, "different-prompt", &entry.model_id);
+        let verdict = verify_cache_hit(
+            &fetched,
+            &entry.inputs_hash,
+            "different-prompt",
+            &entry.model_id,
+        );
         assert_eq!(verdict, CacheHitResult::MismatchPrompt);
     }
 
@@ -18347,8 +18497,7 @@ mod step_cache_tests {
         // cache_key as what the import will bring, but with `force_fresh`
         // set and a distinct output_json.
         let mut rerolled = make_entry("ts", "conflict");
-        rerolled.output_json =
-            serde_json::json!({"content":"LOCAL_REROLL","usage":{}}).to_string();
+        rerolled.output_json = serde_json::json!({"content":"LOCAL_REROLL","usage":{}}).to_string();
         rerolled.force_fresh = true;
         rerolled.build_id = "local-reroll".into();
         store_cache(&conn, &rerolled).unwrap();
@@ -18357,8 +18506,7 @@ mod step_cache_tests {
         // imported-style payload. Under `INSERT OR IGNORE` semantics
         // this must NOT clobber the rerolled row.
         let mut imported = make_entry("ts", "conflict");
-        imported.output_json =
-            serde_json::json!({"content":"IMPORTED","usage":{}}).to_string();
+        imported.output_json = serde_json::json!({"content":"IMPORTED","usage":{}}).to_string();
         imported.force_fresh = false;
         imported.build_id = "import:wire:p1".into();
         let inserted = store_cache_if_absent(&conn, &imported).unwrap();
@@ -18376,11 +18524,7 @@ mod step_cache_tests {
         assert_eq!(count, 1);
 
         // The active row is STILL the local reroll, not the import.
-        let (active_output, active_force_fresh, active_build_id): (
-            String,
-            i64,
-            String,
-        ) = conn
+        let (active_output, active_force_fresh, active_build_id): (String, i64, String) = conn
             .query_row(
                 "SELECT output_json, force_fresh, build_id FROM pyramid_step_cache
                  WHERE slug = 'ts' AND cache_key = ?1",
@@ -18393,10 +18537,7 @@ mod step_cache_tests {
             "store_cache_if_absent clobbered the local reroll output_json: {active_output}"
         );
         assert_eq!(active_force_fresh, 1, "force_fresh flag was cleared");
-        assert_eq!(
-            active_build_id, "local-reroll",
-            "build_id was overwritten"
-        );
+        assert_eq!(active_build_id, "local-reroll", "build_id was overwritten");
     }
 }
 
@@ -18789,13 +18930,7 @@ mod phase13_tests {
         .unwrap();
     }
 
-    fn make_cache_entry(
-        slug: &str,
-        step: &str,
-        chunk: i64,
-        depth: i64,
-        seed: &str,
-    ) -> CacheEntry {
+    fn make_cache_entry(slug: &str, step: &str, chunk: i64, depth: i64, seed: &str) -> CacheEntry {
         let inputs_hash = compute_inputs_hash("sys", &format!("u-{seed}"));
         let prompt_hash = format!("phash-{seed}");
         let model_id = "m-1".to_string();
@@ -18823,10 +18958,38 @@ mod phase13_tests {
     #[test]
     fn test_cost_rollup_groups_by_slug_provider_operation() {
         let conn = mem_conn();
-        seed_cost_row(&conn, "p13-test", "build", Some("openrouter"), 1.23, Some(1.20));
-        seed_cost_row(&conn, "p13-test", "build", Some("openrouter"), 0.50, Some(0.48));
-        seed_cost_row(&conn, "p13-test", "stale_check", Some("openrouter"), 0.10, None);
-        seed_cost_row(&conn, "p13-other", "build", Some("anthropic"), 2.00, Some(1.95));
+        seed_cost_row(
+            &conn,
+            "p13-test",
+            "build",
+            Some("openrouter"),
+            1.23,
+            Some(1.20),
+        );
+        seed_cost_row(
+            &conn,
+            "p13-test",
+            "build",
+            Some("openrouter"),
+            0.50,
+            Some(0.48),
+        );
+        seed_cost_row(
+            &conn,
+            "p13-test",
+            "stale_check",
+            Some("openrouter"),
+            0.10,
+            None,
+        );
+        seed_cost_row(
+            &conn,
+            "p13-other",
+            "build",
+            Some("anthropic"),
+            2.00,
+            Some(1.95),
+        );
 
         let from = "2020-01-01 00:00:00";
         let to = "2100-01-01 00:00:00";
@@ -18881,7 +19044,11 @@ mod phase13_tests {
         // to one entry. Result is alphabetically sorted.
         assert_eq!(
             paths,
-            vec!["/alpha".to_string(), "/mid".to_string(), "/zeta".to_string()]
+            vec![
+                "/alpha".to_string(),
+                "/mid".to_string(),
+                "/zeta".to_string()
+            ]
         );
     }
 
@@ -18921,7 +19088,8 @@ mod phase13_tests {
                 "INSERT INTO dadbear_holds_projection (slug, hold, source, acquired_at)
                  VALUES (?1, 'frozen', 'test', datetime('now'))",
                 rusqlite::params![slug],
-            ).unwrap();
+            )
+            .unwrap();
         }
         let after = count_dadbear_scope(&conn, "folder", Some("/a"), true).unwrap();
         assert_eq!(after, 0);
@@ -18941,7 +19109,10 @@ mod phase13_tests {
         // dangerous "everything" preview when the user hasn't typed
         // a path yet.
         assert_eq!(count_dadbear_scope(&conn, "folder", None, true).unwrap(), 0);
-        assert_eq!(count_dadbear_scope(&conn, "folder", Some(""), true).unwrap(), 0);
+        assert_eq!(
+            count_dadbear_scope(&conn, "folder", Some(""), true).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -18952,8 +19123,7 @@ mod phase13_tests {
         // The circle scope has no backing schema yet (deferred per
         // Phase 18c deviation note). The count helper returns 0 so
         // the UI can render "Circle scoping not yet available".
-        let count =
-            count_dadbear_scope(&conn, "circle", Some("any-circle"), true).unwrap();
+        let count = count_dadbear_scope(&conn, "circle", Some("any-circle"), true).unwrap();
         assert_eq!(count, 0);
     }
 
@@ -18989,13 +19159,9 @@ mod phase13_tests {
         let cache_key = entry.cache_key.clone();
         store_cache(&conn, &entry).unwrap();
 
-        let flipped = invalidate_cache_entries(
-            &conn,
-            "p13-test",
-            &[cache_key.clone()],
-            "upstream_reroll",
-        )
-        .unwrap();
+        let flipped =
+            invalidate_cache_entries(&conn, "p13-test", &[cache_key.clone()], "upstream_reroll")
+                .unwrap();
         assert_eq!(flipped, 1);
 
         // check_cache should now return None because the row is
@@ -19129,7 +19295,10 @@ mod phase13_tests {
         .unwrap();
         assert_eq!(flipped.len(), 2);
         assert!(flipped.contains(&k1));
-        assert!(!flipped.contains(&k2), "already-invalidated key should be skipped");
+        assert!(
+            !flipped.contains(&k2),
+            "already-invalidated key should be skipped"
+        );
         assert!(flipped.contains(&k3));
     }
 
@@ -19403,12 +19572,7 @@ mod phase15_tests {
     /// `broadcast_confirmed_at` is stamped. This is the state
     /// `record_broadcast_confirmation` leaves a row in after a clean
     /// broadcast arrives (see `db::record_broadcast_confirmation`).
-    fn seed_cost_row_confirmed(
-        conn: &Connection,
-        slug: &str,
-        estimated: f64,
-        actual: f64,
-    ) {
+    fn seed_cost_row_confirmed(conn: &Connection, slug: &str, estimated: f64, actual: f64) {
         conn.execute(
             "INSERT INTO pyramid_cost_log
                 (slug, operation, model, input_tokens, output_tokens,
@@ -19508,8 +19672,20 @@ mod phase15_tests {
         // `'synchronous_local'` with `broadcast_confirmed_at` NULL
         // — there's no broadcast to wait for, so the row must not
         // be counted as pending.
-        seed_cost_with_status(&conn, "p15-alpha", Some("synchronous_local"), 0.0, Some(0.0));
-        seed_cost_with_status(&conn, "p15-alpha", Some("synchronous_local"), 0.0, Some(0.0));
+        seed_cost_with_status(
+            &conn,
+            "p15-alpha",
+            Some("synchronous_local"),
+            0.0,
+            Some(0.0),
+        );
+        seed_cost_with_status(
+            &conn,
+            "p15-alpha",
+            Some("synchronous_local"),
+            0.0,
+            Some(0.0),
+        );
 
         let rows = build_dadbear_overview_rows(&conn).unwrap();
         assert_eq!(rows[0].cost_reconciliation_status, "healthy");
@@ -19557,7 +19733,10 @@ mod phase15_tests {
         let rows = build_dadbear_overview_rows(&conn).unwrap();
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
-        assert!(row.enabled, "enabled should be true if any config is enabled");
+        assert!(
+            row.enabled,
+            "enabled should be true if any config is enabled"
+        );
         assert_eq!(row.config_ids.len(), 2);
         assert!(row.config_ids.contains(&id_a));
         assert!(row.config_ids.contains(&id_b));
@@ -19713,11 +19892,9 @@ mod phase15_tests {
         // And must not have inserted anything into the operational
         // table (the global contribution has nowhere to land there).
         let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pyramid_dadbear_config",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM pyramid_dadbear_config", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -20053,7 +20230,10 @@ mod phase17_tests {
         assert_eq!(config.max_file_size_bytes, 20_000);
         assert_eq!(config.max_recursion_depth, 4);
         assert_eq!(config.default_scan_interval_secs, 45);
-        assert_eq!(config.code_extensions, vec![".rs".to_string(), ".ts".to_string()]);
+        assert_eq!(
+            config.code_extensions,
+            vec![".rs".to_string(), ".ts".to_string()]
+        );
         assert_eq!(config.document_extensions, vec![".md".to_string()]);
         assert!(!config.claude_code_auto_include);
         assert_eq!(config.claude_code_conversation_path, "/tmp/cc");
@@ -20200,7 +20380,9 @@ mod phase17_tests {
 
         // Confirm the pre-WS0 state lacks callback_kind.
         let pre_cols: Vec<String> = {
-            let mut stmt = conn.prepare("PRAGMA table_info(fleet_result_outbox)").unwrap();
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(fleet_result_outbox)")
+                .unwrap();
             stmt.query_map([], |r| r.get::<_, String>(1))
                 .unwrap()
                 .filter_map(|r| r.ok())
@@ -20216,7 +20398,9 @@ mod phase17_tests {
 
         // Column is now present.
         let post_cols: Vec<String> = {
-            let mut stmt = conn.prepare("PRAGMA table_info(fleet_result_outbox)").unwrap();
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(fleet_result_outbox)")
+                .unwrap();
             stmt.query_map([], |r| r.get::<_, String>(1))
                 .unwrap()
                 .filter_map(|r| r.ok())
@@ -20261,7 +20445,10 @@ mod phase17_tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 0, "pyramid_market_delivery_policy table must exist (empty)");
+        assert_eq!(
+            n, 0,
+            "pyramid_market_delivery_policy table must exist (empty)"
+        );
     }
 
     #[test]
@@ -20269,14 +20456,12 @@ mod phase17_tests {
         let conn = outbox_conn();
         let expires = future_expires();
         // Fresh insert returns 1.
-        let n1 =
-            fleet_outbox_insert_or_ignore(&conn, "dispA", "job-1", "https://x/cb", &expires)
-                .unwrap();
+        let n1 = fleet_outbox_insert_or_ignore(&conn, "dispA", "job-1", "https://x/cb", &expires)
+            .unwrap();
         assert_eq!(n1, 1, "fresh insert should report rowcount=1");
         // Duplicate PK returns 0.
-        let n2 =
-            fleet_outbox_insert_or_ignore(&conn, "dispA", "job-1", "https://x/cb", &expires)
-                .unwrap();
+        let n2 = fleet_outbox_insert_or_ignore(&conn, "dispA", "job-1", "https://x/cb", &expires)
+            .unwrap();
         assert_eq!(n2, 0, "duplicate PK should report rowcount=0");
     }
 
@@ -20319,8 +20504,7 @@ mod phase17_tests {
         assert_eq!(n, 1);
 
         // Count excluding a nonexistent key returns all in-flight.
-        let n =
-            fleet_outbox_count_inflight_excluding(&conn, "dispA", "nonexistent").unwrap();
+        let n = fleet_outbox_count_inflight_excluding(&conn, "dispA", "nonexistent").unwrap();
         assert_eq!(n, 2);
     }
 
@@ -20331,20 +20515,29 @@ mod phase17_tests {
         fleet_outbox_insert_or_ignore(&conn, "dispA", "job-1", "https://x/cb", &expires).unwrap();
 
         // First promotion: row is pending, CAS wins.
-        let n =
-            fleet_outbox_promote_ready_if_pending(&conn, "dispA", "job-1", "{\"kind\":\"Success\"}", 60)
-                .unwrap();
+        let n = fleet_outbox_promote_ready_if_pending(
+            &conn,
+            "dispA",
+            "job-1",
+            "{\"kind\":\"Success\"}",
+            60,
+        )
+        .unwrap();
         assert_eq!(n, 1);
 
         // Second promotion: row is now ready, CAS loses.
-        let n =
-            fleet_outbox_promote_ready_if_pending(&conn, "dispA", "job-1", "{\"kind\":\"Success\"}", 60)
-                .unwrap();
+        let n = fleet_outbox_promote_ready_if_pending(
+            &conn,
+            "dispA",
+            "job-1",
+            "{\"kind\":\"Success\"}",
+            60,
+        )
+        .unwrap();
         assert_eq!(n, 0);
 
         // Row missing entirely: CAS returns 0 (not an error).
-        let n =
-            fleet_outbox_promote_ready_if_pending(&conn, "dispA", "missing", "{}", 60).unwrap();
+        let n = fleet_outbox_promote_ready_if_pending(&conn, "dispA", "missing", "{}", 60).unwrap();
         assert_eq!(n, 0);
     }
 
@@ -20358,8 +20551,7 @@ mod phase17_tests {
         fleet_outbox_mark_failed_if_ready(&conn, "dispA", "job-1", 3600).unwrap();
 
         // Delivery CAS must lose against failed status.
-        let n =
-            fleet_outbox_mark_delivered_if_ready(&conn, "dispA", "job-1", 3600).unwrap();
+        let n = fleet_outbox_mark_delivered_if_ready(&conn, "dispA", "job-1", 3600).unwrap();
         assert_eq!(n, 0, "ready→delivered CAS must lose when row is failed");
 
         let lookup = fleet_outbox_lookup(&conn, "job-1").unwrap().unwrap();
@@ -20496,14 +20688,9 @@ mod phase17_tests {
         // — the row is NOT created under dispB. The detection mechanism is
         // the subsequent lookup: callers compare the stored dispatcher_node_id
         // against their identity and reject with 409 Conflict on mismatch.
-        let n2 = fleet_outbox_insert_or_ignore(
-            &conn,
-            "dispB",
-            "shared-uuid",
-            "https://b/cb",
-            &expires,
-        )
-        .unwrap();
+        let n2 =
+            fleet_outbox_insert_or_ignore(&conn, "dispB", "shared-uuid", "https://b/cb", &expires)
+                .unwrap();
         assert_eq!(
             n2, 0,
             "unique index on job_id must prevent a second insert under a different dispatcher"
@@ -20542,8 +20729,7 @@ mod phase17_tests {
         // have its counter bumped.
         fleet_outbox_mark_delivered_if_ready(&conn, "dispA", "job-1", 3600).unwrap();
         fleet_outbox_bump_delivery_attempt(&conn, "dispA", "job-1", "nope").unwrap();
-        let lookup_after_delivered =
-            fleet_outbox_lookup(&conn, "job-1").unwrap().unwrap();
+        let lookup_after_delivered = fleet_outbox_lookup(&conn, "job-1").unwrap().unwrap();
         assert_eq!(
             lookup_after_delivered.delivery_attempts, 2,
             "bump must not fire after ready transitions to delivered"
@@ -20561,8 +20747,7 @@ mod phase17_tests {
         // JSON matching the kind/data contract.
         let with_quotes = synthesize_worker_error_json("hello \"world\"");
         assert_eq!(
-            with_quotes,
-            r#"{"kind":"Error","data":"hello \"world\""}"#,
+            with_quotes, r#"{"kind":"Error","data":"hello \"world\""}"#,
             "quotes must be escaped, not copied raw"
         );
 
@@ -20700,8 +20885,7 @@ mod phase17_tests {
         assert_eq!(n, 1);
 
         // Excluding a key that doesn't exist — still only Fleet rows count.
-        let n =
-            fleet_outbox_count_inflight_excluding(&conn, "dispA", "nonexistent").unwrap();
+        let n = fleet_outbox_count_inflight_excluding(&conn, "dispA", "nonexistent").unwrap();
         assert_eq!(n, 2);
     }
 
@@ -20818,12 +21002,42 @@ mod phase17_tests {
         fleet_outbox_insert_or_ignore(&conn, "dispA", "fleet-j2", "https://x/cb", &expires)
             .unwrap();
         // Two MarketStandard + one Relay row.
-        market_outbox_insert_or_ignore(&conn, "mkt-j1", "https://w/cb", "MarketStandard", &expires, None, None, None, None)
-            .unwrap();
-        market_outbox_insert_or_ignore(&conn, "mkt-j2", "https://w/cb", "MarketStandard", &expires, None, None, None, None)
-            .unwrap();
-        market_outbox_insert_or_ignore(&conn, "rly-j1", "https://r/cb", "Relay", &expires, None, None, None, None)
-            .unwrap();
+        market_outbox_insert_or_ignore(
+            &conn,
+            "mkt-j1",
+            "https://w/cb",
+            "MarketStandard",
+            &expires,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        market_outbox_insert_or_ignore(
+            &conn,
+            "mkt-j2",
+            "https://w/cb",
+            "MarketStandard",
+            &expires,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        market_outbox_insert_or_ignore(
+            &conn,
+            "rly-j1",
+            "https://r/cb",
+            "Relay",
+            &expires,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         // Excluding mkt-j1 — count should see mkt-j2 + rly-j1 = 2.
         let n = market_outbox_count_inflight_excluding(
             &conn,
@@ -20831,8 +21045,10 @@ mod phase17_tests {
             "mkt-j1",
         )
         .unwrap();
-        assert_eq!(n, 2,
-            "market count must include MarketStandard + Relay, exclude Fleet");
+        assert_eq!(
+            n, 2,
+            "market count must include MarketStandard + Relay, exclude Fleet"
+        );
         // Excluding a key that doesn't exist — same 3 rows counted.
         let n = market_outbox_count_inflight_excluding(
             &conn,
@@ -20850,12 +21066,42 @@ mod phase17_tests {
         // consume the admission budget.
         let conn = outbox_conn();
         let expires = future_expires();
-        market_outbox_insert_or_ignore(&conn, "mkt-j1", "https://w/cb", "MarketStandard", &expires, None, None, None, None)
-            .unwrap();
-        market_outbox_insert_or_ignore(&conn, "mkt-j2", "https://w/cb", "MarketStandard", &expires, None, None, None, None)
-            .unwrap();
-        market_outbox_insert_or_ignore(&conn, "mkt-j3", "https://w/cb", "MarketStandard", &expires, None, None, None, None)
-            .unwrap();
+        market_outbox_insert_or_ignore(
+            &conn,
+            "mkt-j1",
+            "https://w/cb",
+            "MarketStandard",
+            &expires,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        market_outbox_insert_or_ignore(
+            &conn,
+            "mkt-j2",
+            "https://w/cb",
+            "MarketStandard",
+            &expires,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        market_outbox_insert_or_ignore(
+            &conn,
+            "mkt-j3",
+            "https://w/cb",
+            "MarketStandard",
+            &expires,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         // Promote one to delivered, one to failed.
         conn.execute(
             "UPDATE fleet_result_outbox SET status = 'delivered' WHERE job_id = 'mkt-j1'",
@@ -20921,7 +21167,9 @@ mod phase17_tests {
         // Lookup reports the fleet dispatcher — market handler must see
         // `dispatcher_node_id != WIRE_PLATFORM_DISPATCHER` and 409 the
         // Wire rather than treating it as a retry.
-        let lookup = fleet_outbox_lookup(&conn, "shared-job-uuid").unwrap().unwrap();
+        let lookup = fleet_outbox_lookup(&conn, "shared-job-uuid")
+            .unwrap()
+            .unwrap();
         assert_eq!(lookup.dispatcher_node_id, "peer-abc");
         assert_ne!(
             lookup.dispatcher_node_id,
@@ -20989,13 +21237,22 @@ mod phase17_tests {
 
         let rows = market_outbox_sweep_expired(&conn).unwrap();
         let job_ids: Vec<&str> = rows.iter().map(|r| r.job_id.as_str()).collect();
-        assert_eq!(rows.len(), 2, "exactly the two expired market rows; got {:?}", job_ids);
+        assert_eq!(
+            rows.len(),
+            2,
+            "exactly the two expired market rows; got {:?}",
+            job_ids
+        );
         assert!(job_ids.contains(&"mkt-expired"));
         assert!(job_ids.contains(&"rly-expired"));
-        assert!(!job_ids.contains(&"fleet-expired"),
-            "fleet rows are owned by the fleet sweep");
-        assert!(!job_ids.contains(&"mkt-alive"),
-            "unexpired rows must be left alone");
+        assert!(
+            !job_ids.contains(&"fleet-expired"),
+            "fleet rows are owned by the fleet sweep"
+        );
+        assert!(
+            !job_ids.contains(&"mkt-alive"),
+            "unexpired rows must be left alone"
+        );
     }
 
     #[test]
@@ -21018,8 +21275,18 @@ mod phase17_tests {
             rusqlite::params![&expires],
         )
         .unwrap();
-        market_outbox_insert_or_ignore(&conn, "mkt-row", "https://w/cb", "MarketStandard", &expires, None, None, None, None)
-            .unwrap();
+        market_outbox_insert_or_ignore(
+            &conn,
+            "mkt-row",
+            "https://w/cb",
+            "MarketStandard",
+            &expires,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         conn.execute(
             "UPDATE fleet_result_outbox
                 SET status = 'ready',
@@ -21067,8 +21334,18 @@ mod phase17_tests {
         // past. A row at 4 with max=5 remains untouched.
         let conn = outbox_conn();
         let expires = future_expires();
-        market_outbox_insert_or_ignore(&conn, "mkt-below", "https://w/cb", "MarketStandard", &expires, None, None, None, None)
-            .unwrap();
+        market_outbox_insert_or_ignore(
+            &conn,
+            "mkt-below",
+            "https://w/cb",
+            "MarketStandard",
+            &expires,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         conn.execute(
             "UPDATE fleet_result_outbox
                 SET status = 'ready',
@@ -21099,11 +21376,22 @@ mod phase17_tests {
         let conn = outbox_conn();
         let expires = future_expires();
         // Ready Fleet row — must NOT be returned.
-        fleet_outbox_insert_or_ignore(&conn, "dispA", "fleet-ready", "https://x/cb", &expires).unwrap();
+        fleet_outbox_insert_or_ignore(&conn, "dispA", "fleet-ready", "https://x/cb", &expires)
+            .unwrap();
         fleet_outbox_promote_ready_if_pending(&conn, "dispA", "fleet-ready", "{}", 60).unwrap();
         // Ready Market row — MUST be returned.
-        market_outbox_insert_or_ignore(&conn, "mkt-ready", "https://w/cb", "MarketStandard", &expires, None, None, None, None)
-            .unwrap();
+        market_outbox_insert_or_ignore(
+            &conn,
+            "mkt-ready",
+            "https://w/cb",
+            "MarketStandard",
+            &expires,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         conn.execute(
             "UPDATE fleet_result_outbox
                 SET status = 'ready',
@@ -21114,8 +21402,18 @@ mod phase17_tests {
         )
         .unwrap();
         // Pending market row — must NOT be returned (only ready).
-        market_outbox_insert_or_ignore(&conn, "mkt-pending", "https://w/cb", "MarketStandard", &expires, None, None, None, None)
-            .unwrap();
+        market_outbox_insert_or_ignore(
+            &conn,
+            "mkt-pending",
+            "https://w/cb",
+            "MarketStandard",
+            &expires,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let rows = market_outbox_retry_candidates(&conn).unwrap();
         let ids: Vec<&str> = rows.iter().map(|r| r.job_id.as_str()).collect();
@@ -21225,7 +21523,9 @@ mod rev061_leg_helpers_tests {
         // Belt-and-suspenders: the ALTER block must actually add every
         // column the spec mandates.
         let conn = mem_conn();
-        let mut stmt = conn.prepare("PRAGMA table_info(fleet_result_outbox)").unwrap();
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(fleet_result_outbox)")
+            .unwrap();
         let cols: Vec<String> = stmt
             .query_map([], |r| r.get::<_, String>(1))
             .unwrap()
@@ -21365,7 +21665,10 @@ mod rev061_leg_helpers_tests {
             )
             .unwrap();
         assert_eq!(posted_ok, 1);
-        assert!(lease.is_none(), "success CAS must clear content_lease_until");
+        assert!(
+            lease.is_none(),
+            "success CAS must clear content_lease_until"
+        );
         // Re-calling the helper is a no-op (CAS gated on posted_ok=0).
         let again = market_outbox_mark_content_posted_ok_if_ready(&conn, rowid).unwrap();
         assert!(!again, "second success CAS must return false (no-op)");
@@ -21398,13 +21701,8 @@ mod rev061_leg_helpers_tests {
         let conn = mem_conn();
         let rowid = ready_market_row(&conn, "mkt-bump-content");
         market_outbox_bump_content_attempt_with_backoff(&conn, rowid, 5, "timeout").unwrap();
-        let (attempts, err, next_at, lease): (
-            i64,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) = conn
-            .query_row(
+        let (attempts, err, next_at, lease): (i64, Option<String>, Option<String>, Option<String>) =
+            conn.query_row(
                 "SELECT delivery_attempts, content_last_error, content_next_attempt_at,
                         content_lease_until
                    FROM fleet_result_outbox WHERE rowid = ?1",
@@ -21412,7 +21710,10 @@ mod rev061_leg_helpers_tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
-        assert_eq!(attempts, 1, "content-leg attempts increments delivery_attempts");
+        assert_eq!(
+            attempts, 1,
+            "content-leg attempts increments delivery_attempts"
+        );
         assert_eq!(err.as_deref(), Some("timeout"));
         assert!(next_at.is_some(), "content_next_attempt_at must be set");
         assert!(lease.is_none(), "bump must clear content_lease_until");
@@ -21532,18 +21833,21 @@ mod rev061_leg_helpers_tests {
         // Settlement succeeded: posted_ok=1. Content exhausted: posted_ok=0,
         // content_last_error set.
         assert!(market_outbox_mark_settlement_posted_ok_if_ready(&conn, rowid).unwrap());
-        market_outbox_bump_content_attempt_with_backoff(&conn, rowid, 0, "content 503 × N").unwrap();
+        market_outbox_bump_content_attempt_with_backoff(&conn, rowid, 0, "content 503 × N")
+            .unwrap();
         // Terminal CAS with the composed last_error the delivery worker emits.
         let composed = "failed_content_only: content 503 × N (max_attempts_content exceeded)";
         let n = market_outbox_mark_failed_with_error_cas(
-            &conn, "wire-platform", "mkt-cx-sok", composed, 3600,
+            &conn,
+            "wire-platform",
+            "mkt-cx-sok",
+            composed,
+            3600,
         )
         .unwrap();
         assert_eq!(n, 1, "terminal CAS must flip one row");
-        let (status, last_err, content_ok, settlement_ok): (
-            String, Option<String>, i64, i64,
-        ) = conn
-            .query_row(
+        let (status, last_err, content_ok, settlement_ok): (String, Option<String>, i64, i64) =
+            conn.query_row(
                 "SELECT status, last_error, content_posted_ok, settlement_posted_ok
                    FROM fleet_result_outbox WHERE rowid = ?1",
                 rusqlite::params![rowid],
@@ -21552,11 +21856,17 @@ mod rev061_leg_helpers_tests {
             .unwrap();
         assert_eq!(status, "failed");
         assert!(
-            last_err.as_deref().unwrap_or("").starts_with("failed_content_only:"),
+            last_err
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("failed_content_only:"),
             "last_error must carry the mixed-terminal prefix; got: {last_err:?}"
         );
         assert_eq!(content_ok, 0, "content leg never posted ok");
-        assert_eq!(settlement_ok, 1, "settlement leg must remain marked posted_ok=1");
+        assert_eq!(
+            settlement_ok, 1,
+            "settlement leg must remain marked posted_ok=1"
+        );
     }
 
     // Spec test 5 (DB layer) — inverse of the content-exhausted test.
@@ -21566,17 +21876,20 @@ mod rev061_leg_helpers_tests {
         let conn = mem_conn();
         let rowid = ready_market_row(&conn, "mkt-cok-sx");
         assert!(market_outbox_mark_content_posted_ok_if_ready(&conn, rowid).unwrap());
-        market_outbox_bump_settlement_attempt_with_backoff(&conn, rowid, 0, "settle 503 × N").unwrap();
+        market_outbox_bump_settlement_attempt_with_backoff(&conn, rowid, 0, "settle 503 × N")
+            .unwrap();
         let composed = "failed_settlement_only: settle 503 × N (max_attempts_settlement exceeded)";
         let n = market_outbox_mark_failed_with_error_cas(
-            &conn, "wire-platform", "mkt-cok-sx", composed, 3600,
+            &conn,
+            "wire-platform",
+            "mkt-cok-sx",
+            composed,
+            3600,
         )
         .unwrap();
         assert_eq!(n, 1);
-        let (status, last_err, content_ok, settlement_ok): (
-            String, Option<String>, i64, i64,
-        ) = conn
-            .query_row(
+        let (status, last_err, content_ok, settlement_ok): (String, Option<String>, i64, i64) =
+            conn.query_row(
                 "SELECT status, last_error, content_posted_ok, settlement_posted_ok
                    FROM fleet_result_outbox WHERE rowid = ?1",
                 rusqlite::params![rowid],
@@ -21585,7 +21898,10 @@ mod rev061_leg_helpers_tests {
             .unwrap();
         assert_eq!(status, "failed");
         assert!(
-            last_err.as_deref().unwrap_or("").starts_with("failed_settlement_only:"),
+            last_err
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("failed_settlement_only:"),
             "last_error must carry the mixed-terminal prefix; got: {last_err:?}"
         );
         assert_eq!(content_ok, 1);
@@ -21611,12 +21927,19 @@ mod rev061_leg_helpers_tests {
         );
         let composed = "failed_both: content 503 (max_attempts_content exceeded)";
         let n = market_outbox_mark_failed_with_error_cas(
-            &conn, "wire-platform", "mkt-both-exhaust", composed, 3600,
+            &conn,
+            "wire-platform",
+            "mkt-both-exhaust",
+            composed,
+            3600,
         )
         .unwrap();
         assert_eq!(n, 1);
         let (status, last_err, cerr, serr): (
-            String, Option<String>, Option<String>, Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
         ) = conn
             .query_row(
                 "SELECT status, last_error, content_last_error, settlement_last_error
@@ -21627,7 +21950,10 @@ mod rev061_leg_helpers_tests {
             .unwrap();
         assert_eq!(status, "failed");
         assert!(
-            last_err.as_deref().unwrap_or("").starts_with("failed_both:"),
+            last_err
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("failed_both:"),
             "last_error must carry failed_both prefix; got: {last_err:?}"
         );
         // Per-leg error trails preserved for diagnostics.

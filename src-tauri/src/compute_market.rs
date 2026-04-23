@@ -409,7 +409,10 @@ impl ComputeMarketState {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let slot = self.queue_mirror_seq.entry(model_id.to_string()).or_insert(0);
+        let slot = self
+            .queue_mirror_seq
+            .entry(model_id.to_string())
+            .or_insert(0);
         let next = slot.saturating_add(1).max(now_ms);
         *slot = next;
         next
@@ -526,9 +529,7 @@ impl ComputeDeliveryPolicy {
     /// fallback, not silently merge halfway-valid Wire state with
     /// node-side defaults. Matches the Pillar-37 spirit of
     /// `MarketDeliveryPolicy::from_yaml`.
-    pub fn from_wire_parameters(
-        params: &HashMap<String, serde_json::Value>,
-    ) -> Option<Self> {
+    pub fn from_wire_parameters(params: &HashMap<String, serde_json::Value>) -> Option<Self> {
         let mut value = params.get("compute_delivery_policy")?.clone();
         // Strip envelope fields added by Wire's economic_parameter
         // contribution shape before deny_unknown_fields sees them.
@@ -579,8 +580,14 @@ mod tests {
             rate_per_m_output: 500,
             reservation_fee: 10,
             queue_discount_curve: vec![
-                QueueDiscountPoint { depth: 0, multiplier_bps: 10000 },
-                QueueDiscountPoint { depth: 5, multiplier_bps: 9000 },
+                QueueDiscountPoint {
+                    depth: 0,
+                    multiplier_bps: 10000,
+                },
+                QueueDiscountPoint {
+                    depth: 5,
+                    multiplier_bps: 9000,
+                },
             ],
             max_queue_depth: 8,
             wire_offer_id: Some("offer-abc".into()),
@@ -715,20 +722,27 @@ mod tests {
         // `#[serde(default)]` — but default only fires when the field
         // is MISSING; if save emits it, load reads it, and session
         // state bleeds across restarts).
-        let raw = std::fs::read_to_string(
-            tmp.path().join(COMPUTE_MARKET_STATE_FILENAME)).unwrap();
-        assert!(!raw.contains("session_jobs_completed"),
-            "session_jobs_completed must be omitted from on-disk JSON, got: {raw}");
-        assert!(!raw.contains("session_credits_earned"),
-            "session_credits_earned must be omitted from on-disk JSON, got: {raw}");
+        let raw = std::fs::read_to_string(tmp.path().join(COMPUTE_MARKET_STATE_FILENAME)).unwrap();
+        assert!(
+            !raw.contains("session_jobs_completed"),
+            "session_jobs_completed must be omitted from on-disk JSON, got: {raw}"
+        );
+        assert!(
+            !raw.contains("session_credits_earned"),
+            "session_credits_earned must be omitted from on-disk JSON, got: {raw}"
+        );
 
         let loaded = ComputeMarketState::load(tmp.path()).unwrap();
         assert_eq!(loaded.total_jobs_completed, 10);
         assert_eq!(loaded.total_credits_earned, 1_000);
-        assert_eq!(loaded.session_jobs_completed, 0,
-            "session counter must not persist across restarts");
-        assert_eq!(loaded.session_credits_earned, 0,
-            "session counter must not persist across restarts");
+        assert_eq!(
+            loaded.session_jobs_completed, 0,
+            "session counter must not persist across restarts"
+        );
+        assert_eq!(
+            loaded.session_credits_earned, 0,
+            "session counter must not persist across restarts"
+        );
     }
 
     #[test]
@@ -744,8 +758,7 @@ mod tests {
         // to our stat call yet; what matters is that the primary file
         // has valid JSON.
         let contents =
-            std::fs::read_to_string(tmp.path().join(COMPUTE_MARKET_STATE_FILENAME))
-                .unwrap();
+            std::fs::read_to_string(tmp.path().join(COMPUTE_MARKET_STATE_FILENAME)).unwrap();
         let _: ComputeMarketState = serde_json::from_str(&contents).unwrap();
     }
 
@@ -756,8 +769,11 @@ mod tests {
         let mut state = ComputeMarketState::default();
         state.upsert_active_job(sample_job());
         state.upsert_active_job(sample_job());
-        assert_eq!(state.active_jobs.len(), 1,
-            "duplicate upsert must not create two entries");
+        assert_eq!(
+            state.active_jobs.len(),
+            1,
+            "duplicate upsert must not create two entries"
+        );
     }
 
     #[test]
@@ -777,10 +793,15 @@ mod tests {
         state.upsert_active_job(j2.clone());
 
         let stored = state.active_jobs.get(&j2.job_id).unwrap();
-        assert_eq!(stored.status, ComputeJobStatus::Queued,
-            "second upsert must clobber the first's Executing status");
-        assert!(stored.filled_at.is_none(),
-            "second upsert must clobber the first's filled_at");
+        assert_eq!(
+            stored.status,
+            ComputeJobStatus::Queued,
+            "second upsert must clobber the first's Executing status"
+        );
+        assert!(
+            stored.filled_at.is_none(),
+            "second upsert must clobber the first's filled_at"
+        );
         // Nudge the model_id on the second and confirm it lands too.
         j2.model_id = "other-model".into();
         state.upsert_active_job(j2);
@@ -817,8 +838,10 @@ mod tests {
         let removed = state.remove_job("job-xyz").unwrap();
         assert_eq!(removed.job_id, "job-xyz");
         assert!(state.active_jobs.is_empty());
-        assert!(state.remove_job("job-xyz").is_none(),
-            "second remove must return None");
+        assert!(
+            state.remove_job("job-xyz").is_none(),
+            "second remove must return None"
+        );
     }
 
     // ── Queue mirror seq ─────────────────────────────────────────────
@@ -871,15 +894,21 @@ mod tests {
         let next = state.bump_mirror_seq("m");
         assert!(next > 5, "bump after reload must not regress: got {next}");
         // And it anchors to wall-clock, not to 6.
-        assert!(next > 1_000_000_000, "seq must be unix-ms scale: got {next}");
+        assert!(
+            next > 1_000_000_000,
+            "seq must be unix-ms scale: got {next}"
+        );
     }
 
     #[test]
     fn bump_mirror_seq_saturates_at_u64_max() {
         let mut state = ComputeMarketState::default();
         state.queue_mirror_seq.insert("m".into(), u64::MAX);
-        assert_eq!(state.bump_mirror_seq("m"), u64::MAX,
-            "saturating_add must not wrap to 0");
+        assert_eq!(
+            state.bump_mirror_seq("m"),
+            u64::MAX,
+            "saturating_add must not wrap to 0"
+        );
     }
 
     // ── Completion accounting ────────────────────────────────────────
@@ -900,8 +929,11 @@ mod tests {
         let mut state = ComputeMarketState::default();
         state.total_credits_earned = i64::MAX - 10;
         state.record_completion(1_000);
-        assert_eq!(state.total_credits_earned, i64::MAX,
-            "saturating_add must not wrap to negative");
+        assert_eq!(
+            state.total_credits_earned,
+            i64::MAX,
+            "saturating_add must not wrap to negative"
+        );
     }
 
     #[test]
@@ -1006,8 +1038,8 @@ mod tests {
                 "backoff_schedule_secs": [2, 8, 60]
             }),
         );
-        let dp = ComputeDeliveryPolicy::from_wire_parameters(&params)
-            .expect("full object should parse");
+        let dp =
+            ComputeDeliveryPolicy::from_wire_parameters(&params).expect("full object should parse");
         assert_eq!(dp.max_attempts_content, 7);
         assert_eq!(dp.max_attempts_settlement, 3);
         assert_eq!(dp.backoff_schedule_secs, vec![2, 8, 60]);
@@ -1022,10 +1054,7 @@ mod tests {
 
         // Also: other keys present but ours absent.
         let mut params2: HashMap<String, serde_json::Value> = HashMap::new();
-        params2.insert(
-            "callback_secret_grace_secs".into(),
-            serde_json::json!(300),
-        );
+        params2.insert("callback_secret_grace_secs".into(), serde_json::json!(300));
         assert!(ComputeDeliveryPolicy::from_wire_parameters(&params2).is_none());
     }
 

@@ -296,7 +296,9 @@ mod tests {
             None,
         )
         .unwrap();
-        let (health, _, _, _) = db::get_provider_health(&conn, "openrouter").unwrap().unwrap();
+        let (health, _, _, _) = db::get_provider_health(&conn, "openrouter")
+            .unwrap()
+            .unwrap();
         assert_eq!(health, "down");
     }
 
@@ -315,15 +317,17 @@ mod tests {
             None,
         )
         .unwrap();
-        let (health, _, _, _) = db::get_provider_health(&conn, "openrouter").unwrap().unwrap();
+        let (health, _, _, _) = db::get_provider_health(&conn, "openrouter")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             health, "healthy",
             "single 5xx should not flip the provider health flag"
         );
         // The observation should still be persisted for the rolling
         // window count on the next occurrence.
-        let recent = db::count_recent_provider_errors(&conn, "openrouter", "http_5xx", 600)
-            .unwrap();
+        let recent =
+            db::count_recent_provider_errors(&conn, "openrouter", "http_5xx", 600).unwrap();
         assert_eq!(recent, 1);
     }
 
@@ -370,7 +374,9 @@ mod tests {
             None,
         )
         .unwrap();
-        let (health, _, _, _) = db::get_provider_health(&conn, "openrouter").unwrap().unwrap();
+        let (health, _, _, _) = db::get_provider_health(&conn, "openrouter")
+            .unwrap()
+            .unwrap();
         assert_eq!(health, "healthy");
     }
 
@@ -408,7 +414,9 @@ mod tests {
             None,
         )
         .unwrap();
-        let (health, _, _, _) = db::get_provider_health(&conn, "openrouter").unwrap().unwrap();
+        let (health, _, _, _) = db::get_provider_health(&conn, "openrouter")
+            .unwrap()
+            .unwrap();
         assert_eq!(health, "degraded");
     }
 
@@ -425,8 +433,9 @@ mod tests {
         )
         .unwrap();
         acknowledge_provider(&conn, "openrouter", None).unwrap();
-        let (health, _, _, acked) =
-            db::get_provider_health(&conn, "openrouter").unwrap().unwrap();
+        let (health, _, _, acked) = db::get_provider_health(&conn, "openrouter")
+            .unwrap()
+            .unwrap();
         assert_eq!(health, "healthy");
         assert!(acked.is_some(), "acknowledged_at should be set");
     }

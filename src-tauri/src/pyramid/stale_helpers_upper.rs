@@ -14,10 +14,12 @@ use rusqlite::Connection;
 use tracing::{error, info, warn};
 
 use super::config_helper::estimate_cost;
-use super::llm::{call_model_unified_with_options_and_ctx, extract_json, LlmCallOptions, LlmConfig};
-use super::step_context::{compute_prompt_hash, StepContext};
+use super::llm::{
+    call_model_unified_with_options_and_ctx, extract_json, LlmCallOptions, LlmConfig,
+};
 use super::naming::{clean_headline, headline_for_node};
 use super::stale_engine::batch_items;
+use super::step_context::{compute_prompt_hash, StepContext};
 use super::types::{
     ChangeManifest, ChildSwap, ConnectionCheckResult, ConnectionResult, ManifestValidationError,
     NodeStaleResult, PendingMutation, StaleCheckResult, Topic,
@@ -384,7 +386,9 @@ pub(crate) fn resolve_evidence_targets_for_node_ids(
                 continue;
             }
 
-            if let Some(target) = resolve_stale_target_for_node(conn, &link.slug, &link.target_node_id)? {
+            if let Some(target) =
+                resolve_stale_target_for_node(conn, &link.slug, &link.target_node_id)?
+            {
                 targets.insert(target);
             } else {
                 warn!(
@@ -1053,7 +1057,6 @@ pub async fn dispatch_connection_check(
                         ],
                     )?;
                 }
-
             }
 
             Ok(())
@@ -1634,7 +1637,9 @@ pub async fn generate_change_manifest(
 
     user_prompt.push_str("\n---\n\nCHANGED CHILDREN:\n");
     if input.changed_children.is_empty() {
-        user_prompt.push_str("(no child deltas — likely a forced reroll; produce a minimal no-op manifest)\n");
+        user_prompt.push_str(
+            "(no child deltas — likely a forced reroll; produce a minimal no-op manifest)\n",
+        );
     } else {
         for (i, cc) in input.changed_children.iter().enumerate() {
             let formatted_id = match &cc.slug_prefix {
@@ -1642,14 +1647,8 @@ pub async fn generate_change_manifest(
                 None => cc.child_id.clone(),
             };
             user_prompt.push_str(&format!("\n{}. CHILD {}\n", i + 1, formatted_id));
-            user_prompt.push_str(&format!(
-                "   OLD: {}\n",
-                truncate_str(&cc.old_summary, 800)
-            ));
-            user_prompt.push_str(&format!(
-                "   NEW: {}\n",
-                truncate_str(&cc.new_summary, 800)
-            ));
+            user_prompt.push_str(&format!("   OLD: {}\n", truncate_str(&cc.old_summary, 800)));
+            user_prompt.push_str(&format!("   NEW: {}\n", truncate_str(&cc.new_summary, 800)));
         }
     }
 
@@ -1764,7 +1763,11 @@ pub fn validate_change_manifest(
         row.ok_or(ManifestValidationError::TargetNotFound)?;
 
     // 2. children_swapped references exist in the evidence graph.
-    for ChildSwap { old: old_id, new: new_id } in &manifest.children_swapped {
+    for ChildSwap {
+        old: old_id,
+        new: new_id,
+    } in &manifest.children_swapped
+    {
         // KEEP evidence link old_child -> node_id must exist.
         let keep_exists: bool = conn
             .query_row(
@@ -2119,8 +2122,7 @@ pub async fn execute_supersession(
     // appear in recent deltas. For depth==0 nodes this is a synthesized
     // entry carrying the source file content (see
     // build_changed_children_from_deltas).
-    let changed_children =
-        build_changed_children_from_deltas(&node_ctx, &resolved_node_id);
+    let changed_children = build_changed_children_from_deltas(&node_ctx, &resolved_node_id);
 
     let expected_build_version = node_ctx.current_build_version + 1;
 
@@ -2128,17 +2130,13 @@ pub async fn execute_supersession(
     // reason should reflect that so the prompt context is accurate.
     let stale_check_reason = if node_ctx.depth == 0 {
         match node_ctx.source_file_path.as_deref() {
-            Some(path) => format!(
-                "Automated stale check: source file {path} changed on disk"
-            ),
+            Some(path) => format!("Automated stale check: source file {path} changed on disk"),
             None => format!(
                 "Automated stale check: L0 file-change mutation for node {resolved_node_id}"
             ),
         }
     } else {
-        format!(
-            "Automated stale check: delta(s) detected on children of node {resolved_node_id}"
-        )
+        format!("Automated stale check: delta(s) detected on children of node {resolved_node_id}")
     };
 
     let reason_tag = if node_ctx.depth == 0 {
@@ -2176,11 +2174,9 @@ pub async fn execute_supersession(
     // lookup indices.
     let cache_build_id = format!(
         "stale-{}-{}",
-        resolved_node_id,
-        node_ctx.current_build_version
+        resolved_node_id, node_ctx.current_build_version
     );
-    let prompt_hash =
-        super::step_context::compute_prompt_hash(&load_change_manifest_prompt_body());
+    let prompt_hash = super::step_context::compute_prompt_hash(&load_change_manifest_prompt_body());
     let cache_ctx = super::step_context::StepContext::new(
         slug.to_string(),
         cache_build_id,
@@ -2313,15 +2309,17 @@ async fn apply_supersession_manifest(
         let slug_owned = slug.to_string();
         let node_owned = resolved_node_id.to_string();
         let manifest_owned = manifest.clone();
-        tokio::task::spawn_blocking(move || -> Result<std::result::Result<(), ManifestValidationError>> {
-            let conn = super::db::open_pyramid_connection(Path::new(&db))?;
-            Ok(validate_change_manifest(
-                &conn,
-                &slug_owned,
-                &node_owned,
-                &manifest_owned,
-            ))
-        })
+        tokio::task::spawn_blocking(
+            move || -> Result<std::result::Result<(), ManifestValidationError>> {
+                let conn = super::db::open_pyramid_connection(Path::new(&db))?;
+                Ok(validate_change_manifest(
+                    &conn,
+                    &slug_owned,
+                    &node_owned,
+                    &manifest_owned,
+                ))
+            },
+        )
         .await??
     };
 
@@ -2585,7 +2583,17 @@ fn load_supersession_node_context(
         dead_ends_json,
         parent_id,
         current_build_version,
-    ): (String, String, i64, String, String, String, String, Option<String>, i64) = conn
+    ): (
+        String,
+        String,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        i64,
+    ) = conn
         .query_row(
             "SELECT headline, distilled, depth,
                     COALESCE(topics, '[]'),
@@ -2610,9 +2618,7 @@ fn load_supersession_node_context(
                 ))
             },
         )
-        .map_err(|e| {
-            anyhow::anyhow!("load_supersession_node_context: {slug}/{node_id}: {e}")
-        })?;
+        .map_err(|e| anyhow::anyhow!("load_supersession_node_context: {slug}/{node_id}: {e}"))?;
 
     let topics: Vec<Topic> = serde_json::from_str(&topics_json).unwrap_or_default();
 
@@ -2630,8 +2636,7 @@ fn load_supersession_node_context(
              WHERE slug = ?1 AND thread_id = ?2
              ORDER BY sequence DESC LIMIT 5",
         )?;
-        let rows = stmt
-            .query_map(rusqlite::params![slug, tid], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(rusqlite::params![slug, tid], |row| row.get::<_, String>(0))?;
         for row in rows {
             if let Ok(content) = row {
                 recent_deltas.push(content);
@@ -3614,10 +3619,7 @@ mod tests {
             dead_ends: None,
         };
 
-        let children_swapped = vec![(
-            "L2-child-old".to_string(),
-            "L2-child-new".to_string(),
-        )];
+        let children_swapped = vec![("L2-child-old".to_string(), "L2-child-new".to_string())];
 
         let new_bv = update_node_in_place(
             &conn,
@@ -3687,7 +3689,10 @@ mod tests {
                 |_| Ok(true),
             )
             .unwrap_or(false);
-        assert!(new_evidence_exists, "evidence link should point at new child");
+        assert!(
+            new_evidence_exists,
+            "evidence link should point at new child"
+        );
 
         // And the old evidence row is gone (rewritten, not duplicated)
         let old_evidence_exists: bool = conn
@@ -3700,7 +3705,10 @@ mod tests {
                 |_| Ok(true),
             )
             .unwrap_or(false);
-        assert!(!old_evidence_exists, "old evidence link should be rewritten away");
+        assert!(
+            !old_evidence_exists,
+            "old evidence link should be rewritten away"
+        );
     }
 
     #[test]
@@ -3775,7 +3783,8 @@ mod tests {
     #[test]
     fn test_validate_change_manifest_all_errors() {
         let (_file, conn) = setup_test_db();
-        let topics_json = r#"[{"name":"existing","current":"x","entities":[],"corrections":[],"decisions":[]}]"#;
+        let topics_json =
+            r#"[{"name":"existing","current":"x","entities":[],"corrections":[],"decisions":[]}]"#;
         insert_upper_node(&conn, "L2-node", 2, topics_json, &["L1-child"]);
         insert_node(&conn, "L1-child", None);
         insert_evidence_link(&conn, "L1-child", "L2-node", "build-1", "KEEP");
@@ -3808,7 +3817,9 @@ mod tests {
         );
         assert_eq!(
             validate_change_manifest(&conn, "test-slug", "L2-node", &m),
-            Err(ManifestValidationError::MissingOldChild("L1-nope".to_string()))
+            Err(ManifestValidationError::MissingOldChild(
+                "L1-nope".to_string()
+            ))
         );
 
         // --- MissingNewChild ---
@@ -3825,18 +3836,13 @@ mod tests {
         );
         assert_eq!(
             validate_change_manifest(&conn, "test-slug", "L2-node", &m),
-            Err(ManifestValidationError::MissingNewChild("L1-ghost".to_string()))
+            Err(ManifestValidationError::MissingNewChild(
+                "L1-ghost".to_string()
+            ))
         );
 
         // --- IdentityChangedWithoutRewrite ---
-        let m = build_manifest(
-            "L2-node",
-            2,
-            ContentUpdates::default(),
-            vec![],
-            true,
-            "r",
-        );
+        let m = build_manifest("L2-node", 2, ContentUpdates::default(), vec![], true, "r");
         assert_eq!(
             validate_change_manifest(&conn, "test-slug", "L2-node", &m),
             Err(ManifestValidationError::IdentityChangedWithoutRewrite)
@@ -3935,14 +3941,7 @@ mod tests {
         );
 
         // --- NonContiguousVersion (expected 2, got 5) ---
-        let m = build_manifest(
-            "L2-node",
-            5,
-            ContentUpdates::default(),
-            vec![],
-            false,
-            "r",
-        );
+        let m = build_manifest("L2-node", 5, ContentUpdates::default(), vec![], false, "r");
         assert_eq!(
             validate_change_manifest(&conn, "test-slug", "L2-node", &m),
             Err(ManifestValidationError::NonContiguousVersion {
@@ -4046,9 +4045,9 @@ mod tests {
         assert_eq!(latest.build_version, 3);
 
         // No manifests for a different node
-        assert!(
-            get_latest_manifest_for_node(&conn, "test-slug", "L2-other").unwrap().is_none()
-        );
+        assert!(get_latest_manifest_for_node(&conn, "test-slug", "L2-other")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -4058,8 +4057,7 @@ mod tests {
         // survives with the same id. This is the closest non-LLM simulation
         // of the execute_supersession happy path.
         let (_file, conn) = setup_test_db();
-        let topics_json =
-            r#"[{"name":"focus","current":"initial","entities":[],"corrections":[],"decisions":[]}]"#;
+        let topics_json = r#"[{"name":"focus","current":"initial","entities":[],"corrections":[],"decisions":[]}]"#;
         insert_upper_node(&conn, "L2-stable", 2, topics_json, &["L1-a"]);
         insert_node(&conn, "L1-a", None);
         insert_node(&conn, "L1-b", None);
@@ -4265,8 +4263,8 @@ mod tests {
         // load_supersession_node_context pulls the source file for L0
         // nodes — the fix for Issue 1.
         let conn_for_ctx = open_pyramid_db(db_file.path()).expect("reopen db");
-        let ctx = load_supersession_node_context(&conn_for_ctx, slug, node_id)
-            .expect("load context");
+        let ctx =
+            load_supersession_node_context(&conn_for_ctx, slug, node_id).expect("load context");
         drop(conn_for_ctx);
 
         assert_eq!(ctx.depth, 0, "fixture is a depth=0 node");
@@ -4275,7 +4273,10 @@ mod tests {
             Some(file_path_str.as_str()),
             "L0 context should carry source_file_path"
         );
-        let snap = ctx.source_snapshot.clone().expect("L0 context must carry source_snapshot");
+        let snap = ctx
+            .source_snapshot
+            .clone()
+            .expect("L0 context must carry source_snapshot");
         assert!(
             snap.contains("NEW rewritten content"),
             "snapshot should contain post-edit file bytes, got: {snap}"
@@ -4414,7 +4415,11 @@ mod tests {
         // Drive the failure path directly.
         let synth_err = anyhow::anyhow!("simulated LLM 500 (network blip)");
         let result = rt().block_on(handle_manifest_generation_failure(
-            &db_path, "test-slug", "L2-node", 1, synth_err,
+            &db_path,
+            "test-slug",
+            "L2-node",
+            1,
+            synth_err,
         ));
         assert!(result.is_err(), "failure path must return Err");
         let err_msg = format!("{}", result.unwrap_err());
@@ -4466,8 +4471,8 @@ mod tests {
         );
 
         // Failed manifest persisted with the spec-aligned note prefix.
-        let manifests = get_change_manifests_for_node(&conn, "test-slug", "L2-node")
-            .expect("load manifests");
+        let manifests =
+            get_change_manifests_for_node(&conn, "test-slug", "L2-node").expect("load manifests");
         assert_eq!(manifests.len(), 1, "exactly one failed-manifest row");
         let note = manifests[0].note.as_deref().unwrap_or_default();
         assert!(
@@ -4541,8 +4546,7 @@ mod tests {
         );
 
         // Confirm nothing was persisted — validate is side-effect free.
-        let manifests =
-            get_change_manifests_for_node(&conn, "test-slug", "L2-rare").unwrap();
+        let manifests = get_change_manifests_for_node(&conn, "test-slug", "L2-rare").unwrap();
         assert!(manifests.is_empty(), "validate should not persist rows");
     }
 
@@ -4556,8 +4560,8 @@ mod tests {
     /// fail to compile this test.
     #[test]
     fn test_generate_change_manifest_with_step_context_compiles() {
-        use crate::pyramid::step_context::{compute_prompt_hash, StepContext};
         use super::ChangedChild;
+        use crate::pyramid::step_context::{compute_prompt_hash, StepContext};
 
         let ctx = StepContext::new(
             "test-slug",
@@ -4677,7 +4681,11 @@ mod tests {
                 .expect("receiver should see the event")
         });
         match event.kind {
-            TaggedKind::ManifestGenerated { manifest_id, node_id, .. } => {
+            TaggedKind::ManifestGenerated {
+                manifest_id,
+                node_id,
+                ..
+            } => {
                 assert!(manifest_id > 0);
                 assert_eq!(node_id, "L1-test-001");
             }

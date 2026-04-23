@@ -48,8 +48,7 @@ pub async fn notify_vine_of_bedrock_completion(
     bedrock_build_id: &str,
     apex_node_id: &str,
 ) -> Result<Vec<String>> {
-    notify_vine_of_child_completion(state, bedrock_slug, bedrock_build_id, apex_node_id)
-        .await
+    notify_vine_of_child_completion(state, bedrock_slug, bedrock_build_id, apex_node_id).await
 }
 
 /// Phase 16: called when any child (bedrock OR sub-vine) build completes.
@@ -94,8 +93,7 @@ pub async fn notify_vine_of_child_completion(
 
     // Visited set guards against cycles. Includes the starting child so a
     // vine that references itself at any distance cannot trigger re-entry.
-    let mut visited: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     visited.insert(child_slug.to_string());
 
     // BFS frontier — (child_slug, child_apex_node_id, child_build_id).
@@ -259,10 +257,7 @@ pub async fn notify_vine_of_child_completion(
                 // own nodes table. If nothing is there, recursion for this
                 // branch is a no-op.
                 match db::get_all_live_nodes(&conn, vine_slug) {
-                    Ok(nodes) => nodes
-                        .iter()
-                        .max_by_key(|n| n.depth)
-                        .map(|n| n.id.clone()),
+                    Ok(nodes) => nodes.iter().max_by_key(|n| n.depth).map(|n| n.id.clone()),
                     Err(_) => None,
                 }
             };
@@ -731,7 +726,10 @@ mod tests {
         .unwrap();
 
         // Exactly one pending mutation should land: the KEEP row's target.
-        assert_eq!(enqueued, 1, "should enqueue one mutation for the KEEP row only");
+        assert_eq!(
+            enqueued, 1,
+            "should enqueue one mutation for the KEEP row only"
+        );
 
         // Verify the observation event row is scoped to the parent vine and
         // to the KEEP target node at the node's depth.
@@ -745,7 +743,12 @@ mod tests {
             .unwrap();
         let rows: Vec<(String, i64, String, String)> = stmt
             .query_map(rusqlite::params!["parent-v"], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, Option<String>>(3)?.unwrap_or_default()))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                ))
             })
             .unwrap()
             .filter_map(Result::ok)
@@ -753,7 +756,10 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "parent-v");
-        assert_eq!(rows[0].1, 2, "observation event should land at the vine node's layer");
+        assert_eq!(
+            rows[0].1, 2,
+            "observation event should land at the vine node's layer"
+        );
         assert_eq!(rows[0].2, "vine_stale");
         assert_eq!(rows[0].3, "v-node-keep");
 
@@ -816,9 +822,8 @@ mod tests {
         let reader_conn = db::open_pyramid_connection(&db_path).unwrap();
 
         let llm_config = crate::pyramid::llm::LlmConfig::default();
-        let credential_store = Arc::new(
-            crate::pyramid::credentials::CredentialStore::load(&data_dir).unwrap(),
-        );
+        let credential_store =
+            Arc::new(crate::pyramid::credentials::CredentialStore::load(&data_dir).unwrap());
 
         let state = Arc::new(PyramidState {
             reader: Arc::new(TokioMutex::new(reader_conn)),
@@ -835,9 +840,7 @@ mod tests {
             operational: Arc::new(crate::pyramid::OperationalConfig::default()),
             chains_dir: data_dir.join("chains"),
             remote_query_rate_limiter: Arc::new(TokioMutex::new(HashMap::new())),
-            absorption_gate: Arc::new(TokioMutex::new(
-                crate::pyramid::AbsorptionGate::new(),
-            )),
+            absorption_gate: Arc::new(TokioMutex::new(crate::pyramid::AbsorptionGate::new())),
             build_event_bus: Arc::new(BuildEventBus::new()),
             supabase_url: None,
             supabase_anon_key: None,
@@ -845,13 +848,11 @@ mod tests {
             dadbear_handle: Arc::new(TokioMutex::new(None)),
             dadbear_supervisor_handle: Arc::new(TokioMutex::new(None)),
             dadbear_in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            provider_registry: Arc::new(
-                crate::pyramid::provider::ProviderRegistry::new(credential_store.clone()),
-            ),
+            provider_registry: Arc::new(crate::pyramid::provider::ProviderRegistry::new(
+                credential_store.clone(),
+            )),
             credential_store,
-            schema_registry: Arc::new(
-                crate::pyramid::schema_registry::SchemaRegistry::new(),
-            ),
+            schema_registry: Arc::new(crate::pyramid::schema_registry::SchemaRegistry::new()),
             cross_pyramid_router: Arc::new(
                 crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
             ),
@@ -865,12 +866,7 @@ mod tests {
     /// has a live apex it can lift out of `pyramid_nodes` when it
     /// re-enters the function for the next hop. Async-safe: acquires
     /// the tokio writer lock the normal way.
-    async fn install_vine_with_apex(
-        state: &PyramidState,
-        slug: &str,
-        apex_id: &str,
-        depth: i64,
-    ) {
+    async fn install_vine_with_apex(state: &PyramidState, slug: &str, apex_id: &str, depth: i64) {
         use crate::pyramid::types::{ContentType, PyramidNode};
 
         let writer = state.writer.lock().await;
@@ -931,14 +927,10 @@ mod tests {
 
         // Run the notify — this is the call the build completion hook
         // makes in production (wanderer fix in build_runner.rs).
-        let notified = notify_vine_of_child_completion(
-            &state,
-            "b-leaf",
-            "bedrock-build-1",
-            "bedrock-apex",
-        )
-        .await
-        .expect("notify_vine_of_child_completion should succeed");
+        let notified =
+            notify_vine_of_child_completion(&state, "b-leaf", "bedrock-build-1", "bedrock-apex")
+                .await
+                .expect("notify_vine_of_child_completion should succeed");
 
         // Direct-parent return list: only v-mid (the direct parent of
         // b-leaf). v-top is a second-hop ancestor and is NOT included in
@@ -1021,14 +1013,9 @@ mod tests {
 
         // Starting from v-a: the cycle guard should allow visiting v-b
         // and v-c (via the recursive walk) but refuse to re-enter v-a.
-        let notified = notify_vine_of_child_completion(
-            &state,
-            "v-a",
-            "build-1",
-            "a-apex",
-        )
-        .await
-        .expect("cycle walk must terminate, not hang");
+        let notified = notify_vine_of_child_completion(&state, "v-a", "build-1", "a-apex")
+            .await
+            .expect("cycle walk must terminate, not hang");
 
         // Direct parents of v-a: only v-b.
         assert_eq!(notified, vec!["v-b".to_string()]);

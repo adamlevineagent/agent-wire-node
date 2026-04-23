@@ -206,7 +206,8 @@ impl<'de> Deserialize<'de> for BreakerReset {
                         }
                     }
                 }
-                let kind = kind.ok_or_else(|| A::Error::custom("BreakerReset map missing 'kind'"))?;
+                let kind =
+                    kind.ok_or_else(|| A::Error::custom("BreakerReset map missing 'kind'"))?;
                 match kind.as_str() {
                     "per_build" => Ok(BreakerReset::PerBuild),
                     "probe_based" => Ok(BreakerReset::ProbeBased),
@@ -578,7 +579,13 @@ fn resolve_or_default<T: DeserializeOwned>(
 /// §3 `patience_secs`.
 #[allow(dead_code)]
 pub fn resolve_patience_secs(chain: &ScopeChain, slot: &str, provider_type: ProviderType) -> u64 {
-    resolve_or_default(chain, "patience_secs", slot, provider_type, PATIENCE_SECS_DEFAULT)
+    resolve_or_default(
+        chain,
+        "patience_secs",
+        slot,
+        provider_type,
+        PATIENCE_SECS_DEFAULT,
+    )
 }
 
 /// §3 `patience_clock_resets_per_model`.
@@ -604,7 +611,13 @@ pub fn resolve_breaker_reset(
     slot: &str,
     provider_type: ProviderType,
 ) -> BreakerReset {
-    resolve_or_default(chain, "breaker_reset", slot, provider_type, BREAKER_RESET_DEFAULT)
+    resolve_or_default(
+        chain,
+        "breaker_reset",
+        slot,
+        provider_type,
+        BREAKER_RESET_DEFAULT,
+    )
 }
 
 /// §3 `sequential`.
@@ -616,7 +629,13 @@ pub fn resolve_sequential(chain: &ScopeChain, slot: &str, provider_type: Provide
 /// §3 `bypass_pool`.
 #[allow(dead_code)]
 pub fn resolve_bypass_pool(chain: &ScopeChain, slot: &str, provider_type: ProviderType) -> bool {
-    resolve_or_default(chain, "bypass_pool", slot, provider_type, BYPASS_POOL_DEFAULT)
+    resolve_or_default(
+        chain,
+        "bypass_pool",
+        slot,
+        provider_type,
+        BYPASS_POOL_DEFAULT,
+    )
 }
 
 /// §3 `retry_http_count`.
@@ -1313,7 +1332,10 @@ fn parse_provider_body(yaml: &str) -> Result<HashMap<String, serde_json::Value>>
 /// `(default_order, per_provider_overrides)`.
 fn parse_call_order_body(
     yaml: &str,
-) -> Result<(Vec<ProviderType>, HashMap<ProviderType, HashMap<String, serde_json::Value>>)> {
+) -> Result<(
+    Vec<ProviderType>,
+    HashMap<ProviderType, HashMap<String, serde_json::Value>>,
+)> {
     #[derive(Deserialize)]
     struct Body {
         #[serde(default)]
@@ -1792,8 +1814,7 @@ mod tests {
         assert_eq!(got, Some(vec!["c".to_string()]));
 
         // Slot that isn't declared at scope 4 → None.
-        let got_missing =
-            resolve_model_list(&chain, "extractor", ProviderType::OpenRouter);
+        let got_missing = resolve_model_list(&chain, "extractor", ProviderType::OpenRouter);
         assert_eq!(got_missing, None);
     }
 
@@ -1821,8 +1842,7 @@ mod tests {
         assert_eq!(v, BreakerReset::TimeSecs { value: 300 });
 
         // Deserialize from structured form.
-        let v: BreakerReset =
-            serde_json::from_value(json!({"kind": "per_build"})).unwrap();
+        let v: BreakerReset = serde_json::from_value(json!({"kind": "per_build"})).unwrap();
         assert_eq!(v, BreakerReset::PerBuild);
         let v: BreakerReset =
             serde_json::from_value(json!({"kind": "time_secs", "value": 300})).unwrap();

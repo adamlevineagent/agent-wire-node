@@ -198,7 +198,12 @@ pub fn recompute_from_audit(
         let (phase, model, avg_in, avg_out, n, builds) = row?;
         let builds = builds.max(1);
         let calls_per_conv = (n as f64) / (builds as f64);
-        let per_call = cost_per_call(avg_in, avg_out, default_in_price_per_m, default_out_price_per_m);
+        let per_call = cost_per_call(
+            avg_in,
+            avg_out,
+            default_in_price_per_m,
+            default_out_price_per_m,
+        );
         let per_conv = per_call * calls_per_conv;
 
         conn.execute(
@@ -235,11 +240,7 @@ pub fn recompute_from_audit(
 
 /// Look up cost for a (chain_phase, model). Returns `None` if no row exists
 /// (caller should have seeded before lookup for full coverage).
-pub fn lookup(
-    conn: &Connection,
-    chain_phase: &str,
-    model: &str,
-) -> Result<Option<CostModelEntry>> {
+pub fn lookup(conn: &Connection, chain_phase: &str, model: &str) -> Result<Option<CostModelEntry>> {
     let row = conn
         .query_row(
             "SELECT chain_phase, model, avg_input_tokens, avg_output_tokens,

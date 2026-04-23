@@ -25,11 +25,13 @@ pub fn get_pyramid_viz_config(
 ) -> anyhow::Result<serde_json::Value> {
     // Try slug-scoped first, then global
     if let Some(s) = slug {
-        if let Some(contrib) =
-            load_active_config_contribution(conn, "pyramid_viz_config", Some(s))?
+        if let Some(contrib) = load_active_config_contribution(conn, "pyramid_viz_config", Some(s))?
         {
             let val: serde_json::Value = serde_yaml::from_str(&contrib.yaml_content)?;
-            debug!(slug = s, "pyramid_viz_config: loaded slug-scoped contribution");
+            debug!(
+                slug = s,
+                "pyramid_viz_config: loaded slug-scoped contribution"
+            );
             return Ok(val);
         }
     }

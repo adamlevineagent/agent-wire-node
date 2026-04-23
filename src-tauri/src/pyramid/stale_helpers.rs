@@ -17,14 +17,13 @@ use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use tracing::{info, warn};
 
-
 use super::config_helper::estimate_cost;
 use super::llm::{call_model_unified_with_options_and_ctx, extract_json, LlmConfig};
-use super::step_context::{compute_prompt_hash, StepContext};
 use super::naming::{headline_from_path, tombstone_headline};
 use super::stale_helpers_upper::{
     resolve_evidence_targets_for_node_ids, resolve_live_canonical_node_id,
 };
+use super::step_context::{compute_prompt_hash, StepContext};
 use super::types::{FileStaleResult, PendingMutation, RenameResult, StaleCheckResult};
 
 // ── Utility Functions ────────────────────────────────────────────────────────
@@ -115,13 +114,13 @@ fn enqueue_parent_confirmed_stales(
             slug,
             "cascade",
             "cascade_stale",
-            None,          // source_path
-            None,          // file_path
-            None,          // content_hash
-            None,          // previous_hash
-            Some(target),  // target_node_id
-            Some(1),       // layer
-            Some(detail),  // metadata_json
+            None,         // source_path
+            None,         // file_path
+            None,         // content_hash
+            None,         // previous_hash
+            Some(target), // target_node_id
+            Some(1),      // layer
+            Some(detail), // metadata_json
         );
     }
 
@@ -876,7 +875,14 @@ Output JSON only:
     tokio::task::spawn_blocking(move || -> Result<()> {
         let conn = super::db::open_pyramid_connection(Path::new(&db))
             .context("Failed to open DB for rename post-processing")?;
-        apply_rename_result(&conn, &slug_c, &old_path_c, &new_path_c, result_c.rename, &result_c.reason)?;
+        apply_rename_result(
+            &conn,
+            &slug_c,
+            &old_path_c,
+            &new_path_c,
+            result_c.rename,
+            &result_c.reason,
+        )?;
         Ok(())
     })
     .await??;
@@ -909,8 +915,7 @@ pub(crate) fn apply_rename_result(
 
     if is_rename {
         // Confirmed rename: update thread key, update file_hashes, supersede old
-        let old_node_ids = get_file_node_ids(conn, slug, old_path)
-            .unwrap_or_default();
+        let old_node_ids = get_file_node_ids(conn, slug, old_path).unwrap_or_default();
 
         if let Some(old_node_id) = old_node_ids.first() {
             // Create a rename note node (sequential ID, not UUID)
@@ -925,11 +930,14 @@ pub(crate) fn apply_rename_result(
             let distilled_lines: Vec<&str> = new_content.lines().take(200).collect();
             let distilled = format!(
                 "File: {} (renamed from {})\n\n{}",
-                new_path, old_path, distilled_lines.join("\n")
+                new_path,
+                old_path,
+                distilled_lines.join("\n")
             );
 
             // Insert new L0 node
-            let headline = headline_from_path(new_path).unwrap_or_else(|| "Renamed File".to_string());
+            let headline =
+                headline_from_path(new_path).unwrap_or_else(|| "Renamed File".to_string());
             conn.execute(
                 "INSERT OR REPLACE INTO pyramid_nodes
                  (id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions,
@@ -976,13 +984,8 @@ pub(crate) fn apply_rename_result(
                 rusqlite::params![new_path, new_node_id, now, slug, old_node_id],
             )?;
 
-            let parent_count = enqueue_parent_confirmed_stales(
-                conn,
-                slug,
-                &old_node_ids,
-                &rename_note,
-                &now,
-            )?;
+            let parent_count =
+                enqueue_parent_confirmed_stales(conn, slug, &old_node_ids, &rename_note, &now)?;
 
             if parent_count == 0 {
                 info!(old_path = %old_path, new_path = %new_path, "Rename completed without an existing parent thread target");
@@ -1005,8 +1008,7 @@ pub(crate) fn apply_rename_result(
         );
 
         // Tombstone the old file
-        let old_node_ids = get_file_node_ids(conn, slug, old_path)
-            .unwrap_or_default();
+        let old_node_ids = get_file_node_ids(conn, slug, old_path).unwrap_or_default();
 
         if !old_node_ids.is_empty() {
             let old_distilled = old_node_ids
@@ -1068,11 +1070,7 @@ pub(crate) fn apply_rename_result(
             let new_node_id = super::db::next_sequential_node_id(conn, slug, 0, "");
 
             let distilled_lines: Vec<&str> = new_content.lines().take(200).collect();
-            let distilled = format!(
-                "File: {}\n\n{}",
-                new_path,
-                distilled_lines.join("\n")
-            );
+            let distilled = format!("File: {}\n\n{}", new_path, distilled_lines.join("\n"));
 
             let headline = headline_from_path(new_path).unwrap_or_else(|| "New File".to_string());
             conn.execute(

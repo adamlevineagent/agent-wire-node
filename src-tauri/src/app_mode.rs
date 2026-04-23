@@ -121,7 +121,9 @@ pub async fn guard_app_ready(app_mode: &Arc<RwLock<AppMode>>) -> Result<(), AppN
             current_mode = ?current,
             "build-starter rejected: app_mode is not Ready"
         );
-        Err(AppNotReady { current_mode: current })
+        Err(AppNotReady {
+            current_mode: current,
+        })
     }
 }
 

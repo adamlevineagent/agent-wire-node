@@ -872,8 +872,13 @@ async fn handle_system_compute_summary(
     };
     let result = tokio::task::spawn_blocking(move || {
         let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
-        crate::pyramid::compute_chronicle::query_summary(&conn, &period_start, &period_end, &group_by)
-            .map_err(|e| e.to_string())
+        crate::pyramid::compute_chronicle::query_summary(
+            &conn,
+            &period_start,
+            &period_end,
+            &group_by,
+        )
+        .map_err(|e| e.to_string())
     })
     .await;
     match result {
@@ -1031,8 +1036,11 @@ async fn handle_local_mode_enable(
             ));
         }
     }
-    let plan = match crate::pyramid::local_mode::prepare_enable_local_mode(body.base_url, body.model)
-        .await
+    let plan = match crate::pyramid::local_mode::prepare_enable_local_mode(
+        body.base_url,
+        body.model,
+    )
+    .await
     {
         Ok(p) => p,
         Err(e) => {
@@ -1151,20 +1159,18 @@ async fn handle_local_mode_switch(
             .unwrap_or_else(|| "http://localhost:11434/v1".to_string())
     };
 
-    let plan = match crate::pyramid::local_mode::prepare_enable_local_mode(
-        base_url,
-        Some(body.model),
-    )
-    .await
-    {
-        Ok(p) => p,
-        Err(e) => {
-            return Ok(json_error(
-                warp::http::StatusCode::BAD_REQUEST,
-                &e.to_string(),
-            ));
-        }
-    };
+    let plan =
+        match crate::pyramid::local_mode::prepare_enable_local_mode(base_url, Some(body.model))
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::BAD_REQUEST,
+                    &e.to_string(),
+                ));
+            }
+        };
     let snapshot = {
         let mut writer = pyramid.writer.lock().await;
         if let Err(e) = crate::pyramid::local_mode::commit_enable_local_mode(

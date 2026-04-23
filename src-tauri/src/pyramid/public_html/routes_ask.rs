@@ -32,15 +32,15 @@ use warp::http::StatusCode;
 use warp::{Filter, Rejection};
 
 use crate::http_utils::ct_eq;
-use crate::pyramid::types::ContentType;
-use crate::pyramid::PyramidState;
 use crate::pyramid::public_html::auth::{
-    ANON_SESSION_COOKIE, PublicAuthSource, WIRE_SESSION_COOKIE, csrf_nonce, enforce_public_tier,
-    read_cookie, verify_csrf,
+    csrf_nonce, enforce_public_tier, read_cookie, verify_csrf, PublicAuthSource,
+    ANON_SESSION_COOKIE, WIRE_SESSION_COOKIE,
 };
 use crate::pyramid::public_html::rate_limit;
 use crate::pyramid::public_html::render::{esc, page, status_page};
 use crate::pyramid::public_html::web_sessions;
+use crate::pyramid::types::ContentType;
+use crate::pyramid::PyramidState;
 
 const FORM_BODY_LIMIT: u64 = 8 * 1024;
 const QUESTION_MAX_LEN: usize = 2048;
@@ -131,12 +131,7 @@ fn commit_token_at(
 /// Mint a `commit_token` binding the operator identity + slug + exact
 /// question text + current 5-minute window. Consumed by the second POST to
 /// prove the caller actually saw the preview page.
-pub fn make_commit_token(
-    secret: &[u8; 32],
-    user_id: &str,
-    slug: &str,
-    question: &str,
-) -> String {
+pub fn make_commit_token(secret: &[u8; 32], user_id: &str, slug: &str, question: &str) -> String {
     commit_token_at(secret, user_id, slug, question, epoch_minute_div5())
 }
 
@@ -211,9 +206,7 @@ async fn resolve_auth(
             if token.matches('.').count() == 2 {
                 let pk_str = jwt_public_key.read().await;
                 if !pk_str.is_empty() {
-                    if let Ok(claims) =
-                        crate::server::verify_pyramid_query_jwt(token, &pk_str)
-                    {
+                    if let Ok(claims) = crate::server::verify_pyramid_query_jwt(token, &pk_str) {
                         let operator_id = claims.operator_id.unwrap_or_default();
                         let circle_id = claims.circle_id;
                         return PublicAuthSource::WireOperator {
@@ -330,8 +323,10 @@ fn render_preview_page(
 ) -> warp::reply::Response {
     let mut cand_html = String::new();
     if candidates.is_empty() {
-        cand_html.push_str("<p class=\"empty\">No matching nodes were found yet — \
-             committing will still run a synthesis pass.</p>\n");
+        cand_html.push_str(
+            "<p class=\"empty\">No matching nodes were found yet — \
+             committing will still run a synthesis pass.</p>\n",
+        );
     } else {
         cand_html.push_str("<ul class=\"candidates\">\n");
         for c in candidates {
@@ -642,12 +637,9 @@ async fn create_question_pyramid_and_redirect(
     let question_slug = mint_question_slug(&writer, question);
 
     // Step 2: create the slug row.
-    if let Err(e) = crate::pyramid::db::create_slug(
-        &writer,
-        &question_slug,
-        &ContentType::Question,
-        "",
-    ) {
+    if let Err(e) =
+        crate::pyramid::db::create_slug(&writer, &question_slug, &ContentType::Question, "")
+    {
         let body = format!(
             "<h1>Failed to create question pyramid</h1>\n<p class=\"err\">{}</p>\n",
             esc(&e.to_string())
@@ -738,7 +730,9 @@ async fn handle_ask_post(
     // CSRF (bound to wire_session | anon_session | empty + slug).
     let sess_tok = csrf_session_token(&headers);
     if !verify_csrf(&state.csrf_secret, &csrf, &sess_tok, &slug) {
-        return Ok(bad_request_page("Session expired — please reload the pyramid page."));
+        return Ok(bad_request_page(
+            "Session expired — please reload the pyramid page.",
+        ));
     }
 
     // Tier gate: Anonymous/WebSession on a non-public pyramid → 404.
@@ -916,7 +910,11 @@ mod tests {
         let secret = [7u8; 32];
         let t = make_commit_token(&secret, "op-1", "slug-a", "question A");
         assert!(!verify_commit_token(
-            &secret, &t, "op-1", "slug-a", "question B"
+            &secret,
+            &t,
+            "op-1",
+            "slug-a",
+            "question B"
         ));
     }
 

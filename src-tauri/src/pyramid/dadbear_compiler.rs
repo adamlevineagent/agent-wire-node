@@ -32,7 +32,13 @@ use tracing::{debug, info, warn};
 ///
 /// Consumer parsing contract: `splitn(5, ':')` — field 5 is the complete
 /// target_id which may contain internal `/` separators.
-pub fn work_item_id(slug: &str, epoch_short: &str, primitive: &str, layer: i64, target_id: &str) -> String {
+pub fn work_item_id(
+    slug: &str,
+    epoch_short: &str,
+    primitive: &str,
+    layer: i64,
+    target_id: &str,
+) -> String {
     format!("{slug}:{epoch_short}:{primitive}:{layer}:{target_id}")
 }
 
@@ -152,19 +158,22 @@ fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, &'static st
 /// For rename events, target_id uses rename/{old}/{new} composite format.
 fn derive_target_id(event: &ObservationEvent) -> String {
     match event.event_type.as_str() {
-        "file_created" | "file_modified" | "file_deleted" | "full_sweep" => {
-            event.file_path.clone().unwrap_or_else(|| "unknown".to_string())
-        }
+        "file_created" | "file_modified" | "file_deleted" | "full_sweep" => event
+            .file_path
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
         "file_renamed" => {
             // metadata_json should contain the rename pair info
             // Format: rename/{old_path}/{new_path}
             if let Some(ref meta) = event.metadata_json {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(meta) {
-                    let old = v.get("old_path")
+                    let old = v
+                        .get("old_path")
                         .and_then(|v| v.as_str())
                         .or_else(|| v.get("source_path").and_then(|v| v.as_str()))
                         .unwrap_or("unknown");
-                    let new = v.get("new_path")
+                    let new = v
+                        .get("new_path")
                         .and_then(|v| v.as_str())
                         .or_else(|| v.get("file_path").and_then(|v| v.as_str()))
                         .unwrap_or("unknown");
@@ -172,7 +181,13 @@ fn derive_target_id(event: &ObservationEvent) -> String {
                 }
             }
             // Fallback: use file_path
-            format!("rename/{}", event.file_path.clone().unwrap_or_else(|| "unknown".to_string()))
+            format!(
+                "rename/{}",
+                event
+                    .file_path
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string())
+            )
         }
         "edge_stale" => {
             // target_node_id for edge events encodes both endpoints
@@ -198,11 +213,12 @@ fn derive_target_id(event: &ObservationEvent) -> String {
             }
         }
         // cascade_stale, targeted_stale, evidence_growth, vine_stale, node_stale, faq_category_stale
-        _ => {
-            event.target_node_id.clone().unwrap_or_else(|| {
-                event.file_path.clone().unwrap_or_else(|| "unknown".to_string())
-            })
-        }
+        _ => event.target_node_id.clone().unwrap_or_else(|| {
+            event
+                .file_path
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string())
+        }),
     }
 }
 
@@ -215,9 +231,8 @@ fn derive_layer(event: &ObservationEvent) -> i64 {
     match event.event_type.as_str() {
         "file_created" | "file_modified" | "file_deleted" | "file_renamed" | "full_sweep" => 0,
         "targeted_stale" | "evidence_growth" => 0,
-        "cascade_stale" | "edge_stale" | "vine_stale" | "node_stale" | "faq_category_stale" | "connection_check" => {
-            event.layer.unwrap_or(0)
-        }
+        "cascade_stale" | "edge_stale" | "vine_stale" | "node_stale" | "faq_category_stale"
+        | "connection_check" => event.layer.unwrap_or(0),
         "annotation_written" | "annotation_superseded" => event.layer.unwrap_or(0),
         _ => event.layer.unwrap_or(0),
     }
@@ -297,7 +312,13 @@ pub fn get_or_create_epoch(
          (slug, epoch_id, recipe_contribution_id, norms_contribution_id,
           last_compiled_observation_id, epoch_start_observation_id, epoch_started_at)
          VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)",
-        params![slug, new_epoch_id, recipe_contribution_id, norms_contribution_id, now],
+        params![
+            slug,
+            new_epoch_id,
+            recipe_contribution_id,
+            norms_contribution_id,
+            now
+        ],
     )
     .with_context(|| format!("Failed to create new epoch for slug '{slug}'"))?;
 
@@ -355,7 +376,11 @@ pub fn compile_observations(
         });
     }
 
-    let new_cursor = events.iter().map(|e| e.id).max().unwrap_or(last_compiled_observation_id);
+    let new_cursor = events
+        .iter()
+        .map(|e| e.id)
+        .max()
+        .unwrap_or(last_compiled_observation_id);
     let ep_short = epoch_short(epoch_id);
     let bid = batch_id(slug, &ep_short, new_cursor);
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -423,8 +448,8 @@ pub fn compile_observations(
         );
 
         // (f) Create work item row in 'compiled' state
-        let observation_event_ids = serde_json::to_string(&[event.id])
-            .unwrap_or_else(|_| format!("[{}]", event.id));
+        let observation_event_ids =
+            serde_json::to_string(&[event.id]).unwrap_or_else(|_| format!("[{}]", event.id));
 
         let inserted = insert_work_item(
             conn,
@@ -464,7 +489,12 @@ pub fn compile_observations(
                     .and_then(|v| v.get("triggering_work_item_id")?.as_str().map(String::from))
             });
             let created = create_cross_layer_deps(
-                conn, slug, &wi_id, &target_id, layer, &ep_short,
+                conn,
+                slug,
+                &wi_id,
+                &target_id,
+                layer,
+                &ep_short,
                 trigger_id.as_deref(),
             )?;
             deps_created += created;
@@ -640,11 +670,13 @@ fn create_cross_layer_deps(
     };
 
     // Verify the triggering item exists before creating the edge
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM dadbear_work_items WHERE id = ?1)",
-        params![trigger_id],
-        |row| row.get(0),
-    ).unwrap_or(false);
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM dadbear_work_items WHERE id = ?1)",
+            params![trigger_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
 
     if !exists {
         debug!(
@@ -687,20 +719,10 @@ pub fn run_compilation_for_slug(
     recipe_contribution_id: Option<&str>,
     norms_contribution_id: Option<&str>,
 ) -> Result<CompilationResult> {
-    let (epoch_id, last_cursor) = get_or_create_epoch(
-        conn,
-        slug,
-        recipe_contribution_id,
-        norms_contribution_id,
-    )?;
+    let (epoch_id, last_cursor) =
+        get_or_create_epoch(conn, slug, recipe_contribution_id, norms_contribution_id)?;
 
-    compile_observations(
-        conn,
-        slug,
-        &epoch_id,
-        recipe_contribution_id,
-        last_cursor,
-    )
+    compile_observations(conn, slug, &epoch_id, recipe_contribution_id, last_cursor)
 }
 
 #[cfg(test)]
@@ -742,7 +764,10 @@ mod tests {
 
     #[test]
     fn test_contribution_short() {
-        assert_eq!(contribution_short(Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890")), "a1b2c3d4");
+        assert_eq!(
+            contribution_short(Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890")),
+            "a1b2c3d4"
+        );
         assert_eq!(contribution_short(Some("abcdef01")), "abcdef01");
         assert_eq!(contribution_short(None), "00000000");
     }

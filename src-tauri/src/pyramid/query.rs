@@ -67,18 +67,14 @@ pub fn get_node_version(
                WHERE slug = ?1 AND node_id = ?2 AND version = ?3";
     let mut stmt = conn.prepare(sql)?;
     let result = stmt.query_row(rusqlite::params![slug, node_id, version], |row| {
-        let topics_json: String = row
-            .get::<_, Option<String>>("topics")?
-            .unwrap_or_default();
+        let topics_json: String = row.get::<_, Option<String>>("topics")?.unwrap_or_default();
         let corrections_json: String = row
             .get::<_, Option<String>>("corrections")?
             .unwrap_or_default();
         let decisions_json: String = row
             .get::<_, Option<String>>("decisions")?
             .unwrap_or_default();
-        let terms_json: String = row
-            .get::<_, Option<String>>("terms")?
-            .unwrap_or_default();
+        let terms_json: String = row.get::<_, Option<String>>("terms")?.unwrap_or_default();
         let dead_ends_json: String = row
             .get::<_, Option<String>>("dead_ends")?
             .unwrap_or_default();
@@ -493,7 +489,10 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
             thread_id_by_canonical_id: &HashMap<String, String>,
             source_path_by_node_id: &HashMap<String, String>,
         ) -> TreeNode {
-            let child_ids = children_by_parent.get(&node.id).cloned().unwrap_or_default();
+            let child_ids = children_by_parent
+                .get(&node.id)
+                .cloned()
+                .unwrap_or_default();
             let children: Vec<TreeNode> = child_ids
                 .iter()
                 .filter_map(|child_id| {
@@ -534,7 +533,11 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
                 depth: node.depth,
                 headline: node.headline.clone(),
                 distilled: node.distilled.clone(),
-                self_prompt: if node.self_prompt.is_empty() { None } else { Some(node.self_prompt.clone()) },
+                self_prompt: if node.self_prompt.is_empty() {
+                    None
+                } else {
+                    Some(node.self_prompt.clone())
+                },
                 thread_id: thread_id_by_canonical_id.get(&node.id).cloned(),
                 source_path: source_path_by_node_id.get(&node.id).cloned(),
                 source_slug: None,
@@ -675,7 +678,9 @@ pub fn drill(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<Dril
     if children.is_empty() && is_question_slug {
         let keep_links = db::get_keep_evidence_for_target_cross(conn, slug, node_id)?;
         for link in &keep_links {
-            let child = if let Some((ref_slug, _depth, ref_node_id)) = db::parse_handle_path(&link.source_node_id) {
+            let child = if let Some((ref_slug, _depth, ref_node_id)) =
+                db::parse_handle_path(&link.source_node_id)
+            {
                 db::get_node_summary(conn, ref_slug, ref_node_id)?
             } else {
                 db::get_node_summary(conn, slug, &link.source_node_id)?
@@ -713,7 +718,10 @@ pub fn drill(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<Dril
 }
 
 /// Walk a question tree JSON to find a node by question text and return its parent question + siblings.
-fn find_question_context(tree_json: &serde_json::Value, question_text: &str) -> Option<QuestionContext> {
+fn find_question_context(
+    tree_json: &serde_json::Value,
+    question_text: &str,
+) -> Option<QuestionContext> {
     find_in_tree(&tree_json["apex"], question_text, None)
 }
 
@@ -907,11 +915,11 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
     // tokens drive an OR-match across searchable fields; the score is
     // computed below from the count of matched words and the depth.
     const STOP_WORDS: &[&str] = &[
-        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have", "how",
-        "i", "in", "is", "it", "its", "of", "on", "or", "that", "the", "this", "to", "was",
-        "what", "when", "where", "which", "who", "why", "will", "with", "you", "your", "do",
-        "does", "did", "can", "could", "would", "should", "may", "might", "must", "shall",
-        "but", "if", "then", "than", "so", "no", "not", "any", "all", "some", "such",
+        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have", "how", "i",
+        "in", "is", "it", "its", "of", "on", "or", "that", "the", "this", "to", "was", "what",
+        "when", "where", "which", "who", "why", "will", "with", "you", "your", "do", "does", "did",
+        "can", "could", "would", "should", "may", "might", "must", "shall", "but", "if", "then",
+        "than", "so", "no", "not", "any", "all", "some", "such",
     ];
     let mut words: Vec<String> = term
         .to_lowercase()
@@ -1083,18 +1091,23 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
 
         // 1. Child counts from live_pyramid_nodes.children (JSON array)
         {
-            let placeholders: String = node_ids.iter().enumerate()
+            let placeholders: String = node_ids
+                .iter()
+                .enumerate()
                 .map(|(i, _)| format!("?{}", i + 1))
-                .collect::<Vec<_>>().join(", ");
+                .collect::<Vec<_>>()
+                .join(", ");
             let sql = format!(
                 "SELECT id, json_array_length(children) FROM live_pyramid_nodes WHERE id IN ({})",
                 placeholders
             );
-            let params: Vec<&dyn rusqlite::types::ToSql> = node_ids.iter()
+            let params: Vec<&dyn rusqlite::types::ToSql> = node_ids
+                .iter()
                 .map(|id| id as &dyn rusqlite::types::ToSql)
                 .collect();
             if let Ok(mut stmt) = conn.prepare(&sql) {
-                let mut child_map: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+                let mut child_map: std::collections::HashMap<String, i64> =
+                    std::collections::HashMap::new();
                 if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1).unwrap_or(0)))
                 }) {
@@ -1112,18 +1125,23 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
 
         // 2. Annotation counts from pyramid_annotations
         {
-            let placeholders: String = node_ids.iter().enumerate()
+            let placeholders: String = node_ids
+                .iter()
+                .enumerate()
                 .map(|(i, _)| format!("?{}", i + 1))
-                .collect::<Vec<_>>().join(", ");
+                .collect::<Vec<_>>()
+                .join(", ");
             let sql = format!(
                 "SELECT node_id, COUNT(*) FROM pyramid_annotations WHERE node_id IN ({}) GROUP BY node_id",
                 placeholders
             );
-            let params: Vec<&dyn rusqlite::types::ToSql> = node_ids.iter()
+            let params: Vec<&dyn rusqlite::types::ToSql> = node_ids
+                .iter()
                 .map(|id| id as &dyn rusqlite::types::ToSql)
                 .collect();
             if let Ok(mut stmt) = conn.prepare(&sql) {
-                let mut annot_map: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+                let mut annot_map: std::collections::HashMap<String, i64> =
+                    std::collections::HashMap::new();
                 if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1).unwrap_or(0)))
                 }) {
@@ -1142,23 +1160,26 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
         // 3. Web edges: check if node's thread has any edges
         // Web edges use thread_id, not node_id. We need to go through pyramid_threads.
         {
-            let placeholders: String = node_ids.iter().enumerate()
+            let placeholders: String = node_ids
+                .iter()
+                .enumerate()
                 .map(|(i, _)| format!("?{}", i + 1))
-                .collect::<Vec<_>>().join(", ");
+                .collect::<Vec<_>>()
+                .join(", ");
             let sql = format!(
                 "SELECT DISTINCT t.current_canonical_id FROM pyramid_threads t \
                  JOIN pyramid_web_edges e ON t.slug = e.slug AND (t.thread_id = e.thread_a_id OR t.thread_id = e.thread_b_id) \
                  WHERE t.current_canonical_id IN ({})",
                 placeholders
             );
-            let params: Vec<&dyn rusqlite::types::ToSql> = node_ids.iter()
+            let params: Vec<&dyn rusqlite::types::ToSql> = node_ids
+                .iter()
                 .map(|id| id as &dyn rusqlite::types::ToSql)
                 .collect();
             if let Ok(mut stmt) = conn.prepare(&sql) {
-                let mut edge_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-                if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
-                    row.get::<_, String>(0)
-                }) {
+                let mut edge_set: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                if let Ok(rows) = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0)) {
                     for row in rows.flatten() {
                         edge_set.insert(row);
                     }
@@ -1722,9 +1743,7 @@ pub struct EvidenceLinkRow {
 /// for importance propagation.
 pub fn get_visual_encoding_data(conn: &Connection, slug: &str) -> Result<VisualEncodingData> {
     // 1. Get all live nodes with depth
-    let mut node_stmt = conn.prepare(
-        "SELECT id, depth FROM live_pyramid_nodes WHERE slug = ?1",
-    )?;
+    let mut node_stmt = conn.prepare("SELECT id, depth FROM live_pyramid_nodes WHERE slug = ?1")?;
     let node_rows: Vec<(String, i64)> = node_stmt
         .query_map(rusqlite::params![slug], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))

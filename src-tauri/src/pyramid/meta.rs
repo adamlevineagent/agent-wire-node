@@ -318,7 +318,16 @@ pub async fn run_all_meta_passes(
     let backward = timeline_backward(reader, writer, slug, &forward, base_config, model).await?;
 
     info!("[meta] Running narrative for '{}'", slug);
-    let narr = narrative(reader, writer, slug, &forward, &backward, base_config, model).await?;
+    let narr = narrative(
+        reader,
+        writer,
+        slug,
+        &forward,
+        &backward,
+        base_config,
+        model,
+    )
+    .await?;
 
     info!("[meta] Running quickstart for '{}'", slug);
     let qs = quickstart(reader, writer, slug, &narr, base_config, model).await?;

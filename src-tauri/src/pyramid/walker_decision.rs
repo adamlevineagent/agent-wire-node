@@ -48,16 +48,16 @@ use crate::pyramid::compute_chronicle::{
 use crate::pyramid::walker_breaker;
 use crate::pyramid::walker_cache::ScopeCache;
 use crate::pyramid::walker_readiness::{
-    FleetReadiness, LocalReadiness, MarketReadiness, NotReadyReason,
-    OpenRouterReadinessStub, ProviderReadiness, ReadinessResult, ResolvedProviderParams,
+    FleetReadiness, LocalReadiness, MarketReadiness, NotReadyReason, OpenRouterReadinessStub,
+    ProviderReadiness, ReadinessResult, ResolvedProviderParams,
 };
 use crate::pyramid::walker_resolver::{
-    build_scope_cache_pair, resolve_active, resolve_breaker_reset,
-    resolve_bypass_pool, resolve_context_limit, resolve_dispatch_deadline_grace_secs,
-    resolve_fleet_peer_min_staleness_secs, resolve_fleet_prefer_cached,
-    resolve_max_budget_credits, resolve_max_completion_tokens, resolve_model_list,
-    resolve_network_failure_backoff_secs, resolve_network_failure_backoff_threshold,
-    resolve_ollama_base_url, resolve_ollama_probe_interval_secs, resolve_on_partial_failure,
+    build_scope_cache_pair, resolve_active, resolve_breaker_reset, resolve_bypass_pool,
+    resolve_context_limit, resolve_dispatch_deadline_grace_secs,
+    resolve_fleet_peer_min_staleness_secs, resolve_fleet_prefer_cached, resolve_max_budget_credits,
+    resolve_max_completion_tokens, resolve_model_list, resolve_network_failure_backoff_secs,
+    resolve_network_failure_backoff_threshold, resolve_ollama_base_url,
+    resolve_ollama_probe_interval_secs, resolve_on_partial_failure,
     resolve_patience_clock_resets_per_model, resolve_patience_secs, resolve_pricing_json,
     resolve_retry_backoff_base_secs, resolve_retry_http_count, resolve_sequential,
     resolve_supported_parameters, tier_set_from_chain, PartialFailurePolicy, ProviderType,
@@ -245,9 +245,9 @@ impl DispatchDecision {
         build_id: Option<&str>,
         conn: &Connection,
     ) -> std::result::Result<Self, DecisionBuildError> {
-        let data = build_scope_cache_pair(conn).map_err(DecisionBuildError::ScopeCacheLoadFailed)?;
-        let decision =
-            build_from_chain(slot, Arc::new(data.cache), &data.chain, false, build_id)?;
+        let data =
+            build_scope_cache_pair(conn).map_err(DecisionBuildError::ScopeCacheLoadFailed)?;
+        let decision = build_from_chain(slot, Arc::new(data.cache), &data.chain, false, build_id)?;
         emit_event(EVENT_DECISION_BUILT, &decision);
         Ok(decision)
     }
@@ -291,8 +291,7 @@ impl DispatchDecision {
             per_provider.insert(pt, resolve_all_params(chain, slot, pt));
         }
 
-        let on_partial_failure =
-            resolve_on_partial_failure(chain, slot, ProviderType::Market);
+        let on_partial_failure = resolve_on_partial_failure(chain, slot, ProviderType::Market);
 
         let decision = DispatchDecision {
             slot: slot.to_string(),
@@ -449,11 +448,7 @@ fn build_from_chain(
 /// Pull every §3 parameter for one `(slot, provider_type)` pair into
 /// a fully-resolved `ResolvedProviderParams`. Order of assignments
 /// mirrors the struct definition in walker_readiness.rs for readability.
-fn resolve_all_params(
-    chain: &ScopeChain,
-    slot: &str,
-    pt: ProviderType,
-) -> ResolvedProviderParams {
+fn resolve_all_params(chain: &ScopeChain, slot: &str, pt: ProviderType) -> ResolvedProviderParams {
     ResolvedProviderParams {
         model_list: resolve_model_list(chain, slot, pt),
         max_budget_credits: resolve_max_budget_credits(chain, slot, pt),
@@ -717,8 +712,7 @@ mod tests {
         // caches seeded + three per-provider configs declaring a
         // model_list at slot "mid".
         use crate::pyramid::walker_fleet_probe::{
-            clear_fleet_cache_for_tests, fleet_probe_test_lock, write_cached_peer,
-            CachedFleetPeer,
+            clear_fleet_cache_for_tests, fleet_probe_test_lock, write_cached_peer, CachedFleetPeer,
         };
         use crate::pyramid::walker_market_probe::{
             invalidate_cached_model, write_cached_model, CachedMarketModel, CachedOffer,
@@ -856,9 +850,8 @@ overrides:
 "#
             ),
         );
-        let d = DispatchDecision::build("mid", &conn).expect(
-            "non-Local providers are still Ready stubs → decision builds",
-        );
+        let d = DispatchDecision::build("mid", &conn)
+            .expect("non-Local providers are still Ready stubs → decision builds");
         assert!(
             !d.effective_call_order.contains(&ProviderType::Local),
             "Local must be absent when probe cache is unseeded, got {:?}",
@@ -1353,7 +1346,9 @@ overrides:
         use crate::pyramid::walker_breaker::{
             breaker_test_lock, clear_all_for_tests, record_failure, TRIP_THRESHOLD,
         };
-        let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _g = breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         clear_all_for_tests();
         let bid = "build-decision-skip";
         for _ in 0..TRIP_THRESHOLD {
@@ -1376,10 +1371,9 @@ slots:
         let err = DispatchDecision::build_with_build_id("mid", Some(bid), &conn).unwrap_err();
         match err {
             DecisionBuildError::NoReadyProviders { reasons, .. } => {
-                assert!(reasons.iter().any(|(_pt, r)| matches!(
-                    r,
-                    NotReadyReason::BreakerTripped { .. }
-                )));
+                assert!(reasons
+                    .iter()
+                    .any(|(_pt, r)| matches!(r, NotReadyReason::BreakerTripped { .. })));
             }
             other => panic!("expected NoReadyProviders, got {other:?}"),
         }
@@ -1392,7 +1386,9 @@ slots:
         use crate::pyramid::walker_breaker::{
             breaker_test_lock, clear_all_for_tests, record_failure, TRIP_THRESHOLD,
         };
-        let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _g = breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         clear_all_for_tests();
         for _ in 0..TRIP_THRESHOLD {
             record_failure("build-A", "mid", ProviderType::OpenRouter);
@@ -1412,8 +1408,7 @@ slots:
 "#,
         );
         // build-B still sees OpenRouter as Ready.
-        let d =
-            DispatchDecision::build_with_build_id("mid", Some("build-B"), &conn).unwrap();
+        let d = DispatchDecision::build_with_build_id("mid", Some("build-B"), &conn).unwrap();
         assert!(d.effective_call_order.contains(&ProviderType::OpenRouter));
         clear_all_for_tests();
     }
@@ -1426,7 +1421,9 @@ slots:
         use crate::pyramid::walker_breaker::{
             breaker_test_lock, clear_all_for_tests, record_failure, TRIP_THRESHOLD,
         };
-        let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _g = breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         clear_all_for_tests();
         for _ in 0..TRIP_THRESHOLD {
             record_failure("build-irrelevant", "mid", ProviderType::OpenRouter);
@@ -1463,7 +1460,9 @@ slots:
             clear_node_state_for_tests, invalidate_cached_model, node_state_test_lock,
             write_cached_model, CachedMarketModel, CachedOffer,
         };
-        let _g = node_state_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _g = node_state_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         clear_node_state_for_tests();
         let market_slug = "test-slot-policy-per-provider/market-model";
         write_cached_model(

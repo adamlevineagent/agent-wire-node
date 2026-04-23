@@ -144,7 +144,11 @@ fn page_with_etag_emits_csp_and_security_headers() {
     assert!(headers.contains_key("content-security-policy"));
     assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
     assert_eq!(headers.get("referrer-policy").unwrap(), "same-origin");
-    let csp = headers.get("content-security-policy").unwrap().to_str().unwrap();
+    let csp = headers
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(csp.contains("default-src 'self'"));
     assert!(csp.contains("frame-ancestors 'none'"));
 }
@@ -324,8 +328,10 @@ fn web_sessions_expired_lookup_returns_none() {
 #[test]
 fn ws_l_supersession_chains_history_and_returns_head() {
     let conn = fresh_ascii_db();
-    let id1 = insert_with_supersession(&conn, "test-slug", "banner", "h1", "art-v1", "grok").unwrap();
-    let id2 = insert_with_supersession(&conn, "test-slug", "banner", "h2", "art-v2", "grok").unwrap();
+    let id1 =
+        insert_with_supersession(&conn, "test-slug", "banner", "h1", "art-v1", "grok").unwrap();
+    let id2 =
+        insert_with_supersession(&conn, "test-slug", "banner", "h2", "art-v2", "grok").unwrap();
 
     // Head is the second (newest) row
     let head = lookup_head(&conn, "test-slug", "banner").unwrap().unwrap();

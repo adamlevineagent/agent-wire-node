@@ -351,12 +351,10 @@ mod tests {
         // Three separate user drill events on the leaf.
         let policy = make_policy(0.5, 0.0, 100);
         for _ in 0..3 {
-            record_demand_signal(&conn, "s", "leaf", "user_drill", Some("user"), &policy)
-                .unwrap();
+            record_demand_signal(&conn, "s", "leaf", "user_drill", Some("user"), &policy).unwrap();
         }
 
-        let leaf_total =
-            db::sum_demand_weight(&conn, "s", "leaf", "user_drill", "-1 day").unwrap();
+        let leaf_total = db::sum_demand_weight(&conn, "s", "leaf", "user_drill", "-1 day").unwrap();
         assert!(
             (leaf_total - 3.0).abs() < 1e-9,
             "three 1.0 signals sum to 3.0"
@@ -384,28 +382,21 @@ mod tests {
         // Drop signals on three distinct nodes on the same slug.
         // factor 0.0 → no propagation, each node gets exactly one row.
         let policy = make_policy(0.0, 0.0, 100);
-        record_demand_signal(&conn, "s", "L1-001", "agent_query", Some("user"), &policy)
-            .unwrap();
-        record_demand_signal(&conn, "s", "L1-002", "agent_query", Some("user"), &policy)
-            .unwrap();
-        record_demand_signal(&conn, "s", "L2-003", "agent_query", Some("user"), &policy)
-            .unwrap();
+        record_demand_signal(&conn, "s", "L1-001", "agent_query", Some("user"), &policy).unwrap();
+        record_demand_signal(&conn, "s", "L1-002", "agent_query", Some("user"), &policy).unwrap();
+        record_demand_signal(&conn, "s", "L2-003", "agent_query", Some("user"), &policy).unwrap();
 
         // Per-node lookup against a q-hash question id returns
         // zero (the old broken path).
-        let per_node_miss = db::sum_demand_weight(
-            &conn,
-            "s",
-            "q-abc123456789",
-            "agent_query",
-            "-1 day",
-        )
-        .unwrap();
-        assert!(per_node_miss < 1e-9, "per-node lookup on q-hash can never match");
+        let per_node_miss =
+            db::sum_demand_weight(&conn, "s", "q-abc123456789", "agent_query", "-1 day").unwrap();
+        assert!(
+            per_node_miss < 1e-9,
+            "per-node lookup on q-hash can never match"
+        );
 
         // Slug-level aggregation picks up all three signals.
-        let slug_total =
-            db::sum_slug_demand_weight(&conn, "s", "agent_query", "-1 day").unwrap();
+        let slug_total = db::sum_slug_demand_weight(&conn, "s", "agent_query", "-1 day").unwrap();
         assert!(
             (slug_total - 3.0).abs() < 1e-9,
             "slug aggregate counts all three drill events"
@@ -417,8 +408,7 @@ mod tests {
         assert!(other_slug < 1e-9, "slug filter is respected");
 
         // Different signal type gets zero.
-        let wrong_type =
-            db::sum_slug_demand_weight(&conn, "s", "user_drill", "-1 day").unwrap();
+        let wrong_type = db::sum_slug_demand_weight(&conn, "s", "user_drill", "-1 day").unwrap();
         assert!(wrong_type < 1e-9, "signal_type filter is respected");
     }
 
@@ -475,11 +465,7 @@ mod tests {
 
         let rows = db::list_on_demand_deferred_for_slug(&conn, "s").unwrap();
         let ids: Vec<String> = rows.into_iter().map(|r| r.question_id).collect();
-        assert_eq!(
-            ids.len(),
-            2,
-            "only on_demand + never rows are returned"
-        );
+        assert_eq!(ids.len(), 2, "only on_demand + never rows are returned");
         assert!(ids.contains(&"q-h1".to_string()));
         assert!(ids.contains(&"q-h2".to_string()));
         assert!(!ids.contains(&"q-h3".to_string()));
@@ -500,10 +486,8 @@ mod tests {
         // Mirror what handle_drill does on the from=search path:
         // emit `user_drill` then `search_hit` for the same node.
         let policy = make_policy(0.0, 0.0, 100); // factor=0 → no propagation
-        record_demand_signal(&conn, "p18b", "L1-001", "user_drill", Some("user"), &policy)
-            .unwrap();
-        record_demand_signal(&conn, "p18b", "L1-001", "search_hit", Some("user"), &policy)
-            .unwrap();
+        record_demand_signal(&conn, "p18b", "L1-001", "user_drill", Some("user"), &policy).unwrap();
+        record_demand_signal(&conn, "p18b", "L1-001", "search_hit", Some("user"), &policy).unwrap();
 
         // Both rows landed at the leaf node, with distinct signal types.
         let user_drill_total =
@@ -536,11 +520,9 @@ mod tests {
 
         // factor 0.5, floor 0.0 → leaf=1.0, p1=0.5, p2=0.25.
         let policy = make_policy(0.5, 0.0, 100);
-        record_demand_signal(&conn, "p18b", "leaf", "search_hit", Some("user"), &policy)
-            .unwrap();
+        record_demand_signal(&conn, "p18b", "leaf", "search_hit", Some("user"), &policy).unwrap();
 
-        let leaf =
-            db::sum_demand_weight(&conn, "p18b", "leaf", "search_hit", "-1 day").unwrap();
+        let leaf = db::sum_demand_weight(&conn, "p18b", "leaf", "search_hit", "-1 day").unwrap();
         let p1 = db::sum_demand_weight(&conn, "p18b", "p1", "search_hit", "-1 day").unwrap();
         let p2 = db::sum_demand_weight(&conn, "p18b", "p2", "search_hit", "-1 day").unwrap();
         assert!((leaf - 1.0).abs() < 1e-9, "leaf at full weight");

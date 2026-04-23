@@ -120,9 +120,7 @@ overrides:
 /// assertion expects.
 fn seed_local_ready(conn: &Connection, slug_suffix: &str) -> String {
     use wire_node_lib::pyramid::walker_ollama_probe::{write_cached_probe, CachedProbe};
-    let base_url = format!(
-        "http://test-walker-v3-market-{slug_suffix}.invalid:11434/v1"
-    );
+    let base_url = format!("http://test-walker-v3-market-{slug_suffix}.invalid:11434/v1");
     write_cached_probe(
         &base_url,
         CachedProbe {
@@ -156,8 +154,16 @@ fn cached_model(active_offers: i64, all_saturated: bool, only_self: bool) -> Cac
     let offers = if active_offers > 0 {
         vec![CachedOffer {
             offer_id: "offer-1".into(),
-            node_handle: if only_self { "me-node-id".into() } else { "other-node".into() },
-            operator_handle: if only_self { "me-op".into() } else { "other-op".into() },
+            node_handle: if only_self {
+                "me-node-id".into()
+            } else {
+                "other-node".into()
+            },
+            operator_handle: if only_self {
+                "me-op".into()
+            } else {
+                "other-op".into()
+            },
             typical_serve_ms_p50_7d: Some(1000.0),
             execution_concurrency: 1,
             current_queue_depth: if all_saturated { 5 } else { 0 },
@@ -187,8 +193,7 @@ fn phase3_decision_includes_market_when_offers_have_headroom() {
     write_cached_model(slug, cached_model(1, false, false));
     seed_walker_provider_market(&conn, "c-wpm-happy", "mid", &[slug], None);
 
-    let d = DispatchDecision::build("mid", &conn)
-        .expect("Decision must build with market ready");
+    let d = DispatchDecision::build("mid", &conn).expect("Decision must build with market ready");
     assert!(
         d.effective_call_order.contains(&ProviderType::Market),
         "Market MUST be in effective_call_order; got {:?}",
@@ -279,13 +284,7 @@ fn phase3_decision_drops_market_when_credit_balance_insufficient() {
     let _ = seed_local_ready(&conn, "insufficient");
     let slug = "phase3-market-readiness/insufficient-credit";
     write_cached_model(slug, cached_model(1, false, false));
-    seed_walker_provider_market(
-        &conn,
-        "c-wpm-insufficient",
-        "mid",
-        &[slug],
-        Some(1_000),
-    );
+    seed_walker_provider_market(&conn, "c-wpm-insufficient", "mid", &[slug], Some(1_000));
 
     let d = DispatchDecision::build("mid", &conn)
         .expect("non-Market providers still build the Decision");
@@ -310,16 +309,9 @@ fn phase3_decision_market_ready_when_budget_and_balance_both_high() {
     let _ = seed_local_ready(&conn, "sufficient");
     let slug = "phase3-market-readiness/sufficient-credit";
     write_cached_model(slug, cached_model(1, false, false));
-    seed_walker_provider_market(
-        &conn,
-        "c-wpm-sufficient",
-        "mid",
-        &[slug],
-        Some(1_000),
-    );
+    seed_walker_provider_market(&conn, "c-wpm-sufficient", "mid", &[slug], Some(1_000));
 
-    let d = DispatchDecision::build("mid", &conn)
-        .expect("Decision must build");
+    let d = DispatchDecision::build("mid", &conn).expect("Decision must build");
     assert!(
         d.effective_call_order.contains(&ProviderType::Market),
         "Market MUST be ready with sufficient balance; got {:?}",

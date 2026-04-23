@@ -18,8 +18,8 @@ use similar::{ChangeTag, TextDiff};
 use tracing::warn;
 
 use super::llm::LlmConfig;
-use super::step_context::compute_prompt_hash;
 use super::stale_helpers_upper::resolve_live_canonical_node_id;
+use super::step_context::compute_prompt_hash;
 
 // ── Public types ──────────────────────────────────────────────────────────
 
@@ -110,9 +110,7 @@ pub fn materialize_prompt(
         ("faq_redistill", _) => {
             // TODO: wire up FAQ redistillation prompts
             Ok(MaterializeResult::Prompt(MaterializedPrompt {
-                system_prompt: format!(
-                    "You are re-distilling FAQ categories for pyramid {slug}."
-                ),
+                system_prompt: format!("You are re-distilling FAQ categories for pyramid {slug}."),
                 user_prompt: format!(
                     "Re-evaluate and update the FAQ category for target {target_id}."
                 ),
@@ -355,10 +353,16 @@ fn materialize_rename_check(
 ) -> Result<MaterializeResult> {
     // Try to extract old_path/new_path from metadata_json first.
     let (old_path, new_path) = if let Some(detail) = detail_json {
-        let parsed: serde_json::Value = serde_json::from_str(detail)
-            .context("Failed to parse rename detail JSON")?;
-        let old = parsed.get("old_path").and_then(|v| v.as_str()).map(String::from);
-        let new = parsed.get("new_path").and_then(|v| v.as_str()).map(String::from);
+        let parsed: serde_json::Value =
+            serde_json::from_str(detail).context("Failed to parse rename detail JSON")?;
+        let old = parsed
+            .get("old_path")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let new = parsed
+            .get("new_path")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         match (old, new) {
             (Some(o), Some(n)) => (o, n),
             _ => {
@@ -536,7 +540,11 @@ fn parse_rename_target_id(target_id: &str) -> Option<(String, String)> {
     // Actually, we can be smarter: absolute paths on macOS start with /Users/ or
     // other known roots. The boundary is where we see a `/Users/` (or similar)
     // that isn't the start of the string.
-    if let Some(boundary) = rest[1..].find("/Users/").or_else(|| rest[1..].find("/home/")).or_else(|| rest[1..].find("/tmp/")) {
+    if let Some(boundary) = rest[1..]
+        .find("/Users/")
+        .or_else(|| rest[1..].find("/home/"))
+        .or_else(|| rest[1..].find("/tmp/"))
+    {
         let old_path = &rest[..boundary + 1];
         let new_path = &rest[boundary + 1..];
         if !old_path.is_empty() && !new_path.is_empty() {

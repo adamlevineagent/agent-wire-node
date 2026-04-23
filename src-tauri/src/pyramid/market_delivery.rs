@@ -235,9 +235,21 @@ enum RetryDecision {
 fn classify_retry_settlement(status: reqwest::StatusCode, headers: &HeaderMap) -> RetryDecision {
     if let Some(raw) = headers.get("X-Wire-Retry").and_then(|v| v.to_str().ok()) {
         match raw {
-            "never" => return RetryDecision::Terminal { source: "x_wire_retry_never" },
-            "transient" => return RetryDecision::Retry { source: "x_wire_retry_transient" },
-            "backoff" => return RetryDecision::Retry { source: "x_wire_retry_backoff" },
+            "never" => {
+                return RetryDecision::Terminal {
+                    source: "x_wire_retry_never",
+                }
+            }
+            "transient" => {
+                return RetryDecision::Retry {
+                    source: "x_wire_retry_transient",
+                }
+            }
+            "backoff" => {
+                return RetryDecision::Retry {
+                    source: "x_wire_retry_backoff",
+                }
+            }
             other => {
                 tracing::warn!(
                     header_value = %other,
@@ -247,9 +259,13 @@ fn classify_retry_settlement(status: reqwest::StatusCode, headers: &HeaderMap) -
         }
     }
     if TERMINAL_HTTP_CODES_FALLBACK.contains(&status.as_u16()) {
-        RetryDecision::Terminal { source: "http_code_fallback" }
+        RetryDecision::Terminal {
+            source: "http_code_fallback",
+        }
     } else {
-        RetryDecision::Retry { source: "http_code_fallback" }
+        RetryDecision::Retry {
+            source: "http_code_fallback",
+        }
     }
 }
 
@@ -260,9 +276,13 @@ fn classify_retry_settlement(status: reqwest::StatusCode, headers: &HeaderMap) -
 /// are non-retriable regardless of who's on the other end.
 fn classify_retry_content(status: reqwest::StatusCode) -> RetryDecision {
     if TERMINAL_HTTP_CODES_FALLBACK.contains(&status.as_u16()) {
-        RetryDecision::Terminal { source: "http_code_fallback" }
+        RetryDecision::Terminal {
+            source: "http_code_fallback",
+        }
     } else {
-        RetryDecision::Retry { source: "http_code_fallback" }
+        RetryDecision::Retry {
+            source: "http_code_fallback",
+        }
     }
 }
 
@@ -276,7 +296,10 @@ enum RetryAfterSource {
 }
 
 fn parse_retry_after_header(headers: &HeaderMap) -> (Option<u64>, RetryAfterSource) {
-    let v = match headers.get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()) {
+    let v = match headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+    {
         Some(s) => s.trim(),
         None => return (None, RetryAfterSource::Absent),
     };
@@ -345,7 +368,10 @@ fn build_content_envelope(
         }
         MarketAsyncResult::Error(msg) => ContentEnvelope::Failure {
             job_id: row.job_id.clone(),
-            error: CallbackError { code: classify_failure_code(msg), message: msg.clone() },
+            error: CallbackError {
+                code: classify_failure_code(msg),
+                message: msg.clone(),
+            },
         },
     }
 }
@@ -383,7 +409,10 @@ fn build_settlement_envelope(
         }
         MarketAsyncResult::Error(msg) => SettlementEnvelope::Failure {
             job_id: row.job_id.clone(),
-            error: CallbackError { code: classify_failure_code(msg), message: msg.clone() },
+            error: CallbackError {
+                code: classify_failure_code(msg),
+                message: msg.clone(),
+            },
         },
     }
 }
@@ -398,7 +427,11 @@ fn pick_model_used(resp: &crate::pyramid::market_dispatch::MarketDispatchRespons
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| {
-            if !resp.model.is_empty() { resp.model.clone() } else { "unknown".to_string() }
+            if !resp.model.is_empty() {
+                resp.model.clone()
+            } else {
+                "unknown".to_string()
+            }
         })
 }
 
@@ -486,23 +519,19 @@ pub struct DeliveryContext {
 
 /// Spawn the supervisor task that owns the delivery loop. Mirrors the
 /// pattern shipped in `market_mirror::spawn_market_mirror_task`.
-pub fn spawn_market_delivery_task(
-    ctx: DeliveryContext,
-    rx: mpsc::UnboundedReceiver<()>,
-) {
+pub fn spawn_market_delivery_task(ctx: DeliveryContext, rx: mpsc::UnboundedReceiver<()>) {
     tauri::async_runtime::spawn(async move {
         supervise_delivery_loop(ctx, rx).await;
     });
 }
 
-async fn supervise_delivery_loop(
-    ctx: DeliveryContext,
-    mut rx: mpsc::UnboundedReceiver<()>,
-) {
+async fn supervise_delivery_loop(ctx: DeliveryContext, mut rx: mpsc::UnboundedReceiver<()>) {
     const PANIC_BACKOFF_SECS: u64 = 5;
 
     loop {
-        let result = AssertUnwindSafe(delivery_loop(&ctx, &mut rx)).catch_unwind().await;
+        let result = AssertUnwindSafe(delivery_loop(&ctx, &mut rx))
+            .catch_unwind()
+            .await;
         match result {
             Ok(()) => {
                 record_lifecycle_event(
@@ -541,10 +570,7 @@ async fn supervise_delivery_loop(
     }
 }
 
-async fn delivery_loop(
-    ctx: &DeliveryContext,
-    rx: &mut mpsc::UnboundedReceiver<()>,
-) {
+async fn delivery_loop(ctx: &DeliveryContext, rx: &mut mpsc::UnboundedReceiver<()>) {
     tracing::info!("market delivery task started (rev 0.6.1 two-POST)");
 
     // One boot-push so a post-restart serving-true offer with ready rows
@@ -586,9 +612,8 @@ async fn tick(ctx: &DeliveryContext) {
     // `wire_parameters` out of the AuthState RwLock so we don't hold a
     // read lock across the DB/HTTP awaits below (Pillar 9 discipline).
     let wire_parameters = ctx.auth.read().await.wire_parameters.clone();
-    let delivery_policy =
-        ComputeDeliveryPolicy::from_wire_parameters(&wire_parameters)
-            .unwrap_or_else(ComputeDeliveryPolicy::contract_defaults);
+    let delivery_policy = ComputeDeliveryPolicy::from_wire_parameters(&wire_parameters)
+        .unwrap_or_else(ComputeDeliveryPolicy::contract_defaults);
     // `requester_delivery_jwt_ttl_secs` is a scalar (not part of
     // `compute_delivery_policy`) shipped via heartbeat `wire_parameters`.
     // Default per contract rev 2.0 §3.4 = fill_job_ttl_secs = 1800s. Used
@@ -651,11 +676,13 @@ async fn tick(ctx: &DeliveryContext) {
     let jobs: Vec<(String, String, Leg)> = content_rows
         .iter()
         .map(|r| (r.dispatcher_node_id.clone(), r.job_id.clone(), Leg::Content))
-        .chain(
-            settlement_rows
-                .iter()
-                .map(|r| (r.dispatcher_node_id.clone(), r.job_id.clone(), Leg::Settlement)),
-        )
+        .chain(settlement_rows.iter().map(|r| {
+            (
+                r.dispatcher_node_id.clone(),
+                r.job_id.clone(),
+                Leg::Settlement,
+            )
+        }))
         .collect();
 
     let db_path = ctx.db_path.clone();
@@ -692,11 +719,15 @@ async fn tick(ctx: &DeliveryContext) {
     let union: Vec<(crate::pyramid::db::OutboxRow, Leg, Option<i64>)> = content_rows
         .into_iter()
         .map(|r| {
-            let rid = rowid_map.get(&(r.dispatcher_node_id.clone(), r.job_id.clone())).copied();
+            let rid = rowid_map
+                .get(&(r.dispatcher_node_id.clone(), r.job_id.clone()))
+                .copied();
             (r, Leg::Content, rid)
         })
         .chain(settlement_rows.into_iter().map(|r| {
-            let rid = rowid_map.get(&(r.dispatcher_node_id.clone(), r.job_id.clone())).copied();
+            let rid = rowid_map
+                .get(&(r.dispatcher_node_id.clone(), r.job_id.clone()))
+                .copied();
             (r, Leg::Settlement, rid)
         }))
         .collect();
@@ -851,8 +882,16 @@ async fn deliver_leg(
             &format!("callback_url_validation_failed: {e}"),
             p.max_error_message_chars,
         );
-        terminal_leg_fail(ctx, &row, rowid, leg, &msg, "callback_url_validation_failed", p)
-            .await;
+        terminal_leg_fail(
+            ctx,
+            &row,
+            rowid,
+            leg,
+            &msg,
+            "callback_url_validation_failed",
+            p,
+        )
+        .await;
         return;
     }
 
@@ -907,7 +946,10 @@ async fn deliver_leg(
     {
         Ok(c) => c,
         Err(e) => {
-            let err = truncate(&format!("http client build: {e}"), p.max_error_message_chars);
+            let err = truncate(
+                &format!("http client build: {e}"),
+                p.max_error_message_chars,
+            );
             tracing::error!(err = %err, leg = leg.label(),
                 "delivery_worker: http client construction failed");
             return;
@@ -950,7 +992,16 @@ async fn deliver_leg(
 
     // 6. Branch on outcome.
     if status.is_success() {
-        leg_success(ctx, &row, rowid, leg, p, post_duration_ms, latency_ms_source).await;
+        leg_success(
+            ctx,
+            &row,
+            rowid,
+            leg,
+            p,
+            post_duration_ms,
+            latency_ms_source,
+        )
+        .await;
         return;
     }
 
@@ -1157,13 +1208,15 @@ async fn leg_success(
         let retention = p.failed_retention_secs;
         let cas = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
             let conn = rusqlite::Connection::open(&db_path)?;
-            Ok(crate::pyramid::db::market_outbox_mark_failed_with_error_cas(
-                &conn,
-                &dispatcher,
-                &job_id,
-                &last_err,
-                retention,
-            )?)
+            Ok(
+                crate::pyramid::db::market_outbox_mark_failed_with_error_cas(
+                    &conn,
+                    &dispatcher,
+                    &job_id,
+                    &last_err,
+                    retention,
+                )?,
+            )
         })
         .await;
         if let Ok(Ok(n)) = cas {
@@ -1517,13 +1570,15 @@ async fn terminal_leg_fail_with_extra(
         let retention = p.failed_retention_secs;
         let cas = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
             let conn = rusqlite::Connection::open(&db_path)?;
-            Ok(crate::pyramid::db::market_outbox_mark_failed_with_error_cas(
-                &conn,
-                &dispatcher,
-                &job_id,
-                &last_err,
-                retention,
-            )?)
+            Ok(
+                crate::pyramid::db::market_outbox_mark_failed_with_error_cas(
+                    &conn,
+                    &dispatcher,
+                    &job_id,
+                    &last_err,
+                    retention,
+                )?,
+            )
         })
         .await;
         if let Ok(Ok(n)) = cas {
@@ -1571,11 +1626,11 @@ fn age_secs_from_created_at(created_at: &str) -> i64 {
     chrono::NaiveDateTime::parse_from_str(created_at, "%Y-%m-%d %H:%M:%S")
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(created_at, "%Y-%m-%dT%H:%M:%S%.f"))
         .map(|ndt| {
-            let created = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-                ndt,
-                chrono::Utc,
-            );
-            chrono::Utc::now().signed_duration_since(created).num_seconds()
+            let created =
+                chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc);
+            chrono::Utc::now()
+                .signed_duration_since(created)
+                .num_seconds()
         })
         .unwrap_or(0)
 }
@@ -1738,7 +1793,10 @@ mod tests {
         let row = sample_row();
         let env = build_content_envelope(&row, &success_result());
         let json_str = serde_json::to_string(&env).unwrap();
-        assert!(json_str.contains("\"content\":\"the answer\""), "got: {json_str}");
+        assert!(
+            json_str.contains("\"content\":\"the answer\""),
+            "got: {json_str}"
+        );
         assert!(json_str.contains("\"input_tokens\":7"));
         assert!(json_str.contains("\"output_tokens\":3"));
         assert!(json_str.contains("\"latency_ms\":450"));
@@ -1755,8 +1813,10 @@ mod tests {
         let cj = serde_json::to_value(&content).unwrap();
         let sj = serde_json::to_value(&settlement).unwrap();
         // Identical: type, job_id, error.code, error.message.
-        assert_eq!(cj, sj,
-            "failure envelope must be identical across legs per D4; content={cj} settlement={sj}");
+        assert_eq!(
+            cj, sj,
+            "failure envelope must be identical across legs per D4; content={cj} settlement={sj}"
+        );
     }
 
     #[test]
@@ -1840,11 +1900,20 @@ mod tests {
 
     #[test]
     fn classify_failure_codes() {
-        assert_eq!(classify_failure_code("worker heartbeat lost"), "worker_heartbeat_lost");
-        assert_eq!(classify_failure_code("Ollama timeout after 30s"), "model_timeout");
+        assert_eq!(
+            classify_failure_code("worker heartbeat lost"),
+            "worker_heartbeat_lost"
+        );
+        assert_eq!(
+            classify_failure_code("Ollama timeout after 30s"),
+            "model_timeout"
+        );
         assert_eq!(classify_failure_code("Request timed out"), "model_timeout");
         assert_eq!(classify_failure_code("Out of memory on GPU"), "oom");
-        assert_eq!(classify_failure_code("messages: invalid role 'assistant'"), "invalid_messages");
+        assert_eq!(
+            classify_failure_code("messages: invalid role 'assistant'"),
+            "invalid_messages"
+        );
         assert_eq!(classify_failure_code("garbled LLM response"), "model_error");
     }
 
@@ -1881,11 +1950,17 @@ mod tests {
         for code in TERMINAL_HTTP_CODES_FALLBACK {
             let status = reqwest::StatusCode::from_u16(*code).unwrap();
             assert!(
-                matches!(classify_retry_settlement(status, &headers), RetryDecision::Terminal { .. }),
+                matches!(
+                    classify_retry_settlement(status, &headers),
+                    RetryDecision::Terminal { .. }
+                ),
                 "settlement: HTTP {code} must be terminal"
             );
             assert!(
-                matches!(classify_retry_content(status), RetryDecision::Terminal { .. }),
+                matches!(
+                    classify_retry_content(status),
+                    RetryDecision::Terminal { .. }
+                ),
                 "content: HTTP {code} must be terminal"
             );
         }
@@ -1928,7 +2003,10 @@ mod tests {
     #[test]
     fn retry_after_invalid_value() {
         let mut headers = HeaderMap::new();
-        headers.insert(reqwest::header::RETRY_AFTER, "not-a-valid-thing".parse().unwrap());
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "not-a-valid-thing".parse().unwrap(),
+        );
         let (secs, src) = parse_retry_after_header(&headers);
         assert_eq!(secs, None);
         assert!(matches!(src, RetryAfterSource::HeaderInvalid));
@@ -1989,8 +2067,10 @@ mod tests {
             token: "SHOULD_NEVER_APPEAR_IN_LOGS_12345".into(),
         };
         let debug_str = format!("{auth:?}");
-        assert!(!debug_str.contains("SHOULD_NEVER_APPEAR_IN_LOGS_12345"),
-            "token must be redacted in Debug; got: {debug_str}");
+        assert!(
+            !debug_str.contains("SHOULD_NEVER_APPEAR_IN_LOGS_12345"),
+            "token must be redacted in Debug; got: {debug_str}"
+        );
         assert!(debug_str.contains("<redacted>"));
         assert!(debug_str.contains("bearer"));
     }

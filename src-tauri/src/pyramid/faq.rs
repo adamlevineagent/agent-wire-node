@@ -59,8 +59,15 @@ pub async fn process_annotation(
             "[faq] no existing FAQs for slug '{}', creating new FAQ",
             slug
         );
-        let faq =
-            create_new_faq(writer, slug, &question_context, annotation, base_config, model).await?;
+        let faq = create_new_faq(
+            writer,
+            slug,
+            &question_context,
+            annotation,
+            base_config,
+            model,
+        )
+        .await?;
         return Ok(Some(faq));
     }
 
@@ -118,7 +125,8 @@ pub async fn process_annotation(
         );
 
         // Update the matched FAQ with new annotation content
-        let updated = update_faq_answer(reader, writer, faq_id, annotation, base_config, model).await?;
+        let updated =
+            update_faq_answer(reader, writer, faq_id, annotation, base_config, model).await?;
         Ok(Some(updated))
     } else {
         // NEW — create a fresh FAQ
@@ -126,8 +134,15 @@ pub async fn process_annotation(
             "[faq] annotation {} generates new FAQ for slug '{}'",
             annotation.id, slug
         );
-        let faq =
-            create_new_faq(writer, slug, &question_context, annotation, base_config, model).await?;
+        let faq = create_new_faq(
+            writer,
+            slug,
+            &question_context,
+            annotation,
+            base_config,
+            model,
+        )
+        .await?;
         Ok(Some(faq))
     }
 }
@@ -583,7 +598,8 @@ pub async fn get_faq_directory(
 
     let categories = if existing_categories.is_empty() {
         // No categories exist — run meta-pass
-        match run_faq_category_meta_pass(reader, writer, slug, &all_faqs, base_config, model).await {
+        match run_faq_category_meta_pass(reader, writer, slug, &all_faqs, base_config, model).await
+        {
             Ok(cats) => cats,
             Err(e) => {
                 warn!(

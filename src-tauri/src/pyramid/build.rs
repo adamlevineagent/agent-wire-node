@@ -66,7 +66,6 @@ pub enum WriteOp {
     },
 }
 
-
 // ── HELPERS ──────────────────────────────────────────────────────────────────
 
 /// Call the LLM and parse JSON from the response.  On parse failure, retry once
@@ -85,15 +84,7 @@ pub(crate) async fn call_and_parse(
         None,
         system,
     );
-    let resp = call_model_and_ctx(
-        config,
-        cache_ctx.as_ref(),
-        system,
-        user,
-        0.3,
-        50_000,
-    )
-    .await?;
+    let resp = call_model_and_ctx(config, cache_ctx.as_ref(), system, user, 0.3, 50_000).await?;
     match extract_json(&resp) {
         Ok(v) => Ok(v),
         Err(_) => {
@@ -108,21 +99,13 @@ pub(crate) async fn call_and_parse(
                 None,
                 system,
             );
-            let resp2 = call_model_and_ctx(
-                config,
-                retry_ctx.as_ref(),
-                system,
-                user,
-                0.1,
-                50_000,
-            )
-            .await?;
+            let resp2 =
+                call_model_and_ctx(config, retry_ctx.as_ref(), system, user, 0.1, 50_000).await?;
             extract_json(&resp2)
                 .map_err(|e| anyhow!("JSON parse failed twice for {fallback_key}: {e}"))
         }
     }
 }
-
 
 /// Send a SaveNode WriteOp through the channel.
 /// Logs and continues if the writer channel has closed.
@@ -199,7 +182,6 @@ pub(crate) async fn flush_writes(writer_tx: &mpsc::Sender<WriteOp>) {
     let _ = rx.await;
 }
 
-
 // ── TOPICAL VINE PIPELINE (Phase 16) ─────────────────────────────────────────
 
 /// Build a topical vine by dispatching the `topical-vine` chain through the
@@ -264,13 +246,13 @@ pub async fn build_topical_vine(
         state,
         &chain,
         slug,
-        0,     // from_depth
-        None,  // stop_after
-        None,  // force_from
+        0,    // from_depth
+        None, // stop_after
+        None, // force_from
         cancel,
         Some(progress_tx.clone()),
-        None,  // layer_tx
-        None,  // initial_context
+        None, // layer_tx
+        None, // initial_context
     )
     .await?;
 
@@ -284,7 +266,6 @@ pub async fn build_topical_vine(
 
     Ok(failures)
 }
-
 
 /// Build a JSON payload from a node, preferring topics if available.
 pub(crate) fn child_payload_json(node: &PyramidNode) -> Value {
@@ -330,7 +311,8 @@ pub(crate) fn episodic_child_payload_json(node: &PyramidNode) -> Value {
 
     // Weight as object shape matching synthesize_recursive.md contract
     if node.weight > 0.0 {
-        payload["weight"] = serde_json::json!({"tokens": node.weight, "turns": 0, "fraction_of_parent": 0.0});
+        payload["weight"] =
+            serde_json::json!({"tokens": node.weight, "turns": 0, "fraction_of_parent": 0.0});
     }
 
     if !node.decisions.is_empty() {

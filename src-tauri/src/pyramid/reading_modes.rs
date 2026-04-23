@@ -52,11 +52,7 @@ pub fn reading_walk(
 ) -> Result<WalkView> {
     let total_count = db::count_nodes_at_depth(conn, slug, layer)?;
 
-    let order = if direction == "oldest" {
-        "ASC"
-    } else {
-        "DESC"
-    };
+    let order = if direction == "oldest" { "ASC" } else { "DESC" };
 
     let sql = format!(
         "SELECT id, chunk_index, headline, distilled, time_range_start, time_range_end, weight, topics
@@ -71,8 +67,7 @@ pub fn reading_walk(
         rusqlite::params![slug, layer, limit as i64, offset as i64],
         |row| {
             let topics_json: String = row.get::<_, String>(7).unwrap_or_default();
-            let topics: Vec<Topic> =
-                serde_json::from_str(&topics_json).unwrap_or_default();
+            let topics: Vec<Topic> = serde_json::from_str(&topics_json).unwrap_or_default();
             let topic_names: Vec<String> = topics.iter().map(|t| t.name.clone()).collect();
 
             let time_range_start: Option<String> = row.get(4).ok().flatten();
@@ -238,7 +233,11 @@ pub fn reading_decisions(
     }
 
     // Sort by importance DESC
-    entries.sort_by(|a, b| b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal));
+    entries.sort_by(|a, b| {
+        b.importance
+            .partial_cmp(&a.importance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let total_count = entries.len();
 
@@ -274,7 +273,11 @@ pub fn reading_speaker(conn: &Connection, slug: &str, role: &str) -> Result<Spea
     }
 
     // Sort by importance DESC
-    quotes.sort_by(|a, b| b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal));
+    quotes.sort_by(|a, b| {
+        b.importance
+            .partial_cmp(&a.importance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let total_count = quotes.len();
 
@@ -325,11 +328,7 @@ pub fn reading_search(
 
 /// Walk up the parent_id chain from a node to the apex, collecting ancestor
 /// nodes along the way. Returns ancestors ordered from immediate parent to apex.
-fn build_ancestor_chain(
-    conn: &Connection,
-    slug: &str,
-    node_id: &str,
-) -> Result<Vec<AncestorNode>> {
+fn build_ancestor_chain(conn: &Connection, slug: &str, node_id: &str) -> Result<Vec<AncestorNode>> {
     let mut ancestors = Vec::new();
     let mut current_id = node_id.to_string();
 
@@ -521,7 +520,10 @@ mod tests {
             .iter()
             .map(|d| d.source_node_id.as_str())
             .collect();
-        assert!(node_ids.len() > 1, "Decisions should come from multiple nodes");
+        assert!(
+            node_ids.len() > 1,
+            "Decisions should come from multiple nodes"
+        );
 
         // Sorted by importance DESC
         for window in result.decisions.windows(2) {

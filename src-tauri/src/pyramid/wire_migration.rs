@@ -57,8 +57,8 @@ use crate::pyramid::config_contributions::create_config_contribution_with_metada
 use crate::pyramid::db::{ChainAssignmentYaml, ChainDefaultsYaml};
 use crate::pyramid::prompt_cache::normalize_prompt_path;
 use crate::pyramid::wire_native_metadata::{
-    default_wire_native_metadata, WireContributionType, WireMaturity, WireNativeMetadata,
-    WireRef, WireSectionOverride,
+    default_wire_native_metadata, WireContributionType, WireMaturity, WireNativeMetadata, WireRef,
+    WireSectionOverride,
 };
 
 /// Migration-marker sentinel schema_type. Uses the same pattern as
@@ -423,8 +423,7 @@ pub fn migrate_prompts_and_chains_to_contributions(
     if report.prompts_inserted > 0
         || report.chains_inserted > 0
         || report.schema_annotations_inserted > 0
-        || (report.prompts_skipped_already_present > 0
-            && report.chains_skipped_already_present > 0)
+        || (report.prompts_skipped_already_present > 0 && report.chains_skipped_already_present > 0)
     {
         let marker_id = uuid::Uuid::new_v4().to_string();
         crate::pyramid::config_contributions::write_contribution_envelope(
@@ -623,10 +622,7 @@ fn walk_prompt_files(
 
         // Skip `_archived/` subdirectories entirely.
         if path.is_dir() {
-            let dir_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if dir_name == "_archived" {
                 continue;
             }
@@ -664,7 +660,10 @@ fn walk_prompt_files(
 /// Accumulates `(path, chain_id, bundle_yaml)` tuples. The `chain_id`
 /// is extracted from the YAML's top-level `id:` field (fallback: the
 /// filename stem).
-fn walk_chain_files(root: &Path, out: &mut Vec<(std::path::PathBuf, String, String)>) -> Result<()> {
+fn walk_chain_files(
+    root: &Path,
+    out: &mut Vec<(std::path::PathBuf, String, String)>,
+) -> Result<()> {
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
         Err(e) => {
@@ -930,8 +929,7 @@ pub fn load_bundled_manifest() -> Result<BundledContributionsManifest> {
     // `include_str!` paths are relative to the current Rust source file
     // (src-tauri/src/pyramid/wire_migration.rs). The assets directory
     // lives at src-tauri/assets/, so we go up three levels.
-    const MANIFEST_JSON: &str =
-        include_str!("../../assets/bundled_contributions.json");
+    const MANIFEST_JSON: &str = include_str!("../../assets/bundled_contributions.json");
     let manifest: BundledContributionsManifest = serde_json::from_str(MANIFEST_JSON)
         .map_err(|e| anyhow::anyhow!("failed to parse bundled contributions manifest: {e}"))?;
     Ok(manifest)
@@ -948,10 +946,7 @@ pub fn load_bundled_manifest() -> Result<BundledContributionsManifest> {
 /// Keeps the Phase 5 mapping table as the single source of truth for
 /// per-schema-type default tags; Phase 9 just adds per-entry extras.
 fn build_bundled_metadata(entry: &BundledContributionEntry) -> WireNativeMetadata {
-    let mut metadata = default_wire_native_metadata(
-        &entry.schema_type,
-        entry.slug.as_deref(),
-    );
+    let mut metadata = default_wire_native_metadata(&entry.schema_type, entry.slug.as_deref());
     metadata.maturity = WireMaturity::Canon;
     metadata.price = Some(1);
 
@@ -1487,9 +1482,7 @@ pub struct BundledMigrationReport {
 /// INSERT OR IGNORE therefore skips the bundled row on re-run, which
 /// correctly preserves the user's work. The user's refinement remains
 /// the active version for that (schema_type, slug) pair.
-pub fn walk_bundled_contributions_manifest(
-    conn: &Connection,
-) -> Result<BundledMigrationReport> {
+pub fn walk_bundled_contributions_manifest(conn: &Connection) -> Result<BundledMigrationReport> {
     let mut report = BundledMigrationReport::default();
 
     let manifest = match load_bundled_manifest() {
@@ -1935,8 +1928,7 @@ fields:
         let conn = mem_conn();
         let chains = setup_chains_dir();
 
-        let report =
-            migrate_prompts_and_chains_to_contributions(&conn, chains.path()).unwrap();
+        let report = migrate_prompts_and_chains_to_contributions(&conn, chains.path()).unwrap();
 
         assert!(report.ran);
         assert_eq!(report.prompts_inserted, 3);
@@ -1978,8 +1970,7 @@ fields:
         let conn = mem_conn();
         let chains = setup_chains_dir();
 
-        let report =
-            migrate_prompts_and_chains_to_contributions(&conn, chains.path()).unwrap();
+        let report = migrate_prompts_and_chains_to_contributions(&conn, chains.path()).unwrap();
         assert_eq!(report.chains_inserted, 2);
 
         // question-pipeline chain should have 2 derived_from entries
@@ -2043,8 +2034,7 @@ fields:
         let conn = mem_conn();
         let dir = TempDir::new().unwrap();
         // No prompts/ or defaults/ subdirs.
-        let report =
-            migrate_prompts_and_chains_to_contributions(&conn, dir.path()).unwrap();
+        let report = migrate_prompts_and_chains_to_contributions(&conn, dir.path()).unwrap();
         assert!(report.ran);
         assert_eq!(report.prompts_inserted, 0);
         assert_eq!(report.chains_inserted, 0);
@@ -2131,8 +2121,7 @@ applies_to: 'chain_step_config'
         let conn = mem_conn();
         let chains = setup_chains_dir();
 
-        let report =
-            migrate_prompts_and_chains_to_contributions(&conn, chains.path()).unwrap();
+        let report = migrate_prompts_and_chains_to_contributions(&conn, chains.path()).unwrap();
         assert!(report.ran);
         assert_eq!(
             report.schema_annotations_inserted, 2,
@@ -2178,15 +2167,13 @@ applies_to: 'chain_step_config'
         let conn = mem_conn();
         let chains = setup_chains_dir();
 
-        let first =
-            migrate_prompts_and_chains_to_contributions(&conn, chains.path()).unwrap();
+        let first = migrate_prompts_and_chains_to_contributions(&conn, chains.path()).unwrap();
         assert_eq!(first.schema_annotations_inserted, 2);
 
         // Second run short-circuits on the disk-walk sentinel — no
         // duplicates from the disk walk. Phase 9 bundled annotations
         // (from the manifest) are still present but counted separately.
-        let second =
-            migrate_prompts_and_chains_to_contributions(&conn, chains.path()).unwrap();
+        let second = migrate_prompts_and_chains_to_contributions(&conn, chains.path()).unwrap();
         assert!(!second.ran);
 
         // Total schema_annotation count = 2 disk-migrated (from
@@ -2358,8 +2345,7 @@ applies_to: 'chain_step_config'
         .unwrap();
 
         let dir = TempDir::new().unwrap();
-        let report =
-            migrate_prompts_and_chains_to_contributions(&conn, dir.path()).unwrap();
+        let report = migrate_prompts_and_chains_to_contributions(&conn, dir.path()).unwrap();
         // Disk walk short-circuits (sentinel present).
         assert!(!report.ran);
         // But Phase 9 bundled walk still ran.
@@ -2766,15 +2752,19 @@ applies_to: 'chain_step_config'
             )
             .unwrap();
         // The original explicit override (market_visibility=false) must survive.
-        assert!(new_yaml.contains("allow_market_visibility: false"),
-            "original explicit override must be preserved:\n{new_yaml}");
+        assert!(
+            new_yaml.contains("allow_market_visibility: false"),
+            "original explicit override must be preserved:\n{new_yaml}"
+        );
         // Fleet fields still true.
         assert!(new_yaml.contains("allow_fleet_dispatch: true"));
         assert!(new_yaml.contains("allow_fleet_serving: true"));
         // Previously-absent fields: now explicit at their projected
         // values for hybrid mode (true — the DD-I hybrid projection).
-        assert!(new_yaml.contains("allow_market_dispatch: true"),
-            "hybrid projection for market_dispatch must be explicit:\n{new_yaml}");
+        assert!(
+            new_yaml.contains("allow_market_dispatch: true"),
+            "hybrid projection for market_dispatch must be explicit:\n{new_yaml}"
+        );
         assert!(new_yaml.contains("allow_storage_pulling: true"));
         assert!(new_yaml.contains("allow_storage_hosting: true"));
         assert!(new_yaml.contains("allow_relay_usage: true"));
@@ -2792,8 +2782,10 @@ applies_to: 'chain_step_config'
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(yaml_after, yaml_before,
-            "canonicalization must be idempotent on already-canonical YAML");
+        assert_eq!(
+            yaml_after, yaml_before,
+            "canonicalization must be idempotent on already-canonical YAML"
+        );
     }
 
     #[test]
@@ -2871,8 +2863,10 @@ applies_to: 'chain_step_config'
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(valid.contains("allow_relay_serving:"),
-            "valid row must have the 5 new fields explicit");
+        assert!(
+            valid.contains("allow_relay_serving:"),
+            "valid row must have the 5 new fields explicit"
+        );
     }
 
     #[test]
@@ -2896,8 +2890,7 @@ fields:
         )
         .unwrap();
 
-        let report =
-            migrate_prompts_and_chains_to_contributions(&conn, dir.path()).unwrap();
+        let report = migrate_prompts_and_chains_to_contributions(&conn, dir.path()).unwrap();
         assert!(report.ran);
         assert_eq!(report.prompts_inserted, 0);
         assert_eq!(report.chains_inserted, 0);
@@ -2914,7 +2907,8 @@ fields:
         // sync_chain_defaults_to_operational. Active dispatch_policy
         // contribution → operational pyramid_dispatch_policy row.
         let conn = mem_conn();
-        let yaml = "version: 1\nprovider_pools:\n  openrouter: { concurrency: 4 }\nrouting_rules: []\n";
+        let yaml =
+            "version: 1\nprovider_pools:\n  openrouter: { concurrency: 4 }\nrouting_rules: []\n";
         insert_active_row(
             &conn,
             "test-dispatch-policy-v1",

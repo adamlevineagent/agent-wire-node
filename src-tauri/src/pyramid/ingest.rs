@@ -775,7 +775,10 @@ pub fn default_ingest_config() -> IngestConfig {
         chunk_target_lines: t2.chunk_target_lines,
         chunk_target_tokens: 0, // Not yet used; kept for forward compat with Q11 formula
         code_extensions: {
-            let mut v: Vec<String> = code_extensions().into_iter().map(|s| s.to_string()).collect();
+            let mut v: Vec<String> = code_extensions()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
             v.sort();
             v
         },
@@ -790,7 +793,10 @@ pub fn default_ingest_config() -> IngestConfig {
             v
         },
         doc_extensions: {
-            let mut v: Vec<String> = doc_extensions().into_iter().map(|s| s.to_string()).collect();
+            let mut v: Vec<String> = doc_extensions()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
             v.sort();
             v
         },
@@ -1137,7 +1143,10 @@ mod tests {
         config2.chunk_target_lines = 200; // different from default 100
         let sig1 = ingest_signature(&ContentType::Conversation, &config1);
         let sig2 = ingest_signature(&ContentType::Conversation, &config2);
-        assert_ne!(sig1, sig2, "Different chunk_target_lines should produce different signatures");
+        assert_ne!(
+            sig1, sig2,
+            "Different chunk_target_lines should produce different signatures"
+        );
 
         // Also test code with different extensions
         config1.code_extensions = vec![".rs".to_string()];
@@ -1145,7 +1154,10 @@ mod tests {
         config2.chunk_target_lines = config1.chunk_target_lines; // same lines
         let sig3 = ingest_signature(&ContentType::Code, &config1);
         let sig4 = ingest_signature(&ContentType::Code, &config2);
-        assert_ne!(sig3, sig4, "Different extensions should produce different signatures");
+        assert_ne!(
+            sig3, sig4,
+            "Different extensions should produce different signatures"
+        );
     }
 
     #[test]
@@ -1344,7 +1356,7 @@ mod tests {
             SourceFile {
                 path: "/src/file_a.rs".to_string(),
                 mtime: "2026-04-08T11:00:00Z".to_string(), // different mtime
-                file_hash: "hash_a_v2".to_string(),         // different hash
+                file_hash: "hash_a_v2".to_string(),        // different hash
                 size: 100,
             },
             SourceFile {
@@ -1374,11 +1386,8 @@ mod tests {
         std::fs::write(tmp.join("session.jsonl"), "{}").unwrap();
         std::fs::write(tmp.join("notes.txt"), "not a jsonl").unwrap();
 
-        let files = scan_source_directory(
-            tmp.to_str().unwrap(),
-            &ContentType::Conversation,
-        )
-        .unwrap();
+        let files =
+            scan_source_directory(tmp.to_str().unwrap(), &ContentType::Conversation).unwrap();
 
         assert_eq!(files.len(), 1);
         assert!(files[0].path.ends_with("session.jsonl"));

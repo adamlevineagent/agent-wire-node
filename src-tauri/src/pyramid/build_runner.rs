@@ -26,8 +26,7 @@ use super::question_decomposition::{
 };
 use super::slug;
 use super::types::{
-    BuildProgress, CharacterizationResult, ContentType, HandlePath, LayerEvent,
-    RemoteWebEdge,
+    BuildProgress, CharacterizationResult, ContentType, HandlePath, LayerEvent, RemoteWebEdge,
 };
 use super::vine_composition;
 use super::wire_import::RemotePyramidClient;
@@ -85,7 +84,10 @@ pub async fn check_absorption_rate_limit(
         let now = std::time::Instant::now();
 
         // --- Per-operator hourly rate limit ---
-        let hourly_entry = gate.hourly.entry(operator_id.to_string()).or_insert((0, now));
+        let hourly_entry = gate
+            .hourly
+            .entry(operator_id.to_string())
+            .or_insert((0, now));
         let hourly_elapsed = now.duration_since(hourly_entry.1);
 
         let (new_hourly_count, new_hourly_start) =
@@ -128,7 +130,10 @@ pub async fn check_absorption_rate_limit(
             };
 
         // Both checks passed — commit both increments atomically
-        gate.hourly.insert(operator_id.to_string(), (new_hourly_count, new_hourly_start));
+        gate.hourly.insert(
+            operator_id.to_string(),
+            (new_hourly_count, new_hourly_start),
+        );
         gate.daily = (new_daily_spend, new_daily_start);
     }
 
@@ -164,7 +169,18 @@ pub async fn run_build(
     write_tx: &mpsc::Sender<WriteOp>,
     layer_tx: Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
-    run_build_from(state, slug_name, 0, None, None, cancel, progress_tx, write_tx, layer_tx).await
+    run_build_from(
+        state,
+        slug_name,
+        0,
+        None,
+        None,
+        cancel,
+        progress_tx,
+        write_tx,
+        layer_tx,
+    )
+    .await
 }
 
 /// Run a build from a specific depth, reusing nodes below that depth.
@@ -181,9 +197,18 @@ pub async fn run_build_from(
     layer_tx: Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
     run_build_from_with_evidence_mode(
-        state, slug_name, from_depth, stop_after, force_from,
-        "deep", cancel, progress_tx, write_tx, layer_tx,
-    ).await
+        state,
+        slug_name,
+        from_depth,
+        stop_after,
+        force_from,
+        "deep",
+        cancel,
+        progress_tx,
+        write_tx,
+        layer_tx,
+    )
+    .await
 }
 
 /// Run a build from a specific depth with explicit evidence_mode control.
@@ -298,9 +323,10 @@ pub async fn run_build_from_with_evidence_mode(
                     (
                         "What happened during this conversation? What was discussed, \
                          what decisions were made, how did the discussion evolve, \
-                         and what are the key takeaways?".to_string(),
-                        3u32,  // balanced granularity
-                        3u32,  // reasonable depth for conversations
+                         and what are the key takeaways?"
+                            .to_string(),
+                        3u32, // balanced granularity
+                        3u32, // reasonable depth for conversations
                     )
                 }
             }
@@ -415,7 +441,8 @@ async fn run_post_build_hooks(
                 let detail = serde_json::json!({
                     "reason": "base_slug_rebuilt",
                     "source_slug": slug_owned,
-                }).to_string();
+                })
+                .to_string();
                 let mut notified = 0usize;
                 for referrer in &referrers {
                     // Canonical write: observation event (old WAL INSERT removed)
@@ -553,9 +580,15 @@ async fn run_post_build_hooks(
             // executions) not network_fell_back_local attempts, per the
             // plan §4.7 metadata semantics (total_llm_calls = network +
             // local + openrouter).
-            let (network_calls, distinct_providers, avg_latency_ms,
-                 total_credits_spent, local_calls, openrouter_calls,
-                 total_llm_calls) = match &resolved_build_id {
+            let (
+                network_calls,
+                distinct_providers,
+                avg_latency_ms,
+                total_credits_spent,
+                local_calls,
+                openrouter_calls,
+                total_llm_calls,
+            ) = match &resolved_build_id {
                 Some(bid) => {
                     let sql = "
                         SELECT
@@ -578,15 +611,17 @@ async fn run_post_build_hooks(
                         FROM pyramid_compute_events
                         WHERE slug = ?1 AND build_id = ?2
                     ";
-                    match conn.query_row(
-                        sql,
-                        rusqlite::params![slug_owned, bid],
-                        |r| Ok((
-                            r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?,
-                            r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?,
+                    match conn.query_row(sql, rusqlite::params![slug_owned, bid], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, f64>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, i64>(4)?,
+                            r.get::<_, i64>(5)?,
                             r.get::<_, i64>(6)?,
-                        )),
-                    ) {
+                        ))
+                    }) {
                         Ok(t) => t,
                         Err(e) => {
                             tracing::warn!(
@@ -609,7 +644,8 @@ async fn run_post_build_hooks(
                 .unwrap_or_else(|| format!("{}-no-events", slug_owned));
             let job_path = format!(
                 "{}:{}",
-                super::compute_chronicle::SOURCE_NETWORK, build_id_for_event
+                super::compute_chronicle::SOURCE_NETWORK,
+                build_id_for_event
             );
             let chronicle_ctx = super::compute_chronicle::ChronicleEventContext::minimal(
                 &job_path,
@@ -798,8 +834,19 @@ async fn run_chain_build(
         "starting chain engine build"
     );
 
-    chain_executor::execute_chain_from(state, &chain, slug_name, from_depth, stop_after, force_from, cancel, progress_tx, layer_tx, None)
-        .await
+    chain_executor::execute_chain_from(
+        state,
+        &chain,
+        slug_name,
+        from_depth,
+        stop_after,
+        force_from,
+        cancel,
+        progress_tx,
+        layer_tx,
+        None,
+    )
+    .await
 }
 
 /// IR executor path: load chain YAML, compile to ExecutionPlan, execute via execute_plan.
@@ -948,8 +995,8 @@ pub async fn run_decomposed_build(
             // For question pyramids, use the base pyramid's L0 nodes
             let l0_fallback = {
                 let conn = state.reader.lock().await;
-                let existing_l0 = db::get_nodes_at_depth(&conn, &effective_l0_slug, 0)
-                    .unwrap_or_default();
+                let existing_l0 =
+                    db::get_nodes_at_depth(&conn, &effective_l0_slug, 0).unwrap_or_default();
                 if existing_l0.is_empty() {
                     None
                 } else {
@@ -1011,21 +1058,39 @@ pub async fn run_decomposed_build(
     // These params become accessible as $apex_question, $granularity, etc.
     // in chain steps via ChainContext.initial_params
     let mut initial_context: HashMap<String, serde_json::Value> = HashMap::new();
-    initial_context.insert("apex_question".to_string(), serde_json::json!(apex_question));
+    initial_context.insert(
+        "apex_question".to_string(),
+        serde_json::json!(apex_question),
+    );
     initial_context.insert("granularity".to_string(), serde_json::json!(granularity));
     initial_context.insert("max_depth".to_string(), serde_json::json!(max_depth));
     initial_context.insert("from_depth".to_string(), serde_json::json!(from_depth));
     initial_context.insert("content_type".to_string(), serde_json::json!(ct_str));
-    initial_context.insert("audience".to_string(), serde_json::json!(characterization_result.audience));
-    initial_context.insert("characterize".to_string(), serde_json::json!(format!(
-        "Material Profile: {}\nAudience: {}\nTone: {}",
-        characterization_result.material_profile,
-        characterization_result.audience,
-        characterization_result.tone
-    )));
-    initial_context.insert("is_cross_slug".to_string(), serde_json::json!(is_cross_slug));
-    initial_context.insert("referenced_slugs".to_string(), serde_json::json!(referenced_slugs));
-    initial_context.insert("evidence_mode".to_string(), serde_json::json!(evidence_mode));
+    initial_context.insert(
+        "audience".to_string(),
+        serde_json::json!(characterization_result.audience),
+    );
+    initial_context.insert(
+        "characterize".to_string(),
+        serde_json::json!(format!(
+            "Material Profile: {}\nAudience: {}\nTone: {}",
+            characterization_result.material_profile,
+            characterization_result.audience,
+            characterization_result.tone
+        )),
+    );
+    initial_context.insert(
+        "is_cross_slug".to_string(),
+        serde_json::json!(is_cross_slug),
+    );
+    initial_context.insert(
+        "referenced_slugs".to_string(),
+        serde_json::json!(referenced_slugs),
+    );
+    initial_context.insert(
+        "evidence_mode".to_string(),
+        serde_json::json!(evidence_mode),
+    );
 
     // ── 6. Generate build_id and record build start ─────────────────
     // Create a build_id up front so that if the chain fails BEFORE
@@ -1064,8 +1129,8 @@ pub async fn run_decomposed_build(
         &chain,
         slug_name,
         from_depth,
-        None,  // stop_after
-        None,  // force_from
+        None, // stop_after
+        None, // force_from
         cancel,
         progress_tx,
         layer_tx,

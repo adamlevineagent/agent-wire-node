@@ -15,8 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::pyramid::config_contributions::{
-    create_config_contribution_with_metadata, load_contribution_by_id,
-    sync_config_to_operational,
+    create_config_contribution_with_metadata, load_contribution_by_id, sync_config_to_operational,
 };
 use crate::pyramid::credentials::{CredentialStore, SharedCredentialStore};
 use crate::pyramid::event_bus::BuildEventBus;
@@ -106,7 +105,10 @@ pub fn credential_safety_gate(
 /// base, then overrides with Wire-provided fields. The maturity is
 /// reset to `Draft` so the user reviews the pulled contribution before
 /// it can be re-published.
-fn build_metadata_from_pulled(full: &WireContributionFull, slug: Option<&str>) -> WireNativeMetadata {
+fn build_metadata_from_pulled(
+    full: &WireContributionFull,
+    slug: Option<&str>,
+) -> WireNativeMetadata {
     let schema_type = full.schema_type.as_deref().unwrap_or("unknown");
     let mut metadata = default_wire_native_metadata(schema_type, slug);
     metadata.maturity = WireMaturity::Draft;
@@ -191,12 +193,20 @@ pub async fn pull_wire_contribution(
     let triggering_note = if options.activate {
         format!(
             "Pulled from Wire ({})",
-            options.latest_wire_contribution_id.chars().take(8).collect::<String>()
+            options
+                .latest_wire_contribution_id
+                .chars()
+                .take(8)
+                .collect::<String>()
         )
     } else {
         format!(
             "Pulled from Wire for review ({})",
-            options.latest_wire_contribution_id.chars().take(8).collect::<String>()
+            options
+                .latest_wire_contribution_id
+                .chars()
+                .take(8)
+                .collect::<String>()
         )
     };
 
@@ -484,7 +494,8 @@ mod phase14_tests {
     #[test]
     fn test_credential_safety_gate_rejects_missing_credentials() {
         let (_tmp, store) = make_store_with(&[("DEFINED_VAR", "value")]);
-        let yaml = "schema_type: custom_prompts\napi_key: ${MISSING_VAR}\nanother: ${DEFINED_VAR}\n";
+        let yaml =
+            "schema_type: custom_prompts\napi_key: ${MISSING_VAR}\nanother: ${DEFINED_VAR}\n";
         let result = credential_safety_gate(yaml, &store);
         match result {
             Err(PullError::MissingCredentials(missing)) => {
@@ -537,11 +548,7 @@ mod phase14_tests {
         id
     }
 
-    fn count_active_rows(
-        conn: &Connection,
-        schema_type: &str,
-        slug: Option<&str>,
-    ) -> i64 {
+    fn count_active_rows(conn: &Connection, schema_type: &str, slug: Option<&str>) -> i64 {
         if let Some(slug_val) = slug {
             conn.query_row(
                 "SELECT COUNT(*) FROM pyramid_config_contributions
@@ -813,7 +820,10 @@ mod phase14_tests {
         // Global is still active.
         assert_eq!(count_active_rows(&conn, "custom_prompts", None), 1);
         // Slug-scoped is also active.
-        assert_eq!(count_active_rows(&conn, "custom_prompts", Some("my-slug")), 1);
+        assert_eq!(
+            count_active_rows(&conn, "custom_prompts", Some("my-slug")),
+            1
+        );
 
         // Slug row has no supersedes_id — it's a fresh insert in the
         // slug scope, not a supersession of the global row.

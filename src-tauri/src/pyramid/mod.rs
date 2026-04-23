@@ -29,14 +29,10 @@ pub mod compute_market_ops;
 pub mod compute_quote_flow;
 pub mod config_contributions;
 pub mod config_helper;
-pub mod prompt_cache;
-pub mod pyramid_import;
-pub mod rotator_allocation;
-pub mod step_context;
-pub mod wire_native_metadata;
 pub mod converge_expand;
 pub mod cost_model;
 pub mod credentials;
+pub mod cross_pyramid_router;
 pub mod crystallization;
 pub mod dadbear_compiler;
 pub mod dadbear_extend;
@@ -44,23 +40,22 @@ pub mod dadbear_preview;
 pub mod dadbear_supervisor;
 pub mod db;
 pub mod defaults_adapter;
-pub mod demand_gen;
 pub mod delta;
+pub mod demand_gen;
 pub mod demand_signal;
-pub mod triage;
-pub mod reroll;
-pub mod cross_pyramid_router;
+pub mod dispatch_policy;
 pub mod event_bus;
 pub mod event_chain;
-pub mod public_html;
-pub mod question_build;
 pub mod evidence_answering;
 pub mod execution_plan;
 pub mod execution_state;
 pub mod expression;
 pub mod extraction_schema;
 pub mod faq;
+pub mod fleet_delivery_policy;
 pub mod fleet_identity;
+pub mod fleet_mps;
+pub mod fleet_outbox_sweep;
 pub mod folder_ingestion;
 pub mod generative_config;
 pub mod ingest;
@@ -69,46 +64,69 @@ pub mod local_mode;
 pub mod local_store;
 pub mod lock_manager;
 pub mod manifest;
+pub mod market_delivery;
+pub mod market_delivery_policy;
+pub mod market_dispatch;
+pub mod market_identity;
+pub mod market_mirror;
+pub mod market_surface_cache;
+pub mod messages;
 pub mod meta;
 pub mod migration_config;
 pub mod multi_chain_overlay;
 pub mod naming;
 pub mod observation_events;
+pub mod openrouter_webhook;
 pub mod parity;
 pub mod payment_redeemer;
+pub mod pending_jobs;
 pub mod preview;
 pub mod primer;
+pub mod prompt_cache;
+pub mod prompt_materializer;
 pub mod provider;
 pub mod provider_health;
-pub mod openrouter_webhook;
+pub mod provider_pools;
+pub mod public_html;
 pub mod publication;
+pub mod pyramid_import;
 pub mod query;
+pub mod question_build;
 pub mod question_compiler;
-pub mod reading_modes;
 pub mod question_decomposition;
 pub mod question_loader;
 pub mod question_retrieve;
 pub mod question_yaml;
+pub mod reading_modes;
 pub mod reconciliation;
 pub mod recovery;
+pub mod reroll;
+pub mod result_delivery_identity;
+pub mod rotator_allocation;
 pub mod routes;
 pub mod routes_operator;
+pub mod schema_registry;
 pub mod slug;
 pub mod stale_engine;
 pub mod stale_helpers;
 pub mod stale_helpers_upper;
 pub mod staleness;
 pub mod staleness_bridge;
+pub mod step_context;
 pub mod supersession;
 pub mod sync;
+#[cfg(test)]
+pub mod test_phase9_wanderer;
 pub mod transform_runtime;
+pub mod triage;
 pub mod tunnel_url;
 pub mod types;
+pub mod v3_migration;
 pub mod vine;
 pub mod vine_composition;
 pub mod vine_prompts;
+pub mod viz_config;
 pub mod vocabulary;
-pub mod v3_migration;
 pub mod walker_breaker;
 pub mod walker_cache;
 pub mod walker_decision;
@@ -119,32 +137,14 @@ pub mod walker_readiness;
 pub mod walker_resolver;
 pub mod watcher;
 pub mod webbing;
-pub mod schema_registry;
-#[cfg(test)]
-pub mod test_phase9_wanderer;
 pub mod wire_discovery;
 pub mod wire_import;
 pub mod wire_migration;
+pub mod wire_native_metadata;
 pub mod wire_publish;
 pub mod wire_pull;
 pub mod wire_update_poller;
 pub mod yaml_renderer;
-pub mod dispatch_policy;
-pub mod fleet_delivery_policy;
-pub mod fleet_mps;
-pub mod fleet_outbox_sweep;
-pub mod market_delivery;
-pub mod market_delivery_policy;
-pub mod market_dispatch;
-pub mod market_identity;
-pub mod market_mirror;
-pub mod market_surface_cache;
-pub mod pending_jobs;
-pub mod result_delivery_identity;
-pub mod messages;
-pub mod prompt_materializer;
-pub mod provider_pools;
-pub mod viz_config;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -601,9 +601,15 @@ impl PyramidConfig {
         // machine. The canonical location is preferred; the legacy
         // location is a fallback so existing profile sets keep working
         // until the operator copies them over.
-        let canonical = data_dir.join("profiles").join(format!("{}.json", profile_name));
-        let legacy = dirs::home_dir()
-            .map(|h| h.join(".gemini").join("wire-node").join("profiles").join(format!("{}.json", profile_name)));
+        let canonical = data_dir
+            .join("profiles")
+            .join(format!("{}.json", profile_name));
+        let legacy = dirs::home_dir().map(|h| {
+            h.join(".gemini")
+                .join("wire-node")
+                .join("profiles")
+                .join(format!("{}.json", profile_name))
+        });
         let profile_path = if canonical.exists() {
             canonical
         } else if let Some(legacy_path) = legacy.filter(|p| p.exists()) {
@@ -617,7 +623,11 @@ impl PyramidConfig {
         };
 
         if !profile_path.exists() {
-            return Err(anyhow::anyhow!("Profile '{}' not found at {:?}", profile_name, profile_path));
+            return Err(anyhow::anyhow!(
+                "Profile '{}' not found at {:?}",
+                profile_name,
+                profile_path
+            ));
         }
 
         let contents = std::fs::read_to_string(&profile_path)?;
@@ -641,7 +651,7 @@ impl PyramidConfig {
 
         let mut current_json = serde_json::to_value(&*self)?;
         merge(&mut current_json, patch);
-        
+
         *self = serde_json::from_value(current_json)?;
         Ok(())
     }
@@ -833,7 +843,8 @@ pub struct PyramidState {
     /// DADBEAR supervisor handle (Phase 5). The supervisor runs alongside
     /// the extend loop during the transition period (Phases 5–7), handling
     /// dispatch + result application for work items created by the compiler.
-    pub dadbear_supervisor_handle: Arc<Mutex<Option<crate::pyramid::dadbear_supervisor::DadbearSupervisorHandle>>>,
+    pub dadbear_supervisor_handle:
+        Arc<Mutex<Option<crate::pyramid::dadbear_supervisor::DadbearSupervisorHandle>>>,
     /// Phase 1 fix: shared per-config DADBEAR dispatch in-flight flags, keyed by
     /// `pyramid_dadbear_config.id`.
     ///
@@ -856,11 +867,7 @@ pub struct PyramidState {
     /// observation of a config, and removed by the tick loop's cleanup pass
     /// when the corresponding config is gone (mirroring the `tickers`
     /// HashMap's `retain` call).
-    pub dadbear_in_flight: Arc<
-        std::sync::Mutex<
-            HashMap<i64, Arc<std::sync::atomic::AtomicBool>>,
-        >,
-    >,
+    pub dadbear_in_flight: Arc<std::sync::Mutex<HashMap<i64, Arc<std::sync::atomic::AtomicBool>>>>,
     /// Phase 3: provider registry. Holds all pyramid_providers +
     /// pyramid_tier_routing + pyramid_step_overrides rows in memory.
     /// Shared via Arc so build-scoped reader clones and IPC mutators
@@ -919,11 +926,8 @@ impl PyramidState {
         let cfg = self.config.read().await.clone();
         match self.data_dir.as_ref() {
             Some(dir) => {
-                let db_path: std::sync::Arc<str> = dir
-                    .join("pyramid.db")
-                    .to_string_lossy()
-                    .to_string()
-                    .into();
+                let db_path: std::sync::Arc<str> =
+                    dir.join("pyramid.db").to_string_lossy().to_string().into();
                 cfg.clone_with_cache_access(
                     slug.to_string(),
                     build_id.to_string(),
@@ -939,19 +943,11 @@ impl PyramidState {
     /// sites (stale_engine drain loops, routes.rs HTTP handlers that
     /// already hold a read-locked config). Takes the pre-cloned
     /// `LlmConfig` and the build_id + slug from the caller's scope.
-    pub fn attach_cache_access(
-        &self,
-        cfg: LlmConfig,
-        slug: &str,
-        build_id: &str,
-    ) -> LlmConfig {
+    pub fn attach_cache_access(&self, cfg: LlmConfig, slug: &str, build_id: &str) -> LlmConfig {
         match self.data_dir.as_ref() {
             Some(dir) => {
-                let db_path: std::sync::Arc<str> = dir
-                    .join("pyramid.db")
-                    .to_string_lossy()
-                    .to_string()
-                    .into();
+                let db_path: std::sync::Arc<str> =
+                    dir.join("pyramid.db").to_string_lossy().to_string().into();
                 cfg.clone_with_cache_access(
                     slug.to_string(),
                     build_id.to_string(),

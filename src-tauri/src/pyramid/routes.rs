@@ -23,11 +23,13 @@ use super::ingest;
 use super::manifest;
 use super::meta;
 use super::multi_chain_overlay;
+use super::payment_redeemer;
 use super::preview;
 use super::primer;
 use super::publication;
 use super::query;
 use super::reading_modes;
+use super::recovery;
 use super::slug;
 use super::stale_engine;
 use super::staleness_bridge;
@@ -35,9 +37,7 @@ use super::types::CharacterizationResult;
 use super::types::*;
 use super::vine;
 use super::vocabulary;
-use super::recovery;
 use super::webbing;
-use super::payment_redeemer;
 use super::wire_import;
 use super::wire_publish;
 use super::PyramidState;
@@ -377,13 +377,9 @@ async fn enforce_access_tier(
             };
 
             // Billable route on a priced pyramid — payment token required.
-            let claims = validate_payment_token(
-                &pi.token,
-                auth_source,
-                &pi.jwt_public_key,
-                &pi.node_id,
-            )
-            .await;
+            let claims =
+                validate_payment_token(&pi.token, auth_source, &pi.jwt_public_key, &pi.node_id)
+                    .await;
 
             match claims {
                 Some(c) => Ok(Some(c)),
@@ -397,10 +393,7 @@ async fn enforce_access_tier(
                         operator_id = %operator_id,
                         "Priced pyramid payment enforcement: {}", msg
                     );
-                    Err(json_error(
-                        warp::http::StatusCode::PAYMENT_REQUIRED,
-                        msg,
-                    ))
+                    Err(json_error(warp::http::StatusCode::PAYMENT_REQUIRED, msg))
                 }
             }
         }
@@ -595,9 +588,15 @@ struct ReadingWalkQuery {
     limit: usize,
 }
 
-fn default_walk_layer() -> i64 { 1 }
-fn default_walk_direction() -> String { "newest".to_string() }
-fn default_walk_limit() -> usize { 20 }
+fn default_walk_layer() -> i64 {
+    1
+}
+fn default_walk_direction() -> String {
+    "newest".to_string()
+}
+fn default_walk_limit() -> usize {
+    20
+}
 
 #[derive(Deserialize)]
 struct ReadingThreadQuery {
@@ -622,7 +621,9 @@ struct ReadingSearchQuery {
     limit: usize,
 }
 
-fn default_search_limit() -> usize { 20 }
+fn default_search_limit() -> usize {
+    20
+}
 
 // ── Phase 5 & 6: Auto-update request/response types ─────────────────
 
@@ -660,7 +661,9 @@ struct QuestionBuildBody {
     #[serde(default = "default_evidence_mode")]
     evidence_mode: String,
 }
-fn default_evidence_mode() -> String { "deep".to_string() }
+fn default_evidence_mode() -> String {
+    "deep".to_string()
+}
 
 #[derive(Deserialize)]
 struct CharacterizeBody {
@@ -917,7 +920,10 @@ fn payment_settle(
 /// credits auto-release on TTL expiry at the Wire server. Without this,
 /// the sweeper would redeem the token and the operator would collect payment
 /// for a query that returned 404 or 500.
-fn payment_abort(state: &Arc<PyramidState>, payment_claims: &Option<crate::server::PaymentTokenClaims>) {
+fn payment_abort(
+    state: &Arc<PyramidState>,
+    payment_claims: &Option<crate::server::PaymentTokenClaims>,
+) {
     if let Some(claims) = payment_claims {
         if let Some(nonce) = &claims.nonce {
             let nonce = nonce.clone();
@@ -965,7 +971,8 @@ struct QueryCostParams {
     /// Query type: "apex", "drill", "search", "export"
     query_type: Option<String>,
     /// Node ID (required for drill queries, used for handle-path resolution)
-    #[allow(dead_code)] // Deserialized from query params; not read in Rust but part of API contract
+    #[allow(dead_code)]
+    // Deserialized from query params; not read in Rust but part of API contract
     node_id: Option<String>,
 }
 
@@ -1764,7 +1771,12 @@ pub fn pyramid_routes(
     let r5 = drill.or(search).unify().boxed();
     let r6 = entities.or(resolved).unify().boxed();
     let r7 = corrections.or(terms).unify().boxed();
-    let r8 = ingest_route.or(config_route).unify().or(config_profile_route).unify().boxed();
+    let r8 = ingest_route
+        .or(config_route)
+        .unify()
+        .or(config_profile_route)
+        .unify()
+        .boxed();
     let r9 = threads.or(archive_slug_route).unify().boxed();
     let r31 = purge_slug_route.or(slug_references_route).unify().boxed();
     let r10 = annotate.or(annotations).unify().boxed();
@@ -1931,7 +1943,10 @@ pub fn pyramid_routes(
         .and_then(handle_chain_proposal_list));
 
     // Longest paths first: accept/reject/defer (3 segments), then get (2), then submit+list (1)
-    let cpr_a = chain_proposal_accept.or(chain_proposal_reject).unify().boxed();
+    let cpr_a = chain_proposal_accept
+        .or(chain_proposal_reject)
+        .unify()
+        .boxed();
     let cpr_b = cpr_a.or(chain_proposal_defer).unify().boxed();
     let cpr_c = cpr_b.or(chain_proposal_get).unify().boxed();
     let cpr_d = cpr_c.or(chain_proposal_submit).unify().boxed();
@@ -2685,7 +2700,10 @@ pub fn pyramid_routes(
         .and_then(handle_question_retrieve));
 
     // More-specific path (with question_id param) before bare /question
-    let qr = question_retrieve_poll.or(question_retrieve_submit).unify().boxed();
+    let qr = question_retrieve_poll
+        .or(question_retrieve_submit)
+        .unify()
+        .boxed();
     let top32 = top31.or(qr).unify().boxed();
 
     // ── WS-READING-MODES (Phase 4): Six reading mode routes ──────────────
@@ -2914,12 +2932,22 @@ async fn handle_apex(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "apex").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "apex",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -2968,12 +2996,22 @@ async fn handle_node(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "node").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "node",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -3020,12 +3058,22 @@ async fn handle_tree(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "tree").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "tree",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -3033,7 +3081,13 @@ async fn handle_tree(
     match query::get_tree(&conn, &slug_name) {
         Ok(tree) => {
             if let Some(claims) = payment_claims {
-                payment_settle(state.clone(), claims, &payment_info, slug_name.clone(), "tree");
+                payment_settle(
+                    state.clone(),
+                    claims,
+                    &payment_info,
+                    slug_name.clone(),
+                    "tree",
+                );
             }
             Ok(json_ok(&tree))
         }
@@ -3059,12 +3113,22 @@ async fn handle_drill(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "drill").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "drill",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -3174,12 +3238,22 @@ async fn handle_search(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "search").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "search",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -3309,12 +3383,22 @@ async fn handle_entities(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "entities").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "entities",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -3322,7 +3406,13 @@ async fn handle_entities(
     match query::entities(&conn, &slug_name) {
         Ok(entries) => {
             if let Some(claims) = payment_claims {
-                payment_settle(state.clone(), claims, &payment_info, slug_name.clone(), "entities");
+                payment_settle(
+                    state.clone(),
+                    claims,
+                    &payment_info,
+                    slug_name.clone(),
+                    "entities",
+                );
             }
             Ok(json_ok(&entries))
         }
@@ -3345,12 +3435,22 @@ async fn handle_resolved(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "resolved").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "resolved",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -3358,7 +3458,13 @@ async fn handle_resolved(
     match query::resolved(&conn, &slug_name) {
         Ok(entries) => {
             if let Some(claims) = payment_claims {
-                payment_settle(state.clone(), claims, &payment_info, slug_name.clone(), "resolved");
+                payment_settle(
+                    state.clone(),
+                    claims,
+                    &payment_info,
+                    slug_name.clone(),
+                    "resolved",
+                );
             }
             Ok(json_ok(&entries))
         }
@@ -3381,12 +3487,22 @@ async fn handle_corrections(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "corrections").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "corrections",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -3394,7 +3510,13 @@ async fn handle_corrections(
     match query::corrections(&conn, &slug_name) {
         Ok(entries) => {
             if let Some(claims) = payment_claims {
-                payment_settle(state.clone(), claims, &payment_info, slug_name.clone(), "corrections");
+                payment_settle(
+                    state.clone(),
+                    claims,
+                    &payment_info,
+                    slug_name.clone(),
+                    "corrections",
+                );
             }
             Ok(json_ok(&entries))
         }
@@ -3417,12 +3539,22 @@ async fn handle_terms(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "terms").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "terms",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -3430,7 +3562,13 @@ async fn handle_terms(
     match query::terms(&conn, &slug_name) {
         Ok(entries) => {
             if let Some(claims) = payment_claims {
-                payment_settle(state.clone(), claims, &payment_info, slug_name.clone(), "terms");
+                payment_settle(
+                    state.clone(),
+                    claims,
+                    &payment_info,
+                    slug_name.clone(),
+                    "terms",
+                );
             }
             Ok(json_ok(&entries))
         }
@@ -3575,9 +3713,11 @@ async fn handle_build(
                                 ref parent_id,
                             } => db::update_parent(&conn, slug, node_id, parent_id),
                             WriteOp::UpdateStats { ref slug } => db::update_slug_stats(&conn, slug),
-                            WriteOp::UpdateFileHash { ref slug, ref file_path, ref node_id } => {
-                                db::append_node_id_to_file_hash(&conn, slug, file_path, node_id)
-                            }
+                            WriteOp::UpdateFileHash {
+                                ref slug,
+                                ref file_path,
+                                ref node_id,
+                            } => db::append_node_id_to_file_hash(&conn, slug, file_path, node_id),
                             WriteOp::Flush { done } => {
                                 let _ = done.send(());
                                 Ok(())
@@ -3594,8 +3734,7 @@ async fn handle_build(
         // Create progress channel — forward updates into the build status,
         // and tee onto build_event_bus so the public web surface can subscribe
         // per-slug. The desktop UI consumer keeps reading from progress_rx.
-        let (progress_tx, raw_progress_rx) =
-            tokio::sync::mpsc::channel::<BuildProgress>(64);
+        let (progress_tx, raw_progress_rx) = tokio::sync::mpsc::channel::<BuildProgress>(64);
         let mut progress_rx = crate::pyramid::event_bus::tee_build_progress_to_bus(
             &build_state.build_event_bus,
             slug_name.clone(),
@@ -3612,58 +3751,118 @@ async fn handle_build(
         });
 
         // Create layer event channel for build visualization v2
-        let (layer_tx, mut layer_rx) =
-            tokio::sync::mpsc::channel::<super::types::LayerEvent>(256);
+        let (layer_tx, mut layer_rx) = tokio::sync::mpsc::channel::<super::types::LayerEvent>(256);
         let layer_drain_state = layer_state_for_build;
         let layer_drain_handle = tokio::spawn(async move {
             use super::types::{LayerEvent, LayerProgress, LogEntry, NodeStatus};
             while let Some(event) = layer_rx.recv().await {
                 let mut st = layer_drain_state.write().await;
                 match event {
-                    LayerEvent::Discovered { depth, step_name, estimated_nodes } => {
+                    LayerEvent::Discovered {
+                        depth,
+                        step_name,
+                        estimated_nodes,
+                    } => {
                         st.layers.push(LayerProgress {
-                            depth, step_name, estimated_nodes,
-                            completed_nodes: 0, failed_nodes: 0,
+                            depth,
+                            step_name,
+                            estimated_nodes,
+                            completed_nodes: 0,
+                            failed_nodes: 0,
                             status: "pending".into(),
-                            nodes: if estimated_nodes <= 50 { Some(Vec::new()) } else { None },
+                            nodes: if estimated_nodes <= 50 {
+                                Some(Vec::new())
+                            } else {
+                                None
+                            },
                         });
                     }
-                    LayerEvent::NodeCompleted { depth, step_name, node_id, label } => {
-                        if let Some(layer) = st.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                    LayerEvent::NodeCompleted {
+                        depth,
+                        step_name,
+                        node_id,
+                        label,
+                    } => {
+                        if let Some(layer) = st
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             layer.completed_nodes += 1;
                             layer.status = "active".into();
                             if let Some(ref mut nodes) = layer.nodes {
-                                nodes.push(NodeStatus { node_id, status: "complete".into(), label });
+                                nodes.push(NodeStatus {
+                                    node_id,
+                                    status: "complete".into(),
+                                    label,
+                                });
                             }
                         }
                     }
-                    LayerEvent::NodeFailed { depth, step_name, node_id } => {
-                        if let Some(layer) = st.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                    LayerEvent::NodeFailed {
+                        depth,
+                        step_name,
+                        node_id,
+                    } => {
+                        if let Some(layer) = st
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             layer.failed_nodes += 1;
                             if let Some(ref mut nodes) = layer.nodes {
-                                nodes.push(NodeStatus { node_id, status: "failed".into(), label: None });
+                                nodes.push(NodeStatus {
+                                    node_id,
+                                    status: "failed".into(),
+                                    label: None,
+                                });
                             }
                         }
                     }
                     LayerEvent::LayerCompleted { depth, step_name } => {
-                        if let Some(layer) = st.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                        if let Some(layer) = st
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             layer.status = "complete".into();
                         }
                     }
-                    LayerEvent::NodeStarted { depth, step_name, node_id, .. } => {
+                    LayerEvent::NodeStarted {
+                        depth,
+                        step_name,
+                        node_id,
+                        ..
+                    } => {
                         // Track in-flight nodes: add as "pending" status
-                        if let Some(layer) = st.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                        if let Some(layer) = st
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             if let Some(ref mut nodes) = layer.nodes {
-                                nodes.push(NodeStatus { node_id, status: "pending".into(), label: None });
+                                nodes.push(NodeStatus {
+                                    node_id,
+                                    status: "pending".into(),
+                                    label: None,
+                                });
                             }
                         }
                     }
                     LayerEvent::StepStarted { step_name } => {
                         st.current_step = Some(step_name);
                     }
-                    LayerEvent::Log { elapsed_secs, message } => {
-                        st.log.push_back(LogEntry { elapsed_secs, message });
-                        if st.log.len() > 200 { st.log.pop_front(); }
+                    LayerEvent::Log {
+                        elapsed_secs,
+                        message,
+                    } => {
+                        st.log.push_back(LogEntry {
+                            elapsed_secs,
+                            message,
+                        });
+                        if st.log.len() > 200 {
+                            st.log.pop_front();
+                        }
                     }
                 }
             }
@@ -3720,15 +3919,27 @@ async fn handle_build(
                             let conn = build_state.writer.lock().await;
                             // Auto-refresh vocabulary catalog from apex
                             match super::vocabulary::refresh_vocabulary(&conn, &slug_name) {
-                                Ok((_, count)) => tracing::info!("Post-build: vocabulary refreshed for '{}' ({} entries)", slug_name, count),
-                                Err(e) => tracing::warn!("Post-build: vocabulary refresh failed for '{}': {}", slug_name, e),
+                                Ok((_, count)) => tracing::info!(
+                                    "Post-build: vocabulary refreshed for '{}' ({} entries)",
+                                    slug_name,
+                                    count
+                                ),
+                                Err(e) => tracing::warn!(
+                                    "Post-build: vocabulary refresh failed for '{}': {}",
+                                    slug_name,
+                                    e
+                                ),
                             }
                             // Auto-create DADBEAR watch config for conversation slugs
                             if let Ok(Some(info)) = slug::get_slug(&conn, &slug_name) {
                                 if info.content_type == super::types::ContentType::Conversation {
                                     let source_dir = std::path::Path::new(&info.source_path);
                                     let watch_dir = if source_dir.is_file() {
-                                        source_dir.parent().unwrap_or(source_dir).to_string_lossy().to_string()
+                                        source_dir
+                                            .parent()
+                                            .unwrap_or(source_dir)
+                                            .to_string_lossy()
+                                            .to_string()
                                     } else {
                                         info.source_path.clone()
                                     };
@@ -3746,9 +3957,20 @@ async fn handle_build(
                                         created_at: String::new(),
                                         updated_at: String::new(),
                                     };
-                                    match db::save_dadbear_config_with_contributions(&conn, &dadbear_cfg) {
-                                        Ok(_) => tracing::info!("Post-build: DADBEAR config created for '{}' → '{}'", slug_name, watch_dir),
-                                        Err(e) => tracing::warn!("Post-build: DADBEAR config failed for '{}': {}", slug_name, e),
+                                    match db::save_dadbear_config_with_contributions(
+                                        &conn,
+                                        &dadbear_cfg,
+                                    ) {
+                                        Ok(_) => tracing::info!(
+                                            "Post-build: DADBEAR config created for '{}' → '{}'",
+                                            slug_name,
+                                            watch_dir
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            "Post-build: DADBEAR config failed for '{}': {}",
+                                            slug_name,
+                                            e
+                                        ),
                                     }
                                 }
                             }
@@ -4033,10 +4255,10 @@ async fn handle_config_profile(
     state: Arc<PyramidState>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let mut config_lock = state.config.write().await;
-    
+
     if let Some(ref data_dir) = state.data_dir {
         let mut pyramid_config = super::PyramidConfig::load(data_dir);
-        
+
         if let Err(e) = pyramid_config.apply_profile(&profile_name, data_dir) {
             tracing::error!("Failed to apply profile '{}': {}", profile_name, e);
             return Ok(json_error(
@@ -4044,7 +4266,7 @@ async fn handle_config_profile(
                 &format!("Failed to apply profile: {e}"),
             ));
         }
-        
+
         if let Err(e) = pyramid_config.save(data_dir) {
             tracing::error!("Failed to save config after applying profile: {e}");
             return Ok(json_error(
@@ -4052,17 +4274,18 @@ async fn handle_config_profile(
                 &format!("Failed to save config: {e}"),
             ));
         }
-        
+
         // Update the running LlmConfig via to_llm_config_with_runtime
         // so model fields are resolved from the active tier routing
         // (not hardcoded OpenRouter slugs). Preserve api_key + auth_token
         // from the live config — profiles only override model selection.
         let previous_live = config_lock.clone();
-        *config_lock = pyramid_config.to_llm_config_with_runtime(
-            state.provider_registry.clone(),
-            state.credential_store.clone(),
-        )
-        .with_runtime_overlays_from(&previous_live);
+        *config_lock = pyramid_config
+            .to_llm_config_with_runtime(
+                state.provider_registry.clone(),
+                state.credential_store.clone(),
+            )
+            .with_runtime_overlays_from(&previous_live);
 
         Ok(json_ok(&serde_json::json!({
             "status": "profile_applied",
@@ -4209,12 +4432,22 @@ async fn handle_threads(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "threads").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "threads",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -4222,7 +4455,13 @@ async fn handle_threads(
     match db::get_threads(&conn, &slug_name) {
         Ok(threads) => {
             if let Some(claims) = payment_claims {
-                payment_settle(state.clone(), claims, &payment_info, slug_name.clone(), "threads");
+                payment_settle(
+                    state.clone(),
+                    claims,
+                    &payment_info,
+                    slug_name.clone(),
+                    "threads",
+                );
             }
             Ok(json_ok(&threads))
         }
@@ -4434,12 +4673,12 @@ async fn emit_annotation_observation_events(
             slug,
             "annotation",
             event_type,
-            None,                    // source_path
-            None,                    // file_path
-            None,                    // content_hash
-            None,                    // previous_hash
-            Some(ancestor_id),       // target_node_id
-            Some(*ancestor_depth),   // layer
+            None,                  // source_path
+            None,                  // file_path
+            None,                  // content_hash
+            None,                  // previous_hash
+            Some(ancestor_id),     // target_node_id
+            Some(*ancestor_depth), // layer
             Some(&metadata_json),
         );
     }
@@ -4937,7 +5176,10 @@ async fn handle_auto_update_config_post(
         Some(config) => Ok(json_ok(&config)),
         None => Ok(json_error(
             warp::http::StatusCode::NOT_FOUND,
-            &format!("No auto-update config for slug '{}'. Use contributions to configure.", slug_name),
+            &format!(
+                "No auto-update config for slug '{}'. Use contributions to configure.",
+                slug_name
+            ),
         )),
     }
 }
@@ -4982,7 +5224,8 @@ async fn handle_auto_update_unfreeze(
     } else {
         // No engine in memory — use auto_update_ops for DB write + event
         let conn = state.writer.lock().await;
-        if let Err(e) = super::auto_update_ops::unfreeze(&conn, &state.build_event_bus, &slug_name) {
+        if let Err(e) = super::auto_update_ops::unfreeze(&conn, &state.build_event_bus, &slug_name)
+        {
             tracing::warn!(slug = %slug_name, "auto_update_ops::unfreeze failed: {e}");
         }
     }
@@ -5191,7 +5434,14 @@ pub fn enqueue_full_l0_sweep_with_reconciliation(
     // but that the user wants force-checked)
     let (tracked, enqueued, already_pending) = enqueue_full_l0_sweep(conn, slug);
 
-    (tracked, enqueued, already_pending, r_new, r_changed, r_deleted)
+    (
+        tracked,
+        enqueued,
+        already_pending,
+        r_new,
+        r_changed,
+        r_deleted,
+    )
 }
 
 /// Recursively collect files from a directory, filtering by extension.
@@ -5217,9 +5467,9 @@ fn collect_files_recursive(
         if path.is_dir() {
             // Skip build artifacts, dependencies, and other non-source directories
             match fname.as_str() {
-                "node_modules" | "target" | "dist" | "build" | ".next" | "__pycache__"
-                | "venv" | ".venv" | "vendor" | "Pods" | ".gradle" | "out" | "bin"
-                | ".lab.bak" | ".claude" => continue,
+                "node_modules" | "target" | "dist" | "build" | ".next" | "__pycache__" | "venv"
+                | ".venv" | "vendor" | "Pods" | ".gradle" | "out" | "bin" | ".lab.bak"
+                | ".claude" => continue,
                 _ => {}
             }
             collect_files_recursive(&path, ingested_extensions, content_type, out);
@@ -5271,9 +5521,9 @@ pub fn reconcile_source_files(
 
     // Get file hashes from DB
     let mut tracked_hashes: HashMap<String, String> = HashMap::new();
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT file_path, hash FROM pyramid_file_hashes WHERE slug = ?1",
-    ) {
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT file_path, hash FROM pyramid_file_hashes WHERE slug = ?1")
+    {
         if let Ok(rows) = stmt.query_map(rusqlite::params![slug], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         }) {
@@ -5295,9 +5545,9 @@ pub fn reconcile_source_files(
                 "Backfilled pyramid_file_hashes from chunk headers"
             );
             // Re-read after backfill
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT file_path, hash FROM pyramid_file_hashes WHERE slug = ?1",
-            ) {
+            if let Ok(mut stmt) =
+                conn.prepare("SELECT file_path, hash FROM pyramid_file_hashes WHERE slug = ?1")
+            {
                 if let Ok(rows) = stmt.query_map(rusqlite::params![slug], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 }) {
@@ -5324,7 +5574,12 @@ pub fn reconcile_source_files(
         if !source_dir.is_dir() {
             continue;
         }
-        collect_files_recursive(source_dir, ingested_extensions, content_type, &mut disk_files);
+        collect_files_recursive(
+            source_dir,
+            ingested_extensions,
+            content_type,
+            &mut disk_files,
+        );
     }
 
     let tracked_keys: HashSet<String> = tracked_hashes.keys().cloned().collect();
@@ -5455,11 +5710,7 @@ pub fn reconcile_source_files(
 /// before file-hash tracking was added. Extracts `## FILE: path` from L0 chunks,
 /// resolves against source_paths, and inserts entries with the current hash.
 /// Returns the number of entries backfilled.
-fn backfill_file_hashes_from_chunks(
-    conn: &Connection,
-    slug: &str,
-    source_paths: &[String],
-) -> i64 {
+fn backfill_file_hashes_from_chunks(conn: &Connection, slug: &str, source_paths: &[String]) -> i64 {
     use std::path::Path;
 
     // Check if there are any L0 nodes — if not, nothing to backfill from
@@ -5589,7 +5840,9 @@ async fn handle_breaker_resume(
     } else {
         // No engine in memory — use auto_update_ops for DB write + event
         let conn = state.writer.lock().await;
-        if let Err(e) = super::auto_update_ops::resume_breaker(&conn, &state.build_event_bus, &slug_name) {
+        if let Err(e) =
+            super::auto_update_ops::resume_breaker(&conn, &state.build_event_bus, &slug_name)
+        {
             tracing::warn!(slug = %slug_name, "auto_update_ops::resume_breaker failed: {e}");
         }
         Ok(json_ok(
@@ -5933,11 +6186,7 @@ fn resolve_default_prices(state: &Arc<PyramidState>) -> (f64, f64) {
 /// Apply the seed JSON (cold-start) from `chains/defaults/pyramid_chain_cost_model_seed.json`.
 /// Idempotent: `apply_seed` only inserts rows for (chain_phase, model) pairs that
 /// don't already exist.
-fn seed_cost_model_if_needed(
-    conn: &rusqlite::Connection,
-    in_price: f64,
-    out_price: f64,
-) -> usize {
+fn seed_cost_model_if_needed(conn: &rusqlite::Connection, in_price: f64, out_price: f64) -> usize {
     let candidates = [
         std::path::PathBuf::from("chains/defaults/pyramid_chain_cost_model_seed.json"),
         std::path::PathBuf::from("../chains/defaults/pyramid_chain_cost_model_seed.json"),
@@ -6024,7 +6273,11 @@ async fn handle_auto_update_l0_sweep(
     let (tracked_files, enqueued, already_pending, r_new, r_changed, r_deleted) = {
         let conn = state.writer.lock().await;
         enqueue_full_l0_sweep_with_reconciliation(
-            &conn, &slug_name, &source_paths, &ingested_extensions, &content_type,
+            &conn,
+            &slug_name,
+            &source_paths,
+            &ingested_extensions,
+            &content_type,
         )
     };
 
@@ -6179,32 +6432,41 @@ async fn handle_vine_build(
     let evidence_mode = body.evidence_mode.clone();
 
     tokio::spawn(async move {
-        let (final_status, error_msg) =
-            match vine::build_vine(&state_clone, &slug_clone, &jsonl_dirs, &evidence_mode, &cancel_clone).await {
-                Ok(apex_id) => {
-                    tracing::info!("Vine build complete for '{}': apex={}", slug_clone, apex_id);
-                    // Post-vine-build: refresh vocabulary catalog from apex
-                    {
-                        let conn = state_clone.writer.lock().await;
-                        match super::vocabulary::refresh_vocabulary(&conn, &slug_clone) {
-                            Ok((_, count)) => tracing::info!(
-                                "Post-vine-build: vocabulary refreshed for '{}' ({} entries)",
-                                slug_clone, count
-                            ),
-                            Err(e) => tracing::warn!(
-                                "Post-vine-build: vocabulary refresh failed for '{}': {}",
-                                slug_clone, e
-                            ),
-                        }
+        let (final_status, error_msg) = match vine::build_vine(
+            &state_clone,
+            &slug_clone,
+            &jsonl_dirs,
+            &evidence_mode,
+            &cancel_clone,
+        )
+        .await
+        {
+            Ok(apex_id) => {
+                tracing::info!("Vine build complete for '{}': apex={}", slug_clone, apex_id);
+                // Post-vine-build: refresh vocabulary catalog from apex
+                {
+                    let conn = state_clone.writer.lock().await;
+                    match super::vocabulary::refresh_vocabulary(&conn, &slug_clone) {
+                        Ok((_, count)) => tracing::info!(
+                            "Post-vine-build: vocabulary refreshed for '{}' ({} entries)",
+                            slug_clone,
+                            count
+                        ),
+                        Err(e) => tracing::warn!(
+                            "Post-vine-build: vocabulary refresh failed for '{}': {}",
+                            slug_clone,
+                            e
+                        ),
                     }
-                    ("complete".to_string(), None)
                 }
-                Err(e) => {
-                    let msg = format!("{:#}", e);
-                    tracing::error!("Vine build failed for '{}': {}", slug_clone, msg);
-                    ("failed".to_string(), Some(msg))
-                }
-            };
+                ("complete".to_string(), None)
+            }
+            Err(e) => {
+                let msg = format!("{:#}", e);
+                tracing::error!("Vine build failed for '{}': {}", slug_clone, msg);
+                ("failed".to_string(), Some(msg))
+            }
+        };
         // Update status when build finishes
         let mut builds = state_clone.vine_builds.lock().await;
         if let Some(handle) = builds.get_mut(&slug_clone) {
@@ -6567,8 +6829,7 @@ async fn handle_question_build(
     tokio::spawn(async move {
         let start = std::time::Instant::now();
 
-        let (progress_tx, raw_progress_rx) =
-            tokio::sync::mpsc::channel::<BuildProgress>(64);
+        let (progress_tx, raw_progress_rx) = tokio::sync::mpsc::channel::<BuildProgress>(64);
         let mut progress_rx = crate::pyramid::event_bus::tee_build_progress_to_bus(
             &build_state.build_event_bus,
             slug_name.clone(),
@@ -6585,57 +6846,117 @@ async fn handle_question_build(
         });
 
         // Create layer event channel for build visualization
-        let (layer_tx, mut layer_rx) =
-            tokio::sync::mpsc::channel::<super::types::LayerEvent>(256);
+        let (layer_tx, mut layer_rx) = tokio::sync::mpsc::channel::<super::types::LayerEvent>(256);
         let layer_drain_state = layer_state_for_build;
         let layer_drain_handle = tokio::spawn(async move {
             use super::types::{LayerEvent, LayerProgress, LogEntry, NodeStatus};
             while let Some(event) = layer_rx.recv().await {
                 let mut state = layer_drain_state.write().await;
                 match event {
-                    LayerEvent::Discovered { depth, step_name, estimated_nodes } => {
+                    LayerEvent::Discovered {
+                        depth,
+                        step_name,
+                        estimated_nodes,
+                    } => {
                         state.layers.push(LayerProgress {
-                            depth, step_name, estimated_nodes,
-                            completed_nodes: 0, failed_nodes: 0,
+                            depth,
+                            step_name,
+                            estimated_nodes,
+                            completed_nodes: 0,
+                            failed_nodes: 0,
                             status: "pending".into(),
-                            nodes: if estimated_nodes <= 50 { Some(Vec::new()) } else { None },
+                            nodes: if estimated_nodes <= 50 {
+                                Some(Vec::new())
+                            } else {
+                                None
+                            },
                         });
                     }
-                    LayerEvent::NodeCompleted { depth, step_name, node_id, label } => {
-                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                    LayerEvent::NodeCompleted {
+                        depth,
+                        step_name,
+                        node_id,
+                        label,
+                    } => {
+                        if let Some(layer) = state
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             layer.completed_nodes += 1;
                             layer.status = "active".into();
                             if let Some(ref mut nodes) = layer.nodes {
-                                nodes.push(NodeStatus { node_id, status: "complete".into(), label });
+                                nodes.push(NodeStatus {
+                                    node_id,
+                                    status: "complete".into(),
+                                    label,
+                                });
                             }
                         }
                     }
-                    LayerEvent::NodeFailed { depth, step_name, node_id } => {
-                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                    LayerEvent::NodeFailed {
+                        depth,
+                        step_name,
+                        node_id,
+                    } => {
+                        if let Some(layer) = state
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             layer.failed_nodes += 1;
                             if let Some(ref mut nodes) = layer.nodes {
-                                nodes.push(NodeStatus { node_id, status: "failed".into(), label: None });
+                                nodes.push(NodeStatus {
+                                    node_id,
+                                    status: "failed".into(),
+                                    label: None,
+                                });
                             }
                         }
                     }
                     LayerEvent::LayerCompleted { depth, step_name } => {
-                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                        if let Some(layer) = state
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             layer.status = "complete".into();
                         }
                     }
-                    LayerEvent::NodeStarted { depth, step_name, node_id, .. } => {
-                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                    LayerEvent::NodeStarted {
+                        depth,
+                        step_name,
+                        node_id,
+                        ..
+                    } => {
+                        if let Some(layer) = state
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             if let Some(ref mut nodes) = layer.nodes {
-                                nodes.push(NodeStatus { node_id, status: "pending".into(), label: None });
+                                nodes.push(NodeStatus {
+                                    node_id,
+                                    status: "pending".into(),
+                                    label: None,
+                                });
                             }
                         }
                     }
                     LayerEvent::StepStarted { step_name } => {
                         state.current_step = Some(step_name);
                     }
-                    LayerEvent::Log { elapsed_secs, message } => {
-                        state.log.push_back(LogEntry { elapsed_secs, message });
-                        if state.log.len() > 200 { state.log.pop_front(); }
+                    LayerEvent::Log {
+                        elapsed_secs,
+                        message,
+                    } => {
+                        state.log.push_back(LogEntry {
+                            elapsed_secs,
+                            message,
+                        });
+                        if state.log.len() > 200 {
+                            state.log.pop_front();
+                        }
                     }
                 }
             }
@@ -7395,7 +7716,13 @@ async fn handle_check_staleness(
     let slug_owned = slug_name.clone();
     let result = tokio::task::spawn_blocking(move || {
         let c = conn.blocking_lock();
-        staleness_bridge::run_staleness_check(&c, &slug_owned, &changed_files, threshold, dequeue_cap)
+        staleness_bridge::run_staleness_check(
+            &c,
+            &slug_owned,
+            &changed_files,
+            threshold,
+            dequeue_cap,
+        )
     })
     .await;
 
@@ -7469,12 +7796,22 @@ async fn handle_export(
     };
 
     // WS-ONLINE-E/H: Access tier + payment enforcement (previously missing — fixed)
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug, "export").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug,
+            "export",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -7678,8 +8015,8 @@ async fn handle_remote_query(
         let auth = wire_auth.read().await;
         auth.api_token.clone().unwrap_or_default()
     };
-    let wire_server_url = std::env::var("WIRE_URL")
-        .unwrap_or_else(|_| "https://newsbleach.com".to_string());
+    let wire_server_url =
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
 
     if api_token.is_empty() {
         return Ok(json_error(
@@ -7691,7 +8028,10 @@ async fn handle_remote_query(
     // Step 1: Acquire a real Wire JWT from the pyramid-query-token endpoint
     let http_client = reqwest::Client::new();
     let token_resp = http_client
-        .post(format!("{}/api/v1/wire/pyramid-query-token", wire_server_url))
+        .post(format!(
+            "{}/api/v1/wire/pyramid-query-token",
+            wire_server_url
+        ))
         .header("Authorization", format!("Bearer {}", api_token))
         .json(&serde_json::json!({
             "slug": body.slug,
@@ -8003,11 +8343,7 @@ async fn handle_navigate(
     );
 
     // Phase C fix: Construct a synthetic StepContext so navigate gets caching.
-    let navigate_build_id = format!(
-        "navigate-{}-{}",
-        slug_name,
-        chrono::Utc::now().timestamp()
-    );
+    let navigate_build_id = format!("navigate-{}-{}", slug_name, chrono::Utc::now().timestamp());
     let db_path = state
         .data_dir
         .as_ref()
@@ -8363,9 +8699,7 @@ async fn handle_dead_letter_retry(
     match retry_result {
         Ok(output) => {
             let conn = state.writer.lock().await;
-            if let Err(e) =
-                db::update_dead_letter_status(&conn, &slug_name, id, "resolved", None)
-            {
+            if let Err(e) = db::update_dead_letter_status(&conn, &slug_name, id, "resolved", None) {
                 return Ok(json_error(
                     warp::http::StatusCode::INTERNAL_SERVER_ERROR,
                     &e.to_string(),
@@ -8401,7 +8735,10 @@ async fn handle_ingest_scan(
     let (source_path, content_type_str) = {
         let conn = state.reader.lock().await;
         match db::get_slug(&conn, &slug_name) {
-            Ok(Some(info)) => (info.source_path.clone(), info.content_type.as_str().to_string()),
+            Ok(Some(info)) => (
+                info.source_path.clone(),
+                info.content_type.as_str().to_string(),
+            ),
             Ok(None) => {
                 return Ok(json_error(
                     warp::http::StatusCode::NOT_FOUND,
@@ -8496,16 +8833,17 @@ async fn handle_ingest_scan(
     }
 
     // Emit event
-    let _ = state.build_event_bus.tx.send(
-        super::event_bus::TaggedBuildEvent {
+    let _ = state
+        .build_event_bus
+        .tx
+        .send(super::event_bus::TaggedBuildEvent {
             slug: slug_name.clone(),
             kind: super::event_bus::TaggedKind::IngestScanComplete {
                 new_count: change_set.new_files.len(),
                 modified_count: change_set.modified_files.len(),
                 deleted_count: change_set.deleted_paths.len(),
             },
-        },
-    );
+        });
 
     Ok(json_ok(&serde_json::json!({
         "slug": slug_name,
@@ -8792,11 +9130,21 @@ struct DadbearWatchBody {
     enabled: bool,
 }
 
-fn default_scan_interval() -> u64 { 10 }
-fn default_debounce() -> u64 { 30 }
-fn default_session_timeout() -> u64 { 1800 }
-fn default_batch_size() -> u32 { 1 }
-fn default_enabled() -> bool { true }
+fn default_scan_interval() -> u64 {
+    10
+}
+fn default_debounce() -> u64 {
+    30
+}
+fn default_session_timeout() -> u64 {
+    1800
+}
+fn default_batch_size() -> u32 {
+    1
+}
+fn default_enabled() -> bool {
+    true
+}
 
 /// POST /pyramid/:slug/dadbear/watch — add or update a DADBEAR watch config.
 async fn handle_dadbear_watch(
@@ -8808,7 +9156,10 @@ async fn handle_dadbear_watch(
     if ContentType::from_str(&body.content_type).is_none() {
         return Ok(json_error(
             warp::http::StatusCode::BAD_REQUEST,
-            &format!("Invalid content_type: {}. Must be one of: code, conversation, document", body.content_type),
+            &format!(
+                "Invalid content_type: {}. Must be one of: code, conversation, document",
+                body.content_type
+            ),
         ));
     }
 
@@ -8851,7 +9202,11 @@ async fn handle_dadbear_status(
     state: Arc<PyramidState>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let db_path = match &state.data_dir {
-        Some(d) => d.join("pyramid.db").to_str().unwrap_or_default().to_string(),
+        Some(d) => d
+            .join("pyramid.db")
+            .to_str()
+            .unwrap_or_default()
+            .to_string(),
         None => {
             return Ok(json_error(
                 warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -8881,7 +9236,11 @@ async fn handle_dadbear_trigger(
     state: Arc<PyramidState>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let db_path = match &state.data_dir {
-        Some(d) => d.join("pyramid.db").to_str().unwrap_or_default().to_string(),
+        Some(d) => d
+            .join("pyramid.db")
+            .to_str()
+            .unwrap_or_default()
+            .to_string(),
         None => {
             return Ok(json_error(
                 warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -8890,8 +9249,13 @@ async fn handle_dadbear_trigger(
         }
     };
 
-    match super::dadbear_extend::trigger_for_slug(&state, &db_path, &slug_name, &state.build_event_bus)
-        .await
+    match super::dadbear_extend::trigger_for_slug(
+        &state,
+        &db_path,
+        &slug_name,
+        &state.build_event_bus,
+    )
+    .await
     {
         Ok(result) => Ok(json_ok(&result)),
         Err(e) => Ok(json_error(
@@ -8940,8 +9304,7 @@ async fn handle_vine_add_bedrock(
         None => {
             // Auto-assign: one past the current max position
             let conn = state.reader.lock().await;
-            let bedrocks = db::get_vine_bedrocks(&conn, &vine_slug)
-                .unwrap_or_default();
+            let bedrocks = db::get_vine_bedrocks(&conn, &vine_slug).unwrap_or_default();
             bedrocks.iter().map(|b| b.position).max().unwrap_or(-1) + 1
         }
     };
@@ -9573,11 +9936,12 @@ async fn handle_recovery_force_delta(
         }
         Err(e) => {
             let msg = e.to_string();
-            let status_code = if msg.contains("No active composition") || msg.contains("has no apex") {
-                warp::http::StatusCode::NOT_FOUND
-            } else {
-                warp::http::StatusCode::INTERNAL_SERVER_ERROR
-            };
+            let status_code =
+                if msg.contains("No active composition") || msg.contains("has no apex") {
+                    warp::http::StatusCode::NOT_FOUND
+                } else {
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR
+                };
             Ok(json_error(status_code, &msg))
         }
     }
@@ -9833,13 +10197,8 @@ async fn handle_manifest_exec(
         ));
     }
 
-    match manifest::execute_manifest(
-        &state,
-        &slug,
-        body.operations,
-        body.session_id.as_deref(),
-    )
-    .await
+    match manifest::execute_manifest(&state, &slug, body.operations, body.session_id.as_deref())
+        .await
     {
         Ok(result) => Ok(json_ok(&result)),
         Err(e) => Ok(json_error(
@@ -9939,7 +10298,10 @@ async fn handle_overlay_remove(
         }))),
         Ok(false) => Ok(json_error(
             warp::http::StatusCode::NOT_FOUND,
-            &format!("No active overlay '{}' found for source '{}'", overlay_slug, slug),
+            &format!(
+                "No active overlay '{}' found for source '{}'",
+                overlay_slug, slug
+            ),
         )),
         Err(e) => Ok(json_error(
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -10114,9 +10476,15 @@ struct PreviewCommitBody {
     session_timeout_secs: u64,
 }
 
-fn default_preview_scan_interval() -> u64 { 10 }
-fn default_preview_debounce() -> u64 { 30 }
-fn default_preview_session_timeout() -> u64 { 1800 }
+fn default_preview_scan_interval() -> u64 {
+    10
+}
+fn default_preview_debounce() -> u64 {
+    30
+}
+fn default_preview_session_timeout() -> u64 {
+    1800
+}
 
 /// POST /pyramid/:slug/preview — generate a build preview.
 ///
@@ -10275,7 +10643,10 @@ async fn handle_question_retrieve_poll(
                 if job.slug != slug {
                     return Ok(json_error(
                         warp::http::StatusCode::NOT_FOUND,
-                        &format!("Job {question_id} belongs to slug '{}', not '{slug}'", job.slug),
+                        &format!(
+                            "Job {question_id} belongs to slug '{}', not '{slug}'",
+                            job.slug
+                        ),
                     ));
                 }
                 job
@@ -10318,13 +10689,11 @@ async fn handle_question_retrieve_poll(
                 )),
             }
         }
-        "failed" => {
-            Ok(json_ok(&serde_json::json!({
-                "job_id": question_id,
-                "status": "failed",
-                "error": job.error_message,
-            })))
-        }
+        "failed" => Ok(json_ok(&serde_json::json!({
+            "job_id": question_id,
+            "status": "failed",
+            "error": job.error_message,
+        }))),
         _ => {
             // Still queued or running
             Ok(json_ok(&serde_json::json!({
@@ -10456,7 +10825,7 @@ async fn handle_reading_search(
 #[cfg(test)]
 mod annotation_observation_tests {
     use super::*;
-    use crate::pyramid::{db as dbmod, dadbear_compiler};
+    use crate::pyramid::{dadbear_compiler, db as dbmod};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -10525,7 +10894,11 @@ mod annotation_observation_tests {
             .map(|r| r.unwrap())
             .collect();
 
-        assert_eq!(rows.len(), 2, "one event per ancestor (L1 + L2), skipping the leaf");
+        assert_eq!(
+            rows.len(),
+            2,
+            "one event per ancestor (L1 + L2), skipping the leaf"
+        );
         assert!(rows.iter().all(|r| r.0 == "annotation"));
         assert!(rows.iter().all(|r| r.1 == "annotation_written"));
         assert_eq!(rows[0].2.as_deref(), Some("L1-mid"));
@@ -10660,8 +11033,14 @@ mod annotation_observation_tests {
         // work items (one per distinct ancestor).
         let result = dadbear_compiler::run_compilation_for_slug(&conn, "anno-pyr", None, None)
             .expect("compilation succeeds");
-        assert_eq!(result.items_compiled, 2, "one re_distill per parent, not per annotation");
-        assert_eq!(result.deduped, 4, "second/third annotations coalesce per ancestor");
+        assert_eq!(
+            result.items_compiled, 2,
+            "one re_distill per parent, not per annotation"
+        );
+        assert_eq!(
+            result.deduped, 4,
+            "second/third annotations coalesce per ancestor"
+        );
 
         let wi_count: i64 = conn
             .query_row(

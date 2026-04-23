@@ -72,9 +72,7 @@ pub enum NotReadyReason {
     /// from `effective_call_order` by the Decision builder; readiness
     /// itself may or may not still be Ready. Reset policy determines
     /// whether the breaker will untrip within the build.
-    BreakerTripped {
-        consecutive_failures: u32,
-    },
+    BreakerTripped { consecutive_failures: u32 },
 }
 
 /// Resolved per-provider parameters passed into `can_dispatch_now`.
@@ -399,9 +397,7 @@ impl ProviderReadiness for MarketReadiness {
 
         // 3. Wire reachability — check the node-state failure counter.
         let node_state = read_node_state();
-        if node_state.consecutive_network_failures
-            >= params.network_failure_backoff_threshold
-        {
+        if node_state.consecutive_network_failures >= params.network_failure_backoff_threshold {
             return ReadinessResult::NotReady {
                 reason: NotReadyReason::WireUnreachable,
             };
@@ -412,9 +408,7 @@ impl ProviderReadiness for MarketReadiness {
         //    Unknown balance (None) is permissive — the Phase 3 probe
         //    hasn't observed the balance yet, so the readiness gate
         //    must not fail closed during cold-cache.
-        if let (Some(cap), Some(balance)) =
-            (params.max_budget_credits, node_state.credit_balance)
-        {
+        if let (Some(cap), Some(balance)) = (params.max_budget_credits, node_state.credit_balance) {
             if balance < cap {
                 return ReadinessResult::NotReady {
                     reason: NotReadyReason::InsufficientCredit,
@@ -525,8 +519,7 @@ impl LocalReadiness {
     #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
-            probe_handle:
-                crate::pyramid::walker_ollama_probe::LocalProbeHandle::global(),
+            probe_handle: crate::pyramid::walker_ollama_probe::LocalProbeHandle::global(),
         }
     }
 }
@@ -561,12 +554,9 @@ impl ProviderReadiness for LocalReadiness {
         // until the first probe lands. The SYSTEM_DEFAULT base_url is
         // used when the resolver didn't surface one (shouldn't happen
         // for Local, but defensive).
-        let base_url = params
-            .ollama_base_url
-            .clone()
-            .unwrap_or_else(|| {
-                crate::pyramid::walker_resolver::OLLAMA_BASE_URL_DEFAULT.to_string()
-            });
+        let base_url = params.ollama_base_url.clone().unwrap_or_else(|| {
+            crate::pyramid::walker_resolver::OLLAMA_BASE_URL_DEFAULT.to_string()
+        });
         let probe = match self.probe_handle.probe_for(&base_url) {
             Some(p) => p,
             None => {
@@ -588,7 +578,9 @@ impl ProviderReadiness for LocalReadiness {
         // but with `llama3.2:latest` installed will NOT match — this
         // is intentional; tag-ambiguity is a real misconfig mode and
         // the Decision chronicle's NotReady reason surfaces it cleanly.
-        let any_installed = model_list.iter().any(|m| probe.models.iter().any(|p| p == m));
+        let any_installed = model_list
+            .iter()
+            .any(|m| probe.models.iter().any(|p| p == m));
         if !any_installed {
             return ReadinessResult::NotReady {
                 reason: NotReadyReason::OllamaOffline,
@@ -743,10 +735,7 @@ mod tests {
             ReadinessResult::NotReady {
                 reason: NotReadyReason::OllamaOffline,
             } => {}
-            other => panic!(
-                "expected OllamaOffline (no model overlap), got {:?}",
-                other
-            ),
+            other => panic!("expected OllamaOffline (no model overlap), got {:?}", other),
         }
         invalidate_cached_probe(url);
     }
@@ -877,7 +866,11 @@ mod tests {
         let offers = if active_offers > 0 {
             vec![CachedOffer {
                 offer_id: "o1".into(),
-                node_handle: if only_self { "me".into() } else { "other".into() },
+                node_handle: if only_self {
+                    "me".into()
+                } else {
+                    "other".into()
+                },
                 operator_handle: "op".into(),
                 typical_serve_ms_p50_7d: Some(1000.0),
                 execution_concurrency: 1,
@@ -904,7 +897,9 @@ mod tests {
         clear_node_state_for_tests();
         let p = params_for_market(false, Some(vec!["m1".into()]), None);
         match MarketReadiness::new().can_dispatch_now(&p) {
-            ReadinessResult::NotReady { reason: NotReadyReason::Inactive } => {}
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::Inactive,
+            } => {}
             other => panic!("expected Inactive, got {:?}", other),
         }
     }
@@ -917,13 +912,17 @@ mod tests {
         // None
         let p = params_for_market(true, None, None);
         match MarketReadiness::new().can_dispatch_now(&p) {
-            ReadinessResult::NotReady { reason: NotReadyReason::NoMarketOffersForSlot } => {}
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::NoMarketOffersForSlot,
+            } => {}
             other => panic!("expected NoMarketOffersForSlot (None), got {:?}", other),
         }
         // Empty
         let p2 = params_for_market(true, Some(vec![]), None);
         match MarketReadiness::new().can_dispatch_now(&p2) {
-            ReadinessResult::NotReady { reason: NotReadyReason::NoMarketOffersForSlot } => {}
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::NoMarketOffersForSlot,
+            } => {}
             other => panic!("expected NoMarketOffersForSlot (empty), got {:?}", other),
         }
     }
@@ -939,7 +938,9 @@ mod tests {
         write_cached_model(slug, cached_with_offers(0, false, false));
         let p = params_for_market(true, Some(vec![slug.into()]), None);
         match MarketReadiness::new().can_dispatch_now(&p) {
-            ReadinessResult::NotReady { reason: NotReadyReason::NoMarketOffersForSlot } => {}
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::NoMarketOffersForSlot,
+            } => {}
             other => panic!("expected NoMarketOffersForSlot, got {:?}", other),
         }
         invalidate_cached_model(slug);
@@ -997,7 +998,9 @@ mod tests {
         write_cached_model(slug, cached_with_offers(1, false, false));
         let p = params_for_market(true, Some(vec![slug.into()]), None);
         match MarketReadiness::new().can_dispatch_now(&p) {
-            ReadinessResult::NotReady { reason: NotReadyReason::WireUnreachable } => {}
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::WireUnreachable,
+            } => {}
             other => panic!("expected WireUnreachable, got {:?}", other),
         }
         clear_node_state_for_tests();
@@ -1016,7 +1019,9 @@ mod tests {
         write_cached_model(slug, cached_with_offers(1, false, true));
         let p = params_for_market(true, Some(vec![slug.into()]), None);
         match MarketReadiness::new().can_dispatch_now(&p) {
-            ReadinessResult::NotReady { reason: NotReadyReason::SelfDealing } => {}
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::SelfDealing,
+            } => {}
             other => panic!("expected SelfDealing, got {:?}", other),
         }
         clear_node_state_for_tests();
@@ -1055,8 +1060,7 @@ mod tests {
     // ordering.
 
     use crate::pyramid::walker_fleet_probe::{
-        clear_fleet_cache_for_tests, fleet_probe_test_lock, write_cached_peer,
-        CachedFleetPeer,
+        clear_fleet_cache_for_tests, fleet_probe_test_lock, write_cached_peer, CachedFleetPeer,
     };
 
     /// Serialize FleetReadiness tests that mutate the fleet probe

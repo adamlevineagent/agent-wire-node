@@ -231,8 +231,7 @@ pub async fn build_step_dispatch_decision(
     // build_id established by the outer chain executor; when absent
     // (unit tests, bring-up paths) the breaker gate is skipped — a
     // no-op, preserving prior behavior.
-    let build_id_owned: Option<String> =
-        ctx.cache_base.as_ref().map(|cb| cb.build_id.clone());
+    let build_id_owned: Option<String> = ctx.cache_base.as_ref().map(|cb| cb.build_id.clone());
     let build_id_ref: Option<&str> = build_id_owned.as_deref();
     match DispatchDecision::build_with_build_id(slot, build_id_ref, &conn) {
         Ok(decision) => {
@@ -321,10 +320,7 @@ pub mod test_capture {
     /// Return the list of captured decisions so the test can assert on
     /// count + per-slot Decision content.
     pub fn snapshot() -> Vec<CapturedDecision> {
-        slot_store()
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+        slot_store().lock().map(|g| g.clone()).unwrap_or_default()
     }
 }
 
@@ -401,7 +397,10 @@ fn resolve_model(
         if let Ok(resolved) = registry.resolve_tier(tier, None, None, None) {
             return resolved.tier.model_id;
         }
-        warn!("[CHAIN] tier '{}' not in registry, falling back to legacy resolution", tier);
+        warn!(
+            "[CHAIN] tier '{}' not in registry, falling back to legacy resolution",
+            tier
+        );
     }
 
     // W3c: legacy `config.primary_model` / `fallback_model_{1,2}` arms
@@ -453,8 +452,7 @@ async fn dispatch_llm(
         .unwrap_or_else(|| defaults.model_tier.clone());
     let dispatch_decision = build_step_dispatch_decision(ctx, &slot).await;
 
-    let resolved_model =
-        resolve_model(step, defaults, &ctx.config, dispatch_decision.as_ref());
+    let resolved_model = resolve_model(step, defaults, &ctx.config, dispatch_decision.as_ref());
     let _resolved_limit = resolve_context_limit(step, defaults, &ctx.config, &ctx.tier1);
     let max_tokens: usize = ctx.tier1.ir_max_tokens;
 
@@ -534,12 +532,21 @@ async fn dispatch_llm(
         match llm::extract_json(&response) {
             Ok(json) => return Ok(json),
             Err(e) => {
-                info!("[CHAIN] step '{}' parse failed, on_parse_error={:?}", step.name, step.on_parse_error);
+                info!(
+                    "[CHAIN] step '{}' parse failed, on_parse_error={:?}",
+                    step.name, step.on_parse_error
+                );
                 if step.on_parse_error.as_deref() == Some("heal") {
                     info!("[CHAIN] step '{}' → parse failed ({}), attempting self-healing (1 max attempts)", step.name, e);
-                    let heal_instruction = step.heal_instruction.as_deref().unwrap_or("Fix the JSON.");
+                    let heal_instruction =
+                        step.heal_instruction.as_deref().unwrap_or("Fix the JSON.");
                     let heal_sys = format!("{}\n\n{}", system_prompt, heal_instruction);
-                    let heal_user = format!("Target Schema:\n{}\n\nMalformed Response:\n{}\n\nError:\n{}", serde_json::to_string_pretty(schema).unwrap_or_default(), response, e);
+                    let heal_user = format!(
+                        "Target Schema:\n{}\n\nMalformed Response:\n{}\n\nError:\n{}",
+                        serde_json::to_string_pretty(schema).unwrap_or_default(),
+                        response,
+                        e
+                    );
                     // Phase 12: heal path inherits the cache plumbing
                     // but with a different step_name so it gets its
                     // own cache row.
@@ -580,9 +587,19 @@ async fn dispatch_llm(
                         max_tokens,
                     )
                     .await?;
-                    return llm::extract_json(&retry_resp).map_err(|he| anyhow!("Step '{}': JSON parse failed after self-healing: {}", step.name, he));
+                    return llm::extract_json(&retry_resp).map_err(|he| {
+                        anyhow!(
+                            "Step '{}': JSON parse failed after self-healing: {}",
+                            step.name,
+                            he
+                        )
+                    });
                 } else {
-                    return Err(anyhow!("Step '{}': structured output JSON parse failed: {}", step.name, e));
+                    return Err(anyhow!(
+                        "Step '{}': structured output JSON parse failed: {}",
+                        step.name,
+                        e
+                    ));
                 }
             }
         }
@@ -593,10 +610,10 @@ async fn dispatch_llm(
     // executor always does). This turns the legacy v2 chain path into
     // a cache-reachable path.
     let dispatch_cache_ctx = ctx.cache_base.as_ref().map(|cb| {
-        let prompt_hash = cb.get_or_compute_prompt_hash(
-            step.instruction.as_deref().unwrap_or(&step.name),
-            || system_prompt.to_string(),
-        );
+        let prompt_hash = cb
+            .get_or_compute_prompt_hash(step.instruction.as_deref().unwrap_or(&step.name), || {
+                system_prompt.to_string()
+            });
         let mut c = CacheStepContext::new(
             ctx.slug.clone(),
             cb.build_id.clone(),
@@ -655,12 +672,18 @@ async fn dispatch_llm(
             Ok(json)
         }
         Err(_first_err) => {
-            info!("[CHAIN] step '{}' parse failed, on_parse_error={:?}", step.name, step.on_parse_error);
+            info!(
+                "[CHAIN] step '{}' parse failed, on_parse_error={:?}",
+                step.name, step.on_parse_error
+            );
             if step.on_parse_error.as_deref() == Some("heal") {
                 info!("[CHAIN] step '{}' → parse failed ({}), attempting self-healing (1 max attempts)", step.name, _first_err);
                 let heal_instruction = step.heal_instruction.as_deref().unwrap_or("Fix the JSON.");
                 let heal_sys = format!("{}\n\n{}", system_prompt, heal_instruction);
-                let heal_user = format!("Malformed Response:\n{}\n\nError:\n{}", response, _first_err);
+                let heal_user = format!(
+                    "Malformed Response:\n{}\n\nError:\n{}",
+                    response, _first_err
+                );
                 let heal_ctx = ctx.cache_base.as_ref().map(|cb| {
                     let prompt_hash = compute_prompt_hash(&heal_sys);
                     let mut c = CacheStepContext::new(
@@ -698,7 +721,13 @@ async fn dispatch_llm(
                     max_tokens,
                 )
                 .await?;
-                return llm::extract_json(&retry_resp).map_err(|he| anyhow!("Step '{}': JSON parse failed after self-healing: {}", step.name, he));
+                return llm::extract_json(&retry_resp).map_err(|he| {
+                    anyhow!(
+                        "Step '{}': JSON parse failed after self-healing: {}",
+                        step.name,
+                        he
+                    )
+                });
             } else {
                 // JSON-retry guarantee: retry at temperature 0.1
                 info!(
@@ -781,7 +810,11 @@ const MECHANICAL_FUNCTIONS: &[&str] = &[
 /// the generic `(input: &Value, ctx: &ChainDispatchContext) -> Result<Value>` contract.
 /// The dispatch framework is established here; actual wiring happens in Phase 5
 /// when the chain executor replaces the hardcoded build pipeline.
-fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDispatchContext) -> Result<Value> {
+fn dispatch_mechanical(
+    function_name: &str,
+    input: &Value,
+    ctx: &ChainDispatchContext,
+) -> Result<Value> {
     match function_name {
         "extract_import_graph" => {
             info!("[mechanical] extract_import_graph (placeholder)");
@@ -1022,10 +1055,7 @@ pub fn build_node_from_output(
                             .and_then(|r| r.as_str())
                             .unwrap_or("")
                             .to_string(),
-                        importance: e
-                            .get("importance")
-                            .and_then(|i| i.as_f64())
-                            .unwrap_or(0.0),
+                        importance: e.get("importance").and_then(|i| i.as_f64()).unwrap_or(0.0),
                         liveness: e
                             .get("liveness")
                             .and_then(|l| l.as_str())
@@ -1061,10 +1091,7 @@ pub fn build_node_from_output(
                             .and_then(|r| r.as_str())
                             .unwrap_or("")
                             .to_string(),
-                        importance: q
-                            .get("importance")
-                            .and_then(|i| i.as_f64())
-                            .unwrap_or(0.0),
+                        importance: q.get("importance").and_then(|i| i.as_f64()).unwrap_or(0.0),
                         chunk_ref: q
                             .get("at")
                             .or_else(|| q.get("chunk_ref"))
@@ -1100,7 +1127,9 @@ pub fn build_node_from_output(
     if let Some(decs) = output.get("decisions").and_then(|d| d.as_array()) {
         // Only re-extract if we haven't already — check if the existing
         // decisions lack stance info (legacy extraction path)
-        let has_stance = decisions.iter().any(|d| !d.stance.is_empty() && d.stance != "other");
+        let has_stance = decisions
+            .iter()
+            .any(|d| !d.stance.is_empty() && d.stance != "other");
         if !has_stance {
             decisions.clear();
             for d in decs {
@@ -1134,10 +1163,7 @@ pub fn build_node_from_output(
                         .and_then(|v| v.as_str())
                         .unwrap_or("other")
                         .to_string(),
-                    importance: d
-                        .get("importance")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0),
+                    importance: d.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.0),
                     ..Default::default()
                 });
             }
@@ -1300,7 +1326,10 @@ pub fn resolve_ir_model(
         if let Ok(resolved) = registry.resolve_tier(tier, None, None, None) {
             return resolved.tier.model_id;
         }
-        warn!("[IR] tier '{}' not in registry, falling back to legacy resolution", tier);
+        warn!(
+            "[IR] tier '{}' not in registry, falling back to legacy resolution",
+            tier
+        );
     }
 
     // W3c: legacy hardcoded per-tier match arms deleted. Aliases
@@ -1425,7 +1454,10 @@ fn resolve_ir_llm_call_options(step: &Step, tier1: &Tier1Config) -> llm::LlmCall
         None
     };
 
-    llm::LlmCallOptions { min_timeout_secs, ..Default::default() }
+    llm::LlmCallOptions {
+        min_timeout_secs,
+        ..Default::default()
+    }
 }
 
 /// Dispatch an IR Step to the appropriate execution path.
@@ -1709,10 +1741,7 @@ fn build_cache_ctx_for_ir_step(
     // Instruction key: prefer the resolved instruction string (the
     // template body as supplied by the IR). Falls back to the step id
     // when no instruction is attached (mechanical-ish LLM steps).
-    let instruction_key = step
-        .instruction
-        .clone()
-        .unwrap_or_else(|| step.id.clone());
+    let instruction_key = step.instruction.clone().unwrap_or_else(|| step.id.clone());
     let prompt_hash = base.get_or_compute_prompt_hash(&instruction_key, || {
         // Include both the system prompt and the user prompt template
         // in the body snapshot. The caller above already substituted
@@ -1734,10 +1763,7 @@ fn build_cache_ctx_for_ir_step(
     // Step metadata — primitive defaults to the step id when the
     // step has no primitive attached (legacy chain steps that use
     // `rust_function` instead).
-    let primitive = step
-        .primitive
-        .clone()
-        .unwrap_or_else(|| step.id.clone());
+    let primitive = step.primitive.clone().unwrap_or_else(|| step.id.clone());
     let depth = step
         .storage_directive
         .as_ref()
@@ -2031,10 +2057,7 @@ mod tests {
             on_error: "retry(2)".into(),
         };
         let config = LlmConfig::default();
-        assert_eq!(
-            resolve_model(&step, &defaults, &config, None),
-            "<unknown>"
-        );
+        assert_eq!(resolve_model(&step, &defaults, &config, None), "<unknown>");
     }
 
     // ── IR dispatch tests ───────────────────────────────────────────────────
@@ -2465,10 +2488,9 @@ mod tests {
         // while other parallel tests mutate the walker_market_probe
         // node_state cell. Without this, intermittent failures fire
         // when the concurrent market tests trip the failure counter.
-        let _guard =
-            crate::pyramid::walker_market_probe::node_state_test_lock()
-                .lock()
-                .unwrap();
+        let _guard = crate::pyramid::walker_market_probe::node_state_test_lock()
+            .lock()
+            .unwrap();
         crate::pyramid::walker_market_probe::clear_node_state_for_tests();
 
         test_capture::enable();

@@ -50,8 +50,7 @@ pub struct ServerState {
     /// seqs, and WS7's offer IPC can mutate the offers map. `None`
     /// only in test fixtures and the pre-init boot window; production
     /// boot constructs this before spawning the HTTP server.
-    pub compute_market_state:
-        Option<Arc<RwLock<crate::compute_market::ComputeMarketState>>>,
+    pub compute_market_state: Option<Arc<RwLock<crate::compute_market::ComputeMarketState>>>,
     /// Node configuration (api_url, supabase creds, cache paths).
     /// Needed by operator HTTP routes that proxy to the Wire API
     /// (compute offers, market surface) and by system observability
@@ -179,7 +178,7 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
                 .unwrap_or_else(|_| vec![source_path_json.clone()]);
 
             // Get all relative paths for this slug
-            let rel_paths: Vec<(String, )> = {
+            let rel_paths: Vec<(String,)> = {
                 let mut stmt = match conn.prepare(
                     "SELECT file_path FROM pyramid_file_hashes WHERE slug = ?1 AND file_path NOT LIKE '/%'",
                 ) {
@@ -226,7 +225,8 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
     // carries the registry path through dispatched helpers.
     let (base_config, model, defer_maintenance) = {
         let config = pyramid_state.config.read().await;
-        let defer = config.dispatch_policy
+        let defer = config
+            .dispatch_policy
             .as_ref()
             .map(|p| p.build_coordination.defer_maintenance_during_build)
             .unwrap_or(false);
@@ -374,13 +374,18 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
             if r_new > 0 || r_changed > 0 || r_deleted > 0 {
                 tracing::info!(
                     "Startup reconciliation for '{}': {} new, {} changed, {} deleted, {} unchanged",
-                    slug, r_new, r_changed, r_deleted, r_unchanged
+                    slug,
+                    r_new,
+                    r_changed,
+                    r_deleted,
+                    r_unchanged
                 );
                 engine.notify_mutation(0);
             } else {
                 tracing::info!(
                     "Startup reconciliation for '{}': all {} files unchanged",
-                    slug, r_unchanged
+                    slug,
+                    r_unchanged
                 );
             }
         }
@@ -420,7 +425,8 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
         engines.insert(slug.clone(), engine);
 
         if !source_paths.is_empty() {
-            let mut watcher = PyramidFileWatcher::new(&slug, source_paths, &pyramid_state.operational.tier2);
+            let mut watcher =
+                PyramidFileWatcher::new(&slug, source_paths, &pyramid_state.operational.tier2);
             watcher.set_mutation_sender(mutation_tx.clone());
             match watcher.start(&db_path) {
                 Ok(()) => {
@@ -1095,8 +1101,8 @@ pub async fn start_server(
     // pyramid_config.json::auth_token), mounted under /pyramid/* alongside
     // the existing pyramid routes. Agent/CLI tooling (pyramid-cli) hits
     // these endpoints to drive the node without touching the desktop UI.
-    let operator_routes = pyramid::routes_operator::operator_routes(
-        pyramid::routes_operator::OperatorContext {
+    let operator_routes =
+        pyramid::routes_operator::operator_routes(pyramid::routes_operator::OperatorContext {
             pyramid: state.pyramid.clone(),
             auth: state.auth.clone(),
             credits: state.credits.clone(),
@@ -1109,17 +1115,14 @@ pub async fn start_server(
             compute_market_state: state.compute_market_state.clone(),
             compute_market_dispatch: state.compute_market_dispatch.clone(),
             pending_market_jobs: state.pending_market_jobs.clone(),
-        },
-    );
+        });
 
     // Post-agents-retro /p/ HTML web surface — mounted separately so it can
     // get a permissive CORS filter. The strict desktop-API allowlist above
     // would reject same-tunnel form POSTs (the browser sends an Origin header
     // for any cross-method navigation, including same-origin POSTs).
-    let public_html_routes = pyramid::routes::public_html_routes(
-        state.pyramid.clone(),
-        state.jwt_public_key.clone(),
-    );
+    let public_html_routes =
+        pyramid::routes::public_html_routes(state.pyramid.clone(), state.jwt_public_key.clone());
     let public_cors = warp::cors()
         .allow_any_origin()
         .allow_methods(vec!["GET", "POST", "OPTIONS"])
@@ -1175,9 +1178,7 @@ pub async fn start_server(
             .and(warp::body::json())
             .and_then(move |auth_header: String, body: serde_json::Value| {
                 let state = state.clone();
-                async move {
-                    handle_fleet_dispatch(auth_header, body, state).await
-                }
+                async move { handle_fleet_dispatch(auth_header, body, state).await }
             })
     };
 
@@ -1190,9 +1191,7 @@ pub async fn start_server(
             .and(warp::body::json())
             .and_then(move |auth_header: String, body: serde_json::Value| {
                 let state = state.clone();
-                async move {
-                    handle_fleet_announce(auth_header, body, state).await
-                }
+                async move { handle_fleet_announce(auth_header, body, state).await }
             })
     };
 
@@ -1205,9 +1204,7 @@ pub async fn start_server(
             .and(warp::body::json())
             .and_then(move |auth_header: String, body: serde_json::Value| {
                 let state = state.clone();
-                async move {
-                    handle_fleet_result(auth_header, body, state).await
-                }
+                async move { handle_fleet_result(auth_header, body, state).await }
             })
     };
 
@@ -1227,9 +1224,7 @@ pub async fn start_server(
             .and(warp::body::json())
             .and_then(move |auth_header: String, body: serde_json::Value| {
                 let state = state.clone();
-                async move {
-                    handle_market_dispatch(auth_header, body, state).await
-                }
+                async move { handle_market_dispatch(auth_header, body, state).await }
             })
     };
 
@@ -1257,9 +1252,7 @@ pub async fn start_server(
             .and(warp::body::json())
             .and_then(move |auth_header: String, body: serde_json::Value| {
                 let state = state.clone();
-                async move {
-                    handle_compute_job_result(auth_header, body, state).await
-                }
+                async move { handle_compute_job_result(auth_header, body, state).await }
             })
     };
 
@@ -1820,12 +1813,12 @@ async fn handle_fleet_dispatch(
     // outcome back to the async handler to construct the HTTP response.
     #[derive(Debug)]
     enum AdmissionOutcome {
-        Admitted,         // fresh insert, passed admission → spawn worker
-        RetryExisting,    // same dispatcher, pre-existing pending/ready row
+        Admitted,      // fresh insert, passed admission → spawn worker
+        RetryExisting, // same dispatcher, pre-existing pending/ready row
         ConflictDifferentDispatcher,
         GoneDelivered,
         GoneFailed(Option<String>), // last_error for body
-        Rejected503,      // admission cap hit (freshly inserted path)
+        Rejected503,                // admission cap hit (freshly inserted path)
         DbError(String),
     }
 
@@ -1925,11 +1918,9 @@ async fn handle_fleet_dispatch(
             };
             if admission_max_inflight != 0 && inflight >= admission_max_inflight {
                 // Over capacity — delete the row we just inserted and reject.
-                if let Err(e) = crate::pyramid::db::fleet_outbox_delete(
-                    &tx,
-                    &dispatcher_nid_tx,
-                    &job_id_tx,
-                ) {
+                if let Err(e) =
+                    crate::pyramid::db::fleet_outbox_delete(&tx, &dispatcher_nid_tx, &job_id_tx)
+                {
                     let _ = tx.rollback();
                     return AdmissionOutcome::DbError(e.to_string());
                 }
@@ -1954,22 +1945,18 @@ async fn handle_fleet_dispatch(
                 warp::http::StatusCode::INTERNAL_SERVER_ERROR,
             )))
         }
-        AdmissionOutcome::ConflictDifferentDispatcher => {
-            Ok(Box::new(warp::reply::with_status(
-                warp::reply::json(
-                    &serde_json::json!({"error": "job_id conflict with different dispatcher"}),
-                ),
-                warp::http::StatusCode::CONFLICT,
-            )))
-        }
-        AdmissionOutcome::GoneDelivered => {
-            Ok(Box::new(warp::reply::with_status(
-                warp::reply::json(
-                    &serde_json::json!({"error": "job already delivered; dispatcher lost state"}),
-                ),
-                warp::http::StatusCode::GONE,
-            )))
-        }
+        AdmissionOutcome::ConflictDifferentDispatcher => Ok(Box::new(warp::reply::with_status(
+            warp::reply::json(
+                &serde_json::json!({"error": "job_id conflict with different dispatcher"}),
+            ),
+            warp::http::StatusCode::CONFLICT,
+        ))),
+        AdmissionOutcome::GoneDelivered => Ok(Box::new(warp::reply::with_status(
+            warp::reply::json(
+                &serde_json::json!({"error": "job already delivered; dispatcher lost state"}),
+            ),
+            warp::http::StatusCode::GONE,
+        ))),
         AdmissionOutcome::GoneFailed(last_error) => {
             let body = serde_json::json!({
                 "error": "job previously failed",
@@ -2210,16 +2197,15 @@ fn spawn_fleet_worker(
             }
             Some(Ok(llm_response)) => {
                 // Build FleetAsyncResult::Success from LlmResponse.
-                let outcome = crate::fleet::FleetAsyncResult::Success(
-                    crate::fleet::FleetDispatchResponse {
+                let outcome =
+                    crate::fleet::FleetAsyncResult::Success(crate::fleet::FleetDispatchResponse {
                         content: llm_response.content,
                         prompt_tokens: Some(llm_response.usage.prompt_tokens),
                         completion_tokens: Some(llm_response.usage.completion_tokens),
                         model: resolved_model.clone(),
                         finish_reason: None,
                         peer_model: Some(resolved_model.clone()),
-                    },
-                );
+                    });
                 let result_json = match serde_json::to_string(&outcome) {
                     Ok(s) => s,
                     Err(e) => {
@@ -2239,21 +2225,20 @@ fn spawn_fleet_worker(
                 let jid_promote = job_id.clone();
                 let rj_promote = result_json.clone();
                 let ready_retention_secs = policy.ready_retention_secs;
-                let promote_res: Result<usize, String> =
-                    tokio::task::spawn_blocking(move || {
-                        let conn = rusqlite::Connection::open(&db_promote)
-                            .map_err(|e| e.to_string())?;
-                        crate::pyramid::db::fleet_outbox_promote_ready_if_pending(
-                            &conn,
-                            &disp_promote,
-                            &jid_promote,
-                            &rj_promote,
-                            ready_retention_secs,
-                        )
-                        .map_err(|e| e.to_string())
-                    })
-                    .await
-                    .unwrap_or_else(|je| Err(je.to_string()));
+                let promote_res: Result<usize, String> = tokio::task::spawn_blocking(move || {
+                    let conn =
+                        rusqlite::Connection::open(&db_promote).map_err(|e| e.to_string())?;
+                    crate::pyramid::db::fleet_outbox_promote_ready_if_pending(
+                        &conn,
+                        &disp_promote,
+                        &jid_promote,
+                        &rj_promote,
+                        ready_retention_secs,
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|je| Err(je.to_string()));
 
                 match promote_res {
                     Ok(1) => {
@@ -2359,10 +2344,7 @@ fn spawn_fleet_worker(
                         let _ = tokio::task::spawn_blocking(move || {
                             let conn = rusqlite::Connection::open(&db_fail).ok()?;
                             crate::pyramid::db::fleet_outbox_bump_delivery_attempt(
-                                &conn,
-                                &disp_fail,
-                                &jid_fail,
-                                &err_clone,
+                                &conn, &disp_fail, &jid_fail, &err_clone,
                             )
                             .ok()
                         })
@@ -2391,21 +2373,20 @@ fn spawn_fleet_worker(
                 let disp_promote = dispatcher_nid.clone();
                 let jid_promote = job_id.clone();
                 let ready_retention_secs = policy.ready_retention_secs;
-                let promote_res: Result<usize, String> =
-                    tokio::task::spawn_blocking(move || {
-                        let conn = rusqlite::Connection::open(&db_promote)
-                            .map_err(|e| e.to_string())?;
-                        crate::pyramid::db::fleet_outbox_promote_ready_if_pending(
-                            &conn,
-                            &disp_promote,
-                            &jid_promote,
-                            &result_json,
-                            ready_retention_secs,
-                        )
-                        .map_err(|e| e.to_string())
-                    })
-                    .await
-                    .unwrap_or_else(|je| Err(je.to_string()));
+                let promote_res: Result<usize, String> = tokio::task::spawn_blocking(move || {
+                    let conn =
+                        rusqlite::Connection::open(&db_promote).map_err(|e| e.to_string())?;
+                    crate::pyramid::db::fleet_outbox_promote_ready_if_pending(
+                        &conn,
+                        &disp_promote,
+                        &jid_promote,
+                        &result_json,
+                        ready_retention_secs,
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|je| Err(je.to_string()));
 
                 if !matches!(promote_res, Ok(1)) {
                     chronicle_write(
@@ -2498,10 +2479,7 @@ fn spawn_fleet_worker(
                         let _ = tokio::task::spawn_blocking(move || {
                             let conn = rusqlite::Connection::open(&db_fail).ok()?;
                             crate::pyramid::db::fleet_outbox_bump_delivery_attempt(
-                                &conn,
-                                &disp_fail,
-                                &jid_fail,
-                                &err_clone,
+                                &conn, &disp_fail, &jid_fail, &err_clone,
                             )
                             .ok()
                         })
@@ -2625,7 +2603,13 @@ async fn handle_compute_job_result(
     // code here read `user_id` — pre-existing bug (would 401 every
     // legitimate token); fixed in rev 2.0 cutover to match the fleet
     // identity verifier pattern (server.rs:1589) + pyramid query verifier.
-    let self_operator_id = state.auth.read().await.operator_id.clone().unwrap_or_default();
+    let self_operator_id = state
+        .auth
+        .read()
+        .await
+        .operator_id
+        .clone()
+        .unwrap_or_default();
     if self_operator_id.is_empty() {
         tracing::warn!(
             "compute_job_result: local operator_id empty (not registered with Wire); cannot verify JWT"
@@ -2701,7 +2685,10 @@ async fn handle_compute_job_result(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
-                latency_ms: result.get("latency_ms").and_then(|v| v.as_i64()).unwrap_or(0),
+                latency_ms: result
+                    .get("latency_ms")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0),
                 finish_reason: result
                     .get("finish_reason")
                     .and_then(|v| v.as_str())
@@ -2747,8 +2734,14 @@ async fn handle_compute_job_result(
     // Capture envelope metadata for chronicle BEFORE the payload moves
     // into the oneshot send. The network-framed metadata keys mirror
     // the plan §4.3 shape.
-    let (success_content_len, success_model_used, success_input_tokens, success_output_tokens,
-         success_latency_ms, success_finish_reason) = match &payload {
+    let (
+        success_content_len,
+        success_model_used,
+        success_input_tokens,
+        success_output_tokens,
+        success_latency_ms,
+        success_finish_reason,
+    ) = match &payload {
         crate::pyramid::pending_jobs::DeliveryPayload::Success {
             content,
             model_used,
@@ -2792,26 +2785,28 @@ async fn handle_compute_job_result(
                     crate::pyramid::compute_chronicle::SOURCE_NETWORK_RECEIVED,
                     job_id
                 );
-                let chronicle_ctx = crate::pyramid::compute_chronicle::ChronicleEventContext::minimal(
-                    &job_path,
-                    crate::pyramid::compute_chronicle::EVENT_NETWORK_RESULT_RETURNED,
-                    crate::pyramid::compute_chronicle::SOURCE_NETWORK_RECEIVED,
-                )
-                .with_model_id(model_used.clone())
-                .with_metadata(serde_json::json!({
-                    "job_id": job_path,
-                    "uuid_job_id": job_id,
-                    "input_tokens": success_input_tokens.unwrap_or(0),
-                    "output_tokens": success_output_tokens.unwrap_or(0),
-                    "latency_ms": success_latency_ms.unwrap_or(0),
-                    "model_used": model_used,
-                    "provider_node_id": serde_json::Value::Null,
-                    "finish_reason": success_finish_reason,
-                    "content_bytes": success_content_len.unwrap_or(0),
-                }));
+                let chronicle_ctx =
+                    crate::pyramid::compute_chronicle::ChronicleEventContext::minimal(
+                        &job_path,
+                        crate::pyramid::compute_chronicle::EVENT_NETWORK_RESULT_RETURNED,
+                        crate::pyramid::compute_chronicle::SOURCE_NETWORK_RECEIVED,
+                    )
+                    .with_model_id(model_used.clone())
+                    .with_metadata(serde_json::json!({
+                        "job_id": job_path,
+                        "uuid_job_id": job_id,
+                        "input_tokens": success_input_tokens.unwrap_or(0),
+                        "output_tokens": success_output_tokens.unwrap_or(0),
+                        "latency_ms": success_latency_ms.unwrap_or(0),
+                        "model_used": model_used,
+                        "provider_node_id": serde_json::Value::Null,
+                        "finish_reason": success_finish_reason,
+                        "content_bytes": success_content_len.unwrap_or(0),
+                    }));
                 tokio::task::spawn_blocking(move || {
                     if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                        let _ = crate::pyramid::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                        let _ =
+                            crate::pyramid::compute_chronicle::record_event(&conn, &chronicle_ctx);
                     }
                 });
             }
@@ -2841,18 +2836,20 @@ async fn handle_compute_job_result(
                     crate::pyramid::compute_chronicle::SOURCE_NETWORK_RECEIVED,
                     job_id
                 );
-                let chronicle_ctx = crate::pyramid::compute_chronicle::ChronicleEventContext::minimal(
-                    &job_path,
-                    crate::pyramid::compute_chronicle::EVENT_NETWORK_LATE_ARRIVAL,
-                    crate::pyramid::compute_chronicle::SOURCE_NETWORK_RECEIVED,
-                )
-                .with_metadata(serde_json::json!({
-                    "uuid_job_id": job_id,
-                    "time_since_first_seen_ms": serde_json::Value::Null,
-                }));
+                let chronicle_ctx =
+                    crate::pyramid::compute_chronicle::ChronicleEventContext::minimal(
+                        &job_path,
+                        crate::pyramid::compute_chronicle::EVENT_NETWORK_LATE_ARRIVAL,
+                        crate::pyramid::compute_chronicle::SOURCE_NETWORK_RECEIVED,
+                    )
+                    .with_metadata(serde_json::json!({
+                        "uuid_job_id": job_id,
+                        "time_since_first_seen_ms": serde_json::Value::Null,
+                    }));
                 tokio::task::spawn_blocking(move || {
                     if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                        let _ = crate::pyramid::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                        let _ =
+                            crate::pyramid::compute_chronicle::record_event(&conn, &chronicle_ctx);
                     }
                 });
             }
@@ -3094,9 +3091,7 @@ async fn handle_market_dispatch(
         None => {
             return Ok(Box::new(warp::reply::with_status(
                 warp::reply::with_header(
-                    warp::reply::json(
-                        &serde_json::json!({"error": "compute market disabled"}),
-                    ),
+                    warp::reply::json(&serde_json::json!({"error": "compute market disabled"})),
                     "Retry-After",
                     // No policy to read since the context itself is None.
                     // 30s is the seed default for admission_retry_after_secs.
@@ -3146,8 +3141,7 @@ async fn handle_market_dispatch(
     let allow_market_visibility = {
         let db_path_read = db_path.clone();
         let result: Result<bool, String> = tokio::task::spawn_blocking(move || {
-            let conn = rusqlite::Connection::open(&db_path_read)
-                .map_err(|e| e.to_string())?;
+            let conn = rusqlite::Connection::open(&db_path_read).map_err(|e| e.to_string())?;
             let p = crate::pyramid::local_mode::get_compute_participation_policy(&conn)
                 .map_err(|e| e.to_string())?;
             Ok(p.effective_booleans().allow_market_visibility)
@@ -3159,9 +3153,7 @@ async fn handle_market_dispatch(
             Err(e) => {
                 tracing::error!("Market dispatch participation policy read failed: {}", e);
                 return Ok(Box::new(warp::reply::with_status(
-                    warp::reply::json(
-                        &serde_json::json!({"error": "policy read error"}),
-                    ),
+                    warp::reply::json(&serde_json::json!({"error": "policy read error"})),
                     warp::http::StatusCode::INTERNAL_SERVER_ERROR,
                 )));
             }
@@ -3171,9 +3163,7 @@ async fn handle_market_dispatch(
         return Ok(Box::new(warp::reply::with_status(
             warp::reply::with_header(
                 warp::reply::with_header(
-                    warp::reply::json(
-                        &serde_json::json!({"error": "market_serving_disabled"}),
-                    ),
+                    warp::reply::json(&serde_json::json!({"error": "market_serving_disabled"})),
                     "Retry-After",
                     policy.admission_retry_after_secs.to_string(),
                 ),
@@ -3262,18 +3252,13 @@ async fn handle_market_dispatch(
         "suspended",
         "escalation",
     ];
-    const MARKET_COMPUTE_SLUG: &str =
-        crate::pyramid::dadbear_preview::MARKET_COMPUTE_SLUG;
+    const MARKET_COMPUTE_SLUG: &str = crate::pyramid::dadbear_preview::MARKET_COMPUTE_SLUG;
 
     let blocking_hold: Option<String> = {
         let db_path_read = db_path.clone();
         let result: Result<Option<String>, String> = tokio::task::spawn_blocking(move || {
-            let conn = rusqlite::Connection::open(&db_path_read)
-                .map_err(|e| e.to_string())?;
-            let holds = crate::pyramid::auto_update_ops::get_holds(
-                &conn,
-                MARKET_COMPUTE_SLUG,
-            );
+            let conn = rusqlite::Connection::open(&db_path_read).map_err(|e| e.to_string())?;
+            let holds = crate::pyramid::auto_update_ops::get_holds(&conn, MARKET_COMPUTE_SLUG);
             // Return the FIRST matching blocking hold name so the
             // X-Wire-Reason header can surface it. Iterating in the
             // declared order keeps the surface deterministic.
@@ -3291,9 +3276,7 @@ async fn handle_market_dispatch(
             Err(e) => {
                 tracing::error!("Market dispatch hold-projection read failed: {}", e);
                 return Ok(Box::new(warp::reply::with_status(
-                    warp::reply::json(
-                        &serde_json::json!({"error": "hold projection read error"}),
-                    ),
+                    warp::reply::json(&serde_json::json!({"error": "hold projection read error"})),
                     warp::http::StatusCode::INTERNAL_SERVER_ERROR,
                 )));
             }
@@ -3725,11 +3708,8 @@ async fn handle_market_dispatch(
         let model_tier_wi = req.model_id.clone();
         let wi_call_result: Result<String, String> =
             tokio::task::spawn_blocking(move || -> Result<String, String> {
-                let conn = rusqlite::Connection::open(&db_path_wi)
-                    .map_err(|e| e.to_string())?;
-                let now = chrono::Utc::now()
-                    .format("%Y-%m-%d %H:%M:%S")
-                    .to_string();
+                let conn = rusqlite::Connection::open(&db_path_wi).map_err(|e| e.to_string())?;
+                let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 // Insert work item at state='previewed'. INSERT OR IGNORE
                 // so a Wire retry with the same job_id (crash-recovery
                 // run hitting a pre-existing row) doesn't crash on PK.
@@ -3769,10 +3749,7 @@ async fn handle_market_dispatch(
                     .unwrap_or(0)
                     + 1;
                 let attempt_id_val =
-                    crate::pyramid::dadbear_compiler::attempt_id(
-                        &work_item_id,
-                        attempt_number,
-                    );
+                    crate::pyramid::dadbear_compiler::attempt_id(&work_item_id, attempt_number);
                 // routing = 'local' — Phase 2 market work runs on the
                 // provider's local GPU (bridge is Phase 4). When
                 // bridge lands, the routing column distinguishes.
@@ -4037,10 +4014,8 @@ fn spawn_market_worker(
         // the spec state machine.
         {
             let mut s = market_state_handle.write().await;
-            let _ = s.transition_job_status(
-                &job_id,
-                crate::compute_market::ComputeJobStatus::Executing,
-            );
+            let _ = s
+                .transition_job_status(&job_id, crate::compute_market::ComputeJobStatus::Executing);
             if let Some(job) = s.active_jobs.get_mut(&job_id) {
                 job.filled_at = Some(chrono::Utc::now().to_rfc3339());
             }
@@ -4165,10 +4140,7 @@ fn spawn_market_worker(
                 // Phase 2 WS6: nudge mirror — model's `is_executing`
                 // and `market_depth` changed.
                 let _ = market_ctx.mirror_nudge.send(());
-                tracing::warn!(
-                    "Market worker lost heartbeat sweep for job_id={}",
-                    job_id
-                );
+                tracing::warn!("Market worker lost heartbeat sweep for job_id={}", job_id);
             }
             Some(Ok(llm_response)) => {
                 // Build MarketAsyncResult::Success and CAS pending → ready.
@@ -4199,21 +4171,20 @@ fn spawn_market_worker(
                 let jid_promote = job_id.clone();
                 let rj_promote = result_json.clone();
                 let ready_retention_secs = policy.ready_retention_secs;
-                let promote_res: Result<usize, String> =
-                    tokio::task::spawn_blocking(move || {
-                        let conn = rusqlite::Connection::open(&db_promote)
-                            .map_err(|e| e.to_string())?;
-                        crate::pyramid::db::fleet_outbox_promote_ready_if_pending(
-                            &conn,
-                            crate::fleet::WIRE_PLATFORM_DISPATCHER,
-                            &jid_promote,
-                            &rj_promote,
-                            ready_retention_secs,
-                        )
-                        .map_err(|e| e.to_string())
-                    })
-                    .await
-                    .unwrap_or_else(|je| Err(je.to_string()));
+                let promote_res: Result<usize, String> = tokio::task::spawn_blocking(move || {
+                    let conn =
+                        rusqlite::Connection::open(&db_promote).map_err(|e| e.to_string())?;
+                    crate::pyramid::db::fleet_outbox_promote_ready_if_pending(
+                        &conn,
+                        crate::fleet::WIRE_PLATFORM_DISPATCHER,
+                        &jid_promote,
+                        &rj_promote,
+                        ready_retention_secs,
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|je| Err(je.to_string()));
 
                 match promote_res {
                     Ok(1) => {
@@ -4259,10 +4230,7 @@ fn spawn_market_worker(
                         // Phase 2 WS6: nudge mirror — terminal transition
                         // opens a slot for the model.
                         let _ = market_ctx.mirror_nudge.send(());
-                        tracing::warn!(
-                            "Market worker sweep-lost at promote for job_id={}",
-                            job_id
-                        );
+                        tracing::warn!("Market worker sweep-lost at promote for job_id={}", job_id);
                     }
                     Err(e) => {
                         tracing::error!(
@@ -4285,9 +4253,8 @@ fn spawn_market_worker(
                 // identical to the success path's promote call. The
                 // delivery worker then POSTs the proper failure callback.
                 let err_msg = format!("{}", e);
-                let outcome = crate::pyramid::market_dispatch::MarketAsyncResult::Error(
-                    err_msg.clone(),
-                );
+                let outcome =
+                    crate::pyramid::market_dispatch::MarketAsyncResult::Error(err_msg.clone());
                 let result_json = match serde_json::to_string(&outcome) {
                     Ok(s) => s,
                     Err(e_ser) => crate::pyramid::db::synthesize_worker_error_json(&format!(
@@ -4299,21 +4266,19 @@ fn spawn_market_worker(
                 let jid_fail = job_id.clone();
                 let rj_fail = result_json.clone();
                 let ready_retention_secs = policy.ready_retention_secs;
-                let promote_res: Result<usize, String> =
-                    tokio::task::spawn_blocking(move || {
-                        let conn = rusqlite::Connection::open(&db_fail)
-                            .map_err(|e| e.to_string())?;
-                        crate::pyramid::db::fleet_outbox_promote_ready_if_pending(
-                            &conn,
-                            crate::fleet::WIRE_PLATFORM_DISPATCHER,
-                            &jid_fail,
-                            &rj_fail,
-                            ready_retention_secs,
-                        )
-                        .map_err(|e| e.to_string())
-                    })
-                    .await
-                    .unwrap_or_else(|je| Err(je.to_string()));
+                let promote_res: Result<usize, String> = tokio::task::spawn_blocking(move || {
+                    let conn = rusqlite::Connection::open(&db_fail).map_err(|e| e.to_string())?;
+                    crate::pyramid::db::fleet_outbox_promote_ready_if_pending(
+                        &conn,
+                        crate::fleet::WIRE_PLATFORM_DISPATCHER,
+                        &jid_fail,
+                        &rj_fail,
+                        ready_retention_secs,
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|je| Err(je.to_string()));
                 match promote_res {
                     Ok(1) => {
                         // Row promoted to ready; nudge the delivery worker
@@ -4351,11 +4316,7 @@ fn spawn_market_worker(
                 // Phase 2 WS6: nudge mirror — Executing → Failed opens
                 // a slot for the model.
                 let _ = market_ctx.mirror_nudge.send(());
-                tracing::warn!(
-                    "Market inference failed for job_id={}: {}",
-                    job_id,
-                    err_msg
-                );
+                tracing::warn!("Market inference failed for job_id={}: {}", job_id, err_msg);
                 // TODO (WS8): chronicle event market_failed with error.
             }
         }
@@ -4393,19 +4354,16 @@ async fn handle_fleet_result(
         .clone()
         .unwrap_or_default();
 
-    let identity = match crate::pyramid::fleet_identity::verify_fleet_identity(
-        &auth_header,
-        &pk,
-        &self_op,
-    ) {
-        Ok(i) => i,
-        Err(_) => {
-            return Ok(warp::reply::with_status(
-                warp::reply::json(&serde_json::json!({})),
-                warp::http::StatusCode::FORBIDDEN,
-            ));
-        }
-    };
+    let identity =
+        match crate::pyramid::fleet_identity::verify_fleet_identity(&auth_header, &pk, &self_op) {
+            Ok(i) => i,
+            Err(_) => {
+                return Ok(warp::reply::with_status(
+                    warp::reply::json(&serde_json::json!({})),
+                    warp::http::StatusCode::FORBIDDEN,
+                ));
+            }
+        };
 
     let envelope: crate::fleet::FleetAsyncResultEnvelope = match serde_json::from_value(body) {
         Ok(e) => e,
@@ -4420,9 +4378,7 @@ async fn handle_fleet_result(
     // Peek-verify-pop atomically under the sync mutex. Snapshot the identity
     // match while holding the lock briefly — the mutex MUST NOT be held across
     // any .await.
-    let peek = ctx
-        .pending
-        .peek_matches(&envelope.job_id, identity.nid());
+    let peek = ctx.pending.peek_matches(&envelope.job_id, identity.nid());
     let action: crate::fleet::PeekResult = peek;
 
     // DB path for chronicle side-effects.
@@ -4547,7 +4503,9 @@ async fn handle_fleet_announce(
         Err(e) => {
             tracing::warn!("Fleet announce parse failed: {}. Body: {}", e, body);
             return Ok(warp::reply::with_status(
-                warp::reply::json(&serde_json::json!({"error": format!("Invalid announcement: {}", e)})),
+                warp::reply::json(
+                    &serde_json::json!({"error": format!("Invalid announcement: {}", e)}),
+                ),
                 warp::http::StatusCode::BAD_REQUEST,
             ));
         }

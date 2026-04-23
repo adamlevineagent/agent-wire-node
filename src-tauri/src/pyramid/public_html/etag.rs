@@ -70,9 +70,7 @@ pub fn matches_inm(headers: &warp::http::HeaderMap, etag: &str) -> bool {
     if inm.trim() == "*" {
         return true;
     }
-    inm.split(',')
-        .map(str::trim)
-        .any(|t| strip_weak(t) == want)
+    inm.split(',').map(str::trim).any(|t| strip_weak(t) == want)
 }
 
 /// Strip an optional `W/` weakness prefix and surrounding double quotes so

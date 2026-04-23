@@ -54,12 +54,7 @@ fn make_it_db() -> (TempDir, Connection) {
     (dir, conn)
 }
 
-fn insert_active(
-    conn: &Connection,
-    contribution_id: &str,
-    schema_type: &str,
-    yaml: &str,
-) {
+fn insert_active(conn: &Connection, contribution_id: &str, schema_type: &str, yaml: &str) {
     conn.execute(
         "INSERT INTO pyramid_config_contributions (
              contribution_id, slug, schema_type, yaml_content, status, source
@@ -89,14 +84,16 @@ slots:
 
 #[test]
 fn trip_per_build_excludes_provider_from_next_decision() {
-    let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = breaker_test_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     clear_all_for_tests();
     let (_dir, conn) = make_it_db();
     seed_or_only(&conn);
     let bid = "integ-build-trip-per-build";
     // Sanity: before any failures, Decision must include OpenRouter.
-    let d1 = DispatchDecision::build_with_build_id("mid", Some(bid), &conn)
-        .expect("baseline build");
+    let d1 =
+        DispatchDecision::build_with_build_id("mid", Some(bid), &conn).expect("baseline build");
     assert_eq!(d1.effective_call_order, vec![ProviderType::OpenRouter]);
     // Record TRIP_THRESHOLD failures.
     for _ in 0..TRIP_THRESHOLD {
@@ -114,7 +111,9 @@ fn trip_per_build_excludes_provider_from_next_decision() {
 
 #[test]
 fn trip_on_one_build_does_not_affect_another_build() {
-    let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = breaker_test_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     clear_all_for_tests();
     let (_dir, conn) = make_it_db();
     seed_or_only(&conn);
@@ -124,8 +123,7 @@ fn trip_on_one_build_does_not_affect_another_build() {
         record_failure(bad, "mid", ProviderType::OpenRouter);
     }
     // The `good` build_id sees a fresh, empty breaker state.
-    let d =
-        DispatchDecision::build_with_build_id("mid", Some(good), &conn).unwrap();
+    let d = DispatchDecision::build_with_build_id("mid", Some(good), &conn).unwrap();
     assert_eq!(d.effective_call_order, vec![ProviderType::OpenRouter]);
     // `bad` still trips.
     let err = DispatchDecision::build_with_build_id("mid", Some(bad), &conn).unwrap_err();
@@ -136,7 +134,9 @@ fn trip_on_one_build_does_not_affect_another_build() {
 
 #[test]
 fn clear_build_resets_breaker_state() {
-    let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = breaker_test_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     clear_all_for_tests();
     let (_dir, conn) = make_it_db();
     seed_or_only(&conn);
@@ -145,9 +145,7 @@ fn clear_build_resets_breaker_state() {
         record_failure(bid, "mid", ProviderType::OpenRouter);
     }
     // Tripped.
-    assert!(
-        DispatchDecision::build_with_build_id("mid", Some(bid), &conn).is_err()
-    );
+    assert!(DispatchDecision::build_with_build_id("mid", Some(bid), &conn).is_err());
     // Clear the build's breaker cells.
     clear_build(bid);
     // A fresh Decision for the same build_id sees Ready again.
@@ -163,7 +161,9 @@ fn time_secs_reset_untrips_after_interval() {
     use std::thread::sleep;
     use std::time::Duration;
     use wire_node_lib::pyramid::walker_breaker::is_tripped;
-    let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = breaker_test_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     clear_all_for_tests();
     let bid = "integ-build-timesecs";
     for _ in 0..TRIP_THRESHOLD {
@@ -192,7 +192,9 @@ fn build_without_build_id_bypasses_breaker() {
     // surfaces Ready providers as usual — preserves the pre-Phase-5
     // call-site contract for legacy paths that haven't been threaded
     // through `build_with_build_id`.
-    let _g = breaker_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = breaker_test_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     clear_all_for_tests();
     let (_dir, conn) = make_it_db();
     seed_or_only(&conn);

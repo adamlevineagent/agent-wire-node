@@ -387,9 +387,17 @@ Output JSON only:
     );
 
     // 7. Rewrite distillation
-    let web_edge_notes =
-        rewrite_distillation(reader, writer, slug, thread_id, &delta, base_config, model, ops)
-            .await?;
+    let web_edge_notes = rewrite_distillation(
+        reader,
+        writer,
+        slug,
+        thread_id,
+        &delta,
+        base_config,
+        model,
+        ops,
+    )
+    .await?;
 
     // 7b. Process web edge notes (cross-thread connections)
     if let Some(notes) = web_edge_notes {

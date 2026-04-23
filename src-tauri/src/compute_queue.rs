@@ -25,7 +25,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify, oneshot};
+use tokio::sync::{oneshot, Mutex, Notify};
 
 use crate::pyramid::llm::{LlmCallOptions, LlmConfig, LlmResponse};
 use crate::pyramid::step_context::StepContext;
@@ -110,16 +110,13 @@ impl ComputeQueueManager {
 
     /// Push an entry to the model's FIFO queue.
     pub fn enqueue_local(&mut self, model_id: &str, entry: QueueEntry) {
-        let queue = self
-            .queues
-            .entry(model_id.to_string())
-            .or_insert_with(|| {
-                // New model queue — add to round-robin rotation.
-                self.round_robin_keys.push(model_id.to_string());
-                ModelQueue {
-                    entries: VecDeque::new(),
-                }
-            });
+        let queue = self.queues.entry(model_id.to_string()).or_insert_with(|| {
+            // New model queue — add to round-robin rotation.
+            self.round_robin_keys.push(model_id.to_string());
+            ModelQueue {
+                entries: VecDeque::new(),
+            }
+        });
         queue.entries.push_back(entry);
     }
 
@@ -163,15 +160,12 @@ impl ComputeQueueManager {
         // Force the source field — see method docstring for rationale.
         entry.source = "market_received".to_string();
 
-        let queue = self
-            .queues
-            .entry(model_id.to_string())
-            .or_insert_with(|| {
-                self.round_robin_keys.push(model_id.to_string());
-                ModelQueue {
-                    entries: VecDeque::new(),
-                }
-            });
+        let queue = self.queues.entry(model_id.to_string()).or_insert_with(|| {
+            self.round_robin_keys.push(model_id.to_string());
+            ModelQueue {
+                entries: VecDeque::new(),
+            }
+        });
 
         // Count current market entries only. Local + fleet_received
         // entries on the same queue don't count against the market cap.
@@ -286,7 +280,11 @@ pub enum QueueError {
 impl std::fmt::Display for QueueError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            QueueError::DepthExceeded { model_id, current, max } => write!(
+            QueueError::DepthExceeded {
+                model_id,
+                current,
+                max,
+            } => write!(
                 f,
                 "compute queue for model '{model_id}' at market-source depth {current} (cap {max})"
             ),
@@ -355,7 +353,11 @@ mod tests {
             .enqueue_market("m", sample_entry("m", "market_received"), 1)
             .unwrap_err();
         match err {
-            QueueError::DepthExceeded { model_id, current, max } => {
+            QueueError::DepthExceeded {
+                model_id,
+                current,
+                max,
+            } => {
                 assert_eq!(model_id, "m");
                 assert_eq!(current, 1);
                 assert_eq!(max, 1);
@@ -375,8 +377,11 @@ mod tests {
         let mut mgr = ComputeQueueManager::new();
         let entry = sample_entry("m", "local"); // WRONG source
         mgr.enqueue_market("m", entry, 1).unwrap();
-        assert_eq!(mgr.market_queue_depth("m"), 1,
-            "enqueue_market must force source='market_received'");
+        assert_eq!(
+            mgr.market_queue_depth("m"),
+            1,
+            "enqueue_market must force source='market_received'"
+        );
     }
 
     // ── Cap scoping to market entries only ───────────────────────────
@@ -475,8 +480,11 @@ mod tests {
         mgr.enqueue_local("m", sample_entry("m", "local"));
         mgr.enqueue_local("m", sample_entry("m", "fleet_received"));
         assert_eq!(mgr.queue_depth("m"), 2);
-        assert_eq!(mgr.market_queue_depth("m"), 0,
-            "only source='market_received' counts");
+        assert_eq!(
+            mgr.market_queue_depth("m"),
+            0,
+            "only source='market_received' counts"
+        );
     }
 
     // ── QueueError shape ─────────────────────────────────────────────
