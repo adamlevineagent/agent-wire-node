@@ -154,13 +154,20 @@ fn resolve_step_refs(steps: &mut [crate::pyramid::chain_engine::ChainStep], chai
     Ok(())
 }
 
-/// Scan the chains directory for all `.yaml` files in `defaults/` and
-/// `variants/` subdirectories. Returns metadata for each valid chain.
+/// Scan the chains directory for all `.yaml` files in `defaults/`,
+/// `defaults/starter/`, and `variants/` subdirectories. Returns metadata
+/// for each valid chain.
+///
+/// `defaults/starter/` is where post-build accretion v5 starter chains
+/// (accretion_handler, judge, reconciler, etc.) ship. It's a sibling
+/// directory to the content-type chains in `defaults/` so they don't
+/// clash with operator-authored variants.
 pub fn discover_chains(chains_dir: &Path) -> Result<Vec<ChainMetadata>> {
     let mut results = Vec::new();
 
     let scan_dirs = [
         (chains_dir.join("defaults"), true),
+        (chains_dir.join("defaults").join("starter"), true),
         (chains_dir.join("variants"), false),
     ];
 
@@ -196,6 +203,23 @@ pub fn discover_chains(chains_dir: &Path) -> Result<Vec<ChainMetadata>> {
     }
 
     Ok(results)
+}
+
+/// Resolve a chain by its YAML `id:` field. Scans `discover_chains`
+/// results for a match, then loads the full chain (with prompts resolved)
+/// via `load_chain`.
+///
+/// Used by post-build accretion v5's role-bound dispatch: when a
+/// `StepOperation::RoleBound`-style work item dispatches, the supervisor
+/// resolves the binding's `handler_chain_id` to a loaded chain via this
+/// function.
+pub fn load_chain_by_id(chain_id: &str, chains_dir: &Path) -> Result<ChainDefinition> {
+    let discovered = discover_chains(chains_dir)?;
+    let meta = discovered
+        .into_iter()
+        .find(|m| m.id == chain_id)
+        .ok_or_else(|| anyhow::anyhow!("chain not found by id: '{chain_id}'"))?;
+    load_chain(Path::new(&meta.file_path), chains_dir)
 }
 
 /// Load just the metadata from a chain YAML file (does not resolve prompts).

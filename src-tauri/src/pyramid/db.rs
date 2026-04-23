@@ -2538,6 +2538,111 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         )",
     )?;
 
+    // ── Post-build accretion v5 schema ──────────────────────────────────────
+    // See .lab/architecture/agent-wire-node-post-build-plan-v5.md
+
+    // Purposes: per-slug purpose declaration with supersession chain
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pyramid_purposes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL REFERENCES pyramid_slugs(slug) ON DELETE CASCADE,
+            purpose_text TEXT NOT NULL,
+            stock_purpose_key TEXT,
+            decomposition_chain_ref TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            superseded_by INTEGER REFERENCES pyramid_purposes(id),
+            supersede_reason TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_pyramid_purposes_active
+            ON pyramid_purposes(slug) WHERE superseded_by IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_pyramid_purposes_slug
+            ON pyramid_purposes(slug, superseded_by);",
+    )?;
+
+    // Role bindings: per-pyramid role -> handler chain id mapping.
+    // NEW ROLES ONLY. Existing dispatch stays hardcoded.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pyramid_role_bindings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL REFERENCES pyramid_slugs(slug) ON DELETE CASCADE,
+            role_name TEXT NOT NULL,
+            handler_chain_id TEXT NOT NULL,
+            scope TEXT NOT NULL DEFAULT 'pyramid',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            superseded_by INTEGER REFERENCES pyramid_role_bindings(id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_pyramid_role_bindings_active
+            ON pyramid_role_bindings(slug, role_name, scope) WHERE superseded_by IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_pyramid_role_bindings_slug_role
+            ON pyramid_role_bindings(slug, role_name, superseded_by);",
+    )?;
+
+    // Node shape discriminator + shape-specific payload.
+    // NULL node_shape means scaffolding (existing behavior preserved).
+    // shape_payload_json is parallel to topics column — shape readers consult
+    // it; Vec<Topic> readers get untouched topics (no silent-empty bug).
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_nodes ADD COLUMN node_shape TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_nodes ADD COLUMN shape_payload_json TEXT",
+        [],
+    );
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_pyramid_nodes_shape
+            ON pyramid_nodes(slug, node_shape);",
+    )?;
+
+    // Resolved chain id on work items for role_bound dispatch.
+    // When compiler sees a role_bound primitive event, it resolves the binding
+    // and writes the handler chain id here. Supervisor dispatch reads this.
+    let _ = conn.execute(
+        "ALTER TABLE dadbear_work_items ADD COLUMN resolved_chain_id TEXT",
+        [],
+    );
+
+    // Judge telemetry: 3-tier hit-rate observability.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dadbear_judge_telemetry (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL REFERENCES pyramid_slugs(slug) ON DELETE CASCADE,
+            tier TEXT NOT NULL,
+            invoked_at TEXT NOT NULL DEFAULT (datetime('now')),
+            context_type TEXT,
+            verdict TEXT,
+            duration_ms INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_judge_telemetry_slug_time
+            ON dadbear_judge_telemetry(slug, invoked_at DESC);",
+    )?;
+
+    // Debate candidates: TOCTOU-safe dedup for sweep's silent-multiplicity
+    // detection. UNIQUE(slug, concern_hash) prevents concurrent double-spawn.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pyramid_debate_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL REFERENCES pyramid_slugs(slug) ON DELETE CASCADE,
+            concern_hash TEXT NOT NULL,
+            first_detected_at TEXT NOT NULL DEFAULT (datetime('now')),
+            debate_node_id TEXT,
+            status TEXT NOT NULL DEFAULT 'pending'
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_pyramid_debate_candidates_concern
+            ON pyramid_debate_candidates(slug, concern_hash);",
+    )?;
+
+    // Sweep cursor per slug. Separate table because pyramid_dadbear_config
+    // has UNIQUE(slug, source_path) — multiple rows per slug don't fit a
+    // per-slug cursor. Sweep is a pyramid-level concern (scans annotations
+    // regardless of source_path).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pyramid_sweep_cursors (
+            slug TEXT PRIMARY KEY REFERENCES pyramid_slugs(slug) ON DELETE CASCADE,
+            last_sweep_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );",
+    )?;
+
     Ok(())
 }
 
@@ -4655,37 +4760,92 @@ fn migrate_question_tree_pk(conn: &Connection) -> Result<()> {
 // ── Slug CRUD ────────────────────────────────────────────────────────────────
 
 /// Create a new slug entry. Returns the created SlugInfo.
+///
+/// Post-build accretion v5: every slug gets its genesis purpose + role
+/// bindings seeded here, in the LEAF function, so no caller path can
+/// bypass initialization. All inserts are wrapped in a SAVEPOINT so this
+/// composes safely inside ambient transactions that some callers hold
+/// (folder_ingestion, vine composition, etc.).
 pub fn create_slug(
     conn: &Connection,
     slug: &str,
     content_type: &ContentType,
     source_path: &str,
 ) -> Result<SlugInfo> {
-    conn.execute(
-        "INSERT INTO pyramid_slugs (slug, content_type, source_path) VALUES (?1, ?2, ?3)",
-        rusqlite::params![slug, content_type.as_str(), source_path],
-    )
-    .with_context(|| format!("Failed to create slug '{slug}'"))?;
+    // SAVEPOINT nests safely inside ambient transactions. If any step
+    // below fails, we ROLLBACK TO SAVEPOINT and propagate the error.
+    conn.execute_batch("SAVEPOINT create_slug_init")?;
 
-    // Seed the DADBEAR enable gate for eligible content types. The Phase 8
-    // migration dropped pyramid_auto_update_config and made the presence of a
-    // pyramid_dadbear_config row the canonical enable signal, but nothing was
-    // writing that row on pyramid creation — leaving new pyramids showing
-    // "DADBEAR not configured" in the UI. vine/question pyramids don't have
-    // source files to watch, so they stay excluded.
-    let ct_str = content_type.as_str();
-    if matches!(ct_str, "code" | "conversation" | "document") {
+    let result: Result<SlugInfo> = (|| {
         conn.execute(
-            "INSERT OR IGNORE INTO pyramid_dadbear_config
-                (slug, source_path, content_type)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![slug, source_path, ct_str],
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path) VALUES (?1, ?2, ?3)",
+            rusqlite::params![slug, content_type.as_str(), source_path],
         )
-        .with_context(|| format!("Failed to seed pyramid_dadbear_config for '{slug}'"))?;
-    }
+        .with_context(|| format!("Failed to create slug '{slug}'"))?;
 
-    // Read back the row to get server-generated defaults (created_at)
-    get_slug(conn, slug)?.ok_or_else(|| anyhow::anyhow!("Slug '{slug}' not found after insert"))
+        // Seed the DADBEAR enable gate for eligible content types. The
+        // Phase 8 migration dropped pyramid_auto_update_config and made the
+        // presence of a pyramid_dadbear_config row the canonical enable
+        // signal, but nothing was writing that row on pyramid creation —
+        // leaving new pyramids showing "DADBEAR not configured" in the UI.
+        // vine/question pyramids don't have source files to watch, so they
+        // stay excluded.
+        let ct_str = content_type.as_str();
+        if matches!(ct_str, "code" | "conversation" | "document") {
+            conn.execute(
+                "INSERT OR IGNORE INTO pyramid_dadbear_config
+                    (slug, source_path, content_type)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![slug, source_path, ct_str],
+            )
+            .with_context(|| format!("Failed to seed pyramid_dadbear_config for '{slug}'"))?;
+        }
+
+        // Post-build accretion v5: seed stock purpose from content_type.
+        super::purpose::initialize_from_content_type(conn, slug, content_type)?;
+
+        // Post-build accretion v5: seed genesis role bindings for the new
+        // system-level roles (judge, reconciler, debate_steward, etc.).
+        super::role_binding::initialize_genesis_bindings(conn, slug)?;
+
+        // Post-build accretion v5: cascade_handler gets the judge-gated
+        // default for NEW slugs (binding decision 1). Existing slugs are
+        // backfilled with the immediate-redistill default at startup
+        // (Phase 8 WS8-E) so their prior cascade intent is preserved.
+        super::role_binding::set_binding_ignore_existing(
+            conn,
+            slug,
+            "cascade_handler",
+            super::role_binding::CASCADE_HANDLER_NEW_DEFAULT,
+        )?;
+
+        // Post-build accretion v5: initialize sweep cursor so the first
+        // sweep tick has a baseline timestamp to compare against.
+        conn.execute(
+            "INSERT OR IGNORE INTO pyramid_sweep_cursors (slug) VALUES (?1)",
+            rusqlite::params![slug],
+        )
+        .with_context(|| format!("Failed to seed pyramid_sweep_cursors for '{slug}'"))?;
+
+        // Read back the row to get server-generated defaults (created_at)
+        get_slug(conn, slug)?
+            .ok_or_else(|| anyhow::anyhow!("Slug '{slug}' not found after insert"))
+    })();
+
+    match result {
+        Ok(info) => {
+            conn.execute_batch("RELEASE SAVEPOINT create_slug_init")?;
+            Ok(info)
+        }
+        Err(e) => {
+            // Best-effort rollback; if this fails, the outer transaction
+            // (if any) will still see a dirty state but the caller will
+            // abort their transaction, which cleans up.
+            let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT create_slug_init");
+            let _ = conn.execute_batch("RELEASE SAVEPOINT create_slug_init");
+            Err(e)
+        }
+    }
 }
 
 /// Fetch a slug by name. Returns None if not found.
@@ -21635,3 +21795,182 @@ mod rev061_leg_helpers_tests {
         assert_eq!(serr.as_deref(), Some("settle 503"));
     }
 }
+
+#[cfg(test)]
+mod phase1_post_build_tests {
+    //! Post-build accretion v5 Phase 1 tests.
+    //! See .lab/architecture/agent-wire-node-post-build-plan-v5.md
+    use super::*;
+    use crate::pyramid::types::ContentType;
+    use crate::pyramid::{purpose, role_binding};
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn schema_creates_new_tables_and_columns() {
+        let conn = mem_conn();
+        // Tables exist
+        for t in &[
+            "pyramid_purposes",
+            "pyramid_role_bindings",
+            "dadbear_judge_telemetry",
+            "pyramid_debate_candidates",
+            "pyramid_sweep_cursors",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    rusqlite::params![t],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "table {} missing", t);
+        }
+        // Columns exist on pyramid_nodes
+        let nodes_cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(pyramid_nodes)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(nodes_cols.contains(&"node_shape".to_string()));
+        assert!(nodes_cols.contains(&"shape_payload_json".to_string()));
+        // Column exists on dadbear_work_items
+        let wi_cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(dadbear_work_items)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(wi_cols.contains(&"resolved_chain_id".to_string()));
+    }
+
+    #[test]
+    fn create_slug_seeds_purpose_and_bindings() {
+        let conn = mem_conn();
+        create_slug(&conn, "test-slug", &ContentType::Code, "/tmp/src").unwrap();
+        // Purpose seeded
+        let p = purpose::load_purpose(&conn, "test-slug").unwrap().unwrap();
+        assert_eq!(p.stock_purpose_key.as_deref(), Some("understand_codebase"));
+        // Genesis bindings seeded
+        let bindings = role_binding::list_bindings(&conn, "test-slug").unwrap();
+        let role_names: Vec<String> = bindings.iter().map(|b| b.role_name.clone()).collect();
+        for expected in &[
+            "accretion_handler",
+            "reconciler",
+            "evidence_tester",
+            "judge",
+            "debate_steward",
+            "meta_layer_oracle",
+            "synthesizer",
+            "gap_dispatcher",
+            "sweep",
+            "authorize_question",
+            "cascade_handler",
+        ] {
+            assert!(
+                role_names.contains(&expected.to_string()),
+                "missing binding for role {}",
+                expected
+            );
+        }
+        // Cascade default is judge-gated for NEW slugs
+        let cascade = role_binding::resolve_binding(&conn, "test-slug", "cascade_handler").unwrap();
+        assert_eq!(cascade.handler_chain_id, "starter-cascade-judge-gated");
+        // Sweep cursor row seeded
+        let sweep_row: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_sweep_cursors WHERE slug=?1",
+                rusqlite::params!["test-slug"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sweep_row, 1);
+    }
+
+    #[test]
+    fn purpose_declare_supersede_chain() {
+        let conn = mem_conn();
+        create_slug(&conn, "s1", &ContentType::Document, "/tmp/d").unwrap();
+        let initial = purpose::load_purpose(&conn, "s1").unwrap().unwrap();
+        assert_eq!(initial.stock_purpose_key.as_deref(), Some("understand_document_corpus"));
+
+        // Supersede with a specific purpose
+        let successor = purpose::supersede_purpose(
+            &conn,
+            "s1",
+            "win this condo case or settle well",
+            Some("pivoted from generic understanding to specific case"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(successor.purpose_text, "win this condo case or settle well");
+
+        // Active lookup returns successor
+        let active = purpose::load_purpose(&conn, "s1").unwrap().unwrap();
+        assert_eq!(active.id, successor.id);
+
+        // Full chain has both
+        let chain = purpose::list_purpose_supersession(&conn, "s1").unwrap();
+        assert_eq!(chain.len(), 2);
+    }
+
+    #[test]
+    fn role_binding_set_supersedes_existing() {
+        let conn = mem_conn();
+        create_slug(&conn, "s2", &ContentType::Code, "/tmp/s2").unwrap();
+        // Override cascade to accrete-only
+        role_binding::set_binding(&conn, "s2", "cascade_handler", "starter-cascade-accrete-only")
+            .unwrap();
+        let active = role_binding::resolve_binding(&conn, "s2", "cascade_handler").unwrap();
+        assert_eq!(active.handler_chain_id, "starter-cascade-accrete-only");
+        // Only one active row
+        let active_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_role_bindings
+                 WHERE slug=?1 AND role_name='cascade_handler' AND superseded_by IS NULL",
+                rusqlite::params!["s2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_count, 1);
+    }
+
+    #[test]
+    fn resolve_binding_raises_on_missing() {
+        let conn = mem_conn();
+        create_slug(&conn, "s3", &ContentType::Vine, "").unwrap();
+        let err = role_binding::resolve_binding(&conn, "s3", "nonexistent_role").unwrap_err();
+        // Loud raise per v5 binding decision 9
+        assert!(err.downcast_ref::<role_binding::UnresolvedBinding>().is_some());
+    }
+
+    #[test]
+    fn backfill_preserves_existing_cascade_bindings() {
+        let conn = mem_conn();
+        // Simulate an existing slug that was created pre-backfill —
+        // insert the pyramid_slugs row directly without going through
+        // create_slug, so no cascade binding exists.
+        conn.execute(
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["legacy", "code", "/tmp/legacy"],
+        )
+        .unwrap();
+        // First backfill: gets immediate_redistill default
+        let count = role_binding::backfill_existing_cascade_handlers(&conn).unwrap();
+        assert_eq!(count, 1);
+        let b = role_binding::resolve_binding(&conn, "legacy", "cascade_handler").unwrap();
+        assert_eq!(b.handler_chain_id, "starter-cascade-immediate-redistill");
+        // Second backfill: no-op (binding already exists)
+        let count2 = role_binding::backfill_existing_cascade_handlers(&conn).unwrap();
+        assert_eq!(count2, 0);
+    }
+}
+

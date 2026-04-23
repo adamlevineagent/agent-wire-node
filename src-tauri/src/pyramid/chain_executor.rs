@@ -13012,6 +13012,50 @@ fn classify_ir_step_path(step: &IrStep) -> IrStepExecutionPath {
 
 // ── End of IR execution path ─────────────────────────────────────────────────
 
+// ── Post-build accretion v5: lightweight chain runner ────────────────────────
+//
+// `execute_chain_for_target` runs a short, targeted chain (N≤~5 steps) against
+// a specific node without spinning up the full `execute_chain` build-runner
+// machinery (build_id minting, from_depth cleanup, layer_tx channels, etc.).
+//
+// Used by post-build accretion v5's role-bound dispatch path. When a work
+// item carries `primitive = "role_bound"` and `resolved_chain_id = "X"`,
+// the supervisor calls this function with the loaded chain + target_id +
+// context inputs.
+//
+// Implementation status: Phase 1 ships the SIGNATURE and a clear
+// `unimplemented!` body. Phase 3 (WS3-C, supervisor dispatch for role_bound)
+// is the first caller and will land the real body alongside the first
+// starter chain needing it (probably accretion_handler — which is all
+// mechanical, so the initial implementation only needs to handle mechanical
+// steps). Classify/synthesize LLM steps can be added when Phase 6 lands
+// the judge / reconciler / evidence_tester chains.
+//
+// See `.lab/architecture/agent-wire-node-post-build-plan-v5.md` binding
+// decision 11 for the chain-invocation model (one work_item per dispatch;
+// chain runs its N steps internally; cost attribution via
+// pyramid_pipeline_steps writes).
+#[allow(dead_code)]
+pub async fn execute_chain_for_target(
+    _state: &PyramidState,
+    _chain: &ChainDefinition,
+    _slug: &str,
+    _target_id: Option<&str>,
+    _inputs: serde_json::Value,
+) -> Result<serde_json::Value> {
+    // Phase 3 WS3-C — implement when first role_bound work item dispatches.
+    // The mechanical-only path is straightforward: for each chain step, if
+    // step.primitive == "mechanical", dispatch to the named Rust function
+    // with `inputs` and thread the result into the next step's inputs.
+    // LLM steps (classify/synthesize/etc.) need to enqueue a per-step
+    // work item via chain_dispatch and wait for completion, mirroring
+    // how `execute_chain` does it today.
+    anyhow::bail!(
+        "execute_chain_for_target: implementation pending Phase 3 WS3-C. \
+         See .lab/architecture/agent-wire-node-post-build-plan-v5.md"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

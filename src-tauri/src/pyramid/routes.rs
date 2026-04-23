@@ -4545,6 +4545,28 @@ async fn process_annotation_hook(
                 annotation.node_id
             );
         }
+
+        AnnotationType::SteelMan => {
+            // Post-build accretion v5: structural accretion only at this hook.
+            // Debate steward (Phase 7) consumes steel-man annotations via the
+            // debate_spawned event pipeline once enough positions accrue.
+            tracing::info!(
+                "[annotation] steel-man annotation #{} on node '{}' — awaiting debate_steward",
+                annotation.id,
+                annotation.node_id
+            );
+        }
+
+        AnnotationType::RedTeam => {
+            // Post-build accretion v5: structural accretion only at this hook.
+            // Debate steward (Phase 7) consumes red-team annotations as position
+            // counter-arguments via debate_spawned event pipeline.
+            tracing::info!(
+                "[annotation] red-team annotation #{} on node '{}' — awaiting debate_steward",
+                annotation.id,
+                annotation.node_id
+            );
+        }
     }
 
     // FAQ processing — for any annotation with question_context

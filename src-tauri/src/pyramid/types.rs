@@ -759,7 +759,20 @@ pub enum AnnotationType {
     HealthCheck,
     #[serde(rename = "directory")]
     Directory,
+    // Post-build accretion v5 additions (steel-man / red-team for debate nodes)
+    #[serde(rename = "steel_man")]
+    SteelMan,
+    #[serde(rename = "red_team")]
+    RedTeam,
 }
+
+/// Raised when a string does not match a known annotation type.
+/// Used by `AnnotationType::from_str_strict`. Production write paths should
+/// use the strict form; read paths may fall back to the lossy `from_str` to
+/// handle legacy rows.
+#[derive(Debug, thiserror::Error)]
+#[error("Unknown annotation type: '{0}'")]
+pub struct UnknownAnnotationType(pub String);
 
 // ── FAQ Types ────────────────────────────────────────────────────────────────
 
@@ -791,9 +804,14 @@ impl AnnotationType {
             AnnotationType::Transition => "transition",
             AnnotationType::HealthCheck => "health_check",
             AnnotationType::Directory => "directory",
+            AnnotationType::SteelMan => "steel_man",
+            AnnotationType::RedTeam => "red_team",
         }
     }
 
+    /// Lossy parse — retained for reading legacy DB rows. Unknown values
+    /// warn + default to Observation. Prefer `from_str_strict` in new write
+    /// paths so vocabulary drift surfaces instead of silently corrupting data.
     pub fn from_str(s: &str) -> Self {
         match s {
             "observation" => AnnotationType::Observation,
@@ -805,10 +823,33 @@ impl AnnotationType {
             "transition" => AnnotationType::Transition,
             "health_check" => AnnotationType::HealthCheck,
             "directory" => AnnotationType::Directory,
+            "steel_man" => AnnotationType::SteelMan,
+            "red_team" => AnnotationType::RedTeam,
             other => {
                 tracing::warn!("Unknown annotation type: '{other}', defaulting to Observation");
                 AnnotationType::Observation
             }
+        }
+    }
+
+    /// Strict parse — raises on unknown values. Use in any new write path
+    /// (CLI, MCP, HTTP) so unknown types are refused rather than silently
+    /// mapped to Observation. Pillar 38 absorbed bug: the lossy `from_str`
+    /// has been corrupting annotations written with unknown type strings.
+    pub fn from_str_strict(s: &str) -> std::result::Result<Self, UnknownAnnotationType> {
+        match s {
+            "observation" => Ok(AnnotationType::Observation),
+            "correction" => Ok(AnnotationType::Correction),
+            "question" => Ok(AnnotationType::Question),
+            "friction" => Ok(AnnotationType::Friction),
+            "idea" => Ok(AnnotationType::Idea),
+            "era" => Ok(AnnotationType::Era),
+            "transition" => Ok(AnnotationType::Transition),
+            "health_check" => Ok(AnnotationType::HealthCheck),
+            "directory" => Ok(AnnotationType::Directory),
+            "steel_man" => Ok(AnnotationType::SteelMan),
+            "red_team" => Ok(AnnotationType::RedTeam),
+            other => Err(UnknownAnnotationType(other.to_string())),
         }
     }
 }
@@ -2233,3 +2274,171 @@ impl std::fmt::Display for ManifestValidationError {
 }
 
 impl std::error::Error for ManifestValidationError {}
+
+// ── Post-build accretion v5 types ────────────────────────────────────────────
+// See .lab/architecture/agent-wire-node-post-build-plan-v5.md
+// StepOperation intentionally NOT modified — role_bound dispatch routes via
+// string primitive "role_bound" + dadbear_work_items.resolved_chain_id column.
+
+/// Node shape discriminator stored in `pyramid_nodes.node_shape`.
+/// NULL maps to `Scaffolding` — existing behavior preserved.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeShape {
+    Scaffolding,
+    Debate,
+    #[serde(rename = "meta_layer")]
+    MetaLayer,
+    Gap,
+}
+
+impl NodeShape {
+    /// Convert to the string value stored in `pyramid_nodes.node_shape`.
+    /// `Scaffolding` maps to None (NULL in DB) — no row write needed for the
+    /// default case.
+    pub fn to_db(&self) -> Option<&'static str> {
+        match self {
+            NodeShape::Scaffolding => None,
+            NodeShape::Debate => Some("debate"),
+            NodeShape::MetaLayer => Some("meta_layer"),
+            NodeShape::Gap => Some("gap"),
+        }
+    }
+
+    /// Parse from the optional string stored in the DB column.
+    /// None (NULL) parses as `Scaffolding`.
+    pub fn from_db(s: Option<&str>) -> Self {
+        match s {
+            None | Some("") | Some("scaffolding") => NodeShape::Scaffolding,
+            Some("debate") => NodeShape::Debate,
+            Some("meta_layer") => NodeShape::MetaLayer,
+            Some("gap") => NodeShape::Gap,
+            Some(other) => {
+                tracing::warn!("Unknown node_shape '{other}', defaulting to Scaffolding");
+                NodeShape::Scaffolding
+            }
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NodeShape::Scaffolding => "scaffolding",
+            NodeShape::Debate => "debate",
+            NodeShape::MetaLayer => "meta_layer",
+            NodeShape::Gap => "gap",
+        }
+    }
+}
+
+/// Purpose row — per-slug declaration of what the pyramid is for.
+/// Supersession chain via `superseded_by`. One active row per slug
+/// (enforced by partial UNIQUE index).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Purpose {
+    pub id: i64,
+    pub slug: String,
+    pub purpose_text: String,
+    pub stock_purpose_key: Option<String>,
+    pub decomposition_chain_ref: Option<String>,
+    pub created_at: String,
+    pub superseded_by: Option<i64>,
+    pub supersede_reason: Option<String>,
+}
+
+/// Role binding row — per-pyramid mapping of role name to handler chain id.
+/// Supersession chain. One active row per (slug, role_name, scope).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleBinding {
+    pub id: i64,
+    pub slug: String,
+    pub role_name: String,
+    pub handler_chain_id: String,
+    pub scope: String,
+    pub created_at: String,
+    pub superseded_by: Option<i64>,
+}
+
+// ── Node-shape-specific payload structs ────────────────────────────────
+// Stored serialized in `pyramid_nodes.shape_payload_json`. The legacy
+// `topics: Vec<Topic>` column is untouched for shape nodes so non-shape-aware
+// readers see an empty Vec rather than silently-corrupted JSON.
+
+/// Debate node payload — contested-claim structure with positions,
+/// steel-mannings, red-teams, cross-references, and vote lean.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebateTopic {
+    pub concern: String,
+    pub positions: Vec<DebatePosition>,
+    #[serde(default)]
+    pub cross_refs: Vec<String>,
+    #[serde(default)]
+    pub vote_lean: Option<VoteLean>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebatePosition {
+    pub label: String,
+    pub steel_manning: String,
+    #[serde(default)]
+    pub red_teams: Vec<RedTeamEntry>,
+    #[serde(default)]
+    pub evidence_anchors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedTeamEntry {
+    pub from_position: String,
+    pub argument: String,
+    #[serde(default)]
+    pub evidence_anchors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoteLean {
+    pub up_count: i64,
+    pub down_count: i64,
+    #[serde(default)]
+    pub per_position: Option<HashMap<String, (i64, i64)>>,
+}
+
+/// Meta-layer node payload — purpose-aligned synthesis referencing substrate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaLayerTopic {
+    pub purpose_question: String,
+    #[serde(default)]
+    pub parent_meta_layer_id: Option<String>,
+    #[serde(default)]
+    pub covered_substrate_nodes: Vec<String>,
+}
+
+/// Gap node payload — explicit absence with demand state and candidate
+/// resolutions. Demand state lifecycle: open -> dispatched -> closed |
+/// tombstoned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GapTopic {
+    pub concern: String,
+    pub description: String,
+    pub demand_state: String,
+    #[serde(default)]
+    pub candidate_resolutions: Vec<GapCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GapCandidate {
+    pub resolution_type: String,
+    #[serde(default)]
+    pub cost_estimate: Option<String>,
+    #[serde(default)]
+    pub authorization_required: bool,
+}
+
+/// Tagged enum over shape-specific payloads. Serialized to
+/// `pyramid_nodes.shape_payload_json` via serde untagged with a sibling
+/// node_shape column as the discriminator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ShapePayload {
+    Debate(DebateTopic),
+    MetaLayer(MetaLayerTopic),
+    Gap(GapTopic),
+}
