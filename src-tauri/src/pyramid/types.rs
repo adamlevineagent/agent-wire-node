@@ -2300,6 +2300,14 @@ impl std::error::Error for ManifestValidationError {}
 // StepOperation intentionally NOT modified — role_bound dispatch routes via
 // string primitive "role_bound" + dadbear_work_items.resolved_chain_id column.
 
+/// Error raised when a DB row contains a `node_shape` string value that
+/// is not a recognized `NodeShape` variant. Emitted by `NodeShape::from_db`
+/// so readers fail loud on typos / future-schema drift rather than
+/// silently rendering a shaped node as plain scaffolding.
+#[derive(Debug, thiserror::Error)]
+#[error("Unknown node_shape value in DB: '{0}'")]
+pub struct UnknownNodeShape(pub String);
+
 /// Node shape discriminator stored in `pyramid_nodes.node_shape`.
 /// NULL maps to `Scaffolding` — existing behavior preserved.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2326,18 +2334,19 @@ impl NodeShape {
     }
 
     /// Parse from the optional string stored in the DB column.
-    /// None (NULL) parses as `Scaffolding`.
-    pub fn from_db(s: Option<&str>) -> Self {
-        match s {
+    /// None (NULL) parses as `Scaffolding`. Unknown string values raise
+    /// `UnknownNodeShape` — silent-default-to-scaffolding would let a typo'd
+    /// or future-variant shape silently render as plain scaffolding while
+    /// still holding a payload in `shape_payload_json`, masking a real
+    /// data bug. Per `feedback_loud_deferrals`, fail loud.
+    pub fn from_db(s: Option<&str>) -> Result<Self, UnknownNodeShape> {
+        Ok(match s {
             None | Some("") | Some("scaffolding") => NodeShape::Scaffolding,
             Some("debate") => NodeShape::Debate,
             Some("meta_layer") => NodeShape::MetaLayer,
             Some("gap") => NodeShape::Gap,
-            Some(other) => {
-                tracing::warn!("Unknown node_shape '{other}', defaulting to Scaffolding");
-                NodeShape::Scaffolding
-            }
-        }
+            Some(other) => return Err(UnknownNodeShape(other.to_string())),
+        })
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -2461,4 +2470,76 @@ pub enum ShapePayload {
     Debate(DebateTopic),
     MetaLayer(MetaLayerTopic),
     Gap(GapTopic),
+}
+
+/// Typed view of a node's shape + payload as resolved from the two
+/// parallel columns `pyramid_nodes.node_shape` and
+/// `pyramid_nodes.shape_payload_json`. Produced by `db::get_node_shape`.
+#[derive(Debug, Clone)]
+pub struct NodeShapeView {
+    pub shape: NodeShape,
+    /// `None` iff `shape == Scaffolding`. For Debate / MetaLayer / Gap this
+    /// is always Some — a node claiming a non-scaffolding shape with NULL
+    /// payload is a data bug and raises at read time.
+    pub payload: Option<ShapePayload>,
+}
+
+/// Resolve `shape_payload_json` against a declared `NodeShape` discriminator.
+///
+/// Rather than rely on serde's `#[serde(untagged)]` required-field-set
+/// guessing (brittle when DebateTopic and MetaLayerTopic overlap), this
+/// function deserializes into the concrete inner struct named by `shape`,
+/// then wraps it. Errors are loud and contextual.
+///
+/// Returns:
+/// - `Ok(None)` iff `shape == Scaffolding` and `json` is None or empty.
+/// - `Ok(Some(payload))` for Debate/MetaLayer/Gap with a matching JSON body.
+/// - `Err` when the payload is missing for a shape that requires one, or
+///   when the JSON doesn't match the shape's expected struct (misaligned).
+pub fn parse_shape_payload(
+    shape: &NodeShape,
+    json: Option<&str>,
+) -> anyhow::Result<Option<ShapePayload>> {
+    let json_str = json.and_then(|s| if s.trim().is_empty() { None } else { Some(s) });
+    match (shape, json_str) {
+        (NodeShape::Scaffolding, None) => Ok(None),
+        (NodeShape::Scaffolding, Some(_)) => {
+            // Scaffolding nodes must not carry a payload. A stray payload
+            // signals a data bug: either the writer was wrong about shape,
+            // or the shape column was corrupted after payload was written.
+            // Fail loud rather than silently discarding the payload.
+            Err(anyhow::anyhow!(
+                "pyramid_nodes.shape_payload_json is non-empty but node_shape is Scaffolding — \
+                 data bug: shape and payload columns are misaligned"
+            ))
+        }
+        (NodeShape::Debate, None)
+        | (NodeShape::MetaLayer, None)
+        | (NodeShape::Gap, None) => Err(anyhow::anyhow!(
+            "node_shape is '{}' but shape_payload_json is NULL — \
+             non-scaffolding shapes require a payload",
+            shape.as_str()
+        )),
+        (NodeShape::Debate, Some(s)) => serde_json::from_str::<DebateTopic>(s)
+            .map(|t| Some(ShapePayload::Debate(t)))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "shape_payload_json failed to parse as DebateTopic (node_shape='debate'): {e}"
+                )
+            }),
+        (NodeShape::MetaLayer, Some(s)) => serde_json::from_str::<MetaLayerTopic>(s)
+            .map(|t| Some(ShapePayload::MetaLayer(t)))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "shape_payload_json failed to parse as MetaLayerTopic (node_shape='meta_layer'): {e}"
+                )
+            }),
+        (NodeShape::Gap, Some(s)) => serde_json::from_str::<GapTopic>(s)
+            .map(|t| Some(ShapePayload::Gap(t)))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "shape_payload_json failed to parse as GapTopic (node_shape='gap'): {e}"
+                )
+            }),
+    }
 }

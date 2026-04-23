@@ -6498,6 +6498,49 @@ pub fn get_node_summary(
     }
 }
 
+/// Read a node's shape discriminator + typed payload.
+///
+/// Returns `Ok(None)` if the node does not exist. Returns `Ok(Some(view))`
+/// with `view.shape == Scaffolding` and `view.payload == None` for the common
+/// case of a scaffolding node (NULL `node_shape`, NULL `shape_payload_json`).
+/// For Debate/MetaLayer/Gap nodes, deserializes `shape_payload_json` into the
+/// typed inner struct via the `node_shape` discriminator — not via serde's
+/// untagged field-set guessing, which is brittle when Topic types overlap.
+///
+/// Errors propagate loudly when:
+/// - `node_shape` contains an unrecognized string (→ `UnknownNodeShape`)
+/// - `node_shape` and `shape_payload_json` are misaligned (e.g. shape says
+///   Debate but payload is GapTopic, or shape is non-scaffolding but
+///   payload is NULL)
+///
+/// This is the canonical reader for Phase 4+ consumers (UI renderers,
+/// debate_steward, meta_layer_oracle, gap_dispatcher). Raw
+/// SELECT-node_shape-from-pyramid_nodes queries bypass the loud checks and
+/// should be rewritten to call this function.
+pub fn get_node_shape(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Option<super::types::NodeShapeView>> {
+    let row: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT node_shape, shape_payload_json
+               FROM pyramid_nodes
+              WHERE slug = ?1 AND id = ?2",
+            rusqlite::params![slug, node_id],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let Some((shape_str, payload_json)) = row else {
+        return Ok(None);
+    };
+    let shape = super::types::NodeShape::from_db(shape_str.as_deref())
+        .with_context(|| format!("slug='{slug}' node='{node_id}'"))?;
+    let payload = super::types::parse_shape_payload(&shape, payload_json.as_deref())
+        .with_context(|| format!("slug='{slug}' node='{node_id}'"))?;
+    Ok(Some(super::types::NodeShapeView { shape, payload }))
+}
+
 /// Get all nodes at a given depth for a slug, ordered by chunk_index.
 pub fn get_nodes_at_depth(conn: &Connection, slug: &str, depth: i64) -> Result<Vec<PyramidNode>> {
     let sql = format!(
@@ -22735,5 +22778,295 @@ mod phase3_post_build_tests {
             "after binding fix, cursor ({}) must advance past the previously-held event (_e3={})",
             r2.new_cursor, _e3
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 4 post-build-accretion tests: shape-payload reader + NodeShape strict
+// parse + purpose_shifted observation-event emission.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod phase4_post_build_tests {
+    use super::*;
+    use crate::pyramid::types::{
+        parse_shape_payload, ContentType, DebateTopic, GapTopic, MetaLayerTopic, NodeShape,
+        ShapePayload,
+    };
+    use rusqlite::Connection;
+
+    fn mem_conn() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&c).unwrap();
+        c
+    }
+
+    /// Insert a pyramid_nodes row with arbitrary node_shape + shape_payload_json.
+    /// Used to simulate both real shape nodes and corrupted / forward-drift
+    /// shape strings to exercise the strict reader.
+    fn insert_node_with_shape_raw(
+        conn: &Connection,
+        slug: &str,
+        node_id: &str,
+        node_shape: Option<&str>,
+        shape_payload_json: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version,
+                 node_shape, shape_payload_json)
+             VALUES (?1, ?2, 0, '', '', '', 1, ?3, ?4)",
+            rusqlite::params![node_id, slug, node_shape, shape_payload_json],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn node_shape_from_db_strict_accepts_known_and_raises_unknown() {
+        // NULL, empty, and explicit "scaffolding" all normalize to Scaffolding.
+        assert_eq!(NodeShape::from_db(None).unwrap(), NodeShape::Scaffolding);
+        assert_eq!(NodeShape::from_db(Some("")).unwrap(), NodeShape::Scaffolding);
+        assert_eq!(
+            NodeShape::from_db(Some("scaffolding")).unwrap(),
+            NodeShape::Scaffolding
+        );
+        assert_eq!(NodeShape::from_db(Some("debate")).unwrap(), NodeShape::Debate);
+        assert_eq!(
+            NodeShape::from_db(Some("meta_layer")).unwrap(),
+            NodeShape::MetaLayer
+        );
+        assert_eq!(NodeShape::from_db(Some("gap")).unwrap(), NodeShape::Gap);
+        // Unknown strings raise loudly — silent-default-to-scaffolding is a
+        // Pillar 38 bug that would mask real data corruption.
+        let err = NodeShape::from_db(Some("bogus_shape")).unwrap_err();
+        assert!(
+            err.to_string().contains("bogus_shape"),
+            "error must surface the offending value: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_shape_payload_round_trips_debate_metalayer_gap() {
+        // Debate — serialize and re-parse via the shape-discriminated reader.
+        let d = DebateTopic {
+            concern: "Should we X?".to_string(),
+            positions: vec![],
+            cross_refs: vec![],
+            vote_lean: None,
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        match parse_shape_payload(&NodeShape::Debate, Some(&json)).unwrap().unwrap() {
+            ShapePayload::Debate(round) => assert_eq!(round.concern, "Should we X?"),
+            other => panic!("expected Debate, got {other:?}"),
+        }
+
+        // MetaLayer
+        let m = MetaLayerTopic {
+            purpose_question: "Why X?".to_string(),
+            parent_meta_layer_id: None,
+            covered_substrate_nodes: vec!["L1-1".into(), "L1-2".into()],
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        match parse_shape_payload(&NodeShape::MetaLayer, Some(&json)).unwrap().unwrap() {
+            ShapePayload::MetaLayer(round) => {
+                assert_eq!(round.purpose_question, "Why X?");
+                assert_eq!(round.covered_substrate_nodes.len(), 2);
+            }
+            other => panic!("expected MetaLayer, got {other:?}"),
+        }
+
+        // Gap
+        let g = GapTopic {
+            concern: "missing-evidence".to_string(),
+            description: "No data on Y.".to_string(),
+            demand_state: "open".to_string(),
+            candidate_resolutions: vec![],
+        };
+        let json = serde_json::to_string(&g).unwrap();
+        match parse_shape_payload(&NodeShape::Gap, Some(&json)).unwrap().unwrap() {
+            ShapePayload::Gap(round) => assert_eq!(round.concern, "missing-evidence"),
+            other => panic!("expected Gap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_shape_payload_misalignment_raises() {
+        // Scaffolding + non-null payload is a data bug — raise, don't
+        // silently drop the payload (might mask real shape corruption).
+        let err = parse_shape_payload(&NodeShape::Scaffolding, Some("{\"any\": 1}"))
+            .unwrap_err();
+        assert!(err.to_string().contains("Scaffolding"), "expected shape-name in error: {err}");
+
+        // Non-scaffolding shape + NULL payload is a data bug (writer bug or
+        // truncation) — raise rather than returning empty payload.
+        let err = parse_shape_payload(&NodeShape::Debate, None).unwrap_err();
+        assert!(err.to_string().contains("debate"), "expected shape-name in error: {err}");
+
+        // Shape says Debate but JSON is a Gap-only shape — serde parse error
+        // surfaces via `anyhow` context because GapTopic's `concern` field
+        // is absent in the "question"-only Debate body.
+        let gap_json = serde_json::to_string(&GapTopic {
+            concern: "c".into(),
+            description: "d".into(),
+            demand_state: "open".into(),
+            candidate_resolutions: vec![],
+        })
+        .unwrap();
+        let err = parse_shape_payload(&NodeShape::Debate, Some(&gap_json)).unwrap_err();
+        assert!(
+            err.to_string().contains("DebateTopic"),
+            "misalignment error must name the expected type: {err}"
+        );
+    }
+
+    #[test]
+    fn get_node_shape_returns_none_for_missing_node_and_scaffolding_for_plain() {
+        let conn = mem_conn();
+        create_slug(&conn, "p4a", &ContentType::Code, "/tmp/p4a").unwrap();
+
+        // Missing node → None, not an error.
+        assert!(get_node_shape(&conn, "p4a", "does-not-exist").unwrap().is_none());
+
+        // Plain seeded node (both columns NULL) → Scaffolding + no payload.
+        insert_node_with_shape_raw(&conn, "p4a", "L0-000", None, None);
+        let view = get_node_shape(&conn, "p4a", "L0-000").unwrap().unwrap();
+        assert_eq!(view.shape, NodeShape::Scaffolding);
+        assert!(view.payload.is_none());
+    }
+
+    #[test]
+    fn get_node_shape_reads_typed_debate_payload() {
+        let conn = mem_conn();
+        create_slug(&conn, "p4b", &ContentType::Code, "/tmp/p4b").unwrap();
+
+        let d = DebateTopic {
+            concern: "Should we X?".to_string(),
+            positions: vec![],
+            cross_refs: vec![],
+            vote_lean: None,
+        };
+        let payload_json = serde_json::to_string(&d).unwrap();
+        insert_node_with_shape_raw(
+            &conn,
+            "p4b",
+            "L1-DBT-1",
+            Some("debate"),
+            Some(&payload_json),
+        );
+
+        let view = get_node_shape(&conn, "p4b", "L1-DBT-1").unwrap().unwrap();
+        assert_eq!(view.shape, NodeShape::Debate);
+        match view.payload.unwrap() {
+            ShapePayload::Debate(d) => assert_eq!(d.concern, "Should we X?"),
+            other => panic!("expected Debate payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_node_shape_propagates_loud_error_on_unknown_db_shape() {
+        let conn = mem_conn();
+        create_slug(&conn, "p4c", &ContentType::Code, "/tmp/p4c").unwrap();
+
+        // Simulate a forward-drift or typo node_shape string. Reader must
+        // raise (UnknownNodeShape), NOT silently return Scaffolding — that
+        // would hide the corruption and downstream consumers would treat
+        // this as plain content while a latent payload sits in the row.
+        insert_node_with_shape_raw(
+            &conn,
+            "p4c",
+            "L1-FUTURE",
+            Some("future_shape_not_yet_coded"),
+            Some("{}"),
+        );
+
+        let err = get_node_shape(&conn, "p4c", "L1-FUTURE").unwrap_err();
+        let msg = err.to_string() + " " + &format!("{:?}", err);
+        assert!(
+            msg.contains("future_shape_not_yet_coded"),
+            "error must surface the offending shape string: {msg}"
+        );
+    }
+
+    #[test]
+    fn supersede_purpose_emits_purpose_shifted_observation_event() {
+        let conn = mem_conn();
+        create_slug(&conn, "p4p", &ContentType::Code, "/tmp/p4p").unwrap();
+
+        // create_slug seeded a stock purpose via initialize_from_content_type,
+        // so supersede_purpose will see a prior_id and go through all three
+        // dance steps.
+        crate::pyramid::purpose::supersede_purpose(
+            &conn,
+            "p4p",
+            "Now we want to understand the event routing layer.",
+            Some("user-decision-to-pivot"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Expect exactly one purpose_shifted event against this slug.
+        let mut stmt = conn
+            .prepare(
+                "SELECT metadata_json FROM dadbear_observation_events
+                   WHERE slug = ?1 AND event_type = 'purpose_shifted'",
+            )
+            .unwrap();
+        let rows: Vec<String> = stmt
+            .query_map(rusqlite::params!["p4p"], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1, "exactly one purpose_shifted event expected");
+
+        // Metadata must include the prior id + new id + reason — downstream
+        // chains need the supersession chain + the shift reason to decide
+        // whether to recrystallize meta-layers.
+        let meta: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+        assert!(meta.get("prior_purpose_id").and_then(|v| v.as_i64()).is_some());
+        assert!(meta.get("new_purpose_id").and_then(|v| v.as_i64()).is_some());
+        assert_eq!(
+            meta.get("supersede_reason").and_then(|v| v.as_str()),
+            Some("user-decision-to-pivot")
+        );
+        // Purpose text preview for chain context (first 200 chars).
+        assert!(meta.get("new_purpose_text_preview").and_then(|v| v.as_str()).is_some());
+    }
+
+    #[test]
+    fn supersede_purpose_first_shift_has_no_prior_id() {
+        // Slug that was NOT created via create_slug (no initialize_from_content_type
+        // seed). First-time declaration via supersede still emits purpose_shifted
+        // with prior_purpose_id == null rather than a foreign-key error.
+        let conn = mem_conn();
+        // Create slug directly, skipping initialize_from_content_type so no
+        // purpose is seeded.
+        conn.execute(
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path, created_at)
+             VALUES ('p4px', 'code', '/tmp/p4px', CURRENT_TIMESTAMP)",
+            [],
+        )
+        .unwrap();
+
+        crate::pyramid::purpose::supersede_purpose(
+            &conn,
+            "p4px",
+            "Bootstrap purpose.",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let meta: String = conn
+            .query_row(
+                "SELECT metadata_json FROM dadbear_observation_events
+                   WHERE slug = ?1 AND event_type = 'purpose_shifted'",
+                rusqlite::params!["p4px"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        // Null, not absent — event metadata explicitly records "no prior".
+        assert!(meta.get("prior_purpose_id").unwrap().is_null());
     }
 }

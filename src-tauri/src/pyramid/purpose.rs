@@ -160,6 +160,34 @@ pub fn supersede_purpose(
         .with_context(|| format!("Failed to mark prior purpose superseded for slug '{slug}'"))?;
     }
 
+    // Emit a `purpose_shifted` observation event so the DADBEAR compiler can
+    // route it to the purpose-aware meta_layer_oracle role. Metadata carries
+    // the prior id + stock key + reason so downstream chains can reason about
+    // what shifted and why without a second DB query. Use `.ok()` to tolerate
+    // a missing observation_events table in test harnesses that don't run the
+    // full schema migration — the supersede itself still lands.
+    let metadata = serde_json::json!({
+        "prior_purpose_id": prior_id,
+        "new_purpose_id": new_id,
+        "new_stock_purpose_key": stock_purpose_key,
+        "supersede_reason": supersede_reason,
+        "new_purpose_text_preview": new_purpose_text.chars().take(200).collect::<String>(),
+    })
+    .to_string();
+    let _ = super::observation_events::write_observation_event(
+        conn,
+        slug,
+        "purpose",         // source
+        "purpose_shifted", // event_type
+        None,              // source_path
+        None,              // file_path
+        None,              // content_hash
+        None,              // previous_hash
+        None,              // target_node_id — purpose is slug-level, not node-level
+        None,              // layer
+        Some(&metadata),
+    );
+
     load_purpose(conn, slug)?.ok_or_else(|| {
         anyhow::anyhow!("successor purpose not found after supersede for '{slug}'")
     })
