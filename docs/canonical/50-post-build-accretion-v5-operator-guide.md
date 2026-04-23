@@ -79,7 +79,7 @@ Shape handlers live in a contribution-driven registry (Phase 9c-2-1). Each typed
 
 ## 2. Annotation types (16 genesis)
 
-Every type is a `vocabulary_entry:annotation_type:<name>` row. Fields: `description`, `handler_chain_id` (optional), `reactive` (bool), `creates_delta` (bool), `include_in_cascade_prompt` (bool). Adding a new type is a `publish_vocabulary_entry` call.
+Every type is a `vocabulary_entry:annotation_type:<name>` row. Fields: `description`, `handler_chain_id` (optional), `reactive` (bool), `creates_delta` (bool), `include_in_cascade_prompt` (bool), `event_type_on_emit` (optional string — overrides the default `annotation_written` event name on save; `correction` genesis uses `"annotation_superseded"`). Adding a new type is a `publish_vocabulary_entry` call.
 
 ### Narrative types (`include_in_cascade_prompt=true`)
 
@@ -170,6 +170,9 @@ All endpoints live under the pyramid HTTP surface (normally `localhost:8765` for
 | `POST /pyramid/:slug/debates/:node_id/reopen` | Local | Operator-driven re-open of a collapsed debate. Emits `debate_reopened`, bypasses the post-collapse cooldown on the next append. |
 | `GET /vocabulary/:vocab_kind` | Public (no auth) | List active vocab entries for a kind (`annotation_type`, `node_shape`, `role_name`). Backs MCP + frontend vocab surfacing. |
 | `GET /pyramid/:slug/annotations?node_id=…` | Dual auth | Read annotations for a node / slug. |
+| `GET /pyramid/:slug/debates/:node_id` | Local | Introspection: current debate state — node_shape, DebateTopic payload (if present), recent spawn/collapse/reopen events, is_collapsed + cooldown_until. |
+| `GET /pyramid/:slug/role_bindings` | Local | Introspection: all active role bindings for the slug (role_name → chain_id + created_at). |
+| `GET /pyramid/:slug/synthesis_history/:node_id` | Local | Introspection: MetaLayer node's synthesis trail — shape_payload + re-distill history (build_version, applied_at) + most recent cascade_annotations loaded. |
 
 The operator HTTP surface (registered in `src-tauri/src/pyramid/routes_operator.rs`) adds 25+ routes for compute market, system observability, local mode, and providers — see `docs/canonical/84-http-operator-api.md`.
 
@@ -237,6 +240,8 @@ This is the "no code deploy" extensibility surface. Full flow:
    reactive: true                              # emits annotation_reacted → dispatches handler_chain_id
    creates_delta: false                        # true → creates a thread delta on save
    include_in_cascade_prompt: true             # true → annotation content flows into ancestor re-distill
+   event_type_on_emit: annotation_written      # optional; override the default emit event name
+                                                # (correction genesis uses "annotation_superseded")
    ```
 2. **Process-wide cache invalidates.** `publish_vocabulary_entry` resets the atomic watermark; subsequent reads re-populate from SQL.
 3. **Cross-process readers sync on next read.** The MCP server, Wire node, and CLI all hit `MAX(id)`-indexed check; peer writes are observed on the next read cycle (Phase 9c-3-1).
@@ -290,9 +295,7 @@ Shipping v5 as-is; none of these block the ship gate. Operator workarounds noted
 - **Gap nodes don't auto-close on evidence arrival.** `starter-synthesizer` marks covered gaps resolved when the MetaLayer covering them crystallizes (Phase 9b-5). Gaps not covered by a crystallized meta-layer remain open indefinitely. Operator workaround: manually annotate gap target with a resolution note, then mark resolved via `pyramid-cli gaps resolve`.
 - **`debate_reopened` event is log-only at the compiler level.** It maps to no primitive; the guard in `append_annotation_to_debate_node` reads the event directly to bypass the cooldown. A v6 item is "debate_reopened role-dispatches to a `debate-reopen-validator` chain if operators want custom post-reopen logic."
 - **Cross-pyramid cascades are not v5 scope.** An annotation on slug A never triggers work on slug B. Cross-pyramid event routing exists in the router but is not wired to annotation flows.
-- **Chain-dispatch shape-writes are not LockManager-guarded.** `execute_supersession` (the re_distill apply path) holds `LockManager::global().write(slug)` and enforces the contract via `assert_write_lock_held`. However, `chain_dispatch.rs` mechanicals (`append_annotation_to_debate_node`, `write_gap_node`, `finalize_debate_node`, synthesizer MetaLayer write) update `node_shape` / `shape_payload_json` on `pyramid_nodes` WITHOUT the write guard. In practice, the compiler's `has_active_work_item` dedup (keyed on target_id + step_name + layer) prevents two simultaneous dispatches for the same node, so this is not observed-flaky in v5. The systemic v6 fix: wrap `execute_chain_for_target` invocation in `LockManager::global().write(&slug)` — tradeoff is that LLM-awaiting chain steps will briefly block concurrent re-distills on the same slug. No operator workaround needed today.
-- **`correction` → `annotation_superseded` emit is hardcoded, not vocab-driven.** `emit_annotation_observation_events` in `routes.rs` special-cases `annotation_type == "correction"` → `annotation_superseded`; every other type emits `annotation_written`. A v6 item is a vocab `event_type_on_emit` field (`"annotation_written" | "annotation_superseded"`). Operator-visible impact: today, a new vocab annotation type CANNOT claim the stronger "this supersedes prior content" semantic without a code deploy. Narrative + operational types already distinguish correctly via `include_in_cascade_prompt` + `creates_delta`; the two-event-type distinction only matters if a new type needs supersession semantics without being named `correction`.
-- **HTTP surface for operator introspection is CLI/sqlite-only.** There are no `GET /debates/:node_id`, `GET /role_bindings/:slug`, or `GET /synthesis_history/:slug` routes; the troubleshooting runbook directs operators to `sqlite3 pyramid.db` queries instead. Force-triggering a cascade against a specific target from HTTP is not supported; supervisor-tick cadence is the path. v6: add GET introspection endpoints for debate state, active role bindings, work-item queue.
+- **Force-triggering a cascade against a specific target from HTTP is not supported.** The supervisor-tick cadence is the production trigger path. Read-only introspection is available via the `GET /pyramid/:slug/debates/:node_id`, `/role_bindings`, and `/synthesis_history/:node_id` routes (Phase 9 close-3).
 
 ### Design decisions (not limitations)
 
