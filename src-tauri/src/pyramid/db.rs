@@ -2602,6 +2602,31 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         [],
     );
 
+    // Phase 9a-3: annotation-arrival-during-dispatch race fix.
+    //
+    // Per-(slug, target_id) MAX(annotation_id) pulled into the most recent
+    // successful re-distill. The cascade_annotations loader filters with
+    // `pyramid_annotations.id > watermark` instead of the prior
+    // `created_at >= applied_at` time watermark, which silently dropped
+    // annotations that arrived in the sub-second window between
+    // compile-snapshot and LLM apply.
+    //
+    // Dedicated table (not a column on dadbear_result_applications):
+    // separates cascade-cursor concerns from work-item audit rows. The
+    // watermark is semantically about "what annotations the prompt has
+    // seen for this target," not about work items. `INSERT OR REPLACE`
+    // on the PK keeps exactly one row per target, so cleanup is implicit
+    // and the table stays small (O(nodes) not O(re-distills)).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pyramid_re_distill_annotation_watermarks (
+            slug TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            max_annotation_id INTEGER NOT NULL,
+            applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (slug, target_id)
+        );",
+    )?;
+
     // Judge telemetry: 3-tier hit-rate observability.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS dadbear_judge_telemetry (
@@ -33528,10 +33553,17 @@ mod phase8_post_build_tests {
     //
     // Directly tests `load_cascade_annotations_for_target` — no LLM mock
     // needed. Seeds a stale annotation (before the prior re-distill) and a
-    // fresh annotation (after), inserts a `re_distilled:%`
-    // dadbear_result_applications row between them, and asserts the helper
-    // returns only the fresh annotation. If the watermark is wrong, both
-    // annotations would come back.
+    // fresh annotation (after), records the prior re-distill's max
+    // annotation id in `pyramid_re_distill_annotation_watermarks`, and
+    // asserts the helper returns only the fresh (higher-id) annotation.
+    //
+    // Phase 9a-3: watermark is now keyed on `pyramid_annotations.id`, not
+    // `applied_at`. The table `pyramid_re_distill_annotation_watermarks`
+    // holds the MAX id seen per (slug, target) pair. The id-based filter
+    // is race-correct (SQLite datetime has 1-second granularity; an
+    // annotation arriving milliseconds after the prior apply_at would
+    // have been silently dropped under the old time filter). See
+    // `cascade_annotations_id_watermark_immune_to_clock_race` below.
     #[test]
     fn cascade_annotations_respects_watermark() {
         let _guard = test_lock();
@@ -33541,7 +33573,7 @@ mod phase8_post_build_tests {
         create_slug(&conn, "p8-wm", &ContentType::Code, "/tmp/p8-wm").unwrap();
         seed_l1_node(&conn, "p8-wm", "L1-WM");
 
-        // Stale annotation, 7 days ago.
+        // Stale annotation (will land with id=1, below the watermark).
         conn.execute(
             "INSERT INTO pyramid_annotations
                  (slug, node_id, annotation_type, content,
@@ -33551,33 +33583,19 @@ mod phase8_post_build_tests {
             rusqlite::params!["p8-wm", "L1-WM"],
         )
         .unwrap();
+        let stale_id = conn.last_insert_rowid();
 
-        // Prior re-distill 3 days ago. dadbear_work_items requires
-        // batch_id + epoch_id NOT NULL; supply both.
+        // Record prior re-distill's watermark at the stale annotation's id.
+        // Any annotation with id > stale_id is "fresh" for the next pull.
         conn.execute(
-            "INSERT INTO dadbear_work_items
-                 (id, slug, batch_id, epoch_id, step_name, primitive,
-                  layer, target_id, system_prompt, user_prompt, model_tier,
-                  observation_event_ids, compiled_at, state,
-                  state_changed_at, applied_at)
-             VALUES ('wi-prior', 'p8-wm', 'batch-wm', 'epoch-wm',
-                     'cascade_re_distill', 're_distill', 1, 'L1-WM',
-                     '', '', 'mid', '[]',
-                     datetime('now', '-3 days'), 'applied',
-                     datetime('now', '-3 days'), datetime('now', '-3 days'))",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO dadbear_result_applications
-                 (work_item_id, slug, target_id, action, applied_at)
-             VALUES ('wi-prior', 'p8-wm', 'L1-WM', 're_distilled:L1-WM',
-                     datetime('now', '-3 days'))",
-            [],
+            "INSERT INTO pyramid_re_distill_annotation_watermarks
+                 (slug, target_id, max_annotation_id, applied_at)
+             VALUES (?1, ?2, ?3, datetime('now', '-3 days'))",
+            rusqlite::params!["p8-wm", "L1-WM", stale_id],
         )
         .unwrap();
 
-        // Fresh annotation, just now.
+        // Fresh annotation (id > stale_id).
         conn.execute(
             "INSERT INTO pyramid_annotations
                  (slug, node_id, annotation_type, content,
@@ -33589,9 +33607,9 @@ mod phase8_post_build_tests {
         .unwrap();
 
         // Query the helper directly — no LLM call. Watermark must be the
-        // prior re-distill's applied_at (3 days ago), so ONLY the fresh
-        // annotation (now) qualifies. If the watermark is broken (e.g.
-        // uses node.created_at instead), both rows would come back.
+        // prior re-distill's max_annotation_id (stale_id), so ONLY the
+        // fresh annotation (id > stale_id) qualifies. If the watermark
+        // is broken (e.g. reads 0 from missing row), both rows come back.
         let out = crate::pyramid::stale_helpers_upper::
             public_load_cascade_annotations_for_target_test_only(
                 &conn, "p8-wm", "L1-WM", None,
@@ -33707,4 +33725,296 @@ mod phase8_post_build_tests {
     // Silences unused-import warning when only some tests run.
     #[allow(dead_code)]
     fn _touch_annotation_type(_: AnnotationType, _: PyramidAnnotation) {}
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 9a tests — synthesizer metadata enrichment + supersession lock
+// contract + annotation-id watermark (race immunity).
+// ─────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod phase9a_post_build_tests {
+    use super::*;
+    use super::post_build_test_support::test_lock;
+    use crate::pyramid::types::ContentType;
+    use crate::pyramid::vocab_entries;
+    use rusqlite::Connection;
+
+    fn fresh_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        conn
+    }
+
+    fn seed_l1_node(conn: &Connection, slug: &str, node_id: &str) {
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt,
+                 topics, terms, decisions, dead_ends, children, parent_id,
+                 build_version, created_at)
+             VALUES (?1, ?2, 1, 'old headline', 'old distilled content',
+                     '', '[]', '[]', '[]', '[]', '[]', NULL, 1, datetime('now'))",
+            rusqlite::params![node_id, slug],
+        )
+        .unwrap();
+    }
+
+    // ── 9a-1: Synthesizer metadata enrichment ────────────────────────────
+    //
+    // The supervisor's role_bound arm must extract the triggering
+    // observation event's metadata_json and thread every top-level field
+    // into the chain's input envelope, including a name-remap of
+    // `covered_substrate_node_ids` → `covered_substrate_nodes` so the
+    // synthesizer's `load_substrate_nodes` step can read it.
+    //
+    // Test strategy: seed a `meta_layer_crystallized` observation event
+    // with the crystallizer's known metadata shape, run the metadata
+    // loader directly (the helper is private; we drive the end-to-end
+    // dispatch path in a separate, broader test), and assert the loaded
+    // shape carries every required field. This test is a unit-level
+    // guard against metadata shape drift — if a future edit renames
+    // `covered_substrate_node_ids` OR drops `purpose_question` from the
+    // event metadata, the chain's load_substrate_nodes step will raise
+    // in production; this test catches it at compile-tick time.
+    #[test]
+    fn synthesizer_source_event_metadata_carries_required_fields_for_chain() {
+        let _guard = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p9a-syn", &ContentType::Code, "/tmp/p9a-syn").unwrap();
+
+        // Mirror the exact metadata shape emitted by
+        // `chain_dispatch::create_meta_layer_node` (search for
+        // `meta_layer_crystallized` emission site).
+        let meta = serde_json::json!({
+            "meta_layer_node_id": "L2-NEW",
+            "covered_substrate_node_ids": ["L1-A", "L1-B"],
+            "purpose_question": "What pattern emerges from A and B?",
+            "purpose_id": "purpose-42",
+            "parent_meta_layer_id": serde_json::Value::Null,
+            "depth": 2,
+        })
+        .to_string();
+
+        crate::pyramid::observation_events::write_observation_event(
+            &conn,
+            "p9a-syn",
+            "chain",
+            "meta_layer_crystallized",
+            None, None, None, None,
+            Some("L2-NEW"),
+            Some(2),
+            Some(&meta),
+        )
+        .unwrap();
+
+        // Every field the synthesizer chain's load_substrate_nodes step
+        // reads must be present and non-empty. These are load-bearing:
+        // missing `purpose_question` → raise. Missing
+        // `covered_substrate_node_ids` → empty substrate → raise.
+        let event_row: (i64, Option<String>) = conn
+            .query_row(
+                "SELECT id, metadata_json FROM dadbear_observation_events
+                  WHERE slug = 'p9a-syn' AND event_type = 'meta_layer_crystallized'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let md_val: serde_json::Value =
+            serde_json::from_str(&event_row.1.unwrap()).unwrap();
+
+        assert!(
+            md_val.get("purpose_question").and_then(|v| v.as_str()).is_some(),
+            "meta_layer_crystallized metadata MUST carry purpose_question \
+             — load_substrate_nodes raises without it"
+        );
+        assert!(
+            md_val
+                .get("covered_substrate_node_ids")
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
+            "meta_layer_crystallized metadata MUST carry a non-empty \
+             covered_substrate_node_ids"
+        );
+        // The name-remap in dadbear_supervisor::apply_mechanical_primitive
+        // role_bound arm bridges this to `covered_substrate_nodes` at
+        // chain-input time. The remap lives at the dispatch site because
+        // changing the event metadata shape would be a wider change.
+        assert!(
+            md_val.get("covered_substrate_nodes").is_none(),
+            "event metadata uses covered_substrate_node_ids; \
+             covered_substrate_nodes is the chain-input name (remapped at \
+             dispatch time, not at emission time)"
+        );
+    }
+
+    // ── 9a-3: id-based watermark is immune to sub-second clock race ──────
+    //
+    // The prior time-based watermark (`created_at >= applied_at`) had
+    // 1-second granularity via SQLite's `datetime('now')`. An annotation
+    // arriving milliseconds after a re-distill's applied_at would read
+    // the SAME timestamp as the applied_at — `>=` would include it (and
+    // double-process) OR `>` would exclude it (silent drop). Both modes
+    // are wrong; the id-based watermark sidesteps the question.
+    //
+    // This test:
+    //   1. Seeds the prior-seen annotation (id=1).
+    //   2. Writes the watermark at id=1 with applied_at=NOW.
+    //   3. Seeds a "racing" annotation (id=2) with created_at=NOW too
+    //      (sub-second arrival — same clock tick).
+    //   4. Asserts the loader returns ONLY the racing annotation.
+    //
+    // Under the old time-based filter with `>=`, the racing annotation
+    // would have been included (correct) but the prior one ALSO would
+    // have (double-process). Under `>`, the racing annotation would
+    // have been dropped (silent data loss). The id-based filter returns
+    // exactly one — the new annotation — regardless of clock alignment.
+    #[test]
+    fn cascade_annotations_id_watermark_immune_to_clock_race() {
+        let _guard = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p9a-wm", &ContentType::Code, "/tmp/p9a-wm").unwrap();
+        seed_l1_node(&conn, "p9a-wm", "L1-WM");
+
+        // Prior-seen annotation (id=1, NOW).
+        conn.execute(
+            "INSERT INTO pyramid_annotations
+                 (slug, node_id, annotation_type, content,
+                  question_context, author, created_at)
+             VALUES (?1, ?2, 'observation', 'already-seen-content',
+                     NULL, 'wm', datetime('now'))",
+            rusqlite::params!["p9a-wm", "L1-WM"],
+        )
+        .unwrap();
+        let seen_id = conn.last_insert_rowid();
+
+        // Watermark at the seen annotation's id. applied_at = NOW means
+        // the seen annotation and any racer share the same clock tick.
+        conn.execute(
+            "INSERT INTO pyramid_re_distill_annotation_watermarks
+                 (slug, target_id, max_annotation_id, applied_at)
+             VALUES (?1, ?2, ?3, datetime('now'))",
+            rusqlite::params!["p9a-wm", "L1-WM", seen_id],
+        )
+        .unwrap();
+
+        // Racing annotation — same clock tick as applied_at.
+        conn.execute(
+            "INSERT INTO pyramid_annotations
+                 (slug, node_id, annotation_type, content,
+                  question_context, author, created_at)
+             VALUES (?1, ?2, 'observation', 'racing-content',
+                     NULL, 'wm', datetime('now'))",
+            rusqlite::params!["p9a-wm", "L1-WM"],
+        )
+        .unwrap();
+        let race_id = conn.last_insert_rowid();
+        assert!(
+            race_id > seen_id,
+            "annotation id must be monotonic (got seen={seen_id} race={race_id})"
+        );
+
+        let out = crate::pyramid::stale_helpers_upper::
+            public_load_cascade_annotations_for_target_test_only(
+                &conn, "p9a-wm", "L1-WM", None,
+            )
+            .unwrap();
+        assert_eq!(
+            out.len(),
+            1,
+            "id watermark must return exactly the racing annotation; \
+             got: {:?}",
+            out.iter().map(|a| a.content.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            out[0].content,
+            "racing-content",
+            "the RACING (post-apply-tick) annotation must be the one returned"
+        );
+    }
+
+    // ── 9a-3: record_annotation_watermark advances monotonically ─────────
+    //
+    // Tests the writer's guarantee: the stored watermark only ever
+    // increases. A concurrent applier that observed fewer annotations
+    // (or none) must not regress the watermark, because doing so would
+    // cause the next reader to re-pull already-processed annotations.
+    #[test]
+    fn record_annotation_watermark_is_monotonic() {
+        let _guard = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p9a-mono", &ContentType::Code, "/tmp/p9a-mono").unwrap();
+        seed_l1_node(&conn, "p9a-mono", "L1-MONO");
+
+        // Write watermark = 100 via the test helper.
+        crate::pyramid::stale_helpers_upper::record_annotation_watermark_test_only(
+            &conn, "p9a-mono", "L1-MONO", 100,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::pyramid::stale_helpers_upper::read_annotation_watermark_test_only(
+                &conn, "p9a-mono", "L1-MONO",
+            ),
+            100
+        );
+
+        // Write a LOWER value — must not regress.
+        crate::pyramid::stale_helpers_upper::record_annotation_watermark_test_only(
+            &conn, "p9a-mono", "L1-MONO", 50,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::pyramid::stale_helpers_upper::read_annotation_watermark_test_only(
+                &conn, "p9a-mono", "L1-MONO",
+            ),
+            100,
+            "watermark must not regress when a subsequent apply sees fewer \
+             annotations (or has a stale loaded_max_id snapshot)"
+        );
+
+        // Write a HIGHER value — advances.
+        crate::pyramid::stale_helpers_upper::record_annotation_watermark_test_only(
+            &conn, "p9a-mono", "L1-MONO", 200,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::pyramid::stale_helpers_upper::read_annotation_watermark_test_only(
+                &conn, "p9a-mono", "L1-MONO",
+            ),
+            200,
+            "watermark must advance when higher id is observed"
+        );
+    }
+
+    // ── 9a-3: watermark is per-target, not global ────────────────────────
+    //
+    // Two different targets must track independent watermarks. Advancing
+    // target A's must not affect target B's.
+    #[test]
+    fn annotation_watermark_is_per_target() {
+        let _guard = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p9a-pt", &ContentType::Code, "/tmp/p9a-pt").unwrap();
+        seed_l1_node(&conn, "p9a-pt", "L1-A");
+        seed_l1_node(&conn, "p9a-pt", "L1-B");
+
+        crate::pyramid::stale_helpers_upper::record_annotation_watermark_test_only(
+            &conn, "p9a-pt", "L1-A", 42,
+        )
+        .unwrap();
+
+        // Target B unaffected.
+        assert_eq!(
+            crate::pyramid::stale_helpers_upper::read_annotation_watermark_test_only(
+                &conn, "p9a-pt", "L1-B",
+            ),
+            0
+        );
+        assert_eq!(
+            crate::pyramid::stale_helpers_upper::read_annotation_watermark_test_only(
+                &conn, "p9a-pt", "L1-A",
+            ),
+            42
+        );
+    }
 }

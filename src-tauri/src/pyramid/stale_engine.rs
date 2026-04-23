@@ -23,6 +23,7 @@ use uuid::Uuid;
 use super::event_bus::BuildEventBus;
 use super::faq;
 use super::llm::LlmConfig;
+use super::lock_manager::LockManager;
 use super::stale_helpers;
 use super::stale_helpers_upper;
 use super::types::{AutoUpdateConfig, PendingMutation, StaleCheckResult};
@@ -1034,9 +1035,20 @@ pub async fn drain_and_dispatch(
                         // Stale-check L0 file_change: annotations (if any)
                         // live on this target — pass None so the helper
                         // queries annotations on target_id itself.
-                        if let Err(e) = stale_helpers_upper::execute_supersession(
-                            node_id, &db, &s, &cfg, &mdl, None,
-                        ).await {
+                        //
+                        // Phase 9a-2: honor execute_supersession's
+                        // caller-holds-lock contract. Acquired per-node in
+                        // a tight scope so the lock is released between
+                        // nodes (this loop may touch multiple L0 nodes
+                        // from the same file, and we want concurrent
+                        // readers to make progress between them).
+                        let res = {
+                            let _guard = LockManager::global().write(&s).await;
+                            stale_helpers_upper::execute_supersession(
+                                node_id, &db, &s, &cfg, &mdl, None,
+                            ).await
+                        };
+                        if let Err(e) = res {
                             error!(slug = %s, target = %result.target_id, node_id = %node_id, error = %e, "execute_supersession (L0 file_change) failed");
                         } else {
                             result.reason = format!("{} (node {} superseded)", result.reason, node_id);
@@ -1183,9 +1195,16 @@ pub async fn drain_and_dispatch(
                     // Stale-check node-sweep: same rationale as L0
                     // branch above — annotations, if any, live on
                     // target; None → fall back to target_id.
-                    if let Err(e) = stale_helpers_upper::execute_supersession(
-                        &result.target_id, &db, &s, &cfg, &mdl, None,
-                    ).await {
+                    //
+                    // Phase 9a-2: honor execute_supersession's
+                    // caller-holds-lock contract (tight per-target scope).
+                    let res = {
+                        let _guard = LockManager::global().write(&s).await;
+                        stale_helpers_upper::execute_supersession(
+                            &result.target_id, &db, &s, &cfg, &mdl, None,
+                        ).await
+                    };
+                    if let Err(e) = res {
                         error!(slug = %s, target = %result.target_id, error = %e, "execute_supersession failed");
                     } else {
                         // Bug 4 fix: Update reason to reflect supersession so propagated

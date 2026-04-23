@@ -883,17 +883,91 @@ impl DadbearSupervisor {
                         )));
                     }
                 };
+                // Phase 9a-1: enrich chain input with the triggering
+                // observation event's metadata_json. Some role_bound chains
+                // need source-event context to operate:
+                //
+                // - starter-synthesizer (bound on meta_layer_crystallized)
+                //   requires `purpose_question` + `covered_substrate_node_ids`
+                //   from the crystallization event — load_substrate_nodes
+                //   raises without them. Pre-9a this was "dead plumbing":
+                //   the chain would fire but its first mechanical step
+                //   would loud-raise on missing input.
+                // - future synthesizer variants + debate_steward gates may
+                //   want `purpose_id`, `parent_meta_layer_id`, etc.
+                //
+                // Strategy: pass the ENTIRE event metadata_json as
+                // `trigger_event_metadata` AND splat its top-level fields
+                // into the chain input. Chains that need a specific field
+                // can read it directly; chains that pass through can thread
+                // the whole envelope forward via
+                // `trigger_event_metadata`. This is the same generic
+                // approach Phase 8 tail-2's helper uses — one shared
+                // `load_source_event_metadata` factored above.
+                //
+                // feedback_loud_deferrals: when the event has no metadata
+                // (or the load fails), we still dispatch the chain with a
+                // bare input envelope. The chain's first mechanical step
+                // (which needs the metadata) will raise with a clear
+                // message pointing at the missing field. This is the loud
+                // failure we want — silent no-op would be worse.
+                let obs_ids_str = item.observation_event_ids.as_deref();
+                let trigger_md = load_source_event_metadata(
+                    &db_path,
+                    &slug,
+                    obs_ids_str,
+                );
+                let mut chain_input = serde_json::json!({
+                    "work_item_id": &item.id,
+                    "step_name": &item.step_name,
+                    "target_id": item.target_id,
+                    "layer": item.layer,
+                });
+                if let Some(md) = trigger_md {
+                    // Thread the full envelope under a stable key for chains
+                    // that want the whole object.
+                    chain_input["trigger_event_metadata"] = md.clone();
+                    // Splat top-level fields (non-destructive: never
+                    // overwrites work_item_id / step_name / target_id /
+                    // layer). This is what gives the synthesizer chain
+                    // `purpose_question` + `covered_substrate_node_ids`
+                    // at chain-input depth-0 where `load_substrate_nodes`
+                    // reads them.
+                    if let Some(obj) = md.as_object() {
+                        let existing = chain_input.as_object().cloned().unwrap_or_default();
+                        for (k, v) in obj {
+                            if !existing.contains_key(k) {
+                                chain_input[k.as_str()] = v.clone();
+                            }
+                        }
+                        // Name-remap: the meta_layer_crystallized event emits
+                        // `covered_substrate_node_ids` (the source of truth
+                        // is the crystallizer's output), but the synthesizer
+                        // chain's `load_substrate_nodes` step reads
+                        // `covered_substrate_nodes`. Pre-9a this field was
+                        // never reaching the chain — the mismatch was never
+                        // exercised because the arm didn't thread metadata
+                        // at all. Bridge the two names here so both readers
+                        // see the substrate id list under their expected
+                        // key. Alternative would be renaming the event
+                        // metadata, but that's a wider surface change.
+                        if !chain_input
+                            .as_object()
+                            .map(|o| o.contains_key("covered_substrate_nodes"))
+                            .unwrap_or(false)
+                        {
+                            if let Some(ids) = obj.get("covered_substrate_node_ids") {
+                                chain_input["covered_substrate_nodes"] = ids.clone();
+                            }
+                        }
+                    }
+                }
                 let run_result = crate::pyramid::chain_executor::execute_chain_for_target(
                     &self.pyramid_state,
                     &chain,
                     &slug,
                     item.target_id.as_deref(),
-                    serde_json::json!({
-                        "work_item_id": &item.id,
-                        "step_name": &item.step_name,
-                        "target_id": item.target_id,
-                        "layer": item.layer,
-                    }),
+                    chain_input,
                 )
                 .await;
                 match run_result {
@@ -2349,6 +2423,86 @@ fn emit_state_changed(
 /// routing gap is visible (feedback_loud_deferrals). `None` passes through
 /// to the helper's backward-compat fallback (annotations queried on the
 /// target itself), which is what stale-check callers want.
+
+/// Phase 9a-1: shared helper to load + union metadata_json from the set of
+/// observation events referenced by a work item's `observation_event_ids`.
+///
+/// Factors the "read each referenced event, parse metadata_json" pattern
+/// shared by:
+/// - Phase 8 tail-2 `run_re_distill_supervisor_arm` (extracts
+///   `annotated_node_id` set from annotation_written events)
+/// - Phase 9a-1 role_bound synthesizer enrichment (extracts
+///   `purpose_question` / `covered_substrate_node_ids` / `parent_meta_layer_id`
+///   from the meta_layer_crystallized event)
+/// - Any future consumer that needs the triggering event's full metadata
+///
+/// Returns the metadata_json of the FIRST event in the list (there is always
+/// exactly one for chain-emitted role_bound events — the compiler coalesces
+/// by target, not by source, for these emitters). Returns `None` when:
+/// - `observation_event_ids_json` is None or empty
+/// - The first event id does not resolve to a row
+/// - `metadata_json` is NULL on the row
+/// - `metadata_json` is not parseable as JSON
+///
+/// All failure modes log loudly at warn-level so metadata-loading bugs are
+/// visible rather than silent (feedback_loud_deferrals).
+///
+/// The "union multiple events" variant lives inside
+/// `run_re_distill_supervisor_arm` because its union semantic is specific
+/// to the `annotated_node_id` set — generalizing it here would leak that
+/// concern into the signature. When a second role_bound emitter needs
+/// union semantics, factor THAT out at the call site that needs it.
+fn load_source_event_metadata(
+    db_path: &str,
+    slug: &str,
+    observation_event_ids_json: Option<&str>,
+) -> Option<serde_json::Value> {
+    let ids_json = observation_event_ids_json?;
+    let event_ids: Vec<i64> = serde_json::from_str(ids_json).unwrap_or_default();
+    let first_id = *event_ids.first()?;
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                error = %e,
+                slug = %slug,
+                "load_source_event_metadata: failed to open DB — returning None"
+            );
+            return None;
+        }
+    };
+    let md: Option<Option<String>> = conn
+        .query_row(
+            "SELECT metadata_json FROM dadbear_observation_events
+              WHERE slug = ?1 AND id = ?2",
+            params![slug, first_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok();
+    let Some(Some(md_str)) = md else {
+        warn!(
+            slug = %slug,
+            event_id = %first_id,
+            "load_source_event_metadata: event row has no metadata_json — \
+             returning None (downstream chain input will not carry trigger metadata)"
+        );
+        return None;
+    };
+    match serde_json::from_str::<serde_json::Value>(&md_str) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!(
+                slug = %slug,
+                event_id = %first_id,
+                error = %e,
+                "load_source_event_metadata: metadata_json is not valid JSON — \
+                 returning None"
+            );
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_re_distill_supervisor_arm(
     db_path: &str,
@@ -2362,6 +2516,17 @@ pub(crate) async fn run_re_distill_supervisor_arm(
     event_bus: &Arc<BuildEventBus>,
     observation_event_ids_json: Option<&str>,
 ) -> Result<()> {
+    // Phase 9a-2: enforce the `execute_supersession` caller-holds-lock
+    // contract. Acquired here at function entry so every branch below —
+    // target-missing fast-fail, supersession success, supersession error —
+    // runs under the slug's write lock. Dropped implicitly on return.
+    //
+    // The stale_check path (apply_result) holds its own lock at a higher
+    // scope (line ~1203) and does NOT flow through this arm — it calls
+    // execute_supersession directly. So acquiring here is correct for the
+    // re_distill arm and does not double-lock the stale_check path.
+    let _slug_write_guard = LockManager::global().write(slug).await;
+
     if target_id.is_empty() {
         tracing::warn!(
             slug = %slug,

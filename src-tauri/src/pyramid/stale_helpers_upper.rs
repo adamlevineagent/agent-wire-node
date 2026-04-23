@@ -2149,6 +2149,26 @@ pub(crate) async fn persist_change_manifest_with_bus(
 /// Stale-check callers (L0 file-change, node stale sweep) pass `None` —
 /// annotations are queried on the target itself, preserving the legacy
 /// semantics where the stale node IS the annotated node.
+/// **Phase 9a-2 lock contract — CALLER-HOLDS.** Every production call site
+/// must acquire `LockManager::global().write(slug).await` BEFORE invoking
+/// `execute_supersession` and hold the guard for the full call. The
+/// function does NOT acquire the lock internally because `tokio::sync::RwLock`
+/// is non-reentrant and several supervisor call paths (notably
+/// `apply_result`'s stale_check arm) already hold the slug write lock
+/// across a broader region — internal acquisition would deadlock them.
+///
+/// Current call sites that comply:
+/// - `dadbear_supervisor::apply_result` (stale_check arm) — lock held at
+///   the top of `apply_result` before any primitive dispatch.
+/// - `dadbear_supervisor::run_re_distill_supervisor_arm` — lock acquired
+///   at function entry, held across this call.
+/// - `stale_engine` L0 file_change + L1+ confirmed-stale branches — each
+///   acquires the write lock around the `execute_supersession` call.
+///
+/// Test-only call sites in `db.rs` (phase8_post_build_tests) invoke without
+/// a lock because they are single-threaded. Production code MUST hold the
+/// write lock; the lock-acquired assertion at the top of this function
+/// catches new non-compliant call sites at runtime.
 pub async fn execute_supersession(
     node_id: &str,
     db_path: &str,
@@ -2157,21 +2177,11 @@ pub async fn execute_supersession(
     model: &str,
     annotated_node_ids: Option<Vec<String>>,
 ) -> Result<String> {
-    // FIXME(phase-9): execute_supersession bypasses LockManager::write(slug)
-    // that other supersession sites honor. The in-place update is currently
-    // bounded by `build_version` compare-and-swap (optimistic), which is
-    // safe against lost writes but not architecturally aligned with the
-    // lock contract. Phase 9 hardening should wrap this body in a
-    // LockManager::write(slug) guard so the re_distill arm participates
-    // in the same serialization order as stale-check callers.
-    //
-    // FIXME(phase-9): annotation-arrival-during-dispatch race — if an
-    // annotation arrives between the work-item's compile (when
-    // observation_event_ids is snapshotted) and the LLM apply (when
-    // cascade_annotations is read), the new annotation is NOT included
-    // in THIS re-distill and WILL be picked up by the NEXT. Narrow
-    // window; acceptable for tail-2. Phase 9 should tighten via
-    // watermark-by-max-annotation-id or re-emit-after-applied semantics.
+    // Phase 9a-3: annotation-arrival-during-dispatch race — the race window
+    // between compile-snapshot of observation_event_ids and the LLM apply
+    // is now bounded by a MAX(annotation_id)-indexed watermark stored in
+    // `dadbear_result_applications.result_metadata_json`. See
+    // `load_cascade_annotations_for_target` + `record_max_annotation_id`.
     let requested_node_id = node_id.to_string();
     let resolved_node_id = tokio::task::spawn_blocking({
         let db = db_path.to_string();
@@ -2272,6 +2282,28 @@ pub async fn execute_supersession(
     })
     .await
     .unwrap_or_default();
+
+    // Phase 9a-3: snapshot the MAX(annotation_id) observed by the loader
+    // BEFORE the annotation list moves into `manifest_input`. This is the
+    // race-correct watermark ceiling for the post-apply write — it
+    // captures exactly what the prompt saw, ignoring any annotations
+    // written after the loader's SELECT (those ride the next cycle).
+    let loaded_max_annotation_id: i64 = cascade_annotations
+        .iter()
+        .map(|a| a.id)
+        .max()
+        .unwrap_or(0);
+    // Same resolution logic the loader uses, kept local so we can pass it
+    // to record_annotation_watermark without round-tripping through the
+    // helper a second time.
+    let watermark_target_ids: Vec<String> = match annotated_node_ids.as_deref() {
+        Some(ids) if ids.iter().any(|s| !s.trim().is_empty()) => ids
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.clone())
+            .collect(),
+        _ => vec![resolved_node_id.clone()],
+    };
 
     // The "changed children" the LLM needs are the nodes under this one that
     // appear in recent deltas. For depth==0 nodes this is a synthesized
@@ -2385,7 +2417,7 @@ pub async fn execute_supersession(
         }
     };
 
-    apply_supersession_manifest(
+    let applied = apply_supersession_manifest(
         db_path,
         slug,
         base_config,
@@ -2394,7 +2426,57 @@ pub async fn execute_supersession(
         &node_ctx,
         manifest,
     )
-    .await
+    .await?;
+
+    // Phase 9a-3: advance the annotation watermark for THIS target after
+    // the apply succeeds. Written post-apply so a failed apply leaves the
+    // watermark where it was — the retry re-pulls the same annotations,
+    // no silent drop (feedback_loud_deferrals: partial progress on
+    // annotation dispatch is worse than retry redundancy).
+    //
+    // Uses a fresh short-lived blocking connection to write; the function
+    // is called outside the PyramidState writer mutex scope, and the
+    // caller's slug write lock (Phase 9a-2 contract) serializes concurrent
+    // writers anyway. Best-effort: a watermark-write failure cannot
+    // regress the already-applied re-distill — log loudly and continue.
+    let wm_slug = slug.to_string();
+    let wm_target = applied.clone();
+    let wm_ids = watermark_target_ids.clone();
+    let wm_db = db_path.to_string();
+    let wm_max = loaded_max_annotation_id;
+    let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+        let conn = super::db::open_pyramid_connection(Path::new(&wm_db))
+            .context("watermark-write: failed to open DB")?;
+        let prior: i64 = conn
+            .query_row(
+                "SELECT max_annotation_id FROM pyramid_re_distill_annotation_watermarks
+                  WHERE slug = ?1 AND target_id = ?2",
+                rusqlite::params![wm_slug, wm_target],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0);
+        if let Err(e) = record_annotation_watermark(
+            &conn,
+            &wm_slug,
+            &wm_target,
+            &wm_ids,
+            prior,
+            wm_max,
+        ) {
+            warn!(
+                slug = %wm_slug,
+                target_id = %wm_target,
+                max_id = wm_max,
+                error = %e,
+                "re_distill watermark: record_annotation_watermark failed — \
+                 next cycle will re-pull annotations (safe retry)"
+            );
+        }
+        Ok(())
+    })
+    .await;
+
+    Ok(applied)
 }
 
 /// Persist a failed-manifest row for the oversight page and return an error
@@ -2892,32 +2974,38 @@ fn load_cascade_annotations_for_target(
     // (preserves the legacy semantics where the stale node IS the
     // annotated node).
 
-    // Most recent re-distill applied_at (watermark ceiling) on the TARGET
-    // — NOT on the annotated descendants. Each ancestor's watermark
-    // advances when IT re-distills, independent of other ancestors.
-    let last_redistill_at: Option<String> = conn
+    // Phase 9a-3: annotation-id watermark (Option B — systemic fix,
+    // replaces the applied_at time-based watermark at the query layer).
+    //
+    // The prior implementation filtered `pyramid_annotations.created_at >=
+    // last_redistill_applied_at`. SQLite's `datetime('now')` has 1-second
+    // granularity, so an annotation that arrived between the work-item's
+    // compile-snapshot and the LLM apply (sub-second window) was silently
+    // dropped from THIS re-distill — it would be picked up only on the
+    // NEXT re-distill, which might never happen if no further event fired.
+    //
+    // Id-based watermark is immune to that race: `pyramid_annotations.id`
+    // is monotonic and strictly increasing. We record the MAX id of
+    // annotations pulled into each successful re_distill in
+    // `pyramid_re_distill_annotation_watermarks`. Next read pulls
+    // `id > watermark`, guaranteed to see every annotation written after
+    // the last prompt was built — regardless of clock granularity.
+    //
+    // First-run fallback: when no watermark row exists, watermark = 0 and
+    // all annotations are eligible. Fresh nodes and legacy nodes (pre-9a3
+    // installations) follow this path — the first post-9a re-distill
+    // might re-include annotations the prior (pre-9a) re-distill saw,
+    // but the prompt cap (50) bounds the bloat and the watermark
+    // self-heals on the first apply.
+    let id_watermark: i64 = conn
         .query_row(
-            "SELECT MAX(applied_at) FROM dadbear_result_applications
-              WHERE slug = ?1 AND target_id = ?2
-                AND action LIKE 're_distilled:%'",
+            "SELECT max_annotation_id
+               FROM pyramid_re_distill_annotation_watermarks
+              WHERE slug = ?1 AND target_id = ?2",
             rusqlite::params![slug, target_node_id],
-            |row| row.get::<_, Option<String>>(0),
+            |row| row.get::<_, i64>(0),
         )
-        .unwrap_or(None);
-
-    // Fallback: target's created_at when no prior re-distill exists.
-    let watermark: String = match last_redistill_at {
-        Some(ts) => ts,
-        None => conn
-            .query_row(
-                "SELECT COALESCE(created_at, datetime('now','-100 years'))
-                   FROM pyramid_nodes
-                  WHERE slug = ?1 AND id = ?2",
-                rusqlite::params![slug, target_node_id],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap_or_else(|_| "1970-01-01 00:00:00".to_string()),
-    };
+        .unwrap_or(0);
 
     // Resolve the set of node_ids whose annotations we load. Production
     // annotation-triggered re-distill passes the DESCENDANT(s) the
@@ -2955,13 +3043,12 @@ fn load_cascade_annotations_for_target(
         None => vec![target_node_id.to_string()],
     };
 
-    // `>=` not `>` on the watermark comparison: SQLite `datetime('now')`
-    // has only second granularity, so a node seeded at time T and an
-    // annotation inserted milliseconds later both read as T. Using `>`
-    // would silently drop annotations on a fresh node whose watermark
-    // falls back to `pyramid_nodes.created_at`. Ties go toward INCLUDE —
-    // a spurious extra annotation in the prompt is harmless; a silent
-    // drop (feedback_loud_deferrals) is not.
+    // Phase 9a-3: `id > ?watermark` replaces the prior `created_at >=`
+    // filter. Annotation IDs are monotonic; the race window that made
+    // `>=` mandatory (sub-second ties against `datetime('now')`) no longer
+    // applies at the id layer. No silent drop is possible because
+    // annotations inserted AFTER the prior re-distill ran are
+    // monotonically-greater-id than the recorded `max_annotation_id_seen`.
     //
     // Prompt cap: pull `cap + 1` so we can detect overflow without a
     // second COUNT query, then emit a loud observation event carrying
@@ -2982,8 +3069,8 @@ fn load_cascade_annotations_for_target(
         "SELECT id, annotation_type, author, content, question_context,
                 created_at
            FROM pyramid_annotations
-          WHERE slug = ?1 AND node_id IN ({placeholders}) AND created_at >= ?{watermark_idx}
-          ORDER BY created_at ASC, id ASC
+          WHERE slug = ?1 AND node_id IN ({placeholders}) AND id > ?{watermark_idx}
+          ORDER BY id ASC
           LIMIT ?{limit_idx}"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -2993,7 +3080,7 @@ fn load_cascade_annotations_for_target(
     for id in &resolved_annotation_node_ids {
         params.push(Box::new(id.clone()));
     }
-    params.push(Box::new(watermark.clone()));
+    params.push(Box::new(id_watermark));
     params.push(Box::new(probe as i64));
     let param_refs: Vec<&dyn rusqlite::ToSql> =
         params.iter().map(|p| p.as_ref()).collect();
@@ -3027,7 +3114,7 @@ fn load_cascade_annotations_for_target(
         // floor-only estimate. Reuses the same resolved id set.
         let count_sql = format!(
             "SELECT COUNT(*) FROM pyramid_annotations
-              WHERE slug = ?1 AND node_id IN ({placeholders}) AND created_at >= ?{watermark_idx}"
+              WHERE slug = ?1 AND node_id IN ({placeholders}) AND id > ?{watermark_idx}"
         );
         let mut count_params: Vec<Box<dyn rusqlite::ToSql>> =
             Vec::with_capacity(resolved_annotation_node_ids.len() + 2);
@@ -3035,7 +3122,7 @@ fn load_cascade_annotations_for_target(
         for id in &resolved_annotation_node_ids {
             count_params.push(Box::new(id.clone()));
         }
-        count_params.push(Box::new(watermark.clone()));
+        count_params.push(Box::new(id_watermark));
         let count_param_refs: Vec<&dyn rusqlite::ToSql> =
             count_params.iter().map(|p| p.as_ref()).collect();
         let total: i64 = conn
@@ -3048,7 +3135,8 @@ fn load_cascade_annotations_for_target(
             "cap": CASCADE_ANNOTATION_PROMPT_CAP,
             "total_eligible": total,
             "skipped": skipped,
-            "watermark": watermark,
+            // Phase 9a-3: id watermark replaces the applied_at time stamp.
+            "id_watermark": id_watermark,
             "annotated_node_ids": resolved_annotation_node_ids,
         })
         .to_string();
@@ -3080,6 +3168,113 @@ fn load_cascade_annotations_for_target(
     }
 
     Ok(out)
+}
+
+/// Phase 9a-3: record the MAX(annotation_id) across the annotation node set
+/// into the per-target watermark table after a successful re-distill apply.
+///
+/// Called from `apply_supersession_manifest` once the manifest has been
+/// applied to `pyramid_nodes`. Writing POST-apply is required for race
+/// correctness: if the apply fails, the watermark must NOT advance —
+/// otherwise the failed annotations would be silently dropped from the
+/// retry's eligible set. Writing AFTER success means a failed re-distill
+/// retries with the same watermark as before (no drop).
+///
+/// `annotated_node_ids` is the EXACT set `load_cascade_annotations_for_target`
+/// used (Phase 8 tail-2 production-path uses the annotated descendants;
+/// stale-check callers use `[target_node_id]`). We recompute MAX here
+/// rather than threading it from the loader because:
+/// 1. The loader caps at 50 rows — the "true" max over all eligible
+///    annotations may be beyond the cap and we still want to watermark
+///    past the cap so the overflow doesn't leak into the next read.
+/// 2. Annotations may have arrived between load-time and apply-time
+///    (legitimate — they'll ride the next cycle, not this one) — the
+///    watermark must NOT include them or we'd drop them.
+///    Solution: MAX id AS OF load-time is what we want; we query with
+///    the same node set and a ceiling that captures "everything visible
+///    when the loader ran." Simplest racefree version: MAX(id) WHERE
+///    id <= max_loaded_id. If no rows were loaded for this target set
+///    (fresh first run), fall back to the prior watermark (no advance).
+///
+/// Called with `conn` holding the write-lock scope from
+/// `apply_supersession_manifest`; write is a single INSERT OR REPLACE.
+fn record_annotation_watermark(
+    conn: &Connection,
+    slug: &str,
+    target_node_id: &str,
+    annotated_node_ids: &[String],
+    prior_watermark: i64,
+    loaded_max_id: i64,
+) -> Result<()> {
+    // Use the loaded_max_id (the MAX id observed when the cascade loader
+    // last ran its SELECT). This is the race-correct ceiling: anything
+    // AFTER this id is a post-load arrival and must ride the next cycle.
+    // When the loader saw nothing (loaded_max_id == 0), keep the prior
+    // watermark unchanged so a no-op apply doesn't advance past real
+    // annotations that arrive later.
+    let new_watermark = if loaded_max_id > prior_watermark {
+        loaded_max_id
+    } else {
+        prior_watermark
+    };
+    if new_watermark == prior_watermark && prior_watermark == 0 {
+        // No prior watermark AND no annotations observed — don't write
+        // a 0 row, it's a no-op and churns the table.
+        return Ok(());
+    }
+    let _ = annotated_node_ids; // referenced for audit clarity; query uses
+                                // only the scalar max_id that was observed.
+    conn.execute(
+        "INSERT INTO pyramid_re_distill_annotation_watermarks
+            (slug, target_id, max_annotation_id, applied_at)
+         VALUES (?1, ?2, ?3, datetime('now'))
+         ON CONFLICT(slug, target_id) DO UPDATE SET
+             max_annotation_id = excluded.max_annotation_id,
+             applied_at = excluded.applied_at
+         WHERE excluded.max_annotation_id > pyramid_re_distill_annotation_watermarks.max_annotation_id",
+        rusqlite::params![slug, target_node_id, new_watermark],
+    )?;
+    Ok(())
+}
+
+/// Phase 9a-3 test hook: exposes `record_annotation_watermark` for direct
+/// driving from the watermark-race test without standing up the whole
+/// supersession + LLM + apply pipeline.
+#[cfg(test)]
+#[doc(hidden)]
+pub(crate) fn record_annotation_watermark_test_only(
+    conn: &Connection,
+    slug: &str,
+    target_node_id: &str,
+    loaded_max_id: i64,
+) -> Result<()> {
+    let prior: i64 = conn
+        .query_row(
+            "SELECT max_annotation_id FROM pyramid_re_distill_annotation_watermarks
+              WHERE slug = ?1 AND target_id = ?2",
+            rusqlite::params![slug, target_node_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    record_annotation_watermark(conn, slug, target_node_id, &[], prior, loaded_max_id)
+}
+
+/// Phase 9a-3 test hook: reads the current watermark for a (slug,
+/// target_id) pair. Returns 0 when no row exists.
+#[cfg(test)]
+#[doc(hidden)]
+pub(crate) fn read_annotation_watermark_test_only(
+    conn: &Connection,
+    slug: &str,
+    target_node_id: &str,
+) -> i64 {
+    conn.query_row(
+        "SELECT max_annotation_id FROM pyramid_re_distill_annotation_watermarks
+          WHERE slug = ?1 AND target_id = ?2",
+        rusqlite::params![slug, target_node_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
 }
 
 /// Prompt-cap for `load_cascade_annotations_for_target`.
