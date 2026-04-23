@@ -953,18 +953,15 @@ mod tests {
     }
 
     /// Phase 0b WS-C: the strict form of `test_bundled_tier_coverage`
-    /// that encodes the full plan §6 Phase 0b assertion. Fails today
-    /// because WS-B's bundled walker_provider_openrouter + _market
-    /// seeds do NOT cover `synth_heavy` or `web`, which the bundled
-    /// `question.yaml` and `topical-vine.yaml` chains reference.
+    /// that encodes the full plan §6 Phase 0b assertion — every tier
+    /// referenced by a bundled chain YAML must resolve to a non-empty
+    /// `model_list` via at least one provider-type in the bundled
+    /// walker_* seeds. Now passes after Adam's 2026-04-22 fill-in of
+    /// `synth_heavy` (moonshotai/kimi-k2.6) and `web` (xiaomi/mimo-v2.5-pro)
+    /// on walker_provider_openrouter.
     ///
-    /// Run with: `cargo test --lib test_bundled_tier_coverage_strict -- --ignored`
-    ///
-    /// Remove the `#[ignore]` once WS-B's follow-up seeds `synth_heavy`
-    /// + `web` into at least one provider-type's `model_list`, OR the
-    /// bundled chain YAMLs are migrated off those tier names.
+    /// Run with: `cargo test --lib test_bundled_tier_coverage_strict`
     #[test]
-    #[ignore = "WS-C surfaces Day-1 tier-coverage gap in WS-B bundles (synth_heavy + web uncovered); WS-B follow-up required before un-ignoring"]
     fn test_bundled_tier_coverage_strict() {
         let conn = mem_conn();
         walk_bundled_contributions_manifest(&conn).unwrap();
