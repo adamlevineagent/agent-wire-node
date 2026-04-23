@@ -38,11 +38,15 @@ description: >
        ContentType if missing). Returns `{purpose_text,
        stock_purpose_key}` threaded onto the envelope so the LLM step
        sees the authoritative gating text.
-    3. authorize_question — LLM evaluator producing
+    3. authorize_question — LLM `verify` step producing
        `{approved, reasoning, alternative_question_suggestion}`. The
-       `alternative_question_suggestion` field is nullable — null for
-       clean accepts AND clean rejects, populated only when the
-       question is almost-on-purpose but mis-scoped.
+       `approved` field is a strict boolean gate (yes/no), so `verify`
+       is the right primitive by the convention evidence_tester +
+       judge (post-7d) established — `evaluate` is reserved for
+       open-ended scoring. The `alternative_question_suggestion` field
+       is nullable — null for clean accepts AND clean rejects,
+       populated only when the question is almost-on-purpose but
+       mis-scoped.
     4. finalize — terminal log_and_complete; passes the LLM step's
        output through verbatim so callers can key on `approved`.
 
@@ -73,7 +77,7 @@ steps:
     rust_function: load_slug_purpose
 
   - name: authorize_question
-    primitive: evaluate
+    primitive: verify
     instruction: $prompts/starter/authorize_question.md
     model_tier: mid
     response_schema:

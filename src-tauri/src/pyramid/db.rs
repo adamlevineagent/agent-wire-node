@@ -25252,7 +25252,11 @@ mod phase6b_post_build_tests {
         PathBuf::from(manifest).parent().unwrap().join("chains")
     }
 
-    fn pyramid_state_with_llm_config(
+    // Phase 7d verifier pass: promoted to `pub(super)` so the phase7d test
+    // module can reuse mockito-based library-chain invocation without
+    // duplicating the PyramidState / LlmConfig / provider-registry
+    // scaffolding. Unchanged body.
+    pub(super) fn pyramid_state_with_llm_config(
         conn: Connection,
         config: crate::pyramid::llm::LlmConfig,
     ) -> Arc<crate::pyramid::PyramidState> {
@@ -25308,7 +25312,10 @@ mod phase6b_post_build_tests {
     /// Wire an LlmConfig that routes every call at a mockito HTTP server.
     /// Same shape as phase6's `mocked_llm_config` — inherited verbatim so
     /// library-chain call_sites test with identical provider wiring.
-    async fn mocked_llm_config(base_url: String) -> crate::pyramid::llm::LlmConfig {
+    ///
+    /// Phase 7d verifier pass: promoted to `pub(super)` so the phase7d
+    /// test module can invoke library chains end-to-end through mockito.
+    pub(super) async fn mocked_llm_config(base_url: String) -> crate::pyramid::llm::LlmConfig {
         use crate::pyramid::credentials::CredentialStore;
         use crate::pyramid::dispatch_policy::{
             BuildCoordinationConfig, DispatchPolicy, EscalationConfig, MatchConfig,
@@ -25393,7 +25400,9 @@ mod phase6b_post_build_tests {
         }
     }
 
-    fn openrouter_body(content: &str) -> String {
+    // Phase 7d verifier pass: promoted to `pub(super)` so the phase7d
+    // test module can build identical mock response bodies.
+    pub(super) fn openrouter_body(content: &str) -> String {
         let escaped = serde_json::to_string(content).unwrap();
         format!(
             r#"{{
@@ -30243,7 +30252,13 @@ mod phase7d_post_build_tests {
             .find(|s| s.name == "judge_claim")
             .unwrap();
         assert!(!llm_step.mechanical, "judge_claim must be an LLM step");
-        assert_eq!(llm_step.primitive, "evaluate");
+        // Phase 7d verifier: the judge returns a constrained verdict
+        // shape ({decision: enum, confidence: [0,1]}) — the `verify`
+        // primitive fits the existing evidence_tester convention of
+        // "constrained yes/no-with-evidence". `evaluate` is reserved
+        // for open-ended scoring where the output shape is not known
+        // up front. See starter-evidence-tester.yaml for the precedent.
+        assert_eq!(llm_step.primitive, "verify");
         assert!(
             llm_step.response_schema.is_some(),
             "judge_claim must declare a structured response_schema so \
@@ -30277,7 +30292,11 @@ mod phase7d_post_build_tests {
             .find(|s| s.name == "authorize_question")
             .unwrap();
         assert!(!llm_step.mechanical);
-        assert_eq!(llm_step.primitive, "evaluate");
+        // Phase 7d verifier: `approved` is a strict boolean gate —
+        // `verify` matches the evidence_tester convention. `evaluate`
+        // would be correct if the chain were returning open-ended
+        // quality scoring.
+        assert_eq!(llm_step.primitive, "verify");
         assert!(llm_step.response_schema.is_some());
     }
 
@@ -30883,6 +30902,487 @@ mod phase7d_post_build_tests {
         assert!(
             chain_err.contains("note"),
             "error chain must name the missing field: {chain_err}"
+        );
+    }
+
+    // ── 7d verifier target 1 + 9: `call_starter_chain` invocation tests ──
+    //
+    // The 7c-bundled tests above exercise mechanical primitives directly via
+    // synthetic 1-step chains — that proves the primitives work, but it does
+    // NOT prove the four 7d chains can actually be invoked end-to-end through
+    // `call_starter_chain` as their YAML descriptions claim
+    // ("callable-on-demand library chain today"). These two tests close the
+    // gap:
+    //   - `starter-judge` via mocked LLM — the only 7d LLM chain we can
+    //     driver-pull through the full mechanical → LLM → mechanical path
+    //     with a deterministic mockito response.
+    //   - `starter-sweep` mechanical-only — no LLM, so the whole chain runs
+    //     against in-memory SQLite and asserts the final output carries the
+    //     aggregate sweep result passthrough.
+    // The authorize_question + accretion_handler chains share the same LLM
+    // dispatch + threading contract as judge; their mechanical primitives
+    // have their own tests above. Adding duplicate end-to-end tests for them
+    // would be redundant — the round-trip behaviour is covered by judge.
+
+    #[tokio::test]
+    async fn starter_judge_callable_via_call_starter_chain_with_mock_llm() {
+        // Parent chain has one mechanical step: `call_starter_chain` invoking
+        // starter-judge with a synthetic claim + criteria input. The judge
+        // chain's LLM step hits the mocked OpenRouter endpoint. Final output
+        // of the parent chain is the sub-chain's parsed LLM JSON verbatim.
+        let _lock = test_lock();
+        let mut server = mockito::Server::new_async().await;
+        let mock_content = r#"{
+            "decision": "accept",
+            "confidence": 0.82,
+            "reasoning": "Claim is well-formed and criteria are met."
+        }"#;
+        let _m = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(super::phase6b_post_build_tests::openrouter_body(
+                mock_content,
+            ))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let conn = fresh_db();
+        create_slug(&conn, "p7d_j_call", &ContentType::Code, "/tmp/p7d_j_call").unwrap();
+        let config = super::phase6b_post_build_tests::mocked_llm_config(server.url()).await;
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn, config,
+        );
+
+        // Parent chain: one mechanical step invoking starter-judge.
+        let parent_step = ChainStep {
+            name: "invoke_judge".into(),
+            primitive: "custom".into(),
+            mechanical: true,
+            rust_function: Some("call_starter_chain".into()),
+            input: Some(json!({
+                "chain_id": "starter-judge",
+                "input": {
+                    "claim": "The compute market separates pricing from routing.",
+                    "context": "Rotator arm + walker loop carry different concerns.",
+                    "criteria": "Architecture separation is clean."
+                }
+            })),
+            ..Default::default()
+        };
+        let parent = ChainDefinition {
+            schema_version: 1,
+            id: "p7d-judge-parent".into(),
+            name: "Phase 7d judge invocation parent".into(),
+            description: "round-trip starter-judge via call_starter_chain".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "phase7d-verifier".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".into(),
+            },
+            steps: vec![parent_step],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+
+        let out = chain_executor::execute_chain_for_target(
+            &state,
+            &parent,
+            "p7d_j_call",
+            None,
+            json!({}),
+        )
+        .await
+        .expect("parent chain invoking starter-judge via call_starter_chain must succeed");
+
+        // Parent's final output is the sub-chain's final LLM passthrough.
+        assert_eq!(
+            out["decision"].as_str(),
+            Some("accept"),
+            "sub-chain LLM output must thread as parent's final value: {out}"
+        );
+        assert_eq!(out["confidence"].as_f64(), Some(0.82));
+        assert!(
+            out["reasoning"]
+                .as_str()
+                .map(|s| s.contains("criteria"))
+                .unwrap_or(false),
+            "reasoning string must passthrough verbatim from the mock"
+        );
+
+        // The judge's mechanical `emit_judge_invoked` trace must be in the
+        // chronicle — confirms the mechanical step ran and wasn't silently
+        // skipped by a threading bug.
+        let writer = state.writer.lock().await;
+        let judge_events: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE slug = 'p7d_j_call' AND event_type = 'judge_invoked'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            judge_events, 1,
+            "starter-judge must emit exactly one judge_invoked event per invocation",
+        );
+    }
+
+    #[tokio::test]
+    async fn starter_sweep_callable_via_call_starter_chain_mechanical_only() {
+        // No LLM. Parent chain invokes starter-sweep via call_starter_chain.
+        // The sweep chain runs all four mechanical steps against in-memory
+        // SQLite and the parent sees the final passthrough as output.
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7d_sw_call", &ContentType::Code, "/tmp/p7d_sw_call").unwrap();
+        // Seed one old failed work item so count_stale_failed has a row to
+        // count at stale_days=1.
+        conn.execute(
+            "INSERT INTO dadbear_work_items
+                (id, slug, batch_id, epoch_id, step_name, primitive,
+                 layer, target_id, system_prompt, user_prompt, model_tier,
+                 result_json, observation_event_ids, compiled_at,
+                 state, state_changed_at)
+             VALUES ('wi-old', 'p7d_sw_call', 'b1', 'e1', 'test', 'noop',
+                     0, 'tgt', '', '', 'mid', '{}', '[]',
+                     datetime('now', '-5 days'),
+                     'failed',
+                     datetime('now', '-5 days'))",
+            [],
+        )
+        .unwrap();
+
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        let parent_step = ChainStep {
+            name: "invoke_sweep".into(),
+            primitive: "custom".into(),
+            mechanical: true,
+            rust_function: Some("call_starter_chain".into()),
+            input: Some(json!({
+                "chain_id": "starter-sweep",
+                "input": {
+                    "slug": "p7d_sw_call",
+                    "stale_days": 1,
+                }
+            })),
+            ..Default::default()
+        };
+        let parent = ChainDefinition {
+            schema_version: 1,
+            id: "p7d-sweep-parent".into(),
+            name: "Phase 7d sweep invocation parent".into(),
+            description: "round-trip starter-sweep via call_starter_chain".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "phase7d-verifier".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".into(),
+            },
+            steps: vec![parent_step],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+
+        let out = chain_executor::execute_chain_for_target(
+            &state,
+            &parent,
+            "p7d_sw_call",
+            None,
+            json!({}),
+        )
+        .await
+        .expect("parent chain invoking starter-sweep via call_starter_chain must succeed");
+
+        // Aggregate result: both the stale count (from count_stale_failed)
+        // and the vocab counts (from reindex_vocab_cache) thread through to
+        // the final passthrough.
+        assert_eq!(
+            out["stale_failed_count"].as_i64(),
+            Some(1),
+            "count_stale_failed_work_items must thread into sweep's final output: {out}"
+        );
+        let vc = out["vocab_counts"]
+            .as_object()
+            .expect("vocab_counts must thread into sweep's final output");
+        assert!(vc.contains_key("annotation_type"));
+        assert!(vc.contains_key("node_shape"));
+        assert!(vc.contains_key("role_name"));
+
+        // Chronicle: sweep_invoked + sweep_stale_failed_counted +
+        // sweep_vocab_reindexed all land on the chain slug.
+        let writer = state.writer.lock().await;
+        for event_type in &[
+            "sweep_invoked",
+            "sweep_stale_failed_counted",
+            "sweep_vocab_reindexed",
+        ] {
+            let count: i64 = writer
+                .query_row(
+                    "SELECT COUNT(*) FROM dadbear_observation_events
+                      WHERE slug = 'p7d_sw_call' AND event_type = ?1",
+                    rusqlite::params![event_type],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "starter-sweep via call_starter_chain must emit {} exactly once",
+                event_type,
+            );
+        }
+    }
+
+    // ── 7d verifier target 7 (Pillar 37): missing window_n / stale_days raises ──
+
+    #[tokio::test]
+    async fn accretion_load_recent_raises_loudly_when_window_n_missing() {
+        // feedback_pillar37_no_hedging: the window_n default used to be
+        // baked into Rust as 20; it now loud-raises when absent so the
+        // number lives in caller YAML / chain input. This test verifies
+        // the loud-raise instead of silently defaulting.
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7d_wn", &ContentType::Code, "/tmp/p7d_wn").unwrap();
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7d-wn-missing".into(),
+            name: "Phase 7d window_n loud-raise".into(),
+            description: "loud-raise on missing window_n".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "phase7d-verifier".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "abort".into(),
+            },
+            steps: vec![ChainStep {
+                name: "load_recent".into(),
+                primitive: "custom".into(),
+                mechanical: true,
+                rust_function: Some("load_recent_annotations_for_slug".into()),
+                ..Default::default()
+            }],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+
+        let err = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7d_wn",
+            None,
+            json!({ "slug": "p7d_wn" }),
+        )
+        .await
+        .expect_err("missing window_n must raise (no silent default — Pillar 37)");
+        let chain_err = format!("{err:#}");
+        assert!(
+            chain_err.contains("window_n"),
+            "error must name the missing field: {chain_err}"
+        );
+        assert!(
+            chain_err.contains("Pillar 37")
+                || chain_err.contains("feedback_pillar37"),
+            "error must cite Pillar 37 so operators know why the default was removed: {chain_err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_count_raises_loudly_when_stale_days_missing() {
+        // Mirror test for stale_days. Operators define what counts as
+        // stale; the dispatch code does not.
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7d_sd", &ContentType::Code, "/tmp/p7d_sd").unwrap();
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7d-sd-missing".into(),
+            name: "Phase 7d stale_days loud-raise".into(),
+            description: "loud-raise on missing stale_days".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "phase7d-verifier".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "abort".into(),
+            },
+            steps: vec![ChainStep {
+                name: "count".into(),
+                primitive: "custom".into(),
+                mechanical: true,
+                rust_function: Some("count_stale_failed_work_items".into()),
+                ..Default::default()
+            }],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+
+        let err = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7d_sd",
+            None,
+            json!({ "slug": "p7d_sd" }),
+        )
+        .await
+        .expect_err("missing stale_days must raise (operators define stale, not dispatch)");
+        let chain_err = format!("{err:#}");
+        assert!(
+            chain_err.contains("stale_days"),
+            "error must name the missing field: {chain_err}"
+        );
+    }
+
+    // ── 7d verifier target 10: emit_accretion_written stamps accretion_cursor ──
+
+    #[tokio::test]
+    async fn accretion_written_stamps_accretion_cursor_in_metadata() {
+        // When emit_accretion_written runs after load_recent_annotations_for_slug,
+        // the load step's max_annotation_id threads into the event metadata
+        // as `accretion_cursor` — a chronicle-reconstructible cursor so the
+        // duplicate-processing limitation is observable (not hidden) until
+        // Phase 9 ships atomic cursor updates. feedback_loud_deferrals.
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7d_cur", &ContentType::Code, "/tmp/p7d_cur").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('node-cur', 'p7d_cur', 0, 'node', 'distilled', '', 1)",
+            [],
+        )
+        .unwrap();
+        let mut max_id: i64 = 0;
+        for i in 0..3 {
+            let ann = PyramidAnnotation {
+                id: 0,
+                slug: "p7d_cur".into(),
+                node_id: "node-cur".into(),
+                annotation_type: AnnotationType::new("observation"),
+                content: format!("obs #{i}"),
+                question_context: None,
+                author: "tester".into(),
+                created_at: String::new(),
+            };
+            let saved = save_annotation(&conn, &ann).unwrap();
+            max_id = saved.id;
+        }
+
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        // Parent chain with two mechanical steps: load the annotations
+        // window, then emit accretion_written with a synthetic note. The
+        // load step's max_annotation_id must thread into the emit step's
+        // metadata as accretion_cursor.
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7d-cursor-chain".into(),
+            name: "Phase 7d accretion_cursor threading".into(),
+            description: "load then emit; verify cursor in metadata".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "phase7d-verifier".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "abort".into(),
+            },
+            steps: vec![
+                ChainStep {
+                    name: "load".into(),
+                    primitive: "custom".into(),
+                    mechanical: true,
+                    rust_function: Some("load_recent_annotations_for_slug".into()),
+                    ..Default::default()
+                },
+                // Inject a synthetic `note` field — the step.input in the
+                // starter runner replaces the threaded envelope, so we
+                // must carry max_annotation_id forward explicitly. We
+                // use a second mechanical step that reads from threaded
+                // output and preserves it — since step.input on the
+                // starter runner is a literal replacement, the simplest
+                // shape is to omit step.input and let threading carry
+                // max_annotation_id + note through. We thread note
+                // through via the initial chain input (see caller below)
+                // and the load step's preserve-by-default threading
+                // copies it forward alongside max_annotation_id.
+                ChainStep {
+                    name: "write".into(),
+                    primitive: "custom".into(),
+                    mechanical: true,
+                    rust_function: Some("emit_accretion_written".into()),
+                    ..Default::default()
+                },
+            ],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+
+        // Initial input carries `note` and `window_n` — threading preserves
+        // note across the load step (which doesn't consume it) so the write
+        // step sees both accretion fields without needing step.input.
+        let _out = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7d_cur",
+            None,
+            json!({
+                "slug": "p7d_cur",
+                "window_n": 3,
+                "note": "Synthetic accretion note for cursor test",
+                "references": [max_id],
+            }),
+        )
+        .await
+        .expect("load → emit_accretion_written chain must run");
+
+        let writer = state.writer.lock().await;
+        let (_count, meta): (i64, String) = writer
+            .query_row(
+                "SELECT COUNT(*), MAX(metadata_json) FROM dadbear_observation_events
+                  WHERE slug = 'p7d_cur' AND event_type = 'accretion_written'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        assert_eq!(
+            parsed["accretion_cursor"].as_i64(),
+            Some(max_id),
+            "accretion_cursor must carry the max annotation id the load \
+             step saw, so Phase 9 wiring can reconstruct a cursor from \
+             the chronicle without a schema migration. Got metadata: {meta}"
         );
     }
 }

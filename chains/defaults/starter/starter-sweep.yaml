@@ -26,8 +26,15 @@ description: >
 
       {
         "slug":          "<pyramid slug>",
-        "stale_days":    <optional int — age threshold for "stale failed",
-                          default 30>
+        "stale_days":    <int — REQUIRED age threshold for
+                          "stale failed". Operators define what
+                          counts as stale; baking a default into
+                          Rust was a soft Pillar 37 violation so
+                          the dispatch primitive loud-raises when
+                          this field is absent. Phase 9 cron /
+                          schedule wiring sets the operator-level
+                          default; per-slug superseding chains
+                          encode their own value in YAML.>
       }
 
   Steps:

@@ -3534,12 +3534,31 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
             //
             // `window_n` is the hard cap on how many rows the LLM sees
             // — it protects the prompt from runaway token spend on a
-            // slug with thousands of annotations. Default 20 matches
-            // the chain's documented input envelope default.
+            // slug with thousands of annotations. It shapes LLM input,
+            // so per `feedback_pillar37_no_hedging` the number MUST
+            // live in the caller's envelope (YAML step.input / chain
+            // caller) rather than be baked into Rust. We loud-raise
+            // when absent instead of defaulting silently.
+            //
+            // Phase 7d verifier fix (Pillar 37): was `unwrap_or(20)`
+            // which smuggled a token-budget knob into Rust. The 7d
+            // trigger wiring (Phase 9) is expected to pass `window_n`
+            // at its call site; when operators supersede the
+            // accretion_handler binding to a specialized chain, that
+            // chain's YAML encodes its own window.
             let window_n = input
                 .get("window_n")
                 .and_then(|v| v.as_i64())
-                .unwrap_or(20)
+                .ok_or_else(|| anyhow!(
+                    "load_recent_annotations_for_slug: required field \
+                     `window_n` is missing from the input envelope. \
+                     Pass it from the caller (e.g. \
+                     `call_starter_chain` input: {{ window_n: N }}) or \
+                     from the chain-level initial input — baking a \
+                     default into Rust would violate Pillar 37 \
+                     (feedback_pillar37_no_hedging), since window_n \
+                     shapes the LLM synthesis prompt's token budget."
+                ))?
                 .max(1);
             let node_id_filter = input
                 .get("node_id")
@@ -3636,11 +3655,30 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 (p.purpose_text, anns, total)
             };
 
+            // Phase 7d verifier fix: compute the maximum annotation id
+            // in the loaded window so `emit_accretion_written` can
+            // stamp it as an `accretion_cursor` marker in the event
+            // metadata. No DB-backed cursor exists today (Phase 9
+            // decides cursor schema + atomic update semantics — see
+            // the chain YAML's trigger-investigation block), so until
+            // then repeated invocations reprocess the same annotations
+            // and emit duplicate accretion notes. Stamping the cursor
+            // value on the event gives operators (and future Phase 9
+            // wiring) the data needed to reconstruct a cursor from the
+            // chronicle without adding a schema migration in 7d.
+            // feedback_loud_deferrals: the limitation is now visible
+            // in the event stream, not hidden behind a stub.
+            let max_annotation_id: Option<i64> = annotations
+                .iter()
+                .filter_map(|a| a.get("id").and_then(|v| v.as_i64()))
+                .max();
+
             info!(
-                "[mechanical] load_recent_annotations_for_slug slug={} loaded={} total={} node_id_filter={:?}",
+                "[mechanical] load_recent_annotations_for_slug slug={} loaded={} total={} max_id={:?} node_id_filter={:?}",
                 slug_for_load,
                 annotations.len(),
                 total_count,
+                max_annotation_id,
                 node_id_filter,
             );
 
@@ -3664,6 +3702,12 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
             out.insert(
                 "annotation_count".to_string(),
                 Value::from(total_count),
+            );
+            out.insert(
+                "max_annotation_id".to_string(),
+                max_annotation_id
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
             );
             Ok(Value::Object(out))
         }
@@ -3701,9 +3745,27 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 .unwrap_or_else(|| ctx.slug.clone());
             let node_id = input.get("node_id").and_then(|v| v.as_str());
 
+            // Phase 7d verifier fix (target 10): carry the maximum
+            // annotation id from the preceding load step as a cursor
+            // candidate. The 7d MVP has no DB-backed cursor (Phase 9
+            // decides schema + atomic update ordering), so repeated
+            // invocations reprocess the same annotations and produce
+            // duplicate accretion notes. Stamping the cursor on the
+            // event gives Phase 9 wiring a chronicle-reconstructible
+            // path to pick up where the last run left off. Null when
+            // the load step produced zero annotations or when a caller
+            // invokes `emit_accretion_written` without threading the
+            // load-step output through (tested in
+            // `starter_accretion_emit_written_raises_on_missing_note`).
+            let accretion_cursor = input
+                .get("max_annotation_id")
+                .cloned()
+                .unwrap_or(Value::Null);
+
             let meta = serde_json::json!({
                 "note": note,
                 "references": references,
+                "accretion_cursor": accretion_cursor,
             });
             let metadata_json = serde_json::to_string(&meta)?;
 
@@ -3796,10 +3858,26 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
             // feedback_no_deferral_creep: this measurement IS the
             // MVP deliverable, not a stub — a number is real
             // operator signal.
+            //
+            // Phase 7d verifier fix (Pillar 37 adjacent): stale_days
+            // is a policy knob — "what counts as stale?" — that
+            // different operators will disagree on. Baking 30 into
+            // Rust was a soft Pillar 37 violation; even though
+            // stale_days doesn't shape an LLM prompt (mechanical-only
+            // count), the principle is the same: the caller's YAML
+            // carries the policy, not the dispatch code. Loud-raise
+            // when absent.
             let stale_days = input
                 .get("stale_days")
                 .and_then(|v| v.as_i64())
-                .unwrap_or(30)
+                .ok_or_else(|| anyhow!(
+                    "count_stale_failed_work_items: required field \
+                     `stale_days` is missing from the input envelope. \
+                     Pass it from the caller (e.g. chain-level \
+                     initial input or a `call_starter_chain` input \
+                     envelope with {{ stale_days: N }}). Operators \
+                     define `stale' — the dispatch code does not."
+                ))?
                 .max(0);
             let slug_for_count = input
                 .get("slug")
