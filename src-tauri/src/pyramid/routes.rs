@@ -481,6 +481,30 @@ struct CreateSlugBody {
     source_path: String,
     #[serde(default)]
     referenced_slugs: Option<Vec<String>>,
+    /// Phase 9b-4: for `ContentType::Question` slugs, the natural-
+    /// language question text (optional — preserves backward compat
+    /// with pre-9b callers that only sent `slug` + `content_type`).
+    /// When present AND content_type == Question, the slug creation
+    /// path invokes the authorize_question chain and only persists
+    /// on approval. When absent for Question slugs, slug creation
+    /// proceeds ungated (legacy behavior).
+    #[serde(default)]
+    question: Option<String>,
+    /// Phase 9b-4: author credit carried into the authorize_question
+    /// chain's metadata + into the approved-question annotation.
+    #[serde(default)]
+    author: Option<String>,
+}
+
+/// Phase 9b-4: `POST /pyramid/:slug/propose_question` body.
+#[derive(Deserialize)]
+struct ProposeQuestionBody {
+    /// Free-text question proposed against the slug's purpose.
+    question: String,
+    /// Optional author credit — recorded on the resulting Question
+    /// slug / annotation.
+    #[serde(default)]
+    author: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2781,10 +2805,27 @@ pub fn pyramid_routes(
 
     let top34 = top33.or(vocab_registry).unify().boxed();
 
+    // ── Post-build accretion v5 Phase 9b-4: authorize_question route ──
+    //
+    // POST /pyramid/:slug/propose_question — gate a proposed question
+    // through the slug's authorize_question chain binding, then persist
+    // the approval decision + create a child Question slug on accept.
+    // Local-only auth (this is a mutation).
+    let propose_question = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("propose_question"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json::<ProposeQuestionBody>())
+        .and_then(handle_propose_question));
+
+    let top35 = top34.or(propose_question).unify().boxed();
+
     // public_html is now mounted separately at the server level so it can
     // get a permissive CORS filter (the desktop API allowlist would block
     // form POSTs from the tunnel host).
-    top34
+    top35
 }
 
 /// GET /vocabulary/:vocab_kind — public read of the vocabulary
@@ -2829,6 +2870,273 @@ pub fn public_html_routes(
     crate::pyramid::public_html::routes(state, jwt_public_key)
 }
 
+// ── Phase 9b-4: authorize_question shared helper ────────────────────
+
+/// Result of running the authorize_question chain.
+#[derive(Debug, Clone)]
+pub struct AuthorizeQuestionDecision {
+    pub approved: bool,
+    pub reasoning: String,
+    pub alternative_question_suggestion: Option<String>,
+}
+
+/// Shared helper: resolve the slug's `authorize_question` role
+/// binding, load the bound chain, and run it against the proposed
+/// question. Returns the chain's `{approved, reasoning,
+/// alternative_question_suggestion}` decoded into
+/// `AuthorizeQuestionDecision`.
+///
+/// Callers:
+///   - `handle_propose_question` — direct HTTP route (9b-4).
+///   - `handle_create_slug` for `ContentType::Question` — ingress
+///     gate on slug creation when the caller supplies a `question`
+///     field in the create body.
+///
+/// Any of:
+///   - unresolved binding
+///   - chain load failure
+///   - chain execution failure
+///   - malformed chain output (missing `approved`)
+/// become an `Err(anyhow)` and the HTTP layer maps that to 500.
+/// `feedback_loud_deferrals`: we do NOT silently fall through to
+/// an "approved by default" path when the chain can't run — the
+/// gate must be live.
+pub async fn run_authorize_question_chain(
+    state: &Arc<PyramidState>,
+    slug: &str,
+    question: &str,
+    author: Option<&str>,
+) -> anyhow::Result<AuthorizeQuestionDecision> {
+    // Resolve the slug's authorize_question binding — raises
+    // UnresolvedBinding if the slug has no active binding, which
+    // shouldn't happen for a v5 slug (genesis seed fires at
+    // create_slug time).
+    let chain_id = {
+        let conn = state.reader.lock().await;
+        super::role_binding::resolve_binding(&conn, slug, "authorize_question")?
+            .handler_chain_id
+    };
+
+    let chain = super::chain_loader::load_chain_by_id(&chain_id, &state.chains_dir)?;
+
+    let inputs = serde_json::json!({
+        "slug": slug,
+        "question": question,
+        "author": author,
+    });
+    let result = super::chain_executor::execute_chain_for_target(
+        state, &chain, slug, None, inputs,
+    )
+    .await?;
+
+    // Chain's final step is `log_and_complete` which passes the
+    // preceding `authorize_question` LLM step's output through
+    // verbatim. Expected shape:
+    //   {approved, reasoning, alternative_question_suggestion}
+    let approved = result
+        .get("approved")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "authorize_question chain '{chain_id}' for slug '{slug}' returned no \
+                 `approved` boolean — malformed output; refusing to gate"
+            )
+        })?;
+    let reasoning = result
+        .get("reasoning")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let alternative_question_suggestion = result
+        .get("alternative_question_suggestion")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    Ok(AuthorizeQuestionDecision {
+        approved,
+        reasoning,
+        alternative_question_suggestion,
+    })
+}
+
+/// Phase 9b-4: `POST /pyramid/:slug/propose_question`.
+///
+/// Runs the slug's authorize_question chain against the proposed
+/// question text. On approval:
+///   - Creates a `ContentType::Question` child slug referencing
+///     the parent slug (slug id derived from the question text).
+///   - Persists the question text as an annotation on the new
+///     child slug's L0 seed node (no L0 exists yet, so the
+///     annotation is node-less; the accretion / build pass picks
+///     it up on the next cycle).
+///   - Returns 200 + the new child slug id + the chain's reasoning.
+///
+/// On rejection: returns 400 + the reasoning + the chain's
+/// `alternative_question_suggestion` if any.
+async fn handle_propose_question(
+    slug_name: String,
+    state: Arc<PyramidState>,
+    body: ProposeQuestionBody,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Validate parent slug exists.
+    {
+        let conn = state.reader.lock().await;
+        match db::get_slug(&conn, &slug_name) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("slug '{slug_name}' not found"),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+    }
+
+    if body.question.trim().is_empty() {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "question must not be empty",
+        ));
+    }
+
+    // Gate through authorize_question chain.
+    let decision = match run_authorize_question_chain(
+        &state,
+        &slug_name,
+        &body.question,
+        body.author.as_deref(),
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("authorize_question chain failed: {e}"),
+            ));
+        }
+    };
+
+    if !decision.approved {
+        let payload = serde_json::json!({
+            "approved": false,
+            "reasoning": decision.reasoning,
+            "alternative_question_suggestion": decision.alternative_question_suggestion,
+        });
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&payload),
+            warp::http::StatusCode::BAD_REQUEST,
+        )
+        .into_response());
+    }
+
+    // Approved: create a Question-typed child slug. The slug id is
+    // derived by hashing the question text so repeat proposals land
+    // on the same slug (idempotency) without surfacing collisions.
+    let child_slug_id = {
+        let mut hasher = sha2::Sha256::new();
+        use sha2::Digest;
+        hasher.update(body.question.as_bytes());
+        hasher.update(b":");
+        hasher.update(slug_name.as_bytes());
+        let digest = hasher.finalize();
+        format!("q-{}", hex::encode(&digest[..8]))
+    };
+
+    let new_slug_info = {
+        let conn = state.writer.lock().await;
+        let create_result = slug::create_slug(
+            &conn,
+            &child_slug_id,
+            &ContentType::Question,
+            "",  // source_path — Question slugs don't have a filesystem source
+        );
+        match create_result {
+            Ok(info) => {
+                // Save the parent slug as a referenced slug so the
+                // question build knows which substrate to pull from.
+                if let Err(e) = db::save_slug_references(&conn, &info.slug, &[slug_name.clone()]) {
+                    return Ok(json_error(
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("slug created but failed to save references: {e}"),
+                    ));
+                }
+                info
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("already exists") {
+                    // Idempotent repeat proposal — return 200 with
+                    // the existing slug id.
+                    match db::get_slug(&conn, &child_slug_id) {
+                        Ok(Some(existing)) => existing,
+                        _ => {
+                            return Ok(json_error(
+                                warp::http::StatusCode::CONFLICT,
+                                &msg,
+                            ));
+                        }
+                    }
+                } else {
+                    return Ok(json_error(
+                        warp::http::StatusCode::BAD_REQUEST,
+                        &msg,
+                    ));
+                }
+            }
+        }
+    };
+
+    // Persist the question text as an annotation on the parent
+    // slug's root (no specific node_id — captures the proposal
+    // chronicle even before the child slug gets a build).
+    {
+        let conn = state.writer.lock().await;
+        let annotation = PyramidAnnotation {
+            id: 0,
+            slug: slug_name.clone(),
+            node_id: String::new(),
+            annotation_type: AnnotationType::from_db_string("question"),
+            content: body.question.clone(),
+            question_context: Some(child_slug_id.clone()),
+            author: body
+                .author
+                .clone()
+                .unwrap_or_else(|| "authorize_question".into()),
+            created_at: String::new(),
+        };
+        // Best-effort — primary state lives in the new slug +
+        // reference row; losing the annotation breadcrumb shouldn't
+        // fail the proposal.
+        if let Err(e) = db::save_annotation(&conn, &annotation) {
+            tracing::warn!(
+                slug = %slug_name,
+                child = %child_slug_id,
+                error = %e,
+                "propose_question: failed to persist question annotation on parent slug"
+            );
+        }
+    }
+
+    let payload = serde_json::json!({
+        "approved": true,
+        "reasoning": decision.reasoning,
+        "child_slug_id": new_slug_info.slug,
+        "parent_slug": slug_name,
+    });
+    Ok(warp::reply::with_status(
+        warp::reply::json(&payload),
+        warp::http::StatusCode::OK,
+    )
+    .into_response())
+}
+
 // ── Route handlers ──────────────────────────────────────────────────
 
 async fn handle_list_slugs(
@@ -2866,6 +3174,60 @@ async fn handle_create_slug(
     } else {
         vec![]
     };
+
+    // ── Phase 9b-4: authorize_question gate on Question-typed slug creation ──
+    //
+    // When the caller supplies a `question` body field alongside
+    // `content_type=Question`, route the proposal through the parent
+    // slug's authorize_question chain before creating the slug. This
+    // is the second gate (sibling to the dedicated
+    // POST /pyramid/:slug/propose_question route) — whichever
+    // ingress path the caller uses, the chain evaluates the question.
+    // Creation proceeds only on `approved=true`.
+    //
+    // Callers that don't send `question` keep the legacy ungated
+    // behavior (e.g. pre-9b pinning / import flows creating an empty
+    // Question slug to be filled later). That keeps 9b additive.
+    if is_question {
+        if let Some(question_text) = body.question.as_deref() {
+            if question_text.trim().is_empty() {
+                return Ok(json_error(
+                    warp::http::StatusCode::BAD_REQUEST,
+                    "question must not be empty",
+                ));
+            }
+            let parent = &refs[0]; // refs is non-empty by the check above
+            let state_arc = state.clone();
+            let decision = match run_authorize_question_chain(
+                &state_arc,
+                parent,
+                question_text,
+                body.author.as_deref(),
+            )
+            .await
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    return Ok(json_error(
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("authorize_question chain failed: {e}"),
+                    ));
+                }
+            };
+            if !decision.approved {
+                let payload = serde_json::json!({
+                    "approved": false,
+                    "reasoning": decision.reasoning,
+                    "alternative_question_suggestion": decision.alternative_question_suggestion,
+                });
+                return Ok(warp::reply::with_status(
+                    warp::reply::json(&payload),
+                    warp::http::StatusCode::BAD_REQUEST,
+                )
+                .into_response());
+            }
+        }
+    }
 
     let normalized_source_path = match slug::normalize_and_validate_source_path(
         &body.source_path,
