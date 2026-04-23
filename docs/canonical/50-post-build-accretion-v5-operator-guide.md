@@ -197,8 +197,8 @@ One active row, global scope (slug=NULL). Seeded at first boot via `pyramid_sche
 
 | Field | Default | Sane range | Purpose |
 |-------|---------|------------|---------|
-| `accretion_interval_secs` | 1800 (30 min) | 60 – 2592000 (30 days) | Interval between `accretion_tick` emits per active slug. |
-| `sweep_interval_secs` | 21600 (6 h) | 60 – 2592000 | Interval between `sweep_tick` emits per active slug. |
+| `accretion_interval_secs` | 1800 (30 min) | 30 – 2592000 (30 days) | Interval between `accretion_tick` emits per active slug. |
+| `sweep_interval_secs` | 21600 (6 h) | 30 – 2592000 | Interval between `sweep_tick` emits per active slug. |
 | `accretion_threshold` | 50 | 0+ | K: annotations since cursor that triggers an immediate `accretion_threshold_hit`. 0 disables volume path. |
 | `accretion_tick_window_n` | 50 | 1+ | `window_n` stamped into `accretion_tick` metadata; accretion chain uses it as LLM context cap. |
 | `sweep_stale_days` | 7 | 1+ | Failed work items older than this are sweep candidates. |
@@ -220,7 +220,7 @@ pyramid-cli config supersede scheduler_parameters \
 
 The active row is replaced atomically by `supersede_config_contribution` (Phase 0a-1 commit 5: `BEGIN IMMEDIATE` serializes concurrent supersessions).
 
-Clamps: `accretion_interval_secs` and `sweep_interval_secs` are clamped to `[60s, 30d]` at load time with a loud `tracing::warn!` when clamping fires. The scheduler re-reads on every tick, so supersessions land within one period.
+Clamps: `accretion_interval_secs` and `sweep_interval_secs` are clamped to `[30s, 30d]` at load time (`MIN_INTERVAL_SECS` / `MAX_INTERVAL_SECS` in `pyramid_scheduler.rs`) with a loud `tracing::warn!` when clamping fires. The scheduler re-reads on every tick, so supersessions land within one period.
 
 ---
 
@@ -285,12 +285,15 @@ Vocab-only publish gives you "the shape is known"; the Rust deploy gives you "th
 Shipping v5 as-is; none of these block the ship gate. Operator workarounds noted where they exist.
 
 - **`emit_accretion_threshold_hit` called inline in the annotate hook, not batched.** If an operator POSTs N annotations rapidly past K, multiple threshold events emit. The work-item layer de-dups (distinct `step_name` / target), so this is not correctness-breaking — just a chattier event log than v6 will have. No operator workaround needed.
-- **Scheduler intervals clamp to `[60s, 30d]`.** Sub-minute tick cadences are not supported. A v6 item is "sub-minute burst mode for test harnesses."
+- **Scheduler intervals clamp floor is `30s` (not sub-second).** Sub-30s tick cadences are not supported — the floor is a safety guard against a YAML supersession turning the scheduler into a hot loop. A v6 item is "sub-second burst mode for test harnesses."
 - **Starter chains register by string id, not contribution id.** If an operator supersedes a starter chain via a contribution, the in-process `chain_loader` load-by-id still hits the DB-backed row, so supersession works — but a chain id that's gone entirely (no DB row + no seed) raises at first dispatch. Operator workaround: don't delete starter chains; supersede them.
-- **`starter-debate-collapse` + `starter-debate-steward` are separate chains.** A single unified debate chain with a `collapse: true` step was considered but intentionally kept separate because the semantics are opposite (steward appends; collapser finalizes). Merging them in v6 is not on the roadmap; the split is architectural.
 - **Gap nodes don't auto-close on evidence arrival.** `starter-synthesizer` marks covered gaps resolved when the MetaLayer covering them crystallizes (Phase 9b-5). Gaps not covered by a crystallized meta-layer remain open indefinitely. Operator workaround: manually annotate gap target with a resolution note, then mark resolved via `pyramid-cli gaps resolve`.
 - **`debate_reopened` event is log-only at the compiler level.** It maps to no primitive; the guard in `append_annotation_to_debate_node` reads the event directly to bypass the cooldown. A v6 item is "debate_reopened role-dispatches to a `debate-reopen-validator` chain if operators want custom post-reopen logic."
 - **Cross-pyramid cascades are not v5 scope.** An annotation on slug A never triggers work on slug B. Cross-pyramid event routing exists in the router but is not wired to annotation flows.
+
+### Design decisions (not limitations)
+
+- **`starter-debate-collapse` and `starter-debate-steward` are separate chains by design.** A single unified debate chain with a `collapse: true` step was considered but intentionally kept separate because the semantics are opposite (steward appends; collapser finalizes). Merging them would muddy the responsibility boundary; the split is architectural and is NOT scheduled to be merged in any roadmap milestone.
 
 ---
 
