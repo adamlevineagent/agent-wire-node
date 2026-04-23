@@ -44,6 +44,11 @@ use crate::pyramid::Tier1Config;
 )]
 pub fn config_for_model(api_key: &str, model: &str) -> LlmConfig {
     let defaults = Tier1Config::default();
+    // TODO(W3/Phase 1): walker v3 — the three model-id fields written
+    // below retire in W3. This deprecated helper is already flagged
+    // unsafe for production use and only survives for a handful of
+    // isolated unit-test fixtures; W3's field deletion forces rewrite
+    // of those fixtures + deletion of this helper together.
     LlmConfig {
         api_key: api_key.to_string(),
         auth_token: String::new(),

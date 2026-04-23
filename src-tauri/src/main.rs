@@ -3550,6 +3550,12 @@ async fn post_build_seed(
         let cfg = pyramid_state.config.read().await;
         let base_id = format!("stale-{}", slug);
         let with_cache = pyramid_state.attach_cache_access(cfg.clone(), slug, &base_id);
+        // TODO(walker-v3 W3 — Pattern 4): stale-engine bootstrap has no
+        // step_ctx in scope. When W3 deletes config.primary_model, a future
+        // phase must wire DispatchDecision::synthetic_for_preview(slot,
+        // chain, cache) here (or thread a synthetic StepContext through
+        // PyramidStaleEngine::new) so the stale path resolves the model
+        // via walker_provider_openrouter.overrides.model_list.mid[0].
         let model = cfg.primary_model.clone();
         (with_cache, model)
     };
@@ -4228,6 +4234,13 @@ async fn pyramid_ingest(
     }))
 }
 
+// TODO(walker-v3 Phase 6 — Pattern 3): `pyramid_set_config` is config-CRUD
+// IPC that writes operator-selected model slugs into the legacy LlmConfig
+// fields. Phase 6's Settings-UI redesign retires this IPC entirely: the
+// operator edits walker_provider_* contributions via Tools > Create, and
+// DispatchDecision resolves the active model per step. The primary_model /
+// fallback_model_1 / fallback_model_2 parameters (and their writes at
+// ~4251-4259 / 4310-4312 below) all die with this IPC in Phase 6.
 #[tauri::command]
 async fn pyramid_set_config(
     state: tauri::State<'_, SharedState>,
@@ -5016,6 +5029,10 @@ async fn pyramid_meta_run(
         .pyramid
         .llm_config_with_cache(&slug, &format!("meta-{}", slug))
         .await;
+    // TODO(walker-v3 W3 — Pattern 4): IPC `pyramid_meta_run` has no
+    // step_ctx. When W3 drops config.primary_model, a future phase must
+    // build a synthetic StepContext (via DispatchDecision::synthetic_for_preview)
+    // so meta passes resolve via walker_provider_openrouter.overrides.model_list.mid[0].
     let model = base_config.primary_model.clone();
 
     let reader = state.pyramid.reader.clone();
@@ -5911,6 +5928,14 @@ async fn pyramid_get_config(
         .and_then(|v| v["auto_execute"].as_bool())
         .unwrap_or(false);
 
+    // TODO(walker-v3 W3 — Pattern 2): `pyramid_get_config` surfaces the
+    // legacy LlmConfig fields to the Settings UI for display-only. When W3
+    // deletes these fields, this endpoint should either (a) synthesize the
+    // values from load_active_config_contribution(walker_provider_openrouter)
+    // .overrides.model_list (primary = mid[0], fallback_1 = cheap[0],
+    // fallback_2 = mid.get(1)), or (b) be deleted in favor of a new
+    // pyramid_get_walker_providers IPC that returns the contributions
+    // directly.
     Ok(serde_json::json!({
         "api_key_set": !config.api_key.is_empty(),
         "auth_token_set": !config.auth_token.is_empty(),
@@ -5997,6 +6022,12 @@ async fn pyramid_apply_profile(
     let previous_live = live.clone();
     *live = new_llm.with_runtime_overlays_from(&previous_live);
 
+    // TODO(walker-v3 W3 — Pattern 2): tracing log reads legacy LlmConfig
+    // fields for operator visibility. When W3 deletes the fields, this
+    // log should pull from load_active_config_contribution(walker_provider_openrouter)
+    // .overrides.model_list (mid / cheap / mid[1]) or be dropped. Note that
+    // pyramid_apply_profile itself may also retire in Phase 6 once profiles
+    // become walker_provider_* contribution overlays.
     tracing::info!(
         profile = %profile,
         primary = %live.primary_model,
@@ -6646,6 +6677,12 @@ async fn ensure_dadbear_running(
         let with_cache = state
             .pyramid
             .attach_cache_access(cfg.clone(), slug, &stale_build_id);
+        // TODO(walker-v3 W3 — Pattern 4): `ensure_dadbear_running` bootstraps
+        // the stale engine outside any chain step. When W3 deletes
+        // config.primary_model, a future phase must resolve the model via
+        // DispatchDecision::synthetic_for_preview or by threading a synthetic
+        // StepContext into PyramidStaleEngine::new (see also the sibling
+        // site in the other DADBEAR bootstrap ~line 3553).
         let model = cfg.primary_model.clone();
         let defer = cfg.dispatch_policy
             .as_ref()
@@ -8228,6 +8265,10 @@ async fn pyramid_faq_directory(
         .pyramid
         .llm_config_with_cache(&slug, &format!("faq-dir-{}", slug))
         .await;
+    // TODO(walker-v3 W3 — Pattern 4): IPC `pyramid_faq_directory` has no
+    // step_ctx. When W3 deletes config.primary_model, resolve via
+    // DispatchDecision::synthetic_for_preview(Slot::mid, chain, cache) or
+    // a synthetic StepContext threaded into get_faq_directory.
     let model = base_config.primary_model.clone();
 
     let directory = pyramid_faq::get_faq_directory(

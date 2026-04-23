@@ -11594,7 +11594,7 @@ async fn execute_ir_single(
     // grace period.
     if let Some(ref response) = llm_response {
         let model =
-            chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config);
+            chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config, None);
         let _ = exec_state
             .log_cost_synchronous(
                 step_name,
@@ -11614,7 +11614,7 @@ async fn execute_ir_single(
 
     // Save step record
     let output_json = serde_json::to_string(&output).unwrap_or_default();
-    let model = chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config);
+    let model = chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config, None);
     exec_state
         .send_save_step(
             step_name,
@@ -11804,7 +11804,7 @@ async fn execute_ir_parallel_foreach(
         let reader = exec_state.reader.clone();
         let step_name_owned = step_name.to_string();
         let model =
-            chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config);
+            chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config, None);
         let item_clone = item.clone();
         let mut ctx_snapshot = build_chain_context_from_execution_state(exec_state);
         ctx_snapshot.current_item = Some(item_clone.clone());
@@ -12097,6 +12097,7 @@ async fn execute_ir_sequential_foreach(
                     let model = chain_dispatch::resolve_ir_model(
                         &step.model_requirements,
                         &dispatch_ctx.config,
+                        None,
                     );
                     let _ = exec_state
                         .log_cost_synchronous(
@@ -12120,6 +12121,7 @@ async fn execute_ir_sequential_foreach(
                 let model = chain_dispatch::resolve_ir_model(
                     &step.model_requirements,
                     &dispatch_ctx.config,
+                    None,
                 );
                 exec_state
                     .send_save_step(
@@ -12520,7 +12522,7 @@ async fn execute_ir_web_edges(
         // Log cost — Phase 11 synchronous path.
         if let Some(ref response) = llm_resp {
             let model =
-                chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config);
+                chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config, None);
             let _ = exec_state
                 .log_cost_synchronous(
                     step_name,
@@ -12565,7 +12567,7 @@ async fn execute_ir_web_edges(
 
     // 7. Save step record (directly, not through write drain)
     let output_json = serde_json::to_string(&output)?;
-    let model = chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config);
+    let model = chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config, None);
     {
         let slug = exec_state.slug.clone();
         let step_name_owned = step_name.to_string();

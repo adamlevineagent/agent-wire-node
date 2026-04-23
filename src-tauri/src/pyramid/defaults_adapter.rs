@@ -674,6 +674,13 @@ mod tests {
 
     /// Return the fallback_model_1 from LlmConfig defaults.
     /// All test chains use this instead of hardcoding "qwen/qwen3.5-flash-02-23".
+    ///
+    /// TODO(W3/Phase 1): walker v3 — `fallback_model_1` is retired with
+    /// the rest of the `primary_model` / `fallback_model_{1,2}` fields.
+    /// Update tests to read a fixed fallback slug string directly (they
+    /// don't need live routing data) or source from a walker-v3 bundled
+    /// seed constant. Left unchanged in W2e to keep the test baseline
+    /// stable; W3 removes the field + this helper together.
     fn test_fallback_model() -> String {
         LlmConfig::default().fallback_model_1
     }

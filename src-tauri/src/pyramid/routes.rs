@@ -552,6 +552,13 @@ struct VineBuildBody {
     evidence_mode: String,
 }
 
+// TODO(walker-v3 Phase 6 — Pattern 3): `ConfigBody` is the POST /pyramid/config
+// HTTP body that mirrors the Tauri `pyramid_set_config` IPC. Phase 6's
+// Settings-UI redesign retires both surfaces: operators edit walker_provider_*
+// contributions via Tools > Create, and DispatchDecision resolves models per
+// step. The primary_model / fallback_model_1 / fallback_model_2 fields (and
+// their writes in handle_config at ~3960-3967 / 3982-3984 below) die with
+// this route in Phase 6.
 #[derive(Deserialize)]
 struct ConfigBody {
     openrouter_api_key: Option<String>,
@@ -3990,6 +3997,11 @@ async fn handle_config(
         }
     }
 
+    // TODO(walker-v3 W3 — Pattern 2): handle_config's response echoes the
+    // legacy LlmConfig fields back to the HTTP caller for display/confirm.
+    // When W3 deletes these fields, echo from the newly-written
+    // walker_provider_openrouter.overrides.model_list instead. Route itself
+    // retires in Phase 6 alongside the ConfigBody struct.
     Ok(json_ok(&serde_json::json!({
         "status": "updated",
         "primary_model": config.primary_model,
@@ -4285,6 +4297,12 @@ async fn handle_annotate(
     let base_config = state
         .llm_config_with_cache(&slug_clone, &annotation_build_id)
         .await;
+    // TODO(walker-v3 W3 — Pattern 4): annotation post-save hook has no
+    // step_ctx (spawned from HTTP annotation POST). When W3 deletes
+    // config.primary_model, a future phase must build a synthetic
+    // StepContext (or call DispatchDecision::synthetic_for_preview) so
+    // process_annotation_hook's delta + faq calls resolve via
+    // walker_provider_openrouter.overrides.model_list.mid[0].
     let model = base_config.primary_model.clone();
     let ops_clone = state.operational.clone();
 
@@ -4641,6 +4659,9 @@ async fn handle_meta_run(
     let base_config = state
         .llm_config_with_cache(&slug_name, &format!("meta-{}", slug_name))
         .await;
+    // TODO(walker-v3 W3 — Pattern 4): HTTP POST /pyramid/:slug/meta has
+    // no step_ctx. When W3 deletes config.primary_model, resolve via
+    // DispatchDecision::synthetic_for_preview or a synthetic StepContext.
     let model = base_config.primary_model.clone();
 
     let reader = state.reader.clone();
@@ -4701,6 +4722,9 @@ async fn handle_match_faq(
     let base_config = state
         .llm_config_with_cache(&slug_name, &format!("faq-match-{}", slug_name))
         .await;
+    // TODO(walker-v3 W3 — Pattern 4): HTTP GET /pyramid/:slug/faq/match
+    // has no step_ctx. When W3 deletes config.primary_model, resolve via
+    // DispatchDecision::synthetic_for_preview or a synthetic StepContext.
     let model = base_config.primary_model.clone();
 
     match faq::match_faq(
@@ -4735,6 +4759,9 @@ async fn handle_faq_directory(
     let base_config = state
         .llm_config_with_cache(&slug_name, &format!("faq-dir-{}", slug_name))
         .await;
+    // TODO(walker-v3 W3 — Pattern 4): HTTP GET /pyramid/:slug/faq/directory
+    // has no step_ctx. When W3 deletes config.primary_model, resolve via
+    // DispatchDecision::synthetic_for_preview or a synthetic StepContext.
     let model = base_config.primary_model.clone();
 
     match faq::get_faq_directory(

@@ -24,7 +24,31 @@ use super::step_context::{compute_prompt_hash, StepContext as CacheStepContext};
 use super::transform_runtime;
 use super::types::{Correction, Decision, PyramidNode, Term, Topic};
 use super::walker_decision::DispatchDecision;
+use super::walker_resolver::ProviderType as WalkerProviderType;
 use super::{OperationalConfig, Tier1Config};
+
+// ── Walker v3 W2b: Decision-aware model read helpers ────────────────────────
+//
+// File-private helper that pulls the first OpenRouter model_list entry
+// from an attached DispatchDecision. Mirrors the private helper in
+// llm.rs (W2a scope) — duplicated here rather than exported because
+// W2a/b run in parallel and can't coordinate on a shared helper
+// location without creating merge seams. Removed in W3 when the
+// Decision becomes the sole source and the legacy fallback expressions
+// go.
+//
+// Callers chain `.unwrap_or_else(|| config.primary_model.clone())` (or
+// fall through to the provider-registry / legacy-match chain) to
+// preserve the Phase 1 legacy fallback — see §6 migration contract.
+
+fn first_openrouter_model_from_decision(
+    decision: Option<&Arc<DispatchDecision>>,
+) -> Option<String> {
+    decision
+        .and_then(|d| d.per_provider.get(&WalkerProviderType::OpenRouter))
+        .and_then(|p| p.model_list.as_ref())
+        .and_then(|ml| ml.first().cloned())
+}
 
 // ── Step context ────────────────────────────────────────────────────────────
 
@@ -327,7 +351,19 @@ pub async fn dispatch_step(
 // ── LLM dispatch ────────────────────────────────────────────────────────────
 
 /// Resolve the model string from step overrides, tier routing, or defaults.
-fn resolve_model(step: &ChainStep, defaults: &ChainDefaults, config: &LlmConfig) -> String {
+///
+/// Walker v3 W2b: priority-2 consults the attached `DispatchDecision`'s
+/// per-provider `model_list[OpenRouter][0]` when one is available; the
+/// provider-registry path drops to priority-3, and the legacy
+/// `match tier => primary_model / fallback_model_{1,2}` stays as the
+/// final fallback for Decision-less call sites (unit tests, bring-up
+/// paths). W3 deletes that legacy match when the struct fields go.
+fn resolve_model(
+    step: &ChainStep,
+    defaults: &ChainDefaults,
+    config: &LlmConfig,
+    dispatch_decision: Option<&Arc<DispatchDecision>>,
+) -> String {
     // Direct model override on step takes highest precedence
     if let Some(ref model) = step.model {
         return model.clone();
@@ -344,7 +380,15 @@ fn resolve_model(step: &ChainStep, defaults: &ChainDefaults, config: &LlmConfig)
         .as_deref()
         .unwrap_or(defaults.model_tier.as_str());
 
-    // Phase 3: consult provider registry tier routing (canonical source)
+    // Walker v3 W2b priority 2: the pre-built DispatchDecision is the
+    // canonical source when present. Built once at the outer dispatch
+    // entry (W1b) and threaded via step_ctx.dispatch_decision.
+    if let Some(model) = first_openrouter_model_from_decision(dispatch_decision) {
+        return model;
+    }
+
+    // Phase 3: consult provider registry tier routing (transitional
+    // fallback when no Decision is attached — e.g. unit tests / bring-up).
     if let Some(ref registry) = config.provider_registry {
         if let Ok(resolved) = registry.resolve_tier(tier, None, None, None) {
             return resolved.tier.model_id;
@@ -352,7 +396,8 @@ fn resolve_model(step: &ChainStep, defaults: &ChainDefaults, config: &LlmConfig)
         warn!("[CHAIN] tier '{}' not in registry, falling back to legacy resolution", tier);
     }
 
-    // Legacy fallback: aliases then hardcoded mapping
+    // Legacy fallback: aliases then hardcoded mapping. W3 removes the
+    // match arms when config.primary_model / fallback_model_{1,2} go.
     if let Some(model) = config.model_aliases.get(tier) {
         return model.clone();
     }
@@ -384,9 +429,6 @@ async fn dispatch_llm(
     ctx: &ChainDispatchContext,
 ) -> Result<Value> {
     let temperature = resolve_temperature(step, defaults);
-    let resolved_model = resolve_model(step, defaults, &ctx.config);
-    let resolved_limit = resolve_context_limit(step, defaults, &ctx.config, &ctx.tier1);
-    let max_tokens: usize = ctx.tier1.ir_max_tokens;
 
     // Walker v3 W1b: build the step's DispatchDecision ONCE at the outer
     // LLM entry. Every CacheStepContext constructed below inherits the
@@ -394,11 +436,19 @@ async fn dispatch_llm(
     // see `build_step_dispatch_decision` for the fallback policy.
     // `slot` mirrors the tier used by cache-site `with_model_resolution`
     // calls so the Decision is keyed to the same scope as the LLM call.
+    //
+    // W2b reorder: built BEFORE resolve_model so the resolver can read
+    // the Decision's OpenRouter model_list as the canonical source.
     let slot = step
         .model_tier
         .clone()
         .unwrap_or_else(|| defaults.model_tier.clone());
     let dispatch_decision = build_step_dispatch_decision(ctx, &slot).await;
+
+    let resolved_model =
+        resolve_model(step, defaults, &ctx.config, dispatch_decision.as_ref());
+    let resolved_limit = resolve_context_limit(step, defaults, &ctx.config, &ctx.tier1);
+    let max_tokens: usize = ctx.tier1.ir_max_tokens;
 
     // Apply model override: if the resolved model differs from the config's
     // primary model, create a modified config so call_model() uses it.
@@ -1208,18 +1258,45 @@ pub fn generate_node_id(pattern: &str, index: usize, depth: Option<i64>) -> Stri
 
 /// Resolve the model string from IR `ModelRequirements` and config.
 ///
-/// Priority:
-/// 1. `reqs.model` — direct model override on the step
-/// 2. `reqs.tier` — mapped through config tiers
-/// 3. Falls back to primary_model when tier is absent or unrecognized
-pub fn resolve_ir_model(reqs: &ModelRequirements, config: &LlmConfig) -> String {
-    // Direct model override takes highest precedence
+/// Priority (Walker v3 W2b):
+/// 1. `reqs.model` — operator-supplied explicit model override
+/// 2. `DispatchDecision.per_provider[OpenRouter].model_list[0]` — the
+///    canonical source when the outer dispatcher has built one
+///    (see §2.9 / §6 Phase 1 migration contract)
+/// 3. `config.provider_registry.resolve_tier(tier)` — transitional
+///    fallback when no Decision is attached (unit tests, bring-up)
+/// 4. Legacy hardcoded `match tier => primary_model / fallback_model_{1,2}`
+///    — final fallback; W3 removes the match when the struct fields go
+///
+/// Callers with a live `DispatchDecision` (the in-file `dispatch_ir_llm`
+/// at the outer dispatch entry) pass `Some(&arc)`; callers in
+/// `chain_executor.rs` (step-output provenance writes, cost-log rows)
+/// don't carry a Decision in scope and pass `None`, which routes them
+/// through the registry → legacy chain.
+pub fn resolve_ir_model(
+    reqs: &ModelRequirements,
+    config: &LlmConfig,
+    dispatch_decision: Option<&Arc<DispatchDecision>>,
+) -> String {
+    // Priority 1: operator-supplied explicit model override.
     if let Some(ref model) = reqs.model {
         return model.clone();
     }
+
+    // Priority 2: the pre-built DispatchDecision is the canonical source
+    // when the outer dispatcher has constructed one. Reads the first
+    // OpenRouter model_list entry — matches
+    // `first_openrouter_model_from_decision` in llm.rs so the dispatch
+    // path and the provenance path agree.
+    if let Some(model) = first_openrouter_model_from_decision(dispatch_decision) {
+        return model;
+    }
+
     let tier = reqs.tier.as_deref().unwrap_or("mid");
 
-    // Phase 3: consult provider registry tier routing (canonical source)
+    // Priority 3: consult provider registry tier routing (transitional
+    // fallback — used by unit tests and bring-up paths where no
+    // DispatchDecision is attached).
     if let Some(ref registry) = config.provider_registry {
         if let Ok(resolved) = registry.resolve_tier(tier, None, None, None) {
             return resolved.tier.model_id;
@@ -1227,6 +1304,8 @@ pub fn resolve_ir_model(reqs: &ModelRequirements, config: &LlmConfig) -> String 
         warn!("[IR] tier '{}' not in registry, falling back to legacy resolution", tier);
     }
 
+    // Priority 4: legacy hardcoded match. W3 deletes these arms when
+    // config.primary_model / fallback_model_{1,2} retire.
     if let Some(model) = config.model_aliases.get(tier) {
         return model.clone();
     }
@@ -1413,22 +1492,30 @@ pub async fn dispatch_ir_llm(
     ctx: &ChainDispatchContext,
 ) -> Result<(Value, LlmResponse)> {
     let temperature = resolve_ir_temperature(&step.model_requirements, &ctx.tier1);
-    let resolved_model = resolve_ir_model(&step.model_requirements, &ctx.config);
-    let resolved_limit =
-        resolve_ir_context_limit(&step.model_requirements, &ctx.config, &ctx.tier1);
-    let max_tokens = resolve_ir_max_tokens(step, &ctx.tier1);
-    let llm_options = resolve_ir_llm_call_options(step, &ctx.tier1);
 
     // Walker v3 W1b: build the step's DispatchDecision ONCE at the outer
     // IR LLM entry. See dispatch_llm for the symmetric wire-in; the same
     // Arc is threaded into every CacheStepContext constructed for this
     // step (structured/retry variants + the standard dispatch ctx).
+    //
+    // W2b reorder: built BEFORE resolve_ir_model so the resolver can
+    // read the Decision's OpenRouter model_list as the canonical source.
     let slot = step
         .model_requirements
         .tier
         .clone()
         .unwrap_or_else(|| "mid".to_string());
     let dispatch_decision = build_step_dispatch_decision(ctx, &slot).await;
+
+    let resolved_model = resolve_ir_model(
+        &step.model_requirements,
+        &ctx.config,
+        dispatch_decision.as_ref(),
+    );
+    let resolved_limit =
+        resolve_ir_context_limit(&step.model_requirements, &ctx.config, &ctx.tier1);
+    let max_tokens = resolve_ir_max_tokens(step, &ctx.tier1);
+    let llm_options = resolve_ir_llm_call_options(step, &ctx.tier1);
 
     // Apply model override: pin ALL model slots (primary + fallback_1 +
     // fallback_2) to the resolved model so cascade stays on the same
@@ -1874,7 +1961,10 @@ mod tests {
             on_error: "retry(2)".into(),
         };
         let config = LlmConfig::default();
-        assert_eq!(resolve_model(&step, &defaults, &config), "custom/model");
+        assert_eq!(
+            resolve_model(&step, &defaults, &config, None),
+            "custom/model"
+        );
     }
 
     #[test]
@@ -1895,19 +1985,19 @@ mod tests {
         let config = LlmConfig::default();
 
         assert_eq!(
-            resolve_model(&make_step("low"), &defaults, &config),
+            resolve_model(&make_step("low"), &defaults, &config, None),
             config.primary_model
         );
         assert_eq!(
-            resolve_model(&make_step("mid"), &defaults, &config),
+            resolve_model(&make_step("mid"), &defaults, &config, None),
             config.primary_model
         );
         assert_eq!(
-            resolve_model(&make_step("high"), &defaults, &config),
+            resolve_model(&make_step("high"), &defaults, &config, None),
             config.fallback_model_1
         );
         assert_eq!(
-            resolve_model(&make_step("max"), &defaults, &config),
+            resolve_model(&make_step("max"), &defaults, &config, None),
             config.fallback_model_2
         );
     }
@@ -1954,7 +2044,7 @@ mod tests {
         };
         let config = LlmConfig::default();
         // Direct model override wins over tier
-        assert_eq!(resolve_ir_model(&reqs, &config), "custom/my-model");
+        assert_eq!(resolve_ir_model(&reqs, &config, None), "custom/my-model");
     }
 
     #[test]
@@ -1968,19 +2058,19 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_ir_model(&make_reqs("low"), &config),
+            resolve_ir_model(&make_reqs("low"), &config, None),
             config.primary_model
         );
         assert_eq!(
-            resolve_ir_model(&make_reqs("mid"), &config),
+            resolve_ir_model(&make_reqs("mid"), &config, None),
             config.primary_model
         );
         assert_eq!(
-            resolve_ir_model(&make_reqs("high"), &config),
+            resolve_ir_model(&make_reqs("high"), &config, None),
             config.fallback_model_1
         );
         assert_eq!(
-            resolve_ir_model(&make_reqs("max"), &config),
+            resolve_ir_model(&make_reqs("max"), &config, None),
             config.fallback_model_2
         );
     }
@@ -1990,7 +2080,7 @@ mod tests {
         // When tier is None, defaults to "mid" → primary_model
         let reqs = ModelRequirements::default();
         let config = LlmConfig::default();
-        assert_eq!(resolve_ir_model(&reqs, &config), config.primary_model);
+        assert_eq!(resolve_ir_model(&reqs, &config, None), config.primary_model);
     }
 
     #[test]
@@ -2002,7 +2092,7 @@ mod tests {
         };
         let config = LlmConfig::default();
         // Unknown tier falls back to primary
-        assert_eq!(resolve_ir_model(&reqs, &config), config.primary_model);
+        assert_eq!(resolve_ir_model(&reqs, &config, None), config.primary_model);
     }
 
     #[test]

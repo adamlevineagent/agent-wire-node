@@ -563,6 +563,13 @@ pub fn make_step_context_from_slug(
 /// routes to. For sites that use `call_model_unified_with_options_and_ctx`
 /// with an explicit tier, the direct construction path
 /// (`StepContext::new` + `with_model_resolution`) remains available.
+///
+/// TODO(W3/Phase 1): walker v3 — `primary_model` is retired in W3 along
+/// with `fallback_model_{1,2}`. This retrofit helper fills a transition
+/// role; callers with a Decision in scope should prefer a direct
+/// construction path that stamps the Decision-resolved model id. This
+/// helper stays behind the field deletion until W3's global rewrite of
+/// caller sites, which is when a Decision-aware replacement lands.
 pub fn make_step_ctx_from_llm_config(
     config: &LlmConfig,
     step_name: &str,

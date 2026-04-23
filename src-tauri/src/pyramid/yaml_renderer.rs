@@ -312,11 +312,11 @@ pub fn resolve_option_source(
 ) -> Result<Vec<OptionValue>> {
     // Handle parameterized `model_list:{provider_id}` form first.
     if let Some(provider_id) = source.strip_prefix("model_list:") {
-        return Ok(resolve_model_list_sync(provider_registry, provider_id));
+        return Ok(resolve_model_list_sync(Some(conn), provider_registry, provider_id));
     }
 
     match source {
-        "tier_registry" => Ok(resolve_tier_registry(provider_registry)),
+        "tier_registry" => Ok(resolve_tier_registry(conn, provider_registry)),
         "provider_list" => Ok(resolve_provider_list(provider_registry)),
         "node_fields" => Ok(resolve_node_fields()),
         "chain_list" => Ok(resolve_chain_list(conn)?),
@@ -348,13 +348,14 @@ pub async fn resolve_model_list_only(
 /// be held across the call. The IPC layer hits
 /// `resolve_model_list_only` separately to refresh the cache.
 fn resolve_model_list_sync(
+    conn: Option<&Connection>,
     provider_registry: &ProviderRegistry,
     provider_id: &str,
 ) -> Vec<OptionValue> {
     if let Some(cached) = lookup_cached_models(provider_id) {
         return cached;
     }
-    resolve_model_list_from_tier_table(provider_registry, provider_id)
+    resolve_model_list_from_tier_table(conn, provider_registry, provider_id)
 }
 
 // ── Phase 18a (L5): Ollama /api/tags resolver + per-provider cache ──────────
@@ -421,11 +422,58 @@ pub fn clear_ollama_tags_cache_for_tests() {
     }
 }
 
-/// `tier_registry` resolver — one entry per tier row with the
-/// provider+model+context_window as metadata. The label is the
-/// tier_name; the description is the human-readable description in
-/// the tier routing table.
-fn resolve_tier_registry(registry: &ProviderRegistry) -> Vec<OptionValue> {
+/// `tier_registry` resolver — one entry per tier name derived from the
+/// walker_* scope chain's declared `model_list` keys (Phase 1 §5.1
+/// migration: `pyramid_tier_routing` table is retired and replaced by
+/// `walker_provider_*` contributions). The label is the tier_name; the
+/// description is synthesized from the walker-declared provider/model
+/// pair for that tier (first provider in call order that declares the
+/// tier wins for display purposes).
+///
+/// Per rev 1.0.2 §5.1 + W2e migration plan: data source switches from
+/// the legacy `pyramid_tier_routing` rows to the walker ScopeChain's
+/// union of `model_list` keys (see `walker_resolver::tier_set_from_chain`).
+/// Rich fields (pricing_json, context_limit, max_completion_tokens) come
+/// from the per-provider `walker_provider_*` overrides at the same tier.
+///
+/// Falls back to the legacy `ProviderRegistry::list_tier_routing()` view
+/// only when the walker scope cache is empty (pre-bootstrap) OR the
+/// connection read fails — preserves UI liveness during first-run migration.
+fn resolve_tier_registry(
+    conn: &Connection,
+    registry: &ProviderRegistry,
+) -> Vec<OptionValue> {
+    // Walker-first: build the scope chain from active walker_* contributions
+    // and derive the tier set + per-tier rich metadata.
+    match crate::pyramid::walker_resolver::build_scope_cache_pair(conn) {
+        Ok(data) => {
+            let chain = &data.chain;
+            let tier_names =
+                crate::pyramid::walker_resolver::tier_set_from_chain(chain);
+            if !tier_names.is_empty() {
+                let mut out: Vec<OptionValue> = tier_names
+                    .into_iter()
+                    .map(|tier| walker_tier_to_option(chain, &tier))
+                    .collect();
+                out.sort_by(|a, b| a.label.cmp(&b.label));
+                return out;
+            }
+            // Empty tier set → fall through to legacy registry view so the
+            // Settings UI still shows something during the first-boot
+            // window before walker_provider_* contributions land.
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "resolve_tier_registry: walker scope cache load failed; \
+                 falling back to legacy pyramid_tier_routing view"
+            );
+        }
+    }
+
+    // Legacy fallback (retired in W3 when the pyramid_tier_routing table
+    // is dropped). TODO(W3): remove this branch once walker_provider_*
+    // seeds ship in the default bundle.
     let mut out: Vec<OptionValue> = registry
         .list_tier_routing()
         .into_iter()
@@ -433,6 +481,106 @@ fn resolve_tier_registry(registry: &ProviderRegistry) -> Vec<OptionValue> {
         .collect();
     out.sort_by(|a, b| a.label.cmp(&b.label));
     out
+}
+
+/// Render a single walker-declared tier as an `OptionValue`. Scans the
+/// chain's call-order providers and provider scopes for the first one
+/// that declares this tier in its `model_list` map, then pulls the rich
+/// metadata (pricing_json, context_limit, max_completion_tokens) off
+/// the same provider. Mirrors the shape previously produced by
+/// `tier_entry_to_option` from a `TierRoutingEntry` row so the frontend
+/// contract is unchanged.
+fn walker_tier_to_option(
+    chain: &crate::pyramid::walker_resolver::ScopeChain,
+    tier: &str,
+) -> OptionValue {
+    use crate::pyramid::walker_resolver::{
+        resolve_context_limit, resolve_max_completion_tokens, resolve_model_list,
+        resolve_pricing_json, ProviderType,
+    };
+
+    // Walk the call order (union of scope 3 then scope 4 provider keys)
+    // so display picks up whichever provider declares this tier first.
+    let mut provider_and_model: Option<(ProviderType, String)> = None;
+    let providers_iter = chain
+        .call_order_provider
+        .keys()
+        .copied()
+        .chain(chain.provider.keys().copied());
+    let mut seen = std::collections::HashSet::new();
+    for pt in providers_iter {
+        if !seen.insert(pt) {
+            continue;
+        }
+        if let Some(list) = resolve_model_list(chain, tier, pt) {
+            if let Some(model_id) = list.first().cloned() {
+                provider_and_model = Some((pt, model_id));
+                break;
+            }
+        }
+    }
+
+    let (provider_id, model_id) = match &provider_and_model {
+        Some((pt, model)) => (pt.as_str().to_string(), model.clone()),
+        None => (String::new(), String::new()),
+    };
+
+    let (prompt_price, completion_price, context_limit, max_completion_tokens) =
+        match provider_and_model.as_ref().map(|(pt, _)| *pt) {
+            Some(pt) => {
+                let pricing_value = resolve_pricing_json(chain, tier, pt);
+                let (pp, cp) = match pricing_value.as_ref() {
+                    Some(v) => (
+                        parse_price_from_walker_json(v, "prompt"),
+                        parse_price_from_walker_json(v, "completion"),
+                    ),
+                    None => (None, None),
+                };
+                (
+                    pp,
+                    cp,
+                    resolve_context_limit(chain, tier, pt),
+                    resolve_max_completion_tokens(chain, tier, pt),
+                )
+            }
+            None => (None, None, None, None),
+        };
+
+    let description = if !model_id.is_empty() && !provider_id.is_empty() {
+        Some(format!("{} via {}", model_id, provider_id))
+    } else {
+        None
+    };
+
+    let meta = serde_json::json!({
+        "provider_id": provider_id,
+        "model_id": model_id,
+        "context_limit": context_limit,
+        "max_completion_tokens": max_completion_tokens,
+        "prompt_price_per_token": prompt_price,
+        "completion_price_per_token": completion_price,
+    });
+
+    OptionValue {
+        value: tier.to_string(),
+        label: tier.to_string(),
+        description,
+        meta: Some(meta),
+    }
+}
+
+/// Parse an OpenRouter-shaped pricing field (`"prompt"` / `"completion"`)
+/// from the walker `pricing_json` blob. Pricing is stored as a
+/// string-encoded decimal (e.g. `"0.0000015"`) per §5.1. Returns `None`
+/// on missing or unparseable field.
+fn parse_price_from_walker_json(
+    value: &serde_json::Value,
+    field: &str,
+) -> Option<f64> {
+    value
+        .get(field)
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
 }
 
 /// Convert a `TierRoutingEntry` into an `OptionValue`. Exposes the
@@ -524,7 +672,12 @@ async fn resolve_model_list_for(
                     // Cache an empty list briefly so we don't spin on
                     // a misconfigured base_url.
                     store_cached_models(provider_id, Vec::new());
-                    return resolve_model_list_from_tier_table(registry, provider_id);
+                    // TODO(W2c/W3): async callers from main.rs don't thread
+                    // a `&Connection`. Until W2c updates the caller or a
+                    // global ArcSwap<ScopeCache> handle lands, this branch
+                    // falls back to the legacy registry view. Safe because
+                    // Ollama probe failure is already a degraded path.
+                    return resolve_model_list_from_tier_table(None, registry, provider_id);
                 }
             };
 
@@ -561,15 +714,77 @@ async fn resolve_model_list_for(
 
     // Non-Ollama path: the Phase 8 view, returning what's already
     // configured in tier_routing for this provider.
-    resolve_model_list_from_tier_table(registry, provider_id)
+    // TODO(W2c/W3): async caller doesn't thread a `&Connection`; the
+    // walker-data-first path inside `resolve_model_list_from_tier_table`
+    // activates only when the sync caller (`resolve_option_source`) runs.
+    resolve_model_list_from_tier_table(None, registry, provider_id)
 }
 
-/// Phase 8 fallback: build a model list from tier routing rows. Used
-/// for non-Ollama providers and when the Ollama probe fails.
+/// Phase 8 fallback: build a model list for `provider_id` by enumerating
+/// the walker scope chain's `model_list` overrides (Phase 1 §5.1
+/// migration). The walker-first path activates when a `&Connection` is
+/// available (sync caller via `resolve_option_source`). Async callers
+/// (`resolve_model_list_for` in the Ollama-fallback branches) pass
+/// `None` and fall back to the legacy `ProviderRegistry::list_tier_routing()`
+/// view — retired in W3 when the table is dropped.
 fn resolve_model_list_from_tier_table(
+    conn: Option<&Connection>,
     registry: &ProviderRegistry,
     provider_id: &str,
 ) -> Vec<OptionValue> {
+    // Walker-first: derive (model_id, tier, per-tier metadata) from the
+    // scope chain for the matching ProviderType. `provider_id` from the
+    // frontend maps to ProviderType::as_str() (e.g. "openrouter", "local").
+    if let Some(conn) = conn {
+        if let Some(pt) = provider_type_from_id(provider_id) {
+            if let Ok(data) = crate::pyramid::walker_resolver::build_scope_cache_pair(conn) {
+                let chain = &data.chain;
+                let tier_names =
+                    crate::pyramid::walker_resolver::tier_set_from_chain(chain);
+                let mut out: Vec<OptionValue> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for tier in &tier_names {
+                    let Some(list) =
+                        crate::pyramid::walker_resolver::resolve_model_list(chain, tier, pt)
+                    else {
+                        continue;
+                    };
+                    let context_limit =
+                        crate::pyramid::walker_resolver::resolve_context_limit(
+                            chain, tier, pt,
+                        );
+                    let max_completion_tokens =
+                        crate::pyramid::walker_resolver::resolve_max_completion_tokens(
+                            chain, tier, pt,
+                        );
+                    for model_id in list {
+                        if !seen.insert(model_id.clone()) {
+                            continue;
+                        }
+                        out.push(OptionValue {
+                            value: model_id.clone(),
+                            label: model_id.clone(),
+                            description: context_limit
+                                .map(|n| format!("context: {n} tokens")),
+                            meta: Some(serde_json::json!({
+                                "provider_id": provider_id,
+                                "context_limit": context_limit,
+                                "max_completion_tokens": max_completion_tokens,
+                            })),
+                        });
+                    }
+                }
+                if !out.is_empty() {
+                    out.sort_by(|a, b| a.label.cmp(&b.label));
+                    return out;
+                }
+                // Empty walker result → fall through to legacy view so
+                // pre-bootstrap UI still shows options.
+            }
+        }
+    }
+
+    // Legacy fallback (retired in W3).
     let mut out: Vec<OptionValue> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for entry in registry.list_tier_routing() {
@@ -596,6 +811,25 @@ fn resolve_model_list_from_tier_table(
     }
     out.sort_by(|a, b| a.label.cmp(&b.label));
     out
+}
+
+/// Map a UI provider_id string onto a walker `ProviderType`. The four
+/// walker provider types use `ProviderType::as_str()` values
+/// (`"local"`, `"openrouter"`, `"fleet"`, `"market"`). Returns `None` for
+/// legacy provider ids that don't map to a walker variant — callers then
+/// fall back to the registry view. Ollama-shaped `ProviderType::OpenaiCompat`
+/// rows route through the Ollama-tags path above and never reach here.
+fn provider_type_from_id(
+    provider_id: &str,
+) -> Option<crate::pyramid::walker_resolver::ProviderType> {
+    use crate::pyramid::walker_resolver::ProviderType;
+    match provider_id {
+        "local" => Some(ProviderType::Local),
+        "openrouter" => Some(ProviderType::OpenRouter),
+        "fleet" => Some(ProviderType::Fleet),
+        "market" => Some(ProviderType::Market),
+        _ => None,
+    }
 }
 
 /// `node_fields` resolver — static list of top-level pyramid node
@@ -738,6 +972,23 @@ fn resolve_prompt_files(conn: &Connection) -> Result<Vec<OptionValue>> {
 /// Cost data lives on the tier routing rows (not the provider rows)
 /// because one provider can serve multiple models at different
 /// prices.
+///
+/// TODO(W2c/W3/Phase 1): walker v3 — pricing lives on walker_provider_*
+/// overrides (see `walker_resolver::resolve_pricing_json`). This pub fn
+/// is called from main.rs (W2c-owned) with only `&ProviderRegistry` in
+/// scope; no `&Connection` to build the scope cache and no global
+/// ArcSwap<ScopeCache> handle on the registry. Two viable upgrades,
+/// both out of scope for W2e:
+///
+///   a. W2c can update the Tauri command (`yaml_renderer_estimate_cost`)
+///      to take a `&Connection` from SharedState and thread it through.
+///   b. W3 can augment `ProviderRegistry` with an ArcSwap handle at
+///      construction so all three yaml_renderer callers share one source
+///      of truth without a signature churn.
+///
+/// Until then, this branch keeps the legacy `pyramid_tier_routing` read
+/// path. Acceptable because the table is still populated at W2e time;
+/// migration is a W3 responsibility together with field/table deletion.
 pub fn estimate_cost(
     provider_registry: &ProviderRegistry,
     provider_id: &str,

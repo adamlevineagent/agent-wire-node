@@ -293,6 +293,11 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
                 Some(batch_idx as i64),
                 ca.db_path.to_string(),
             )
+            // TODO(W3/Phase 1): walker v3 — primary_model field is retired
+            // in W3. Cache-key model id should come from the Decision's
+            // resolved model for the "fast_extract" slot. These entry
+            // points don't receive a step_ctx from an outer chain; resolve
+            // in W3 when the field deletion forces a rewrite.
             .with_model_resolution("fast_extract", llm_config.primary_model.clone())
             .with_prompt_hash(compute_prompt_hash(&system_prompt));
             if let Some(bus) = &ca.bus {
@@ -994,6 +999,11 @@ Respond with ONLY a JSON object:
                 Some(batch_idx as i64),
                 ca.db_path.to_string(),
             )
+            // TODO(W3/Phase 1): walker v3 — primary_model field is retired
+            // in W3. Cache-key model id should come from the Decision's
+            // resolved model for the "fast_extract" slot. These entry
+            // points don't receive a step_ctx from an outer chain; resolve
+            // in W3 when the field deletion forces a rewrite.
             .with_model_resolution("fast_extract", llm_config.primary_model.clone())
             .with_prompt_hash(compute_prompt_hash(&system_prompt));
             if let Some(bus) = &ca.bus {
@@ -1465,6 +1475,8 @@ Respond with ONLY a JSON object:
             None,
             ca.db_path.to_string(),
         )
+        // TODO(W3/Phase 1): walker v3 — see sibling TODO in this file at
+        // line ~296; primary_model retires in W3.
         .with_model_resolution("fast_extract", llm_config.primary_model.clone())
         .with_prompt_hash(compute_prompt_hash(&merge_system));
         if let Some(bus) = &ca.bus {
@@ -1681,6 +1693,11 @@ Respond with ONLY a JSON object:
                 None,
                 ca.db_path.to_string(),
             )
+            // TODO(W3/Phase 1): walker v3 — primary_model field is retired
+            // in W3. Cache-key model id should come from the Decision's
+            // resolved model for the "fast_extract" slot. These entry
+            // points don't receive a step_ctx from an outer chain; resolve
+            // in W3 when the field deletion forces a rewrite.
             .with_model_resolution("fast_extract", llm_config.primary_model.clone())
             .with_prompt_hash(compute_prompt_hash(&system_prompt));
             if let Some(bus) = &ca.bus {

@@ -159,6 +159,9 @@ Analyze this material and produce the characterization."#,
             let provider_id = resolved.provider.id.clone();
             let context_limit = resolved.tier.context_limit;
             let mut cloned = llm_config.clone();
+            // TODO(W3/Phase 1): walker v3 — `primary_model` field goes away
+            // when W3 removes the fallback. Keep the overwrite for now to
+            // satisfy the LlmConfig struct contract the field still enforces.
             cloned.primary_model = model_id.clone();
             if let Some(ctx_limit) = context_limit {
                 cloned.primary_context_limit = ctx_limit;
@@ -166,6 +169,13 @@ Analyze this material and produce the characterization."#,
             ("max", model_id, Some(provider_id), cloned)
         }
         None => {
+            // TODO(W3/Phase 1): walker v3 — replace with a synthetic Decision
+            // for the "max" slot built via
+            // `DispatchDecision::synthetic_for_preview`. This is a top-level
+            // entry point that has no step_ctx from an outer chain, and the
+            // provider_registry path above is the primary path today. The
+            // `primary_model` fallback read here exists as a last-resort
+            // bridge; W3 removes the field + this branch together.
             warn!(
                 "characterize: provider registry unavailable — falling back to \
                  llm_config.primary_model='{}' (declared intent was max-tier). \
