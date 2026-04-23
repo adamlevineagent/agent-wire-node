@@ -550,56 +550,14 @@ pub fn make_step_context_from_slug(
     ctx
 }
 
-/// W3c variant: explicitly thread the model slug used for this call,
-/// replacing the deleted `config.primary_model` read. Maintenance
-/// subsystem callers that used to clone LlmConfig via
-/// `clone_with_model_override(model)` now pass the model directly.
-/// When `model` is None, the cache row's model_resolution is stamped
-/// with `<unknown>` with a tracing warn — it's a provenance field, so
-/// dispatch doesn't depend on it.
-pub fn make_step_ctx_from_llm_config_with_model(
-    config: &LlmConfig,
-    step_name: &str,
-    primitive: &str,
-    depth: i64,
-    chunk_index: Option<i64>,
-    system_prompt: &str,
-    model: Option<&str>,
-) -> Option<StepContext> {
-    let cache = config.cache_access.as_ref()?;
-    if system_prompt.is_empty() {
-        return None;
-    }
-    let prompt_hash = compute_prompt_hash(system_prompt);
-    let resolved_model = model.map(|s| s.to_string()).unwrap_or_else(|| {
-        tracing::warn!(
-            event = "make_step_ctx_model_unknown",
-            step = %step_name,
-            "walker-v3: no model slug provided for cache model_resolution stamp; using '<unknown>'",
-        );
-        "<unknown>".to_string()
-    });
-    let mut ctx = StepContext::new(
-        cache.slug.clone(),
-        cache.build_id.clone(),
-        step_name.to_string(),
-        primitive.to_string(),
-        depth,
-        chunk_index,
-        cache.db_path.to_string(),
-    )
-    .with_model_resolution("primary", resolved_model)
-    .with_prompt_hash(prompt_hash);
-    if let Some(bus) = &cache.bus {
-        ctx = ctx.with_bus(bus.clone());
-    }
-    // Populate chain context from CacheAccess when present.
-    if let Some(ref cn) = cache.chain_name {
-        let ct = cache.content_type.as_deref().unwrap_or("");
-        ctx = ctx.with_chain_context(cn.clone(), ct.to_string());
-    }
-    Some(ctx)
-}
+// walker-v3-completion Wave 6: deleted `make_step_ctx_from_llm_config_with_model`
+// — the W3c workaround that hardcoded slot="primary" so
+// `with_dispatch_decision_if_available` early-returned. All 22 former
+// callers (faq/delta/meta/webbing/stale_helpers) migrated to the
+// canonical `make_step_ctx_from_llm_config` below in Wave 4. The
+// canonical constructor attaches Decision via
+// `with_dispatch_decision_if_available` so walker v3's full cascade
+// (Market/Fleet/OpenRouter/Local) routes correctly.
 
 /// Canonical StepContext constructor for LLM dispatch. Always attaches
 /// a runtime DispatchDecision from the DB via `with_dispatch_decision_if_available`
