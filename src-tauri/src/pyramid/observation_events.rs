@@ -61,6 +61,15 @@ use rusqlite::Connection;
 ///                  | "sweep_vocab_reindexed"          // v5 Phase 7d: sweep vocab cache refresh
 ///                  | "vocabulary_published"          // v5 6c-A: vocab entry publish
 ///                  | "vocabulary_superseded"         // v5 6c-A: vocab entry supersede
+///                  | "node_re_distilled"             // v5 Phase 8-2: supervisor re_distill arm
+///                                                     //                 successfully updated a node's
+///                                                     //                 distilled/headline/topics via
+///                                                     //                 execute_supersession. Chronicle
+///                                                     //                 breadcrumb for the original-bug
+///                                                     //                 fix path:
+///                                                     //                 annotation → cascade_handler →
+///                                                     //                 queue_re_distill → supervisor →
+///                                                     //                 execute_supersession → this.
 /// - `source_path`: filesystem path for the observation source (NULL for internal events)
 /// - `file_path`: filesystem path of the affected file (NULL for internal events)
 /// - `content_hash`: SHA-256 of new content (NULL for deletes/internal)

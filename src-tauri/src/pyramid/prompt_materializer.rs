@@ -98,6 +98,24 @@ pub fn materialize_prompt(
         ("log_only", _) => Ok(MaterializeResult::Mechanical {
             reason: "log_only is chronicle-only — no LLM call needed".into(),
         }),
+        // v5 Phase 8-2: re_distill work items are queued by the cascade
+        // chain's queue_re_distill_for_target mechanical step. They flow
+        // through the supervisor's apply_mechanical_primitive re_distill
+        // arm which delegates to execute_supersession (that helper runs
+        // its own LLM call internally via generate_change_manifest). No
+        // outer prompt is needed — returning Mechanical keeps the item
+        // off the compute queue so execute_supersession can handle end-
+        // to-end supersession (change_manifest LLM call + pyramid_nodes
+        // UPDATE + build_version bump + node_re_distilled chronicle).
+        //
+        // Pre-Phase-8 this primitive fell through to the unknown-primitive
+        // placeholder arm, dispatched a garbage "[Unknown primitive
+        // 're_distill' at L{layer}...]" prompt, and the default apply
+        // arm marked it applied:re_distill without doing anything. That
+        // was THE original DADBEAR non-firing bug.
+        ("re_distill", _) => Ok(MaterializeResult::Mechanical {
+            reason: "re_distill delegates to execute_supersession — LLM call is internal".into(),
+        }),
         ("rename_candidate", _) => {
             // Look up the observation event's metadata_json to get old_path/new_path.
             let detail_json = observation_event_ids_json

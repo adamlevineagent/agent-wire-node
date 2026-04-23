@@ -221,6 +221,15 @@ pub(crate) fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, 
         "sweep_vocab_reindexed" => {
             Some(("log_only", "sweep_vocab_reindexed_log", "stale_remote"))
         }
+        // v5 Phase 8-2: supervisor emits node_re_distilled after
+        // execute_supersession successfully updates pyramid_nodes for a
+        // re_distill work item. Pure observability — the mutation has
+        // already happened on the node row; the event is the chronicle
+        // breadcrumb that closes the annotation → cascade → re_distill
+        // loop for operators. No downstream work.
+        "node_re_distilled" => {
+            Some(("log_only", "node_redistilled_log", "stale_remote"))
+        }
         unknown => {
             // Per v5 R5 loud-raise discipline: opt-in strict mode for
             // production. Default warn-and-skip preserves backward compat

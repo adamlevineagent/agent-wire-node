@@ -740,6 +740,181 @@ impl DadbearSupervisor {
                 .context("spawn_blocking join error for log_only apply")??;
                 return Ok(());
             }
+            // v5 Phase 8-2: THE original DADBEAR non-firing bug fix.
+            //
+            // Flow: annotation_written → (8-1) role_bound cascade_handler →
+            // starter-cascade-immediate-redistill OR starter-cascade-judge-gated
+            // → queue_re_distill_for_target mechanical enqueues a work item with
+            // primitive=re_distill → supervisor finds it → prompt_materializer
+            // returns Mechanical → we land here.
+            //
+            // Actually RE-DISTILL the node by delegating to execute_supersession,
+            // which loads node context (distilled + topics + children + evidence),
+            // generates a change_manifest via the LLM, validates, then UPDATEs
+            // pyramid_nodes.distilled / headline / topics / build_version in
+            // place. This is the same call path stale_check takes when the
+            // judge says "stale"; it is already battle-tested and preserves
+            // node identity (no new node id, viz DAG coherence intact).
+            //
+            // Pre-Phase-8 behavior: re_distill fell through to the supervisor
+            // default arm ("applied:re_distill") — marked complete without
+            // touching the node. Annotations landed but the pyramid never
+            // reflected them. Killing that silent no-op is the mission of
+            // this phase.
+            "re_distill" => {
+                if target_id.is_empty() {
+                    tracing::warn!(
+                        slug = %slug,
+                        work_item_id = %item.id,
+                        "re_distill: missing target_id, cannot re-distill"
+                    );
+                    let db_path_rd = db_path.clone();
+                    let wi_id_rd = wi_id.clone();
+                    let slug_rd = slug.clone();
+                    let event_bus_rd = event_bus.clone();
+                    tokio::task::spawn_blocking(move || -> Result<()> {
+                        let conn = Connection::open(&db_path_rd)?;
+                        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                        conn.execute(
+                            "UPDATE dadbear_work_items
+                             SET state = 'failed',
+                                 state_changed_at = ?1
+                             WHERE id = ?2 AND state = 'previewed'",
+                            params![now, wi_id_rd],
+                        )?;
+                        emit_state_changed(&event_bus_rd, &slug_rd, &wi_id_rd, "previewed", "failed");
+                        Ok(())
+                    })
+                    .await
+                    .context("spawn_blocking join error for re_distill target-missing fail")??;
+                    return Ok(());
+                }
+
+                let config = self.pyramid_state.config.read().await.clone();
+                let model = item
+                    .resolved_model_id
+                    .as_deref()
+                    .unwrap_or(&item.model_tier);
+
+                let supersession_result = crate::pyramid::stale_helpers_upper::execute_supersession(
+                    &target_id,
+                    &db_path,
+                    &slug,
+                    &config,
+                    model,
+                )
+                .await;
+
+                match supersession_result {
+                    Ok(new_canonical_id) => {
+                        info!(
+                            work_item_id = %item.id,
+                            target_id = %target_id,
+                            new_canonical_id = %new_canonical_id,
+                            slug = %slug,
+                            "DADBEAR supervisor: re_distill complete via execute_supersession"
+                        );
+
+                        // CAS previewed → applied + emit node_re_distilled
+                        // chronicle breadcrumb + result_applications row.
+                        let db_path_rd = db_path.clone();
+                        let wi_id_rd = wi_id.clone();
+                        let slug_rd = slug.clone();
+                        let target_id_rd = target_id.clone();
+                        let event_bus_rd = event_bus.clone();
+                        let primitive_rd = primitive.clone();
+                        let layer_rd = item.layer;
+                        tokio::task::spawn_blocking(move || -> Result<()> {
+                            let conn = Connection::open(&db_path_rd)?;
+                            let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                            conn.execute(
+                                "UPDATE dadbear_work_items
+                                 SET state = 'applied',
+                                     state_changed_at = ?1,
+                                     applied_at = ?1
+                                 WHERE id = ?2 AND state = 'previewed'",
+                                params![now, wi_id_rd],
+                            )?;
+                            emit_state_changed(
+                                &event_bus_rd, &slug_rd, &wi_id_rd, "previewed", "applied",
+                            );
+
+                            conn.execute(
+                                "INSERT OR IGNORE INTO dadbear_result_applications
+                                 (work_item_id, slug, target_id, action, applied_at)
+                                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                                params![
+                                    wi_id_rd,
+                                    slug_rd,
+                                    target_id_rd,
+                                    format!("re_distilled:{}", new_canonical_id),
+                                    now,
+                                ],
+                            )?;
+
+                            // Chronicle breadcrumb for the original-bug fix.
+                            let metadata = serde_json::json!({
+                                "triggering_work_item_id": wi_id_rd,
+                                "source_primitive": primitive_rd,
+                                "new_canonical_id": new_canonical_id,
+                            })
+                            .to_string();
+                            let _ = observation_events::write_observation_event(
+                                &conn,
+                                &slug_rd,
+                                "dadbear",
+                                "node_re_distilled",
+                                None, None, None, None,
+                                Some(&target_id_rd),
+                                Some(layer_rd),
+                                Some(&metadata),
+                            );
+                            Ok(())
+                        })
+                        .await
+                        .context("spawn_blocking join error for re_distill apply")??;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!(
+                            work_item_id = %item.id,
+                            target_id = %target_id,
+                            error = %e,
+                            slug = %slug,
+                            "DADBEAR supervisor: re_distill via execute_supersession failed"
+                        );
+                        // CAS previewed → failed so we don't spin on this
+                        // row every tick. execute_supersession already
+                        // persists a failed-manifest oversight row when
+                        // the LLM call produces unusable output.
+                        let db_path_rd = db_path.clone();
+                        let wi_id_rd = wi_id.clone();
+                        let slug_rd = slug.clone();
+                        let event_bus_rd = event_bus.clone();
+                        tokio::task::spawn_blocking(move || -> Result<()> {
+                            let conn = Connection::open(&db_path_rd)?;
+                            let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                            conn.execute(
+                                "UPDATE dadbear_work_items
+                                 SET state = 'failed',
+                                     state_changed_at = ?1
+                                 WHERE id = ?2 AND state = 'previewed'",
+                                params![now, wi_id_rd],
+                            )?;
+                            emit_state_changed(
+                                &event_bus_rd, &slug_rd, &wi_id_rd, "previewed", "failed",
+                            );
+                            Ok(())
+                        })
+                        .await
+                        .context("spawn_blocking join error for re_distill fail")??;
+                        return Err(e.context(format!(
+                            "re_distill via execute_supersession failed for target '{}' in slug '{}'",
+                            target_id, slug,
+                        )));
+                    }
+                }
+            }
             // Post-build accretion v5 Phase 3 (WS3-C): role_bound dispatch.
             // The compiler stamps resolved_chain_id onto the work_item when
             // map_event_to_primitive returns "role_bound" for this event_type.
@@ -1276,9 +1451,26 @@ impl DadbearSupervisor {
                     }
                 }
                 _ => {
-                    // Other primitives (edge_check, connection_check, faq_redistill, etc.)
-                    // — log and mark applied. TODO: wire up specific application logic.
-                    action = format!("applied:{}", primitive);
+                    // v5 Phase 8-2 — loud-deferral discipline. Historically
+                    // this arm silently marked `applied:{primitive}` without
+                    // applying anything. Per feedback_loud_deferrals, name
+                    // the no-op so operators see the deferral in the result
+                    // row instead of it blending in with genuinely-applied
+                    // rows. `re_distill` specifically used to land here
+                    // before it got its own mechanical path above — if any
+                    // legacy work item produced in a pre-Phase-8 build
+                    // reaches this arm, the action string makes that
+                    // visible to audits.
+                    tracing::warn!(
+                        work_item_id = %work_item_id,
+                        primitive = %primitive,
+                        target_id = %target_id,
+                        "DADBEAR supervisor: apply_result has no arm for primitive — \
+                         marking deferred_no_op (no mutation applied). If this is a \
+                         re_distill row, it was compiled under pre-Phase-8 code; \
+                         the Phase 8-2 arm handles fresh rows via apply_mechanical_primitive."
+                    );
+                    action = format!("deferred_no_op:{}", primitive);
                 }
             }
         }
