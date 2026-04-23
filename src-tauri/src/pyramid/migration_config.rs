@@ -52,7 +52,7 @@ use crate::pyramid::event_bus::{BuildEventBus, TaggedBuildEvent, TaggedKind};
 use crate::pyramid::llm::{call_model_unified_with_options_and_ctx, LlmCallOptions, LlmConfig};
 use crate::pyramid::provider::ProviderRegistry;
 use crate::pyramid::schema_registry::SchemaRegistry;
-use crate::pyramid::step_context::{compute_prompt_hash, StepContext};
+use crate::pyramid::step_context::make_step_ctx_from_llm_config;
 use crate::pyramid::wire_native_metadata::{default_wire_native_metadata, WireMaturity};
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -582,25 +582,31 @@ pub async fn run_migration_llm_call(
         }
     };
 
+    // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
     let build_id = format!("migrate-{}", uuid::Uuid::new_v4());
-    let prompt_hash = compute_prompt_hash(&inputs.skill_body);
-    let ctx = StepContext::new(
+    let scoped_config = llm_config.clone_with_cache_access(
         inputs
             .flagged_contribution
             .slug
             .as_deref()
-            .unwrap_or("global"),
+            .unwrap_or("global")
+            .to_string(),
         build_id.clone(),
+        std::sync::Arc::<str>::from(db_path.to_string()),
+        Some(bus.clone()),
+    );
+    let ctx = make_step_ctx_from_llm_config(
+        &scoped_config,
         "migrate_config",
         "config_migration",
         0,
         None,
-        db_path,
+        &inputs.skill_body,
+        tier,
+        Some(&model_id),
+        Some(&provider_id),
     )
-    .with_model_resolution(tier, model_id)
-    .with_provider(provider_id)
-    .with_prompt_hash(prompt_hash)
-    .with_bus(bus.clone());
+    .await;
 
     debug!(
         contribution_id = %inputs.flagged_contribution.contribution_id,
@@ -610,8 +616,8 @@ pub async fn run_migration_llm_call(
     );
 
     let response = call_model_unified_with_options_and_ctx(
-        llm_config,
-        Some(&ctx),
+        &scoped_config,
+        ctx.as_ref(),
         "You are a configuration migrator for Wire Node.",
         &prompt_body,
         0.2,

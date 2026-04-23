@@ -35,7 +35,9 @@ use serde_json::Value;
 use super::db;
 use super::event_bus::{BuildEventBus, TaggedBuildEvent, TaggedKind};
 use super::llm::{call_model_unified_with_options_and_ctx, LlmCallOptions, LlmConfig, LlmResponse};
-use super::step_context::{CacheEntry, CachedStepOutput, StepContext};
+use super::step_context::{
+    with_dispatch_decision_if_available, CacheEntry, CachedStepOutput, StepContext,
+};
 
 // ── IPC contract types ─────────────────────────────────────────────
 
@@ -151,6 +153,14 @@ pub async fn reroll_node(
     //     cache_key and served the pre-reroll content.
     // The fix routes the DB write manually so the new row occupies
     // prior.cache_key with a proper supersedes_cache_id link.
+    // walker-v3-completion Wave 3 exception: reroll intentionally bypasses
+    // the cache-aware path (empty prompt_hash → cache_is_usable() = false)
+    // so the manual supersession below lands at the prior cache_key. The
+    // canonical make_step_ctx_from_llm_config always computes prompt_hash
+    // from system_prompt, which would defeat this. Manual StepContext::new
+    // with explicit with_dispatch_decision_if_available is the canonical
+    // pattern for this edge case — Decision is still attached for the
+    // walker's full cascade; only the cache is bypassed.
     let build_id = format!("reroll-{}-{}", slug, chrono::Utc::now().timestamp());
     let ctx = StepContext::new(
         slug.clone(),
@@ -168,6 +178,7 @@ pub async fn reroll_node(
     .with_model_resolution("reroll", prior.model_id.clone())
     .with_bus(bus.clone())
     .with_force_fresh(input.force_fresh);
+    let ctx = with_dispatch_decision_if_available(ctx).await;
     // Deliberately NOT calling `.with_prompt_hash(...)` — leaving
     // `prompt_hash = ""` flips `cache_is_usable()` to false.
     debug_assert!(

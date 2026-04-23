@@ -56,7 +56,7 @@ use crate::pyramid::event_bus::BuildEventBus;
 use crate::pyramid::llm::{call_model_unified_with_options_and_ctx, LlmCallOptions, LlmConfig};
 use crate::pyramid::provider::ProviderRegistry;
 use crate::pyramid::schema_registry::{ConfigSchemaSummary, SchemaRegistry};
-use crate::pyramid::step_context::{compute_prompt_hash, StepContext};
+use crate::pyramid::step_context::make_step_ctx_from_llm_config;
 use crate::pyramid::wire_native_metadata::{default_wire_native_metadata, WireMaturity};
 
 // ── Response types ──────────────────────────────────────────────────
@@ -249,20 +249,25 @@ async fn call_generation_llm(
         }
     };
 
-    let prompt_hash = compute_prompt_hash(params.skill_body);
-    let ctx = StepContext::new(
-        params.slug.unwrap_or("global"),
+    // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+    let scoped_config = llm_config.clone_with_cache_access(
+        params.slug.unwrap_or("global").to_string(),
         params.build_id.clone(),
+        std::sync::Arc::<str>::from(db_path.to_string()),
+        Some(bus.clone()),
+    );
+    let ctx = make_step_ctx_from_llm_config(
+        &scoped_config,
         params.step_name,
         params.primitive,
         0,
         None,
-        db_path,
+        params.skill_body,
+        tier,
+        Some(&model_id),
+        Some(&provider_id),
     )
-    .with_model_resolution(tier, model_id)
-    .with_provider(provider_id)
-    .with_prompt_hash(prompt_hash)
-    .with_bus(bus.clone());
+    .await;
 
     debug!(
         schema_type = params.schema_type,
@@ -278,8 +283,8 @@ async fn call_generation_llm(
     // effective max tokens from the model's context window minus
     // input).
     let response = call_model_unified_with_options_and_ctx(
-        llm_config,
-        Some(&ctx),
+        &scoped_config,
+        ctx.as_ref(),
         "You are a configuration generator for Wire Node.",
         &prompt_body,
         0.2,
