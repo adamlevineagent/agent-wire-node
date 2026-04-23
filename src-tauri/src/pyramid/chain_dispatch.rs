@@ -2020,12 +2020,16 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 })
                 .unwrap_or_default();
 
-            // Resolve purpose_text via the slug's active purpose (not the
-            // input's purpose_question — purpose_question IS the purpose
-            // text today, but we separate the two fields so Phase 8+ can
-            // split the operator's declaration from a decomposed-question
-            // prompt without a schema change).
-            let (purpose_text, max_depth) = {
+            // Resolve purpose_text + purpose_id via the slug's active
+            // purpose. Audit pass note: purpose_id is carried through
+            // the synthesizer chain as an echo-passthrough field so the
+            // create_meta_layer_node writer can pin provenance to the
+            // purpose that drove THIS synthesis (and not whatever is
+            // active by the time the writer runs). This read happens
+            // once here at the top of the synthesizer chain; every
+            // downstream step (LLM echo + writer) keys off the value
+            // captured right here.
+            let (purpose_text, purpose_id, max_depth) = {
                 let conn_guard = ctx.db_reader.lock().await;
                 let p = super::purpose::load_or_create_purpose(&conn_guard, &ctx.slug)?;
                 // Find the max depth across covered substrate nodes while
@@ -2040,7 +2044,7 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                         }
                     }
                 }
-                (p.purpose_text, max_depth)
+                (p.purpose_text, p.id, max_depth)
             };
 
             // Load each covered node's (distilled, topics) projection.
@@ -2116,6 +2120,12 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 Value::String(purpose_question),
             );
             out.insert("purpose_text".to_string(), Value::String(purpose_text));
+            // Audit pass: also emit purpose_id so the LLM step's echo
+            // contract can pass it through to create_meta_layer_node.
+            // Without this value in the envelope, the LLM has nothing to
+            // echo and the writer's loud-raise on missing purpose_id
+            // would fire on every real run.
+            out.insert("purpose_id".to_string(), Value::from(purpose_id));
             out.insert(
                 "parent_meta_layer_id".to_string(),
                 parent_meta_layer_id,
@@ -2257,41 +2267,59 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 }
             }
 
-            // Pull purpose_question + parent_meta_layer_id. These fields
-            // come in via the threaded envelope when upstream steps echo
-            // their input, but the default chain_executor threading
-            // replaces `current` with each step's OUTPUT — and the LLM
-            // synthesize step's output only carries the structured
-            // response fields, not the load step's input. So self-resolve
-            // purpose_question from the slug's active purpose when it's
-            // not explicitly set in the input envelope. Matches the
-            // purpose.load_or_create_purpose contract used elsewhere in
-            // the oracle / synthesizer chains.
+            // Pull purpose_question + purpose_id + parent_meta_layer_id.
             //
-            // purpose_id similarly falls through to a fresh read when
-            // the caller didn't stamp one — keeps the MetaLayer
-            // chronicle event's metadata tight to the active purpose id.
-            let purpose_question = match input.get("purpose_question").and_then(|v| v.as_str()) {
-                Some(s) if !s.is_empty() => s.to_string(),
-                _ => {
-                    let conn_guard = ctx.db_reader.lock().await;
-                    let p = super::purpose::load_or_create_purpose(&conn_guard, &ctx.slug)?;
-                    p.purpose_text
-                }
-            };
+            // Audit pass (race fix): these fields MUST arrive via the
+            // threaded input envelope. The prior self-resolve fallthrough
+            // (reading `purpose::load_or_create_purpose` here when the
+            // input was empty) raced concurrent `supersede_purpose`:
+            // between the oracle's decide_crystallization (which captured
+            // the purpose driving synthesis) and the writer (which runs
+            // after the LLM synthesize step), a second supersede could
+            // shift the slug's active purpose. The writer would then
+            // label the new MetaLayer with the NEW purpose text while
+            // its distilled/topics content was synthesized FROM the OLD
+            // purpose — semantically wrong provenance.
+            //
+            // Fix: load_substrate_nodes reads purpose ONCE at the top of
+            // the synthesizer chain and emits purpose_question +
+            // purpose_id into its output envelope. The LLM synthesize
+            // step's response_schema declares both as required echo
+            // passthrough fields (see starter-synthesizer.yaml +
+            // synthesize_meta_layer.md). The writer then consumes the
+            // echoed values directly — NO self-resolve. If either field
+            // is missing, raise loudly per feedback_loud_deferrals: it
+            // indicates the LLM dropped the echo or the chain was
+            // invoked via a direct-call path that bypassed
+            // load_substrate_nodes, and silently falling back to the
+            // active purpose reintroduces the race.
+            let purpose_question = input
+                .get("purpose_question")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow!(
+                    "create_meta_layer_node: missing / empty `purpose_question` in input. \
+                     The synthesizer's synthesize_meta_layer LLM step is required to echo \
+                     the purpose_question it was given verbatim so the writer pins \
+                     provenance to the purpose that drove synthesis — not whatever is \
+                     active by the time the writer runs (which could have been superseded \
+                     mid-chain). If you are calling create_meta_layer_node directly, pass \
+                     purpose_question in the input envelope. Do NOT self-resolve from the \
+                     slug's active purpose — that reintroduces the race this guard closes."
+                ))?
+                .to_string();
             let parent_meta_layer_id = input
                 .get("parent_meta_layer_id")
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            let purpose_id = match input.get("purpose_id").and_then(|v| v.as_i64()) {
-                Some(id) => Some(id),
-                None => {
-                    let conn_guard = ctx.db_reader.lock().await;
-                    super::purpose::load_or_create_purpose(&conn_guard, &ctx.slug)
-                        .ok()
-                        .map(|p| p.id)
-                }
-            };
+            let purpose_id = input
+                .get("purpose_id")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| anyhow!(
+                    "create_meta_layer_node: missing `purpose_id` (integer) in input. \
+                     Same echo-passthrough contract as `purpose_question`; see the \
+                     field's error above for full rationale."
+                ))?;
 
             // Compute the new node's depth. Meta layers sit above their
             // substrate, so depth = max(covered_substrate_depths) + 1.
@@ -3859,14 +3887,28 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
             // MVP deliverable, not a stub — a number is real
             // operator signal.
             //
-            // Phase 7d verifier fix (Pillar 37 adjacent): stale_days
-            // is a policy knob — "what counts as stale?" — that
-            // different operators will disagree on. Baking 30 into
-            // Rust was a soft Pillar 37 violation; even though
-            // stale_days doesn't shape an LLM prompt (mechanical-only
-            // count), the principle is the same: the caller's YAML
-            // carries the policy, not the dispatch code. Loud-raise
-            // when absent.
+            // Phase 7d verifier fix (operator-policy separation, NOT
+            // Pillar 37): stale_days is a policy knob — "what counts
+            // as stale?" — that different operators will disagree on.
+            //
+            // Audit-pass clarification: Pillar 37's literal text is "a
+            // number constraining LLM output"; stale_days is a SQL
+            // threshold against state_changed_at, not an LLM input, so
+            // Pillar 37 doesn't apply. The right architectural principle
+            // here is the broader "dispatch code does not decide policy"
+            // rule (same rule that keeps temperature / max_tokens out of
+            // Rust, just for a different reason). Baking 30 days into the
+            // primitive would hard-code retention policy onto every
+            // operator that invokes the sweep chain.
+            //
+            // Loud-raise when absent: Phase 9 cron / schedule wiring
+            // passes the operator-specified value; per-slug superseding
+            // chains encode their own value in YAML (step.input or a
+            // chain-level default block when that schema extension lands).
+            // Today the sweep chain has no natural trigger, so the
+            // loud-raise fires only if someone invokes the primitive
+            // directly without stale_days — which is the author bug it's
+            // meant to catch.
             let stale_days = input
                 .get("stale_days")
                 .and_then(|v| v.as_i64())

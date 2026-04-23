@@ -41,7 +41,9 @@ Return a single JSON object matching the response_schema exactly:
         },
         ...
       ],
-      "covered_substrate_node_ids": ["<id>", ...]
+      "covered_substrate_node_ids": ["<id>", ...],
+      "purpose_question": "<echo the purpose_question input verbatim>",
+      "purpose_id": <echo the purpose_id input verbatim (integer)>
     }
 
 ### Field semantics
@@ -63,6 +65,12 @@ Return a single JSON object matching the response_schema exactly:
   to purpose_question, do NOT list it here — this is the audit trail
   saying "these are the nodes the meta-layer depends on." Must be a
   subset of covered_substrate_nodes.
+- purpose_question (echo): Copy the `purpose_question` input field into
+  your output verbatim. This is a passthrough so the downstream mechanical
+  writer sees the SAME purpose your synthesis targeted. Do NOT rewrite,
+  shorten, or interpret it.
+- purpose_id (echo): Copy the `purpose_id` input field into your output
+  verbatim (as an integer). Same passthrough contract — pins provenance.
 
 ## Guardrails
 

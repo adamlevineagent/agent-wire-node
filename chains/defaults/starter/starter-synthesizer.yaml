@@ -56,10 +56,22 @@ steps:
     primitive: synthesize
     instruction: $prompts/starter/synthesize_meta_layer.md
     model_tier: mid
+    # Audit pass (race fix for create_meta_layer_node self-resolve):
+    # `purpose_question` + `purpose_id` are REQUIRED echo-passthrough
+    # fields. The starter runner replaces each step's input with the
+    # prior step's OUTPUT; any field not echoed by this LLM step is
+    # dropped before the writer sees it. Without the echo, the writer
+    # fell through to re-reading the slug's active purpose — racing
+    # any concurrent supersede_purpose and labelling the new MetaLayer
+    # with a DIFFERENT purpose than the synthesis was oriented against.
+    # The LLM must echo the values it was given verbatim; the writer
+    # loud-raises if they are absent, so author omissions are caught
+    # before a silently-wrong MetaLayer lands in the pyramid.
     response_schema:
       type: object
       additionalProperties: false
-      required: [headline, distilled, topics, covered_substrate_node_ids]
+      required:
+        [headline, distilled, topics, covered_substrate_node_ids, purpose_question, purpose_id]
       properties:
         headline:
           type: string
@@ -82,6 +94,20 @@ steps:
           type: array
           items:
             type: string
+        purpose_question:
+          type: string
+          description: >
+            ECHO the `purpose_question` input value verbatim. This is
+            a passthrough field so the downstream writer step has the
+            purpose the synthesis was oriented against (not whatever is
+            active by the time the writer runs, which could have been
+            superseded mid-chain).
+        purpose_id:
+          type: integer
+          description: >
+            ECHO the `purpose_id` input value verbatim. Same passthrough
+            contract as `purpose_question` — pins the MetaLayer's
+            chronicle metadata to the purpose that drove the synthesis.
 
   - name: create_meta_layer_node
     primitive: custom

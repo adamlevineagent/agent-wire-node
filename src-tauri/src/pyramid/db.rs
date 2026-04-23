@@ -28401,6 +28401,33 @@ mod phase7b_post_build_tests {
             synth_step.response_schema.is_some(),
             "synthesize step must declare a structured response_schema"
         );
+        // Audit pass: response_schema MUST declare `purpose_question` +
+        // `purpose_id` as required echo-passthrough fields so the writer
+        // receives the purpose that drove synthesis (not whatever becomes
+        // active by the time the writer runs under a concurrent
+        // supersede_purpose). Pins the race-close contract at chain-load
+        // time — an edit that drops either field breaks this assertion
+        // before any runtime side-effect.
+        let schema = synth_step.response_schema.as_ref().unwrap();
+        let required = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+        assert!(
+            required.contains(&"purpose_question".to_string()),
+            "synthesize_meta_layer response_schema.required must include \
+             purpose_question (echo passthrough, race-close) — got {required:?}"
+        );
+        assert!(
+            required.contains(&"purpose_id".to_string()),
+            "synthesize_meta_layer response_schema.required must include \
+             purpose_id (echo passthrough, race-close) — got {required:?}"
+        );
         // Structured-output keys live in the schema, so no numeric tuning
         // in Rust — feedback_pillar37_no_hedging check on the prompt itself.
     }
@@ -28798,6 +28825,7 @@ mod phase7b_post_build_tests {
                 "distilled": "d",
                 "covered_substrate_node_ids": ["L0-A"],
                 "purpose_question": "q?",
+                "purpose_id": 1,
                 "parent_meta_layer_id": null,
                 // topics intentionally omitted
             }),
@@ -28860,6 +28888,7 @@ mod phase7b_post_build_tests {
                 "distilled": "d",
                 "covered_substrate_node_ids": ["L0-A"],
                 "purpose_question": "q?",
+                "purpose_id": 1,
                 "parent_meta_layer_id": null,
                 "topics": [],
             }),
@@ -28879,6 +28908,7 @@ mod phase7b_post_build_tests {
                 "distilled": "d",
                 "covered_substrate_node_ids": ["L0-A"],
                 "purpose_question": "q?",
+                "purpose_id": 1,
                 "parent_meta_layer_id": null,
                 "topics": [{"topic": "floating", "anchor_nodes": []}],
             }),
@@ -28886,6 +28916,145 @@ mod phase7b_post_build_tests {
         .await
         .expect_err("topic with no anchor_nodes must raise");
         assert!(format!("{err2:#}").contains("floating"), "{err2:#}");
+    }
+
+    // ── Audit-pass regression: writer loud-raises on missing purpose ───────
+    //
+    // Race fix for create_meta_layer_node. The prior implementation fell
+    // through to `purpose::load_or_create_purpose(slug)` when the input
+    // envelope lacked `purpose_question` / `purpose_id` — silently
+    // labelling the new MetaLayer with whatever purpose was active at
+    // WRITE time, not the one the synthesizer was oriented against. Under
+    // a concurrent `supersede_purpose`, the distilled/topics content and
+    // the written purpose_question would disagree. The audit pass removed
+    // the fallthrough; these tests pin the loud-raise semantic so a future
+    // edit that reintroduces the race fails immediately.
+    #[tokio::test]
+    async fn create_meta_layer_node_raises_when_purpose_question_missing() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7bv-pq", &ContentType::Code, "/tmp/p7bv-pq").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L0-A', 'p7bv-pq', 0, 'A', 'd', '', 1)",
+            [],
+        )
+        .unwrap();
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7bv-pq".into(),
+            name: "missing purpose_question".into(),
+            description: "writer must raise, not silently self-resolve".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "audit-pass".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".into(),
+            },
+            steps: vec![crate::pyramid::chain_engine::ChainStep {
+                name: "create".into(),
+                primitive: "custom".into(),
+                mechanical: true,
+                rust_function: Some("create_meta_layer_node".into()),
+                ..Default::default()
+            }],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+        let err = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7bv-pq",
+            None,
+            json!({
+                "headline": "h",
+                "distilled": "d",
+                "covered_substrate_node_ids": ["L0-A"],
+                "parent_meta_layer_id": null,
+                "topics": [{"topic": "t", "anchor_nodes": ["L0-A"]}],
+                "purpose_id": 1,
+                // purpose_question intentionally omitted
+            }),
+        )
+        .await
+        .expect_err("writer must raise when purpose_question absent (race guard)");
+        let s = format!("{err:#}");
+        assert!(
+            s.contains("purpose_question"),
+            "error must name purpose_question: {s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_meta_layer_node_raises_when_purpose_id_missing() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7bv-pid", &ContentType::Code, "/tmp/p7bv-pid").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L0-A', 'p7bv-pid', 0, 'A', 'd', '', 1)",
+            [],
+        )
+        .unwrap();
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7bv-pid".into(),
+            name: "missing purpose_id".into(),
+            description: "writer must raise, not silently self-resolve".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "audit-pass".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".into(),
+            },
+            steps: vec![crate::pyramid::chain_engine::ChainStep {
+                name: "create".into(),
+                primitive: "custom".into(),
+                mechanical: true,
+                rust_function: Some("create_meta_layer_node".into()),
+                ..Default::default()
+            }],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+        let err = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7bv-pid",
+            None,
+            json!({
+                "headline": "h",
+                "distilled": "d",
+                "covered_substrate_node_ids": ["L0-A"],
+                "parent_meta_layer_id": null,
+                "topics": [{"topic": "t", "anchor_nodes": ["L0-A"]}],
+                "purpose_question": "q?",
+                // purpose_id intentionally omitted
+            }),
+        )
+        .await
+        .expect_err("writer must raise when purpose_id absent (race guard)");
+        let s = format!("{err:#}");
+        assert!(
+            s.contains("purpose_id"),
+            "error must name purpose_id: {s}"
+        );
     }
 
     #[tokio::test]
@@ -28938,6 +29107,7 @@ mod phase7b_post_build_tests {
                 "distilled": "d",
                 "covered_substrate_node_ids": ["L0-A"],
                 "purpose_question": "q?",
+                "purpose_id": 1,
                 "parent_meta_layer_id": null,
                 "topics": [
                     {"topic": "one", "anchor_nodes": ["L0-A"]},
@@ -29062,7 +29232,13 @@ mod phase7b_post_build_tests {
         let _lock = test_lock();
 
         // Mock the LLM so the synthesizer's synthesize_meta_layer step
-        // gets a well-formed structured response.
+        // gets a well-formed structured response. Audit pass: purpose_question
+        // + purpose_id are now REQUIRED echo-passthrough fields. The mock
+        // echoes the active post-supersede purpose (id=2; create_slug seeded
+        // the stock purpose as id=1, then supersede_purpose inserted the
+        // crown-jewel text as id=2) so the writer's loud-raise doesn't fire.
+        // This pins provenance to the purpose that drove synthesis, closing
+        // the supersede_purpose race in the writer.
         let mut server = mockito::Server::new_async().await;
         let mock_content = r#"{
             "headline":"Crown-jewel synthesis",
@@ -29070,7 +29246,9 @@ mod phase7b_post_build_tests {
             "topics":[
                 {"topic":"coverage","anchor_nodes":["L0-crown-A"]}
             ],
-            "covered_substrate_node_ids":["L0-crown-A"]
+            "covered_substrate_node_ids":["L0-crown-A"],
+            "purpose_question":"Phase 7b crown-jewel purpose — drive oracle through synthesizer.",
+            "purpose_id":2
         }"#;
         let mock = server
             .mock("POST", "/chat/completions")
