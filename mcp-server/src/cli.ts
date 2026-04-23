@@ -10,7 +10,15 @@
  * Default output is pretty-printed JSON. Use --compact for minified JSON.
  */
 
-import { resolveAuthToken, pyramidFetch, type PyramidResponse, getToolCatalog, getToolCatalogEntry, getToolCatalogByCategory } from "./lib.js";
+import {
+  resolveAuthToken,
+  pyramidFetch,
+  type PyramidResponse,
+  getToolCatalog,
+  getToolCatalogEntry,
+  getToolCatalogByCategory,
+  ANNOTATION_TYPES,
+} from "./lib.js";
 
 // ── Arg Parsing ──────────────────────────────────────────────────────────────
 
@@ -51,23 +59,23 @@ const pretty = flags.compact !== "true";
 
 // ── Valid Annotation Types ───────────────────────────────────────────────────
 
-// Post-build accretion v5: full enum surface exposed. Previously Era,
-// Transition, HealthCheck, Directory were silently rejected at the CLI
-// despite being valid Rust enum variants (Pillar 38 absorbed bug).
-// SteelMan and RedTeam are new in v5.
-const VALID_ANNOTATION_TYPES = [
-  "observation",
-  "correction",
-  "question",
-  "friction",
-  "idea",
-  "era",
-  "transition",
-  "health_check",
-  "directory",
-  "steel_man",
-  "red_team",
-] as const;
+// Single source of truth lives in lib.ts → ANNOTATION_TYPES. The CLI, the
+// MCP zod schema (index.ts), and the command registry (lib.ts) all read
+// from the same list so help text, Zod validation, and the input validator
+// cannot drift from each other or from the Rust `AnnotationType` enum.
+const VALID_ANNOTATION_TYPES = ANNOTATION_TYPES;
+
+/** Render the annotation-type vocabulary for a help-text flag description,
+ * wrapped across two lines to keep narrow terminal output readable. */
+function renderAnnotationTypeHelp(indent: string): string {
+  const types = [...ANNOTATION_TYPES];
+  // Two-line wrap: first 5 on line 1, the rest on continuations.
+  const first = types.slice(0, 5).join(" | ");
+  const rest = types.slice(5);
+  const mid = rest.slice(0, 4).join(" | ");
+  const last = rest.slice(4).join(" | ");
+  return `${first} |\n${indent}${mid} |\n${indent}${last}`;
+}
 
 // ── Per-command Help ─────────────────────────────────────────────────────────
 
@@ -168,9 +176,7 @@ Arguments:
 Options:
   --question "..."   Question this answers (triggers FAQ creation)
   --author "..."     Your agent name (default: cli-agent)
-  --type <type>      observation | correction | question | friction | idea |
-                     era | transition | health_check | directory |
-                     steel_man | red_team
+  --type <type>      ${renderAnnotationTypeHelp("                     ")}
                      (default: observation)`,
 
   tree: `tree — Structural overview of a pyramid
@@ -2182,9 +2188,7 @@ Local Mode + Providers:
 Annotation flags:
   --question "..."     Question this answers (triggers FAQ)
   --author "..."       Your agent name
-  --type <type>        observation | correction | question | friction | idea |
-                       era | transition | health_check | directory |
-                       steel_man | red_team
+  --type <type>        ${renderAnnotationTypeHelp("                       ")}
 
 Options:
   --pretty             Pretty-print JSON output (default: on)

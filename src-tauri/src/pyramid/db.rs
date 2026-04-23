@@ -22058,6 +22058,28 @@ mod phase2_post_build_tests {
         assert!(AnnotationType::from_str_strict("").is_err());
     }
 
+    /// Phase 2 verifier: guard against drift between `AnnotationType::ALL`
+    /// (used by the HTTP write-path error message + any downstream
+    /// vocabulary display) and the parse/display methods. If someone adds
+    /// a new variant to the enum and forgets to extend `ALL`, this test
+    /// fails loud instead of letting the error message silently lie.
+    #[test]
+    fn annotation_type_all_is_in_sync_with_parser() {
+        // Every string in ALL must parse strictly.
+        for name in AnnotationType::ALL {
+            AnnotationType::from_str_strict(name).unwrap_or_else(|_| {
+                panic!("AnnotationType::ALL contains '{name}' but from_str_strict rejects it")
+            });
+        }
+        // Spot-check: ALL has the full 11-type surface (length is a
+        // cheap canary for either side losing a variant).
+        assert_eq!(
+            AnnotationType::ALL.len(),
+            11,
+            "ALL length drift — enum and ALL vocabulary are out of sync"
+        );
+    }
+
     /// Wanderer-added: ShapePayload is #[serde(untagged)] so the JSON body is
     /// the raw inner struct and node_shape (stored in a sibling column) is the
     /// discriminator. This test pins the Rust side of the contract so the

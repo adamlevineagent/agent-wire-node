@@ -12,6 +12,32 @@ import { homedir } from "node:os";
 export const WIRE_NODE_BASE_URL = "http://localhost:8765";
 export const REQUEST_TIMEOUT_MS = 10_000;
 
+/**
+ * Canonical annotation-type vocabulary. Keep in lock-step with the Rust
+ * `AnnotationType` enum in `src-tauri/src/pyramid/types.rs` — the HTTP
+ * write path (`POST /pyramid/{slug}/annotate`) parses via
+ * `AnnotationType::from_str_strict` and returns 400 on unknown values,
+ * so any drift here silently shifts rejection from the MCP layer (zod)
+ * to the Rust layer (500-looking 400). Single source of truth for
+ * cli.ts VALID_ANNOTATION_TYPES, index.ts zod enum, and the help text
+ * both surfaces print.
+ */
+export const ANNOTATION_TYPES = [
+  "observation",
+  "correction",
+  "question",
+  "friction",
+  "idea",
+  "era",
+  "transition",
+  "health_check",
+  "directory",
+  "steel_man",
+  "red_team",
+] as const;
+
+export type AnnotationType = (typeof ANNOTATION_TYPES)[number];
+
 // ── Auth Token Resolution ────────────────────────────────────────────────────
 
 export function resolveAuthToken(): string {
@@ -401,7 +427,7 @@ export const TOOL_CATALOG: CatalogEntry[] = [
     flags: [
       { name: "question", type: "string", description: "Question this answers (triggers FAQ)" },
       { name: "author", type: "string", description: "Your agent name", default: "cli-agent" },
-      { name: "type", type: "string", description: "observation | correction | question | friction | idea", default: "observation" },
+      { name: "type", type: "string", description: ANNOTATION_TYPES.join(" | "), default: "observation" },
     ],
     examples: ["pyramid-cli annotate my-pyramid L0-012 \"Finding text\" --question \"What does X do?\" --author my-agent --type observation"],
     related: ["annotations", "drill", "faq"],

@@ -11,6 +11,7 @@ import {
   getToolCatalog,
   getToolCatalogEntry,
   getToolCatalogByCategory,
+  ANNOTATION_TYPES,
 } from "./lib.js";
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -354,10 +355,10 @@ server.tool(
       .optional()
       .describe("Optional: the question or task context that prompted this annotation"),
     annotation_type: z
-      .string()
+      .enum(ANNOTATION_TYPES)
       .optional()
       .describe(
-        "Optional: annotation type — 'observation', 'correction', 'question', 'friction', 'idea', 'era', 'transition', 'health_check', 'directory', 'steel_man', 'red_team' (default: 'observation')"
+        `Optional: annotation type — ${ANNOTATION_TYPES.map((t) => `'${t}'`).join(", ")} (default: 'observation'). Unknown values are rejected at the MCP layer before hitting the Wire Node.`
       ),
     author: z
       .string()

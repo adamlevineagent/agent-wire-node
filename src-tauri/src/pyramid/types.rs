@@ -793,6 +793,26 @@ pub struct FaqNode {
 }
 
 impl AnnotationType {
+    /// Canonical enumeration of every annotation type, in the order the
+    /// Rust enum declares them. Exposed so error messages and vocabulary
+    /// lists generate from this single source of truth instead of being
+    /// repeated as drift-prone string literals next to every ingress.
+    /// Post-build accretion v5 Phase 2 verifier: added to kill the
+    /// hand-rolled list that had been living in `routes.rs`.
+    pub const ALL: &'static [&'static str] = &[
+        "observation",
+        "correction",
+        "question",
+        "friction",
+        "idea",
+        "era",
+        "transition",
+        "health_check",
+        "directory",
+        "steel_man",
+        "red_team",
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             AnnotationType::Observation => "observation",

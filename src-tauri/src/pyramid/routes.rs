@@ -4257,8 +4257,9 @@ async fn handle_annotate(
             return Ok(json_error(
                 warp::http::StatusCode::BAD_REQUEST,
                 &format!(
-                    "{}. Valid types: observation, correction, question, friction, idea, era, transition, health_check, directory, steel_man, red_team",
-                    e
+                    "{}. Valid types: {}",
+                    e,
+                    AnnotationType::ALL.join(", ")
                 ),
             ));
         }
