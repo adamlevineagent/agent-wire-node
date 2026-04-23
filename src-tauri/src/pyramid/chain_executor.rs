@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
 use tokio::sync::{mpsc, Mutex, Semaphore};
@@ -13023,37 +13023,141 @@ fn classify_ir_step_path(step: &IrStep) -> IrStepExecutionPath {
 // the supervisor calls this function with the loaded chain + target_id +
 // context inputs.
 //
-// Implementation status: Phase 1 ships the SIGNATURE and a clear
-// `unimplemented!` body. Phase 3 (WS3-C, supervisor dispatch for role_bound)
-// is the first caller and will land the real body alongside the first
-// starter chain needing it (probably accretion_handler — which is all
-// mechanical, so the initial implementation only needs to handle mechanical
-// steps). Classify/synthesize LLM steps can be added when Phase 6 lands
-// the judge / reconciler / evidence_tester chains.
+// Phase 5 implementation: MECHANICAL-ONLY. Each step must have
+// `mechanical: true` + `rust_function: <name>` in the YAML. LLM-primitive
+// steps are deliberately rejected with a Phase-6 error so they don't fail
+// silently — see feedback_loud_deferrals. Phase 6 extends this to enqueue
+// per-step work items for LLM steps via chain_dispatch.
+//
+// Input threading: `inputs` becomes the input to step 0. Each step's output
+// becomes the next step's input UNLESS `step.input` is explicitly set (in
+// which case that wins — but the starter chains this phase ships don't rely
+// on it yet). The final step's output is returned.
+//
+// Target context: `target_id` is merged into each step's input under
+// `target_node_id` so mechanical primitives (emit_cascade_handler_invoked,
+// queue_re_distill_for_target) can access it. If the caller already set
+// `target_node_id` on the inputs JSON, that value wins.
 //
 // See `.lab/architecture/agent-wire-node-post-build-plan-v5.md` binding
 // decision 11 for the chain-invocation model (one work_item per dispatch;
 // chain runs its N steps internally; cost attribution via
 // pyramid_pipeline_steps writes).
-#[allow(dead_code)]
 pub async fn execute_chain_for_target(
-    _state: &PyramidState,
-    _chain: &ChainDefinition,
-    _slug: &str,
-    _target_id: Option<&str>,
-    _inputs: serde_json::Value,
+    state: &PyramidState,
+    chain: &ChainDefinition,
+    slug: &str,
+    target_id: Option<&str>,
+    inputs: serde_json::Value,
 ) -> Result<serde_json::Value> {
-    // Phase 3 WS3-C — implement when first role_bound work item dispatches.
-    // The mechanical-only path is straightforward: for each chain step, if
-    // step.primitive == "mechanical", dispatch to the named Rust function
-    // with `inputs` and thread the result into the next step's inputs.
-    // LLM steps (classify/synthesize/etc.) need to enqueue a per-step
-    // work item via chain_dispatch and wait for completion, mirroring
-    // how `execute_chain` does it today.
-    anyhow::bail!(
-        "execute_chain_for_target: implementation pending Phase 3 WS3-C. \
-         See .lab/architecture/agent-wire-node-post-build-plan-v5.md"
-    )
+    info!(
+        "[CHAIN-TARGET] executing starter chain '{}' for slug '{}' target={:?} steps={}",
+        chain.id,
+        slug,
+        target_id,
+        chain.steps.len()
+    );
+
+    // Merge target_id into the initial input under `target_node_id`
+    // unless the caller already set it. Starter chain mechanical
+    // primitives read this field.
+    let mut initial_input = inputs;
+    if let Some(tid) = target_id {
+        if let Value::Object(ref mut map) = initial_input {
+            map.entry("target_node_id".to_string())
+                .or_insert_with(|| Value::String(tid.to_string()));
+        }
+    }
+
+    // Build a minimal dispatch context. We do NOT mint a build_id or wire
+    // CacheDispatchBase — starter chains are mechanical-only in Phase 5 so
+    // the LLM cache plumbing is not exercised. Phase 6 (LLM-step support)
+    // will add that wiring when it lands per-step work item enqueueing.
+    let llm_config = state.config.read().await.clone();
+    let dispatch_ctx = chain_dispatch::ChainDispatchContext {
+        db_reader: state.reader.clone(),
+        db_writer: state.writer.clone(),
+        slug: slug.to_string(),
+        config: llm_config,
+        tier1: state.operational.tier1.clone(),
+        ops: (*state.operational).clone(),
+        audit: None,
+        cache_base: None,
+        concurrency_cap: None,
+    };
+
+    // Thread inputs through each step. `current` is what the next step sees
+    // as its input (unless that step explicitly sets `step.input`).
+    let mut current = initial_input;
+
+    for (idx, step) in chain.steps.iter().enumerate() {
+        // Reject LLM-primitive steps loudly — Phase 6 will extend this runner
+        // to enqueue per-step work items for LLM steps. Silent skip would
+        // make a partially-LLM starter chain look like it succeeded, which
+        // masks the unimplemented code path. See feedback_loud_deferrals.
+        if !step.mechanical {
+            anyhow::bail!(
+                "execute_chain_for_target: chain '{}' step '{}' is an LLM step \
+                 (primitive='{}'). Phase 6 will handle LLM steps in starter chains; \
+                 for now starter chains must be mechanical-only.",
+                chain.id,
+                step.name,
+                step.primitive,
+            );
+        }
+
+        // If the YAML declares an explicit `step.input` expression, resolve
+        // it against the threaded context. Starter chains in Phase 5 don't
+        // need this (they rely on threaded output), so we handle only the
+        // trivial "literal JSON" case — step.input is surfaced as-is when
+        // set. More complex resolution (ctx refs) is Phase 6+ when an IR
+        // path is needed. Emit loudly if `step.input` is set on a Phase 5
+        // starter chain because it indicates the YAML expects richer
+        // resolution than this runner provides.
+        let resolved_input = if let Some(ref explicit) = step.input {
+            // Starter chains in Phase 5 should thread via output chaining,
+            // not step.input. Warn if someone authored one relying on this
+            // field — this runner returns the literal `input` value, not a
+            // ctx-resolved one.
+            warn!(
+                "[CHAIN-TARGET] chain '{}' step '{}' uses step.input literal; \
+                 Phase 5 runner does not resolve $ref / template expressions — \
+                 passing literal to dispatch.",
+                chain.id, step.name
+            );
+            explicit.clone()
+        } else {
+            current.clone()
+        };
+
+        info!(
+            "[CHAIN-TARGET] step[{}] '{}' (fn={:?}) dispatching",
+            idx, step.name, step.rust_function
+        );
+
+        let output = chain_dispatch::dispatch_step(
+            step,
+            &resolved_input,
+            "", // no system prompt for mechanical steps
+            &chain.defaults,
+            &dispatch_ctx,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "chain '{}' step '{}' (mechanical fn={:?}) failed",
+                chain.id, step.name, step.rust_function
+            )
+        })?;
+
+        current = output;
+    }
+
+    info!(
+        "[CHAIN-TARGET] chain '{}' complete for slug '{}' target={:?}",
+        chain.id, slug, target_id
+    );
+    Ok(current)
 }
 
 #[cfg(test)]

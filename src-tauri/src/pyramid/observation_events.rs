@@ -16,6 +16,13 @@ use rusqlite::Connection;
 /// - `source`: "watcher" | "cascade" | "rescan" | "evidence" | "vine" | "annotation"
 ///             | "purpose"                        // v5: purpose supersession
 ///             | "dadbear"                        // v5: binding_unresolved from compiler
+///             | "chain"                          // v5 Phase 5: emitted from a
+///                                                //             role_bound chain step
+///                                                //             (starter-cascade-*,
+///                                                //             starter-meta-layer-oracle,
+///                                                //             etc.) via the
+///                                                //             emit_cascade_handler_invoked
+///                                                //             mechanical primitive
 /// - `event_type`: "file_modified" | "file_created" | "file_deleted" | "file_renamed"
 ///                  | "cascade_stale" | "edge_stale" | "evidence_growth" | "vine_stale"
 ///                  | "targeted_stale" | "full_sweep"

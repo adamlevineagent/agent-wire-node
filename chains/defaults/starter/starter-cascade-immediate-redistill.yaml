@@ -1,0 +1,35 @@
+schema_version: 1
+id: starter-cascade-immediate-redistill
+name: Cascade Handler — Immediate Re-distill (pre-v5 compat)
+description: >
+  Starter cascade_handler binding for pre-v5 pyramids (backfilled at upgrade).
+  Preserves the pre-v5 behavior where every cascade event re-distills the
+  target ancestor immediately. The judge-gated flavor is the default for new
+  pyramids; this one is the backfill default so existing pyramids' prior
+  cascade intent survives the v5 cutover.
+
+  Phase 5 ships mechanical-only: two steps that (1) chronicle the cascade
+  invocation for observability and (2) queue a re_distill work item against
+  the target node. The supervisor's pre-existing re_distill arm (Phase 8
+  work) then applies it.
+content_type: code
+version: "1.0.0"
+author: post-build-accretion-v5
+
+defaults:
+  model_tier: mid
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  - name: emit_cascade_invoked
+    primitive: custom
+    mechanical: true
+    rust_function: emit_cascade_handler_invoked
+
+  - name: queue_redistill
+    primitive: custom
+    mechanical: true
+    rust_function: queue_re_distill_for_target
+
+post_build: []

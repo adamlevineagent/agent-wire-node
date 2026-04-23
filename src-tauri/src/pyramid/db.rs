@@ -2643,6 +2643,34 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         );",
     )?;
 
+    // ── Post-build accretion v5 Phase 5: role-binding backfill ────────────
+    //
+    // Backfill genesis bindings + cascade_handler for any pre-v5 slug that
+    // was created before the role-binding table existed. Both helpers are
+    // idempotent (INSERT OR IGNORE), so running at every init is safe.
+    //
+    // Called from init_pyramid_db (not open_pyramid_db) so all callers —
+    // tests that open ephemeral in-memory DBs AND the production startup
+    // path via open_pyramid_db — get the backfill consistently. Tests that
+    // want to observe a backfill side-effect (e.g., the Phase 5
+    // `backfill_runs_on_init_pyramid_db_for_existing_slug` test) exercise
+    // it via a fresh connection to a shared file DB.
+    //
+    // Failures are logged but DO NOT abort init — a broken backfill
+    // shouldn't prevent the app from booting; the slugs just keep their
+    // pre-v5 state until the next successful init. Loud log message so
+    // operators see the drift.
+    if let Err(e) = super::role_binding::backfill_existing_cascade_handlers(conn) {
+        tracing::error!(
+            "post-build-v5 cascade_handler backfill failed during init_pyramid_db: {e}"
+        );
+    }
+    if let Err(e) = super::role_binding::backfill_genesis_bindings(conn) {
+        tracing::error!(
+            "post-build-v5 genesis bindings backfill failed during init_pyramid_db: {e}"
+        );
+    }
+
     Ok(())
 }
 
@@ -23381,5 +23409,566 @@ mod phase4_post_build_tests {
             "compile cursor must advance past purpose_shifted; got {}",
             cursor_after
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 5 post-build-accretion tests: chain runner + starter chains + v5
+// mechanical primitives + role-binding backfill + end-to-end role_bound proof.
+//
+// See `.lab/architecture/agent-wire-node-post-build-plan-v5.md` Phase 5.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod phase5_post_build_tests {
+    use super::*;
+    use crate::pyramid::chain_engine::{
+        ChainDefaults, ChainDefinition, ChainStep,
+    };
+    use crate::pyramid::{chain_dispatch, chain_executor, chain_loader, observation_events};
+    use crate::pyramid::types::ContentType;
+    use rusqlite::Connection;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+
+    fn chains_dir_path() -> PathBuf {
+        // Resolve `chains/` relative to CARGO_MANIFEST_DIR (src-tauri/).
+        // Starter YAMLs live at `{repo}/chains/defaults/starter/`.
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        PathBuf::from(manifest).parent().unwrap().join("chains")
+    }
+
+    fn test_pyramid_state(conn: Connection) -> crate::pyramid::PyramidState {
+        let db = Arc::new(Mutex::new(conn));
+        let config = crate::pyramid::llm::LlmConfig::default();
+        crate::pyramid::PyramidState {
+            reader: db.clone(),
+            writer: db,
+            config: Arc::new(tokio::sync::RwLock::new(config)),
+            active_build: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            data_dir: None,
+            stale_engines: Arc::new(Mutex::new(HashMap::new())),
+            file_watchers: Arc::new(Mutex::new(HashMap::new())),
+            vine_builds: Arc::new(Mutex::new(HashMap::new())),
+            use_chain_engine: AtomicBool::new(false),
+            use_ir_executor: AtomicBool::new(true),
+            event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
+            operational: Arc::new(crate::pyramid::OperationalConfig::default()),
+            chains_dir: chains_dir_path(),
+            remote_query_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            absorption_gate: Arc::new(Mutex::new(crate::pyramid::AbsorptionGate::new())),
+            build_event_bus: Arc::new(crate::pyramid::event_bus::BuildEventBus::new()),
+            supabase_url: None,
+            supabase_anon_key: None,
+            csrf_secret: [0u8; 32],
+            dadbear_handle: Arc::new(Mutex::new(None)),
+            dadbear_supervisor_handle: Arc::new(Mutex::new(None)),
+            dadbear_in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            provider_registry: {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                Arc::new(crate::pyramid::provider::ProviderRegistry::new(store))
+            },
+            credential_store: {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                store
+            },
+            schema_registry: Arc::new(crate::pyramid::schema_registry::SchemaRegistry::new()),
+            cross_pyramid_router: Arc::new(
+                crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
+            ),
+            ollama_pull_cancel: Arc::new(AtomicBool::new(false)),
+            ollama_pull_in_progress: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn minimal_chain_with_steps(id: &str, steps: Vec<ChainStep>) -> ChainDefinition {
+        ChainDefinition {
+            schema_version: 1,
+            id: id.to_string(),
+            name: format!("Test {}", id),
+            description: "Phase 5 test chain".to_string(),
+            content_type: "code".to_string(),
+            version: "0.0.1".to_string(),
+            author: "phase5-test".to_string(),
+            defaults: ChainDefaults {
+                model_tier: "mid".to_string(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".to_string(),
+            },
+            steps,
+            post_build: vec![],
+            audience: Default::default(),
+        }
+    }
+
+    fn mech_step(name: &str, rust_fn: &str) -> ChainStep {
+        ChainStep {
+            name: name.to_string(),
+            primitive: "custom".to_string(),
+            mechanical: true,
+            rust_function: Some(rust_fn.to_string()),
+            ..Default::default()
+        }
+    }
+
+    // ── 1. Chain runner threads mechanical-step output ─────────────────────
+
+    #[tokio::test]
+    async fn execute_chain_for_target_runs_mechanical_chain_threads_output() {
+        // Build a chain with two mechanical steps. log_and_complete returns
+        // its input unchanged — but we can confirm output is threaded by
+        // first emitting a cascade event (which returns `{"emitted":true,
+        // "event_id":N}`) then piping that into log_and_complete, and then
+        // asserting the final output is the second step's output.
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p5a", &ContentType::Code, "/tmp/p5a").unwrap();
+        let state = test_pyramid_state(conn);
+
+        let chain = minimal_chain_with_steps(
+            "test-two-mech-steps",
+            vec![
+                mech_step("step1", "emit_cascade_handler_invoked"),
+                mech_step("step2", "log_and_complete"),
+            ],
+        );
+
+        let inputs = serde_json::json!({
+            "target_node_id": "L1-XYZ",
+            "reason": "phase5 unit",
+        });
+        let out = chain_executor::execute_chain_for_target(
+            &state, &chain, "p5a", Some("L1-XYZ"), inputs,
+        )
+        .await
+        .expect("two-step mechanical chain must succeed");
+
+        // The final output is step2's output. log_and_complete returns
+        // input unchanged. Step2's input is step1's output which contains
+        // {"emitted": true, "event_id": N}.
+        assert_eq!(out["emitted"], serde_json::json!(true),
+            "final output must be step2's output which is step1's output (logged through), got {out}");
+        assert!(out["event_id"].is_i64(), "event_id must be an integer: {out}");
+    }
+
+    // ── 2. LLM steps in starter chains are rejected for Phase 6 ─────────────
+
+    #[tokio::test]
+    async fn execute_chain_for_target_rejects_llm_steps_for_now() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p5b", &ContentType::Code, "/tmp/p5b").unwrap();
+        let state = test_pyramid_state(conn);
+
+        // A pure LLM step — mechanical=false, primitive=classify.
+        let step = ChainStep {
+            name: "llm_step".into(),
+            primitive: "classify".into(),
+            instruction: Some("Classify something".into()),
+            mechanical: false,
+            ..Default::default()
+        };
+        let chain = minimal_chain_with_steps("test-llm-step", vec![step]);
+
+        let err = chain_executor::execute_chain_for_target(
+            &state, &chain, "p5b", None, serde_json::json!({}),
+        )
+        .await
+        .expect_err("LLM step must be rejected in Phase 5");
+        let msg = err.to_string() + " " + &err.root_cause().to_string();
+        assert!(
+            msg.contains("Phase 6"),
+            "error must mention Phase 6 so operators know LLM is pending: {msg}"
+        );
+    }
+
+    // ── 3. Starter chains load via chain_loader ─────────────────────────────
+
+    #[test]
+    fn starter_chains_load_via_chain_loader() {
+        let chains_dir = chains_dir_path();
+        for id in [
+            "starter-cascade-immediate-redistill",
+            "starter-cascade-judge-gated",
+            "starter-meta-layer-oracle",
+        ] {
+            let loaded = chain_loader::load_chain_by_id(id, &chains_dir)
+                .unwrap_or_else(|e| panic!("starter chain '{}' must load: {}", id, e));
+            assert_eq!(loaded.id, id);
+            assert!(!loaded.steps.is_empty(), "{} must have at least one step", id);
+            // Every step in Phase 5 starter chains is mechanical.
+            for step in &loaded.steps {
+                assert!(
+                    step.mechanical,
+                    "Phase 5 starter chain '{}' step '{}' must be mechanical",
+                    id, step.name
+                );
+                assert!(
+                    step.rust_function.is_some(),
+                    "Phase 5 starter chain '{}' step '{}' must name a rust_function",
+                    id, step.name
+                );
+            }
+        }
+    }
+
+    // ── 4. dispatch_mechanical emit_cascade_handler_invoked writes event ────
+
+    #[tokio::test]
+    async fn dispatch_mechanical_emit_cascade_handler_invoked_writes_event() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p5c", &ContentType::Code, "/tmp/p5c").unwrap();
+        let state = test_pyramid_state(conn);
+
+        let chain = minimal_chain_with_steps(
+            "test-emit-only",
+            vec![mech_step("emit", "emit_cascade_handler_invoked")],
+        );
+        let inputs = serde_json::json!({
+            "target_node_id": "L1-CASC",
+            "reason": "unit-test",
+            "work_item_id": "wi-unit-1",
+        });
+        let out = chain_executor::execute_chain_for_target(
+            &state, &chain, "p5c", Some("L1-CASC"), inputs,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["emitted"], serde_json::json!(true));
+
+        // Now assert a cascade_handler_invoked event was written to
+        // dadbear_observation_events.
+        let writer = state.writer.lock().await;
+        let (event_type, source, target, meta): (String, String, Option<String>, Option<String>) =
+            writer
+                .query_row(
+                    "SELECT event_type, source, target_node_id, metadata_json
+                       FROM dadbear_observation_events
+                      WHERE slug = 'p5c' AND event_type = 'cascade_handler_invoked'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .expect("cascade_handler_invoked event must exist");
+        assert_eq!(event_type, "cascade_handler_invoked");
+        assert_eq!(source, "chain");
+        assert_eq!(target.as_deref(), Some("L1-CASC"));
+        let m = meta.unwrap_or_default();
+        assert!(
+            m.contains("unit-test"),
+            "metadata must carry the reason: {m}"
+        );
+        assert!(
+            m.contains("wi-unit-1"),
+            "metadata must carry extra fields (work_item_id): {m}"
+        );
+    }
+
+    // ── 5. dispatch_mechanical queue_re_distill creates a work item ─────────
+
+    #[tokio::test]
+    async fn dispatch_mechanical_queue_re_distill_creates_work_item() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p5d", &ContentType::Code, "/tmp/p5d").unwrap();
+        let state = test_pyramid_state(conn);
+
+        let chain = minimal_chain_with_steps(
+            "test-queue-only",
+            vec![mech_step("queue", "queue_re_distill_for_target")],
+        );
+        let inputs = serde_json::json!({
+            "target_node_id": "L1-RD",
+            "layer": 1,
+            "reason": "test redistill",
+        });
+        let out = chain_executor::execute_chain_for_target(
+            &state, &chain, "p5d", Some("L1-RD"), inputs,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["queued"], serde_json::json!(true));
+        let wi_id = out["work_item_id"].as_str().expect("work_item_id").to_string();
+        assert!(wi_id.starts_with("wi-"));
+
+        let writer = state.writer.lock().await;
+        let (stored_id, primitive, target, state_col, layer): (String, String, Option<String>, String, i64) = writer
+            .query_row(
+                "SELECT id, primitive, target_id, state, layer
+                   FROM dadbear_work_items
+                  WHERE slug = 'p5d' AND step_name = 'cascade_re_distill'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("re_distill work item must exist");
+        assert_eq!(stored_id, wi_id);
+        assert_eq!(primitive, "re_distill");
+        assert_eq!(target.as_deref(), Some("L1-RD"));
+        assert_eq!(state_col, "compiled");
+        assert_eq!(layer, 1);
+    }
+
+    // ── 6. End-to-end proof ─────────────────────────────────────────────────
+    //
+    // Build on the Phase 4 wanderer: create slug → supersede purpose →
+    // purpose_shifted observation event → compile tick → role_bound work
+    // item stamped with resolved_chain_id `starter-meta-layer-oracle` →
+    // load the chain directly → execute_chain_for_target on the target →
+    // CAS work item to `applied`. This demonstrates the entire Phase 5
+    // pipeline: role_bound work item now reaches `applied`, not `failed`.
+
+    #[tokio::test]
+    async fn role_bound_work_item_reaches_applied_via_execute_chain_for_target() {
+        use crate::pyramid::dadbear_compiler;
+        use crate::pyramid::purpose;
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p5e2e", &ContentType::Code, "/tmp/p5e2e").unwrap();
+
+        // 1. Supersede purpose — drives a purpose_shifted observation event.
+        purpose::supersede_purpose(
+            &conn,
+            "p5e2e",
+            "Now we want to understand Phase 5 end-to-end.",
+            Some("phase5-e2e-test"),
+            None,
+            None,
+        )
+        .expect("supersede_purpose must succeed");
+
+        // Sanity: purpose_shifted event exists.
+        let purpose_shifted_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM dadbear_observation_events
+              WHERE slug = 'p5e2e' AND event_type = 'purpose_shifted'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(purpose_shifted_count, 1, "purpose_shifted must be emitted");
+
+        // 2. Run compile tick — produces a role_bound work item.
+        let result = dadbear_compiler::run_compilation_for_slug(
+            &conn, "p5e2e", None, None,
+        ).expect("compile tick must succeed");
+        assert!(
+            result.items_compiled >= 1,
+            "at least one work_item from purpose_shifted; got {}",
+            result.items_compiled
+        );
+
+        let (wi_id, primitive, step_name, resolved_chain_id, state_col): (
+            String, String, String, Option<String>, String,
+        ) = conn.query_row(
+            "SELECT id, primitive, step_name, resolved_chain_id, state
+               FROM dadbear_work_items
+              WHERE slug = 'p5e2e' AND step_name = 'oracle_purpose_shift'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        ).expect("oracle_purpose_shift work_item must exist");
+        assert_eq!(primitive, "role_bound");
+        assert_eq!(step_name, "oracle_purpose_shift");
+        assert_eq!(resolved_chain_id.as_deref(), Some("starter-meta-layer-oracle"));
+        assert_eq!(state_col, "compiled");
+
+        // 3. Construct a pyramid state reusing the same DB. Directly load
+        //    + run the bound chain + CAS the work item to `applied`. This
+        //    mirrors what the supervisor arm does at
+        //    dadbear_supervisor.rs:755 (role_bound arm).
+        let state = test_pyramid_state(conn);
+        let chain = chain_loader::load_chain_by_id(
+            &resolved_chain_id.as_deref().unwrap(),
+            &state.chains_dir,
+        ).expect("starter-meta-layer-oracle must load");
+        let inputs = serde_json::json!({
+            "work_item_id": wi_id,
+            "step_name": step_name,
+            "target_id": serde_json::Value::Null,
+            "layer": 0,
+        });
+        chain_executor::execute_chain_for_target(
+            &state, &chain, "p5e2e", None, inputs,
+        )
+        .await
+        .expect("role_bound chain must run to completion");
+
+        // CAS to applied — same as the supervisor's role_bound success arm.
+        {
+            let conn = state.writer.lock().await;
+            let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let rows = conn.execute(
+                "UPDATE dadbear_work_items
+                    SET state = 'applied',
+                        state_changed_at = ?1,
+                        applied_at = ?1
+                  WHERE id = ?2 AND state = 'compiled'",
+                rusqlite::params![now, wi_id],
+            ).unwrap();
+            assert_eq!(rows, 1, "applied CAS must update exactly one row");
+        }
+
+        // 4. Assert the work item is `applied`, NOT `failed`.
+        let writer = state.writer.lock().await;
+        let final_state: String = writer.query_row(
+            "SELECT state FROM dadbear_work_items WHERE id = ?1",
+            rusqlite::params![wi_id],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(
+            final_state, "applied",
+            "role_bound work item must reach 'applied' state, not 'failed' — \
+             the stub fix is complete for this path"
+        );
+    }
+
+    // ── 7. init_pyramid_db runs the binding backfill for existing slugs ────
+
+    #[test]
+    fn backfill_runs_on_init_pyramid_db_for_existing_slug() {
+        // Use a file-based DB so we can close + reopen.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("pyramid.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            init_pyramid_db(&conn).unwrap();
+            create_slug(&conn, "legacy5", &ContentType::Code, "/tmp/legacy5").unwrap();
+        }
+
+        // Manually delete all role bindings for this slug to simulate
+        // pre-v5 state.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "DELETE FROM pyramid_role_bindings WHERE slug = 'legacy5'",
+                [],
+            ).unwrap();
+            let remaining: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pyramid_role_bindings WHERE slug = 'legacy5'",
+                [],
+                |r| r.get(0),
+            ).unwrap();
+            assert_eq!(remaining, 0, "bindings must be wiped before reopen");
+        }
+
+        // Reopen — init_pyramid_db runs, which invokes backfill.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            init_pyramid_db(&conn).unwrap();
+
+            // Backfill must have restored the cascade_handler binding with
+            // the EXISTING-pyramid default (immediate-redistill).
+            let cascade = crate::pyramid::role_binding::resolve_binding(
+                &conn, "legacy5", "cascade_handler",
+            ).expect("cascade_handler binding must be backfilled");
+            assert_eq!(
+                cascade.handler_chain_id,
+                crate::pyramid::role_binding::CASCADE_HANDLER_EXISTING_DEFAULT,
+                "backfill for existing slug uses immediate-redistill default"
+            );
+
+            // Genesis bindings must also be backfilled.
+            for (role, expected_chain) in
+                crate::pyramid::role_binding::GENESIS_BINDINGS.iter()
+            {
+                let b = crate::pyramid::role_binding::resolve_binding(
+                    &conn, "legacy5", role,
+                ).unwrap_or_else(|e| panic!(
+                    "genesis binding '{}' must be backfilled: {}", role, e
+                ));
+                assert_eq!(
+                    b.handler_chain_id, *expected_chain,
+                    "genesis backfill for '{}' must use the GENESIS_BINDINGS chain id",
+                    role
+                );
+            }
+        }
+    }
+
+    // ── 8. Regression: backfill is idempotent and preserves operator overrides
+
+    #[test]
+    fn backfill_is_idempotent_and_preserves_overrides() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("pyramid.db");
+
+        // Create a slug and OVERRIDE cascade_handler to something bespoke.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            init_pyramid_db(&conn).unwrap();
+            create_slug(&conn, "custom5", &ContentType::Code, "/tmp/custom5").unwrap();
+            crate::pyramid::role_binding::set_binding(
+                &conn, "custom5", "cascade_handler", "operator-authored-cascade",
+            ).unwrap();
+        }
+
+        // Reopen — backfill must NOT clobber the operator override.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            init_pyramid_db(&conn).unwrap();
+            let b = crate::pyramid::role_binding::resolve_binding(
+                &conn, "custom5", "cascade_handler",
+            ).unwrap();
+            assert_eq!(
+                b.handler_chain_id, "operator-authored-cascade",
+                "backfill must NOT override an existing active binding"
+            );
+        }
+    }
+
+    // ── 9. Starter YAMLs validate — regression against drift ───────────────
+
+    #[test]
+    fn starter_chain_yamls_are_valid_per_chain_engine_validator() {
+        let chains_dir = chains_dir_path();
+        for id in [
+            "starter-cascade-immediate-redistill",
+            "starter-cascade-judge-gated",
+            "starter-meta-layer-oracle",
+        ] {
+            // load_chain_by_id already calls validate_chain under the hood;
+            // any validation error bubbles out as an Err.
+            let _ = chain_loader::load_chain_by_id(id, &chains_dir).unwrap_or_else(|e| {
+                panic!("starter chain '{}' failed validation: {}", id, e)
+            });
+        }
+    }
+
+    // ── 10. Mechanical registry exposes the three new v5 functions ─────────
+
+    #[test]
+    fn v5_mechanical_functions_are_registered() {
+        assert!(chain_dispatch::is_known_mechanical_function(
+            "emit_cascade_handler_invoked"
+        ));
+        assert!(chain_dispatch::is_known_mechanical_function(
+            "queue_re_distill_for_target"
+        ));
+        assert!(chain_dispatch::is_known_mechanical_function(
+            "log_and_complete"
+        ));
+    }
+
+    // ── 11. Observation source 'chain' is accepted by write_observation_event
+
+    #[test]
+    fn observation_events_accept_source_chain() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p5obs", &ContentType::Code, "/tmp/p5obs").unwrap();
+        let eid = observation_events::write_observation_event(
+            &conn, "p5obs", "chain", "cascade_handler_invoked",
+            None, None, None, None, Some("L1-Y"), Some(1), Some("{}"),
+        ).unwrap();
+        assert!(eid > 0);
     }
 }

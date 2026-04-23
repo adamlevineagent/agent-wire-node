@@ -194,7 +194,7 @@ pub async fn dispatch_step(
             .as_deref()
             .ok_or_else(|| anyhow!("Mechanical step '{}' missing rust_function", step.name))?;
         info!("[CHAIN] step '{}' → mechanical fn '{}'", step.name, fn_name);
-        dispatch_mechanical(fn_name, resolved_input, ctx)
+        dispatch_mechanical(fn_name, resolved_input, ctx).await
     } else {
         dispatch_llm(step, resolved_input, system_prompt, defaults, ctx).await
     }
@@ -563,11 +563,21 @@ fn short_model_name(model: &str) -> &str {
 // ── Mechanical dispatch ─────────────────────────────────────────────────────
 
 /// Known mechanical function names for the v1 registry.
+///
+/// Post-build accretion v5 Phase 5 adds three v5 targets (last three) used by
+/// the starter chains that back role_bound dispatches (cascade handlers, the
+/// meta-layer oracle, etc.). These are invoked from
+/// `chain_executor::execute_chain_for_target` via `dispatch_step` /
+/// `dispatch_mechanical`.
 const MECHANICAL_FUNCTIONS: &[&str] = &[
     "extract_import_graph",
     "extract_mechanical_metadata",
     "cluster_by_imports",
     "cluster_by_entity_overlap",
+    // Post-build accretion v5 Phase 5 — role_bound chain primitives.
+    "emit_cascade_handler_invoked",
+    "queue_re_distill_for_target",
+    "log_and_complete",
 ];
 
 /// Dispatch a mechanical step to a named Rust function.
@@ -576,7 +586,13 @@ const MECHANICAL_FUNCTIONS: &[&str] = &[
 /// the generic `(input: &Value, ctx: &ChainDispatchContext) -> Result<Value>` contract.
 /// The dispatch framework is established here; actual wiring happens in Phase 5
 /// when the chain executor replaces the hardcoded build pipeline.
-fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDispatchContext) -> Result<Value> {
+///
+/// Phase 5 post-build-accretion v5: made `async` so the v5 role_bound primitives
+/// (emit_cascade_handler_invoked, queue_re_distill_for_target) can `.await` the
+/// writer mutex and perform a short SQLite INSERT without resorting to
+/// `block_in_place` tricks. Existing placeholder arms don't await and are
+/// unaffected.
+async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDispatchContext) -> Result<Value> {
     match function_name {
         "extract_import_graph" => {
             info!("[mechanical] extract_import_graph (placeholder)");
@@ -613,6 +629,163 @@ fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDispatchCo
                 "_status": "placeholder",
                 "input": input,
             }))
+        }
+        // ── Post-build accretion v5 Phase 5 role_bound primitives ───────────
+        //
+        // These functions back the starter chains invoked by the supervisor's
+        // role_bound dispatch arm. The input shape is free-form JSON; each
+        // primitive reads only the fields it needs and tolerates missing
+        // ones (work items built by the compiler don't set every field).
+        "emit_cascade_handler_invoked" => {
+            // Writes a `cascade_handler_invoked` observation event for
+            // chronicle traceability. Every cascade handler (role_bound)
+            // starter chain emits this at step 1 so the chronicle records
+            // that a handler actually fired for the triggering target.
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str());
+            let reason = input
+                .get("reason")
+                .and_then(|v| v.as_str());
+            // Preserve any additional metadata already carried by the step's
+            // input (work item id, step name, etc.) so downstream observers
+                    // have full context.
+            let mut metadata = serde_json::Map::new();
+            if let Some(obj) = input.as_object() {
+                for (k, v) in obj {
+                    if k != "target_node_id" && k != "target_id" && k != "reason" {
+                        metadata.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            if let Some(r) = reason {
+                metadata.insert("reason".to_string(), Value::String(r.to_string()));
+            }
+            let metadata_json = if metadata.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&Value::Object(metadata))?)
+            };
+
+            info!(
+                "[mechanical] emit_cascade_handler_invoked slug={} target={:?} reason={:?}",
+                ctx.slug, target_node_id, reason
+            );
+            // Short INSERT via the writer mutex. The async lock awaits the
+            // writer briefly — OK because chain runners are already async
+            // and no other await happens while the guard is held.
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "cascade_handler_invoked",
+                None,
+                None,
+                None,
+                None,
+                target_node_id,
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+            Ok(serde_json::json!({ "emitted": true, "event_id": event_id }))
+        }
+        "queue_re_distill_for_target" => {
+            // Creates a `re_distill` work item for the target node. Preserves
+            // the pre-v5 cascade-always-re-distills behavior under the v5
+            // role-binding model — used by starter-cascade-immediate-redistill
+            // (the backfill default for existing pyramids).
+            //
+            // Schema of dadbear_work_items follows the Phase 3 supervisor's
+            // compile path (see db::init_pyramid_db for column list).
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "queue_re_distill_for_target: input missing target_node_id / target_id field"
+                ))?
+                .to_string();
+            let layer: i64 = input
+                .get("layer")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(1);
+            let reason = input
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("cascade re-distill via starter chain")
+                .to_string();
+            info!(
+                "[mechanical] queue_re_distill_for_target slug={} target={} layer={} reason={}",
+                ctx.slug, target_node_id, layer, reason
+            );
+            let wi_id = format!("wi-{}", uuid::Uuid::new_v4());
+            let conn_guard = ctx.db_writer.lock().await;
+            let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let epoch_id = format!("epoch-chain-{}", uuid::Uuid::new_v4());
+            let batch_id = format!("batch-chain-{}", uuid::Uuid::new_v4());
+            let metadata = serde_json::json!({
+                "queued_by_chain": "starter-chain",
+                "reason": reason,
+            });
+            conn_guard.execute(
+                "INSERT INTO dadbear_work_items
+                    (id, slug, batch_id, epoch_id, step_name, primitive,
+                     layer, target_id, system_prompt, user_prompt, model_tier,
+                     result_json, observation_event_ids, compiled_at,
+                     state, state_changed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                         ?12, ?13, ?14, ?15, ?16)",
+                rusqlite::params![
+                    wi_id,              // ?1  id
+                    ctx.slug,           // ?2  slug
+                    batch_id,           // ?3  batch_id
+                    epoch_id,           // ?4  epoch_id
+                    "cascade_re_distill", // ?5 step_name
+                    "re_distill",       // ?6  primitive
+                    layer,              // ?7  layer
+                    target_node_id,     // ?8  target_id
+                    "",                 // ?9  system_prompt
+                    "",                 // ?10 user_prompt
+                    "mid",              // ?11 model_tier
+                    metadata.to_string(), // ?12 result_json
+                    "[]",               // ?13 observation_event_ids
+                    now,                // ?14 compiled_at
+                    "compiled",         // ?15 state
+                    now,                // ?16 state_changed_at
+                ],
+            ).map_err(|e| anyhow!(
+                "queue_re_distill_for_target: failed to insert work item: {}", e
+            ))?;
+            drop(conn_guard);
+            Ok(serde_json::json!({ "queued": true, "work_item_id": wi_id }))
+        }
+        "log_and_complete" => {
+            // MVP starter-chain no-op: log the step name + a small input
+            // summary and return input unchanged. Starter chains whose v6+
+            // LLM logic is pending land here so the work item still CASes
+            // to `applied` (proving the pipeline) without a silent drop.
+            //
+            // feedback_loud_deferrals compliance: this is a deliberate,
+            // documented no-op that surfaces in the log — not a silent stub.
+            let summary = match input {
+                Value::Object(o) => {
+                    let mut keys: Vec<&str> = o.keys().map(|k| k.as_str()).collect();
+                    keys.sort();
+                    format!("object keys=[{}]", keys.join(", "))
+                }
+                Value::Array(a) => format!("array len={}", a.len()),
+                Value::String(s) => format!("string len={}", s.len()),
+                Value::Null => "null".to_string(),
+                other => format!("scalar={}", other),
+            };
+            info!(
+                "[mechanical] log_and_complete slug={} input_summary={}",
+                ctx.slug, summary
+            );
+            Ok(input.clone())
         }
         unknown => Err(anyhow!("Unknown mechanical function: {}", unknown)),
     }
@@ -1229,7 +1402,7 @@ pub async fn dispatch_ir_step(
             Ok((result, None))
         }
         StepOperation::Mechanical => {
-            let result = dispatch_ir_mechanical(step, resolved_input, ctx)?;
+            let result = dispatch_ir_mechanical(step, resolved_input, ctx).await?;
             Ok((result, None))
         }
         StepOperation::Wire | StepOperation::Task | StepOperation::Game => Err(anyhow!(
@@ -1534,7 +1707,7 @@ fn build_cache_ctx_for_ir_step(
 /// Dispatch an IR mechanical step: look up `step.rust_function` in the registry.
 ///
 /// Same registry as the legacy `dispatch_mechanical` but reads from IR types.
-pub fn dispatch_ir_mechanical(
+pub async fn dispatch_ir_mechanical(
     step: &Step,
     resolved_input: &Value,
     ctx: &ChainDispatchContext,
@@ -1544,7 +1717,7 @@ pub fn dispatch_ir_mechanical(
         .as_deref()
         .ok_or_else(|| anyhow!("IR mechanical step '{}' missing rust_function", step.id))?;
     info!("[IR] step '{}' → mechanical fn '{}'", step.id, fn_name);
-    dispatch_mechanical(fn_name, resolved_input, ctx)
+    dispatch_mechanical(fn_name, resolved_input, ctx).await
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -1605,8 +1778,8 @@ mod tests {
         assert!(!is_known_mechanical_function("nonexistent_function"));
     }
 
-    #[test]
-    fn test_dispatch_mechanical_unknown_fn() {
+    #[tokio::test]
+    async fn test_dispatch_mechanical_unknown_fn() {
         let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
@@ -1618,7 +1791,7 @@ mod tests {
             cache_base: None,
             concurrency_cap: None,
         };
-        let result = dispatch_mechanical("nonexistent", &serde_json::json!({}), &ctx);
+        let result = dispatch_mechanical("nonexistent", &serde_json::json!({}), &ctx).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -1626,8 +1799,8 @@ mod tests {
             .contains("Unknown mechanical function"));
     }
 
-    #[test]
-    fn test_dispatch_mechanical_known_fn() {
+    #[tokio::test]
+    async fn test_dispatch_mechanical_known_fn() {
         let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
@@ -1640,7 +1813,7 @@ mod tests {
             concurrency_cap: None,
         };
         let input = serde_json::json!({"files": ["main.rs"]});
-        let result = dispatch_mechanical("extract_import_graph", &input, &ctx).unwrap();
+        let result = dispatch_mechanical("extract_import_graph", &input, &ctx).await.unwrap();
         assert_eq!(result["_mechanical"], "extract_import_graph");
         assert_eq!(result["_status"], "placeholder");
         assert_eq!(result["slug"], "test-slug");
@@ -1871,8 +2044,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_dispatch_ir_mechanical_routes_correctly() {
+    #[tokio::test]
+    async fn test_dispatch_ir_mechanical_routes_correctly() {
         let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
@@ -1887,14 +2060,14 @@ mod tests {
         let mut step = ir_step("mech_step", StepOperation::Mechanical);
         step.rust_function = Some("extract_import_graph".into());
         let input = serde_json::json!({"files": ["lib.rs"]});
-        let result = dispatch_ir_mechanical(&step, &input, &ctx).unwrap();
+        let result = dispatch_ir_mechanical(&step, &input, &ctx).await.unwrap();
         assert_eq!(result["_mechanical"], "extract_import_graph");
         assert_eq!(result["_status"], "placeholder");
         assert_eq!(result["slug"], "ir-test");
     }
 
-    #[test]
-    fn test_dispatch_ir_mechanical_missing_fn_name() {
+    #[tokio::test]
+    async fn test_dispatch_ir_mechanical_missing_fn_name() {
         let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
@@ -1908,7 +2081,7 @@ mod tests {
         };
         let step = ir_step("no_fn", StepOperation::Mechanical);
         // rust_function is None
-        let result = dispatch_ir_mechanical(&step, &serde_json::json!({}), &ctx);
+        let result = dispatch_ir_mechanical(&step, &serde_json::json!({}), &ctx).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -1916,8 +2089,8 @@ mod tests {
             .contains("missing rust_function"));
     }
 
-    #[test]
-    fn test_dispatch_ir_mechanical_unknown_fn() {
+    #[tokio::test]
+    async fn test_dispatch_ir_mechanical_unknown_fn() {
         let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
@@ -1931,7 +2104,7 @@ mod tests {
         };
         let mut step = ir_step("bad_fn", StepOperation::Mechanical);
         step.rust_function = Some("nonexistent_fn".into());
-        let result = dispatch_ir_mechanical(&step, &serde_json::json!({}), &ctx);
+        let result = dispatch_ir_mechanical(&step, &serde_json::json!({}), &ctx).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()

@@ -1,0 +1,36 @@
+schema_version: 1
+id: starter-cascade-judge-gated
+name: Cascade Handler — Judge-gated (v5 default for new pyramids)
+description: >
+  Starter cascade_handler binding for NEW v5 pyramids. The v5 model gates
+  cascade re-distills behind an LLM judge decision: no re-distill unless the
+  judge sees enough change to warrant it.
+
+  Phase 5 ships the mechanical skeleton only:
+    1. Emit cascade_handler_invoked for chronicle/observability.
+    2. log_and_complete (MVP no-op).
+
+  Phase 6 extends this chain with the LLM judge step that decides whether to
+  enqueue a re_distill (like the immediate-redistill variant does
+  unconditionally).
+content_type: code
+version: "1.0.0"
+author: post-build-accretion-v5
+
+defaults:
+  model_tier: mid
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  - name: emit_cascade_invoked
+    primitive: custom
+    mechanical: true
+    rust_function: emit_cascade_handler_invoked
+
+  - name: log_pending_judge
+    primitive: custom
+    mechanical: true
+    rust_function: log_and_complete
+
+post_build: []

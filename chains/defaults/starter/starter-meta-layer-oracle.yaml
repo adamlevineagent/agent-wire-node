@@ -1,0 +1,28 @@
+schema_version: 1
+id: starter-meta-layer-oracle
+name: Meta Layer Oracle — MVP log_and_complete
+description: >
+  Starter binding for the meta_layer_oracle role. Fires on purpose_shifted
+  and gap_resolved events, where the role's job is to decide whether the
+  event should trigger meta-layer synthesis.
+
+  Phase 5 ships the MVP no-op: one log_and_complete step so the role_bound
+  dispatch path can demonstrate work_items CASing to `applied`. Phase 6+
+  extends this chain with the oracle LLM step that reasons about whether a
+  meta-layer crystallization is warranted.
+content_type: code
+version: "1.0.0"
+author: post-build-accretion-v5
+
+defaults:
+  model_tier: mid
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  - name: oracle_log_and_complete
+    primitive: custom
+    mechanical: true
+    rust_function: log_and_complete
+
+post_build: []
