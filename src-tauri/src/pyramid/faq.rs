@@ -18,7 +18,7 @@ use super::llm::LlmConfig;
 use super::llm::{
     call_model_with_override_and_ctx, call_model_with_usage_with_override_and_ctx, extract_json,
 };
-use super::step_context::make_step_ctx_from_llm_config_with_model;
+use super::step_context::make_step_ctx_from_llm_config;
 use super::types::{FaqCategory, FaqCategoryEntry, FaqDirectory, FaqNode, PyramidAnnotation};
 
 /// Called after every annotation is saved.
@@ -94,17 +94,29 @@ pub async fn process_annotation(
         question_context, faq_list
     );
 
-    // W3c: legacy clone_with_model_override removed. Model threads via
-    // LlmCallOptions.model_override + explicit step_ctx model arg.
-    let cache_ctx = make_step_ctx_from_llm_config_with_model(
-        base_config,
-        "faq_match_existing",
-        "faq",
-        -1,
-        None,
-        system_prompt,
-        Some(model),
-    );
+    // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+    // slot="mid" for FAQ work (fast focused decisions / synthesis).
+    let faq_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+    let cache_ctx = match &faq_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "faq_match_existing",
+                "faq",
+                -1,
+                None,
+                system_prompt,
+                "mid",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
     let response = call_model_with_override_and_ctx(
         base_config,
         model,
@@ -279,17 +291,28 @@ async fn match_faq_with_llm(
         question, faq_list
     );
 
-    // W3c: legacy clone_with_model_override removed. Model threads via
-    // LlmCallOptions.model_override + explicit step_ctx model arg.
-    let cache_ctx = make_step_ctx_from_llm_config_with_model(
-        base_config,
-        "faq_disambiguate",
-        "faq",
-        -1,
-        None,
-        system_prompt,
-        Some(model),
-    );
+    // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+    let faq_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+    let cache_ctx = match &faq_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "faq_disambiguate",
+                "faq",
+                -1,
+                None,
+                system_prompt,
+                "mid",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
     let response = call_model_with_override_and_ctx(
         base_config,
         model,
@@ -352,15 +375,28 @@ pub async fn update_faq_answer(
         new_annotation.question_context.as_deref().unwrap_or("(none)")
     );
 
-    let update_ctx = make_step_ctx_from_llm_config_with_model(
-        base_config,
-        "faq_update_answer",
-        "faq",
-        -1,
-        None,
-        system_prompt,
-        Some(model),
-    );
+    // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+    let faq_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+    let update_ctx = match &faq_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "faq_update_answer",
+                "faq",
+                -1,
+                None,
+                system_prompt,
+                "mid",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
     let updated_answer = call_model_with_override_and_ctx(
         base_config,
         model,
@@ -401,15 +437,28 @@ pub async fn update_faq_answer(
             "Current question: {}\nAccumulated triggers: {}\nNew annotation: {}",
             faq.question, triggers_list, new_annotation.content
         );
-        let regen_ctx = make_step_ctx_from_llm_config_with_model(
-            base_config,
-            "faq_regeneralize",
-            "faq",
-            -1,
-            None,
-            regen_system,
-            Some(model),
-        );
+        // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+        let faq_resolved = base_config
+            .provider_registry
+            .as_ref()
+            .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+        let regen_ctx = match &faq_resolved {
+            Some(resolved) => {
+                make_step_ctx_from_llm_config(
+                    base_config,
+                    "faq_regeneralize",
+                    "faq",
+                    -1,
+                    None,
+                    regen_system,
+                    "mid",
+                    Some(model),
+                    Some(&resolved.provider.id),
+                )
+                .await
+            }
+            None => None,
+        };
         match call_model_with_override_and_ctx(
             base_config,
             model,
@@ -484,15 +533,28 @@ async fn create_new_faq(
             question, generalized_text
         );
 
-        let gen_ctx = make_step_ctx_from_llm_config_with_model(
-            base_config,
-            "faq_generalize",
-            "faq",
-            -1,
-            None,
-            gen_system,
-            Some(model),
-        );
+        // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+        let faq_resolved = base_config
+            .provider_registry
+            .as_ref()
+            .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+        let gen_ctx = match &faq_resolved {
+            Some(resolved) => {
+                make_step_ctx_from_llm_config(
+                    base_config,
+                    "faq_generalize",
+                    "faq",
+                    -1,
+                    None,
+                    gen_system,
+                    "mid",
+                    Some(model),
+                    Some(&resolved.provider.id),
+                )
+                .await
+            }
+            None => None,
+        };
         match call_model_with_override_and_ctx(
             base_config,
             model,
@@ -689,16 +751,28 @@ Return ONLY valid JSON: an array of objects with fields "name", "faq_ids", and "
         faq_list
     );
 
-    // W3c: legacy clone_with_model_override removed.
-    let cat_ctx = make_step_ctx_from_llm_config_with_model(
-        base_config,
-        "faq_categorize",
-        "faq",
-        -1,
-        None,
-        system_prompt,
-        Some(model),
-    );
+    // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+    let faq_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+    let cat_ctx = match &faq_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "faq_categorize",
+                "faq",
+                -1,
+                None,
+                system_prompt,
+                "mid",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
     let (response, usage) = call_model_with_usage_with_override_and_ctx(
         base_config,
         model,
