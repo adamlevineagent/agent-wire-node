@@ -13296,6 +13296,16 @@ fn main() {
                 }
             });
 
+            // --- Post-build v5 Phase 9b-1: pyramid_scheduler periodic ticks ---
+            //
+            // Two tokio tasks (accretion + sweep) emit per-slug observation
+            // events on the operator-configured cadence. Periods + thresholds
+            // live in `scheduler_parameters` config contribution (DB-driven,
+            // operator-editable — Pillar 37). The tasks re-read the config
+            // each tick so supersessions land within one period.
+            let scheduler_db_path = config.data_dir().join("pyramid.db");
+            let _scheduler_handle = wire_node_lib::pyramid::pyramid_scheduler::spawn(scheduler_db_path);
+
             // --- Startup: refresh token, register node, start tunnel ---
             let startup_state = state.clone();
             let startup_config = config.clone();

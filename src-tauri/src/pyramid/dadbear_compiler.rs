@@ -230,6 +230,22 @@ pub(crate) fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, 
         "node_re_distilled" => {
             Some(("log_only", "node_redistilled_log", "stale_remote"))
         }
+        // Phase 9b-1: pyramid_scheduler tick events. Each is role_bound
+        // so the slug's configured role binding (default: accretion_handler
+        // → starter-accretion-handler, sweep → starter-sweep) dispatches.
+        // Operators can swap the chain via role_binding supersession per
+        // slug without touching the scheduler.
+        "accretion_tick" => Some(("role_bound", "accretion_tick_dispatch", "stale_remote")),
+        "sweep_tick" => Some(("role_bound", "sweep_tick_dispatch", "stale_remote")),
+        // Phase 9b-2: annotation-volume threshold crossing. Immediate
+        // dispatch path — same role as `accretion_tick` but with richer
+        // metadata (annotation_id, count_since_cursor) so the handler
+        // chain can key off the trigger if desired. Distinct step_name
+        // so has_active_work_item dedup doesn't collapse a threshold-hit
+        // onto a coincident tick-initiated row.
+        "accretion_threshold_hit" => {
+            Some(("role_bound", "accretion_threshold_dispatch", "stale_remote"))
+        }
         unknown => {
             // Per v5 R5 loud-raise discipline: opt-in strict mode for
             // production. Default warn-and-skip preserves backward compat
@@ -906,6 +922,12 @@ pub(crate) fn role_for_event(event_type: &str) -> Option<&'static str> {
         "gap_detected" => None,
         "gap_resolved" | "purpose_shifted" => Some("meta_layer_oracle"),
         "meta_layer_crystallized" => Some("synthesizer"),
+        // Phase 9b-1/9b-2: scheduler tick + volume-threshold trigger
+        // fan out to the slug's `accretion_handler` / `sweep` role
+        // bindings. The slug can supersede the binding to swap
+        // chains without touching this map.
+        "accretion_tick" | "accretion_threshold_hit" => Some("accretion_handler"),
+        "sweep_tick" => Some("sweep"),
         _ => None,
     }
 }

@@ -2720,6 +2720,18 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         );
     }
 
+    // ── Post-build accretion v5 Phase 9b-1: scheduler genesis ──────────────
+    //
+    // Seed the single global `scheduler_parameters` contribution row if
+    // missing. Idempotent — operator supersessions persist across boots.
+    // Failure is logged but doesn't abort init; the scheduler's load path
+    // falls back to hardcoded defaults + loud-logs when the row is absent.
+    if let Err(e) = super::pyramid_scheduler::seed_scheduler_defaults(conn) {
+        tracing::error!(
+            "post-build-v5 Phase 9b-1 scheduler_parameters genesis seed failed during init_pyramid_db: {e}"
+        );
+    }
+
     Ok(())
 }
 

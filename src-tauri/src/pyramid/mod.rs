@@ -137,6 +137,7 @@ pub mod market_identity;
 pub mod market_mirror;
 pub mod market_surface_cache;
 pub mod pending_jobs;
+pub mod pyramid_scheduler;
 pub mod result_delivery_identity;
 pub mod messages;
 pub mod prompt_materializer;

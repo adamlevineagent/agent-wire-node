@@ -28,6 +28,9 @@ use rusqlite::Connection;
 ///                                                //                 types, node shapes,
 ///                                                //                 role names — stored as
 ///                                                //                 contribution subtype)
+///             | "scheduler"                      // Phase 9b: pyramid_scheduler periodic
+///                                                //           tick + volume-threshold
+///                                                //           annotation hook
 /// - `event_type`: "file_modified" | "file_created" | "file_deleted" | "file_renamed"
 ///                  | "cascade_stale" | "edge_stale" | "evidence_growth" | "vine_stale"
 ///                  | "targeted_stale" | "full_sweep"
@@ -70,6 +73,17 @@ use rusqlite::Connection;
 ///                                                     //                 annotation → cascade_handler →
 ///                                                     //                 queue_re_distill → supervisor →
 ///                                                     //                 execute_supersession → this.
+///                  | "accretion_tick"                // Phase 9b-1: pyramid_scheduler periodic
+///                                                     //             accretion tick — fans to
+///                                                     //             accretion_handler role binding
+///                  | "sweep_tick"                    // Phase 9b-1: pyramid_scheduler periodic
+///                                                     //             sweep tick — fans to sweep
+///                                                     //             role binding
+///                  | "accretion_threshold_hit"       // Phase 9b-2: annotation hook volume-
+///                                                     //             threshold immediate trigger
+///                                                     //             (same role routing as
+///                                                     //             accretion_tick; different
+///                                                     //             step_name so dedup works)
 /// - `source_path`: filesystem path for the observation source (NULL for internal events)
 /// - `file_path`: filesystem path of the affected file (NULL for internal events)
 /// - `content_hash`: SHA-256 of new content (NULL for deletes/internal)
