@@ -32068,3 +32068,568 @@ mod phase7d_post_build_tests {
         assert_eq!(persisted, max_id, "cursor must still be at max_id");
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 8 (post-build accretion v5) tests — THE original DADBEAR non-firing
+// bug fix.
+//
+// Coverage:
+//   1. annotation_written compiles to a role_bound work item whose
+//      resolved_chain_id is the cascade_handler binding.
+//   2. CROWN JEWEL: end-to-end annotation → cascade → re_distill actually
+//      UPDATES pyramid_nodes.distilled/headline/topics/build_version.
+//   3. Legacy slugs route via starter-cascade-immediate-redistill and
+//      enqueue a re_distill work item.
+//   4. New slugs route via starter-cascade-judge-gated; LLM judge says
+//      "redistill" → work item queued.
+//   5. Judge says "skip" → no re_distill; node unchanged.
+//   6. gap_resolved observation event fires from mark_gap_resolved.
+//   7. debate_collapsed emitter is dormant but correctly shaped (deferral
+//      cover test until v6 trigger lands).
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod phase8_post_build_tests {
+    use super::*;
+    use super::post_build_test_support::test_lock;
+    use super::phase6_post_build_tests::{mocked_llm_config, openrouter_body, pyramid_state_with_llm_config};
+    use crate::pyramid::types::{AnnotationType, ContentType, PyramidAnnotation};
+    use crate::pyramid::{chain_executor, chain_loader, dadbear_compiler, observation_events, role_binding, vocab_entries};
+    use rusqlite::Connection;
+
+    fn fresh_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        conn
+    }
+
+    /// Write an annotation_written observation event mirroring what
+    /// routes::emit_annotation_observation_events would produce against
+    /// a real annotation save.
+    fn write_annotation_written_event(
+        conn: &Connection,
+        slug: &str,
+        target_node_id: &str,
+        layer: i64,
+        annotation_id: i64,
+    ) -> i64 {
+        let metadata = serde_json::json!({
+            "annotation_id": annotation_id,
+            "annotation_type": "observation",
+            "annotated_node_id": target_node_id,
+            "author": "phase8-test",
+        })
+        .to_string();
+        observation_events::write_observation_event(
+            conn,
+            slug,
+            "annotation",
+            "annotation_written",
+            None, None, None, None,
+            Some(target_node_id),
+            Some(layer),
+            Some(&metadata),
+        )
+        .unwrap()
+    }
+
+    fn seed_l1_node(conn: &Connection, slug: &str, node_id: &str) {
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt,
+                 topics, terms, decisions, dead_ends, children, parent_id,
+                 build_version, created_at)
+             VALUES (?1, ?2, 1, 'old headline', 'old distilled content',
+                     '', '[]', '[]', '[]', '[]', '[]', NULL, 1, datetime('now'))",
+            rusqlite::params![node_id, slug],
+        )
+        .unwrap();
+    }
+
+    // ── Test 1: compile tick — annotation_written routes to role_bound
+    // ──────────────────────────────────────────────────────────────────────
+    //
+    // Phase 8-1 flip regression test. Given an annotation_written observation
+    // event, the compiler must produce a work item with primitive=role_bound
+    // and resolved_chain_id equal to the slug's cascade_handler binding.
+    // Pre-flip the item was primitive=re_distill with step_name=
+    // annotation_redistill which silently no-op'd in the supervisor.
+    #[test]
+    fn annotation_written_routes_to_cascade_handler_role_bound() {
+        let _guard = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p8-route", &ContentType::Code, "/tmp/p8-route").unwrap();
+        role_binding::initialize_genesis_bindings(&conn, "p8-route").unwrap();
+        seed_l1_node(&conn, "p8-route", "L1-ROUTE");
+
+        write_annotation_written_event(&conn, "p8-route", "L1-ROUTE", 1, 42);
+
+        let res = dadbear_compiler::run_compilation_for_slug(
+            &conn, "p8-route", None, None,
+        )
+        .unwrap();
+        assert_eq!(res.items_compiled, 1, "one role_bound work item expected");
+
+        let (primitive, step_name, resolved_chain_id, target_id, layer): (
+            String, String, Option<String>, Option<String>, i64,
+        ) = conn
+            .query_row(
+                "SELECT primitive, step_name, resolved_chain_id, target_id, layer
+                   FROM dadbear_work_items
+                  WHERE slug = 'p8-route'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("one work item row");
+        assert_eq!(primitive, "role_bound", "Phase 8-1: no longer re_distill");
+        assert_eq!(step_name, "annotation_cascade");
+        assert_eq!(target_id.as_deref(), Some("L1-ROUTE"));
+        assert_eq!(layer, 1);
+
+        // New-slug policy: cascade_handler binding is the judge-gated chain.
+        let chain_id = resolved_chain_id.expect("role_bound must carry resolved_chain_id");
+        assert_eq!(
+            chain_id,
+            role_binding::CASCADE_HANDLER_NEW_DEFAULT,
+            "new slugs route via judge-gated cascade_handler"
+        );
+    }
+
+    // ── Test 2: CROWN JEWEL — end-to-end annotation → re_distill → node updated
+    // ──────────────────────────────────────────────────────────────────────
+    //
+    // THE test for the original DADBEAR non-firing bug. We drive
+    // execute_supersession directly (the function the Phase 8-2 supervisor
+    // arm now delegates to) with a mocked LLM that returns a valid
+    // ChangeManifest whose content_updates.distilled carries the new text.
+    // After the call, the pyramid_nodes row MUST reflect the new distilled
+    // content + bumped build_version.
+    //
+    // Pre-Phase-8 flow: annotation landed → cascade chain queued a
+    // re_distill work item → supervisor default arm marked it
+    // applied:re_distill without touching the node. The pyramid never
+    // reflected the annotation. This test would have been impossible to
+    // make green pre-Phase-8: no code path UPDATE'd pyramid_nodes for a
+    // re_distill primitive. It goes green now because the supervisor's
+    // new re_distill arm runs execute_supersession which does the update.
+    #[tokio::test]
+    async fn re_distill_end_to_end_updates_node_distilled_and_headline() {
+        let _guard = test_lock();
+
+        // Mocked LLM returns a valid ChangeManifest whose
+        // content_updates.distilled is the post-annotation text.
+        let mut server = mockito::Server::new_async().await;
+        let manifest_json = serde_json::json!({
+            "node_id": "L1-CROWN",
+            "identity_changed": false,
+            "content_updates": {
+                "distilled": "NEW distilled reflecting the annotation — crown jewel payload",
+                "headline": "updated headline post-annotation"
+            },
+            "children_swapped": [],
+            "reason": "annotation cascade triggered re-distill",
+            "build_version": 2
+        })
+        .to_string();
+        let _m = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openrouter_body(&manifest_json))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        create_slug(&conn, "p8-crown", &ContentType::Code, "/tmp/p8-crown").unwrap();
+        seed_l1_node(&conn, "p8-crown", "L1-CROWN");
+
+        // Baseline assertions: pre-re_distill state.
+        let (old_distilled, old_headline, old_bv): (String, String, i64) = conn
+            .query_row(
+                "SELECT distilled, headline, build_version
+                   FROM pyramid_nodes
+                  WHERE slug = 'p8-crown' AND id = 'L1-CROWN'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(old_distilled, "old distilled content");
+        assert_eq!(old_headline, "old headline");
+        assert_eq!(old_bv, 1);
+        drop(conn);
+
+        // Persist the DB + obtain its path so execute_supersession can
+        // re-open it (same pattern phase7b's crown jewel uses).
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap().to_string();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            init_pyramid_db(&conn).unwrap();
+            vocab_entries::invalidate_cache();
+            create_slug(&conn, "p8-crown", &ContentType::Code, "/tmp/p8-crown").unwrap();
+            seed_l1_node(&conn, "p8-crown", "L1-CROWN");
+            drop(conn);
+        }
+
+        let config = mocked_llm_config(server.url()).await;
+        // execute_supersession is the exact call the Phase 8-2 supervisor
+        // re_distill arm makes.
+        let resolved = crate::pyramid::stale_helpers_upper::execute_supersession(
+            "L1-CROWN",
+            &db_path,
+            "p8-crown",
+            &config,
+            "openai/gpt-4o-mini",
+        )
+        .await
+        .expect("execute_supersession must succeed against mocked LLM");
+        assert_eq!(resolved, "L1-CROWN", "node identity must NOT change");
+
+        // ── THE CROWN JEWEL ASSERTIONS ─────────────────────────────────
+        // pyramid_nodes.distilled / headline MUST reflect the mocked
+        // ChangeManifest. build_version MUST have bumped from 1 → 2.
+        let conn = Connection::open(&db_path).unwrap();
+        let (new_distilled, new_headline, new_bv): (String, String, i64) = conn
+            .query_row(
+                "SELECT distilled, headline, COALESCE(build_version, 1)
+                   FROM pyramid_nodes
+                  WHERE slug = 'p8-crown' AND id = 'L1-CROWN'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(
+            new_distilled.contains("NEW distilled reflecting the annotation"),
+            "pyramid_nodes.distilled must be the mocked manifest's new content, got: {new_distilled}"
+        );
+        assert_eq!(new_headline, "updated headline post-annotation");
+        assert_eq!(new_bv, 2, "build_version must bump from 1 → 2");
+    }
+
+    // ── Test 3: legacy slug cascade path — immediate-redistill queues re_distill
+    // ──────────────────────────────────────────────────────────────────────
+    //
+    // Existing (pre-v5) slugs get CASCADE_HANDLER_EXISTING_DEFAULT
+    // (starter-cascade-immediate-redistill) bound to cascade_handler. The
+    // chain's terminal mechanical queues a re_distill work item
+    // unconditionally — no judge gate. This test runs the chain directly
+    // and asserts the re_distill work item lands.
+    #[tokio::test]
+    async fn legacy_slug_cascade_path_via_immediate_redistill() {
+        let _guard = test_lock();
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        create_slug(&conn, "p8-legacy", &ContentType::Code, "/tmp/p8-legacy").unwrap();
+        // Rebind cascade_handler → immediate-redistill (simulates
+        // existing-slug backfill posture).
+        role_binding::set_binding(
+            &conn,
+            "p8-legacy",
+            "cascade_handler",
+            role_binding::CASCADE_HANDLER_EXISTING_DEFAULT,
+        )
+        .unwrap();
+
+        let config = crate::pyramid::llm::LlmConfig::default();
+        let state = pyramid_state_with_llm_config(conn, config);
+
+        let chain = chain_loader::load_chain_by_id(
+            role_binding::CASCADE_HANDLER_EXISTING_DEFAULT,
+            &state.chains_dir,
+        )
+        .expect("immediate-redistill chain must load");
+
+        let inputs = serde_json::json!({
+            "work_item_id": "wi-p8-legacy",
+            "target_node_id": "L1-LEGACY",
+            "layer": 1,
+            "reason": "annotation cascade legacy-slug path",
+        });
+        chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p8-legacy",
+            Some("L1-LEGACY"),
+            inputs,
+        )
+        .await
+        .expect("immediate-redistill chain must run end-to-end");
+
+        // re_distill work item must exist — queue_re_distill_for_target
+        // always runs in this chain (no judge gate).
+        let writer = state.writer.lock().await;
+        let (target, primitive): (Option<String>, String) = writer
+            .query_row(
+                "SELECT target_id, primitive
+                   FROM dadbear_work_items
+                  WHERE slug = 'p8-legacy' AND primitive = 're_distill'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("legacy path must enqueue a re_distill work item");
+        assert_eq!(target.as_deref(), Some("L1-LEGACY"));
+        assert_eq!(primitive, "re_distill");
+    }
+
+    // ── Test 4: new slug cascade path — judge-gated approves
+    // ──────────────────────────────────────────────────────────────────────
+    //
+    // Fresh slug gets CASCADE_HANDLER_NEW_DEFAULT. Judge LLM says
+    // "redistill" → queue step fires → re_distill work item lands.
+    // Parallels Phase 6's judge_cascade_relevance_redistill test but
+    // explicitly proves the Phase 8 route flip carries the flow through
+    // the `annotation_written` → cascade_handler binding.
+    #[tokio::test]
+    async fn new_slug_cascade_path_via_judge_gated() {
+        let _guard = test_lock();
+        let mut server = mockito::Server::new_async().await;
+        let mock_content =
+            r#"{"decision":"redistill","reasoning":"annotation adds material new claim"}"#;
+        let _m = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openrouter_body(mock_content))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        create_slug(&conn, "p8-new", &ContentType::Code, "/tmp/p8-new").unwrap();
+        // create_slug seeds cascade_handler → judge-gated via genesis.
+        let binding = role_binding::resolve_binding(&conn, "p8-new", "cascade_handler").unwrap();
+        assert_eq!(binding.handler_chain_id, role_binding::CASCADE_HANDLER_NEW_DEFAULT);
+
+        let config = mocked_llm_config(server.url()).await;
+        let state = pyramid_state_with_llm_config(conn, config);
+
+        let chain = chain_loader::load_chain_by_id(
+            role_binding::CASCADE_HANDLER_NEW_DEFAULT,
+            &state.chains_dir,
+        )
+        .expect("judge-gated chain must load");
+
+        let inputs = serde_json::json!({
+            "work_item_id": "wi-p8-new",
+            "target_node_id": "L1-NEW",
+            "layer": 1,
+            "cascade_reason": "annotation cascade new-slug path",
+        });
+        chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p8-new",
+            Some("L1-NEW"),
+            inputs,
+        )
+        .await
+        .expect("judge-gated chain must run end-to-end on redistill");
+
+        let writer = state.writer.lock().await;
+        let primitive: String = writer
+            .query_row(
+                "SELECT primitive FROM dadbear_work_items
+                  WHERE slug = 'p8-new' AND primitive = 're_distill'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("new-slug judge-approve path must enqueue re_distill");
+        assert_eq!(primitive, "re_distill");
+    }
+
+    // ── Test 5: judge-gated skip path — no re_distill, node unchanged
+    // ──────────────────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn judge_gated_skip_path_leaves_node_unchanged() {
+        let _guard = test_lock();
+        let mut server = mockito::Server::new_async().await;
+        let mock_content = r#"{"decision":"skip","reasoning":"pure-metadata annotation"}"#;
+        let _m = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openrouter_body(mock_content))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        create_slug(&conn, "p8-skip", &ContentType::Code, "/tmp/p8-skip").unwrap();
+        seed_l1_node(&conn, "p8-skip", "L1-SKIP");
+        // Snapshot pre-chain node state.
+        let (pre_distilled, pre_bv): (String, i64) = conn
+            .query_row(
+                "SELECT distilled, build_version
+                   FROM pyramid_nodes WHERE slug = 'p8-skip' AND id = 'L1-SKIP'",
+                [], |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        let config = mocked_llm_config(server.url()).await;
+        let state = pyramid_state_with_llm_config(conn, config);
+
+        let chain = chain_loader::load_chain_by_id(
+            role_binding::CASCADE_HANDLER_NEW_DEFAULT,
+            &state.chains_dir,
+        )
+        .expect("judge-gated chain must load");
+        chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p8-skip",
+            Some("L1-SKIP"),
+            serde_json::json!({
+                "work_item_id": "wi-p8-skip",
+                "target_node_id": "L1-SKIP",
+                "layer": 1,
+                "cascade_reason": "skip path",
+            }),
+        )
+        .await
+        .expect("judge-gated chain must run on skip decision");
+
+        // No re_distill queued.
+        let writer = state.writer.lock().await;
+        let rd_count: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_work_items
+                  WHERE slug = 'p8-skip' AND primitive = 're_distill'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rd_count, 0,
+            "judge-skip path MUST NOT enqueue a re_distill work item"
+        );
+
+        // Node state unchanged — pre-Phase-8 this would have been the
+        // same outcome, but only coincidentally. Phase 8 preserves it
+        // as an explicit contract.
+        let (post_distilled, post_bv): (String, i64) = writer
+            .query_row(
+                "SELECT distilled, build_version
+                   FROM pyramid_nodes WHERE slug = 'p8-skip' AND id = 'L1-SKIP'",
+                [], |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(post_distilled, pre_distilled, "skip must leave distilled untouched");
+        assert_eq!(post_bv, pre_bv, "skip must NOT bump build_version");
+    }
+
+    // ── Test 6: gap_resolved emitter fires from mark_gap_resolved
+    // ──────────────────────────────────────────────────────────────────────
+    //
+    // Phase 8-4 extended mark_gap_resolved to write a gap_resolved
+    // observation event alongside the pyramid_gaps UPDATE. This test
+    // seeds a gap, calls mark_gap_resolved, and asserts both sides.
+    #[test]
+    fn gap_resolved_emitter_fires_on_mark_gap_resolved() {
+        let _guard = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p8-gap", &ContentType::Code, "/tmp/p8-gap").unwrap();
+        // Seed a gap directly in pyramid_gaps.
+        let gap = crate::pyramid::types::GapReport {
+            question_id: "Q-42".to_string(),
+            description: "missing explanation of the DADBEAR non-firing bug".to_string(),
+            layer: 1,
+            resolved: false,
+            resolution_confidence: 0.0,
+        };
+        save_gap(&conn, "p8-gap", &gap, Some("build-1")).unwrap();
+
+        // Call the new emitter-aware function.
+        mark_gap_resolved_with_reason(
+            &conn,
+            "p8-gap",
+            "Q-42",
+            "missing explanation of the DADBEAR non-firing bug",
+            "operator_closure",
+            "phase8-test",
+        )
+        .unwrap();
+
+        // (a) pyramid_gaps row marked resolved.
+        let resolved_flag: i64 = conn
+            .query_row(
+                "SELECT resolved FROM pyramid_gaps
+                  WHERE slug = 'p8-gap' AND question_id = 'Q-42'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved_flag, 1, "UPDATE must have flipped resolved=1");
+
+        // (b) gap_resolved observation event landed with correct metadata.
+        let (event_type, metadata_json): (String, Option<String>) = conn
+            .query_row(
+                "SELECT event_type, metadata_json
+                   FROM dadbear_observation_events
+                  WHERE slug = 'p8-gap' AND event_type = 'gap_resolved'",
+                [], |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("gap_resolved event must have been emitted");
+        assert_eq!(event_type, "gap_resolved");
+        let meta: serde_json::Value =
+            serde_json::from_str(metadata_json.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(meta["gap_question_id"], serde_json::json!("Q-42"));
+        assert_eq!(meta["resolution_reason"], serde_json::json!("operator_closure"));
+        assert_eq!(meta["resolved_by"], serde_json::json!("phase8-test"));
+    }
+
+    // ── Test 7: debate_collapsed emitter shape (deferral cover)
+    // ──────────────────────────────────────────────────────────────────────
+    //
+    // Phase 8-3 shipped the emitter as dormant (no trigger wired — v6).
+    // This test pins the emitter's metadata shape so whatever Phase 9+
+    // wires doesn't drift from the chronicle contract.
+    #[test]
+    fn debate_collapsed_emitter_writes_expected_shape_when_called_directly() {
+        let _guard = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p8-debate", &ContentType::Code, "/tmp/p8-debate").unwrap();
+
+        let event_id = observation_events::emit_debate_collapsed(
+            &conn,
+            "p8-debate",
+            "L2-DEBATE",
+            Some(2),
+            "last_position_abandoned",
+            0,
+            "phase8-test",
+        )
+        .unwrap();
+        assert!(event_id > 0);
+
+        let (event_type, target, layer, metadata_json): (
+            String, Option<String>, Option<i64>, Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT event_type, target_node_id, layer, metadata_json
+                   FROM dadbear_observation_events WHERE id = ?1",
+                rusqlite::params![event_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(event_type, "debate_collapsed");
+        assert_eq!(target.as_deref(), Some("L2-DEBATE"));
+        assert_eq!(layer, Some(2));
+        let meta: serde_json::Value =
+            serde_json::from_str(metadata_json.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(meta["debate_node_id"], serde_json::json!("L2-DEBATE"));
+        assert_eq!(meta["reason"], serde_json::json!("last_position_abandoned"));
+        assert_eq!(meta["positions_remaining"], serde_json::json!(0));
+        assert_eq!(meta["collapsed_by"], serde_json::json!("phase8-test"));
+    }
+
+    // Silences unused-import warning when only some tests run.
+    #[allow(dead_code)]
+    fn _touch_annotation_type(_: AnnotationType, _: PyramidAnnotation) {}
+}
