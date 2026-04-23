@@ -18,6 +18,15 @@ use rusqlite::Connection;
 ///                  | "cascade_stale" | "edge_stale" | "evidence_growth" | "vine_stale"
 ///                  | "targeted_stale" | "full_sweep"
 ///                  | "annotation_written" | "annotation_superseded"
+///                  | "annotation_reacted"            // v5: vote event
+///                  | "debate_spawned"                // v5: silent->named
+///                  | "debate_collapsed"              // v5: debate resolved
+///                  | "gap_detected"                  // v5: gap surfaced
+///                  | "gap_resolved"                  // v5: gap closed
+///                  | "purpose_shifted"               // v5: purpose superseded
+///                  | "meta_layer_crystallized"       // v5: meta-layer emerged
+///                  | "binding_unresolved"            // v5: observability for RAISE
+///                  | "cascade_handler_invoked"       // v5: chronicle cascade trace
 /// - `source_path`: filesystem path for the observation source (NULL for internal events)
 /// - `file_path`: filesystem path of the affected file (NULL for internal events)
 /// - `content_hash`: SHA-256 of new content (NULL for deletes/internal)

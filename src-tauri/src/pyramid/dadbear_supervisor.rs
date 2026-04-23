@@ -700,6 +700,102 @@ impl DadbearSupervisor {
                 )
                 .await?;
             }
+            // Post-build accretion v5 Phase 3 (WS3-C): log-only primitive.
+            // Observability events (binding_unresolved, cascade_handler_invoked)
+            // produce a chronicle trail without triggering any actual work.
+            "log_only" => {
+                tracing::info!(
+                    slug = %slug,
+                    work_item_id = %item.id,
+                    step_name = %item.step_name,
+                    "log_only event processed (chronicle-only, no side effects)"
+                );
+            }
+            // Post-build accretion v5 Phase 3 (WS3-C): role_bound dispatch.
+            // The compiler stamps resolved_chain_id onto the work_item when
+            // map_event_to_primitive returns "role_bound" for this event_type.
+            // Supervisor invokes the bound chain via the lightweight runner
+            // chain_executor::execute_chain_for_target.
+            //
+            // v5 Phase 1 ships execute_chain_for_target as a stub. Phase 5
+            // (first starter chain ships) and Phase 8 (cascade rebinding
+            // activates annotation_written via role_bound) are when this arm
+            // actually produces work. Until then it returns the stub's
+            // "implementation pending" error which is surfaced as a work
+            // item failure — honest about the state.
+            "role_bound" => {
+                // Re-query resolved_chain_id from the work_items row to
+                // avoid plumbing a new field through WorkItem's 3
+                // constructor sites + SELECT statement. One extra DB read
+                // per role_bound dispatch; acceptable given these dispatches
+                // are rare (judge-gated, sweep, debate-spawn, etc.).
+                let chain_id: Option<String> = {
+                    let db_path_rq = db_path.clone();
+                    let wi_id_rq = item.id.clone();
+                    tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+                        let conn = Connection::open(&db_path_rq)?;
+                        let v: Option<String> = conn
+                            .query_row(
+                                "SELECT resolved_chain_id FROM dadbear_work_items WHERE id = ?1",
+                                params![wi_id_rq],
+                                |row| row.get(0),
+                            )
+                            .ok()
+                            .flatten();
+                        Ok(v)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("join error reading resolved_chain_id: {e}"))??
+                };
+                let chain_id = match chain_id {
+                    Some(id) if !id.is_empty() => id,
+                    _ => {
+                        tracing::error!(
+                            slug = %slug,
+                            work_item_id = %item.id,
+                            "role_bound work item missing resolved_chain_id — compiler bug"
+                        );
+                        return Err(anyhow::anyhow!(
+                            "role_bound work_item '{}' missing resolved_chain_id",
+                            item.id
+                        ));
+                    }
+                };
+                // Phase 3 ships the wiring; the chain_executor runner body
+                // is stubbed in Phase 1 (chain_executor::execute_chain_for_target
+                // returns "implementation pending"). Phase 5 lands the first
+                // real starter chain; this arm becomes exercisable then.
+                let chains_dir = self.pyramid_state.chains_dir.clone();
+                let chain = crate::pyramid::chain_loader::load_chain_by_id(
+                    &chain_id,
+                    chains_dir.as_path(),
+                )
+                .with_context(|| {
+                    format!(
+                        "role_bound: failed to load chain '{}' for slug '{}'",
+                        chain_id, slug
+                    )
+                })?;
+                let _result = crate::pyramid::chain_executor::execute_chain_for_target(
+                    &self.pyramid_state,
+                    &chain,
+                    &slug,
+                    item.target_id.as_deref(),
+                    serde_json::json!({
+                        "work_item_id": &item.id,
+                        "step_name": &item.step_name,
+                        "target_id": item.target_id,
+                        "layer": item.layer,
+                    }),
+                )
+                .await?;
+                tracing::info!(
+                    slug = %slug,
+                    work_item_id = %item.id,
+                    chain_id = %chain_id,
+                    "role_bound chain invocation complete"
+                );
+            }
             _ => {
                 warn!(
                     primitive = %primitive,

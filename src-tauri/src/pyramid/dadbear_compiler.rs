@@ -138,9 +138,44 @@ fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, &'static st
         "faq_category_stale" => Some(("faq_redistill", "faq_redistill", "stale_remote")),
         "full_sweep" => Some(("extract", "full_sweep_extract", "stale_remote")),
         "annotation_written" | "annotation_superseded" => {
+            // Legacy mapping. Phase 8 flips this to role_bound cascade_handler.
+            // Pre-Phase-8 behavior preserved so existing pyramids at upgrade
+            // see no change until the backfill lands.
             Some(("re_distill", "annotation_redistill", "stale_remote"))
         }
-        _ => None,
+        // ── Post-build accretion v5 event types ─────────────────────────────
+        // Per v5 R8: per-event-type step_names so dedup in has_active_work_item
+        // (keyed on target_id + step_name + layer) doesn't collapse
+        // semantically distinct events onto the same work_item row.
+        "annotation_reacted" => Some(("role_bound", "cascade_reacted", "stale_remote")),
+        "debate_spawned" => Some(("role_bound", "debate_spawn", "stale_remote")),
+        "debate_collapsed" => Some(("role_bound", "debate_collapse", "stale_remote")),
+        "gap_detected" => Some(("role_bound", "gap_dispatch", "stale_remote")),
+        "gap_resolved" => Some(("role_bound", "oracle_gap_resolved", "stale_remote")),
+        "purpose_shifted" => Some(("role_bound", "oracle_purpose_shift", "stale_remote")),
+        "meta_layer_crystallized" => Some(("role_bound", "synthesize_meta_layer", "stale_remote")),
+        // Chronicle-only events (log_only dispatches nothing; observability hook).
+        "binding_unresolved" => Some(("log_only", "binding_unresolved_log", "stale_remote")),
+        "cascade_handler_invoked" => Some(("log_only", "cascade_invoked_log", "stale_remote")),
+        unknown => {
+            // Per v5 R5 loud-raise discipline: opt-in strict mode for
+            // production. Default warn-and-skip preserves backward compat
+            // for any pre-existing emitter outside the known vocabulary.
+            if std::env::var("STRICT_UNKNOWN_EVENTS").is_ok() {
+                panic!(
+                    "map_event_to_primitive: unknown event_type '{}' — \
+                     must be added to the map before emission. Unset \
+                     STRICT_UNKNOWN_EVENTS to warn-skip instead.",
+                    unknown
+                );
+            }
+            tracing::warn!(
+                event_type = %unknown,
+                "map_event_to_primitive: unknown event_type — skipping. \
+                 Set STRICT_UNKNOWN_EVENTS=1 to raise instead."
+            );
+            None
+        }
     }
 }
 
@@ -355,14 +390,19 @@ pub fn compile_observations(
         });
     }
 
-    let new_cursor = events.iter().map(|e| e.id).max().unwrap_or(last_compiled_observation_id);
+    // v5 R4 cursor-gating fix: max of all-read events is dangerous because
+    // a failed role-binding resolution (role_bound events) can leave the
+    // event permanently skipped if cursor jumps past it. Compute cursor from
+    // successfully-processed event ids only.
+    let max_event_id = events.iter().map(|e| e.id).max().unwrap_or(last_compiled_observation_id);
     let ep_short = epoch_short(epoch_id);
-    let bid = batch_id(slug, &ep_short, new_cursor);
+    let bid = batch_id(slug, &ep_short, max_event_id);
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     let mut items_compiled = 0usize;
     let mut deps_created = 0usize;
     let mut deduped = 0usize;
+    let mut compiled_event_ids: Vec<i64> = Vec::new();
 
     // ── (b-g) Process each observation event ─────────────────────────────
     for event in &events {
@@ -376,8 +416,66 @@ pub fn compile_observations(
                     event_id = event.id,
                     "Unknown observation event type, skipping"
                 );
+                // Skipped events DO still advance the cursor — they're
+                // vocabulary drift, not resolution failures. If the operator
+                // wants strict handling, STRICT_UNKNOWN_EVENTS=1 makes
+                // map_event_to_primitive panic before reaching this line.
+                compiled_event_ids.push(event.id);
                 continue;
             }
+        };
+
+        // v5 Phase 3: for role_bound events, resolve the binding up front
+        // and capture the handler chain id. On resolution failure, we do
+        // NOT advance the cursor past this event so the next tick retries.
+        let resolved_chain_id: Option<String> = if primitive == "role_bound" {
+            let role_name = match role_for_event(&event.event_type) {
+                Some(r) => r,
+                None => {
+                    warn!(
+                        slug = %slug,
+                        event_type = %event.event_type,
+                        event_id = event.id,
+                        "role_bound event has no role mapping — misconfigured event vocabulary"
+                    );
+                    // Cursor does NOT advance — retry next tick after fix.
+                    continue;
+                }
+            };
+            match crate::pyramid::role_binding::resolve_binding(conn, slug, role_name) {
+                Ok(binding) => Some(binding.handler_chain_id),
+                Err(e) => {
+                    warn!(
+                        slug = %slug,
+                        event_type = %event.event_type,
+                        role = %role_name,
+                        event_id = event.id,
+                        error = %e,
+                        "role_bound resolution failed — cursor held, retry next tick"
+                    );
+                    // Emit chronicle entry for observability
+                    let _ = crate::pyramid::observation_events::write_observation_event(
+                        conn,
+                        slug,
+                        "dadbear",
+                        "binding_unresolved",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(&format!(
+                            r#"{{"role":"{}","event_type":"{}","source_event_id":{}}}"#,
+                            role_name, event.event_type, event.id
+                        )),
+                    );
+                    // Cursor does NOT advance — retry next tick.
+                    continue;
+                }
+            }
+        } else {
+            None
         };
 
         let target_id = derive_target_id(event);
@@ -393,6 +491,9 @@ pub fn compile_observations(
                 layer = layer,
                 "Dedup: active work item already exists, skipping"
             );
+            // Dedup-skipped events should still advance the cursor —
+            // they're semantic duplicates that an earlier tick handled.
+            compiled_event_ids.push(event.id);
             continue;
         }
 
@@ -447,10 +548,26 @@ pub fn compile_observations(
         if !inserted {
             // Work item ID already exists (idempotent — semantic path collision)
             deduped += 1;
+            // Dedup via semantic path collision also counts as processed.
+            compiled_event_ids.push(event.id);
             continue;
         }
 
         items_compiled += 1;
+        compiled_event_ids.push(event.id);
+
+        // v5 Phase 3: for role_bound dispatch, stamp the resolved chain id
+        // onto the work_item row so the supervisor's dispatch arm can load
+        // and invoke the chain without re-resolving the binding.
+        if let Some(chain_id) = &resolved_chain_id {
+            conn.execute(
+                "UPDATE dadbear_work_items SET resolved_chain_id = ?1 WHERE id = ?2",
+                params![chain_id, &wi_id],
+            )
+            .with_context(|| format!(
+                "Failed to stamp resolved_chain_id on work_item '{wi_id}'"
+            ))?;
+        }
 
         // (g) Create dependency edges for cross-layer items.
         // The cascade observation's metadata_json may carry a triggering_work_item_id
@@ -471,7 +588,16 @@ pub fn compile_observations(
         }
     }
 
-    // ── Update compilation cursor ────────────────────────────────────────
+    // ── v5 R4 cursor-gating: cursor = max of successfully-processed event
+    // ids only. role_bound events that failed binding resolution are NOT
+    // in compiled_event_ids, so cursor does NOT advance past them. They
+    // stay in the read-pool next tick for retry.
+    let new_cursor = compiled_event_ids
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(last_compiled_observation_id);
+
     conn.execute(
         "UPDATE dadbear_compilation_state SET last_compiled_observation_id = ?1 WHERE slug = ?2",
         params![new_cursor, slug],
@@ -486,6 +612,7 @@ pub fn compile_observations(
             deps_created = deps_created,
             deduped = deduped,
             cursor = new_cursor,
+            skipped_for_retry = events.len() - compiled_event_ids.len(),
             "Compilation pass complete"
         );
     }
@@ -496,6 +623,23 @@ pub fn compile_observations(
         deps_created,
         deduped,
     })
+}
+
+/// v5 Phase 3: map event_type to the role that handles role_bound dispatch.
+///
+/// Returns None if the event_type is not a role_bound event (caller should
+/// handle via map_event_to_primitive's primitive string instead).
+fn role_for_event(event_type: &str) -> Option<&'static str> {
+    match event_type {
+        // annotation_written + annotation_superseded stay mapped to re_distill
+        // in Phase 3 — Phase 8 flips them to role_bound with cascade_handler.
+        "annotation_reacted" => Some("cascade_handler"),
+        "debate_spawned" | "debate_collapsed" => Some("debate_steward"),
+        "gap_detected" => Some("gap_dispatcher"),
+        "gap_resolved" | "purpose_shifted" => Some("meta_layer_oracle"),
+        "meta_layer_crystallized" => Some("synthesizer"),
+        _ => None,
+    }
 }
 
 // ── DB helpers ────────────────────────────────────────────────────────────────
