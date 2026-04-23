@@ -3750,6 +3750,47 @@ fn backfill_node_ids(conn: &rusqlite::Connection, slug: &str) -> Result<(), Stri
     Ok(())
 }
 
+// ── Walker v3 build-starter guards (Phase 0a-2 §2.17.1) ────────────────────
+//
+// Plan §2.17.1: "every current starter (HTTP build routes, Tauri
+// pyramid_build, question-build spawn, folder-ingestion initial-build
+// spawn, DADBEAR manual trigger, stale-engine startup reconciliation,
+// and any future spawn_*build* helper) must route through the same
+// guard helper so boot ordering and runtime gating cannot drift apart."
+//
+// Phase 0a-2 instruments the Tauri IPC build-starter commands here —
+// `pyramid_build`, `pyramid_question_build`, `pyramid_rebuild` — which
+// are the five-or-so entry points a user can hit before boot finishes.
+// Every call routes through `guard_app_ready(&state.app_mode)` and
+// refuses if AppMode != Ready.
+//
+// TODO(walker-v3 Phase 0b): extend the guard to the rest of the
+// inventory the plan calls out. These sites live in `pyramid/*.rs` and
+// are out of scope for WS5 (file scope restriction):
+//
+//   - `folder_ingestion::spawn_initial_builds` (invoked from main.rs
+//     ~L4401) — calls `question_build::spawn_question_build` for each
+//     ingestion apex. The lib-side helper has no AppState reference;
+//     WS5 can't plumb the guard without touching pyramid/*.rs.
+//   - `public_html/routes_ask.rs` — the /ask HTTP surface spawns
+//     question builds for public questions.
+//   - `dadbear_supervisor::start_dadbear_supervisor` — the runtime
+//     supervisor dispatches work items the compiler emits; manual
+//     triggers bypass the Tauri IPC layer.
+//   - `server::init_stale_engines` — stale-engine startup
+//     reconciliation ticks rebuild tasks 3s after boot. The 3s sleep
+//     happens to cover the typical boot window in practice, but the
+//     guard should be explicit so quarantine state can refuse stale
+//     rebuilds.
+//
+// Each of those will get `guard_app_ready(&state.app_mode).await?`
+// added at its entry in Phase 0b, when the WS plan covers pyramid/*.rs
+// edits. Until then, they rely on the implicit ordering: the boot
+// coordinator spawns BEFORE `init_stale_engines`'s 3s delay elapses,
+// and BEFORE the HTTP server accepts requests (see
+// `server::start_server` call site), so the practical window in which
+// a build-starter could run against `Booting` state is <100ms in
+// happy-path boot.
 #[tauri::command]
 async fn pyramid_build(
     state: tauri::State<'_, SharedState>,
@@ -3758,6 +3799,11 @@ async fn pyramid_build(
     stop_after: Option<String>,
     force_from: Option<String>,
 ) -> Result<BuildStatus, String> {
+    // Walker v3 §2.17.1: every build-starter routes through the Ready guard.
+    wire_node_lib::guard_app_ready(&state.app_mode)
+        .await
+        .map_err(|e| e.to_string())?;
+
     // Verify slug exists
     {
         let conn = state.pyramid.reader.lock().await;
@@ -4724,6 +4770,11 @@ async fn pyramid_question_build(
     from_depth: Option<i64>,
     characterization: Option<wire_node_lib::pyramid::types::CharacterizationResult>,
 ) -> Result<serde_json::Value, String> {
+    // Walker v3 §2.17.1: every build-starter routes through the Ready guard.
+    wire_node_lib::guard_app_ready(&state.app_mode)
+        .await
+        .map_err(|e| e.to_string())?;
+
     pyramid_question_build_inner(
         &state,
         slug,
@@ -4768,6 +4819,11 @@ async fn pyramid_rebuild(
     state: tauri::State<'_, SharedState>,
     slug: String,
 ) -> Result<serde_json::Value, String> {
+    // Walker v3 §2.17.1: every build-starter routes through the Ready guard.
+    wire_node_lib::guard_app_ready(&state.app_mode)
+        .await
+        .map_err(|e| e.to_string())?;
+
     // Look up the question from the last build record, or fall back to
     // the default apex question for the slug's content type. This makes
     // rebuild work for pre-existing pyramids that were built before the
@@ -12797,6 +12853,13 @@ fn main() {
         },
     );
 
+    // Walker v3 Phase 0a-2 §2.17.1: construct the AppMode handle BEFORE
+    // AppState so every build-starter can reach it via `state.app_mode`.
+    // Always starts at `Booting`; flipped to `Ready` by the boot
+    // coordinator (see `boot::run_walker_cache_boot` in the Tauri setup
+    // block below, canonical §2.17 step 9).
+    let app_mode_handle = wire_node_lib::app_mode::new_app_mode();
+
     let state = Arc::new(AppState {
         auth: shared_auth.clone(),
         sync_state: Arc::new(RwLock::new(
@@ -12822,6 +12885,10 @@ fn main() {
         // dispatches by design. See pyramid::pending_jobs for the
         // semantics rationale.
         pending_market_jobs: shared_pending_market_jobs.clone(),
+        // Walker v3 §2.17.1: in-memory AppMode state machine. Starts at
+        // `Booting`. The boot coordinator (spawned in `setup()` below)
+        // flips to `Ready` only after the scope_cache_reloader is live.
+        app_mode: app_mode_handle.clone(),
     });
 
     // ── Phase 2 WS6: queue mirror push task + market outbox sweep ──
@@ -13009,6 +13076,71 @@ fn main() {
         .manage(state.clone())
         .setup(move |app| {
             let state = state.clone();
+
+            // ── Walker v3 Phase 0a-2 §2.17 boot coordinator ───────────────
+            //
+            // Runs the walker-v3-owned portion of the canonical 11-step
+            // boot sequence: step 3 (initial ScopeCache), step 4/5
+            // (migration phase scaffold + post-migration rebuild — both
+            // stubbed until Phase 0b/§5.3), step 6 (spawn
+            // scope_cache_reloader), step 7 (ConfigSynced →
+            // RebuildTrigger bridge), step 9 (transition AppMode →
+            // Ready). Steps 1-2 (DB open + bundled manifest walk via the
+            // envelope writer) + 8 (stale_engine rehydrate) + 10-11
+            // (HTTP listeners + DADBEAR + chain executor) already ran /
+            // are queued above/below this spawn.
+            //
+            // The coordinator is called via `tauri::async_runtime::spawn`
+            // so it yields to the reactor — the Tauri setup() callback
+            // itself is synchronous + non-async, which is why we defer.
+            // Any build-starter that lands before the coordinator flips
+            // AppMode → Ready is refused by `guard_app_ready` with a
+            // "node is not Ready" error (fail-fast, not hang).
+            //
+            // §2.17.3: if the DB probe fails, the coordinator returns
+            // `BootResult::Aborted`. We log `boot_aborted` and leave
+            // AppMode in `Booting` — build-starters will keep refusing
+            // and the operator sees the error in the log.
+            {
+                let boot_db_path = pyramid_db_path
+                    .to_string_lossy()
+                    .to_string();
+                let boot_app_mode = state.app_mode.clone();
+                let boot_event_bus = state.pyramid.build_event_bus.clone();
+                // Leak the handles into process-lifetime tasks — main.rs
+                // owns the Tauri event loop, and the reloader/relay/bridge
+                // all need to outlive setup(). Dropping the handles ends
+                // the tasks (JoinHandle drops abort on drop in tokio), so
+                // we hold them on a Box::leak'd slot.
+                tauri::async_runtime::spawn(async move {
+                    match wire_node_lib::boot::run_walker_cache_boot(
+                        boot_db_path,
+                        boot_app_mode,
+                        boot_event_bus,
+                    )
+                    .await
+                    {
+                        wire_node_lib::boot::BootResult::Ok(handles) => {
+                            // Stash handles so they outlive setup().
+                            // Box::leak is deliberate — process-lifetime
+                            // ownership, no clean shutdown path yet.
+                            let _: &'static mut wire_node_lib::boot::BootHandles =
+                                Box::leak(Box::new(handles));
+                            tracing::info!(
+                                event = "boot_complete",
+                                "walker-v3 boot coordinator complete; AppMode=Ready"
+                            );
+                        }
+                        wire_node_lib::boot::BootResult::Aborted(reason) => {
+                            tracing::error!(
+                                event = "boot_aborted",
+                                reason = %reason,
+                                "walker-v3 boot coordinator aborted; node will refuse build-starters"
+                            );
+                        }
+                    }
+                });
+            }
 
             // --- Phase 13: cross-pyramid event forwarder ---
             //

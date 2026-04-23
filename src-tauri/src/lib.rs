@@ -10,7 +10,9 @@
 //   market    — Market daemon: evaluates storage opportunities, auto-hosts/drops documents
 //   retention — Proof-of-retention challenges and purge handling
 
+pub mod app_mode;
 pub mod auth;
+pub mod boot;
 pub mod compute_market;
 pub mod compute_queue;
 pub mod fleet;
@@ -30,6 +32,8 @@ pub mod work;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+pub use app_mode::{guard_app_ready, transition_to as transition_app_mode, AppMode, AppNotReady};
 
 /// Shared application state
 pub struct AppState {
@@ -72,6 +76,13 @@ pub struct AppState {
     /// take+fire at inbound-push time. In-memory only; node restart
     /// loses pending and `pyramid_build` retries the step.
     pub pending_market_jobs: pyramid::pending_jobs::PendingJobs,
+    /// Walker v3 Phase 0a-2 §2.17.1: in-memory boot/run state machine.
+    /// Always starts at `Booting`; flipped to `Ready` by the boot
+    /// coordinator (§2.17 step 9). Only the boot coordinator + the
+    /// scope_cache_reloader quarantine relay write here
+    /// ({invariant: app_mode_single_writer}). NOT persisted — boot
+    /// always restarts at `Booting`.
+    pub app_mode: Arc<RwLock<AppMode>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

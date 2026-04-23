@@ -1,4 +1,5 @@
-//! Walker v3 Phase 0a-1 commit 5 smoke against a real dev DB snapshot.
+//! Walker v3 Phase 0a-1 commit 5 + Phase 0a-2 WS5 smoke against a real
+//! dev DB snapshot.
 //!
 //! Run with:
 //!   PYRAMID_DB=/tmp/walker-v3-smoke-XXXXX/pyramid.db \
@@ -6,9 +7,16 @@
 //!
 //! Validates: migration runs cleanly on the copy, creates uq_config_contrib_active
 //! + _pre_v3_dedup_snapshot, preserves 155 active rows (0 dups = 0 moved),
-//! and is idempotent on a second call.
+//! and is idempotent on a second call. Second test (Phase 0a-2 WS5) exercises
+//! `run_walker_cache_boot` against the copy and asserts Booting → Ready.
 
 use rusqlite::Connection;
+use std::sync::Arc;
+use std::time::Duration;
+
+use wire_node_lib::app_mode::{new_app_mode, AppMode};
+use wire_node_lib::boot::{run_walker_cache_boot, BootResult};
+use wire_node_lib::pyramid::event_bus::BuildEventBus;
 
 #[test]
 #[ignore]
@@ -127,4 +135,58 @@ fn migration_runs_cleanly_on_live_db_copy() {
     );
 
     println!("SMOKE: migration clean, index enforced, baseline preserved.");
+}
+
+/// Phase 0a-2 WS5 boot-coordinator smoke: point `run_walker_cache_boot`
+/// at the live DB copy and assert AppMode walks Booting → Ready in a
+/// reasonable wall-clock. Also confirms the returned handles are live
+/// (reloader, mode_relay, ConfigSynced bridge all still polling).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn boot_coordinator_runs_clean_against_live_db_copy() {
+    let path = std::env::var("PYRAMID_DB")
+        .expect("set PYRAMID_DB=/tmp/walker-v3-smoke-XXXXX/pyramid.db");
+
+    let app_mode = new_app_mode();
+    assert_eq!(
+        *app_mode.read().await,
+        AppMode::Booting,
+        "fresh app_mode handle must start at Booting"
+    );
+
+    let bus = Arc::new(BuildEventBus::new());
+
+    let t0 = std::time::Instant::now();
+    let result = run_walker_cache_boot(path.clone(), app_mode.clone(), bus.clone()).await;
+    let dur = t0.elapsed();
+    println!("BOOT took {:?}", dur);
+
+    let handles = match result {
+        BootResult::Ok(h) => h,
+        BootResult::Aborted(reason) => panic!("boot must not abort on live DB copy: {reason}"),
+    };
+
+    assert_eq!(
+        *app_mode.read().await,
+        AppMode::Ready,
+        "post-boot AppMode must be Ready"
+    );
+    assert!(
+        dur < Duration::from_secs(5),
+        "boot on live DB copy must complete in <5s (got {:?})",
+        dur
+    );
+    assert!(
+        !handles.reloader_handle.is_finished(),
+        "reloader must be live"
+    );
+    assert!(
+        !handles.mode_relay_handle.is_finished(),
+        "mode_relay must be live"
+    );
+    assert!(
+        !handles.config_sync_bridge_handle.is_finished(),
+        "config_sync_bridge must be live"
+    );
+    println!("SMOKE: boot coordinator Booting → Ready on live DB copy in {:?}", dur);
 }
