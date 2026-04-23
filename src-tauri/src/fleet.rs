@@ -58,6 +58,14 @@ pub struct FleetPeer {
     /// New nodes prefer this over node_id for provenance and display.
     #[serde(default)]
     pub handle_path: Option<String>,
+    /// Walker v3 §5.4.2: peer's announce_protocol_version at last seen.
+    /// `0` = absent (pre-v3 peer, field wasn't in their announce body),
+    /// `1` = v2.1.1 explicit, `2` = v3. Walker's fleet readiness refuses
+    /// dispatch to any peer with `announce_protocol_version < 2`
+    /// (§5.5.2 strict mode). Default 0 preserves backward-compat for
+    /// serialized FleetRosters persisted before Phase 4 added the field.
+    #[serde(default)]
+    pub announce_protocol_version: u8,
 }
 
 /// Fleet roster — all known same-operator peers.
@@ -111,6 +119,11 @@ impl FleetRoster {
                     total_queue_depth: 0,
                     last_seen: now,
                     handle_path: None,
+                    // Heartbeat-only discovery doesn't carry an announce
+                    // protocol version; default to `0` so the peer is
+                    // flagged as v1 until a direct announce lands with
+                    // an explicit version (§5.4.2).
+                    announce_protocol_version: 0,
                 });
             // Heartbeat provides tunnel_url and name. Models + serving_rules
             // come from direct announcement (preferred) or queue state mirror.
@@ -148,6 +161,7 @@ impl FleetRoster {
                 total_queue_depth: 0,
                 last_seen: now,
                 handle_path: None,
+                announce_protocol_version: announcement.announce_protocol_version,
             });
         peer.tunnel_url = announcement.tunnel_url;
         peer.models_loaded = announcement.models_loaded;
@@ -155,6 +169,9 @@ impl FleetRoster {
         peer.queue_depths = announcement.queue_depths;
         peer.total_queue_depth = announcement.total_queue_depth;
         peer.last_seen = now;
+        // Walker v3 §5.4.2: latest announce wins. A peer that upgrades
+        // in place flips from v1 → v2 without needing a roster reset.
+        peer.announce_protocol_version = announcement.announce_protocol_version;
         if let Some(name) = announcement.name {
             peer.name = name;
         }
@@ -242,7 +259,35 @@ pub struct FleetAnnouncement {
     #[serde(default)]
     pub total_queue_depth: usize,
     pub operator_id: String,
+    /// Walker v3 §5.4.2 / B-I1: explicit announce-protocol version so
+    /// walker requesters can strict-refuse dispatch to pre-v3 peers that
+    /// populate `models_loaded` with observability-only semantics
+    /// (§5.5.2 — readiness returns `PeerIsV1Announcer`).
+    ///
+    /// Version mapping:
+    ///   `0` — pre-v3 peer (field absent in their announce body).
+    ///   `1` — v2.1.1 with explicit versioning.
+    ///   `2` — v3 (current).
+    ///
+    /// `serde(default)` returns `0` so a pre-v3 peer's existing announce
+    /// body deserializes cleanly; walker flags those as v1 announcers.
+    #[serde(default = "announce_protocol_version_default")]
+    pub announce_protocol_version: u8,
 }
+
+/// Default for `FleetAnnouncement.announce_protocol_version` when the
+/// field is absent in the deserialized body (pre-v3 peer). See
+/// §5.4.2 / B-F7.
+#[allow(dead_code)]
+pub fn announce_protocol_version_default() -> u8 {
+    0
+}
+
+/// Walker v3 current announce-protocol version. Emitted by this node
+/// when sending a `FleetAnnouncement`. Bumped when the announce wire
+/// format gains gating-impacting semantics.
+#[allow(dead_code)]
+pub const ANNOUNCE_PROTOCOL_VERSION: u8 = 2;
 
 // ── Fleet dispatch request / response types (async protocol) ──────────────
 
@@ -1127,6 +1172,7 @@ mod tests {
             total_queue_depth: 0,
             last_seen: chrono::Utc::now(),
             handle_path: None,
+            announce_protocol_version: ANNOUNCE_PROTOCOL_VERSION,
         }
     }
 

@@ -2452,6 +2452,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_w1b_build_step_dispatch_decision_empty_db_returns_some_default() {
+        // Acquire the global node-state lock so MarketReadiness's
+        // `network_failure_backoff_threshold` check reads stable state
+        // while other parallel tests mutate the walker_market_probe
+        // node_state cell. Without this, intermittent failures fire
+        // when the concurrent market tests trip the failure counter.
+        let _guard =
+            crate::pyramid::walker_market_probe::node_state_test_lock()
+                .lock()
+                .unwrap();
+        crate::pyramid::walker_market_probe::clear_node_state_for_tests();
+
         test_capture::enable();
         test_capture::clear();
         let conn = make_pyramid_config_contributions_db();

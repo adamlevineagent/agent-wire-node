@@ -47,7 +47,7 @@ use crate::pyramid::compute_chronicle::{
 };
 use crate::pyramid::walker_cache::ScopeCache;
 use crate::pyramid::walker_readiness::{
-    FleetReadinessStub, LocalReadiness, MarketReadiness, NotReadyReason,
+    FleetReadiness, LocalReadiness, MarketReadiness, NotReadyReason,
     OpenRouterReadinessStub, ProviderReadiness, ReadinessResult, ResolvedProviderParams,
 };
 use crate::pyramid::walker_resolver::{
@@ -457,10 +457,12 @@ fn readiness_for(pt: ProviderType) -> Box<dyn ProviderReadiness> {
         // Phase 2: real probe-cache-backed LocalReadiness.
         // Phase 3: real market-surface + balance + reachability
         //          MarketReadiness.
-        // OpenRouter + Fleet still stubs (Fleet → Phase 4).
+        // Phase 4: real fleet-roster-backed FleetReadiness.
+        // OpenRouter still stub — trivial to real-impl (api_key presence
+        // check), but no phase explicitly owns it yet.
         ProviderType::Local => Box::new(LocalReadiness::new()),
         ProviderType::OpenRouter => Box::new(OpenRouterReadinessStub),
-        ProviderType::Fleet => Box::new(FleetReadinessStub),
+        ProviderType::Fleet => Box::new(FleetReadiness::new()),
         ProviderType::Market => Box::new(MarketReadiness::new()),
     }
 }
@@ -622,21 +624,29 @@ mod tests {
 
     #[test]
     fn test_decision_build_all_providers_ready() {
-        // Empty DB = SYSTEM_DEFAULTS everywhere. OpenRouter/Fleet stubs
-        // return Ready unconditionally; Local (Phase 2 real impl)
+        // Empty DB = SYSTEM_DEFAULTS everywhere. OpenRouter stub still
+        // returns Ready unconditionally; Local (Phase 2 real impl)
         // consults the Ollama probe cache; Market (Phase 3 real impl)
-        // consults the market-surface probe cache.
+        // consults the market-surface probe cache; Fleet (Phase 4 real
+        // impl) consults the fleet roster probe cache.
         //
-        // For this "all providers ready" smoke, we need BOTH probe
-        // caches seeded with a model that matches the declared
-        // model_list and BOTH providers' configs declaring that slug
-        // at slot "mid".
+        // For this "all providers ready" smoke, we need three probe
+        // caches seeded + three per-provider configs declaring a
+        // model_list at slot "mid".
+        use crate::pyramid::walker_fleet_probe::{
+            clear_fleet_cache_for_tests, fleet_probe_test_lock, write_cached_peer,
+            CachedFleetPeer,
+        };
         use crate::pyramid::walker_market_probe::{
             invalidate_cached_model, write_cached_model, CachedMarketModel, CachedOffer,
         };
         use crate::pyramid::walker_ollama_probe::{
             invalidate_cached_probe, write_cached_probe, CachedProbe,
         };
+        let _fg = fleet_probe_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        clear_fleet_cache_for_tests();
         let base_url = "http://test-decision-allready.invalid:11434/v1";
         write_cached_probe(
             base_url,
@@ -666,6 +676,14 @@ mod tests {
                 at: std::time::Instant::now(),
             },
         );
+        let fleet_model = "test-decision-allready-fleet:latest";
+        write_cached_peer(CachedFleetPeer {
+            node_id: "peer-allready".into(),
+            node_handle: Some("@op/peer-allready".into()),
+            announced_models: vec![fleet_model.to_string()],
+            last_seen_at: chrono::Utc::now(),
+            is_v1_announcer: false,
+        });
         let (_dir, conn) = make_db();
         insert_active(
             &conn,
@@ -700,6 +718,22 @@ overrides:
 "#
             ),
         );
+        insert_active(
+            &conn,
+            "c-wpf-mid",
+            "walker_provider_fleet",
+            None,
+            &format!(
+                r#"
+schema_type: walker_provider_fleet
+version: 1
+overrides:
+  active: true
+  model_list:
+    mid: ["{fleet_model}"]
+"#
+            ),
+        );
         let d = DispatchDecision::build("mid", &conn).expect("build must succeed");
         assert!(!d.synthetic);
         assert_eq!(d.slot, "mid");
@@ -709,6 +743,7 @@ overrides:
         }
         invalidate_cached_probe(base_url);
         invalidate_cached_model(market_slug);
+        clear_fleet_cache_for_tests();
     }
 
     #[test]

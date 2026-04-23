@@ -189,8 +189,6 @@ pub trait ProviderReadiness {
 
 #[allow(dead_code)]
 pub struct OpenRouterReadinessStub;
-#[allow(dead_code)]
-pub struct FleetReadinessStub;
 
 impl ProviderReadiness for OpenRouterReadinessStub {
     fn can_dispatch_now(&self, _params: &ResolvedProviderParams) -> ReadinessResult {
@@ -198,8 +196,126 @@ impl ProviderReadiness for OpenRouterReadinessStub {
     }
 }
 
-impl ProviderReadiness for FleetReadinessStub {
-    fn can_dispatch_now(&self, _params: &ResolvedProviderParams) -> ReadinessResult {
+// ── FleetReadiness (§2.6 Phase 4 real impl) ─────────────────────────────────
+//
+// Replaces the Phase 0a-1 FleetReadinessStub. Readiness ladder:
+//   1. params.active == false                   → NotReady { Inactive }
+//   2. params.model_list absent/empty           → NotReady { NoPeerHasModel }
+//      (Interpreted per plan §2.6: operator declared no fleet models for
+//      this tier, so the fleet doesn't serve this slot.)
+//   3. No peer's `last_seen_at` is within
+//      params.fleet_peer_min_staleness_secs     → NotReady { NoReachablePeer }
+//   4. Of reachable peers, at least one has
+//      announced any model in params.model_list → continue; else
+//                                               → NotReady { NoPeerHasModel }
+//   5. Every matching peer is a v1 announcer
+//      (announce_protocol_version < 2)          → NotReady { PeerIsV1Announcer }
+//   6. otherwise                                → Ready
+//
+// The fleet roster probe cache (`walker_fleet_probe`) is the sync-read
+// shared state populated by the boot-spawned refresh task. FleetReadiness
+// never blocks on async I/O — it only reads what the refresh task has
+// already observed.
+//
+// Order rationale: inexpensive checks first (active flag, model_list),
+// then roster-cache reads. The v1-announcer verdict comes LAST because
+// it requires first confirming that reachable peers have matching
+// models — a peer running v1 that doesn't have our model is
+// `NoPeerHasModel` (cohort absent), not `PeerIsV1Announcer` (cohort
+// present-but-incompatible). Plan §5.5.2 is explicit: NoPeerHasModel is
+// reserved for same-protocol peers without the slug; PeerIsV1Announcer
+// fires when the matching cohort is only v1.
+#[allow(dead_code)]
+pub struct FleetReadiness;
+
+impl FleetReadiness {
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for FleetReadiness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProviderReadiness for FleetReadiness {
+    fn can_dispatch_now(&self, params: &ResolvedProviderParams) -> ReadinessResult {
+        use crate::pyramid::walker_fleet_probe::snapshot_reachable_peers;
+
+        // 1. Operator-disabled fleet provider.
+        if !params.active {
+            return ReadinessResult::NotReady {
+                reason: NotReadyReason::Inactive,
+            };
+        }
+
+        // 2. No model declared at this (slot, Fleet) scope. Per §2.6
+        //    this is interpreted as "fleet doesn't serve this slot" —
+        //    operator declared nothing, so no peer could match.
+        let model_list = match params.model_list.as_ref() {
+            Some(list) if !list.is_empty() => list,
+            _ => {
+                return ReadinessResult::NotReady {
+                    reason: NotReadyReason::NoPeerHasModel,
+                };
+            }
+        };
+
+        // 3. Consult the roster probe cache with the resolver-supplied
+        //    staleness cutoff. `None` at this layer shouldn't happen for
+        //    Fleet (the Decision builder only populates it for Fleet),
+        //    but defensively fall back to the SYSTEM_DEFAULT.
+        let cutoff = params
+            .fleet_peer_min_staleness_secs
+            .unwrap_or(crate::pyramid::walker_resolver::FLEET_PEER_MIN_STALENESS_SECS_DEFAULT);
+        let reachable = snapshot_reachable_peers(cutoff);
+        if reachable.is_empty() {
+            return ReadinessResult::NotReady {
+                reason: NotReadyReason::NoReachablePeer,
+            };
+        }
+
+        // 4-5. Partition reachable peers by whether they announce at
+        //      least one model in our model_list. If zero peers match,
+        //      NoPeerHasModel. If the matching cohort is entirely v1
+        //      announcers, PeerIsV1Announcer (§5.5.2 strict mode). If
+        //      at least one v2+ peer matches, Ready.
+        let mut any_peer_has_model = false;
+        let mut any_matching_peer_is_v2_plus = false;
+        for peer in reachable.iter() {
+            let has_match = model_list
+                .iter()
+                .any(|m| peer.announced_models.iter().any(|am| am == m));
+            if !has_match {
+                continue;
+            }
+            any_peer_has_model = true;
+            if !peer.is_v1_announcer {
+                any_matching_peer_is_v2_plus = true;
+            }
+        }
+
+        if !any_peer_has_model {
+            return ReadinessResult::NotReady {
+                reason: NotReadyReason::NoPeerHasModel,
+            };
+        }
+
+        if !any_matching_peer_is_v2_plus {
+            // All matching peers are v1 announcers.
+            return ReadinessResult::NotReady {
+                reason: NotReadyReason::PeerIsV1Announcer,
+            };
+        }
+
+        // `params.fleet_prefer_cached` is consulted by the dispatch path
+        // for peer-selection ranking, not the readiness gate — any
+        // matching v2+ peer existing is sufficient for readiness. The
+        // ranking preference is plumbed through walker_decision into
+        // the fleet dispatch branch separately.
         ReadinessResult::Ready
     }
 }
@@ -480,18 +596,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn two_non_local_stubs_return_ready() {
-        // LocalReadinessStub was replaced in Phase 2 by LocalReadiness,
-        // and MarketReadinessStub was replaced in Phase 3 by
-        // MarketReadiness. OpenRouter + Fleet stay Ready until Phase 4
-        // replaces FleetReadiness with a real impl.
+    fn openrouter_stub_returns_ready() {
+        // LocalReadinessStub → LocalReadiness (Phase 2).
+        // MarketReadinessStub → MarketReadiness (Phase 3).
+        // FleetReadinessStub → FleetReadiness (Phase 4).
+        // OpenRouterReadinessStub stays stub — natural follow-up; no
+        // phase explicitly owns it (see Phase 4 scope note F).
         let p = ResolvedProviderParams::default();
-        for r in [
+        assert!(matches!(
             OpenRouterReadinessStub.can_dispatch_now(&p),
-            FleetReadinessStub.can_dispatch_now(&p),
-        ] {
-            assert!(matches!(r, ReadinessResult::Ready));
-        }
+            ReadinessResult::Ready
+        ));
     }
 
     // ── LocalReadiness (Phase 2) ─────────────────────────────────────────────
@@ -920,5 +1035,227 @@ mod tests {
         }
         invalidate_cached_model(a);
         invalidate_cached_model(b);
+    }
+
+    // ── FleetReadiness (Phase 4) ─────────────────────────────────────────────
+    //
+    // Unit tests for the real impl. Each test sets up a minimal world
+    // via the walker_fleet_probe test helpers. Tests mutate the shared
+    // global probe cache; serialize via the module-level
+    // `fleet_probe_test_lock` so sibling tests in walker_decision +
+    // walker_fleet_probe + the integration test crate see the same
+    // ordering.
+
+    use crate::pyramid::walker_fleet_probe::{
+        clear_fleet_cache_for_tests, fleet_probe_test_lock, write_cached_peer,
+        CachedFleetPeer,
+    };
+
+    /// Serialize FleetReadiness tests that mutate the fleet probe
+    /// cache. Routed through `fleet_probe_test_lock` so the lock is
+    /// shared with sibling unit tests + the integration test crate.
+    fn fleet_test_lock() -> &'static std::sync::Mutex<()> {
+        fleet_probe_test_lock()
+    }
+
+    fn params_for_fleet(
+        active: bool,
+        model_list: Option<Vec<String>>,
+        min_staleness_secs: u64,
+    ) -> ResolvedProviderParams {
+        ResolvedProviderParams {
+            active,
+            model_list,
+            fleet_peer_min_staleness_secs: Some(min_staleness_secs),
+            fleet_prefer_cached: Some(true),
+            ..ResolvedProviderParams::default()
+        }
+    }
+
+    fn make_cached_peer(
+        node_id: &str,
+        models: &[&str],
+        last_seen: chrono::DateTime<chrono::Utc>,
+        is_v1: bool,
+    ) -> CachedFleetPeer {
+        CachedFleetPeer {
+            node_id: node_id.to_string(),
+            node_handle: Some(format!("@op/{node_id}")),
+            announced_models: models.iter().map(|s| s.to_string()).collect(),
+            last_seen_at: last_seen,
+            is_v1_announcer: is_v1,
+        }
+    }
+
+    #[test]
+    fn test_fleet_readiness_inactive_returns_not_ready_inactive() {
+        let _g = fleet_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_fleet_cache_for_tests();
+        let p = params_for_fleet(false, Some(vec!["gemma3:27b".into()]), 300);
+        match FleetReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::Inactive,
+            } => {}
+            other => panic!("expected Inactive, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_fleet_readiness_no_model_list_returns_not_ready_no_peer_has_model() {
+        let _g = fleet_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_fleet_cache_for_tests();
+        // model_list = None
+        let p = params_for_fleet(true, None, 300);
+        match FleetReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::NoPeerHasModel,
+            } => {}
+            other => panic!("expected NoPeerHasModel (None), got {:?}", other),
+        }
+        // model_list = Some(empty)
+        let p2 = params_for_fleet(true, Some(vec![]), 300);
+        match FleetReadiness::new().can_dispatch_now(&p2) {
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::NoPeerHasModel,
+            } => {}
+            other => panic!("expected NoPeerHasModel (empty), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_fleet_readiness_no_reachable_peers_returns_not_ready_no_reachable_peer() {
+        let _g = fleet_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_fleet_cache_for_tests();
+        // Empty cache → no reachable peers.
+        let p = params_for_fleet(true, Some(vec!["gemma3:27b".into()]), 300);
+        match FleetReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::NoReachablePeer,
+            } => {}
+            other => panic!("expected NoReachablePeer (empty cache), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_fleet_readiness_peer_too_stale_filtered_out() {
+        let _g = fleet_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_fleet_cache_for_tests();
+        let stale_when = chrono::Utc::now() - chrono::Duration::seconds(1000);
+        write_cached_peer(make_cached_peer(
+            "stale-peer",
+            &["gemma3:27b"],
+            stale_when,
+            false,
+        ));
+        // Cutoff 300s, peer 1000s old → not reachable.
+        let p = params_for_fleet(true, Some(vec!["gemma3:27b".into()]), 300);
+        match FleetReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::NoReachablePeer,
+            } => {}
+            other => panic!("expected NoReachablePeer (stale), got {:?}", other),
+        }
+        clear_fleet_cache_for_tests();
+    }
+
+    #[test]
+    fn test_fleet_readiness_no_peer_has_matching_model_returns_no_peer_has_model() {
+        let _g = fleet_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_fleet_cache_for_tests();
+        // Peer reachable but announces a different model.
+        write_cached_peer(make_cached_peer(
+            "other-model-peer",
+            &["llama3.2:latest"],
+            chrono::Utc::now(),
+            false,
+        ));
+        let p = params_for_fleet(true, Some(vec!["gemma3:27b".into()]), 300);
+        match FleetReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::NoPeerHasModel,
+            } => {}
+            other => panic!("expected NoPeerHasModel (no match), got {:?}", other),
+        }
+        clear_fleet_cache_for_tests();
+    }
+
+    #[test]
+    fn test_fleet_readiness_all_matching_peers_are_v1_announcers_returns_peer_is_v1_announcer() {
+        let _g = fleet_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_fleet_cache_for_tests();
+        // Two peers: one matches model but is v1; another is v2 but no
+        // matching model. The matching cohort is exclusively v1.
+        write_cached_peer(make_cached_peer(
+            "v1-match",
+            &["gemma3:27b"],
+            chrono::Utc::now(),
+            true,
+        ));
+        write_cached_peer(make_cached_peer(
+            "v2-no-match",
+            &["llama3.2:latest"],
+            chrono::Utc::now(),
+            false,
+        ));
+        let p = params_for_fleet(true, Some(vec!["gemma3:27b".into()]), 300);
+        match FleetReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::PeerIsV1Announcer,
+            } => {}
+            other => panic!("expected PeerIsV1Announcer, got {:?}", other),
+        }
+        clear_fleet_cache_for_tests();
+    }
+
+    #[test]
+    fn test_fleet_readiness_at_least_one_peer_has_model_returns_ready() {
+        let _g = fleet_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_fleet_cache_for_tests();
+        write_cached_peer(make_cached_peer(
+            "v2-match",
+            &["gemma3:27b"],
+            chrono::Utc::now(),
+            false,
+        ));
+        // Extra peer with no match — must not affect the Ready verdict.
+        write_cached_peer(make_cached_peer(
+            "v2-other",
+            &["llama3.2:latest"],
+            chrono::Utc::now(),
+            false,
+        ));
+        let p = params_for_fleet(true, Some(vec!["gemma3:27b".into()]), 300);
+        match FleetReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::Ready => {}
+            other => panic!("expected Ready, got {:?}", other),
+        }
+        clear_fleet_cache_for_tests();
+    }
+
+    #[test]
+    fn test_fleet_readiness_mixed_v1_v2_matches_returns_ready() {
+        // Both a v1 and a v2 peer match — v2 wins and overall is Ready
+        // (PeerIsV1Announcer only fires when the entire matching cohort
+        // is v1, per §5.5.2).
+        let _g = fleet_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_fleet_cache_for_tests();
+        write_cached_peer(make_cached_peer(
+            "v1-match",
+            &["gemma3:27b"],
+            chrono::Utc::now(),
+            true,
+        ));
+        write_cached_peer(make_cached_peer(
+            "v2-match",
+            &["gemma3:27b"],
+            chrono::Utc::now(),
+            false,
+        ));
+        let p = params_for_fleet(true, Some(vec!["gemma3:27b".into()]), 300);
+        assert!(matches!(
+            FleetReadiness::new().can_dispatch_now(&p),
+            ReadinessResult::Ready
+        ));
+        clear_fleet_cache_for_tests();
     }
 }

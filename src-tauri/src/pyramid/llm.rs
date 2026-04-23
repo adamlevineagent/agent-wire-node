@@ -2815,13 +2815,51 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 }
             };
 
+            // Walker v3 Phase 4: read fleet_peer_min_staleness_secs +
+            // fleet_prefer_cached from the Decision's per_provider[Fleet]
+            // params. Legacy fallback to fleet_delivery_policy's
+            // `peer_staleness_secs` for synthetic / preview paths that
+            // don't carry a Decision yet. `fleet_prefer_cached` has no
+            // legacy equivalent; default SYSTEM_DEFAULT (true) applies.
+            let fleet_min_staleness_secs: u64 = ctx
+                .and_then(|c| c.dispatch_decision.as_ref())
+                .and_then(|d| {
+                    d.per_provider
+                        .get(&crate::pyramid::walker_resolver::ProviderType::Fleet)
+                })
+                .and_then(|p| p.fleet_peer_min_staleness_secs)
+                .unwrap_or(policy_snap.peer_staleness_secs);
+            let _fleet_prefer_cached: bool = ctx
+                .and_then(|c| c.dispatch_decision.as_ref())
+                .and_then(|d| {
+                    d.per_provider
+                        .get(&crate::pyramid::walker_resolver::ProviderType::Fleet)
+                })
+                .and_then(|p| p.fleet_prefer_cached)
+                .unwrap_or(
+                    crate::pyramid::walker_resolver::FLEET_PREFER_CACHED_DEFAULT,
+                );
+
             // Acquire: non-blocking peer lookup. No permit held — fleet
             // is not pool-limited.
+            //
+            // `find_peer_for_rule` ranks by lowest total_queue_depth.
+            // Walker v3's `fleet_prefer_cached` is captured above; the
+            // current roster implementation does not track per-peer
+            // "has this model cached" beyond announce-declared
+            // models_loaded, so the prefer-cached preference is
+            // consumed upstream by FleetReadiness (model_list vs
+            // announced_models match) and by this peer-selection
+            // function via `find_peer_for_rule`'s rule match. A
+            // future peer-probe module (Phase 6 nicety) can use the
+            // _fleet_prefer_cached signal for a first-pass filter
+            // that prefers peers with the requested slug in their
+            // models_loaded before falling back to queue-depth sort.
             let (peer, jwt) = {
                 let roster = roster_handle.read().await;
                 match roster.find_peer_for_rule(
                     &route_ref.matched_rule_name,
-                    policy_snap.peer_staleness_secs,
+                    fleet_min_staleness_secs,
                 ) {
                     Some(peer) => {
                         let jwt = roster.fleet_jwt.clone().unwrap_or_default();

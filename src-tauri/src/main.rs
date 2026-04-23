@@ -12198,6 +12198,51 @@ fn main() {
         }
     }
 
+    // Walker v3 Phase 4 (plan §2.6 + §3): spawn the fleet-probe refresh
+    // task. The sync walker_fleet_probe cache is what `FleetReadiness`
+    // reads synchronously during Decision build; this task projects the
+    // async FleetRoster (tokio RwLock) snapshot into that sync cache at
+    // a bounded cadence. Without this, the sync cache stays empty →
+    // FleetReadiness returns NoReachablePeer → fleet is never tried for
+    // dispatch in production. Mirror of the market-probe task at 7.6.
+    //
+    // Cadence: 15s. Fleet peers come/go faster than market offers
+    // (announces + heartbeats land every 5-10s in a healthy fleet).
+    // Shorter than Ollama's 300s default because fleet state is the
+    // most volatile of the three.
+    {
+        let roster_for_probe = fleet_roster.clone();
+        let refresh = |roster: Arc<tokio::sync::RwLock<wire_node_lib::fleet::FleetRoster>>| async move {
+            let guard = roster.read().await;
+            for peer in guard.peers.values() {
+                let is_v1 = peer.announce_protocol_version < 2;
+                let projected =
+                    wire_node_lib::pyramid::walker_fleet_probe::project_peer(peer, is_v1);
+                wire_node_lib::pyramid::walker_fleet_probe::write_cached_peer(projected);
+            }
+        };
+        tauri::async_runtime::spawn(async move {
+            // Run one initial refresh immediately.
+            refresh(roster_for_probe.clone()).await;
+
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(15));
+            // First tick fires immediately; skip it since we already
+            // refreshed above.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                refresh(roster_for_probe.clone()).await;
+            }
+        });
+        tracing::info!(
+            event = "boot_step",
+            step = "7.7",
+            name = "walker_fleet_probe_task_spawned",
+            "Walker v3 Phase 4 fleet-probe refresh task is up (15s cadence)"
+        );
+    }
+
     // Phase 1 daemon control plane (AD-8 Part 1): ConfigSynced listener for
     // dispatch_policy. When a dispatch_policy contribution is synced to the
     // operational table, rebuild the in-memory ProviderPools and update the
@@ -12327,6 +12372,7 @@ fn main() {
                                                                 queue_depths,
                                                                 total_queue_depth,
                                                                 operator_id: self_operator_id,
+                                                                announce_protocol_version: wire_node_lib::fleet::ANNOUNCE_PROTOCOL_VERSION,
                                                             };
                                                             wire_node_lib::fleet::announce_to_fleet(&roster, &announcement).await;
                                                             tracing::info!("ConfigSynced: re-announced to fleet with updated serving_rules");
@@ -14066,6 +14112,7 @@ fn main() {
                                                 queue_depths,
                                                 total_queue_depth,
                                                 operator_id: self_operator_id,
+                                                announce_protocol_version: wire_node_lib::fleet::ANNOUNCE_PROTOCOL_VERSION,
                                             };
                                             wire_node_lib::fleet::announce_to_fleet(&roster, &announcement).await;
                                         }
