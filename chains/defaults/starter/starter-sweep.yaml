@@ -1,73 +1,50 @@
 schema_version: 1
 id: starter-sweep
-name: Sweep — periodic cleanup + vocab cache refresh (Phase 7d)
+name: Sweep — periodic cleanup + vocab cache refresh (Phase 9b upgrade)
 description: >
-  Callable-on-demand library chain that performs periodic maintenance on
-  a slug: counts stale-failed work items and warms the vocab cache so
-  the next compile tick sees a fresh registry. Mechanical-only — no LLM.
+  Bound to the `sweep` role. Dispatches on `sweep_tick` observation
+  events emitted by pyramid_scheduler (Phase 9b-1) — one tick per
+  configured period (default 6h, operator-editable via
+  scheduler_parameters.sweep_interval_secs). Performs per-slug
+  maintenance:
 
-  Trigger investigation (Phase 7d orientation):
-    - Grepped for existing sweeps: `fleet_outbox_sweep` and
-      `market_mirror` have their own sweep routines but they're
-      compute/market-specific, not pyramid maintenance. Nothing in
-      `stale_engine.rs` maps to the `sweep` role.
-    - Genesis role_name vocab binds `sweep` → this chain, but
-      `dadbear_compiler::role_for_event` has no arm routing any event
-      to the `sweep` role. Plausible future trigger: a scheduled cron
-      OR a per-slug watermark (work_items_failed >= threshold). Both
-      are Phase 9 design calls — not shipped here.
-    - Ship as CALLABLE-ON-DEMAND with real mechanical work (no stub):
-      counting failed work items is a measurable signal operators can
-      act on, and `vocab_entries::invalidate_cache()` +
-      `list_vocabulary(...)` is a concrete reindex operation that
-      observably affects the next compile tick.
+    1. chronicles the sweep (emit_sweep_invoked)
+    2. counts stale-failed work items older than `stale_days`
+       (observability — unchanged from 7d)
+    3. archives stale-failed work items older than
+       `stale_days + retention_days` (Phase 9b-3 — real mutation)
+    4. retires superseded config contributions past retention
+       (Phase 9b-3 — real mutation)
+    5. invalidates + warms the vocab cache
+    6. finalizes (passthrough log_and_complete)
 
-  Input envelope (caller-supplied):
+  Input envelope (supplied by the scheduler caller, or by a direct
+  invocation):
 
       {
-        "slug":          "<pyramid slug>",
-        "stale_days":    <int — REQUIRED age threshold for
-                          "stale failed". Operators define what
-                          counts as stale; baking a default into
-                          Rust was a soft Pillar 37 violation so
-                          the dispatch primitive loud-raises when
-                          this field is absent. Phase 9 cron /
-                          schedule wiring sets the operator-level
-                          default; per-slug superseding chains
-                          encode their own value in YAML.>
+        "slug":                         "<pyramid slug>",
+        "stale_days":                   <int — sweep's age threshold
+                                         for "stale failed">,
+        "retention_days":               <int — extra days beyond
+                                         stale_days before archival
+                                         (two-stage window)>,
+        "contribution_retention_days":  <int — supersession retention
+                                         window in days>
       }
 
-  Steps:
-    1. emit_sweep_invoked — chronicle trace (source="chain",
-       event_type="sweep_invoked") so the chronicle records when a
-       sweep ran against which slug.
-    2. count_stale_failed_work_items — mechanical read counting
-       `dadbear_work_items` rows in state='failed' whose
-       state_changed_at is older than `stale_days` days. Emits a
-       `sweep_stale_failed_counted` chronicle event with the count
-       in metadata (operators can key on this to decide whether a
-       manual retry/archive is warranted). No mutation — Phase 9
-       decides whether to archive or delete, since deletion semantics
-       touch the supervisor's retry-back-off window and must be
-       designed, not guessed (feedback_no_deferral_creep: this is
-       measurement, which is real functionality, not a placeholder).
-    3. reindex_vocab_cache — mechanical call to
-       `vocab_entries::invalidate_cache()` followed by a
-       `list_vocabulary(...)` warm of each of the three vocab_kinds.
-       Emits a `sweep_vocab_reindexed` chronicle event with counts per
-       kind in metadata.
-    4. finalize — terminal log_and_complete so the chain's output is
-       the aggregate sweep result.
+  All four policy knobs live in `scheduler_parameters`
+  (SchedulerConfig) as editable defaults; operators who want a
+  heavier or lighter sweep supersede the contribution row. Baking
+  any of them into Rust is a Pillar-37-adjacent "dispatch code
+  owning operator policy" violation.
 
-  Returns `{stale_failed_count, vocab_counts: {annotation_type, node_shape,
-  role_name}}` via the final log_and_complete passthrough.
-
-  This chain is bound to the `sweep` role via the role_name vocab
-  registry. Operators may supersede the binding per slug to run a
-  heavier sweep (e.g. a chain that archives stale work items instead
-  of just counting them) once Phase 9 decides the archive semantics.
+  Archive semantics (Phase 9b-3): `dadbear_work_items.archived_at`
+  is a new nullable column. Archival flips NULL → ISO timestamp;
+  the compiler + supervisor filter on `archived_at IS NULL` so live
+  queries ignore archived rows. Row IDs (semantic paths) are
+  preserved — attempts + deps still resolve.
 content_type: code
-version: "1.0.0"
+version: "2.0.0"
 author: post-build-accretion-v5
 
 defaults:
@@ -85,6 +62,16 @@ steps:
     primitive: custom
     mechanical: true
     rust_function: count_stale_failed_work_items
+
+  - name: archive_stale_failed_work_items
+    primitive: custom
+    mechanical: true
+    rust_function: archive_stale_failed_work_items
+
+  - name: retire_superseded_contributions_past_retention
+    primitive: custom
+    mechanical: true
+    rust_function: retire_superseded_contributions_past_retention
 
   - name: reindex_vocab_cache
     primitive: custom

@@ -4440,6 +4440,31 @@ fn migrate_online_push_columns(conn: &Connection) -> Result<()> {
         [],
     );
 
+    // ── dadbear_work_items: soft archive column (Phase 9b-3) ────────────
+    //
+    // Adds `archived_at` (nullable) so the sweep chain can soft-archive
+    // long-stale failed rows without deleting them. Archival is one-way
+    // (NULL → timestamp); index excludes archived rows so the compiler
+    // and supervisor see only live work. Chosen over a shadow table
+    // because:
+    //   - semantic path IDs (`{slug}:{epoch_short}:{primitive}:{layer}:{target_id}`)
+    //     are referenced by `dadbear_work_item_deps.depends_on_id` and
+    //     `dadbear_work_attempts.work_item_id`. Moving rows to a sibling
+    //     table would orphan those FKs or force cascading rewrites.
+    //   - the supervisor's state_changed_at + applied_at columns need to
+    //     stay queryable for retention-window debugging after archival;
+    //     a soft archive keeps them in-place.
+    //   - a partial index on `WHERE archived_at IS NULL` is enough to
+    //     keep hot-path queries fast.
+    let _ = conn.execute(
+        "ALTER TABLE dadbear_work_items ADD COLUMN archived_at TEXT DEFAULT NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wi_live ON dadbear_work_items(slug, state) WHERE archived_at IS NULL",
+        [],
+    );
+
     // ── pyramid_web_edges: build_id scoping (WS-ONLINE-S3) ──
     let _ = conn.execute(
         "ALTER TABLE pyramid_web_edges ADD COLUMN build_id TEXT DEFAULT NULL",

@@ -235,13 +235,29 @@ fn list_active_slugs(conn: &Connection) -> Result<Vec<String>> {
 ///
 /// Returns the number of events written. Per-slug write failures are
 /// logged and skipped — a bad slug shouldn't fail the whole tick.
+///
+/// Metadata carries the accretion-related SchedulerConfig fields so
+/// the supervisor's role_bound dispatch can splat them into the
+/// accretion chain's initial input envelope. The accretion chain
+/// itself reads `window_n` (LLM-context cap) from the envelope — we
+/// send an aggressive default that operators override via a
+/// chain-level supersession. The count + cursor are NOT pre-computed
+/// at tick time (they'd be stale by dispatch) — the accretion chain
+/// reads them freshly in `load_recent_annotations_for_slug`.
 pub fn emit_accretion_tick(conn: &Connection) -> Result<usize> {
+    let cfg = load_config(conn);
     let slugs = list_active_slugs(conn)?;
     let mut written = 0usize;
     for slug in &slugs {
         let metadata = serde_json::json!({
             "trigger": "scheduler",
             "tick_kind": "accretion",
+            // Starter-accretion-handler reads `window_n` as required
+            // field. Tie the scheduler default to the threshold so
+            // tick-dispatched accretions load at least `K` annotations
+            // of recent window — matches the threshold-hit semantics.
+            // Operators override per-slug via chain-level YAML.
+            "window_n": cfg.accretion_threshold.max(20) as i64,
         })
         .to_string();
         match observation_events::write_observation_event(
@@ -269,13 +285,21 @@ pub fn emit_accretion_tick(conn: &Connection) -> Result<usize> {
 }
 
 /// Emit `sweep_tick` for every active slug.
+///
+/// Metadata carries the sweep policy knobs (stale_days +
+/// retention_days + contribution_retention_days) so the sweep chain's
+/// mechanicals receive them via the supervisor's metadata splat.
 pub fn emit_sweep_tick(conn: &Connection) -> Result<usize> {
+    let cfg = load_config(conn);
     let slugs = list_active_slugs(conn)?;
     let mut written = 0usize;
     for slug in &slugs {
         let metadata = serde_json::json!({
             "trigger": "scheduler",
             "tick_kind": "sweep",
+            "stale_days": cfg.sweep_stale_days as i64,
+            "retention_days": cfg.sweep_retention_days as i64,
+            "contribution_retention_days": cfg.sweep_retention_days as i64,
         })
         .to_string();
         match observation_events::write_observation_event(
@@ -322,6 +346,10 @@ pub fn emit_accretion_threshold_hit(
         "count_since_cursor": count_since_cursor,
         "accretion_cursor": accretion_cursor,
         "threshold": threshold,
+        // Same field the accretion chain's `load_recent_annotations_for_slug`
+        // reads as required envelope field; tied to the threshold that
+        // just crossed so the load window matches the cause.
+        "window_n": count_since_cursor.max(threshold as i64),
     })
     .to_string();
     observation_events::write_observation_event(

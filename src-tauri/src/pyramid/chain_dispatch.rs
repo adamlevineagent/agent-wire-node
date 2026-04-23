@@ -654,6 +654,9 @@ const MECHANICAL_FUNCTIONS: &[&str] = &[
     "emit_sweep_invoked",
     "count_stale_failed_work_items",
     "reindex_vocab_cache",
+    // Post-build accretion v5 Phase 9b-3 — sweep archive mechanicals.
+    "archive_stale_failed_work_items",
+    "retire_superseded_contributions_past_retention",
 ];
 
 /// Post-build accretion v5 Phase 6b: hard ceiling on sub-chain recursion.
@@ -3971,9 +3974,13 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 let conn_guard = ctx.db_reader.lock().await;
                 conn_guard
                     .query_row(
+                        // Phase 9b-3: exclude archived rows so the count
+                        // reflects live operator-actionable debt, not
+                        // sweep-accumulated cold storage.
                         "SELECT COUNT(*) FROM dadbear_work_items
                           WHERE slug = ?1
                             AND state = 'failed'
+                            AND archived_at IS NULL
                             AND state_changed_at < datetime('now', ?2)",
                         rusqlite::params![slug_for_count, threshold_modifier],
                         |r| r.get(0),
@@ -4089,6 +4096,209 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 "role_name": role_count,
             });
             out.insert("vocab_counts".to_string(), counts);
+            Ok(Value::Object(out))
+        }
+        "archive_stale_failed_work_items" => {
+            // Phase 9b-3: graduate the sweep chain from measurement to
+            // actual archival. Moves `dadbear_work_items` rows where
+            // state='failed' AND state_changed_at < (now - stale_days -
+            // retention_days) to `archived_at = now()`. The sweep
+            // chain's prior `count_stale_failed_work_items` step ran on
+            // stale_days; archival happens on the *longer* window so
+            // operators have a recovery period between "stale" and
+            // "archived" (count-only) during which they can manually
+            // retry / debug.
+            //
+            // Input envelope:
+            //   stale_days       — same as count step (sweep's "what's
+            //                      stale?" threshold; read from envelope).
+            //   retention_days   — extra days beyond stale before the
+            //                      row is archived. Loud-raises if absent.
+            //
+            // Both values come from the sweep chain's caller (today:
+            // pyramid_scheduler dispatch path — the SchedulerConfig's
+            // sweep_stale_days + sweep_retention_days) so the policy
+            // sits outside Rust.
+            //
+            // Emits `sweep_archived_failed_work_items` with the count.
+            // Idempotent: already-archived rows are filtered by the
+            // `archived_at IS NULL` predicate.
+            let stale_days = input
+                .get("stale_days")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| anyhow!(
+                    "archive_stale_failed_work_items: required field \
+                     `stale_days` is missing from the input envelope. \
+                     The sweep chain caller owns this policy knob \
+                     (scheduler_parameters.sweep_stale_days today)."
+                ))?
+                .max(0);
+            let retention_days = input
+                .get("retention_days")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| anyhow!(
+                    "archive_stale_failed_work_items: required field \
+                     `retention_days` is missing from the input \
+                     envelope. Operators define the recovery window \
+                     after `stale_days` before archival; the dispatch \
+                     code does not hardcode it \
+                     (scheduler_parameters.sweep_retention_days today)."
+                ))?
+                .max(0);
+            let slug_for_archive = input
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| ctx.slug.clone());
+            let total_days = stale_days.saturating_add(retention_days);
+            let threshold_modifier = format!("-{} days", total_days);
+
+            let archived_count: i64 = {
+                let conn_guard = ctx.db_writer.lock().await;
+                let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                let rows = conn_guard
+                    .execute(
+                        "UPDATE dadbear_work_items
+                            SET archived_at = ?1
+                          WHERE slug = ?2
+                            AND state = 'failed'
+                            AND archived_at IS NULL
+                            AND state_changed_at < datetime('now', ?3)",
+                        rusqlite::params![now, slug_for_archive, threshold_modifier],
+                    )
+                    .map_err(|e| anyhow!(
+                        "archive_stale_failed_work_items: UPDATE failed for slug={}: {}",
+                        slug_for_archive, e,
+                    ))?;
+                rows as i64
+            };
+
+            info!(
+                "[mechanical] archive_stale_failed_work_items slug={} stale_days={} retention_days={} archived={}",
+                slug_for_archive, stale_days, retention_days, archived_count,
+            );
+
+            let meta = serde_json::json!({
+                "stale_days": stale_days,
+                "retention_days": retention_days,
+                "threshold_days": total_days,
+                "archived_count": archived_count,
+            });
+            let metadata_json = serde_json::to_string(&meta)?;
+            let conn_guard = ctx.db_writer.lock().await;
+            super::observation_events::write_observation_event(
+                &conn_guard,
+                &slug_for_archive,
+                "chain",
+                "sweep_archived_failed_work_items",
+                None, None, None, None, None, None,
+                Some(&metadata_json),
+            )?;
+            drop(conn_guard);
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("slug".to_string(), Value::String(slug_for_archive));
+            out.insert("archived_count".to_string(), Value::from(archived_count));
+            out.insert("stale_days".to_string(), Value::from(stale_days));
+            out.insert("retention_days".to_string(), Value::from(retention_days));
+            Ok(Value::Object(out))
+        }
+        "retire_superseded_contributions_past_retention" => {
+            // Phase 9b-3: retire long-dead superseded contribution rows.
+            // When `status = 'superseded'` AND accepted_at < (now -
+            // retention_days), flip status to `retired`. Retirement is
+            // soft (no row deletion) — the supersession chain stays
+            // intact for audit, but a `retired` row is excluded from
+            // active-version queries (which already filter
+            // `status = 'active'`), so the semantic is preserved.
+            //
+            // Retention window lives on the input envelope
+            // (`contribution_retention_days`, operator-editable via the
+            // scheduler config). Absent or <= 0 → loud-raise (the
+            // primitive cannot invent a retention policy).
+            //
+            // Emits `sweep_retired_superseded_contributions` with the
+            // count.
+            let retention_days = input
+                .get("contribution_retention_days")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| anyhow!(
+                    "retire_superseded_contributions_past_retention: required \
+                     field `contribution_retention_days` is missing from the \
+                     input envelope. Operators define supersession retention; \
+                     the dispatch code does not hardcode it."
+                ))?;
+            if retention_days <= 0 {
+                return Err(anyhow!(
+                    "retire_superseded_contributions_past_retention: \
+                     contribution_retention_days must be > 0 (got {retention_days}). \
+                     Zero/negative retention would retire every superseded row \
+                     immediately; refusing per feedback_loud_deferrals."
+                ));
+            }
+            let slug_for_retire = input
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| ctx.slug.clone());
+            let threshold_modifier = format!("-{} days", retention_days);
+
+            let retired_count: i64 = {
+                let conn_guard = ctx.db_writer.lock().await;
+                // Scope the retire pass: either slug-scoped (non-NULL slug
+                // match) OR the global pool (slug IS NULL). The sweep
+                // chain caller may want both passes in turn; this
+                // primitive handles one call per invocation and we run
+                // it slug-scoped by default (sweep is a per-slug chain).
+                let rows = conn_guard
+                    .execute(
+                        "UPDATE pyramid_config_contributions
+                            SET status = 'retired'
+                          WHERE status = 'superseded'
+                            AND slug = ?1
+                            AND COALESCE(accepted_at, created_at) < datetime('now', ?2)",
+                        rusqlite::params![slug_for_retire, threshold_modifier],
+                    )
+                    .map_err(|e| anyhow!(
+                        "retire_superseded_contributions_past_retention: UPDATE failed for slug={}: {}",
+                        slug_for_retire, e,
+                    ))?;
+                rows as i64
+            };
+
+            info!(
+                "[mechanical] retire_superseded_contributions_past_retention slug={} retention_days={} retired={}",
+                slug_for_retire, retention_days, retired_count,
+            );
+
+            let meta = serde_json::json!({
+                "retention_days": retention_days,
+                "retired_count": retired_count,
+            });
+            let metadata_json = serde_json::to_string(&meta)?;
+            let conn_guard = ctx.db_writer.lock().await;
+            super::observation_events::write_observation_event(
+                &conn_guard,
+                &slug_for_retire,
+                "chain",
+                "sweep_retired_superseded_contributions",
+                None, None, None, None, None, None,
+                Some(&metadata_json),
+            )?;
+            drop(conn_guard);
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("slug".to_string(), Value::String(slug_for_retire));
+            out.insert("retention_days".to_string(), Value::from(retention_days));
+            out.insert("retired_count".to_string(), Value::from(retired_count));
             Ok(Value::Object(out))
         }
         unknown => Err(anyhow!("Unknown mechanical function: {}", unknown)),
