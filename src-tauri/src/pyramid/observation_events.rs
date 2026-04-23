@@ -46,6 +46,12 @@ use rusqlite::Connection;
 ///                  | "meta_layer_oracle_skipped"     // v5 Phase 7b: oracle decided no crystallization
 ///                  | "synthesizer_invoked"           // v5 Phase 7b: synthesizer chain fired
 ///                  | "gap_dispatcher_invoked"        // v5 Phase 7c: gap_dispatcher chain fired
+///                  | "gap_dispatcher_skipped"        // v5 Phase 7c verifier: skip path
+///                                                     //   (target already typed Debate/MetaLayer,
+///                                                     //   or retrigger hit existing anchor → no_op).
+///                                                     //   Emitted instead of tracing::warn so
+///                                                     //   operators see it in the chronicle
+///                                                     //   (feedback_loud_deferrals).
 ///                  | "vocabulary_published"          // v5 6c-A: vocab entry publish
 ///                  | "vocabulary_superseded"         // v5 6c-A: vocab entry supersede
 /// - `source_path`: filesystem path for the observation source (NULL for internal events)

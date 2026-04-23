@@ -2807,10 +2807,36 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
             let annotation_obj = input.get("annotation").cloned().unwrap_or(Value::Null);
 
             if annotation_id.is_none() {
+                // feedback_loud_deferrals: the "no annotation_id" path is the
+                // gap_detected retrigger safety net — we don't want to silently
+                // drop it to an info! log. Emit a `gap_dispatcher_skipped`
+                // chronicle event so an operator sees it in the same place they
+                // see all other chain activity. Info log stays for stream-grep.
                 info!(
                     "[mechanical] materialize_gap_node slug={} target={} → no_op (no annotation_id in input — likely gap_detected retrigger)",
                     ctx.slug, target_node_id
                 );
+                let skip_meta = serde_json::json!({
+                    "target_node_id": target_node_id,
+                    "reason": "no_annotation_id",
+                    "detail": "work item carried no annotation_id (likely gap_detected retrigger via role_for_event mapping). Idempotency: second dispatch is a cheap no_op.",
+                })
+                .to_string();
+                let conn_guard = ctx.db_writer.lock().await;
+                let _ = super::observation_events::write_observation_event(
+                    &conn_guard,
+                    &ctx.slug,
+                    "chain",
+                    "gap_dispatcher_skipped",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&target_node_id),
+                    None,
+                    Some(&skip_meta),
+                );
+                drop(conn_guard);
                 return Ok(serde_json::json!({
                     "action": "no_op",
                     "reason": "no annotation_id in input",
@@ -2897,29 +2923,31 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 .map(|v| v.shape.clone())
                 .unwrap_or_else(NodeShape::scaffolding);
 
-            // The annotation-anchor marker is embedded as a synthetic
-            // GapCandidate whose `resolution_type` field starts with the
-            // reserved prefix `annotation#`. This gives us a stable key
-            // for idempotency without adding a new field to GapCandidate.
-            //
-            // feedback_generalize_not_enumerate: if the annotation-anchor
-            // pattern proliferates beyond 2 use sites, lift it to a
-            // first-class `evidence_anchors: Vec<String>` on GapTopic
-            // (mirroring DebatePosition.evidence_anchors). For Phase 7c
-            // one use site = no schema change warranted.
-            let annotation_anchor_resolution_type = format!("annotation#{annotation_id}");
+            // Phase 7c verifier pass: the annotation anchor lives on a
+            // first-class `GapTopic.evidence_anchors: Vec<String>` field
+            // (mirroring `DebatePosition.evidence_anchors` /
+            // `RedTeamEntry.evidence_anchors`). Previously we overloaded
+            // `GapCandidate.resolution_type` with an `annotation#{id}`
+            // synthetic candidate — that muddled the semantic channel
+            // (`resolution_type` is meant to describe HOW a gap might
+            // close: "query_wire" / "run_evidence_loop" / etc.) and would
+            // have surfaced in Phase 8's LLM-driven candidate generation
+            // as a "real" candidate. Per `feedback_generalize_not_enumerate`:
+            // add the purpose-matched field now while the blast radius is
+            // small, rather than defer cleanup to when LLM prompts have
+            // already learned the wrong schema.
+            let annotation_anchor = format!("annotation#{annotation_id}");
 
             let (action, updated_gap, shape_was_upgraded) = if current_shape.is_scaffolding() {
-                // Fresh Gap. Seed a single candidate carrying the anchor.
+                // Fresh Gap. Seed an empty candidate list — real candidates
+                // come from a Phase 8+ LLM step — and record the annotation
+                // anchor under evidence_anchors for idempotent replay.
                 let gap = GapTopic {
                     concern: concern_line,
                     description: description.clone(),
                     demand_state: "open".to_string(),
-                    candidate_resolutions: vec![super::types::GapCandidate {
-                        resolution_type: annotation_anchor_resolution_type.clone(),
-                        cost_estimate: None,
-                        authorization_required: false,
-                    }],
+                    candidate_resolutions: Vec::new(),
+                    evidence_anchors: vec![annotation_anchor.clone()],
                 };
                 ("created_gap", gap, true)
             } else if current_shape.as_str() == NODE_SHAPE_GAP {
@@ -2936,18 +2964,15 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                     }
                 };
                 let already = gap
-                    .candidate_resolutions
+                    .evidence_anchors
                     .iter()
-                    .any(|c| c.resolution_type == annotation_anchor_resolution_type);
+                    .any(|a| a == &annotation_anchor);
                 if !already {
-                    // Append the anchor candidate. Don't mutate concern /
-                    // description of an existing gap (the original
-                    // concern is load-bearing for operators).
-                    gap.candidate_resolutions.push(super::types::GapCandidate {
-                        resolution_type: annotation_anchor_resolution_type.clone(),
-                        cost_estimate: None,
-                        authorization_required: false,
-                    });
+                    // Append the anchor. Don't mutate concern / description
+                    // of an existing gap (the original concern is
+                    // load-bearing for operators) and don't touch
+                    // candidate_resolutions (that's the LLM's channel).
+                    gap.evidence_anchors.push(annotation_anchor.clone());
                 }
                 let action_label = if already { "no_op" } else { "appended_anchor" };
                 (action_label, gap, false)
@@ -2955,10 +2980,40 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 || current_shape.as_str() == NODE_SHAPE_META_LAYER
             {
                 // Don't destroy typed nodes — no_op loud. Phase 8 decides
-                // whether to create a sibling Gap node (new id).
+                // whether to create a sibling Gap node (new id). Phase 7c
+                // verifier: emit a chronicle `gap_dispatcher_skipped` event
+                // alongside the tracing::warn so operators see the skip in
+                // the same surface as every other chain action
+                // (feedback_loud_deferrals). Mirrors the Phase 7b
+                // `meta_layer_oracle_skipped` pattern.
                 warn!(
                     "[mechanical] materialize_gap_node slug={} target={} shape={} → skip (Phase 8 will decide sibling-Gap policy)",
                     ctx.slug, target_node_id, current_shape,
+                );
+                let skip_meta = serde_json::json!({
+                    "target_node_id": target_node_id,
+                    "annotation_id": annotation_id,
+                    "existing_shape": current_shape.as_str(),
+                    "reason": "shape_incompatible",
+                    "detail": format!(
+                        "target '{}' is shape '{}' — gap_dispatcher will not overwrite \
+                         a typed node. Phase 8 may create a sibling Gap node.",
+                        target_node_id, current_shape,
+                    ),
+                })
+                .to_string();
+                let _ = super::observation_events::write_observation_event(
+                    &conn_guard,
+                    &ctx.slug,
+                    "chain",
+                    "gap_dispatcher_skipped",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&target_node_id),
+                    None,
+                    Some(&skip_meta),
                 );
                 drop(conn_guard);
                 return Ok(serde_json::json!({
@@ -3005,6 +3060,11 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
             // Emit gap_detected only on the shape upgrade (scaffolding→gap).
             // Append-to-existing-gap does NOT re-emit (the chronicle already
             // carries the original gap_detected).
+            //
+            // Phase 7c verifier: metadata carries `concern` in addition to
+            // the bookkeeping fields. Downstream consumers (FE gap surface,
+            // Phase 8 LLM candidate generation) need a human-readable
+            // summary line without a second DB read.
             let mut gap_detected_event_id: Option<i64> = None;
             if shape_was_upgraded {
                 let meta = serde_json::json!({
@@ -3012,6 +3072,7 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                     "annotation_id": annotation_id,
                     "author": ann_author,
                     "demand_state": updated_gap.demand_state,
+                    "concern": updated_gap.concern,
                 })
                 .to_string();
                 let eid = super::observation_events::write_observation_event(

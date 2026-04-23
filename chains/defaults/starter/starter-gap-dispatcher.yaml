@@ -33,11 +33,23 @@ description: >
 
   Notes:
     - `gap_detected` routing (role_for_event(gap_detected) →
-      gap_dispatcher) is intentionally suppressed in Phase 7c:
-      annotation_reacted already carried the dispatch trigger via
-      the vocab handler_chain_id path (6c-B flip). Re-dispatching on
-      the chain's own gap_detected emission would be a wasted cycle
-      (idempotent, but noisy).  See dadbear_compiler::role_for_event.
+      gap_dispatcher) is KEPT in Phase 7c (symmetrical event-map
+      discipline). The chain's own gap_detected emission does cause
+      a second gap_dispatcher work item to compile; the second
+      dispatch is harmless because:
+        (a) load_gap_context back-fills annotation_id from the
+            gap_detected event's metadata, AND the existing Gap
+            node already carries an `annotation#{id}` token on
+            `evidence_anchors`. The anchor-check fires, action =
+            `no_op`, no re-emit. OR
+        (b) if metadata is absent (legacy event), annotation_id
+            stays None and materialize_gap_node hits the
+            `gap_dispatcher_skipped` chronicle path with
+            reason=no_annotation_id.
+      Phase 7c verifier pass added a `gap_dispatcher_skipped`
+      observation event on both paths per
+      `feedback_loud_deferrals` so the wasted cycle surfaces in
+      the chronicle, not just tracing logs.
     - Every step is mechanical; Phase 7c ships no LLM at this layer.
 content_type: code
 version: "1.0.0"

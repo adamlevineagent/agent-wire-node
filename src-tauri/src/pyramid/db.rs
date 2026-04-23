@@ -22144,12 +22144,18 @@ mod phase2_post_build_tests {
     }
 
     #[test]
-    fn save_annotation_round_trip_all_eleven_types() {
+    fn save_annotation_round_trip_all_fifteen_types() {
+        // Phase 7c verifier: extended from 11 → 15 types (adds gap /
+        // hypothesis / purpose_declaration / purpose_shift as pure vocab
+        // entries per 6c-B flip). The old round-trip covered only the
+        // original 11 — adding a new vocab verb shouldn't be a silent
+        // coverage regression, so this test is kept in sync with the
+        // genesis table. Iteration order matches GENESIS_ANNOTATION_TYPES.
         let conn = mem_conn();
         create_slug(&conn, "s", &ContentType::Code, "/tmp/s").unwrap();
         seed_target_node(&conn, "s", "L0-000");
         // Phase 6c-B: AnnotationType is a newtype wrapping a string; the
-        // canonical names live in the vocab registry (genesis seeds all 11).
+        // canonical names live in the vocab registry (genesis seeds 15).
         let all = [
             AnnotationType::new("observation"),
             AnnotationType::new("correction"),
@@ -22162,6 +22168,11 @@ mod phase2_post_build_tests {
             AnnotationType::new("directory"),
             AnnotationType::new("steel_man"),
             AnnotationType::new("red_team"),
+            // Phase 7c v5 verbs — pure vocab additions (no enum edit).
+            AnnotationType::new("gap"),
+            AnnotationType::new("hypothesis"),
+            AnnotationType::new("purpose_declaration"),
+            AnnotationType::new("purpose_shift"),
         ];
         for ty in all.iter() {
             let a = make_annotation("s", "L0-000", ty.clone());
@@ -22169,7 +22180,7 @@ mod phase2_post_build_tests {
             assert_eq!(saved.annotation_type, *ty, "round-trip mismatch for {:?}", ty);
         }
         let listed = get_annotations(&conn, "s", "L0-000").unwrap();
-        assert_eq!(listed.len(), 11);
+        assert_eq!(listed.len(), 15);
     }
 
     #[test]
@@ -22278,6 +22289,7 @@ mod phase2_post_build_tests {
             description: "y".into(),
             demand_state: "open".into(),
             candidate_resolutions: vec![],
+            evidence_anchors: vec![],
         });
         let g_json = serde_json::to_string(&gap).unwrap();
         assert!(!g_json.contains("\"kind\""));
@@ -23017,6 +23029,7 @@ mod phase4_post_build_tests {
             description: "No data on Y.".to_string(),
             demand_state: "open".to_string(),
             candidate_resolutions: vec![],
+            evidence_anchors: vec![],
         };
         let json = serde_json::to_string(&g).unwrap();
         match parse_shape_payload(&NodeShape::new("gap"), Some(&json)).unwrap().unwrap() {
@@ -23046,6 +23059,7 @@ mod phase4_post_build_tests {
             description: "d".into(),
             demand_state: "open".into(),
             candidate_resolutions: vec![],
+            evidence_anchors: vec![],
         })
         .unwrap();
         let err = parse_shape_payload(&NodeShape::new("debate"), Some(&gap_json)).unwrap_err();
@@ -23296,6 +23310,7 @@ mod phase4_post_build_tests {
                     authorization_required: false,
                 },
             ],
+            evidence_anchors: vec![],
         };
         let json = serde_json::to_string(&g).unwrap();
         match parse_shape_payload(&NodeShape::new("gap"), Some(&json)).unwrap().unwrap() {
@@ -29590,11 +29605,19 @@ mod phase7c_post_build_tests {
         match view.payload {
             Some(ShapePayload::Gap(g)) => {
                 assert_eq!(g.demand_state, "open", "fresh gap is demand_state=open");
+                // Phase 7c verifier: the annotation anchor lives on
+                // `evidence_anchors` (purpose-matched), NOT on a synthetic
+                // GapCandidate. `candidate_resolutions` is the LLM's
+                // channel and should start empty.
                 assert!(
-                    g.candidate_resolutions
+                    g.evidence_anchors
                         .iter()
-                        .any(|c| c.resolution_type.starts_with("annotation#")),
-                    "GapTopic must carry the annotation anchor for dedup"
+                        .any(|a| a.starts_with("annotation#")),
+                    "GapTopic must carry the annotation anchor under evidence_anchors for dedup"
+                );
+                assert!(
+                    g.candidate_resolutions.is_empty(),
+                    "fresh Gap must not seed synthetic candidate_resolutions — that channel is reserved for the LLM"
                 );
                 assert!(
                     !g.description.is_empty(),
@@ -29614,15 +29637,16 @@ mod phase7c_post_build_tests {
         create_slug(&conn, "p7c2", &ContentType::Code, "/tmp/p7c2").unwrap();
         // Pre-existing Gap already carries one anchor (annotation#99) so
         // the later materialize call is the "second" author adding theirs.
+        // Phase 7c verifier: annotation anchors moved to
+        // `evidence_anchors: Vec<String>`. Previously this fixture wrapped
+        // the anchor as a synthetic GapCandidate — now it goes to the
+        // purpose-matched field.
         let existing = GapTopic {
             concern: "Pre-existing concern".to_string(),
             description: "Pre-existing description".to_string(),
             demand_state: "open".to_string(),
-            candidate_resolutions: vec![GapCandidate {
-                resolution_type: "annotation#99".to_string(),
-                cost_estimate: None,
-                authorization_required: false,
-            }],
+            candidate_resolutions: vec![],
+            evidence_anchors: vec!["annotation#99".to_string()],
         };
         seed_existing_gap_node(&conn, "p7c2", "node-gap-2", &existing);
 
@@ -29685,14 +29709,22 @@ mod phase7c_post_build_tests {
             Some(ShapePayload::Gap(g)) => {
                 // Exactly 2 anchors: the pre-seeded annotation#99 + the
                 // one from ann.id. Idempotent re-run does NOT duplicate.
+                // Phase 7c verifier: anchors live on evidence_anchors now.
                 let anchor_count = g
-                    .candidate_resolutions
+                    .evidence_anchors
                     .iter()
-                    .filter(|c| c.resolution_type.starts_with("annotation#"))
+                    .filter(|a| a.starts_with("annotation#"))
                     .count();
                 assert_eq!(
                     anchor_count, 2,
                     "re-running must not duplicate the annotation anchor"
+                );
+                // candidate_resolutions untouched — still empty after
+                // merge-append. The LLM channel is off-limits for the
+                // mechanical dispatcher.
+                assert!(
+                    g.candidate_resolutions.is_empty(),
+                    "mechanical dispatcher must not write to candidate_resolutions"
                 );
             }
             other => panic!("expected Gap payload, got {other:?}"),
@@ -29791,6 +29823,30 @@ mod phase7c_post_build_tests {
                 )
                 .unwrap();
             assert_eq!(gd, 0, "skip path must not emit gap_detected");
+            // Phase 7c verifier (audit target 6): skip must be chronicled
+            // via `gap_dispatcher_skipped` per feedback_loud_deferrals.
+            // Tracing-level warn alone is insufficient for operators.
+            let (skip_count, skip_meta): (i64, Option<String>) = writer
+                .query_row(
+                    "SELECT COUNT(*), MAX(metadata_json) FROM dadbear_observation_events
+                      WHERE slug = 'p7c3a' AND event_type = 'gap_dispatcher_skipped'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                skip_count, 1,
+                "skip-loud: debate target must emit gap_dispatcher_skipped"
+            );
+            let sm = skip_meta.expect("skip metadata required");
+            assert!(
+                sm.contains("shape_incompatible"),
+                "skip metadata must carry reason: {sm}"
+            );
+            assert!(
+                sm.contains("debate"),
+                "skip metadata must carry existing shape: {sm}"
+            );
         }
 
         // Case B: MetaLayer target
@@ -29843,6 +29899,20 @@ mod phase7c_post_build_tests {
                 view.shape.as_str(),
                 NODE_SHAPE_META_LAYER,
                 "shape must remain meta_layer"
+            );
+            // Phase 7c verifier: skip-loud chronicle event required here
+            // too (see case A comment above).
+            let skip_count: i64 = writer
+                .query_row(
+                    "SELECT COUNT(*) FROM dadbear_observation_events
+                      WHERE slug = 'p7c3b' AND event_type = 'gap_dispatcher_skipped'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                skip_count, 1,
+                "skip-loud: meta_layer target must emit gap_dispatcher_skipped"
             );
         }
     }
@@ -29901,6 +29971,18 @@ mod phase7c_post_build_tests {
         assert!(
             m.contains("demand_state"),
             "metadata must carry demand_state: {m}"
+        );
+        // Phase 7c verifier (audit target 9): downstream consumers need a
+        // human-readable concern line so the FE gap surface + Phase 8 LLM
+        // candidate-generation prompt can operate without a second DB read.
+        assert!(
+            m.contains("\"concern\""),
+            "metadata must carry concern: {m}"
+        );
+        // annotation_id carries the source annotation for traceability.
+        assert!(
+            m.contains("annotation_id"),
+            "metadata must carry annotation_id: {m}"
         );
     }
 
@@ -30039,11 +30121,17 @@ mod phase7c_post_build_tests {
                     "concern must carry question_context when present: {}",
                     g.concern
                 );
+                // Phase 7c verifier: anchors on evidence_anchors, not
+                // on candidate_resolutions.
                 assert!(
-                    g.candidate_resolutions
+                    g.evidence_anchors
                         .iter()
-                        .any(|c| c.resolution_type.starts_with("annotation#")),
-                    "annotation anchor must be present for dedup"
+                        .any(|a| a.starts_with("annotation#")),
+                    "annotation anchor must be present on evidence_anchors for dedup"
+                );
+                assert!(
+                    g.candidate_resolutions.is_empty(),
+                    "mechanical dispatcher does not seed candidate_resolutions"
                 );
             }
             other => panic!("expected Gap payload, got {other:?}"),

@@ -156,6 +156,10 @@ export interface GapTopic {
   description: string;
   demand_state: string; // "open" | "dispatched" | "closed" | "tombstoned"
   candidate_resolutions?: GapCandidate[];
+  // Phase 7c verifier: annotation-sourced dedup tokens (e.g. "annotation#42")
+  // so re-running the gap_dispatcher on the same annotation is idempotent.
+  // Mirrors DebatePosition.evidence_anchors / RedTeamEntry.evidence_anchors.
+  evidence_anchors?: string[];
 }
 
 // Shape payload is stored as JSON in `pyramid_nodes.shape_payload_json`;

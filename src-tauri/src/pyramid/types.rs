@@ -2604,6 +2604,17 @@ pub struct MetaLayerTopicEntry {
 /// Gap node payload — explicit absence with demand state and candidate
 /// resolutions. Demand state lifecycle: open -> dispatched -> closed |
 /// tombstoned.
+///
+/// `evidence_anchors` carries dedup tokens for idempotent append (same
+/// pattern as `DebatePosition.evidence_anchors` / `RedTeamEntry.evidence_anchors`).
+/// Today the `gap_dispatcher` chain writes `annotation#{id}` tokens here
+/// when materializing a Gap from a `gap` annotation, so a replay of the
+/// same annotation is a cheap anchor-match → no-op. Phase 7c verifier pass
+/// lifted this out of `GapCandidate.resolution_type` because encoding the
+/// anchor there muddles the semantic channel (`resolution_type` is meant
+/// to describe HOW a gap might be closed, e.g. "query_wire" / "run_evidence_loop",
+/// not WHO first observed it). Per `feedback_generalize_not_enumerate`:
+/// use the purpose-matched field, don't overload the first one that fits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GapTopic {
     pub concern: String,
@@ -2611,6 +2622,8 @@ pub struct GapTopic {
     pub demand_state: String,
     #[serde(default)]
     pub candidate_resolutions: Vec<GapCandidate>,
+    #[serde(default)]
+    pub evidence_anchors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
