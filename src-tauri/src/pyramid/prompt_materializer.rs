@@ -85,6 +85,19 @@ pub fn materialize_prompt(
         ("tombstone", _) => Ok(MaterializeResult::Mechanical {
             reason: "Tombstone is a mechanical deletion — no LLM call needed".into(),
         }),
+        // Post-build accretion v5 Phase 3: role_bound + log_only are handled
+        // directly by `apply_mechanical_primitive` (role_bound dispatches
+        // the bound chain; log_only emits tracing info). Neither consults
+        // the compute queue, so the materializer returns Mechanical to keep
+        // the supervisor off the LLM dispatch path. Without this arm the
+        // fallback `_ =>` branch below routes the work item through a
+        // placeholder LLM prompt and burns compute — Phase 3 verifier fix.
+        ("role_bound", _) => Ok(MaterializeResult::Mechanical {
+            reason: "role_bound dispatches the bound chain — no LLM prompt materialization".into(),
+        }),
+        ("log_only", _) => Ok(MaterializeResult::Mechanical {
+            reason: "log_only is chronicle-only — no LLM call needed".into(),
+        }),
         ("rename_candidate", _) => {
             // Look up the observation event's metadata_json to get old_path/new_path.
             let detail_json = observation_event_ids_json

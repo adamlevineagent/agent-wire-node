@@ -121,7 +121,7 @@ pub struct CompilationResult {
 ///   annotation_superseded → re_distill (same primitive; supersession is a stronger signal
 ///     preserved in metadata_json but coalesces with additive writes so a single parent
 ///     re-distill runs even if multiple annotations fire within the dedup window)
-fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, &'static str, &'static str)> {
+pub(crate) fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, &'static str, &'static str)> {
     // Returns (primitive, step_name, model_tier)
     match event_type {
         "file_created" => Some(("extract", "l0_extract", "stale_remote")),
@@ -410,17 +410,24 @@ pub fn compile_observations(
         let (primitive, step_name, model_tier) = match map_event_to_primitive(&event.event_type) {
             Some(mapping) => mapping,
             None => {
+                // Phase 3 verifier fix: previously this arm advanced the
+                // cursor (silent-skip-and-advance). Per feedback_loud_deferrals
+                // unknown event types are now held in the read-pool: we warn
+                // every tick until an operator either teaches the compiler
+                // the new event_type or supersedes/deletes the rogue row.
+                // Silent-advance used to lose events permanently.
+                //
+                // STRICT_UNKNOWN_EVENTS=1 still escalates to a hard panic
+                // inside map_event_to_primitive, for operators who prefer
+                // the loop die over spam logs. The default now loud-holds
+                // instead of loud-losing.
                 warn!(
                     slug = %slug,
                     event_type = %event.event_type,
                     event_id = event.id,
-                    "Unknown observation event type, skipping"
+                    "Unknown observation event type — holding cursor so event is not lost; \
+                     update map_event_to_primitive or supersede the row"
                 );
-                // Skipped events DO still advance the cursor — they're
-                // vocabulary drift, not resolution failures. If the operator
-                // wants strict handling, STRICT_UNKNOWN_EVENTS=1 makes
-                // map_event_to_primitive panic before reaching this line.
-                compiled_event_ids.push(event.id);
                 continue;
             }
         };
@@ -588,15 +595,36 @@ pub fn compile_observations(
         }
     }
 
-    // ── v5 R4 cursor-gating: cursor = max of successfully-processed event
-    // ids only. role_bound events that failed binding resolution are NOT
-    // in compiled_event_ids, so cursor does NOT advance past them. They
-    // stay in the read-pool next tick for retry.
-    let new_cursor = compiled_event_ids
+    // ── v5 R4 cursor-gating (Phase 3 verifier refinement): the cursor must
+    // advance only to the largest contiguous-prefix id. `max(compiled_ids)`
+    // alone was insufficient — it silently skipped over a held event when
+    // subsequent events still succeeded, because the held id was absent
+    // from `compiled_event_ids` while larger successful ids were present.
+    // We compute the smallest held id, then take the largest compiled id
+    // strictly less than it. Held events (and everything after them) stay
+    // in the read-pool for next-tick retry — preserving the Wave 3 R4
+    // contract that a failed resolution never loses in-flight events.
+    let compiled_set: std::collections::HashSet<i64> =
+        compiled_event_ids.iter().copied().collect();
+    let min_held_id: Option<i64> = events
         .iter()
-        .copied()
-        .max()
-        .unwrap_or(last_compiled_observation_id);
+        .map(|e| e.id)
+        .filter(|id| !compiled_set.contains(id))
+        .min();
+    let new_cursor = if let Some(first_held) = min_held_id {
+        compiled_event_ids
+            .iter()
+            .copied()
+            .filter(|id| *id < first_held)
+            .max()
+            .unwrap_or(last_compiled_observation_id)
+    } else {
+        compiled_event_ids
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(last_compiled_observation_id)
+    };
 
     conn.execute(
         "UPDATE dadbear_compilation_state SET last_compiled_observation_id = ?1 WHERE slug = ?2",
@@ -629,7 +657,7 @@ pub fn compile_observations(
 ///
 /// Returns None if the event_type is not a role_bound event (caller should
 /// handle via map_event_to_primitive's primitive string instead).
-fn role_for_event(event_type: &str) -> Option<&'static str> {
+pub(crate) fn role_for_event(event_type: &str) -> Option<&'static str> {
     match event_type {
         // annotation_written + annotation_superseded stay mapped to re_distill
         // in Phase 3 — Phase 8 flips them to role_bound with cascade_handler.

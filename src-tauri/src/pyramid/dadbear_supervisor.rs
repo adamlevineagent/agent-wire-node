@@ -703,6 +703,14 @@ impl DadbearSupervisor {
             // Post-build accretion v5 Phase 3 (WS3-C): log-only primitive.
             // Observability events (binding_unresolved, cascade_handler_invoked)
             // produce a chronicle trail without triggering any actual work.
+            //
+            // Phase 3 verifier fix: the shared post-apply block below emits
+            // cascade_stale to parent layers unconditionally, which for
+            // log_only would create downstream observation work (defeating
+            // the "no side effects" contract and risking feedback loops —
+            // binding_unresolved itself maps to log_only, so a cascade back
+            // into the pipeline would loop). We CAS → applied directly here
+            // and early-return before the shared cascade-emitter runs.
             "log_only" => {
                 tracing::info!(
                     slug = %slug,
@@ -710,6 +718,27 @@ impl DadbearSupervisor {
                     step_name = %item.step_name,
                     "log_only event processed (chronicle-only, no side effects)"
                 );
+                let db_path_lo = db_path.clone();
+                let wi_id_lo = wi_id.clone();
+                let slug_lo = slug.clone();
+                let event_bus_lo = event_bus.clone();
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let conn = Connection::open(&db_path_lo)?;
+                    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                    conn.execute(
+                        "UPDATE dadbear_work_items
+                         SET state = 'applied',
+                             state_changed_at = ?1,
+                             applied_at = ?1
+                         WHERE id = ?2 AND state = 'previewed'",
+                        params![now, wi_id_lo],
+                    )?;
+                    emit_state_changed(&event_bus_lo, &slug_lo, &wi_id_lo, "previewed", "applied");
+                    Ok(())
+                })
+                .await
+                .context("spawn_blocking join error for log_only apply")??;
+                return Ok(());
             }
             // Post-build accretion v5 Phase 3 (WS3-C): role_bound dispatch.
             // The compiler stamps resolved_chain_id onto the work_item when
@@ -765,18 +794,35 @@ impl DadbearSupervisor {
                 // is stubbed in Phase 1 (chain_executor::execute_chain_for_target
                 // returns "implementation pending"). Phase 5 lands the first
                 // real starter chain; this arm becomes exercisable then.
+                //
+                // Phase 3 verifier fix: on chain load/execute failure (the
+                // stub bails today), transition the work item to `failed` so
+                // the next tick's `find_committed_previewed_items` does NOT
+                // keep re-dispatching it forever. Without this CAS the item
+                // stays `previewed`, the chain bail repeats every tick, and
+                // we spam the log + waste DB reads until operator intervention.
+                //
+                // Also: the shared cascade_stale emitter at the bottom of this
+                // function assumes the primitive has mutated the target node
+                // (extract/tombstone). role_bound delegates mutation to the
+                // chain runner — cascades are the chain's responsibility, not
+                // ours. Early-return on success to skip the shared emitter.
                 let chains_dir = self.pyramid_state.chains_dir.clone();
-                let chain = crate::pyramid::chain_loader::load_chain_by_id(
+                let load_result = crate::pyramid::chain_loader::load_chain_by_id(
                     &chain_id,
                     chains_dir.as_path(),
-                )
-                .with_context(|| {
-                    format!(
-                        "role_bound: failed to load chain '{}' for slug '{}'",
-                        chain_id, slug
-                    )
-                })?;
-                let _result = crate::pyramid::chain_executor::execute_chain_for_target(
+                );
+                let chain = match load_result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        mark_role_bound_failed(&db_path, &wi_id, &slug, &event_bus).await;
+                        return Err(e.context(format!(
+                            "role_bound: failed to load chain '{}' for slug '{}'",
+                            chain_id, slug
+                        )));
+                    }
+                };
+                let run_result = crate::pyramid::chain_executor::execute_chain_for_target(
                     &self.pyramid_state,
                     &chain,
                     &slug,
@@ -788,13 +834,47 @@ impl DadbearSupervisor {
                         "layer": item.layer,
                     }),
                 )
-                .await?;
-                tracing::info!(
-                    slug = %slug,
-                    work_item_id = %item.id,
-                    chain_id = %chain_id,
-                    "role_bound chain invocation complete"
-                );
+                .await;
+                match run_result {
+                    Ok(_result) => {
+                        tracing::info!(
+                            slug = %slug,
+                            work_item_id = %item.id,
+                            chain_id = %chain_id,
+                            "role_bound chain invocation complete"
+                        );
+                        // CAS previewed → applied; no shared cascade (chain
+                        // is responsible for its own downstream effects).
+                        let db_path_rb = db_path.clone();
+                        let wi_id_rb = wi_id.clone();
+                        let slug_rb = slug.clone();
+                        let event_bus_rb = event_bus.clone();
+                        tokio::task::spawn_blocking(move || -> Result<()> {
+                            let conn = Connection::open(&db_path_rb)?;
+                            let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                            conn.execute(
+                                "UPDATE dadbear_work_items
+                                 SET state = 'applied',
+                                     state_changed_at = ?1,
+                                     applied_at = ?1
+                                 WHERE id = ?2 AND state = 'previewed'",
+                                params![now, wi_id_rb],
+                            )?;
+                            emit_state_changed(&event_bus_rb, &slug_rb, &wi_id_rb, "previewed", "applied");
+                            Ok(())
+                        })
+                        .await
+                        .context("spawn_blocking join error for role_bound apply")??;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        mark_role_bound_failed(&db_path, &wi_id, &slug, &event_bus).await;
+                        return Err(e.context(format!(
+                            "role_bound: chain '{}' execution failed for slug '{}'",
+                            chain_id, slug
+                        )));
+                    }
+                }
             }
             _ => {
                 warn!(
@@ -2034,6 +2114,58 @@ fn reconstruct_step_context(
         content_type: String::new(),
         task_label: format!("dadbear:{}", item.primitive),
         balance_exhausted_emitted: std::sync::OnceLock::new(),
+    }
+}
+
+/// Phase 3 verifier helper: on role_bound chain load or execution failure,
+/// CAS the work item from `previewed` to `failed` so the supervisor's
+/// `find_committed_previewed_items` query doesn't re-select it every tick.
+/// We don't propagate this helper's own errors — the caller is already
+/// returning an Err on the original failure; a CAS blip here becomes a
+/// follow-up concern, not a cascade of nested errors.
+async fn mark_role_bound_failed(
+    db_path: &str,
+    wi_id: &str,
+    slug: &str,
+    event_bus: &Arc<BuildEventBus>,
+) {
+    let db_path = db_path.to_string();
+    let wi_id = wi_id.to_string();
+    let slug = slug.to_string();
+    let event_bus = event_bus.clone();
+    let wi_id_for_log = wi_id.clone();
+    let join = tokio::task::spawn_blocking(move || -> Result<bool> {
+        let conn = Connection::open(&db_path)?;
+        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let changed = conn.execute(
+            "UPDATE dadbear_work_items
+             SET state = 'failed',
+                 state_changed_at = ?1
+             WHERE id = ?2 AND state = 'previewed'",
+            params![now, wi_id],
+        )?;
+        if changed > 0 {
+            emit_state_changed(&event_bus, &slug, &wi_id, "previewed", "failed");
+        }
+        Ok(changed > 0)
+    })
+    .await;
+    match join {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            warn!(
+                work_item_id = %wi_id_for_log,
+                error = %e,
+                "mark_role_bound_failed: CAS previewed→failed error"
+            );
+        }
+        Err(e) => {
+            warn!(
+                work_item_id = %wi_id_for_log,
+                error = %e,
+                "mark_role_bound_failed: spawn_blocking join error"
+            );
+        }
     }
 }
 

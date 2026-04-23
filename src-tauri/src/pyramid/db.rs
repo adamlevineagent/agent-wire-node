@@ -22141,3 +22141,375 @@ mod phase2_post_build_tests {
         assert!(matches!(g_back, ShapePayload::Gap(_)));
     }
 }
+
+
+#[cfg(test)]
+mod phase3_post_build_tests {
+    //! Post-build accretion v5 Phase 3 tests — event vocabulary extensions,
+    //! compiler arms for role_bound / log_only, cursor-gating on binding
+    //! resolution failure, and supervisor dispatch shape (for the pieces
+    //! that don't require a full async runtime).
+    //!
+    //! See `.lab/architecture/agent-wire-node-post-build-plan-v5.md`
+    use super::*;
+    use crate::pyramid::types::ContentType;
+    use crate::pyramid::{dadbear_compiler, observation_events, role_binding};
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        conn
+    }
+
+    fn seed_slug(conn: &Connection, slug: &str) {
+        create_slug(conn, slug, &ContentType::Code, "/tmp/src").unwrap();
+        // dadbear_compilation_state row is not auto-seeded by create_slug.
+        // compile_observations reads via get_or_create_epoch, which inserts.
+    }
+
+    // ── Target 1: complete event → primitive coverage ──────────────────
+
+    #[test]
+    fn map_event_to_primitive_covers_all_nine_v5_event_types() {
+        // Post-build accretion v5 R8: each new event type has a dedicated
+        // step_name so has_active_work_item's (target_id, step_name, layer)
+        // dedup does NOT collapse semantically distinct events.
+        let cases: &[(&str, &str, &str)] = &[
+            ("annotation_reacted", "role_bound", "cascade_reacted"),
+            ("debate_spawned", "role_bound", "debate_spawn"),
+            ("debate_collapsed", "role_bound", "debate_collapse"),
+            ("gap_detected", "role_bound", "gap_dispatch"),
+            ("gap_resolved", "role_bound", "oracle_gap_resolved"),
+            ("purpose_shifted", "role_bound", "oracle_purpose_shift"),
+            ("meta_layer_crystallized", "role_bound", "synthesize_meta_layer"),
+            ("binding_unresolved", "log_only", "binding_unresolved_log"),
+            ("cascade_handler_invoked", "log_only", "cascade_invoked_log"),
+        ];
+        for (event_type, exp_prim, exp_step) in cases {
+            let got = dadbear_compiler::map_event_to_primitive(event_type)
+                .unwrap_or_else(|| panic!("Phase 3 event_type '{}' missing arm", event_type));
+            assert_eq!(got.0, *exp_prim, "primitive for '{}'", event_type);
+            assert_eq!(got.1, *exp_step, "step_name for '{}'", event_type);
+        }
+    }
+
+    #[test]
+    fn map_event_to_primitive_pre_phase3_types_still_map() {
+        // Regression guard: Phase 3 edits in map_event_to_primitive must
+        // not regress the pre-Phase-3 vocabulary. Spot-check the big ones.
+        let pre_phase3: &[(&str, &str)] = &[
+            ("file_created", "extract"),
+            ("file_modified", "stale_check"),
+            ("file_deleted", "tombstone"),
+            ("file_renamed", "rename_candidate"),
+            ("cascade_stale", "stale_check"),
+            ("edge_stale", "edge_check"),
+            ("evidence_growth", "stale_check"),
+            ("vine_stale", "stale_check"),
+            ("targeted_stale", "stale_check"),
+            ("full_sweep", "extract"),
+            ("annotation_written", "re_distill"),
+            ("annotation_superseded", "re_distill"),
+        ];
+        for (event_type, exp_prim) in pre_phase3 {
+            let got = dadbear_compiler::map_event_to_primitive(event_type)
+                .unwrap_or_else(|| panic!("pre-Phase-3 event_type '{}' no longer maps", event_type));
+            assert_eq!(got.0, *exp_prim, "primitive regression for '{}'", event_type);
+        }
+    }
+
+    #[test]
+    fn role_for_event_matches_genesis_bindings() {
+        // Every role_bound event must map to a role that's in GENESIS_BINDINGS
+        // (or cascade_handler, which is seeded separately) — otherwise
+        // resolve_binding always raises and the event is permanently stuck.
+        use crate::pyramid::role_binding::GENESIS_BINDINGS;
+        let genesis: std::collections::HashSet<&str> =
+            GENESIS_BINDINGS.iter().map(|(role, _)| *role).collect();
+        let role_bound_events = &[
+            "annotation_reacted",
+            "debate_spawned",
+            "debate_collapsed",
+            "gap_detected",
+            "gap_resolved",
+            "purpose_shifted",
+            "meta_layer_crystallized",
+        ];
+        for ev in role_bound_events {
+            let role = dadbear_compiler::role_for_event(ev)
+                .unwrap_or_else(|| panic!("role_bound event '{}' has no role", ev));
+            // cascade_handler is seeded in db::create_slug, not in GENESIS_BINDINGS
+            let ok = genesis.contains(role) || role == "cascade_handler";
+            assert!(ok, "role '{}' for event '{}' is not genesis-seeded", role, ev);
+        }
+    }
+
+    // ── Target 2: cursor gating correctness ────────────────────────────
+
+    #[test]
+    fn cursor_holds_when_role_bound_binding_is_unresolved() {
+        let conn = mem_conn();
+        seed_slug(&conn, "pc3");
+        // Delete the debate_steward binding so resolve_binding raises.
+        conn.execute(
+            "UPDATE pyramid_role_bindings
+             SET superseded_by = id
+             WHERE slug = 'pc3' AND role_name = 'debate_steward'",
+            [],
+        )
+        .unwrap();
+
+        // Write 5 observation events: 1, 2, 4, 5 file_created (extract —
+        // mechanical, always compiles); 3 debate_spawned (role_bound —
+        // will fail resolution, must hold cursor).
+        let e1 = observation_events::write_observation_event(
+            &conn, "pc3", "watcher", "file_created",
+            None, Some("/tmp/a"), None, None, None, None, None,
+        ).unwrap();
+        let e2 = observation_events::write_observation_event(
+            &conn, "pc3", "watcher", "file_created",
+            None, Some("/tmp/b"), None, None, None, None, None,
+        ).unwrap();
+        let _e3 = observation_events::write_observation_event(
+            &conn, "pc3", "internal", "debate_spawned",
+            None, None, None, None, Some("L2-100"), Some(2), None,
+        ).unwrap();
+        let _e4 = observation_events::write_observation_event(
+            &conn, "pc3", "watcher", "file_created",
+            None, Some("/tmp/d"), None, None, None, None, None,
+        ).unwrap();
+        let _e5 = observation_events::write_observation_event(
+            &conn, "pc3", "watcher", "file_created",
+            None, Some("/tmp/e"), None, None, None, None, None,
+        ).unwrap();
+
+        // Sanity: verify debate_steward binding is parked before compilation
+        let b = crate::pyramid::role_binding::resolve_binding(&conn, "pc3", "debate_steward");
+        assert!(b.is_err(), "debate_steward should resolve to error, got {:?}", b.map(|b| b.handler_chain_id));
+
+        // Compile — role_bound at e3 must hold the cursor to e2 (the last
+        // successfully-compiled event before the unresolved binding).
+        // Independent events after the hold (e4/e5 file_created) DO
+        // proceed in this tick — they're mechanical extracts unrelated to
+        // the parked binding. On next tick, re-reading from cursor+1 will
+        // re-attempt e3 (likely still held) and re-read e4/e5 (which
+        // dedup via has_active_work_item). This is deliberate: in-order
+        // semantics are cursor-level only, not processing-level.
+        let result = dadbear_compiler::run_compilation_for_slug(
+            &conn, "pc3", None, None,
+        )
+        .unwrap();
+
+        // Cursor must be at e2 (not at e5 — the pre-fix bug). That
+        // preserves e3 for next-tick retry without losing it.
+        assert_eq!(
+            result.new_cursor, e2,
+            "cursor must hold at event_id={} after failed role_bound at id={}, got {}",
+            e2, _e3, result.new_cursor
+        );
+        // e1, e2, e4, e5 all compiled this tick (independent file_created
+        // extracts). e3 is the only held event.
+        assert_eq!(result.items_compiled, 4);
+
+        // Sanity: binding_unresolved event was emitted for observability.
+        let bu_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                 WHERE slug = 'pc3' AND event_type = 'binding_unresolved'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bu_count, 1, "binding_unresolved must be emitted");
+
+        // Cursor does NOT advance past e3 even though e4/e5 were read.
+        assert!(
+            result.new_cursor < _e3,
+            "cursor {} must be < held role_bound event {}",
+            result.new_cursor, _e3
+        );
+    }
+
+    #[test]
+    fn cursor_advances_normally_when_all_events_succeed() {
+        let conn = mem_conn();
+        seed_slug(&conn, "pc3b");
+        let _e1 = observation_events::write_observation_event(
+            &conn, "pc3b", "watcher", "file_created",
+            None, Some("/tmp/x"), None, None, None, None, None,
+        ).unwrap();
+        let _e2 = observation_events::write_observation_event(
+            &conn, "pc3b", "watcher", "file_created",
+            None, Some("/tmp/y"), None, None, None, None, None,
+        ).unwrap();
+        let e3 = observation_events::write_observation_event(
+            &conn, "pc3b", "watcher", "file_created",
+            None, Some("/tmp/z"), None, None, None, None, None,
+        ).unwrap();
+
+        let result = dadbear_compiler::run_compilation_for_slug(
+            &conn, "pc3b", None, None,
+        )
+        .unwrap();
+        assert_eq!(result.new_cursor, e3);
+        assert_eq!(result.items_compiled, 3);
+    }
+
+    #[test]
+    fn cursor_holds_for_unknown_event_type_default() {
+        // Phase 3 verifier fix: previously unknown types silently advanced
+        // the cursor and the event was lost. New default is warn-and-hold
+        // so operator can see the drift in logs and either update the
+        // compiler vocab or supersede the row. (STRICT_UNKNOWN_EVENTS=1
+        // remains the opt-in panic path.)
+        let conn = mem_conn();
+        seed_slug(&conn, "pc3u");
+        let e1 = observation_events::write_observation_event(
+            &conn, "pc3u", "watcher", "file_created",
+            None, Some("/tmp/a"), None, None, None, None, None,
+        ).unwrap();
+        let _e2 = observation_events::write_observation_event(
+            &conn, "pc3u", "bogus_source", "bogus_event_type_definitely_unknown",
+            None, None, None, None, None, None, None,
+        ).unwrap();
+        let _e3 = observation_events::write_observation_event(
+            &conn, "pc3u", "watcher", "file_created",
+            None, Some("/tmp/c"), None, None, None, None, None,
+        ).unwrap();
+
+        let result = dadbear_compiler::run_compilation_for_slug(
+            &conn, "pc3u", None, None,
+        )
+        .unwrap();
+        // Cursor held at e1 — e2 is unknown, so we don't advance past it,
+        // and we stop processing for this tick (events after a hold stay
+        // for next tick even though they might succeed — this is the
+        // in-order-per-slug invariant).
+        assert_eq!(
+            result.new_cursor, e1,
+            "unknown event_type must hold the cursor at the prior success"
+        );
+    }
+
+    // ── Target 3 + 4 + 5: role_bound happy path writes resolved_chain_id ──
+
+    #[test]
+    fn role_bound_successful_resolve_stamps_chain_id_and_compiles_work_item() {
+        let conn = mem_conn();
+        seed_slug(&conn, "pc3r");
+        // Genesis seeded debate_steward → starter-debate-steward
+        let _eid = observation_events::write_observation_event(
+            &conn, "pc3r", "internal", "debate_spawned",
+            None, None, None, None, Some("L2-007"), Some(2), None,
+        ).unwrap();
+
+        let result = dadbear_compiler::run_compilation_for_slug(
+            &conn, "pc3r", None, None,
+        )
+        .unwrap();
+        assert_eq!(result.items_compiled, 1);
+
+        // Verify the work item row has resolved_chain_id populated.
+        let (primitive, resolved): (String, Option<String>) = conn
+            .query_row(
+                "SELECT primitive, resolved_chain_id
+                 FROM dadbear_work_items WHERE slug = 'pc3r'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(primitive, "role_bound");
+        assert_eq!(resolved.as_deref(), Some("starter-debate-steward"));
+    }
+
+    // ── Target 7: binding_unresolved metadata shape ────────────────────
+
+    #[test]
+    fn binding_unresolved_event_captures_debug_metadata() {
+        let conn = mem_conn();
+        seed_slug(&conn, "pc3m");
+        // Park debate_steward so resolution fails
+        conn.execute(
+            "UPDATE pyramid_role_bindings
+             SET superseded_by = id
+             WHERE slug = 'pc3m' AND role_name = 'debate_steward'",
+            [],
+        )
+        .unwrap();
+        let e1 = observation_events::write_observation_event(
+            &conn, "pc3m", "internal", "debate_collapsed",
+            None, None, None, None, Some("L2-008"), Some(2), None,
+        ).unwrap();
+
+        dadbear_compiler::run_compilation_for_slug(&conn, "pc3m", None, None).unwrap();
+
+        let (event_type, metadata): (String, String) = conn
+            .query_row(
+                "SELECT event_type, metadata_json FROM dadbear_observation_events
+                 WHERE slug = 'pc3m' AND event_type = 'binding_unresolved'",
+                [],
+                |r| Ok((r.get(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default())),
+            )
+            .unwrap();
+        assert_eq!(event_type, "binding_unresolved");
+        // Metadata must contain enough to debug: role, source event type, source id
+        assert!(metadata.contains("debate_steward"), "metadata: {}", metadata);
+        assert!(metadata.contains("debate_collapsed"), "metadata: {}", metadata);
+        assert!(
+            metadata.contains(&format!("\"source_event_id\":{}", e1)),
+            "metadata must cite source event id: {}",
+            metadata
+        );
+    }
+
+    #[test]
+    fn binding_unresolved_event_maps_to_log_only_not_role_bound() {
+        // Critical: if binding_unresolved were itself role_bound, we'd
+        // infinite-loop when the role for binding_unresolved is also
+        // missing (turtles all the way down). binding_unresolved must
+        // map to log_only.
+        let (prim, _step, _tier) =
+            dadbear_compiler::map_event_to_primitive("binding_unresolved").unwrap();
+        assert_eq!(
+            prim, "log_only",
+            "binding_unresolved MUST map to log_only to avoid infinite loop"
+        );
+        // And cascade_handler_invoked for the same reason.
+        let (prim2, _, _) =
+            dadbear_compiler::map_event_to_primitive("cascade_handler_invoked").unwrap();
+        assert_eq!(prim2, "log_only");
+    }
+
+    // ── Target 9: UnresolvedBinding is downcastable error type ─────────
+
+    #[test]
+    fn resolve_binding_error_is_typed_not_string_matched() {
+        // The compiler matches the binding-resolution error via anyhow
+        // chaining + downcast on the typed UnresolvedBinding struct (see
+        // role_binding.rs). String-matching the error message would be
+        // brittle; the typed path survives message tweaks.
+        let conn = mem_conn();
+        seed_slug(&conn, "pc3t");
+        let err = role_binding::resolve_binding(&conn, "pc3t", "nonexistent_role")
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<role_binding::UnresolvedBinding>().is_some(),
+            "role resolution error must be UnresolvedBinding, got: {}", err
+        );
+    }
+
+    // ── Target 11: execute_chain_for_target stub signature sanity ──────
+
+    #[test]
+    fn execute_chain_for_target_symbol_exists() {
+        // Compile-time guard: the supervisor's role_bound arm imports
+        // `crate::pyramid::chain_executor::execute_chain_for_target`. If
+        // that symbol disappears or is renamed, both the supervisor and
+        // this test stop compiling — forcing the two to stay in sync.
+        // We reference the symbol (not call it — the stub bails) as a
+        // compile-only check.
+        let _symbol: &'static str = std::any::type_name_of_val(
+            &crate::pyramid::chain_executor::execute_chain_for_target,
+        );
+    }
+}
