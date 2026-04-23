@@ -22789,8 +22789,8 @@ mod phase3_post_build_tests {
 mod phase4_post_build_tests {
     use super::*;
     use crate::pyramid::types::{
-        parse_shape_payload, ContentType, DebateTopic, GapTopic, MetaLayerTopic, NodeShape,
-        ShapePayload,
+        parse_shape_payload, ContentType, DebatePosition, DebateTopic, GapCandidate, GapTopic,
+        MetaLayerTopic, NodeShape, RedTeamEntry, ShapePayload, VoteLean,
     };
     use rusqlite::Connection;
 
@@ -23068,5 +23068,175 @@ mod phase4_post_build_tests {
         let meta: serde_json::Value = serde_json::from_str(&meta).unwrap();
         // Null, not absent — event metadata explicitly records "no prior".
         assert!(meta.get("prior_purpose_id").unwrap().is_null());
+    }
+
+    /// Verifier-added (Phase 4 audit target 2): round-trip a populated
+    /// DebateTopic with DebatePosition + RedTeamEntry + VoteLean — all nested
+    /// collections and optional fields that were empty/None in the baseline
+    /// happy-path test. Without this, a serde field rename (e.g. dropping
+    /// `evidence_anchors` on RedTeamEntry) would slip through the suite.
+    #[test]
+    fn parse_shape_payload_round_trips_populated_debate_with_red_teams_and_votes() {
+        let d = DebateTopic {
+            concern: "Should we adopt X?".to_string(),
+            positions: vec![
+                DebatePosition {
+                    label: "Pro".to_string(),
+                    steel_manning: "X aligns with our pillars.".to_string(),
+                    red_teams: vec![RedTeamEntry {
+                        from_position: "Con".to_string(),
+                        argument: "X conflicts with Pillar 38.".to_string(),
+                        evidence_anchors: vec!["L1-001".into(), "L1-007".into()],
+                    }],
+                    evidence_anchors: vec!["L1-001".into()],
+                },
+                DebatePosition {
+                    label: "Con".to_string(),
+                    steel_manning: "X is too expensive.".to_string(),
+                    red_teams: vec![],
+                    evidence_anchors: vec![],
+                },
+            ],
+            cross_refs: vec!["adjacent-pyramid/L2-42".into()],
+            vote_lean: Some(VoteLean {
+                up_count: 3,
+                down_count: 1,
+                per_position: Some({
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("Pro".to_string(), (2i64, 0i64));
+                    m.insert("Con".to_string(), (1i64, 1i64));
+                    m
+                }),
+            }),
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        match parse_shape_payload(&NodeShape::Debate, Some(&json)).unwrap().unwrap() {
+            ShapePayload::Debate(r) => {
+                assert_eq!(r.concern, "Should we adopt X?");
+                assert_eq!(r.positions.len(), 2);
+                assert_eq!(r.positions[0].label, "Pro");
+                assert_eq!(r.positions[0].red_teams.len(), 1);
+                assert_eq!(r.positions[0].red_teams[0].from_position, "Con");
+                assert_eq!(
+                    r.positions[0].red_teams[0].evidence_anchors,
+                    vec!["L1-001".to_string(), "L1-007".to_string()]
+                );
+                assert_eq!(r.positions[0].evidence_anchors, vec!["L1-001".to_string()]);
+                assert_eq!(r.cross_refs, vec!["adjacent-pyramid/L2-42".to_string()]);
+                let vl = r.vote_lean.expect("vote_lean must round-trip");
+                assert_eq!(vl.up_count, 3);
+                assert_eq!(vl.down_count, 1);
+                let per = vl.per_position.expect("per_position must round-trip");
+                assert_eq!(per.get("Pro"), Some(&(2i64, 0i64)));
+                assert_eq!(per.get("Con"), Some(&(1i64, 1i64)));
+            }
+            other => panic!("expected Debate, got {other:?}"),
+        }
+    }
+
+    /// Verifier-added (Phase 4 audit target 2): round-trip a populated GapTopic
+    /// with GapCandidate fields (resolution_type, cost_estimate,
+    /// authorization_required). The baseline test left candidate_resolutions
+    /// empty so those fields were never exercised.
+    #[test]
+    fn parse_shape_payload_round_trips_populated_gap_with_candidates() {
+        let g = GapTopic {
+            concern: "missing-evidence".to_string(),
+            description: "No data on Y across the vine.".to_string(),
+            demand_state: "open".to_string(),
+            candidate_resolutions: vec![
+                GapCandidate {
+                    resolution_type: "commission-research".into(),
+                    cost_estimate: Some("2 hours".into()),
+                    authorization_required: true,
+                },
+                GapCandidate {
+                    resolution_type: "annotate-from-corpus".into(),
+                    cost_estimate: None,
+                    authorization_required: false,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&g).unwrap();
+        match parse_shape_payload(&NodeShape::Gap, Some(&json)).unwrap().unwrap() {
+            ShapePayload::Gap(r) => {
+                assert_eq!(r.concern, "missing-evidence");
+                assert_eq!(r.candidate_resolutions.len(), 2);
+                assert_eq!(r.candidate_resolutions[0].resolution_type, "commission-research");
+                assert_eq!(
+                    r.candidate_resolutions[0].cost_estimate,
+                    Some("2 hours".to_string())
+                );
+                assert!(r.candidate_resolutions[0].authorization_required);
+                assert_eq!(
+                    r.candidate_resolutions[1].resolution_type,
+                    "annotate-from-corpus"
+                );
+                assert!(r.candidate_resolutions[1].cost_estimate.is_none());
+                assert!(!r.candidate_resolutions[1].authorization_required);
+            }
+            other => panic!("expected Gap, got {other:?}"),
+        }
+    }
+
+    /// Verifier-added (Phase 4 audit target 7): JSON-literal `null` payload
+    /// for a non-scaffolding shape must NOT silently parse as an empty struct
+    /// — it must raise loudly the same as a malformed body. Without this
+    /// guard, a writer bug that serialized Option::None instead of the
+    /// intended Topic would be indistinguishable from a legitimate empty
+    /// payload and silently render as a broken shape node.
+    #[test]
+    fn parse_shape_payload_rejects_literal_null_json_for_non_scaffolding() {
+        // `null` is neither empty (the trim guard treats it as Some("null"))
+        // nor a valid object — serde returns a parse error and we surface
+        // it loudly with the expected type name in context.
+        let err = parse_shape_payload(&NodeShape::Debate, Some("null")).unwrap_err();
+        assert!(
+            err.to_string().contains("DebateTopic"),
+            "expected DebateTopic in error chain: {err}"
+        );
+        let err = parse_shape_payload(&NodeShape::MetaLayer, Some("null")).unwrap_err();
+        assert!(
+            err.to_string().contains("MetaLayerTopic"),
+            "expected MetaLayerTopic in error chain: {err}"
+        );
+        let err = parse_shape_payload(&NodeShape::Gap, Some("null")).unwrap_err();
+        assert!(
+            err.to_string().contains("GapTopic"),
+            "expected GapTopic in error chain: {err}"
+        );
+    }
+
+    /// Verifier-added (Phase 4 audit target 3): when `supersede_purpose`'s
+    /// observation-event write fails, the whole call must fail (no silent
+    /// half-commit). Simulate the failure by dropping the observation_events
+    /// table before invoking supersede — the call should return Err, not
+    /// quietly succeed with a missing event.
+    ///
+    /// This test codifies the Phase 4 verifier-pass decision to switch from
+    /// `.ok()` to `?`, so a regression that reintroduces silent swallow
+    /// is caught.
+    #[test]
+    fn supersede_purpose_propagates_observation_event_write_failure() {
+        let conn = mem_conn();
+        create_slug(&conn, "p4fail", &ContentType::Code, "/tmp/p4fail").unwrap();
+
+        // Drop the observation-events table to force the write to fail.
+        conn.execute("DROP TABLE dadbear_observation_events", []).unwrap();
+
+        let res = crate::pyramid::purpose::supersede_purpose(
+            &conn,
+            "p4fail",
+            "Different purpose.",
+            Some("test-failure-propagation"),
+            None,
+            None,
+        );
+        let err = res.expect_err("supersede must propagate observation-write failure, not silently swallow");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("purpose_shifted") || chain.contains("observation"),
+            "error chain should name the failed emit: {chain}"
+        );
     }
 }

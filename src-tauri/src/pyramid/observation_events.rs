@@ -14,6 +14,8 @@ use rusqlite::Connection;
 ///
 /// Parameters map to the table columns:
 /// - `source`: "watcher" | "cascade" | "rescan" | "evidence" | "vine" | "annotation"
+///             | "purpose"                        // v5: purpose supersession
+///             | "dadbear"                        // v5: binding_unresolved from compiler
 /// - `event_type`: "file_modified" | "file_created" | "file_deleted" | "file_renamed"
 ///                  | "cascade_stale" | "edge_stale" | "evidence_growth" | "vine_stale"
 ///                  | "targeted_stale" | "full_sweep"

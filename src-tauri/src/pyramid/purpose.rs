@@ -163,9 +163,16 @@ pub fn supersede_purpose(
     // Emit a `purpose_shifted` observation event so the DADBEAR compiler can
     // route it to the purpose-aware meta_layer_oracle role. Metadata carries
     // the prior id + stock key + reason so downstream chains can reason about
-    // what shifted and why without a second DB query. Use `.ok()` to tolerate
-    // a missing observation_events table in test harnesses that don't run the
-    // full schema migration — the supersede itself still lands.
+    // what shifted and why without a second DB query.
+    //
+    // Propagate (no `.ok()` swallow): the supersede dance already committed
+    // three writes to pyramid_purposes above. If the observation write fails
+    // here, the state change has landed but is invisible to downstream chains
+    // — exactly the kind of silent divergence `feedback_loud_deferrals` is
+    // about. Per v5 R5 loud-raise discipline, fail the whole call and let the
+    // caller retry or surface the error. `dadbear_observation_events` is
+    // created unconditionally by `init_pyramid_db`, so the earlier "tolerate
+    // missing table in test harnesses" rationale doesn't apply.
     let metadata = serde_json::json!({
         "prior_purpose_id": prior_id,
         "new_purpose_id": new_id,
@@ -174,7 +181,7 @@ pub fn supersede_purpose(
         "new_purpose_text_preview": new_purpose_text.chars().take(200).collect::<String>(),
     })
     .to_string();
-    let _ = super::observation_events::write_observation_event(
+    super::observation_events::write_observation_event(
         conn,
         slug,
         "purpose",         // source
@@ -186,7 +193,10 @@ pub fn supersede_purpose(
         None,              // target_node_id — purpose is slug-level, not node-level
         None,              // layer
         Some(&metadata),
-    );
+    )
+    .with_context(|| {
+        format!("Failed to emit purpose_shifted observation event for slug '{slug}'")
+    })?;
 
     load_purpose(conn, slug)?.ok_or_else(|| {
         anyhow::anyhow!("successor purpose not found after supersede for '{slug}'")
