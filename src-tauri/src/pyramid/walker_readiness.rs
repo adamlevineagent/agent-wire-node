@@ -13,6 +13,8 @@
 
 use std::time::SystemTime;
 
+use crate::pyramid::walker_resolver::BreakerReset;
+
 /// Per-provider answer to the readiness gate.
 ///
 /// `NotReady { reason }` carries a specific enum variant so the chronicle
@@ -63,16 +65,83 @@ pub enum NotReadyReason {
 
 /// Resolved per-provider parameters passed into `can_dispatch_now`.
 ///
-/// Phase 0a-1 stub: carries only `active` (the universal gate). Phase 0a-2
-/// / Phase 0b expand to the full catalog from plan §2.9 (model_list,
-/// max_budget_credits, patience_secs, breaker_reset, sequential, bypass_pool,
-/// retry_http_count, retry_backoff_base_secs, dispatch_deadline_grace_secs,
-/// and provider-specific fields). Kept minimal here so Phase 0a-1 stubs
-/// compile without depending on Decision-builder scaffolding that lands later.
+/// Extended by Phase 0b Workstream D to the full §2.9 parameter catalog.
+/// The Decision builder (`walker_decision.rs`) populates every field
+/// once at construction time by calling the typed accessors in
+/// `walker_resolver.rs`. Readiness impls then consume this struct —
+/// the stubs ignore most fields today; Phase 2/3/4 real impls check
+/// provider-specific ones (e.g. `ollama_base_url` freshness for local,
+/// network_failure_backoff counters for openrouter/market).
+///
+/// Provider-specific fields are `Option<T>` so the Decision builder
+/// can omit them for providers that don't apply (e.g. `ollama_base_url`
+/// is populated only for `ProviderType::Local`; `fleet_*` only for
+/// `ProviderType::Fleet`). A readiness impl that reaches for a field
+/// that should be `Some` but isn't is a programmer bug — the impl
+/// should match its own provider's contract.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ResolvedProviderParams {
+    // ── Universal parameters (all providers) ────────────────────────
+    /// Resolved per-(slot, provider) model list. `None` = no model
+    /// declared for this pair; readiness returns `NoModelListForSlot`.
+    pub model_list: Option<Vec<String>>,
+    /// Optional per-build market spend cap (sensitive, chronicle-redacted).
+    pub max_budget_credits: Option<i64>,
+    pub patience_secs: u64,
+    pub patience_clock_resets_per_model: bool,
+    pub breaker_reset: BreakerReset,
+    pub sequential: bool,
+    pub bypass_pool: bool,
+    pub retry_http_count: u32,
+    pub retry_backoff_base_secs: u64,
+    pub dispatch_deadline_grace_secs: u64,
     pub active: bool,
+
+    // ── Provider-specific (Some only for the owning ProviderType) ───
+    /// Local provider: Ollama /v1 endpoint (§3 OLLAMA_BASE_URL_DEFAULT).
+    pub ollama_base_url: Option<String>,
+    /// Local provider: probe cadence for /api/tags freshness.
+    pub ollama_probe_interval_secs: Option<u64>,
+    /// Fleet provider: staleness cutoff for peer announcements.
+    pub fleet_peer_min_staleness_secs: Option<u64>,
+    /// Fleet provider: whether to prefer peers that have the model cached.
+    pub fleet_prefer_cached: Option<bool>,
+
+    // ── Offline-aware gate (§2.16.5) ────────────────────────────────
+    /// Consecutive-failure count before readiness returns
+    /// `NetworkUnreachable`.
+    pub network_failure_backoff_threshold: u32,
+    /// Duration in `NetworkUnreachable` state before readiness retries.
+    pub network_failure_backoff_secs: u64,
+}
+
+impl Default for ResolvedProviderParams {
+    fn default() -> Self {
+        // Defaults mirror SYSTEM_DEFAULTS in walker_resolver.rs. These
+        // are the absolute-safest values; real usage comes from
+        // `walker_decision::resolve_all_params` which calls each
+        // typed accessor once per (slot, pt).
+        Self {
+            model_list: None,
+            max_budget_credits: None,
+            patience_secs: 3600,
+            patience_clock_resets_per_model: false,
+            breaker_reset: BreakerReset::PerBuild,
+            sequential: true,
+            bypass_pool: false,
+            retry_http_count: 3,
+            retry_backoff_base_secs: 2,
+            dispatch_deadline_grace_secs: 10,
+            active: true,
+            ollama_base_url: None,
+            ollama_probe_interval_secs: None,
+            fleet_peer_min_staleness_secs: None,
+            fleet_prefer_cached: None,
+            network_failure_backoff_threshold: 3,
+            network_failure_backoff_secs: 300,
+        }
+    }
 }
 
 /// Plan §2.6. Each provider implements; Decision builder calls at step entry.
@@ -129,7 +198,7 @@ mod tests {
 
     #[test]
     fn all_four_stubs_return_ready() {
-        let p = ResolvedProviderParams { active: true };
+        let p = ResolvedProviderParams::default();
         for r in [
             LocalReadinessStub.can_dispatch_now(&p),
             OpenRouterReadinessStub.can_dispatch_now(&p),

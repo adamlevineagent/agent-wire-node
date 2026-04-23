@@ -1938,6 +1938,7 @@ fn reconstruct_step_context(
         content_type: String::new(),
         task_label: format!("dadbear:{}", item.primitive),
         balance_exhausted_emitted: std::sync::OnceLock::new(),
+        dispatch_decision: None,
     }
 }
 

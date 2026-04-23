@@ -323,6 +323,21 @@ pub struct StepContext {
     /// Leak on build crash: when the StepContext drops, the OnceLock
     /// drops with it. Memory-only, not persistent state.
     pub balance_exhausted_emitted: std::sync::OnceLock<()>,
+
+    // ── Walker v3 DispatchDecision (§2.9 / §2.12 F-D2) ─────────────
+    /// Plan §2.9 DispatchDecision — populated at outer chain step
+    /// entry by the executor. `None` for legacy paths that haven't
+    /// been migrated yet (Phase 1 / Root 29 drives this toward
+    /// "always populated"). Synthetic preview paths build their own
+    /// via `DispatchDecision::synthetic_for_preview` and attach here
+    /// via a cheap `Arc` clone.
+    ///
+    /// `Arc` so StepContext clones across child tasks don't re-walk
+    /// the resolver — the Decision is compute-once, immutable for its
+    /// own lifetime (pins one `Arc<ScopeCache>` against mid-step
+    /// ArcSwap updates).
+    pub dispatch_decision:
+        Option<Arc<crate::pyramid::walker_decision::DispatchDecision>>,
 }
 
 impl std::fmt::Debug for StepContext {
@@ -345,6 +360,10 @@ impl std::fmt::Debug for StepContext {
             .field("content_type", &self.content_type)
             .field("task_label", &self.task_label)
             .field("balance_exhausted_emitted", &"<oncelock>")
+            .field(
+                "dispatch_decision",
+                &self.dispatch_decision.as_ref().map(|_| "<decision>"),
+            )
             .finish()
     }
 }
@@ -382,7 +401,19 @@ impl StepContext {
             content_type: String::new(),
             task_label: String::new(),
             balance_exhausted_emitted: std::sync::OnceLock::new(),
+            dispatch_decision: None,
         }
+    }
+
+    /// Attach a pre-built `DispatchDecision` (Phase 1 consumer migration).
+    /// Executors call this at outer-chain step entry; child tasks see
+    /// the same Arc via the existing `Clone` derive.
+    pub fn with_dispatch_decision(
+        mut self,
+        decision: Arc<crate::pyramid::walker_decision::DispatchDecision>,
+    ) -> Self {
+        self.dispatch_decision = Some(decision);
+        self
     }
 
     /// Set the model tier name + resolved model id (builder-style). The

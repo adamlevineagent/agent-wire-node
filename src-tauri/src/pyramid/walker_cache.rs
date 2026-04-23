@@ -39,6 +39,7 @@ use tokio::task::JoinHandle;
 use crate::pyramid::compute_chronicle::{
     EVENT_SCOPE_CACHE_LISTENER_RESTARTED, EVENT_SCOPE_CACHE_QUARANTINED,
 };
+use crate::pyramid::walker_resolver::ScopeChain;
 
 // ── Core types ────────────────────────────────────────────────────────────
 
@@ -48,14 +49,18 @@ use crate::pyramid::compute_chronicle::{
 /// `Arc<ScopeCache>` via `ArcSwap::load_full` + carry it through a
 /// ScopeSnapshot into the Decision.
 ///
-/// Phase 0a-2 shell: minimal fields. Phase 0b `walker_resolver.rs` loads
-/// the real scope objects into this struct. The intentional placeholder
-/// `_phase_0b_scope_maps` is a reminder that the next phase fills this
-/// out — it carries no runtime value today.
+/// Phase 0b: carries the real `scope_chain` built by
+/// `walker_resolver::build_scope_cache`. Downstream dispatchers
+/// (WS-D DispatchDecision + future phase dispatchers) read the
+/// resolved chain via `cache.scope_chain` off the ArcSwap — no
+/// need to call `build_scope_cache_pair` on every Decision build.
 ///
 /// NOT `Serialize`: the chronicle must only see a redacted view. The raw
 /// cache is reachable through `ScopeSnapshot::cache` for internal
-/// dispatchers that consume by field access.
+/// dispatchers that consume by field access. `scope_chain` transitively
+/// carries `local_only`/`sensitive` parameter overrides so the
+/// Serialize-ban applies here as hard as it applies to `ScopeChain`
+/// itself (§5.4.3 / Root 27 — the compile-fence below pins this).
 #[derive(Debug)]
 pub struct ScopeCache {
     /// Wall-clock at ScopeCache construction. Surfaces in the redacted
@@ -66,21 +71,25 @@ pub struct ScopeCache {
     /// contribution; also useful for ad-hoc debugging of "which row
     /// produced this resolver state?".
     pub source_contribution_ids: Vec<String>,
-    /// Room for Phase 0b: scope_slot_provider, scope_slot,
-    /// scope_call_order_provider, scope_provider maps. Placeholder so the
-    /// struct shape doesn't churn when Phase 0b expands it.
-    #[doc(hidden)]
-    pub _phase_0b_scope_maps: (),
+    /// The resolved six-scope chain. Carried in an `Arc` so snapshots can
+    /// be cloned without re-walking `build_scope_cache`. Dispatchers read
+    /// `cache.scope_chain` directly off the ArcSwap — there is no
+    /// separate "resolver handle" type. Phase 0b§2.9: DispatchDecision
+    /// consumers access scope data via this field.
+    pub scope_chain: Arc<ScopeChain>,
 }
 
 impl ScopeCache {
-    /// Minimal constructor. Real Phase 0b builds ScopeCache from the
-    /// active-contribution set via `walker_resolver::build_scope_cache`.
+    /// Minimal constructor — empty scope chain, no source contributions,
+    /// `built_at` = now. Used as the pre-first-build placeholder the boot
+    /// coordinator stores if `walker_resolver::build_scope_cache` fails
+    /// on an unexpected shape. Real Phase 0b boot calls
+    /// `walker_resolver::build_scope_cache(&conn)` instead.
     pub fn new_empty() -> Self {
         Self {
             built_at: SystemTime::now(),
             source_contribution_ids: Vec::new(),
-            _phase_0b_scope_maps: (),
+            scope_chain: Arc::new(ScopeChain::default()),
         }
     }
 }
@@ -132,15 +141,22 @@ impl ScopeSnapshot {
 
 /// Chronicle-serializable view of a ScopeSnapshot. The ONLY type in this
 /// module that derives `Serialize`. Adding a field here requires checking
-/// its schema_annotation's `local_only` / `sensitive` flags (Phase 0b).
+/// its schema_annotation's `local_only` / `sensitive` flags.
+///
+/// Phase 0b decision: intentionally STAYS at `built_at` / `taken_at` /
+/// `source_contribution_ids` only. Per §5.4.3, scope data carries
+/// `local_only` + `sensitive` params (Ollama base URLs, budget caps,
+/// closed-beta slugs) whose redaction is WS-D's purview — WS-D builds
+/// `DecisionChronicleView` with the per-param redaction pass. Exposing
+/// raw scope entries here would force the redaction logic into two
+/// places. The current shape gives operators enough signal to debug
+/// scope_cache lifecycle (when it was built, what fed it) without
+/// leaking anything the per-param annotations mark sensitive.
 #[derive(Debug, Clone, Serialize)]
 pub struct RedactedSnapshot {
     pub built_at: SystemTime,
     pub taken_at: SystemTime,
     pub source_contribution_ids: Vec<String>,
-    // Phase 0b: redacted scope entries (only public, non-local-only
-    // parameters) land here. Ollama base URLs, budget caps, closed-beta
-    // slugs are stripped.
 }
 
 // ── Reloader supervisor ──────────────────────────────────────────────────
@@ -543,6 +559,21 @@ fn _scope_snapshot_must_not_be_serializable(ss: &ScopeSnapshot) {
     // Fix: remove the derive and rebuild chronicle callers to go
     // through `redacted_for_chronicle()`.
     let _ = serde_json::to_value(ss).expect("must not compile");
+}
+
+// Parallel guard for `ScopeCache` itself. Now that the cache transitively
+// carries `Arc<ScopeChain>` (Phase 0b WS-E), leaking the cache via serde
+// would expose every `local_only`/`sensitive` override. ScopeCache MUST
+// NOT derive Serialize. Chronicle integrations go through
+// `ScopeSnapshot::redacted_for_chronicle()`.
+#[cfg(any())]
+#[allow(dead_code)]
+fn _scope_cache_must_not_be_serializable(c: &ScopeCache) {
+    // ── DO NOT ADD `#[derive(Serialize)]` to `ScopeCache` ──
+    // If this compiles, the Phase 0b Serialize-ban on scope data has
+    // regressed — raw `ScopeChain` entries would flow through any
+    // chronicle or IPC path that grabs a cache reference.
+    let _ = serde_json::to_value(c).expect("must not compile");
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

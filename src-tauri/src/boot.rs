@@ -87,7 +87,12 @@ pub enum BootResult {
 ///
 /// Steps this function implements:
 /// 3. Build initial ScopeCache from active contributions → ArcSwap::store.
-///    Phase 0a-2 stub: `ScopeCache::new_empty()` (Phase 0b fleshes this out).
+///    Phase 0b WS-E: calls `walker_resolver::build_scope_cache(&conn)`
+///    against a fresh connection. If that fails (malformed walker_*
+///    body, etc.), we log at warn and fall back to
+///    `ScopeCache::new_empty()` so the ArcSwap is populated and the
+///    resolver can still serve defaults — one bad contribution body
+///    must not brick boot.
 /// 4. Migration phase — reads the active `migration_marker` body. If
 ///    "v2", logs "v3 migration pending (not yet implemented)" and
 ///    continues. No destructive DDL in Phase 0a-2.
@@ -136,13 +141,57 @@ pub async fn run_walker_cache_boot(
         }
     }
 
-    // Step 3: initial ScopeCache → ArcSwap. Phase 0a-2 stub.
-    let cache_writer = Arc::new(ArcSwap::from_pointee(ScopeCache::new_empty()));
+    // Step 3: initial ScopeCache → ArcSwap. Phase 0b WS-E builds the real
+    // cache via `walker_resolver::build_scope_cache`. If the build fails
+    // (malformed walker_* body, for example), we fall back to an empty
+    // cache and log at warn — boot MUST NOT brick on a single bad
+    // contribution body. The reloader + ConfigSynced bridge wired in
+    // steps 6-7 will pick up a corrected supersession and recover the
+    // cache to a non-empty state without a restart.
+    let initial_cache = {
+        let probe_path = db_path.clone();
+        let build_result = tokio::task::spawn_blocking(move || -> Result<ScopeCache> {
+            let conn = Connection::open(&probe_path)?;
+            crate::pyramid::walker_resolver::build_scope_cache(&conn)
+        })
+        .await;
+
+        match build_result {
+            Ok(Ok(cache)) => cache,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    event = "boot_step_warn",
+                    step = 3,
+                    name = "scope_cache_initial",
+                    error = %e,
+                    "build_scope_cache failed at boot; storing empty ScopeCache \
+                     and continuing — ConfigSynced-driven rebuild will recover \
+                     on the next supersession"
+                );
+                ScopeCache::new_empty()
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    event = "boot_step_warn",
+                    step = 3,
+                    name = "scope_cache_initial",
+                    error = %join_err,
+                    "build_scope_cache task failed at boot; storing empty \
+                     ScopeCache and continuing"
+                );
+                ScopeCache::new_empty()
+            }
+        }
+    };
+    let source_count = initial_cache.source_contribution_ids.len();
+    let cache_writer = Arc::new(ArcSwap::from_pointee(initial_cache));
     tracing::info!(
         event = "boot_step",
         step = 3,
         name = "scope_cache_initial",
-        "Phase 0a-2: initial ScopeCache stored (stub; Phase 0b fills scope maps)"
+        source_contributions = source_count,
+        "ScopeCache populated with {} contributions",
+        source_count
     );
 
     // Step 4: migration phase. Phase 0a-2 does NOT implement the v3 DDL.
@@ -239,9 +288,16 @@ pub async fn run_walker_cache_boot(
     let (trigger_tx, trigger_rx) = mpsc::channel::<RebuildTrigger>(16);
     let (app_mode_tx, app_mode_rx) = mpsc::channel::<AppModeTransition>(4);
 
-    // Phase 0a-2 stub rebuild function. Phase 0b replaces with
-    // `walker_resolver::build_scope_cache`.
-    let rebuild_fn = |_conn: &Connection| -> Result<ScopeCache> { Ok(ScopeCache::new_empty()) };
+    // Phase 0b WS-E: real rebuild_fn. Plugs `walker_resolver::build_scope_cache`
+    // into the reloader. Signature matches the `Fn(&Connection) -> Result<ScopeCache>`
+    // bound on `spawn_scope_cache_reloader` exactly. Malformed walker_*
+    // bodies surface as `Err(_)` which the reloader logs as non-panic
+    // failure (does not burn restart budget). Rust-level panics inside
+    // the parser (shouldn't happen in practice) are caught by the
+    // reloader's catch_unwind and drive the quarantine path.
+    let rebuild_fn = |conn: &Connection| -> Result<ScopeCache> {
+        crate::pyramid::walker_resolver::build_scope_cache(conn)
+    };
 
     // Event emitter: fire-and-forget tracing::warn. Phase 0b swaps in a
     // real BuildEventBus emit once the chronicle integration lands.

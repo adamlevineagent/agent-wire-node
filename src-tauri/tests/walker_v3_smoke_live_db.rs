@@ -190,3 +190,166 @@ async fn boot_coordinator_runs_clean_against_live_db_copy() {
     );
     println!("SMOKE: boot coordinator Booting → Ready on live DB copy in {:?}", dur);
 }
+
+/// Phase 0b WS-E live-DB smoke: drive `walker_resolver::build_scope_cache`
+/// directly against a real pyramid DB. Two phases:
+///
+/// 1. Pre-manifest: with no `walker_*` schema_type contributions present
+///    yet (first v3 binary on pre-walker-v3 state), return a valid-but-
+///    empty cache fast (<100ms). Exposed as a timing sanity check for
+///    the fallback-on-error path the boot coordinator takes in step 3.
+///
+/// 2. Post-manifest: after `walk_bundled_contributions_manifest` inserts
+///    the six walker_* defaults, re-building the cache produces a
+///    populated `ScopeChain`. Asserts tier_set_from_chain unions the
+///    per-provider model_list keys, resolve_patience_secs for
+///    (mid, Market) returns SYSTEM_DEFAULT (3600) because the bundled
+///    walker_provider_market does NOT override patience_secs, and a
+///    runtime `DispatchDecision::build("mid", conn)` produces
+///    effective_call_order matching the bundled `walker_call_order`
+///    seed (market, local, openrouter, fleet). All four readiness stubs
+///    return Ready so every provider is present in per_provider.
+///
+/// Run with:
+///   PYRAMID_DB=/tmp/walker-v3-smoke-XXXXX/pyramid.db \
+///   cargo test --test walker_v3_smoke_live_db \
+///     phase_0b_scope_cache_populates_from_live_db \
+///     -- --nocapture --ignored
+#[test]
+#[ignore]
+fn phase_0b_scope_cache_populates_from_live_db() {
+    use wire_node_lib::pyramid::walker_decision::DispatchDecision;
+    use wire_node_lib::pyramid::walker_resolver::{
+        build_scope_cache, resolve_patience_secs, tier_set_from_chain, ProviderType,
+        DEFAULT_CALL_ORDER, PATIENCE_SECS_DEFAULT,
+    };
+    use wire_node_lib::pyramid::wire_migration::walk_bundled_contributions_manifest;
+
+    let path = std::env::var("PYRAMID_DB")
+        .expect("set PYRAMID_DB=/tmp/walker-v3-smoke-XXXXX/pyramid.db");
+    let conn = Connection::open(&path).expect("open db copy");
+
+    // ── Phase 1: pre-manifest baseline ──────────────────────────────
+    let t0 = std::time::Instant::now();
+    let cache_pre = build_scope_cache(&conn).expect("build_scope_cache on live DB copy (pre)");
+    let dur_pre = t0.elapsed();
+
+    println!(
+        "[pre-manifest]  build_scope_cache took {:?}; source_contribution_ids = {}",
+        dur_pre,
+        cache_pre.source_contribution_ids.len()
+    );
+    assert!(
+        dur_pre.as_millis() < 100,
+        "pre-manifest build_scope_cache should be fast on a real DB (got {:?})",
+        dur_pre
+    );
+
+    // ── Phase 2: seed the bundled manifest into the live DB copy ───
+    //
+    // Walks the JSON manifest and inserts walker_* defaults via the
+    // envelope writer. INSERT OR IGNORE means repeat runs are no-ops.
+    let t_mani = std::time::Instant::now();
+    let report = walk_bundled_contributions_manifest(&conn)
+        .expect("bundled manifest walk must succeed on live DB copy");
+    println!(
+        "[manifest-walk] took {:?}; inserted={} skipped={} failed={}",
+        t_mani.elapsed(),
+        report.inserted,
+        report.skipped_already_present,
+        report.failed
+    );
+    assert_eq!(report.failed, 0, "manifest walk had failures");
+
+    // ── Phase 3: post-manifest rebuild + resolver assertions ────────
+    let t1 = std::time::Instant::now();
+    let cache = build_scope_cache(&conn).expect("build_scope_cache on live DB copy (post)");
+    let dur = t1.elapsed();
+
+    println!(
+        "[post-manifest] build_scope_cache took {:?}; source_contribution_ids = {}",
+        dur,
+        cache.source_contribution_ids.len()
+    );
+    assert!(
+        dur.as_millis() < 100,
+        "post-manifest build_scope_cache should be fast on a real DB (got {:?})",
+        dur
+    );
+    // All six walker_* seeds (4 providers + call_order + slot_policy)
+    // should contribute a source_contribution_id except slot_policy
+    // whose bundled body is `slots: {}` (empty) — that row still gets
+    // inserted as an active config so its contribution_id is pushed.
+    assert!(
+        cache.source_contribution_ids.len() >= 4,
+        "expected at least 4 walker_* source contributions, got {:?}",
+        cache.source_contribution_ids
+    );
+
+    // (a) tier_set_from_chain pulls keys from the per-provider
+    //     model_list maps at scopes 3 + 4. Bundled openrouter declares
+    //     max/high/mid/extractor; market declares mid/high/extractor.
+    let tiers = tier_set_from_chain(&cache.scope_chain);
+    println!("[post-manifest] tier_set = {:?}", tiers);
+    for required in ["max", "high", "mid", "extractor"] {
+        assert!(
+            tiers.contains(required),
+            "expected tier `{required}` in tier_set, got {:?}",
+            tiers
+        );
+    }
+
+    // (b) resolve_patience_secs(slot=mid, Market) = SYSTEM_DEFAULT
+    //     (bundled walker_provider_market does not override patience_secs)
+    let ps = resolve_patience_secs(&cache.scope_chain, "mid", ProviderType::Market);
+    assert_eq!(
+        ps, PATIENCE_SECS_DEFAULT,
+        "market mid patience_secs must fall through to SYSTEM_DEFAULT"
+    );
+
+    // (c) DispatchDecision::build yields the bundled call_order.
+    //     All four readiness stubs return Ready today, so
+    //     effective_call_order matches the bundled seed's order.
+    let t_d = std::time::Instant::now();
+    let decision =
+        DispatchDecision::build("mid", &conn).expect("DispatchDecision::build must succeed");
+    println!(
+        "[post-manifest] DispatchDecision::build took {:?}; effective_call_order = {:?}",
+        t_d.elapsed(),
+        decision
+            .effective_call_order
+            .iter()
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        decision.effective_call_order,
+        DEFAULT_CALL_ORDER.to_vec(),
+        "bundled walker_call_order must yield DEFAULT_CALL_ORDER"
+    );
+    for pt in DEFAULT_CALL_ORDER {
+        assert!(
+            decision.per_provider.contains_key(&pt),
+            "per_provider must include {pt:?}"
+        );
+    }
+    // Market carries active=false per bundled seed.
+    let mkt = decision
+        .per_provider
+        .get(&ProviderType::Market)
+        .expect("market present");
+    assert!(
+        !mkt.active,
+        "bundled walker_provider_market ships active=false"
+    );
+    // OpenRouter mid model_list is [inception/mercury-2].
+    let or = decision
+        .per_provider
+        .get(&ProviderType::OpenRouter)
+        .expect("openrouter present");
+    assert_eq!(
+        or.model_list.as_deref(),
+        Some(&["inception/mercury-2".to_string()][..]),
+        "openrouter mid model_list from bundled seed"
+    );
+}

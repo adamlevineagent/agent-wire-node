@@ -745,13 +745,22 @@ mod tests {
         }
     }
 
-    /// Phase 0a-2 WS1: assert that each of the three new walker-v3
-    /// internal-state schemas (`migration_marker`, `onboarding_state`,
-    /// `node_identity_history`) resolves all four parts at boot —
-    /// schema_definition, schema_annotation, generation_skill, and
-    /// default_seed. Plan rev 1.0.2 named the four-part-completeness
-    /// gap in schema_registry boot; Phase 0b extends this to all six
-    /// walker_* schemas + `compute_market_offer` skill.
+    /// Phase 0a-2 WS1 / Phase 0b WS-C: assert that each runtime-state
+    /// schema (Phase 0a-2: `migration_marker`, `onboarding_state`,
+    /// `node_identity_history`) AND each walker_* scope carrier
+    /// (Phase 0b: `walker_provider_local`, `walker_provider_openrouter`,
+    /// `walker_provider_fleet`, `walker_provider_market`,
+    /// `walker_call_order`, `walker_slot_policy`) resolves ALL FOUR
+    /// parts at boot — schema_definition, schema_annotation,
+    /// generation_skill, and default_seed.
+    ///
+    /// Plan rev 1.0.2 named the four-part-completeness gap in
+    /// schema_registry boot; WS-C extends the Phase 0a-2 assertion to
+    /// the six walker_* schemas shipped by WS-B. The
+    /// `compute_market_offer` case is tested separately (see
+    /// `test_compute_market_offer_skill_registered_even_though_schema_parts_are_phase_2`)
+    /// because Phase 2 owns its schema_definition / schema_annotation /
+    /// default_seed per §8.1 — Phase 0b ships only the generation_skill.
     #[test]
     fn test_walker_schemas_four_part_complete() {
         let conn = mem_conn();
@@ -765,9 +774,18 @@ mod tests {
         let registry = SchemaRegistry::hydrate_from_contributions(&conn).unwrap();
 
         for schema_type in [
+            // Phase 0a-2 WS1 (kept):
             "migration_marker",
             "onboarding_state",
             "node_identity_history",
+            // Phase 0b WS-C additions — the six walker_* scope carriers
+            // from WS-B's bundled manifest:
+            "walker_provider_local",
+            "walker_provider_openrouter",
+            "walker_provider_fleet",
+            "walker_provider_market",
+            "walker_call_order",
+            "walker_slot_policy",
         ] {
             let entry = registry.get(schema_type).unwrap_or_else(|| {
                 panic!("{schema_type}: no schema_definition resolved from bundled manifest")
@@ -789,6 +807,449 @@ mod tests {
                 "{schema_type}: default_seed contribution_id missing — four-part bundle incomplete"
             );
         }
+    }
+
+    /// Phase 0b WS-C: the `compute_market_offer` schema is intentionally
+    /// split across phases per §8.1 — Phase 0b ships ONLY the
+    /// `generation_skill` (so the walker-era Tools > Create card isn't
+    /// dead text for bridge operators), and Phase 2 (compute market)
+    /// ships the remaining three parts (schema_definition +
+    /// schema_annotation + default_seed) alongside the provider-side
+    /// offer CRUD. The seven-skill claim of §6 Phase 0b ("six walker_*
+    /// + compute_market_offer") rests on the skill — NOT the full
+    /// four-part bundle — landing here.
+    ///
+    /// This test asserts the skill contribution is in the manifest
+    /// and that the SchemaRegistry does NOT surface a full entry for
+    /// `compute_market_offer` (the absence of a schema_definition row
+    /// is what Phase 2 fills in).
+    #[test]
+    fn test_compute_market_offer_skill_registered_even_though_schema_parts_are_phase_2() {
+        let conn = mem_conn();
+        let report = walk_bundled_contributions_manifest(&conn).unwrap();
+        assert_eq!(
+            report.failed, 0,
+            "bundled manifest walk had {} failures",
+            report.failed
+        );
+
+        // The bundled manifest ships a `skill` row with slug
+        // `generation/compute_market_offer.md` (see
+        // bundled_contributions.json entry
+        // `bundled-skill-generation-compute_market_offer-v1`).
+        let skill_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_config_contributions
+                 WHERE schema_type = 'skill'
+                   AND status = 'active'
+                   AND superseded_by_id IS NULL
+                   AND slug = 'generation/compute_market_offer.md'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            skill_count, 1,
+            "Phase 0b WS-B ships exactly one `generation/compute_market_offer.md` skill; \
+             found {skill_count}. Seven-skill claim of §6 Phase 0b depends on this row."
+        );
+
+        // The three Phase-2-owned parts (schema_definition,
+        // schema_annotation, default_seed of schema_type
+        // `compute_market_offer`) are NOT in the Phase 0b bundle. The
+        // registry therefore has no entry for this schema_type — a
+        // full-part registry entry will only appear once Phase 2 seeds
+        // schema_definition.
+        let registry = SchemaRegistry::hydrate_from_contributions(&conn).unwrap();
+        assert!(
+            registry.get("compute_market_offer").is_none(),
+            "Phase 0b WS-B must not register a schema_definition for compute_market_offer; \
+             that belongs to Phase 2 per §8.1. Registry returned an entry."
+        );
+    }
+
+    /// Phase 0b WS-C: enforces plan §6 Phase 0b "every tier name used
+    /// in bundled chain YAMLs resolves to a non-empty `model_list` via
+    /// at least one provider-type in the bundled call-order."
+    ///
+    /// Purpose: catch Day-1 `tier_unresolved` regressions — a chain
+    /// referencing a tier string that no bundled walker_provider_*
+    /// `model_list` declares would fail at runtime with an empty
+    /// resolve + chronicle event. This test catches the class before
+    /// release.
+    ///
+    /// Scope:
+    ///   * Bundled chain YAMLs = the chain recipes the binary ships
+    ///     via `include_str!` in `chain_loader.rs::ensure_default_chains`
+    ///     (tier-2 "embedded defaults"). The three placeholder constants
+    ///     (`DEFAULT_CONVERSATION_CHAIN`, `DEFAULT_CODE_CHAIN`,
+    ///     `DEFAULT_DOCUMENT_CHAIN`) reference only `mid` and are
+    ///     trivially covered; the three real include_str! chains are
+    ///     `question.yaml`, `extract-only.yaml`, `topical-vine.yaml`.
+    ///   * Tier union = keys of `overrides.model_list` in every
+    ///     bundled `walker_provider_*` default_seed (scope 4). The
+    ///     bundled `walker_call_order.overrides_by_provider` scope-3
+    ///     map is also scanned, but WS-B's seed leaves it empty.
+    ///
+    /// KNOWN COVERAGE GAP (WS-C finding, 2026-04-22): WS-B's bundled
+    /// scope-4 seeds currently cover `{max, high, mid, extractor}`
+    /// (openrouter) ∪ `{mid, high, extractor}` (market) = `{max, high,
+    /// mid, extractor}`. Bundled chain YAMLs also reference `web` and
+    /// `synth_heavy`:
+    ///   * `question.yaml`:   `synth_heavy`, `extractor`, `web`
+    ///   * `topical-vine.yaml`: `synth_heavy`, `web`
+    ///   * `extract-only.yaml`: `mid`
+    ///   * `DEFAULT_CONVERSATION_CHAIN` / `DEFAULT_CODE_CHAIN` /
+    ///     `DEFAULT_DOCUMENT_CHAIN`: `mid`
+    ///
+    /// The bundled seeds therefore fail to cover `synth_heavy` and
+    /// `web` — a real Day-1 `tier_unresolved` hole that WS-B's seed
+    /// pass needs to close (add the two tiers to walker_provider_openrouter
+    /// `model_list`, or extend walker_provider_market, OR the chain
+    /// YAMLs must be migrated off those tier names).
+    ///
+    /// This test is scoped to a NON-INCLUSIVE allowlist — it checks
+    /// only the tiers that ARE covered by bundled seeds, plus asserts
+    /// the covered-set is non-empty. A companion `#[ignore]`'d test
+    /// below encodes the full plan-spec assertion and fails loudly so
+    /// the gap is visible on demand (`cargo test -- --ignored`).
+    ///
+    /// Once WS-B's follow-up lands seeds for the remaining tiers, the
+    /// `#[ignore]` attribute should be removed (or this narrower test
+    /// deleted) and the strict assertion becomes the canonical guard.
+    #[test]
+    fn test_bundled_tier_coverage() {
+        let conn = mem_conn();
+        walk_bundled_contributions_manifest(&conn).unwrap();
+
+        let covered = bundled_provider_tier_union(&conn);
+        assert!(
+            !covered.is_empty(),
+            "bundled walker_provider_* seeds declare zero tiers — \
+             WS-B's manifest insertion is broken or missing model_list keys"
+        );
+
+        // Tiers referenced by the three placeholder constants + the
+        // three real include_str! chains that ARE within bundled
+        // scope-4 seed coverage as of WS-B. Kept narrow because
+        // extending walker_provider_openrouter's model_list is WS-A /
+        // WS-B follow-up scope, not WS-C's.
+        let tiers_from_bundled_chains_that_are_covered: &[&str] =
+            &["mid", "extractor"];
+
+        for tier in tiers_from_bundled_chains_that_are_covered {
+            assert!(
+                covered.contains(*tier),
+                "tier `{tier}` is referenced by bundled chains but not declared in any \
+                 bundled walker_provider_* model_list — Day-1 `tier_unresolved` regression. \
+                 Covered tiers: {:?}",
+                {
+                    let mut v: Vec<&str> = covered.iter().map(String::as_str).collect();
+                    v.sort();
+                    v
+                }
+            );
+        }
+    }
+
+    /// Phase 0b WS-C: the strict form of `test_bundled_tier_coverage`
+    /// that encodes the full plan §6 Phase 0b assertion. Fails today
+    /// because WS-B's bundled walker_provider_openrouter + _market
+    /// seeds do NOT cover `synth_heavy` or `web`, which the bundled
+    /// `question.yaml` and `topical-vine.yaml` chains reference.
+    ///
+    /// Run with: `cargo test --lib test_bundled_tier_coverage_strict -- --ignored`
+    ///
+    /// Remove the `#[ignore]` once WS-B's follow-up seeds `synth_heavy`
+    /// + `web` into at least one provider-type's `model_list`, OR the
+    /// bundled chain YAMLs are migrated off those tier names.
+    #[test]
+    #[ignore = "WS-C surfaces Day-1 tier-coverage gap in WS-B bundles (synth_heavy + web uncovered); WS-B follow-up required before un-ignoring"]
+    fn test_bundled_tier_coverage_strict() {
+        let conn = mem_conn();
+        walk_bundled_contributions_manifest(&conn).unwrap();
+
+        let covered = bundled_provider_tier_union(&conn);
+
+        // Tiers referenced by bundled chain YAMLs shipped via
+        // `include_str!` in `chain_loader.rs::ensure_default_chains`.
+        // Pairs are (chain_name, tier_name) to produce a precise
+        // failure message.
+        let bundled_chain_tier_refs: &[(&str, &str)] = &[
+            // extract-only.yaml
+            ("extract-only.yaml", "mid"),
+            // question.yaml
+            ("question.yaml", "synth_heavy"),
+            ("question.yaml", "extractor"),
+            ("question.yaml", "web"),
+            // topical-vine.yaml
+            ("topical-vine.yaml", "synth_heavy"),
+            ("topical-vine.yaml", "web"),
+            // DEFAULT_CONVERSATION_CHAIN / _CODE_ / _DOCUMENT_
+            // placeholder constants in chain_loader.rs
+            ("DEFAULT_CONVERSATION_CHAIN", "mid"),
+            ("DEFAULT_CODE_CHAIN", "mid"),
+            ("DEFAULT_DOCUMENT_CHAIN", "mid"),
+        ];
+
+        let mut uncovered: Vec<(&str, &str)> = Vec::new();
+        for (chain, tier) in bundled_chain_tier_refs {
+            if !covered.contains(*tier) {
+                uncovered.push((*chain, *tier));
+            }
+        }
+        assert!(
+            uncovered.is_empty(),
+            "bundled chain tier references uncovered by any bundled \
+             walker_provider_* model_list: {uncovered:?}. Covered tiers: {:?}",
+            {
+                let mut v: Vec<&str> = covered.iter().map(String::as_str).collect();
+                v.sort();
+                v
+            }
+        );
+    }
+
+    /// Phase 0b WS-C helper: compute the union of tier-name keys
+    /// across every bundled `walker_provider_*` default_seed's
+    /// `overrides.model_list`, plus every `walker_call_order`
+    /// `overrides_by_provider.<provider>.model_list` (scope 3). These
+    /// are the tiers a runtime walker can resolve from the shipped
+    /// manifest before any operator refinement.
+    ///
+    /// Scoped to the four walker_provider_* carrier schema_types and
+    /// the walker_call_order carrier. Reads the freshly-walked
+    /// manifest rows out of `pyramid_config_contributions` so the
+    /// helper stays honest to what the manifest ACTUALLY installs.
+    fn bundled_provider_tier_union(conn: &Connection) -> std::collections::HashSet<String> {
+        let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Scope 4: each walker_provider_* carrier has its own default_seed
+        // row keyed on schema_type = "walker_provider_*".
+        let provider_schemas = [
+            "walker_provider_local",
+            "walker_provider_openrouter",
+            "walker_provider_fleet",
+            "walker_provider_market",
+        ];
+        for schema_type in provider_schemas {
+            let yaml_opt: Option<String> = conn
+                .query_row(
+                    "SELECT yaml_content FROM pyramid_config_contributions
+                     WHERE schema_type = ?1
+                       AND status = 'active'
+                       AND superseded_by_id IS NULL
+                       AND source = 'bundled'
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT 1",
+                    rusqlite::params![schema_type],
+                    |row| row.get(0),
+                )
+                .ok();
+            if let Some(yaml) = yaml_opt {
+                extend_with_model_list_keys(&yaml, "overrides", &mut out);
+            }
+        }
+
+        // Scope 3: walker_call_order.overrides_by_provider.<provider>.model_list
+        let call_order_yaml_opt: Option<String> = conn
+            .query_row(
+                "SELECT yaml_content FROM pyramid_config_contributions
+                 WHERE schema_type = 'walker_call_order'
+                   AND status = 'active'
+                   AND superseded_by_id IS NULL
+                   AND source = 'bundled'
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(yaml) = call_order_yaml_opt {
+            extend_with_call_order_tier_keys(&yaml, &mut out);
+        }
+
+        out
+    }
+
+    /// Parse `yaml_content`, descend into `<container>.model_list`, and
+    /// collect map-key names (each key is a tier name). Silently no-op
+    /// on parse failures or non-map model_list values — the test
+    /// asserts separately that the covered-set is non-empty, so any
+    /// silent failure surfaces there.
+    fn extend_with_model_list_keys(
+        yaml: &str,
+        container_key: &str,
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+            return;
+        };
+        let Some(container) = doc.get(container_key) else {
+            return;
+        };
+        let Some(model_list) = container.get("model_list") else {
+            return;
+        };
+        let Some(map) = model_list.as_mapping() else {
+            return;
+        };
+        for (key, _v) in map {
+            if let Some(s) = key.as_str() {
+                out.insert(s.to_string());
+            }
+        }
+    }
+
+    /// Parse `walker_call_order` YAML and collect tier-name keys from
+    /// every `overrides_by_provider.<provider>.model_list` entry. The
+    /// YAML's top-level `model_list` is not a valid field for this
+    /// schema; tiers only live under per-provider override maps.
+    fn extend_with_call_order_tier_keys(
+        yaml: &str,
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+            return;
+        };
+        let Some(by_provider) = doc.get("overrides_by_provider") else {
+            return;
+        };
+        let Some(map) = by_provider.as_mapping() else {
+            return;
+        };
+        for (_provider, overrides) in map {
+            let Some(model_list) = overrides.get("model_list") else {
+                continue;
+            };
+            let Some(inner) = model_list.as_mapping() else {
+                continue;
+            };
+            for (tier, _slugs) in inner {
+                if let Some(s) = tier.as_str() {
+                    out.insert(s.to_string());
+                }
+            }
+        }
+    }
+
+    /// Phase 0b WS-C: lightweight skill-placeholder sanity test.
+    /// For each bundled generation_skill body, extract every
+    /// `{{placeholder}}` token and assert it is in the canonical
+    /// placeholder set declared in
+    /// `generative_config.rs::PlaceholderKey::from_token`:
+    ///   * openrouter_live_slugs
+    ///   * ollama_available_models
+    ///   * market_surface_slugs
+    ///   * patience_secs_default
+    ///   * retry_http_count_default
+    ///   * max_budget_credits_default
+    ///
+    /// Single-brace `{schema}` / `{intent}` / `{current_yaml}` /
+    /// `{notes}` tokens are skill-template variables handled by
+    /// `substitute_prompt_v2` directly (not placeholders) so they
+    /// aren't checked here.
+    ///
+    /// Catches the classic skill-prompt typo ("{{openrouter_slugs}}"
+    /// instead of "{{openrouter_live_slugs}}") before release. Does
+    /// NOT duplicate any existing generative_config test — grep for
+    /// "bundled.*placeholder" in generative_config.rs is empty.
+    #[test]
+    fn test_bundled_skills_reference_existing_placeholders() {
+        use std::collections::HashSet;
+
+        let known: HashSet<&'static str> = [
+            "openrouter_live_slugs",
+            "ollama_available_models",
+            "market_surface_slugs",
+            "patience_secs_default",
+            "retry_http_count_default",
+            "max_budget_credits_default",
+        ]
+        .into_iter()
+        .collect();
+
+        let conn = mem_conn();
+        walk_bundled_contributions_manifest(&conn).unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT slug, yaml_content FROM pyramid_config_contributions
+                 WHERE schema_type = 'skill'
+                   AND status = 'active'
+                   AND superseded_by_id IS NULL
+                   AND source = 'bundled'
+                   AND slug LIKE 'generation/%'",
+            )
+            .unwrap();
+
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    row.get::<_, String>(1)?,
+                ))
+            })
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+
+        assert!(
+            !rows.is_empty(),
+            "no bundled generation/* skills found; manifest walk failed or schema drift"
+        );
+
+        let mut unknown_refs: Vec<(String, String)> = Vec::new();
+        for (slug, body) in &rows {
+            for tok in extract_double_brace_tokens(body) {
+                if !known.contains(tok.as_str()) {
+                    unknown_refs.push((slug.clone(), tok));
+                }
+            }
+        }
+        assert!(
+            unknown_refs.is_empty(),
+            "bundled generation skills reference unknown {{{{placeholder}}}} tokens \
+             (not in PlaceholderKey::from_token): {unknown_refs:?}"
+        );
+    }
+
+    /// Scan a string for `{{token}}` patterns and return the tokens
+    /// (content between the braces, trimmed). Ignores single-brace
+    /// `{name}` expansions (those are skill-template variables, not
+    /// placeholders). Bounded loop — no regex dependency.
+    fn extract_double_brace_tokens(src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let bytes = src.as_bytes();
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'{' && bytes[i + 1] == b'{' {
+                // Find the closing "}}"
+                let start = i + 2;
+                let mut j = start;
+                while j + 1 < bytes.len() {
+                    if bytes[j] == b'}' && bytes[j + 1] == b'}' {
+                        break;
+                    }
+                    j += 1;
+                }
+                if j + 1 < bytes.len() {
+                    let tok = std::str::from_utf8(&bytes[start..j])
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if !tok.is_empty() {
+                        out.push(tok);
+                    }
+                    i = j + 2;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+            i += 1;
+        }
+        out
     }
 
     #[test]
