@@ -169,6 +169,28 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool)] = 
         true,
         false,
     ),
+    // Post-build accretion v5 Phase 9c-1: close the debate-collapse
+    // dormant-emitter gap. The 7a debate_steward chain only APPENDS
+    // positions/red_teams; it has no path that removes them, so
+    // `debate_collapsed` was an observation helper with no production
+    // caller. Phase 9c-1 ships the full collapse feature: a dedicated
+    // `debate_collapse` annotation type + a dedicated
+    // `starter-debate-collapse` handler chain that finalizes the
+    // debate (transitions `debate` → `scaffolding` + NULLs the
+    // shape_payload_json) and emits the canonical `debate_collapsed`
+    // observation event for audit. Separate from debate_steward
+    // because the semantics are opposite (steward appends,
+    // collapser finalizes) — mixing them in one chain would muddy
+    // the responsibility. `handler_chain_id` on the vocab entry is
+    // how the annotation_reacted override path (6c-B / audit 7a-gen)
+    // dispatches — no new role_name needed.
+    (
+        "debate_collapse",
+        "Collapse a Debate node back to Scaffolding (positions resolved or abandoned). Triggers starter-debate-collapse to finalize the debate and emit debate_collapsed.",
+        Some("starter-debate-collapse"),
+        true,
+        false,
+    ),
 ];
 
 // ── Node Shapes (4 genesis entries) ─────────────────────────────────

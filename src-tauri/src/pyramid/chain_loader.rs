@@ -452,6 +452,19 @@ pub fn ensure_default_chains(
             "starter-sweep.yaml",
             include_str!("../../../chains/defaults/starter/starter-sweep.yaml"),
         ),
+        // Post-build accretion v5 Phase 9c-1: starter-debate-collapse.
+        // Closes the Phase 8-3 `emit_debate_collapsed` dormant-emitter gap.
+        // The vocab entry for `debate_collapse` annotation type nominates
+        // this chain as its handler (override path via 6c-B / audit 7a-gen);
+        // Tier 2 bundling keeps release builds from failing to resolve at
+        // dispatch time. Separate from starter-debate-steward because
+        // steward APPENDS positions/red_teams and this chain FINALIZES
+        // the debate (transitions back to scaffolding, NULLs the payload,
+        // emits `debate_collapsed` into the chronicle).
+        (
+            "starter-debate-collapse.yaml",
+            include_str!("../../../chains/defaults/starter/starter-debate-collapse.yaml"),
+        ),
     ];
     for (filename, content) in starter_chains {
         let path = chains_dir.join("defaults").join("starter").join(filename);
@@ -918,6 +931,10 @@ mod phase5_ensure_default_chains_tests {
             "starter-authorize-question",
             "starter-accretion-handler",
             "starter-sweep",
+            // Phase 9c-1 — debate_collapse vocab handler (new dedicated
+            // chain; kept separate from debate_steward because steward
+            // appends and collapser finalizes).
+            "starter-debate-collapse",
         ] {
             let loaded = load_chain_by_id(id, chains_dir).unwrap_or_else(|e| {
                 panic!(

@@ -137,8 +137,8 @@ pub fn write_observation_event(
 ///
 /// Deliberately a standalone helper (not inline at a call site) so the
 /// trigger logic can live wherever it makes sense — an annotation handler,
-/// an operator HTTP route, a v6 collapse chain, etc. — without each caller
-/// rewriting the metadata shape.
+/// an operator HTTP route, or the canonical `starter-debate-collapse`
+/// chain — without each caller rewriting the metadata shape.
 ///
 /// `reason`: short machine-friendly token (e.g. `"last_position_abandoned"`,
 /// `"operator_collapsed"`, `"steel_man_superseded"`).
@@ -147,16 +147,13 @@ pub fn write_observation_event(
 /// a winner).
 /// `collapsed_by`: human- or agent-identifier (author, operator id, chain id).
 ///
-/// FIXME(v6 debate collapse design): the MVP trigger hasn't been wired yet.
-/// `append_annotation_to_debate_node` only APPENDS positions/red_teams —
-/// it never removes them, so the "positions.is_empty() after append"
-/// trigger is dead code today. A real collapse needs either:
-///   (a) a `debate_collapse` annotation type + vocab entry + handler,
-///   (b) position supersession (annotation supersedes a SteelMan), or
-///   (c) a `starter-debate-collapse` chain the operator or meta-layer
-///       oracle invokes explicitly.
-/// This helper exists so whichever path ships in v6 is a one-line call.
-/// Leaving it dormant here is intentional and loud per feedback_loud_deferrals.
+/// Phase 9c-1 update: the v5 feature is now canonical. The triggering path
+/// is `debate_collapse` annotation type → `annotation_reacted` with
+/// `handler_chain_id=starter-debate-collapse` → `finalize_debate_node`
+/// mechanical → this emitter (writes the terminal debate state into the
+/// chronicle + transitions the node from debate shape back to scaffolding).
+/// Kept as a helper so operator-initiated direct-DB collapse flows stay
+/// one-liners without the full chain round-trip.
 pub fn emit_debate_collapsed(
     conn: &Connection,
     slug: &str,

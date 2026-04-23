@@ -128,10 +128,11 @@ async fn genesis_annotation_type_served_over_real_http() {
         .as_array()
         .expect("entries array")
         .clone();
+    // Phase 9c-1: 11 original + 4 Phase 7c verbs + debate_collapse = 16.
     assert_eq!(
         entries.len(),
-        11,
-        "genesis ships 11 annotation types, got {} — body: {}",
+        16,
+        "genesis ships 16 annotation types, got {} — body: {}",
         entries.len(),
         body
     );
@@ -242,10 +243,11 @@ async fn publish_then_refetch_over_http_surfaces_new_entry() {
     let addr = spawn_server(state).await;
 
     // Baseline — genesis-count.
+    // Phase 9c-1: 11 original + 4 Phase 7c verbs + debate_collapse = 16.
     let url = format!("http://{}/vocabulary/annotation_type", addr);
     let baseline: serde_json::Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
     let baseline_count = baseline["entries"].as_array().unwrap().len();
-    assert_eq!(baseline_count, 11, "baseline must be 11");
+    assert_eq!(baseline_count, 16, "baseline must be 16");
 
     // Publish a new entry through the normal write API. This mirrors what a
     // publish-vocab-entry HTTP route would do (that route isn't yet wired —
@@ -272,10 +274,11 @@ async fn publish_then_refetch_over_http_surfaces_new_entry() {
     // Re-fetch via real HTTP — new entry must be in the response.
     let after: serde_json::Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
     let after_entries = after["entries"].as_array().unwrap().clone();
+    // Phase 9c-1: genesis 16 + new 1 = 17.
     assert_eq!(
         after_entries.len(),
-        12,
-        "after publish, expected 12 entries (genesis 11 + new 1), got {}",
+        17,
+        "after publish, expected 17 entries (genesis 16 + new 1), got {}",
         after_entries.len()
     );
     let smoke = after_entries
@@ -313,5 +316,6 @@ async fn vocab_is_global_not_per_slug() {
     let addr = spawn_server(state).await;
     let url = format!("http://{}/vocabulary/annotation_type", addr);
     let body: serde_json::Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
-    assert_eq!(body["entries"].as_array().unwrap().len(), 11);
+    // Phase 9c-1: 16 annotation types post-debate_collapse addition.
+    assert_eq!(body["entries"].as_array().unwrap().len(), 16);
 }

@@ -700,7 +700,7 @@ fn emit_vocabulary_event_with_reason(
 /// in `init_pyramid_db`. Loud `tracing::error!` on individual failures
 /// so operators see the drift.
 pub fn seed_genesis_vocabulary(conn: &Connection) -> Result<()> {
-    // Annotation types (15 — 11 original + Phase 7c verbs)
+    // Annotation types (16 — 11 original + 4 Phase 7c verbs + debate_collapse Phase 9c-1)
     for (name, description, handler_chain_id, reactive, creates_delta) in
         GENESIS_ANNOTATION_TYPES
     {

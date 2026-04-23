@@ -158,7 +158,19 @@ pub(crate) fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, 
         // semantically distinct events onto the same work_item row.
         "annotation_reacted" => Some(("role_bound", "cascade_reacted", "stale_remote")),
         "debate_spawned" => Some(("role_bound", "debate_spawn", "stale_remote")),
-        "debate_collapsed" => Some(("role_bound", "debate_collapse", "stale_remote")),
+        // v5 Phase 9c-1: debate_collapsed is emitted BY starter-debate-collapse
+        // AFTER the node has been collapsed to scaffolding. Previously mapped
+        // to `role_bound` + role_for_event("debate_collapsed") → debate_steward,
+        // which meant every collapse would have re-dispatched the steward on
+        // the same target — a wasted cycle at best (steward finds the target
+        // is now scaffolding with no collapse annotation) and a re-collapse
+        // loop at worst. Post-9c-1 the collapse chain dispatches on the
+        // `debate_collapse` ANNOTATION TYPE via the vocab handler_chain_id
+        // override (6c-B / audit 7a-gen); the EMITTED `debate_collapsed`
+        // event is observability-only. log_only keeps the chronicle row,
+        // maps it to a dedicated `debate_collapsed_log` step_name so
+        // has_active_work_item dedup stays clean, and spawns no work item.
+        "debate_collapsed" => Some(("log_only", "debate_collapsed_log", "stale_remote")),
         // v5 audit P3: gap_detected is observability-only. The actual
         // dispatch already fired via annotation_reacted → handler_chain_id
         // (6c-B flip), so compiling a second work item for gap_detected
@@ -916,7 +928,14 @@ pub(crate) fn role_for_event(event_type: &str) -> Option<&'static str> {
         // re_distill work item the Phase 8-2 supervisor arm applies.
         "annotation_written" | "annotation_superseded" => Some("cascade_handler"),
         "annotation_reacted" => Some("cascade_handler"),
-        "debate_spawned" | "debate_collapsed" => Some("debate_steward"),
+        // v5 Phase 9c-1: debate_collapsed is observability-only post-collapse
+        // — the dispatch already fired via annotation_reacted →
+        // handler_chain_id=starter-debate-collapse (the `debate_collapse`
+        // ANNOTATION TYPE, not the emitted event). Returning None here
+        // prevents the emitted event from triggering another collapse
+        // against a node that has already been collapsed to scaffolding.
+        "debate_spawned" => Some("debate_steward"),
+        "debate_collapsed" => None,
         // v5 audit P3: gap_detected is observability-only — the actual
         // dispatch already fired via annotation_reacted → handler_chain_id.
         "gap_detected" => None,

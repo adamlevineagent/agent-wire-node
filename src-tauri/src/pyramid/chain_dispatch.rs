@@ -657,6 +657,13 @@ const MECHANICAL_FUNCTIONS: &[&str] = &[
     // Post-build accretion v5 Phase 9b-3 — sweep archive mechanicals.
     "archive_stale_failed_work_items",
     "retire_superseded_contributions_past_retention",
+    // Post-build accretion v5 Phase 9c-1 — starter-debate-collapse primitives.
+    // Close the Phase 8-3 `emit_debate_collapsed` dormant-emitter gap.
+    // The collapse chain dispatches on the `debate_collapse` annotation
+    // type (vocab entry ships with handler_chain_id=starter-debate-collapse).
+    "emit_debate_collapse_invoked",
+    "load_collapse_context",
+    "finalize_debate_node",
 ];
 
 /// Post-build accretion v5 Phase 6b: hard ceiling on sub-chain recursion.
@@ -3272,6 +3279,505 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 "gap_detected_event_id": gap_detected_event_id,
                 "updated_payload": updated_payload_value,
             }))
+        }
+        // ── Post-build accretion v5 Phase 9c-1: starter-debate-collapse ─────
+        //
+        // Closes the Phase 8-3 `emit_debate_collapsed` dormant-emitter gap.
+        // Three mechanicals back `starter-debate-collapse.yaml`. The chain
+        // fires on `annotation_reacted` events whose vocab entry nominates
+        // `starter-debate-collapse` (the `debate_collapse` annotation type).
+        // Separate from debate_steward because semantics are opposite —
+        // steward appends, collapser finalizes.
+        //
+        // Shape transition on finalize: Debate → Scaffolding + NULL payload
+        // (the debate is resolved; the node returns to scaffolding carrying
+        // the conclusion in the final distilled/annotation state). The
+        // emitted `debate_collapsed` event captures the terminal debate
+        // state (concern, position labels, vote_lean) in metadata for
+        // audit trail — no in-place "collapsed" marker on DebateTopic.
+        "emit_debate_collapse_invoked" => {
+            // Chronicle-only observability — mirrors emit_debate_steward_invoked's
+            // threading discipline so later steps still see work_item_id /
+            // annotation_id / annotation_type after this step's output.
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str());
+            let annotation_id = input.get("annotation_id").and_then(|v| v.as_i64());
+            let annotation_type = input
+                .get("annotation_type")
+                .and_then(|v| v.as_str());
+            let mut meta = serde_json::Map::new();
+            if let Some(tid) = target_node_id {
+                meta.insert(
+                    "target_node_id".to_string(),
+                    Value::String(tid.to_string()),
+                );
+            }
+            if let Some(aid) = annotation_id {
+                meta.insert("annotation_id".to_string(), Value::from(aid));
+            }
+            if let Some(at) = annotation_type {
+                meta.insert(
+                    "annotation_type".to_string(),
+                    Value::String(at.to_string()),
+                );
+            }
+            let metadata_json = if meta.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&Value::Object(meta))?)
+            };
+            info!(
+                "[mechanical] emit_debate_collapse_invoked slug={} target={:?} annotation_id={:?} annotation_type={:?}",
+                ctx.slug, target_node_id, annotation_id, annotation_type
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "debate_collapse_invoked",
+                None,
+                None,
+                None,
+                None,
+                target_node_id,
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            Ok(Value::Object(out))
+        }
+        "load_collapse_context" => {
+            // Resolves the triggering annotation + target shape + existing
+            // DebateTopic payload (if present). Mirrors load_gap_context /
+            // load_annotation_and_target back-fill pattern: annotation_id
+            // and annotation_type arrive directly on the input envelope OR
+            // get pulled from the triggering observation event's metadata
+            // via the work item's observation_event_ids column.
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "load_collapse_context: missing target_node_id"
+                ))?
+                .to_string();
+
+            let mut annotation_id = input.get("annotation_id").and_then(|v| v.as_i64());
+            let mut annotation_type = input
+                .get("annotation_type")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            if annotation_id.is_none() || annotation_type.is_none() {
+                let work_item_id = input
+                    .get("work_item_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                if let Some(wid) = work_item_id.as_deref() {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let obs_ids_json: Option<String> = conn_guard
+                        .query_row(
+                            "SELECT observation_event_ids FROM dadbear_work_items WHERE id = ?1",
+                            rusqlite::params![wid],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    if let Some(ids_json) = obs_ids_json {
+                        if let Ok(ids) = serde_json::from_str::<Vec<i64>>(&ids_json) {
+                            if let Some(eid) = ids.first() {
+                                let meta: Option<String> = conn_guard
+                                    .query_row(
+                                        "SELECT metadata_json FROM dadbear_observation_events WHERE id = ?1",
+                                        rusqlite::params![eid],
+                                        |row| row.get(0),
+                                    )
+                                    .ok()
+                                    .flatten();
+                                if let Some(m) = meta {
+                                    if let Ok(v) = serde_json::from_str::<Value>(&m) {
+                                        if annotation_id.is_none() {
+                                            annotation_id =
+                                                v.get("annotation_id").and_then(|x| x.as_i64());
+                                        }
+                                        if annotation_type.is_none() {
+                                            annotation_type = v
+                                                .get("annotation_type")
+                                                .and_then(|x| x.as_str())
+                                                .map(String::from);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    drop(conn_guard);
+                }
+            }
+
+            let conn_guard = ctx.db_reader.lock().await;
+
+            let annotation_obj: Value = if let Some(aid) = annotation_id {
+                let row: Option<(i64, String, String, String, Option<String>, String, String, String)> = conn_guard
+                    .query_row(
+                        "SELECT id, slug, node_id, annotation_type, question_context, author,
+                                content, created_at
+                         FROM pyramid_annotations WHERE id = ?1",
+                        rusqlite::params![aid],
+                        |r| Ok((
+                            r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?,
+                            r.get(5)?, r.get(6)?, r.get(7)?,
+                        )),
+                    )
+                    .ok();
+                if let Some((id, slug, node_id, aty, qctx, author, content, created_at)) = row {
+                    if annotation_type.as_deref() != Some(aty.as_str()) {
+                        annotation_type = Some(aty.clone());
+                    }
+                    serde_json::json!({
+                        "id": id,
+                        "slug": slug,
+                        "node_id": node_id,
+                        "annotation_type": aty,
+                        "question_context": qctx,
+                        "author": author,
+                        "content": content,
+                        "created_at": created_at,
+                    })
+                } else {
+                    Value::Null
+                }
+            } else {
+                Value::Null
+            };
+
+            let node_row: Option<(i64, String, String)> = conn_guard
+                .query_row(
+                    "SELECT depth, headline, distilled FROM pyramid_nodes
+                     WHERE slug = ?1 AND id = ?2",
+                    rusqlite::params![ctx.slug, target_node_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok();
+            let shape_view = super::db::get_node_shape(&conn_guard, &ctx.slug, &target_node_id)?;
+            drop(conn_guard);
+
+            let (current_shape, existing_debate_payload, target_obj) =
+                if let Some((depth, headline, distilled)) = node_row {
+                    let current_shape = shape_view
+                        .as_ref()
+                        .map(|v| v.shape.as_str().to_string())
+                        .unwrap_or_else(|| "scaffolding".to_string());
+                    let existing_debate = match shape_view.as_ref().and_then(|v| v.payload.as_ref()) {
+                        Some(ShapePayload::Debate(d)) => serde_json::to_value(d).ok(),
+                        _ => None,
+                    };
+                    let current_payload = shape_view
+                        .as_ref()
+                        .and_then(|v| v.payload.as_ref())
+                        .and_then(|p| serde_json::to_value(p).ok())
+                        .unwrap_or(Value::Null);
+                    let target = serde_json::json!({
+                        "id": target_node_id,
+                        "depth": depth,
+                        "headline": headline,
+                        "distilled": distilled,
+                        "current_shape": current_shape,
+                        "current_payload": current_payload,
+                    });
+                    (current_shape, existing_debate, target)
+                } else {
+                    ("scaffolding".to_string(), None, Value::Null)
+                };
+
+            info!(
+                "[mechanical] load_collapse_context slug={} target={} annotation_id={:?} annotation_type={:?} current_shape={}",
+                ctx.slug, target_node_id, annotation_id, annotation_type, current_shape,
+            );
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert(
+                "target_node_id".to_string(),
+                Value::String(target_node_id.clone()),
+            );
+            out.insert(
+                "annotation_id".to_string(),
+                annotation_id.map(Value::from).unwrap_or(Value::Null),
+            );
+            out.insert(
+                "annotation_type".to_string(),
+                annotation_type
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+            out.insert("annotation".to_string(), annotation_obj);
+            out.insert("target_node".to_string(), target_obj);
+            out.insert("target_shape".to_string(), Value::String(current_shape));
+            out.insert(
+                "existing_debate_payload".to_string(),
+                existing_debate_payload.unwrap_or(Value::Null),
+            );
+            Ok(Value::Object(out))
+        }
+        "finalize_debate_node" => {
+            // Core collapse writer. Given a `debate_collapse` annotation +
+            // target node:
+            //   - Debate → transition node_shape to 'scaffolding', NULL
+            //     the shape_payload_json. The resolved debate state
+            //     (concern, position labels, vote_lean) is preserved in
+            //     the emitted `debate_collapsed` observation event's
+            //     metadata for audit trail.
+            //   - Scaffolding / Gap / MetaLayer → skip loud (not
+            //     destructive): emit `debate_collapse_skipped` event
+            //     with a reason so the operator sees it in the
+            //     chronicle (feedback_loud_deferrals).
+            //   - Unknown shape → raise.
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "finalize_debate_node: missing target_node_id"
+                ))?
+                .to_string();
+            let annotation_id: Option<i64> = input.get("annotation_id").and_then(|v| v.as_i64());
+            let annotation_obj = input.get("annotation").cloned().unwrap_or(Value::Null);
+
+            // Pull annotation content + author. Prefer the threaded
+            // `annotation` object; fall back to a DB read. Loud-raise on
+            // missing row (same discipline as append_annotation_to_debate_node
+            // and materialize_gap_node).
+            let ann_content: Option<String>;
+            let ann_author: Option<String>;
+            {
+                let threaded_content = annotation_obj
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let threaded_author = annotation_obj
+                    .get("author")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                if threaded_content.is_some() && threaded_author.is_some() {
+                    ann_content = threaded_content;
+                    ann_author = threaded_author;
+                } else if let Some(aid) = annotation_id {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let row: Option<(String, String)> = conn_guard
+                        .query_row(
+                            "SELECT content, author FROM pyramid_annotations WHERE id = ?1",
+                            rusqlite::params![aid],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .ok();
+                    drop(conn_guard);
+                    match row {
+                        Some((c, a)) => {
+                            ann_content = Some(c);
+                            ann_author = Some(a);
+                        }
+                        None => {
+                            return Err(anyhow!(
+                                "finalize_debate_node: annotation_id={} not \
+                                 found in pyramid_annotations — stale event or deleted row. \
+                                 Target '{}' will not be mutated.",
+                                aid,
+                                target_node_id,
+                            ));
+                        }
+                    }
+                } else {
+                    // Direct invocation without annotation context is
+                    // acceptable for this chain — an operator may invoke
+                    // starter-debate-collapse as a library call. In that
+                    // case content/author are whatever the caller stamped
+                    // on annotation_obj, or None. Don't loud-raise.
+                    ann_content = None;
+                    ann_author = None;
+                }
+            }
+
+            // Serialize the transition under the writer mutex so concurrent
+            // collapse annotations on the same target don't race.
+            let conn_guard = ctx.db_writer.lock().await;
+            let shape_view =
+                super::db::get_node_shape(&conn_guard, &ctx.slug, &target_node_id)?;
+            let current_shape = shape_view
+                .as_ref()
+                .map(|v| v.shape.clone())
+                .unwrap_or_else(NodeShape::scaffolding);
+            let existing_debate: Option<DebateTopic> =
+                match shape_view.as_ref().and_then(|v| v.payload.as_ref()) {
+                    Some(ShapePayload::Debate(d)) => Some(d.clone()),
+                    _ => None,
+                };
+
+            if current_shape.as_str() == NODE_SHAPE_DEBATE {
+                // Canonical collapse path: transition to scaffolding, NULL
+                // the payload, emit `debate_collapsed` with the terminal
+                // debate state in metadata.
+                let debate_ref = existing_debate.as_ref();
+                let position_labels: Vec<String> = debate_ref
+                    .map(|d| d.positions.iter().map(|p| p.label.clone()).collect())
+                    .unwrap_or_default();
+                let concern = debate_ref
+                    .map(|d| d.concern.clone())
+                    .unwrap_or_default();
+                let vote_lean_json = debate_ref
+                    .and_then(|d| d.vote_lean.as_ref())
+                    .and_then(|v| serde_json::to_value(v).ok())
+                    .unwrap_or(Value::Null);
+                let positions_remaining = position_labels.len();
+
+                // Transition: debate → scaffolding, NULL shape_payload_json.
+                conn_guard.execute(
+                    "UPDATE pyramid_nodes
+                     SET node_shape = 'scaffolding', shape_payload_json = NULL
+                     WHERE slug = ?1 AND id = ?2",
+                    rusqlite::params![ctx.slug, target_node_id],
+                )?;
+
+                // Compose the collapse reason + collapsed_by from the
+                // triggering annotation. Fall back to defaults when the
+                // chain is invoked without annotation context.
+                let reason = ann_content
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "operator_collapsed".to_string());
+                let collapsed_by = ann_author
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "starter-debate-collapse".to_string());
+
+                // Emit `debate_collapsed` via the canonical helper. The
+                // helper carries debate_node_id / reason / positions_remaining
+                // / collapsed_by; we merge in the audit-trail fields
+                // (final_concern, final_position_labels, final_vote_lean,
+                // annotation_id) by writing an EXTENDED metadata row
+                // directly, keeping the helper's contract for the base
+                // fields.
+                let metadata = serde_json::json!({
+                    "debate_node_id": target_node_id,
+                    "reason": reason,
+                    "positions_remaining": positions_remaining,
+                    "collapsed_by": collapsed_by,
+                    "annotation_id": annotation_id,
+                    "final_concern": concern,
+                    "final_position_labels": position_labels,
+                    "final_vote_lean": vote_lean_json,
+                })
+                .to_string();
+                let layer: Option<i64> = conn_guard
+                    .query_row(
+                        "SELECT depth FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
+                        rusqlite::params![ctx.slug, target_node_id],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                let debate_collapsed_event_id =
+                    super::observation_events::write_observation_event(
+                        &conn_guard,
+                        &ctx.slug,
+                        "chain",
+                        "debate_collapsed",
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(&target_node_id),
+                        layer,
+                        Some(&metadata),
+                    )?;
+                drop(conn_guard);
+
+                info!(
+                    "[mechanical] finalize_debate_node slug={} target={} action=collapsed_to_scaffolding \
+                     debate_collapsed_event_id={} positions_remaining={}",
+                    ctx.slug, target_node_id, debate_collapsed_event_id, positions_remaining
+                );
+
+                Ok(serde_json::json!({
+                    "action": "collapsed_to_scaffolding",
+                    "target_node_id": target_node_id,
+                    "annotation_id": annotation_id,
+                    "debate_collapsed_event_id": debate_collapsed_event_id,
+                    "positions_remaining": positions_remaining,
+                    "final_concern": concern,
+                    "final_position_labels": position_labels,
+                }))
+            } else if current_shape.as_str() == "scaffolding"
+                || current_shape.as_str() == NODE_SHAPE_GAP
+                || current_shape.as_str() == NODE_SHAPE_META_LAYER
+            {
+                // Skip loud (not destructive). Emit chronicle event so the
+                // operator sees the skipped collapse attempt.
+                warn!(
+                    "[mechanical] finalize_debate_node slug={} target={} shape={} → skip \
+                     (debate_collapse annotation on a non-Debate target)",
+                    ctx.slug, target_node_id, current_shape,
+                );
+                let skip_meta = serde_json::json!({
+                    "target_node_id": target_node_id,
+                    "annotation_id": annotation_id,
+                    "existing_shape": current_shape.as_str(),
+                    "reason": "target_not_debate",
+                    "detail": format!(
+                        "target '{}' is shape '{}' — debate_collapse only applies \
+                         to Debate nodes. Non-destructive skip.",
+                        target_node_id, current_shape,
+                    ),
+                })
+                .to_string();
+                let _ = super::observation_events::write_observation_event(
+                    &conn_guard,
+                    &ctx.slug,
+                    "chain",
+                    "debate_collapse_skipped",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&target_node_id),
+                    None,
+                    Some(&skip_meta),
+                );
+                drop(conn_guard);
+                Ok(serde_json::json!({
+                    "action": "skipped_not_debate",
+                    "target_node_id": target_node_id,
+                    "annotation_id": annotation_id,
+                    "existing_shape": current_shape.as_str(),
+                    "reason": format!(
+                        "target '{}' is shape '{}' — only Debate nodes can be \
+                         collapsed. Non-destructive skip.",
+                        target_node_id, current_shape,
+                    ),
+                }))
+            } else {
+                // Unknown shape — raise loud (feedback_loud_deferrals).
+                drop(conn_guard);
+                Err(anyhow!(
+                    "finalize_debate_node: target '{}' has unknown shape '{}' — \
+                     debate_collapse only handles scaffolding / debate / gap / \
+                     meta_layer today. Publish a collapse extension before \
+                     introducing new node shapes.",
+                    target_node_id,
+                    current_shape
+                ))
+            }
         }
         // ── Post-build accretion v5 Phase 6b: sub-chain invocation ──────────
         //

@@ -22358,18 +22358,20 @@ mod phase2_post_build_tests {
     }
 
     #[test]
-    fn save_annotation_round_trip_all_fifteen_types() {
+    fn save_annotation_round_trip_all_sixteen_types() {
         // Phase 7c verifier: extended from 11 → 15 types (adds gap /
         // hypothesis / purpose_declaration / purpose_shift as pure vocab
-        // entries per 6c-B flip). The old round-trip covered only the
-        // original 11 — adding a new vocab verb shouldn't be a silent
-        // coverage regression, so this test is kept in sync with the
-        // genesis table. Iteration order matches GENESIS_ANNOTATION_TYPES.
+        // entries per 6c-B flip).
+        // Phase 9c-1 verifier: extended 15 → 16 (adds debate_collapse to
+        // close the Phase 8-3 dormant-emitter gap). The round-trip must
+        // stay in sync with the genesis table. Iteration order matches
+        // GENESIS_ANNOTATION_TYPES.
         let conn = mem_conn();
         create_slug(&conn, "s", &ContentType::Code, "/tmp/s").unwrap();
         seed_target_node(&conn, "s", "L0-000");
         // Phase 6c-B: AnnotationType is a newtype wrapping a string; the
-        // canonical names live in the vocab registry (genesis seeds 15).
+        // canonical names live in the vocab registry (genesis seeds 16
+        // post-Phase-9c-1).
         let all = [
             AnnotationType::new("observation"),
             AnnotationType::new("correction"),
@@ -22387,6 +22389,8 @@ mod phase2_post_build_tests {
             AnnotationType::new("hypothesis"),
             AnnotationType::new("purpose_declaration"),
             AnnotationType::new("purpose_shift"),
+            // Phase 9c-1: debate_collapse (closes the 8-3 dormant-emitter gap).
+            AnnotationType::new("debate_collapse"),
         ];
         for ty in all.iter() {
             let a = make_annotation("s", "L0-000", ty.clone());
@@ -22394,7 +22398,7 @@ mod phase2_post_build_tests {
             assert_eq!(saved.annotation_type, *ty, "round-trip mismatch for {:?}", ty);
         }
         let listed = get_annotations(&conn, "s", "L0-000").unwrap();
-        assert_eq!(listed.len(), 15);
+        assert_eq!(listed.len(), 16);
     }
 
     #[test]
@@ -22448,12 +22452,13 @@ mod phase2_post_build_tests {
             vocab_sorted, all_sorted,
             "AnnotationType::all(conn) must equal the vocab registry's active annotation_type set"
         );
-        // Spot check: 15 genesis entries seeded (Phase 7c: 11 original +
-        // gap / hypothesis / purpose_declaration / purpose_shift).
+        // Spot check: 16 genesis entries seeded (Phase 7c: 11 original +
+        // gap / hypothesis / purpose_declaration / purpose_shift +
+        // Phase 9c-1: debate_collapse).
         assert_eq!(
             all_sorted.len(),
-            15,
-            "genesis seeds 15 annotation_type entries; length drift means the seeder lost one"
+            16,
+            "genesis seeds 16 annotation_type entries; length drift means the seeder lost one"
         );
     }
 
@@ -22558,7 +22563,13 @@ mod phase3_post_build_tests {
         let cases: &[(&str, &str, &str)] = &[
             ("annotation_reacted", "role_bound", "cascade_reacted"),
             ("debate_spawned", "role_bound", "debate_spawn"),
-            ("debate_collapsed", "role_bound", "debate_collapse"),
+            // v5 Phase 9c-1: debate_collapsed is observability-only post-
+            // 9c-1 (emitted BY starter-debate-collapse AFTER collapse). The
+            // collapse chain dispatches on the `debate_collapse`
+            // ANNOTATION TYPE via the vocab handler_chain_id override —
+            // mapping the emitted event to role_bound would re-dispatch
+            // the steward on a node that has already been collapsed.
+            ("debate_collapsed", "log_only", "debate_collapsed_log"),
             // v5 audit P3: gap_detected is observability-only post-audit.
             ("gap_detected", "log_only", "gap_detected_log"),
             ("gap_resolved", "role_bound", "oracle_gap_resolved"),
@@ -22759,10 +22770,15 @@ mod phase3_post_build_tests {
         // v5 audit P3: gap_detected intentionally excluded — it is
         // observability-only; its dispatch already fired via
         // annotation_reacted → handler_chain_id.
+        //
+        // v5 Phase 9c-1: debate_collapsed is excluded for the same reason —
+        // the dispatch already fired via annotation_reacted →
+        // handler_chain_id=starter-debate-collapse on the triggering
+        // `debate_collapse` ANNOTATION TYPE, and the emitted event is
+        // observability-only (log_only).
         let role_bound_events = &[
             "annotation_reacted",
             "debate_spawned",
-            "debate_collapsed",
             "gap_resolved",
             "purpose_shifted",
             "meta_layer_crystallized",
@@ -22959,7 +22975,14 @@ mod phase3_post_build_tests {
     fn binding_unresolved_event_captures_debug_metadata() {
         let conn = mem_conn();
         seed_slug(&conn, "pc3m");
-        // Park debate_steward so resolution fails
+        // Park debate_steward so resolution fails.
+        //
+        // v5 Phase 9c-1: switched the triggering event from debate_collapsed
+        // to debate_spawned. debate_collapsed is no longer role_bound
+        // post-9c-1 (it's observability-only now — the collapse chain
+        // dispatches on the `debate_collapse` ANNOTATION TYPE, not the
+        // emitted event). debate_spawned still role_binds to debate_steward
+        // and exercises the identical binding_unresolved code path.
         conn.execute(
             "UPDATE pyramid_role_bindings
              SET superseded_by = id
@@ -22968,7 +22991,7 @@ mod phase3_post_build_tests {
         )
         .unwrap();
         let e1 = observation_events::write_observation_event(
-            &conn, "pc3m", "internal", "debate_collapsed",
+            &conn, "pc3m", "internal", "debate_spawned",
             None, None, None, None, Some("L2-008"), Some(2), None,
         ).unwrap();
 
@@ -22985,7 +23008,7 @@ mod phase3_post_build_tests {
         assert_eq!(event_type, "binding_unresolved");
         // Metadata must contain enough to debug: role, source event type, source id
         assert!(metadata.contains("debate_steward"), "metadata: {}", metadata);
-        assert!(metadata.contains("debate_collapsed"), "metadata: {}", metadata);
+        assert!(metadata.contains("debate_spawned"), "metadata: {}", metadata);
         assert!(
             metadata.contains(&format!("\"source_event_id\":{}", e1)),
             "metadata must cite source event id: {}",
@@ -26439,16 +26462,18 @@ mod phase6c_a_post_build_tests {
     }
 
     #[test]
-    fn genesis_seeds_15_annotation_types_4_shapes_11_roles() {
+    fn genesis_seeds_16_annotation_types_4_shapes_11_roles() {
         let _lock = test_lock();
         let conn = mem_conn();
-        // Phase 7c: 15 annotation types.
+        // Phase 9c-1: 16 annotation types.
         //   11 original (observation, correction, question, friction,
         //   idea, era, transition, health_check, directory, steel_man,
         //   red_team) +
         //   4 Phase 7c verbs (gap, hypothesis, purpose_declaration,
-        //   purpose_shift) published as pure vocab entries.
-        assert_eq!(count_active(&conn, "annotation_type"), 15);
+        //   purpose_shift) published as pure vocab entries +
+        //   1 Phase 9c-1 verb (debate_collapse) closing the 8-3
+        //   `emit_debate_collapsed` dormant-emitter gap.
+        assert_eq!(count_active(&conn, "annotation_type"), 16);
         // 4 node shapes: scaffolding, debate, meta_layer, gap.
         assert_eq!(count_active(&conn, "node_shape"), 4);
         // 11 role names: 10 Phase-1 genesis roles + cascade_handler.
@@ -26719,18 +26744,17 @@ mod phase6c_a_post_build_tests {
     }
 
     #[test]
-    fn http_get_vocabulary_annotation_type_returns_15_genesis_entries() {
+    fn http_get_vocabulary_annotation_type_returns_16_genesis_entries() {
         let _lock = test_lock();
         let conn = mem_conn();
         let response =
             vocab_entries::handle_get_vocabulary(&conn, VOCAB_KIND_ANNOTATION_TYPE).unwrap();
         assert_eq!(response.vocab_kind, "annotation_type");
-        // Phase 7c: 11 original + gap / hypothesis / purpose_declaration /
-        // purpose_shift = 15.
+        // Phase 9c-1: 11 original + 4 Phase 7c verbs + debate_collapse = 16.
         assert_eq!(
             response.entries.len(),
-            15,
-            "genesis ships 15 annotation types, got {}",
+            16,
+            "genesis ships 16 annotation types, got {}",
             response.entries.len()
         );
         // Spot-check: observation is non-reactive, steel_man is reactive.
@@ -30104,9 +30128,15 @@ mod phase7c_post_build_tests {
     }
 
     // ── 7c-7.2: genesis seeds 15 annotation types after Phase 7c ───────
+    //
+    // Phase 9c-1 update: bumped to 16 after `debate_collapse` was added
+    // to close the 8-3 `emit_debate_collapsed` dormant-emitter gap. The
+    // four Phase 7c verbs (gap / hypothesis / purpose_declaration /
+    // purpose_shift) are still asserted present — the increment is
+    // inclusive.
 
     #[test]
-    fn genesis_seeds_15_annotation_types_after_phase7c() {
+    fn genesis_seeds_16_annotation_types_after_phase9c1() {
         let _lock = test_lock();
         let conn = Connection::open_in_memory().unwrap();
         init_pyramid_db(&conn).unwrap();
@@ -30119,8 +30149,8 @@ mod phase7c_post_build_tests {
         .unwrap();
         assert_eq!(
             active.len(),
-            15,
-            "Phase 7c adds 4 verbs to the 11 original — got {}",
+            16,
+            "Phase 9c-1 adds debate_collapse to the Phase 7c 15 — got {}",
             active.len()
         );
 
@@ -31485,8 +31515,8 @@ mod phase7d_post_build_tests {
             .expect("vocab_counts must be an object");
         assert_eq!(
             vc["annotation_type"].as_i64(),
-            Some(15),
-            "genesis seeds 15 annotation_types (11 original + 4 v5 from Phase 7c)"
+            Some(16),
+            "genesis seeds 16 annotation_types (11 original + 4 v5 Phase 7c verbs + debate_collapse from Phase 9c-1)"
         );
         assert_eq!(
             vc["node_shape"].as_i64(),
@@ -31511,7 +31541,7 @@ mod phase7d_post_build_tests {
         assert_eq!(event_count, 1, "reindex must chronicle per-kind counts");
         let m = meta.expect("metadata required");
         assert!(m.contains("annotation_type"), "metadata must name the kind");
-        assert!(m.contains("15"), "metadata must carry the 15-count");
+        assert!(m.contains("16"), "metadata must carry the 16-count (Phase 9c-1: +debate_collapse)");
     }
 
     // ── 7d-8.8: accretion_handler emit_accretion_written raises on missing note
@@ -34729,5 +34759,696 @@ mod phase9b_post_build_tests {
     #[allow(dead_code)]
     fn _ping_chain_dispatch() {
         let _ = chain_dispatch::is_known_mechanical_function("create_meta_layer_node");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Post-build accretion v5 Phase 9c-1: close the `debate_collapsed` dormant-
+// emitter gap.
+//
+// Coverage:
+//   1. `debate_collapse` vocab genesis entry is reactive + nominates the
+//      dedicated `starter-debate-collapse` handler chain. (No new role
+//      needed — the handler_chain_id override ships the dispatch.)
+//   2. `finalize_debate_node` transitions a Debate-shape node back to
+//      scaffolding + NULLs the shape_payload_json.
+//   3. `finalize_debate_node` emits `debate_collapsed` with the terminal
+//      debate state (concern, position labels, vote_lean) in metadata.
+//   4. `finalize_debate_node` on a non-Debate target skips loud: emits
+//      `debate_collapse_skipped` and does NOT mutate the node.
+//   5. `starter-debate-collapse` loads via chain_loader (YAML is valid,
+//      Tier 2 bundling works).
+//   6. Crown jewel — a `debate_collapse` annotation flows through
+//      process_annotation_hook → compile tick → chain_executor →
+//      Debate→Scaffolding transition + debate_collapsed event + work
+//      item CAS to applied.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod phase9c1_post_build_tests {
+    use super::*;
+    use super::post_build_test_support::test_lock;
+    use crate::pyramid::types::{
+        AnnotationType, ContentType, DebatePosition, DebateTopic, PyramidAnnotation,
+        ShapePayload, VoteLean, NODE_SHAPE_DEBATE, NODE_SHAPE_GAP, NODE_SHAPE_META_LAYER,
+    };
+    use crate::pyramid::{chain_executor, chain_loader, dadbear_compiler, observation_events, vocab_entries};
+    use rusqlite::Connection;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex as TokioMutex;
+
+    fn chains_dir_path() -> PathBuf {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        PathBuf::from(manifest).parent().unwrap().join("chains")
+    }
+
+    fn test_pyramid_state(conn: Connection) -> Arc<crate::pyramid::PyramidState> {
+        let db = Arc::new(TokioMutex::new(conn));
+        let config = crate::pyramid::llm::LlmConfig::default();
+        Arc::new(crate::pyramid::PyramidState {
+            reader: db.clone(),
+            writer: db,
+            config: Arc::new(tokio::sync::RwLock::new(config)),
+            active_build: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            data_dir: None,
+            stale_engines: Arc::new(TokioMutex::new(HashMap::new())),
+            file_watchers: Arc::new(TokioMutex::new(HashMap::new())),
+            vine_builds: Arc::new(TokioMutex::new(HashMap::new())),
+            use_chain_engine: AtomicBool::new(false),
+            use_ir_executor: AtomicBool::new(true),
+            event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
+            operational: Arc::new(crate::pyramid::OperationalConfig::default()),
+            chains_dir: chains_dir_path(),
+            remote_query_rate_limiter: Arc::new(TokioMutex::new(HashMap::new())),
+            absorption_gate: Arc::new(TokioMutex::new(crate::pyramid::AbsorptionGate::new())),
+            build_event_bus: Arc::new(crate::pyramid::event_bus::BuildEventBus::new()),
+            supabase_url: None,
+            supabase_anon_key: None,
+            csrf_secret: [0u8; 32],
+            dadbear_handle: Arc::new(TokioMutex::new(None)),
+            dadbear_supervisor_handle: Arc::new(TokioMutex::new(None)),
+            dadbear_in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            provider_registry: {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                Arc::new(crate::pyramid::provider::ProviderRegistry::new(store))
+            },
+            credential_store: {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                store
+            },
+            schema_registry: Arc::new(crate::pyramid::schema_registry::SchemaRegistry::new()),
+            cross_pyramid_router: Arc::new(
+                crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
+            ),
+            ollama_pull_cancel: Arc::new(AtomicBool::new(false)),
+            ollama_pull_in_progress: Arc::new(TokioMutex::new(None)),
+        })
+    }
+
+    fn fresh_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        conn
+    }
+
+    fn seed_debate_node(
+        conn: &Connection,
+        slug: &str,
+        node_id: &str,
+        debate: &DebateTopic,
+    ) {
+        let payload = serde_json::to_string(debate).unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version,
+                 node_shape, shape_payload_json)
+             VALUES (?1, ?2, 2, 'debate headline', 'debate distilled', '', 1, ?3, ?4)",
+            rusqlite::params![node_id, slug, NODE_SHAPE_DEBATE, payload],
+        )
+        .unwrap();
+    }
+
+    fn two_position_debate() -> DebateTopic {
+        DebateTopic {
+            concern: "Should the API use REST or gRPC?".to_string(),
+            positions: vec![
+                DebatePosition {
+                    label: "Pro-REST".to_string(),
+                    steel_manning: "REST is simpler and widely supported.".to_string(),
+                    red_teams: vec![],
+                    evidence_anchors: vec![],
+                    source_annotation_ids: vec!["annotation#10".to_string()],
+                },
+                DebatePosition {
+                    label: "Pro-gRPC".to_string(),
+                    steel_manning: "gRPC is faster and typed.".to_string(),
+                    red_teams: vec![],
+                    evidence_anchors: vec![],
+                    source_annotation_ids: vec!["annotation#11".to_string()],
+                },
+            ],
+            cross_refs: vec![],
+            vote_lean: Some(VoteLean {
+                up_count: 3,
+                down_count: 1,
+                per_position: None,
+            }),
+        }
+    }
+
+    fn save_collapse_annotation(
+        conn: &Connection,
+        slug: &str,
+        node_id: &str,
+        content: &str,
+        author: &str,
+    ) -> PyramidAnnotation {
+        let ann = PyramidAnnotation {
+            id: 0,
+            slug: slug.to_string(),
+            node_id: node_id.to_string(),
+            annotation_type: AnnotationType::new("debate_collapse"),
+            content: content.to_string(),
+            question_context: None,
+            author: author.to_string(),
+            created_at: String::new(),
+        };
+        save_annotation(conn, &ann).unwrap()
+    }
+
+    // ── 9c-1.1: vocab entry ────────────────────────────────────────────
+
+    #[test]
+    fn debate_collapse_vocab_entry_reactive_with_collapse_chain() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        let entry = vocab_entries::get_vocabulary_entry(
+            &conn,
+            vocab_entries::VOCAB_KIND_ANNOTATION_TYPE,
+            "debate_collapse",
+        )
+        .unwrap()
+        .expect("debate_collapse vocab entry must exist after genesis");
+        assert_eq!(entry.reactive, true, "debate_collapse must be reactive");
+        assert_eq!(
+            entry.creates_delta, false,
+            "debate_collapse does not create deltas"
+        );
+        assert_eq!(
+            entry.handler_chain_id.as_deref(),
+            Some("starter-debate-collapse"),
+            "handler_chain_id must nominate the dedicated starter-debate-collapse chain"
+        );
+    }
+
+    // ── 9c-1.2: finalize transitions Debate → Scaffolding + NULL payload
+
+    #[tokio::test]
+    async fn finalize_debate_node_transitions_debate_to_scaffolding() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p9c1t", &ContentType::Code, "/tmp/p9c1t").unwrap();
+        seed_debate_node(&conn, "p9c1t", "L2-DEBATE", &two_position_debate());
+        let ann = save_collapse_annotation(
+            &conn,
+            "p9c1t",
+            "L2-DEBATE",
+            "Consensus: go with gRPC.",
+            "operator",
+        );
+
+        let state_pyr = test_pyramid_state(conn);
+        let chain = chain_loader::load_chain_by_id(
+            "starter-debate-collapse",
+            &state_pyr.chains_dir,
+        )
+        .expect("starter-debate-collapse must load");
+        chain_executor::execute_chain_for_target(
+            &state_pyr,
+            &chain,
+            "p9c1t",
+            Some("L2-DEBATE"),
+            serde_json::json!({
+                "target_id": "L2-DEBATE",
+                "annotation_id": ann.id,
+                "annotation_type": "debate_collapse",
+                "step_name": "cascade_reacted",
+                "layer": 2,
+            }),
+        )
+        .await
+        .expect("starter-debate-collapse chain must succeed");
+
+        let writer = state_pyr.writer.lock().await;
+        // Node is now scaffolding with NULL payload.
+        let (shape, payload): (String, Option<String>) = writer
+            .query_row(
+                "SELECT node_shape, shape_payload_json FROM pyramid_nodes
+                  WHERE slug = 'p9c1t' AND id = 'L2-DEBATE'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(shape, "scaffolding", "node_shape must collapse to scaffolding");
+        assert!(
+            payload.is_none(),
+            "shape_payload_json must be NULL after collapse, got {:?}",
+            payload
+        );
+    }
+
+    // ── 9c-1.3: finalize emits debate_collapsed with terminal state ────
+
+    #[tokio::test]
+    async fn finalize_debate_node_emits_debate_collapsed_event() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p9c1e", &ContentType::Code, "/tmp/p9c1e").unwrap();
+        seed_debate_node(&conn, "p9c1e", "L2-DBT", &two_position_debate());
+        let ann = save_collapse_annotation(
+            &conn,
+            "p9c1e",
+            "L2-DBT",
+            "Pro side wins.",
+            "alice",
+        );
+
+        let state_pyr = test_pyramid_state(conn);
+        let chain = chain_loader::load_chain_by_id(
+            "starter-debate-collapse",
+            &state_pyr.chains_dir,
+        )
+        .unwrap();
+        chain_executor::execute_chain_for_target(
+            &state_pyr,
+            &chain,
+            "p9c1e",
+            Some("L2-DBT"),
+            serde_json::json!({
+                "target_id": "L2-DBT",
+                "annotation_id": ann.id,
+                "annotation_type": "debate_collapse",
+                "step_name": "cascade_reacted",
+                "layer": 2,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let writer = state_pyr.writer.lock().await;
+        let (count, metadata): (i64, Option<String>) = writer
+            .query_row(
+                "SELECT COUNT(*), MAX(metadata_json) FROM dadbear_observation_events
+                  WHERE slug = 'p9c1e' AND event_type = 'debate_collapsed'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "exactly one debate_collapsed event");
+        let meta: serde_json::Value =
+            serde_json::from_str(metadata.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(meta["debate_node_id"], serde_json::json!("L2-DBT"));
+        assert_eq!(meta["reason"], serde_json::json!("Pro side wins."));
+        assert_eq!(meta["positions_remaining"], serde_json::json!(2));
+        assert_eq!(meta["collapsed_by"], serde_json::json!("alice"));
+        assert_eq!(meta["annotation_id"], serde_json::json!(ann.id));
+        // Terminal state captured for audit trail.
+        assert_eq!(
+            meta["final_concern"],
+            serde_json::json!("Should the API use REST or gRPC?")
+        );
+        let labels = meta["final_position_labels"].as_array().unwrap();
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0].as_str(), Some("Pro-REST"));
+        assert_eq!(labels[1].as_str(), Some("Pro-gRPC"));
+        assert_eq!(meta["final_vote_lean"]["up_count"], serde_json::json!(3));
+        assert_eq!(meta["final_vote_lean"]["down_count"], serde_json::json!(1));
+    }
+
+    // ── 9c-1.4: non-Debate target → skip loud (chronicle + no mutation)
+
+    #[tokio::test]
+    async fn finalize_debate_node_skips_non_debate_target_loud() {
+        let _lock = test_lock();
+        // Cover all three non-Debate shapes that shouldn't be mutated:
+        // scaffolding, gap, meta_layer.
+        for (shape_marker, node_id) in [
+            ("scaffolding", "L1-SCAF"),
+            (NODE_SHAPE_GAP, "L1-GAP"),
+            (NODE_SHAPE_META_LAYER, "L2-ML"),
+        ] {
+            let conn = fresh_db();
+            let slug = format!("p9c1s-{}", shape_marker);
+            create_slug(&conn, &slug, &ContentType::Code, "/tmp/p9c1s").unwrap();
+
+            // Seed the target with the non-Debate shape we're testing.
+            // For typed shapes the payload must deserialize as the matching
+            // struct (get_node_shape is strict) — use a minimal valid payload.
+            if shape_marker == "scaffolding" {
+                conn.execute(
+                    "INSERT INTO pyramid_nodes
+                        (id, slug, depth, headline, distilled, self_prompt, build_version)
+                     VALUES (?1, ?2, 1, 'scaf headline', 'scaf distilled', '', 1)",
+                    rusqlite::params![node_id, &slug],
+                )
+                .unwrap();
+            } else if shape_marker == NODE_SHAPE_GAP {
+                let gap = crate::pyramid::types::GapTopic {
+                    concern: "placeholder gap".to_string(),
+                    description: "pd".to_string(),
+                    demand_state: "open".to_string(),
+                    candidate_resolutions: vec![],
+                    evidence_anchors: vec![],
+                    source_annotation_ids: vec![],
+                };
+                let payload = serde_json::to_string(&gap).unwrap();
+                conn.execute(
+                    "INSERT INTO pyramid_nodes
+                        (id, slug, depth, headline, distilled, self_prompt, build_version,
+                         node_shape, shape_payload_json)
+                     VALUES (?1, ?2, 1, 'h', 'd', '', 1, ?3, ?4)",
+                    rusqlite::params![node_id, &slug, shape_marker, payload],
+                )
+                .unwrap();
+            } else {
+                // meta_layer
+                let ml = crate::pyramid::types::MetaLayerTopic {
+                    purpose_question: "placeholder purpose".to_string(),
+                    parent_meta_layer_id: None,
+                    covered_substrate_nodes: vec![],
+                    topics: vec![],
+                };
+                let payload = serde_json::to_string(&ml).unwrap();
+                conn.execute(
+                    "INSERT INTO pyramid_nodes
+                        (id, slug, depth, headline, distilled, self_prompt, build_version,
+                         node_shape, shape_payload_json)
+                     VALUES (?1, ?2, 2, 'h', 'd', '', 1, ?3, ?4)",
+                    rusqlite::params![node_id, &slug, shape_marker, payload],
+                )
+                .unwrap();
+            }
+
+            let ann = save_collapse_annotation(
+                &conn,
+                &slug,
+                node_id,
+                "Attempted collapse on non-debate.",
+                "agent",
+            );
+
+            let state_pyr = test_pyramid_state(conn);
+            let chain = chain_loader::load_chain_by_id(
+                "starter-debate-collapse",
+                &state_pyr.chains_dir,
+            )
+            .unwrap();
+            chain_executor::execute_chain_for_target(
+                &state_pyr,
+                &chain,
+                &slug,
+                Some(node_id),
+                serde_json::json!({
+                    "target_id": node_id,
+                    "annotation_id": ann.id,
+                    "annotation_type": "debate_collapse",
+                    "step_name": "cascade_reacted",
+                    "layer": 1,
+                }),
+            )
+            .await
+            .expect("chain must succeed even on skip path (non-destructive)");
+
+            let writer = state_pyr.writer.lock().await;
+
+            // Target shape must be unchanged (not collapsed).
+            let shape_after: String = writer
+                .query_row(
+                    "SELECT COALESCE(node_shape, 'scaffolding') FROM pyramid_nodes
+                      WHERE slug = ?1 AND id = ?2",
+                    rusqlite::params![&slug, node_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                shape_after, shape_marker,
+                "non-Debate target '{}' must NOT be mutated by finalize",
+                shape_marker
+            );
+
+            // debate_collapse_skipped chronicle event must have fired.
+            let skipped: i64 = writer
+                .query_row(
+                    "SELECT COUNT(*) FROM dadbear_observation_events
+                      WHERE slug = ?1 AND event_type = 'debate_collapse_skipped'",
+                    rusqlite::params![&slug],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                skipped >= 1,
+                "debate_collapse_skipped must fire on non-Debate shape '{}' per feedback_loud_deferrals",
+                shape_marker
+            );
+
+            // No debate_collapsed event (skip path must not emit the
+            // terminal event — that would be a false audit trail).
+            let collapsed: i64 = writer
+                .query_row(
+                    "SELECT COUNT(*) FROM dadbear_observation_events
+                      WHERE slug = ?1 AND event_type = 'debate_collapsed'",
+                    rusqlite::params![&slug],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                collapsed, 0,
+                "debate_collapsed must NOT fire on skip path for shape '{}'",
+                shape_marker
+            );
+        }
+    }
+
+    // ── 9c-1.5: chain_loader structural check ──────────────────────────
+
+    #[test]
+    fn debate_collapse_chain_loads_via_chain_loader() {
+        let chains_dir = chains_dir_path();
+        let loaded = chain_loader::load_chain_by_id("starter-debate-collapse", &chains_dir)
+            .expect("starter-debate-collapse must load");
+        assert_eq!(loaded.id, "starter-debate-collapse");
+        assert!(!loaded.steps.is_empty());
+        for step in &loaded.steps {
+            assert!(step.mechanical, "Phase 9c-1 ships mechanical-only");
+            assert!(step.rust_function.is_some());
+        }
+        let names: Vec<&str> = loaded.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["emit_invoked", "load_context", "finalize_debate", "complete"],
+            "canonical 4-step mechanical graph"
+        );
+        let fns: Vec<Option<&str>> = loaded
+            .steps
+            .iter()
+            .map(|s| s.rust_function.as_deref())
+            .collect();
+        assert_eq!(
+            fns,
+            vec![
+                Some("emit_debate_collapse_invoked"),
+                Some("load_collapse_context"),
+                Some("finalize_debate_node"),
+                Some("log_and_complete"),
+            ],
+            "each step must bind the expected mechanical function"
+        );
+    }
+
+    // ── 9c-1.6 (crown jewel): end-to-end annotation → node transition ──
+
+    #[tokio::test]
+    async fn debate_collapse_annotation_flows_to_node_transition_end_to_end() {
+        // Full path: save_annotation → process_annotation_hook →
+        // annotation_reacted emitted with handler_chain_id=starter-debate-collapse
+        // → compile tick resolves the work item → chain_executor collapses
+        // the node (debate → scaffolding + NULL payload) + emits
+        // debate_collapsed → work item CAS to applied.
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p9c1cj", &ContentType::Code, "/tmp/p9c1cj").unwrap();
+        seed_debate_node(&conn, "p9c1cj", "L2-CROWN", &two_position_debate());
+
+        let state_pyr = test_pyramid_state(conn);
+
+        // Save the collapse annotation via the canonical write path, then
+        // run the hook (Phase 6c-B logic — emits annotation_reacted with the
+        // vocab handler_chain_id stamped).
+        let ann_to_save = PyramidAnnotation {
+            id: 0,
+            slug: "p9c1cj".to_string(),
+            node_id: "L2-CROWN".to_string(),
+            annotation_type: AnnotationType::new("debate_collapse"),
+            content: "Consensus reached on Pro-REST.".to_string(),
+            question_context: None,
+            author: "user".to_string(),
+            created_at: String::new(),
+        };
+        let saved = {
+            let writer = state_pyr.writer.lock().await;
+            save_annotation(&writer, &ann_to_save).unwrap()
+        };
+
+        // Run the annotation hook — this is what HTTP + MCP invoke in prod.
+        let base_config = state_pyr.config.read().await.clone();
+        let ops = crate::pyramid::OperationalConfig::default();
+        crate::pyramid::routes::test_hooks::run_process_annotation_hook(
+            &state_pyr.reader,
+            &state_pyr.writer,
+            "p9c1cj",
+            &saved,
+            &base_config,
+            "",
+            &ops,
+        )
+        .await
+        .expect("annotation hook must succeed");
+
+        // annotation_reacted stamped the collapse chain as handler.
+        {
+            let reader = state_pyr.reader.lock().await;
+            let (count, meta): (i64, Option<String>) = reader
+                .query_row(
+                    "SELECT COUNT(*), MAX(metadata_json) FROM dadbear_observation_events
+                      WHERE slug = 'p9c1cj' AND event_type = 'annotation_reacted'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "exactly one annotation_reacted");
+            let m = meta.expect("metadata required");
+            assert!(
+                m.contains("starter-debate-collapse"),
+                "handler_chain_id must be stamped: {m}"
+            );
+        }
+
+        // Compile tick routes annotation_reacted → work item with
+        // resolved_chain_id=starter-debate-collapse.
+        {
+            let writer = state_pyr.writer.lock().await;
+            dadbear_compiler::run_compilation_for_slug(&writer, "p9c1cj", None, None).unwrap();
+        }
+        let wi_id: String;
+        let resolved_chain: Option<String>;
+        {
+            let reader = state_pyr.reader.lock().await;
+            let row: (String, Option<String>) = reader
+                .query_row(
+                    "SELECT id, resolved_chain_id FROM dadbear_work_items
+                      WHERE slug = 'p9c1cj' AND step_name = 'cascade_reacted'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("work item must exist");
+            wi_id = row.0;
+            resolved_chain = row.1;
+        }
+        assert_eq!(
+            resolved_chain.as_deref(),
+            Some("starter-debate-collapse"),
+            "vocab handler_chain_id must route to starter-debate-collapse"
+        );
+
+        // Execute the chain.
+        let chain = chain_loader::load_chain_by_id(
+            "starter-debate-collapse",
+            &state_pyr.chains_dir,
+        )
+        .unwrap();
+        chain_executor::execute_chain_for_target(
+            &state_pyr,
+            &chain,
+            "p9c1cj",
+            Some("L2-CROWN"),
+            serde_json::json!({
+                "work_item_id": wi_id,
+                "target_id": "L2-CROWN",
+                "step_name": "cascade_reacted",
+                "layer": 2,
+            }),
+        )
+        .await
+        .expect("starter-debate-collapse chain must succeed end-to-end");
+
+        let writer = state_pyr.writer.lock().await;
+
+        // Target node transitioned: scaffolding + NULL payload.
+        let (shape, payload): (String, Option<String>) = writer
+            .query_row(
+                "SELECT node_shape, shape_payload_json FROM pyramid_nodes
+                  WHERE slug = 'p9c1cj' AND id = 'L2-CROWN'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(shape, "scaffolding", "node must be back to scaffolding");
+        assert!(payload.is_none(), "shape_payload_json must be NULL");
+
+        // debate_collapsed observation event carries correct metadata.
+        let (collapsed_count, collapsed_meta): (i64, Option<String>) = writer
+            .query_row(
+                "SELECT COUNT(*), MAX(metadata_json) FROM dadbear_observation_events
+                  WHERE slug = 'p9c1cj' AND event_type = 'debate_collapsed'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(collapsed_count, 1, "exactly one debate_collapsed event");
+        let m: serde_json::Value =
+            serde_json::from_str(collapsed_meta.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(m["debate_node_id"], serde_json::json!("L2-CROWN"));
+        assert_eq!(
+            m["reason"],
+            serde_json::json!("Consensus reached on Pro-REST.")
+        );
+        assert_eq!(m["collapsed_by"], serde_json::json!("user"));
+        assert_eq!(m["positions_remaining"], serde_json::json!(2));
+        let labels = m["final_position_labels"].as_array().unwrap();
+        assert_eq!(labels.len(), 2);
+
+        // Also emitted: debate_collapse_invoked for chronicle observability.
+        let invoked: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE slug = 'p9c1cj' AND event_type = 'debate_collapse_invoked'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(invoked >= 1, "debate_collapse_invoked must fire for chronicle");
+
+        // CAS the work item to applied to mirror the supervisor arm.
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let rows = writer
+            .execute(
+                "UPDATE dadbear_work_items
+                    SET state = 'applied', state_changed_at = ?1, applied_at = ?1
+                  WHERE id = ?2 AND state = 'compiled'",
+                rusqlite::params![now, wi_id],
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "applied CAS must succeed");
+        let final_state: String = writer
+            .query_row(
+                "SELECT state FROM dadbear_work_items WHERE id = ?1",
+                rusqlite::params![wi_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(final_state, "applied");
+    }
+
+    // Silence unused-import warning for observation_events; imported for
+    // future helper use and parity with sibling test modules.
+    #[allow(dead_code)]
+    fn _ping_observation_events() {
+        // Touch the canonical emitter so its symbol is always linked when
+        // this test module is compiled.
+        let _: fn(
+            &Connection, &str, &str, Option<i64>, &str, usize, &str,
+        ) -> anyhow::Result<i64> = observation_events::emit_debate_collapsed;
     }
 }
