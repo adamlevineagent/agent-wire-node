@@ -22343,7 +22343,8 @@ mod phase3_post_build_tests {
             ("annotation_reacted", "role_bound", "cascade_reacted"),
             ("debate_spawned", "role_bound", "debate_spawn"),
             ("debate_collapsed", "role_bound", "debate_collapse"),
-            ("gap_detected", "role_bound", "gap_dispatch"),
+            // v5 audit P3: gap_detected is observability-only post-audit.
+            ("gap_detected", "log_only", "gap_detected_log"),
             ("gap_resolved", "role_bound", "oracle_gap_resolved"),
             ("purpose_shifted", "role_bound", "oracle_purpose_shift"),
             ("meta_layer_crystallized", "role_bound", "synthesize_meta_layer"),
@@ -22400,11 +22401,13 @@ mod phase3_post_build_tests {
         .unwrap();
         let genesis: std::collections::HashSet<String> =
             genesis_entries.iter().map(|e| e.name.clone()).collect();
+        // v5 audit P3: gap_detected intentionally excluded — it is
+        // observability-only; its dispatch already fired via
+        // annotation_reacted → handler_chain_id.
         let role_bound_events = &[
             "annotation_reacted",
             "debate_spawned",
             "debate_collapsed",
-            "gap_detected",
             "gap_resolved",
             "purpose_shifted",
             "meta_layer_crystallized",
@@ -22786,18 +22789,24 @@ mod phase3_post_build_tests {
     // 3 and 7 hold (unresolved bindings). 1,2,4,5,6,8,9,10 compile
     // successfully. Correct cursor: 2 (largest compiled id below the
     // smallest held id).
+    //
+    // v5 audit P3: gap_detected is no longer role_bound — it is log_only,
+    // so it cannot fail binding resolution. Replaced e7's gap_detected
+    // with a second debate_spawned on a different target so the
+    // multi-hold contract still exercises two independent unresolved
+    // role_bound events.
 
     #[test]
     fn cursor_gating_holds_at_smallest_held_id_when_multiple_events_hold() {
         let conn = mem_conn();
         seed_slug(&conn, "pc3mh");
-        // Park both debate_steward and gap_dispatcher so TWO different
-        // role_bound event types fail resolution independently.
+        // Park debate_steward so role_bound resolution fails for both
+        // debate_spawned events (e3, e7) independently.
         conn.execute(
             "UPDATE pyramid_role_bindings
              SET superseded_by = id
              WHERE slug = 'pc3mh'
-               AND role_name IN ('debate_steward', 'gap_dispatcher')",
+               AND role_name = 'debate_steward'",
             [],
         )
         .unwrap();
@@ -22821,7 +22830,7 @@ mod phase3_post_build_tests {
             &conn, "pc3mh", "watcher", "file_created", None, Some("/tmp/6"), None, None, None, None, None,
         ).unwrap();
         let _e7 = observation_events::write_observation_event(
-            &conn, "pc3mh", "internal", "gap_detected", None, None, None, None, Some("L2-B"), Some(2), None,
+            &conn, "pc3mh", "internal", "debate_spawned", None, None, None, None, Some("L2-B"), Some(2), None,
         ).unwrap();
         let _e8 = observation_events::write_observation_event(
             &conn, "pc3mh", "watcher", "file_created", None, Some("/tmp/8"), None, None, None, None, None,

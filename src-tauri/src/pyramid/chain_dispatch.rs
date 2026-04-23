@@ -2571,17 +2571,14 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
         // re-compile of the same annotation will find the existing anchor
         // and fall to no_op without re-emitting `gap_detected`.
         //
-        // role_for_event(gap_detected) is intentionally left unchanged
-        // (returns Some("gap_dispatcher") today). The chain's gap_detected
-        // emission happens AFTER the Gap node is materialized; if the
-        // compiler re-routes it to gap_dispatcher, the second pass finds
-        // the target already Gap-shaped AND no annotation context in the
-        // compiled work item, and the arm falls through to a no_op —
-        // wasted cycle but no data corruption. The `feedback_loud_deferrals`
-        // compromise: leaving the role_for_event arm intact keeps the
-        // compiler's event-map symmetrical (every role-emitted event has
-        // an explicit role mapping, documented at the mapping site), and
-        // the wasted cycle is logged at info! level so operators see it.
+        // v5 audit P3: role_for_event(gap_detected) returns None — the
+        // chain's gap_detected emission is observability-only. The actual
+        // dispatch has already fired via annotation_reacted →
+        // handler_chain_id (6c-B flip), so there is nothing more to do
+        // than write the chronicle event. `gap_dispatcher_skipped` may
+        // still fire in the rare case of a direct chain invocation that
+        // carries no annotation_id; when that happens it is the loud
+        // deferral, not the norm.
         // See project_auto_stale_system.md for the broader map.
         "emit_dispatcher_invoked" => {
             // Chronicle-only observability event — one row in
@@ -2850,19 +2847,21 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
             let annotation_obj = input.get("annotation").cloned().unwrap_or(Value::Null);
 
             if annotation_id.is_none() {
-                // feedback_loud_deferrals: the "no annotation_id" path is the
-                // gap_detected retrigger safety net — we don't want to silently
-                // drop it to an info! log. Emit a `gap_dispatcher_skipped`
-                // chronicle event so an operator sees it in the same place they
-                // see all other chain activity. Info log stays for stream-grep.
+                // feedback_loud_deferrals: the "no annotation_id" path fires
+                // when something invokes the gap_dispatcher chain directly
+                // (outside the annotation_reacted → handler_chain_id path).
+                // Post-v5 audit, this is no longer the gap_detected retrigger
+                // — `role_for_event("gap_detected")` returns None — so if
+                // this arm fires in production it is a real anomaly, not a
+                // cheap expected no_op. Emit `gap_dispatcher_skipped` loudly.
                 info!(
-                    "[mechanical] materialize_gap_node slug={} target={} → no_op (no annotation_id in input — likely gap_detected retrigger)",
+                    "[mechanical] materialize_gap_node slug={} target={} → no_op (no annotation_id in input — direct chain invocation without annotation context)",
                     ctx.slug, target_node_id
                 );
                 let skip_meta = serde_json::json!({
                     "target_node_id": target_node_id,
                     "reason": "no_annotation_id",
-                    "detail": "work item carried no annotation_id (likely gap_detected retrigger via role_for_event mapping). Idempotency: second dispatch is a cheap no_op.",
+                    "detail": "work item carried no annotation_id. After v5 audit P3, role_for_event(gap_detected) returns None so this is not a retrigger cycle — investigate why the chain was dispatched without annotation context.",
                 })
                 .to_string();
                 let conn_guard = ctx.db_writer.lock().await;

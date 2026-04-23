@@ -150,7 +150,12 @@ pub(crate) fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, 
         "annotation_reacted" => Some(("role_bound", "cascade_reacted", "stale_remote")),
         "debate_spawned" => Some(("role_bound", "debate_spawn", "stale_remote")),
         "debate_collapsed" => Some(("role_bound", "debate_collapse", "stale_remote")),
-        "gap_detected" => Some(("role_bound", "gap_dispatch", "stale_remote")),
+        // v5 audit P3: gap_detected is observability-only. The actual
+        // dispatch already fired via annotation_reacted → handler_chain_id
+        // (6c-B flip), so compiling a second work item for gap_detected
+        // was a wasted compile+dispatch+no_op cycle. Now log_only —
+        // chronicle entry stays, no work item.
+        "gap_detected" => Some(("log_only", "gap_detected_log", "stale_remote")),
         "gap_resolved" => Some(("role_bound", "oracle_gap_resolved", "stale_remote")),
         "purpose_shifted" => Some(("role_bound", "oracle_purpose_shift", "stale_remote")),
         "meta_layer_crystallized" => Some(("role_bound", "synthesize_meta_layer", "stale_remote")),
@@ -767,44 +772,44 @@ pub fn compile_observations(
 /// Returns None if the event_type is not a role_bound event (caller should
 /// handle via map_event_to_primitive's primitive string instead).
 ///
-/// Phase 7c decision on `gap_detected → gap_dispatcher`:
+/// Post-build accretion v5 audit (P3) decision on `gap_detected`:
 ///   The `gap` annotation type's vocab entry (Phase 7c addition) nominates
 ///   `starter-gap-dispatcher` as its handler_chain_id, so the FIRST
 ///   dispatch on a `gap` annotation already routes via the
-///   annotation_reacted → handler_chain_id path (6c-B flip) — not via this
-///   map. The `gap_detected` event is emitted BY the gap_dispatcher chain
-///   AFTER the Gap node is materialized; if the compiler re-routes it
-///   here, a second gap_dispatcher work item gets compiled. That second
-///   run finds:
-///     (a) the target already Gap-shaped, and
-///     (b) no annotation_id in the input (gap_detected events carry
-///         target_node_id only, no annotation context).
-///   `materialize_gap_node` handles (b) with a loud no_op (logged,
-///   returning {action: "no_op"}). So the cost is one wasted work item
-///   per gap-shape upgrade; the correctness property holds (no
-///   double-writes, no infinite recursion — Phase 7a's debate_spawned
-///   arm relies on the same idempotency guard via the semantic-path-id
-///   dedup in `has_active_work_item`).
+///   annotation_reacted → handler_chain_id path (6c-B flip) — not via
+///   this map. The `gap_detected` event is emitted BY the gap_dispatcher
+///   chain AFTER the Gap node is materialized, purely as an
+///   observability/chronicle marker.
 ///
-///   This is the alternative to option 1 (returning None here for
-///   gap_detected). We chose option 2 because:
-///     - keeps event-map symmetry: every role-emitted event has an
-///       explicit role mapping, documented at the mapping site
-///     - idempotency is already load-bearing for Phase 7a's twin
-///       debate_spawned / annotation_reacted routing; extending the
-///       same pattern to Phase 7c minimizes cross-phase cognitive load
-///     - Phase 8 may add LLM-driven gap enrichment that WANTS a second
-///       dispatch on gap_detected (to kick off candidate generation);
-///       removing the mapping here would be a deferred-work footgun.
+///   Earlier Phase 7c kept `gap_detected → gap_dispatcher` for
+///   "event-map symmetry". The audit found that this creates a wasted
+///   compile+dispatch+no_op cycle on every gap-shape upgrade: the second
+///   dispatch finds the target already Gap-shaped AND no annotation_id
+///   in the input, so `materialize_gap_node` emits
+///   `gap_dispatcher_skipped` and the work item CAS-completes. Result:
+///   one spurious chronicle event + one wasted dispatch per gap, and an
+///   annotation_reacted → gap_detected → gap_dispatcher cycle where the
+///   second step is entirely redundant with the first.
+///
+///   Fix: map `gap_detected` to None (log_only). The chronicle event
+///   still fires from the originating chain (audit trail preserved);
+///   the second dispatch is removed entirely. If a caller directly
+///   invokes the gap_dispatcher chain outside the annotation_reacted
+///   path, `gap_dispatcher_skipped` can still fire — but it shouldn't
+///   be the norm, and if it becomes one the loud deferral is visible.
+///   Phase 8's LLM-driven gap enrichment (should it want reentry on
+///   gap_detected) will route via a chain-level subscription, not via
+///   this event-to-role map — the map is for role_bound dispatch, not
+///   for every event that needs an effect.
 pub(crate) fn role_for_event(event_type: &str) -> Option<&'static str> {
     match event_type {
         // annotation_written + annotation_superseded stay mapped to re_distill
         // in Phase 3 — Phase 8 flips them to role_bound with cascade_handler.
         "annotation_reacted" => Some("cascade_handler"),
         "debate_spawned" | "debate_collapsed" => Some("debate_steward"),
-        // Kept per Phase 7c decision above — gap_dispatcher is idempotent
-        // on the gap_detected retrigger (see materialize_gap_node).
-        "gap_detected" => Some("gap_dispatcher"),
+        // v5 audit P3: gap_detected is observability-only — the actual
+        // dispatch already fired via annotation_reacted → handler_chain_id.
+        "gap_detected" => None,
         "gap_resolved" | "purpose_shifted" => Some("meta_layer_oracle"),
         "meta_layer_crystallized" => Some("synthesizer"),
         _ => None,
