@@ -316,6 +316,11 @@ pub fn ensure_default_chains(
         chains_dir.join("prompts").join("planner"),
         // Phase 16: topical vine prompts for vine-of-vines composition.
         chains_dir.join("prompts").join("vine"),
+        // Post-build accretion v5 Phase 6: starter-chain LLM prompts
+        // (judge_cascade_relevance + future reconciler prompts) live
+        // here. chain_loader's `$prompts/starter/...` resolution looks
+        // for them by this path both in dev and release.
+        chains_dir.join("prompts").join("starter"),
     ];
 
     for dir in &dirs_to_create {
@@ -414,6 +419,26 @@ pub fn ensure_default_chains(
             std::fs::write(&path, content)
                 .with_context(|| format!("failed to write vine prompt: {}", path.display()))?;
             tracing::info!(path = %path.display(), "bootstrapped bundled vine prompt");
+        }
+    }
+
+    // Post-build accretion v5 Phase 6: bundle starter-chain prompts for
+    // standalone release builds so role_bound dispatch can resolve
+    // `$prompts/starter/...` references without a source tree.
+    // starter-cascade-judge-gated's judge step reads this file at chain
+    // load time via chain_loader::resolve_prompt_refs.
+    let starter_prompts: &[(&str, &str)] = &[
+        (
+            "judge_cascade_relevance.md",
+            include_str!("../../../chains/prompts/starter/judge_cascade_relevance.md"),
+        ),
+    ];
+    for (filename, content) in starter_prompts {
+        let path = chains_dir.join("prompts").join("starter").join(filename);
+        if !path.exists() {
+            std::fs::write(&path, content)
+                .with_context(|| format!("failed to write starter prompt: {}", path.display()))?;
+            tracing::info!(path = %path.display(), "bootstrapped bundled starter prompt");
         }
     }
 

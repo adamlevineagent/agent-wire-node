@@ -23562,34 +23562,42 @@ mod phase5_post_build_tests {
         assert!(out["event_id"].is_i64(), "event_id must be an integer: {out}");
     }
 
-    // ── 2. LLM steps in starter chains are rejected for Phase 6 ─────────────
+    // ── 2. Orchestration primitives are rejected by the starter runner ──────
+    //
+    // Phase 6 lifts the mechanical-only restriction: LLM primitives
+    // (classify/synthesize/…) dispatch through chain_dispatch. What
+    // remains unsupported is orchestration + recipe primitives —
+    // container/split/loop/gate/recursive_decompose/build_lifecycle/
+    // evidence_loop/cross_build_input/process_gaps — because those
+    // need the full ChainContext the legacy executor builds. Keep a
+    // loud-error guard so a mis-authored starter chain surfaces
+    // instead of silently no-opping.
 
     #[tokio::test]
-    async fn execute_chain_for_target_rejects_llm_steps_for_now() {
+    async fn execute_chain_for_target_rejects_orchestration_primitives() {
         let conn = Connection::open_in_memory().unwrap();
         init_pyramid_db(&conn).unwrap();
         create_slug(&conn, "p5b", &ContentType::Code, "/tmp/p5b").unwrap();
         let state = test_pyramid_state(conn);
 
-        // A pure LLM step — mechanical=false, primitive=classify.
+        // A container/loop/gate/etc. step is out of scope for the
+        // starter runner. Use "loop" because it is short + unambiguous.
         let step = ChainStep {
-            name: "llm_step".into(),
-            primitive: "classify".into(),
-            instruction: Some("Classify something".into()),
-            mechanical: false,
+            name: "orch_step".into(),
+            primitive: "loop".into(),
             ..Default::default()
         };
-        let chain = minimal_chain_with_steps("test-llm-step", vec![step]);
+        let chain = minimal_chain_with_steps("test-orch-step", vec![step]);
 
         let err = chain_executor::execute_chain_for_target(
             &state, &chain, "p5b", None, serde_json::json!({}),
         )
         .await
-        .expect_err("LLM step must be rejected in Phase 5");
+        .expect_err("orchestration primitive must be rejected in starter runner");
         let msg = err.to_string() + " " + &err.root_cause().to_string();
         assert!(
-            msg.contains("Phase 6"),
-            "error must mention Phase 6 so operators know LLM is pending: {msg}"
+            msg.contains("execute_chain_from") || msg.contains("orchestration") || msg.contains("starter chains"),
+            "error must point operators at the full chain executor: {msg}"
         );
     }
 
@@ -23607,18 +23615,24 @@ mod phase5_post_build_tests {
                 .unwrap_or_else(|e| panic!("starter chain '{}' must load: {}", id, e));
             assert_eq!(loaded.id, id);
             assert!(!loaded.steps.is_empty(), "{} must have at least one step", id);
-            // Every step in Phase 5 starter chains is mechanical.
+            // Phase 6: starter chains may mix mechanical + LLM steps.
+            // Mechanical steps still need a rust_function; LLM steps
+            // need either instruction or instruction_from (the
+            // chain-engine validator covers this at load time).
             for step in &loaded.steps {
-                assert!(
-                    step.mechanical,
-                    "Phase 5 starter chain '{}' step '{}' must be mechanical",
-                    id, step.name
-                );
-                assert!(
-                    step.rust_function.is_some(),
-                    "Phase 5 starter chain '{}' step '{}' must name a rust_function",
-                    id, step.name
-                );
+                if step.mechanical {
+                    assert!(
+                        step.rust_function.is_some(),
+                        "starter chain '{}' mechanical step '{}' must name a rust_function",
+                        id, step.name
+                    );
+                } else {
+                    assert!(
+                        step.instruction.is_some() || step.instruction_from.is_some(),
+                        "starter chain '{}' LLM step '{}' must specify instruction or instruction_from",
+                        id, step.name
+                    );
+                }
             }
         }
     }
@@ -24118,3 +24132,753 @@ mod phase5_post_build_tests {
         );
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 6 (post-build accretion v5): LLM-step support in the starter-chain
+// runner + judge-gated cascade chain. Tests verify:
+//
+//   1. execute_chain_for_target dispatches an LLM step to a mocked provider
+//      and threads the parsed output to the next step.
+//   2. Orchestration / recipe primitives still raise loudly.
+//   3. starter-cascade-judge-gated routes "redistill" → queues a re_distill
+//      work item. (end-to-end proof of 6-A through 6-D.)
+//   4. starter-cascade-judge-gated routes "skip" → leaves the re_distill
+//      step un-invoked.
+//   5. The upgraded YAML parses with the expected 3-step shape.
+//   6. `when:` guard prevents the queue step when the prior decision is
+//      "skip".
+//
+// LLM mocking: the legacy `build_call_provider` fallback path hardcodes
+// `https://openrouter.ai/api/v1`. Tests therefore attach a
+// ProviderRegistry carrying a single `openrouter` provider whose
+// `base_url` is the mockito server URL — same pattern llm.rs already
+// uses for the walker regression tests. No real HTTP happens.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod phase6_post_build_tests {
+    use super::*;
+    use crate::pyramid::chain_engine::{ChainDefaults, ChainDefinition, ChainStep};
+    use crate::pyramid::{chain_executor, chain_loader};
+    use crate::pyramid::types::ContentType;
+    use rusqlite::Connection;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+
+    fn chains_dir_path() -> PathBuf {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        PathBuf::from(manifest).parent().unwrap().join("chains")
+    }
+
+    /// Build a default PyramidState that uses `config` as its LlmConfig.
+    /// Separate from phase5's test_pyramid_state so we can inject an LLM
+    /// config with a mocked provider registry attached.
+    fn pyramid_state_with_llm_config(
+        conn: Connection,
+        config: crate::pyramid::llm::LlmConfig,
+    ) -> crate::pyramid::PyramidState {
+        let db = Arc::new(Mutex::new(conn));
+        crate::pyramid::PyramidState {
+            reader: db.clone(),
+            writer: db,
+            config: Arc::new(tokio::sync::RwLock::new(config)),
+            active_build: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            data_dir: None,
+            stale_engines: Arc::new(Mutex::new(HashMap::new())),
+            file_watchers: Arc::new(Mutex::new(HashMap::new())),
+            vine_builds: Arc::new(Mutex::new(HashMap::new())),
+            use_chain_engine: AtomicBool::new(false),
+            use_ir_executor: AtomicBool::new(true),
+            event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
+            operational: Arc::new(crate::pyramid::OperationalConfig::default()),
+            chains_dir: chains_dir_path(),
+            remote_query_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            absorption_gate: Arc::new(Mutex::new(crate::pyramid::AbsorptionGate::new())),
+            build_event_bus: Arc::new(crate::pyramid::event_bus::BuildEventBus::new()),
+            supabase_url: None,
+            supabase_anon_key: None,
+            csrf_secret: [0u8; 32],
+            dadbear_handle: Arc::new(Mutex::new(None)),
+            dadbear_supervisor_handle: Arc::new(Mutex::new(None)),
+            dadbear_in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            provider_registry: {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                Arc::new(crate::pyramid::provider::ProviderRegistry::new(store))
+            },
+            credential_store: {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                store
+            },
+            schema_registry: Arc::new(crate::pyramid::schema_registry::SchemaRegistry::new()),
+            cross_pyramid_router: Arc::new(
+                crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
+            ),
+            ollama_pull_cancel: Arc::new(AtomicBool::new(false)),
+            ollama_pull_in_progress: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Wire an LlmConfig that routes every call at a mockito HTTP server.
+    /// The server must mock `POST /chat/completions` with a JSON OpenRouter
+    /// envelope (`choices[0].message.content`) whose content is whatever
+    /// the test wants the judge step to produce.
+    async fn mocked_llm_config(base_url: String) -> crate::pyramid::llm::LlmConfig {
+        use crate::pyramid::credentials::CredentialStore;
+        use crate::pyramid::dispatch_policy::{
+            BuildCoordinationConfig, DispatchPolicy, EscalationConfig, MatchConfig,
+            ProviderPoolConfig, RouteEntry, RoutingRule,
+        };
+        use crate::pyramid::provider::{Provider, ProviderRegistry, ProviderType};
+
+        // Credential store with a throwaway api key — the openrouter
+        // provider requires one to satisfy auth, but mockito ignores.
+        let cred_tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(CredentialStore::load(cred_tmp.path()).unwrap());
+        store.set("P6_KEY", "sk-or-test-p6").unwrap();
+        std::mem::forget(cred_tmp);
+
+        // Registry with a single openrouter-style provider pointing at
+        // mockito. The provider id `openrouter` + provider_type
+        // `Openrouter` match the production convention and the legacy
+        // build_call_provider fallback.
+        let reg_conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_pyramid_db(&reg_conn).unwrap();
+        let registry = Arc::new(ProviderRegistry::new(store));
+        registry
+            .save_provider(
+                &reg_conn,
+                Provider {
+                    id: "openrouter".into(),
+                    display_name: "OpenRouter (phase6 mock)".into(),
+                    provider_type: ProviderType::Openrouter,
+                    base_url,
+                    api_key_ref: Some("P6_KEY".into()),
+                    auto_detect_context: false,
+                    supports_broadcast: false,
+                    broadcast_config_json: None,
+                    config_json: "{}".into(),
+                    enabled: true,
+                },
+            )
+            .unwrap();
+
+        // Dispatch policy with a single route entry so the walker picks
+        // `openrouter` and goes straight to HTTP (mocked).
+        let mut pool_configs = std::collections::BTreeMap::new();
+        pool_configs.insert(
+            "openrouter".into(),
+            ProviderPoolConfig {
+                concurrency: 1,
+                rate_limit: None,
+            },
+        );
+        let policy = Arc::new(DispatchPolicy {
+            rules: vec![RoutingRule {
+                name: "phase6_mock".into(),
+                match_config: MatchConfig {
+                    work_type: None,
+                    min_depth: None,
+                    step_pattern: None,
+                },
+                route_to: vec![RouteEntry {
+                    provider_id: "openrouter".into(),
+                    model_id: Some("openai/gpt-4o-mini".into()),
+                    tier_name: None,
+                    is_local: false,
+                    max_budget_credits: None,
+                }],
+                bypass_pool: false,
+                sequential: false,
+            }],
+            escalation: EscalationConfig::default(),
+            build_coordination: BuildCoordinationConfig::default(),
+            pool_configs,
+            max_batch_cost_usd: None,
+            max_daily_cost_usd: None,
+        });
+        let pools = Arc::new(
+            crate::pyramid::provider_pools::ProviderPools::new(policy.as_ref()),
+        );
+
+        crate::pyramid::llm::LlmConfig {
+            api_key: "sk-or-test-p6".into(),
+            auth_token: String::new(),
+            primary_model: "openai/gpt-4o-mini".into(),
+            fallback_model_1: "openai/gpt-4o-mini".into(),
+            fallback_model_2: "openai/gpt-4o-mini".into(),
+            provider_registry: Some(registry),
+            dispatch_policy: Some(policy),
+            provider_pools: Some(pools),
+            max_retries: 1,
+            retry_base_sleep_secs: 0,
+            ..Default::default()
+        }
+    }
+
+    /// Build a minimal OpenRouter-shape chat/completions response body
+    /// that returns `content` as the assistant message.
+    fn openrouter_body(content: &str) -> String {
+        let escaped = serde_json::to_string(content).unwrap();
+        format!(
+            r#"{{
+                "id":"resp-p6",
+                "model":"openai/gpt-4o-mini",
+                "choices":[{{
+                    "index":0,
+                    "message":{{"role":"assistant","content":{escaped}}},
+                    "finish_reason":"stop"
+                }}],
+                "usage":{{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}
+            }}"#
+        )
+    }
+
+    fn minimal_chain_with_steps(id: &str, steps: Vec<ChainStep>) -> ChainDefinition {
+        ChainDefinition {
+            schema_version: 1,
+            id: id.to_string(),
+            name: format!("Test {}", id),
+            description: "Phase 6 test chain".to_string(),
+            content_type: "code".to_string(),
+            version: "0.0.1".to_string(),
+            author: "phase6-test".to_string(),
+            defaults: ChainDefaults {
+                model_tier: "mid".to_string(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".to_string(),
+            },
+            steps,
+            post_build: vec![],
+            audience: Default::default(),
+        }
+    }
+
+    fn mech_step(name: &str, rust_fn: &str) -> ChainStep {
+        ChainStep {
+            name: name.to_string(),
+            primitive: "custom".to_string(),
+            mechanical: true,
+            rust_function: Some(rust_fn.to_string()),
+            ..Default::default()
+        }
+    }
+
+    // ── 1. execute_chain_for_target runs an LLM step with a mocked provider
+    //       and threads the parsed JSON output to the next step.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn execute_chain_for_target_runs_llm_step_with_mock() {
+        let mut server = mockito::Server::new_async().await;
+
+        // Mock returns a JSON object with a `decision` field. The chain
+        // runner should parse this into a Value and pass it to the next
+        // step as its input.
+        let mock_content = r#"{"decision":"redistill","reasoning":"content shift is substantive"}"#;
+        let _m = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openrouter_body(mock_content))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p6llm", &ContentType::Code, "/tmp/p6llm").unwrap();
+        let config = mocked_llm_config(server.url()).await;
+        let state = pyramid_state_with_llm_config(conn, config);
+
+        // One LLM step + one mechanical step to confirm threading works.
+        let llm_step = ChainStep {
+            name: "judge".into(),
+            primitive: "classify".into(),
+            instruction: Some("Return a decision as JSON.".into()),
+            mechanical: false,
+            response_schema: Some(serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["decision", "reasoning"],
+                "properties": {
+                    "decision": {"type": "string", "enum": ["redistill", "skip"]},
+                    "reasoning": {"type": "string"}
+                }
+            })),
+            ..Default::default()
+        };
+        // A no-op mechanical step that returns input unchanged so we can
+        // assert the LLM output is what threaded through.
+        let log_step = mech_step("log", "log_and_complete");
+
+        let chain =
+            minimal_chain_with_steps("test-llm-then-mech", vec![llm_step, log_step]);
+
+        let out = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p6llm",
+            Some("L1-JUDGE"),
+            serde_json::json!({}),
+        )
+        .await
+        .expect("LLM chain must run end-to-end");
+
+        // Final output is log_and_complete's output = its input = the LLM step's parsed JSON.
+        assert_eq!(out["decision"], serde_json::json!("redistill"));
+        assert_eq!(out["reasoning"], serde_json::json!("content shift is substantive"));
+    }
+
+    // ── 2. Orchestration primitives are rejected loudly.
+    //       (Replaces the Phase-5 LLM-rejection test; Phase 6 now runs
+    //       LLM steps. What remains unsupported is container/loop/gate/etc.)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn execute_chain_for_target_rejects_unknown_or_unsupported_primitive_loud() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p6unk", &ContentType::Code, "/tmp/p6unk").unwrap();
+        // No LLM mocking — the step must be rejected before any HTTP.
+        let state = pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        for primitive in [
+            "container",
+            "split",
+            "loop",
+            "gate",
+            "recursive_decompose",
+            "build_lifecycle",
+            "evidence_loop",
+            "cross_build_input",
+            "process_gaps",
+        ] {
+            let chain = minimal_chain_with_steps(
+                "test-orch",
+                vec![ChainStep {
+                    name: "orch".into(),
+                    primitive: primitive.into(),
+                    ..Default::default()
+                }],
+            );
+            let err = chain_executor::execute_chain_for_target(
+                &state,
+                &chain,
+                "p6unk",
+                None,
+                serde_json::json!({}),
+            )
+            .await
+            .expect_err(&format!(
+                "orchestration primitive '{}' must be rejected",
+                primitive
+            ));
+            let msg = err.to_string() + " " + &err.root_cause().to_string();
+            assert!(
+                msg.contains(primitive),
+                "error must name the rejected primitive '{}': {}",
+                primitive,
+                msg
+            );
+            assert!(
+                msg.contains("execute_chain_from")
+                    || msg.contains("starter chains"),
+                "error must point operators at the full chain executor: {}",
+                msg
+            );
+        }
+    }
+
+    // ── 3. starter-cascade-judge-gated — judge says "redistill"
+    //       → re_distill work item is queued, end-to-end.
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn judge_cascade_relevance_redistill_queues_re_distill() {
+        let mut server = mockito::Server::new_async().await;
+        let mock_content =
+            r#"{"decision":"redistill","reasoning":"canonical child superseded"}"#;
+        let _m = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openrouter_body(mock_content))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p6yes", &ContentType::Code, "/tmp/p6yes").unwrap();
+        let config = mocked_llm_config(server.url()).await;
+        let state = pyramid_state_with_llm_config(conn, config);
+
+        let chain = chain_loader::load_chain_by_id(
+            "starter-cascade-judge-gated",
+            &state.chains_dir,
+        )
+        .expect("starter-cascade-judge-gated must load");
+
+        let inputs = serde_json::json!({
+            "work_item_id": "wi-jg-yes",
+            "step_name": "cascade_stale_handler",
+            "layer": 1,
+            "cascade_reason": "child L0-3 supersedes prior synthesis",
+        });
+        chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p6yes",
+            Some("L1-YES"),
+            inputs,
+        )
+        .await
+        .expect("judge-gated chain must run to completion on redistill decision");
+
+        // A re_distill work item must have been queued against L1-YES
+        // (step 3 runs because the when-guard saw decision == redistill).
+        let writer = state.writer.lock().await;
+        let (target, primitive, step_name): (Option<String>, String, String) = writer
+            .query_row(
+                "SELECT target_id, primitive, step_name
+                   FROM dadbear_work_items
+                  WHERE slug = 'p6yes' AND primitive = 're_distill'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("re_distill work item must exist for redistill decision");
+        assert_eq!(target.as_deref(), Some("L1-YES"));
+        assert_eq!(primitive, "re_distill");
+        assert_eq!(step_name, "cascade_re_distill");
+    }
+
+    // ── 4. starter-cascade-judge-gated — judge says "skip"
+    //       → NO re_distill work item is queued (when-guard holds).
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn judge_cascade_relevance_skip_does_not_queue() {
+        let mut server = mockito::Server::new_async().await;
+        let mock_content =
+            r#"{"decision":"skip","reasoning":"metadata-only annotation"}"#;
+        let _m = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openrouter_body(mock_content))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p6skp", &ContentType::Code, "/tmp/p6skp").unwrap();
+        let config = mocked_llm_config(server.url()).await;
+        let state = pyramid_state_with_llm_config(conn, config);
+
+        let chain = chain_loader::load_chain_by_id(
+            "starter-cascade-judge-gated",
+            &state.chains_dir,
+        )
+        .expect("starter-cascade-judge-gated must load");
+
+        let inputs = serde_json::json!({
+            "work_item_id": "wi-jg-skp",
+            "step_name": "cascade_stale_handler",
+            "layer": 1,
+            "cascade_reason": "rename + tag adjustment only",
+        });
+        chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p6skp",
+            Some("L1-SKP"),
+            inputs,
+        )
+        .await
+        .expect("judge-gated chain must run to completion on skip decision");
+
+        // NO re_distill work item must exist — the when guard blocked
+        // queue_redistill_if_warranted.
+        let writer = state.writer.lock().await;
+        let count: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_work_items
+                  WHERE slug = 'p6skp' AND primitive = 're_distill'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "skip decision must NOT queue re_distill — when-guard is load-bearing"
+        );
+
+        // But the cascade_handler_invoked event MUST still be written
+        // (step 1 runs unconditionally).
+        let cascade_events: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE slug = 'p6skp' AND event_type = 'cascade_handler_invoked'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cascade_events, 1);
+    }
+
+    // ── 5. Structural check on the upgraded YAML.
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn starter_cascade_judge_gated_loads_and_structurally_valid() {
+        let chains_dir = chains_dir_path();
+        let chain = chain_loader::load_chain_by_id(
+            "starter-cascade-judge-gated",
+            &chains_dir,
+        )
+        .expect("starter-cascade-judge-gated must load");
+        assert_eq!(chain.id, "starter-cascade-judge-gated");
+        assert_eq!(chain.steps.len(), 3, "Phase 6 judge chain has 3 steps");
+
+        // Step 1 — mechanical emit.
+        assert_eq!(chain.steps[0].name, "emit_cascade_invoked");
+        assert!(chain.steps[0].mechanical);
+        assert_eq!(
+            chain.steps[0].rust_function.as_deref(),
+            Some("emit_cascade_handler_invoked")
+        );
+
+        // Step 2 — LLM classify with a structured-output schema.
+        assert_eq!(chain.steps[1].name, "judge_cascade_relevance");
+        assert!(!chain.steps[1].mechanical);
+        assert_eq!(chain.steps[1].primitive, "classify");
+        let instr = chain.steps[1]
+            .instruction
+            .as_deref()
+            .expect("judge step must carry a resolved instruction body");
+        // chain_loader swaps `$prompts/...` refs for the file body at
+        // load time; a surviving `$prompts/` prefix would mean the
+        // prompt file wasn't found and the loader silently left the
+        // ref in place — guard against that regression.
+        assert!(
+            !instr.starts_with("$prompts/"),
+            "chain_loader must resolve $prompts/starter/judge_cascade_relevance.md to the file body; \
+             got unresolved ref: {}",
+            instr
+        );
+        assert!(
+            instr.contains("Cascade Relevance Judge"),
+            "resolved instruction must be the judge_cascade_relevance.md body (first-line sentinel missing)"
+        );
+        let schema = chain.steps[1]
+            .response_schema
+            .as_ref()
+            .expect("judge step must define a response_schema");
+        assert_eq!(schema["type"], serde_json::json!("object"));
+        let decision_enum = &schema["properties"]["decision"]["enum"];
+        assert!(
+            decision_enum
+                .as_array()
+                .map(|a| a.contains(&serde_json::json!("redistill"))
+                    && a.contains(&serde_json::json!("skip")))
+                .unwrap_or(false),
+            "decision enum must be [redistill, skip], got {}",
+            decision_enum
+        );
+
+        // Step 3 — mechanical queue, guarded by when.
+        assert_eq!(chain.steps[2].name, "queue_redistill_if_warranted");
+        assert!(chain.steps[2].mechanical);
+        assert_eq!(
+            chain.steps[2].rust_function.as_deref(),
+            Some("queue_re_distill_for_target")
+        );
+        let when = chain.steps[2]
+            .when
+            .as_deref()
+            .expect("queue step must carry a when guard");
+        assert!(
+            when.contains("judge_cascade_relevance") && when.contains("redistill"),
+            "when guard must reference judge_cascade_relevance.decision and the redistill literal, got: {}",
+            when
+        );
+    }
+
+    // ── 6. Regression: when-guard skips the guarded step when false,
+    //       without erroring the whole chain, and threaded output is still
+    //       the prior step's output (not the skipped step's).
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn when_guard_skips_step_and_preserves_threaded_output() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p6gate", &ContentType::Code, "/tmp/p6gate").unwrap();
+        let state = pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        // A 2-step mechanical chain: step1 emits (returns {emitted:true}),
+        // step2 is a guarded queue that would fail (no target_node_id in
+        // the guard expression's scope beyond step_outputs) — but when
+        // the guard is false the queue is skipped entirely.
+        let chain = minimal_chain_with_steps(
+            "test-when-guard",
+            vec![
+                mech_step("step1", "emit_cascade_handler_invoked"),
+                {
+                    let mut s = mech_step("step2", "queue_re_distill_for_target");
+                    // Guard is literally false (references a step output field
+                    // that doesn't exist → evaluate_when_starter returns false).
+                    s.when = Some("$step1.never_present".into());
+                    s
+                },
+            ],
+        );
+        let inputs = serde_json::json!({
+            "target_node_id": "L1-GATE",
+            "reason": "when-guard regression",
+        });
+
+        let out = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p6gate",
+            Some("L1-GATE"),
+            inputs,
+        )
+        .await
+        .expect("chain must complete when the guarded step is skipped");
+
+        // The final `current` threaded forward is step1's output
+        // (step2 was skipped), so `emitted: true` shows through.
+        assert_eq!(out["emitted"], serde_json::json!(true));
+
+        // And no re_distill work item was queued.
+        let writer = state.writer.lock().await;
+        let rd_count: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_work_items
+                  WHERE slug = 'p6gate' AND primitive = 're_distill'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rd_count, 0,
+            "when-guard must prevent the guarded mechanical step from firing"
+        );
+    }
+
+    // ── 7. Instruction-template rendering works on the LLM path.
+    //       {{target_node_id}} in the LLM step's instruction must be
+    //       substituted at dispatch time against the resolved input.
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn llm_step_instruction_templates_are_rendered() {
+        let mut server = mockito::Server::new_async().await;
+        // The mock is lax on request matching; we assert on the output.
+        let _m = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openrouter_body(r#"{"decision":"skip","reasoning":"ok"}"#))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p6tpl", &ContentType::Code, "/tmp/p6tpl").unwrap();
+        let config = mocked_llm_config(server.url()).await;
+        let state = pyramid_state_with_llm_config(conn, config);
+
+        let step = ChainStep {
+            name: "llm".into(),
+            primitive: "classify".into(),
+            // {{target_node_id}} must resolve. If the runner silently
+            // passed an unrendered template, mockito still returns OK and
+            // the test would pass — so we add an explicit failure case
+            // (below) for unresolved templates.
+            instruction: Some("Judge target {{target_node_id}}".into()),
+            mechanical: false,
+            response_schema: Some(serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["decision", "reasoning"],
+                "properties": {
+                    "decision": {"type": "string", "enum": ["redistill", "skip"]},
+                    "reasoning": {"type": "string"}
+                }
+            })),
+            ..Default::default()
+        };
+        let chain = minimal_chain_with_steps("test-tpl", vec![step]);
+
+        chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p6tpl",
+            Some("L1-TPL"),
+            serde_json::json!({}),
+        )
+        .await
+        .expect("template with resolvable {{target_node_id}} must succeed");
+    }
+
+    #[tokio::test]
+    async fn llm_step_unresolved_template_fails_loud() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p6err", &ContentType::Code, "/tmp/p6err").unwrap();
+        // No LLM mocking — resolve_prompt_template must fail BEFORE any HTTP.
+        let state = pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        let step = ChainStep {
+            name: "llm".into(),
+            primitive: "classify".into(),
+            // {{nope}} is not in the input → resolve_prompt_template errors.
+            instruction: Some("See {{nope}}".into()),
+            mechanical: false,
+            ..Default::default()
+        };
+        let chain = minimal_chain_with_steps("test-tpl-err", vec![step]);
+        let err = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p6err",
+            Some("L1-ERR"),
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("unresolved {{nope}} must raise loudly");
+        let msg = err.to_string() + " " + &err.root_cause().to_string();
+        assert!(
+            msg.contains("nope") || msg.contains("template"),
+            "error must mention the bad variable or the template failure: {}",
+            msg
+        );
+    }
+}
+

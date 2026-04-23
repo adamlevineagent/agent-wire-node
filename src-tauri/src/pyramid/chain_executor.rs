@@ -13043,6 +13043,29 @@ fn classify_ir_step_path(step: &IrStep) -> IrStepExecutionPath {
 // decision 11 for the chain-invocation model (one work_item per dispatch;
 // chain runs its N steps internally; cost attribution via
 // pyramid_pipeline_steps writes).
+//
+// Phase 6 (post-build accretion v5): LLM-primitive support is now wired in.
+// Each step is routed by `step.mechanical`:
+//   - `mechanical: true` + `rust_function: X` → dispatch via
+//     `chain_dispatch::dispatch_mechanical`, same as Phase 5.
+//   - `mechanical: false` AND `primitive` is an LLM primitive (classify,
+//     synthesize, extract, evaluate, compare, etc. — see VALID_PRIMITIVES
+//     in chain_engine.rs) → render the `step.instruction` as the system
+//     prompt (with `{{var}}` templating against the threaded input +
+//     step_outputs) and dispatch via `chain_dispatch::dispatch_llm` for a
+//     synchronous HTTP call. Structured outputs via `response_schema`
+//     work out of the box because `dispatch_llm` already handles that.
+//   - Orchestration / recipe primitives (container, split, loop, gate,
+//     recursive_decompose, etc.) → loud error. Starter chains use linear
+//     step flow with `when:` guards; if you need orchestration, use the
+//     full chain executor, not this runner.
+//
+// Branching: Option B. The runner tracks each step's output keyed by
+// `step.name` in `step_outputs`. A step's `when:` guard is evaluated
+// against `{step_outputs..., target_node_id, target_id, slug, <input fields>}`
+// via the existing expression engine (`super::expression::evaluate_expression`).
+// When the guard is false the step is skipped — threading continues with
+// the prior step's output. When omitted the guard is treated as true.
 pub async fn execute_chain_for_target(
     state: &PyramidState,
     chain: &ChainDefinition,
@@ -13072,17 +13095,20 @@ pub async fn execute_chain_for_target(
     // initial merge too so the trivial 1-step case and the resolved_input
     // path below both do the right thing.
     let mut initial_input = inputs;
-    if let Some(tid) = target_id {
-        if let Value::Object(ref mut map) = initial_input {
+    if let Value::Object(ref mut map) = initial_input {
+        if let Some(tid) = target_id {
             map.entry("target_node_id".to_string())
                 .or_insert_with(|| Value::String(tid.to_string()));
         }
+        map.entry("slug".to_string())
+            .or_insert_with(|| Value::String(slug.to_string()));
     }
 
     // Build a minimal dispatch context. We do NOT mint a build_id or wire
-    // CacheDispatchBase — starter chains are mechanical-only in Phase 5 so
-    // the LLM cache plumbing is not exercised. Phase 6 (LLM-step support)
-    // will add that wiring when it lands per-step work item enqueueing.
+    // CacheDispatchBase — starter chains are short (2-5 steps) + run
+    // synchronously in one supervisor tick; the LLM step cache is not
+    // load-bearing here. Audit context is also None; the supervisor's
+    // role_bound arm records completion via work_item state transitions.
     let llm_config = state.config.read().await.clone();
     let dispatch_ctx = chain_dispatch::ChainDispatchContext {
         db_reader: state.reader.clone(),
@@ -13098,41 +13124,71 @@ pub async fn execute_chain_for_target(
 
     // Thread inputs through each step. `current` is what the next step sees
     // as its input (unless that step explicitly sets `step.input`).
-    let mut current = initial_input;
+    let mut current = initial_input.clone();
+
+    // Accumulate per-step outputs keyed by `step.name` so downstream `when:`
+    // guards can reference `$prior_step.decision`, etc. via the expression
+    // engine. Also holds the initial input fields so `when: $target_node_id`
+    // resolves for Step 0 and later steps.
+    let mut step_outputs: serde_json::Map<String, Value> = serde_json::Map::new();
+    if let Value::Object(ref map) = initial_input {
+        for (k, v) in map {
+            step_outputs.insert(k.clone(), v.clone());
+        }
+    }
 
     for (idx, step) in chain.steps.iter().enumerate() {
-        // Reject LLM-primitive steps loudly — Phase 6 will extend this runner
-        // to enqueue per-step work items for LLM steps. Silent skip would
-        // make a partially-LLM starter chain look like it succeeded, which
-        // masks the unimplemented code path. See feedback_loud_deferrals.
-        if !step.mechanical {
-            anyhow::bail!(
-                "execute_chain_for_target: chain '{}' step '{}' is an LLM step \
-                 (primitive='{}'). Phase 6 will handle LLM steps in starter chains; \
-                 for now starter chains must be mechanical-only.",
-                chain.id,
-                step.name,
-                step.primitive,
-            );
+        // ── Reject orchestration / recipe primitives loudly ─────────────
+        //
+        // Starter chains are a flat step list with optional `when:` guards;
+        // they never need container / split / loop / gate / recursive_*.
+        // Routing those here would need the full ChainContext the legacy
+        // execute_chain_from builds, which pulls in pyramid chunk loading
+        // and thread state. Loud error so a mis-authored starter chain
+        // surfaces before it silently no-ops.
+        match step.primitive.as_str() {
+            "container" | "split" | "loop" | "gate"
+            | "recursive_decompose" | "build_lifecycle"
+            | "evidence_loop" | "cross_build_input" | "process_gaps" => {
+                anyhow::bail!(
+                    "execute_chain_for_target: chain '{}' step '{}' uses primitive '{}' \
+                     which is only supported by execute_chain_from (full chain executor). \
+                     Starter chains must use linear step flow with `when:` guards.",
+                    chain.id, step.name, step.primitive,
+                );
+            }
+            _ => {}
         }
 
-        // If the YAML declares an explicit `step.input` expression, resolve
-        // it against the threaded context. Starter chains in Phase 5 don't
-        // need this (they rely on threaded output), so we handle only the
-        // trivial "literal JSON" case — step.input is surfaced as-is when
-        // set. More complex resolution (ctx refs) is Phase 6+ when an IR
-        // path is needed. Emit loudly if `step.input` is set on a Phase 5
-        // starter chain because it indicates the YAML expects richer
-        // resolution than this runner provides.
+        // ── `when:` guard ─────────────────────────────────────────────
+        //
+        // Evaluate against {step_outputs..., initial_input fields}. When
+        // the guard is false, skip the step entirely — `current` carries
+        // the prior step's output forward. When the expression errors
+        // (e.g., ref to a step that didn't run), evaluate_when_starter
+        // logs the failure and returns `false` — safer than crashing
+        // the whole chain on an author typo, and matches the legacy
+        // evaluate_when behavior at line 3186.
+        if !evaluate_when_starter(step.when.as_deref(), &step_outputs) {
+            info!(
+                "[CHAIN-TARGET] step[{}] '{}' skipped (when='{}' is false)",
+                idx,
+                step.name,
+                step.when.as_deref().unwrap_or(""),
+            );
+            continue;
+        }
+
+        // If the YAML declares an explicit `step.input` expression, take
+        // that literal. Starter chains rely on threaded output chaining
+        // by default, but a literal input is still useful for the judge
+        // step to carry a payload shape the mechanical step below
+        // doesn't produce.
         let mut resolved_input = if let Some(ref explicit) = step.input {
-            // Starter chains in Phase 5 should thread via output chaining,
-            // not step.input. Warn if someone authored one relying on this
-            // field — this runner returns the literal `input` value, not a
-            // ctx-resolved one.
             warn!(
                 "[CHAIN-TARGET] chain '{}' step '{}' uses step.input literal; \
-                 Phase 5 runner does not resolve $ref / template expressions — \
-                 passing literal to dispatch.",
+                 starter runner does not resolve $ref / template expressions \
+                 inside step.input — passing literal to dispatch.",
                 chain.id, step.name
             );
             explicit.clone()
@@ -13149,33 +13205,81 @@ pub async fn execute_chain_for_target(
         //
         // Caller-set / upstream-preserved target_node_id always wins — we
         // only insert when absent, matching the initial-input merge semantics.
-        if let Some(tid) = target_id {
-            if let Value::Object(ref mut map) = resolved_input {
+        if let Value::Object(ref mut map) = resolved_input {
+            if let Some(tid) = target_id {
                 map.entry("target_node_id".to_string())
                     .or_insert_with(|| Value::String(tid.to_string()));
             }
         }
 
+        // ── Resolve system prompt for LLM steps ─────────────────────────
+        //
+        // For mechanical steps the system prompt is empty (dispatch_mechanical
+        // doesn't consult it). For LLM steps the chain_loader has already
+        // replaced `$prompts/...` references with the file content; we run
+        // `{{var}}` template substitution against the resolved input so the
+        // judge can see e.g. the cascade_reason / target text the supervisor
+        // passed in.
+        let system_prompt: String = if step.mechanical {
+            String::new()
+        } else {
+            let template = step.instruction.as_deref().unwrap_or("");
+            if template.is_empty() {
+                warn!(
+                    "[CHAIN-TARGET] chain '{}' step '{}' is LLM but has no instruction — sending empty system prompt",
+                    chain.id, step.name,
+                );
+                String::new()
+            } else {
+                match super::chain_resolve::resolve_prompt_template(template, &resolved_input) {
+                    Ok(rendered) => rendered,
+                    Err(e) => {
+                        // Loud fail: an unresolved {{var}} in a starter
+                        // chain prompt is an author bug. See
+                        // feedback_loud_deferrals — silent substitution
+                        // with empty values would mask the missing field.
+                        anyhow::bail!(
+                            "chain '{}' step '{}' instruction template failed: {}",
+                            chain.id, step.name, e,
+                        );
+                    }
+                }
+            }
+        };
+
         info!(
-            "[CHAIN-TARGET] step[{}] '{}' (fn={:?}) dispatching",
-            idx, step.name, step.rust_function
+            "[CHAIN-TARGET] step[{}] '{}' primitive='{}' mechanical={} dispatching",
+            idx, step.name, step.primitive, step.mechanical,
         );
 
         let output = chain_dispatch::dispatch_step(
             step,
             &resolved_input,
-            "", // no system prompt for mechanical steps
+            &system_prompt,
             &chain.defaults,
             &dispatch_ctx,
         )
         .await
         .with_context(|| {
-            format!(
-                "chain '{}' step '{}' (mechanical fn={:?}) failed",
-                chain.id, step.name, step.rust_function
-            )
+            if step.mechanical {
+                format!(
+                    "chain '{}' step '{}' (mechanical fn={:?}) failed",
+                    chain.id, step.name, step.rust_function
+                )
+            } else {
+                format!(
+                    "chain '{}' step '{}' (LLM primitive='{}') failed",
+                    chain.id, step.name, step.primitive
+                )
+            }
         })?;
 
+        // Stash the output under step.name so downstream `when:` guards can
+        // reference `$step_name.decision` etc. Also thread it forward as
+        // `current` for the next step's default input.
+        if !step.name.is_empty() {
+            step_outputs.insert(step.name.clone(), output.clone());
+        }
         current = output;
     }
 
@@ -13184,6 +13288,51 @@ pub async fn execute_chain_for_target(
         chain.id, slug, target_id
     );
     Ok(current)
+}
+
+/// Evaluate a starter-chain `when:` expression.
+///
+/// Minimal cousin of the full-executor `evaluate_when(..., &ChainContext)`
+/// that works off the starter runner's flat `step_outputs` map rather than
+/// a full ChainContext. Defers to the shared expression engine so
+/// `$step_name.decision == "redistill"` + `count($items) > 0` all work.
+///
+/// `None` / empty returns true (step runs). Expression errors return false
+/// (step skipped) — matches the legacy executor's behavior on unresolvable
+/// refs. A warn!() is emitted so author typos show up in logs.
+fn evaluate_when_starter(
+    when: Option<&str>,
+    step_outputs: &serde_json::Map<String, Value>,
+) -> bool {
+    let expr = match when {
+        Some(e) => e.trim(),
+        None => return true,
+    };
+    if expr.is_empty() {
+        return true;
+    }
+
+    let env_value = Value::Object(step_outputs.clone());
+    let env = super::expression::ValueEnv::new(&env_value);
+
+    // Fast path: bare `$ref` without operators → truthiness only.
+    if expr.starts_with('$') && !expr.contains(' ') {
+        return match super::expression::evaluate_expression(expr, &env) {
+            Ok(v) => super::expression::value_is_truthy(&v),
+            Err(_) => false,
+        };
+    }
+
+    match super::expression::evaluate_expression(expr, &env) {
+        Ok(v) => super::expression::value_is_truthy(&v),
+        Err(e) => {
+            warn!(
+                "[CHAIN-TARGET] when-expression '{}' failed to evaluate ({}) — skipping step",
+                expr, e,
+            );
+            false
+        }
+    }
 }
 
 #[cfg(test)]
