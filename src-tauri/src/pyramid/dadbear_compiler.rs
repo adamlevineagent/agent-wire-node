@@ -138,10 +138,19 @@ pub(crate) fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, 
         "faq_category_stale" => Some(("faq_redistill", "faq_redistill", "stale_remote")),
         "full_sweep" => Some(("extract", "full_sweep_extract", "stale_remote")),
         "annotation_written" | "annotation_superseded" => {
-            // Legacy mapping. Phase 8 flips this to role_bound cascade_handler.
-            // Pre-Phase-8 behavior preserved so existing pyramids at upgrade
-            // see no change until the backfill lands.
-            Some(("re_distill", "annotation_redistill", "stale_remote"))
+            // Phase 8-1 flip: route through the `cascade_handler` role. The
+            // bound chain (starter-cascade-judge-gated for new slugs,
+            // starter-cascade-immediate-redistill for legacy slugs) runs,
+            // and its terminal mechanical `queue_re_distill_for_target`
+            // enqueues a re_distill work item against the target ancestor.
+            // The supervisor's Phase 8-2 re_distill arm (apply_mechanical)
+            // then actually re-distills the node via execute_supersession,
+            // updating pyramid_nodes.distilled/headline/topics/build_version.
+            //
+            // Pre-Phase-8 mapping was `re_distill` + `annotation_redistill`
+            // which silently no-op'd in the supervisor default arm. That
+            // was THE original DADBEAR non-firing bug.
+            Some(("role_bound", "annotation_cascade", "stale_remote"))
         }
         // ── Post-build accretion v5 event types ─────────────────────────────
         // Per v5 R8: per-event-type step_names so dedup in has_active_work_item
@@ -874,8 +883,13 @@ pub fn compile_observations(
 ///   for every event that needs an effect.
 pub(crate) fn role_for_event(event_type: &str) -> Option<&'static str> {
     match event_type {
-        // annotation_written + annotation_superseded stay mapped to re_distill
-        // in Phase 3 — Phase 8 flips them to role_bound with cascade_handler.
+        // Phase 8-1: annotation_written + annotation_superseded now route
+        // via the cascade_handler role (previously mapped to `re_distill`
+        // primitive which silently no-op'd in the supervisor — the
+        // original DADBEAR non-firing bug). The bound chain runs; its
+        // terminal queue_re_distill_for_target step enqueues a real
+        // re_distill work item the Phase 8-2 supervisor arm applies.
+        "annotation_written" | "annotation_superseded" => Some("cascade_handler"),
         "annotation_reacted" => Some("cascade_handler"),
         "debate_spawned" | "debate_collapsed" => Some("debate_steward"),
         // v5 audit P3: gap_detected is observability-only — the actual
@@ -1155,20 +1169,25 @@ mod tests {
     }
 
     #[test]
-    fn test_annotation_events_map_to_redistill() {
-        // annotation_written and annotation_superseded both map to the same
-        // (primitive, step_name) so they coalesce on the has_active_work_item
-        // dedup. The superseded variant is distinguishable in the event row's
-        // metadata_json, not in the work item.
+    fn test_annotation_events_route_to_cascade_handler_role() {
+        // Phase 8-1 flip: annotation_written and annotation_superseded now
+        // compile to `role_bound` so the cascade_handler chain runs instead
+        // of the legacy silent `re_distill` primitive. Both events share
+        // the same step_name so they coalesce on has_active_work_item.
         let (prim, step, tier) = map_event_to_primitive("annotation_written").unwrap();
-        assert_eq!(prim, "re_distill");
-        assert_eq!(step, "annotation_redistill");
+        assert_eq!(prim, "role_bound");
+        assert_eq!(step, "annotation_cascade");
         assert_eq!(tier, "stale_remote");
 
         let (prim2, step2, tier2) = map_event_to_primitive("annotation_superseded").unwrap();
         assert_eq!(prim2, prim);
         assert_eq!(step2, step);
         assert_eq!(tier2, tier);
+
+        // role_for_event must now hand these events to cascade_handler so
+        // the supervisor resolves the slug's binding and invokes the chain.
+        assert_eq!(role_for_event("annotation_written"), Some("cascade_handler"));
+        assert_eq!(role_for_event("annotation_superseded"), Some("cascade_handler"));
     }
 
     #[test]

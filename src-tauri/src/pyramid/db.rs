@@ -22527,8 +22527,12 @@ mod phase3_post_build_tests {
             ("vine_stale", "stale_check"),
             ("targeted_stale", "stale_check"),
             ("full_sweep", "extract"),
-            ("annotation_written", "re_distill"),
-            ("annotation_superseded", "re_distill"),
+            // Phase 8-1: flipped from `re_distill` (silent no-op) to
+            // `role_bound` via cascade_handler. This is THE original
+            // DADBEAR non-firing bug fix — updated here to keep the
+            // regression guard honest.
+            ("annotation_written", "role_bound"),
+            ("annotation_superseded", "role_bound"),
         ];
         for (event_type, exp_prim) in pre_phase3 {
             let got = dadbear_compiler::map_event_to_primitive(event_type)
