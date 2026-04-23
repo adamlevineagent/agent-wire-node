@@ -2551,16 +2551,34 @@ pub struct DebatePosition {
     pub steel_manning: String,
     #[serde(default)]
     pub red_teams: Vec<RedTeamEntry>,
+    /// Node-id references to the substrate that supports this position.
+    /// Semantic channel: genuine evidence — readers expect node_ids or
+    /// cross-pyramid refs (e.g. "L1-001", "adjacent-pyramid/L2-42"), NOT
+    /// annotation-id tags. Provenance/idempotency tokens live on
+    /// `source_annotation_ids` per v5 audit P6.
     #[serde(default)]
     pub evidence_anchors: Vec<String>,
+    /// Annotation provenance + idempotency tokens of the form
+    /// `annotation#{id}`. Populated by writers that materialize or append
+    /// to a debate from annotations (see `append_annotation_to_debate_node`).
+    /// Kept separate from `evidence_anchors` so readers of the evidence
+    /// channel see only genuine node-id refs.
+    #[serde(default)]
+    pub source_annotation_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedTeamEntry {
     pub from_position: String,
     pub argument: String,
+    /// Node-id references to substrate supporting this red-team argument.
+    /// See `DebatePosition.evidence_anchors` for the semantic contract.
     #[serde(default)]
     pub evidence_anchors: Vec<String>,
+    /// Annotation provenance + idempotency tokens of the form
+    /// `annotation#{id}`. See `DebatePosition.source_annotation_ids`.
+    #[serde(default)]
+    pub source_annotation_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2605,16 +2623,16 @@ pub struct MetaLayerTopicEntry {
 /// resolutions. Demand state lifecycle: open -> dispatched -> closed |
 /// tombstoned.
 ///
-/// `evidence_anchors` carries dedup tokens for idempotent append (same
-/// pattern as `DebatePosition.evidence_anchors` / `RedTeamEntry.evidence_anchors`).
-/// Today the `gap_dispatcher` chain writes `annotation#{id}` tokens here
-/// when materializing a Gap from a `gap` annotation, so a replay of the
-/// same annotation is a cheap anchor-match → no-op. Phase 7c verifier pass
-/// lifted this out of `GapCandidate.resolution_type` because encoding the
-/// anchor there muddles the semantic channel (`resolution_type` is meant
-/// to describe HOW a gap might be closed, e.g. "query_wire" / "run_evidence_loop",
-/// not WHO first observed it). Per `feedback_generalize_not_enumerate`:
-/// use the purpose-matched field, don't overload the first one that fits.
+/// `evidence_anchors` carries node-id references to substrate that supports
+/// the existence of the gap (same semantic channel as
+/// `DebatePosition.evidence_anchors` / `RedTeamEntry.evidence_anchors`).
+///
+/// `source_annotation_ids` carries `annotation#{id}` provenance/idempotency
+/// tokens. v5 audit P6 split this off from `evidence_anchors` so readers
+/// of the evidence channel see only genuine node-id refs. Phase 7c verifier
+/// previously merged these into `evidence_anchors` to dodge
+/// `GapCandidate.resolution_type` overloading; that fix lifted the wrong
+/// end of the problem, so v5 audit completes the split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GapTopic {
     pub concern: String,
@@ -2622,8 +2640,13 @@ pub struct GapTopic {
     pub demand_state: String,
     #[serde(default)]
     pub candidate_resolutions: Vec<GapCandidate>,
+    /// Node-id references to substrate supporting the gap (genuine evidence).
     #[serde(default)]
     pub evidence_anchors: Vec<String>,
+    /// Annotation provenance + idempotency tokens of the form
+    /// `annotation#{id}`.
+    #[serde(default)]
+    pub source_annotation_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -122,14 +122,21 @@ export interface VoteLean {
 export interface RedTeamEntry {
   from_position: string;
   argument: string;
+  // Node-id references (genuine evidence) — e.g. "L1-001".
   evidence_anchors?: string[];
+  // Annotation provenance + idempotency tokens (e.g. "annotation#42").
+  // v5 audit P6 split these off from evidence_anchors.
+  source_annotation_ids?: string[];
 }
 
 export interface DebatePosition {
   label: string;
   steel_manning: string;
   red_teams?: RedTeamEntry[];
+  // Node-id references supporting this position (genuine evidence).
   evidence_anchors?: string[];
+  // Annotation provenance + idempotency tokens. See RedTeamEntry.
+  source_annotation_ids?: string[];
 }
 
 export interface DebateTopic {
@@ -156,10 +163,12 @@ export interface GapTopic {
   description: string;
   demand_state: string; // "open" | "dispatched" | "closed" | "tombstoned"
   candidate_resolutions?: GapCandidate[];
-  // Phase 7c verifier: annotation-sourced dedup tokens (e.g. "annotation#42")
-  // so re-running the gap_dispatcher on the same annotation is idempotent.
-  // Mirrors DebatePosition.evidence_anchors / RedTeamEntry.evidence_anchors.
+  // Node-id references to substrate supporting the gap (genuine evidence).
   evidence_anchors?: string[];
+  // Annotation provenance + idempotency tokens (e.g. "annotation#42").
+  // v5 audit P6 split these off from evidence_anchors so the evidence
+  // channel stays node-id only.
+  source_annotation_ids?: string[];
 }
 
 // Shape payload is stored as JSON in `pyramid_nodes.shape_payload_json`;

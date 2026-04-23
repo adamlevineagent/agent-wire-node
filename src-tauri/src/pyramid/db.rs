@@ -22262,6 +22262,7 @@ mod phase2_post_build_tests {
                 steel_manning: "b".into(),
                 red_teams: vec![],
                 evidence_anchors: vec![],
+                source_annotation_ids: vec![],
             }],
             cross_refs: vec![],
             vote_lean: None,
@@ -22290,6 +22291,7 @@ mod phase2_post_build_tests {
             demand_state: "open".into(),
             candidate_resolutions: vec![],
             evidence_anchors: vec![],
+            source_annotation_ids: vec![],
         });
         let g_json = serde_json::to_string(&gap).unwrap();
         assert!(!g_json.contains("\"kind\""));
@@ -23039,6 +23041,7 @@ mod phase4_post_build_tests {
             demand_state: "open".to_string(),
             candidate_resolutions: vec![],
             evidence_anchors: vec![],
+            source_annotation_ids: vec![],
         };
         let json = serde_json::to_string(&g).unwrap();
         match parse_shape_payload(&NodeShape::new("gap"), Some(&json)).unwrap().unwrap() {
@@ -23069,6 +23072,7 @@ mod phase4_post_build_tests {
             demand_state: "open".into(),
             candidate_resolutions: vec![],
             evidence_anchors: vec![],
+            source_annotation_ids: vec![],
         })
         .unwrap();
         let err = parse_shape_payload(&NodeShape::new("debate"), Some(&gap_json)).unwrap_err();
@@ -23249,15 +23253,20 @@ mod phase4_post_build_tests {
                     red_teams: vec![RedTeamEntry {
                         from_position: "Con".to_string(),
                         argument: "X conflicts with Pillar 38.".to_string(),
+                        // v5 audit P6: evidence_anchors is node-id refs only;
+                        // annotation provenance on source_annotation_ids.
                         evidence_anchors: vec!["L1-001".into(), "L1-007".into()],
+                        source_annotation_ids: vec!["annotation#42".into()],
                     }],
                     evidence_anchors: vec!["L1-001".into()],
+                    source_annotation_ids: vec![],
                 },
                 DebatePosition {
                     label: "Con".to_string(),
                     steel_manning: "X is too expensive.".to_string(),
                     red_teams: vec![],
                     evidence_anchors: vec![],
+                    source_annotation_ids: vec![],
                 },
             ],
             cross_refs: vec!["adjacent-pyramid/L2-42".into()],
@@ -23284,7 +23293,14 @@ mod phase4_post_build_tests {
                     r.positions[0].red_teams[0].evidence_anchors,
                     vec!["L1-001".to_string(), "L1-007".to_string()]
                 );
+                // v5 audit P6: annotation provenance survives round-trip
+                // on source_annotation_ids, not mixed into evidence_anchors.
+                assert_eq!(
+                    r.positions[0].red_teams[0].source_annotation_ids,
+                    vec!["annotation#42".to_string()]
+                );
                 assert_eq!(r.positions[0].evidence_anchors, vec!["L1-001".to_string()]);
+                assert!(r.positions[0].source_annotation_ids.is_empty());
                 assert_eq!(r.cross_refs, vec!["adjacent-pyramid/L2-42".to_string()]);
                 let vl = r.vote_lean.expect("vote_lean must round-trip");
                 assert_eq!(vl.up_count, 3);
@@ -23320,6 +23336,7 @@ mod phase4_post_build_tests {
                 },
             ],
             evidence_anchors: vec![],
+            source_annotation_ids: vec![],
         };
         let json = serde_json::to_string(&g).unwrap();
         match parse_shape_payload(&NodeShape::new("gap"), Some(&json)).unwrap().unwrap() {
@@ -27930,6 +27947,7 @@ mod phase7a_post_build_tests {
                 steel_manning: "Initial steel_man".to_string(),
                 red_teams: vec![],
                 evidence_anchors: vec![],
+                source_annotation_ids: vec![],
             }],
             cross_refs: vec![],
             vote_lean: None,
@@ -28000,13 +28018,23 @@ mod phase7a_post_build_tests {
                     d.positions[0].red_teams[0].from_position, "pos-1",
                     "from_position must carry the target position's label, not the author's name"
                 );
+                // v5 audit P6: annotation provenance now lives on
+                // source_annotation_ids. evidence_anchors stays for
+                // node-id refs only.
+                assert!(
+                    d.positions[0].red_teams[0]
+                        .source_annotation_ids
+                        .iter()
+                        .any(|a| a.starts_with("annotation#")),
+                    "red_team must be tagged with `annotation#{{id}}` source_annotation_ids \
+                     for idempotency dedup"
+                );
                 assert!(
                     d.positions[0].red_teams[0]
                         .evidence_anchors
                         .iter()
-                        .any(|a| a.starts_with("annotation#")),
-                    "red_team must be tagged with `annotation#{{id}}` evidence anchor \
-                     for idempotency dedup"
+                        .all(|a| !a.starts_with("annotation#")),
+                    "evidence_anchors must hold node-id refs only, not annotation tags"
                 );
             }
             other => panic!("expected Debate payload, got {other:?}"),
@@ -29801,15 +29829,19 @@ mod phase7c_post_build_tests {
         match view.payload {
             Some(ShapePayload::Gap(g)) => {
                 assert_eq!(g.demand_state, "open", "fresh gap is demand_state=open");
-                // Phase 7c verifier: the annotation anchor lives on
-                // `evidence_anchors` (purpose-matched), NOT on a synthetic
-                // GapCandidate. `candidate_resolutions` is the LLM's
-                // channel and should start empty.
+                // v5 audit P6: annotation tokens live on
+                // `source_annotation_ids` (provenance channel) — NOT on
+                // `evidence_anchors` (node-id refs channel) and NOT on
+                // `candidate_resolutions` (LLM's channel).
                 assert!(
-                    g.evidence_anchors
+                    g.source_annotation_ids
                         .iter()
                         .any(|a| a.starts_with("annotation#")),
-                    "GapTopic must carry the annotation anchor under evidence_anchors for dedup"
+                    "GapTopic must carry the annotation anchor under source_annotation_ids for dedup"
+                );
+                assert!(
+                    g.evidence_anchors.iter().all(|a| !a.starts_with("annotation#")),
+                    "evidence_anchors must not be overloaded with annotation tokens"
                 );
                 assert!(
                     g.candidate_resolutions.is_empty(),
@@ -29837,12 +29869,16 @@ mod phase7c_post_build_tests {
         // `evidence_anchors: Vec<String>`. Previously this fixture wrapped
         // the anchor as a synthetic GapCandidate — now it goes to the
         // purpose-matched field.
+        // v5 audit P6: pre-existing gaps seeded annotation tokens on
+        // source_annotation_ids (new channel). evidence_anchors stays
+        // node-id only.
         let existing = GapTopic {
             concern: "Pre-existing concern".to_string(),
             description: "Pre-existing description".to_string(),
             demand_state: "open".to_string(),
             candidate_resolutions: vec![],
-            evidence_anchors: vec!["annotation#99".to_string()],
+            evidence_anchors: vec![],
+            source_annotation_ids: vec!["annotation#99".to_string()],
         };
         seed_existing_gap_node(&conn, "p7c2", "node-gap-2", &existing);
 
@@ -29903,17 +29939,21 @@ mod phase7c_post_build_tests {
         let view = get_node_shape(&writer, "p7c2", "node-gap-2").unwrap().unwrap();
         match view.payload {
             Some(ShapePayload::Gap(g)) => {
-                // Exactly 2 anchors: the pre-seeded annotation#99 + the
-                // one from ann.id. Idempotent re-run does NOT duplicate.
-                // Phase 7c verifier: anchors live on evidence_anchors now.
+                // Exactly 2 anchor tokens: the pre-seeded annotation#99 +
+                // the one from ann.id. Idempotent re-run does NOT duplicate.
+                // v5 audit P6: anchor tokens live on source_annotation_ids.
                 let anchor_count = g
-                    .evidence_anchors
+                    .source_annotation_ids
                     .iter()
                     .filter(|a| a.starts_with("annotation#"))
                     .count();
                 assert_eq!(
                     anchor_count, 2,
                     "re-running must not duplicate the annotation anchor"
+                );
+                assert!(
+                    g.evidence_anchors.iter().all(|a| !a.starts_with("annotation#")),
+                    "evidence_anchors must stay annotation-free (node-id refs only)"
                 );
                 // candidate_resolutions untouched — still empty after
                 // merge-append. The LLM channel is off-limits for the
@@ -29957,6 +29997,7 @@ mod phase7c_post_build_tests {
                     steel_manning: "sm".into(),
                     red_teams: vec![],
                     evidence_anchors: vec![],
+                    source_annotation_ids: vec![],
                 }],
                 cross_refs: vec![],
                 vote_lean: None,
@@ -30317,13 +30358,16 @@ mod phase7c_post_build_tests {
                     "concern must carry question_context when present: {}",
                     g.concern
                 );
-                // Phase 7c verifier: anchors on evidence_anchors, not
-                // on candidate_resolutions.
+                // v5 audit P6: anchor tokens live on source_annotation_ids.
                 assert!(
-                    g.evidence_anchors
+                    g.source_annotation_ids
                         .iter()
                         .any(|a| a.starts_with("annotation#")),
-                    "annotation anchor must be present on evidence_anchors for dedup"
+                    "annotation anchor must be present on source_annotation_ids for dedup"
+                );
+                assert!(
+                    g.evidence_anchors.iter().all(|a| !a.starts_with("annotation#")),
+                    "evidence_anchors must stay node-id refs only"
                 );
                 assert!(
                     g.candidate_resolutions.is_empty(),

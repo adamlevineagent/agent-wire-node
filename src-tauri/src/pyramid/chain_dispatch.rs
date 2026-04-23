@@ -1303,22 +1303,32 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
             let (action, updated_debate, shape_was_upgraded) = if current_shape.is_scaffolding() {
                 // Create fresh Debate.
                 let (positions, action_label) = if is_steel_man {
+                    // v5 audit P6: record the annotation id under the
+                    // dedicated `source_annotation_ids` channel. The
+                    // position-LABEL also carries `annotation#{id}` today
+                    // because a steel-manning position from an external
+                    // author has no named stance — that's a separate
+                    // labeling concern. `evidence_anchors` stays empty:
+                    // genuine node-id refs only.
+                    let annotation_token = format!("annotation#{annotation_id}");
                     (
                         vec![DebatePosition {
                             label: position_label_for_steel_man.clone(),
                             steel_manning: ann_content.clone(),
                             red_teams: vec![],
                             evidence_anchors: vec![],
+                            source_annotation_ids: vec![annotation_token],
                         }],
                         "created_debate",
                     )
                 } else {
                     // Red team without any existing position: seed an
                     // empty "main" position carrying the red_team.
-                    // Carry the `annotation#{id}` tag as an evidence anchor
-                    // so the append-path idempotency check can dedup by
-                    // annotation_id consistently across both code paths.
-                    let annotation_anchor = format!("annotation#{annotation_id}");
+                    // v5 audit P6: `annotation#{id}` goes on
+                    // `source_annotation_ids` for idempotency dedup;
+                    // `evidence_anchors` is reserved for genuine node-id
+                    // refs (empty on first seed).
+                    let annotation_token = format!("annotation#{annotation_id}");
                     (
                         vec![DebatePosition {
                             label: red_team_from_position.to_string(),
@@ -1326,9 +1336,11 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                             red_teams: vec![RedTeamEntry {
                                 from_position: red_team_from_position.to_string(),
                                 argument: ann_content.clone(),
-                                evidence_anchors: vec![annotation_anchor],
+                                evidence_anchors: vec![],
+                                source_annotation_ids: vec![annotation_token],
                             }],
                             evidence_anchors: vec![],
+                            source_annotation_ids: vec![],
                         }],
                         "created_debate",
                     )
@@ -1365,8 +1377,17 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 };
                 let action_label = if is_steel_man {
                     let label = position_label_for_steel_man.clone();
+                    let annotation_token = format!("annotation#{annotation_id}");
+                    // v5 audit P6: idempotency check widened to match the
+                    // new field (catch replays regardless of which side of
+                    // the split wrote the existing row, for forward/back
+                    // compat during rollover).
                     let already = debate.positions.iter().any(|p| {
-                        p.label == label || (p.steel_manning == ann_content && !ann_content.is_empty())
+                        p.label == label
+                            || (p.steel_manning == ann_content && !ann_content.is_empty())
+                            || p.source_annotation_ids
+                                .iter()
+                                .any(|a| a == &annotation_token)
                     });
                     if !already {
                         debate.positions.push(DebatePosition {
@@ -1374,6 +1395,7 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                             steel_manning: ann_content.clone(),
                             red_teams: vec![],
                             evidence_anchors: vec![],
+                            source_annotation_ids: vec![annotation_token],
                         });
                     }
                     if already { "no_op" } else { "appended_position" }
@@ -1397,23 +1419,31 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                             steel_manning: String::new(),
                             red_teams: vec![],
                             evidence_anchors: vec![],
+                            source_annotation_ids: vec![],
                         });
                     }
                     let pos = debate.positions.first_mut().unwrap();
                     let from_position_label = pos.label.clone();
-                    // Idempotency: collision on (argument, annotation#{id}
-                    // evidence anchor) — the evidence_anchors slot carries a
-                    // stable annotation_id tag so re-runs don't duplicate.
-                    let annotation_anchor = format!("annotation#{annotation_id}");
+                    // v5 audit P6: idempotency now keyed on
+                    // `source_annotation_ids` (not `evidence_anchors` —
+                    // that field is for genuine node-id refs). Legacy
+                    // rows that stamped the token into `evidence_anchors`
+                    // still dedup under the second clause so rollover is
+                    // seamless during the migration window.
+                    let annotation_token = format!("annotation#{annotation_id}");
                     let already = pos.red_teams.iter().any(|r| {
                         r.argument == ann_content
-                            && r.evidence_anchors.iter().any(|a| a == &annotation_anchor)
+                            && (r.source_annotation_ids
+                                .iter()
+                                .any(|a| a == &annotation_token)
+                                || r.evidence_anchors.iter().any(|a| a == &annotation_token))
                     });
                     if !already {
                         pos.red_teams.push(RedTeamEntry {
                             from_position: from_position_label,
                             argument: ann_content.clone(),
-                            evidence_anchors: vec![annotation_anchor],
+                            evidence_anchors: vec![],
+                            source_annotation_ids: vec![annotation_token],
                         });
                     }
                     if already { "no_op" } else { "appended_red_team" }
@@ -2965,31 +2995,27 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 .map(|v| v.shape.clone())
                 .unwrap_or_else(NodeShape::scaffolding);
 
-            // Phase 7c verifier pass: the annotation anchor lives on a
-            // first-class `GapTopic.evidence_anchors: Vec<String>` field
-            // (mirroring `DebatePosition.evidence_anchors` /
-            // `RedTeamEntry.evidence_anchors`). Previously we overloaded
-            // `GapCandidate.resolution_type` with an `annotation#{id}`
-            // synthetic candidate — that muddled the semantic channel
-            // (`resolution_type` is meant to describe HOW a gap might
-            // close: "query_wire" / "run_evidence_loop" / etc.) and would
-            // have surfaced in Phase 8's LLM-driven candidate generation
-            // as a "real" candidate. Per `feedback_generalize_not_enumerate`:
-            // add the purpose-matched field now while the blast radius is
-            // small, rather than defer cleanup to when LLM prompts have
-            // already learned the wrong schema.
-            let annotation_anchor = format!("annotation#{annotation_id}");
+            // Phase 7c verifier: the annotation anchor lived on
+            // `GapTopic.evidence_anchors` to avoid overloading
+            // `GapCandidate.resolution_type`. v5 audit P6 completes the
+            // split: annotation tokens move to `source_annotation_ids`,
+            // `evidence_anchors` is reserved for genuine node-id refs.
+            // Per `feedback_generalize_not_enumerate`: the right field
+            // for provenance is a dedicated provenance field.
+            let annotation_token = format!("annotation#{annotation_id}");
 
             let (action, updated_gap, shape_was_upgraded) = if current_shape.is_scaffolding() {
-                // Fresh Gap. Seed an empty candidate list — real candidates
-                // come from a Phase 8+ LLM step — and record the annotation
-                // anchor under evidence_anchors for idempotent replay.
+                // Fresh Gap. Seed empty candidate_resolutions (LLM's
+                // channel) + empty evidence_anchors (no node-id refs
+                // yet) + record the annotation token under
+                // source_annotation_ids for idempotent replay.
                 let gap = GapTopic {
                     concern: concern_line,
                     description: description.clone(),
                     demand_state: "open".to_string(),
                     candidate_resolutions: Vec::new(),
-                    evidence_anchors: vec![annotation_anchor.clone()],
+                    evidence_anchors: Vec::new(),
+                    source_annotation_ids: vec![annotation_token.clone()],
                 };
                 ("created_gap", gap, true)
             } else if current_shape.as_str() == NODE_SHAPE_GAP {
@@ -3005,16 +3031,21 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                         ));
                     }
                 };
+                // v5 audit P6: dedup against BOTH the new
+                // source_annotation_ids channel AND the legacy
+                // evidence_anchors slot (for rollover compat: pre-audit
+                // rows carry the token on evidence_anchors).
                 let already = gap
-                    .evidence_anchors
+                    .source_annotation_ids
                     .iter()
-                    .any(|a| a == &annotation_anchor);
+                    .chain(gap.evidence_anchors.iter())
+                    .any(|a| a == &annotation_token);
                 if !already {
-                    // Append the anchor. Don't mutate concern / description
-                    // of an existing gap (the original concern is
-                    // load-bearing for operators) and don't touch
-                    // candidate_resolutions (that's the LLM's channel).
-                    gap.evidence_anchors.push(annotation_anchor.clone());
+                    // Append the token to the provenance channel. Don't
+                    // mutate concern / description of an existing gap
+                    // (the original concern is load-bearing for operators)
+                    // and don't touch candidate_resolutions (LLM channel).
+                    gap.source_annotation_ids.push(annotation_token.clone());
                 }
                 let action_label = if already { "no_op" } else { "appended_anchor" };
                 (action_label, gap, false)
