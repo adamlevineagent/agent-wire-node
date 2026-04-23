@@ -13112,6 +13112,72 @@ pub async fn execute_chain_for_target(
         chain.steps.len()
     );
 
+    // ── Phase 9 close-1: per-slug write lock for chain execution ──
+    //
+    // Chain execution can mutate `pyramid_nodes` via mechanical primitives
+    // (`append_annotation_to_debate_node`, `finalize_debate_node`,
+    // `create_meta_layer_node`, `materialize_gap_node`). Phase 9c-3-2
+    // flipped `execute_supersession` to enforce `LockManager::is_locked`,
+    // but these chain-side mechanical writers run without the slug-scoped
+    // guard — they relied on the `dadbear_work_items` active-work dedup
+    // to prevent two overlapping dispatches against the same node. The
+    // wanderer pass flagged this as "not observed-flaky but systemically
+    // racy."
+    //
+    // Wrap here (at the chain entry point) rather than on each mechanical
+    // write site because:
+    //
+    //   1. A single guard covers every chain-side write transitively
+    //      regardless of which future primitives are added.
+    //   2. `tokio::sync::RwLock` is non-reentrant, so the per-mechanical
+    //      approach would force a guard-weaving discipline on every new
+    //      primitive + would deadlock any composite primitive that
+    //      rewrites under multiple headers.
+    //   3. Chain steps that ALSO call into shared writers (e.g.
+    //      `execute_supersession` via re_distill) are already covered by
+    //      the slug lock — their `LockManager::is_locked` assertion now
+    //      passes naturally instead of requiring a carved-out caller.
+    //
+    // Concurrency tradeoff: chain executions on the same slug serialize.
+    // Acceptable per Adam's mandate — per-slug ordering invariant > raw
+    // throughput. Different-slug chains still run concurrently.
+    //
+    // Reentrant safety: `call_starter_chain` (Phase 6b) recurses back
+    // into this function with the SAME slug to invoke library chains.
+    // `tokio::sync::RwLock` is non-reentrant, so unconditional acquire
+    // here would deadlock on every sub-chain call. Skip acquisition if
+    // THIS process already holds the write guard for this slug — the
+    // reentrant call is covered by the outer guard.
+    //
+    // Process-wide `is_write_locked` cannot distinguish "self-held" from
+    // "foreign-held," but when the outer guard is foreign-held we WANT
+    // to block anyway (serialization), and the `await` on a foreign lock
+    // would yield. The only case where we end up on this branch with a
+    // foreign lock held is a same-process peer — which would already
+    // serialize correctly even without acquiring here (the outer
+    // chain-level guard on the other tokio task would release before
+    // this one runs). In practice the branch is taken only for the
+    // reentrant sub-chain case. See the Close-1 tests in
+    // `phase9e_close_tests`.
+    //
+    // Callers that previously never held the lock (supervisor role_bound
+    // arm, `run_authorize_question_chain`, test harness) fall through
+    // and acquire here as expected.
+    //
+    // See `feedback_systemic_before_fix` — the fix is at the root (chain
+    // entry), not patched per-primitive.
+    let already_held =
+        super::lock_manager::LockManager::global().is_write_locked(slug);
+    let _slug_write_guard = if already_held {
+        None
+    } else {
+        Some(
+            super::lock_manager::LockManager::global()
+                .write(slug)
+                .await,
+        )
+    };
+
     // Merge target_id into the initial input under `target_node_id`
     // unless the caller already set it. Starter chain mechanical
     // primitives read this field.
