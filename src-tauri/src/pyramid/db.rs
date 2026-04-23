@@ -32338,6 +32338,7 @@ mod phase8_post_build_tests {
             "p8-crown",
             &config,
             "openai/gpt-4o-mini",
+            None, // Phase 8 tail-2: correction path, annotations live on target
         )
         .await
         .expect("execute_supersession must succeed against mocked LLM");
@@ -32858,6 +32859,12 @@ mod phase8_post_build_tests {
             &config,
             "openai/gpt-4o-mini",
             &event_bus,
+            // Phase 8 tail-2: crown jewel seeds the annotation on the
+            // target itself, so None → fall back to target_id in the
+            // helper. Real production flow (annotation on descendant)
+            // is covered by the new
+            // `annotation_on_descendant_updates_ancestor...` test.
+            None,
         )
         .await
         .expect("supervisor re_distill arm must succeed against mocked LLM");
@@ -33042,12 +33049,19 @@ mod phase8_post_build_tests {
         // run_re_distill_supervisor_arm). Testing at this layer isolates
         // the cascade_annotations channel from the cascade chain / work
         // item machinery already covered by the correction-path crown jewel.
+        // Phase 8 tail-2: annotation is seeded ON L1-TAIL (the target)
+        // itself — preserves the pre-tail-2 stale-check semantic where
+        // the target IS the annotated node. None → helper falls back to
+        // target_id. The new production path (annotations on
+        // DESCENDANTS) is covered by the new
+        // `annotation_on_descendant_updates_ancestor...` test below.
         let resolved = crate::pyramid::stale_helpers_upper::execute_supersession(
             "L1-TAIL",
             &db_path,
             "p8-tail",
             &config,
             "openai/gpt-4o-mini",
+            None,
         )
         .await
         .expect(
@@ -33079,6 +33093,433 @@ mod phase8_post_build_tests {
         );
         assert_eq!(post_headline, "TAIL updated headline");
         assert_eq!(post_bv, 2, "build_version must bump 1 → 2");
+    }
+
+    // ── Test 2b-prod: THE PRODUCTION-PATH CROWN JEWEL (Phase 8 tail-2).
+    //     Annotation on DESCENDANT updates ANCESTOR distilled via cascade.
+    // ──────────────────────────────────────────────────────────────────────
+    //
+    // This is THE test that proves the production routing fix. Pre-tail-2,
+    // `load_cascade_annotations_for_target(slug, ancestor_id)` queried
+    // `pyramid_annotations WHERE node_id = ancestor_id` — empty, because
+    // annotations live on the DESCENDANT the user wrote on, not on the
+    // ancestor. Non-correction annotations therefore hit a no-op manifest
+    // for 14/15 vocab types.
+    //
+    // The fix: `emit_annotation_observation_events` stamps
+    // `metadata_json.annotated_node_id = annotation.node_id` (the
+    // descendant) on every ancestor event. The supervisor arm reads the
+    // work item's observation_event_ids, parses that metadata, and passes
+    // the descendant id set through `execute_supersession` to
+    // `load_cascade_annotations_for_target`. Annotations on the descendant
+    // now reach the ancestor re-distill's prompt.
+    //
+    // Test shape (uses the REAL emission path, no test-only event writer):
+    //   1. Seed slug with L0-042 (child) + L1-007 (parent).
+    //   2. Insert `observation` annotation on L0-042.
+    //   3. Call the pub(crate) test-only wrapper around
+    //      `emit_annotation_observation_events` — writes the real
+    //      annotation_written event on L1-007 with metadata pointing at
+    //      L0-042. This IS the production emission path (pyramid/routes.rs).
+    //   4. Run compile: expect one role_bound work item targeting L1-007.
+    //   5. Execute the immediate-redistill chain against L1-007 → queues a
+    //      re_distill work item targeting L1-007 with observation_event_ids
+    //      threading the original event's id through.
+    //   6. Stand up a mockito server with AllOf body-matcher: the request
+    //      body MUST contain both the L0-042 annotation's content AND the
+    //      "PENDING ANNOTATIONS ON THIS NODE" section header. If
+    //      cascade_annotations loads empty (the pre-fix behavior), neither
+    //      string appears, mockito returns 501, the supervisor errors out,
+    //      the test fails loud.
+    //   7. Run `run_re_distill_supervisor_arm` with the work item's
+    //      observation_event_ids threaded in — same call shape the real
+    //      supervisor loop uses.
+    //   8. Assert L1-007's distilled / headline carry the mocked manifest's
+    //      new content AND build_version bumped 1 → 2.
+    //
+    // This test covers the gap Phase 8 wanderer flagged. Without it, the
+    // cascade channel ships green on test 2b (annotation-on-target, which
+    // uses the stale-check fallback) while silently no-op'ing for every
+    // real user annotation in production.
+    #[tokio::test]
+    async fn annotation_on_descendant_updates_ancestor_distilled_via_cascade_in_production_path() {
+        let _guard = test_lock();
+
+        // Annotation content strings — the LLM body matcher asserts both
+        // this string AND the prompt section header appear in the
+        // request body. If either is absent (because cascade_annotations
+        // loaded empty for the ancestor target) mockito returns 501.
+        let annotation_content =
+            "distinctive-descendant-annotation-string-xyzzy-cascade-prod-fix";
+        let annotation_type = "observation";
+
+        let mut server = mockito::Server::new_async().await;
+        let manifest_json = serde_json::json!({
+            "node_id": "L1-007",
+            "identity_changed": false,
+            "content_updates": {
+                "distilled": "NEW L1 distilled incorporates descendant observation annotation",
+                "headline": "L1-007 updated via descendant-annotation cascade"
+            },
+            "children_swapped": [],
+            "reason": "descendant annotation cascaded up to L1-007 (prod path)",
+            "build_version": 2
+        })
+        .to_string();
+
+        let content_re = regex::escape(annotation_content);
+        let _m = server
+            .mock("POST", "/chat/completions")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(content_re),
+                mockito::Matcher::Regex(
+                    "PENDING ANNOTATIONS ON THIS NODE".to_string(),
+                ),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openrouter_body(&manifest_json))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap().to_string();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            init_pyramid_db(&conn).unwrap();
+            vocab_entries::invalidate_cache();
+            create_slug(
+                &conn,
+                "p8-prod",
+                &ContentType::Code,
+                "/tmp/p8-prod",
+            )
+            .unwrap();
+            // Immediate-redistill binding: unconditional queue, no
+            // second LLM mock for a judge.
+            role_binding::set_binding(
+                &conn,
+                "p8-prod",
+                "cascade_handler",
+                role_binding::CASCADE_HANDLER_EXISTING_DEFAULT,
+            )
+            .unwrap();
+
+            // Two-layer tree: L1-007 (ancestor, the re-distill target) →
+            // L0-042 (descendant, where the annotation actually lives).
+            conn.execute(
+                "INSERT INTO pyramid_nodes
+                    (id, slug, depth, headline, distilled, self_prompt,
+                     topics, terms, decisions, dead_ends, children, parent_id,
+                     build_version, created_at)
+                 VALUES ('L1-007', 'p8-prod', 1, 'L1 old headline',
+                         'L1 old distilled', '', '[]', '[]', '[]', '[]',
+                         '[\"L0-042\"]', NULL, 1,
+                         datetime('now', '-1 hour'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pyramid_nodes
+                    (id, slug, depth, headline, distilled, self_prompt,
+                     topics, terms, decisions, dead_ends, children, parent_id,
+                     build_version, created_at)
+                 VALUES ('L0-042', 'p8-prod', 0, 'L0 headline',
+                         'L0 body content', '', '[]', '[]', '[]', '[]',
+                         '[]', 'L1-007', 1,
+                         datetime('now', '-1 hour'))",
+                [],
+            )
+            .unwrap();
+
+            // Insert the annotation on the DESCENDANT (not the ancestor).
+            // This is exactly how pyramid_annotations looks when a user
+            // writes an `observation` via the annotation route.
+            conn.execute(
+                "INSERT INTO pyramid_annotations
+                    (slug, node_id, annotation_type, content, question_context,
+                     author, created_at)
+                 VALUES (?1, 'L0-042', ?2, ?3, NULL,
+                         'p8-prod-tester', datetime('now'))",
+                rusqlite::params![
+                    "p8-prod",
+                    annotation_type,
+                    annotation_content,
+                ],
+            )
+            .unwrap();
+
+            drop(conn);
+        }
+
+        // Step 3: use the REAL emission path. This walks parent_id from
+        // L0-042 upward, emits one annotation_written event per ancestor,
+        // with metadata_json.annotated_node_id = "L0-042". The annotated
+        // node itself is skipped. For this tree (single ancestor L1-007)
+        // we get exactly one event, target = L1-007, carrying the
+        // "look at L0-042 for annotations" breadcrumb.
+        let ann_id: i64 = {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.query_row(
+                "SELECT id FROM pyramid_annotations
+                  WHERE slug = 'p8-prod' AND node_id = 'L0-042'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let ann = PyramidAnnotation {
+            id: ann_id,
+            slug: "p8-prod".to_string(),
+            node_id: "L0-042".to_string(),
+            annotation_type: AnnotationType::new(annotation_type),
+            content: annotation_content.to_string(),
+            question_context: None,
+            author: "p8-prod-tester".to_string(),
+            created_at: chrono::Utc::now()
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+        };
+        let writer_arc = std::sync::Arc::new(tokio::sync::Mutex::new(
+            Connection::open(&db_path).unwrap(),
+        ));
+        crate::pyramid::routes::emit_annotation_observation_events_test_only(
+            &writer_arc,
+            "p8-prod",
+            &ann,
+        )
+        .await
+        .expect("real emission path must write the ancestor event");
+
+        // Drop the writer lock before the compile reads from the DB on
+        // a fresh connection (WAL mode still needs serialized access on
+        // SQLite if the two connections use the same file).
+        drop(writer_arc);
+
+        // Verify the event landed on L1-007 (ancestor) with
+        // annotated_node_id = L0-042 in metadata — this IS the bug
+        // surface we're fixing. If this ever stops being true the
+        // routing fix unravels.
+        let (ev_target, ev_metadata): (String, String) = {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.query_row(
+                "SELECT target_node_id, metadata_json
+                   FROM dadbear_observation_events
+                  WHERE slug = 'p8-prod' AND event_type = 'annotation_written'",
+                [],
+                |r| Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get(1)?)),
+            )
+            .expect("exactly one ancestor event expected")
+        };
+        assert_eq!(
+            ev_target, "L1-007",
+            "event target_node_id must be the ANCESTOR (L1-007), not the \
+             annotated descendant — this is the routing gap the fix patches"
+        );
+        let md: serde_json::Value = serde_json::from_str(&ev_metadata).unwrap();
+        assert_eq!(
+            md["annotated_node_id"].as_str(), Some("L0-042"),
+            "metadata_json.annotated_node_id must be the DESCENDANT (L0-042) — \
+             the supervisor uses this to route the load_cascade query"
+        );
+
+        // Step 4: compile — produces one role_bound work item targeting
+        // L1-007. The work item row carries observation_event_ids
+        // pointing at the emitted event.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let res = dadbear_compiler::run_compilation_for_slug(
+                &conn, "p8-prod", None, None,
+            )
+            .unwrap();
+            assert_eq!(
+                res.items_compiled, 1,
+                "compile must produce one role_bound work item for L1-007"
+            );
+        }
+
+        // Step 5: execute the immediate-redistill chain — queues a
+        // re_distill work item targeting L1-007.
+        let config = mocked_llm_config(server.url()).await;
+        let state = {
+            let conn = Connection::open(&db_path).unwrap();
+            pyramid_state_with_llm_config(conn, config.clone())
+        };
+        let chain = chain_loader::load_chain_by_id(
+            role_binding::CASCADE_HANDLER_EXISTING_DEFAULT,
+            &state.chains_dir,
+        )
+        .expect("immediate-redistill chain must load");
+        // Thread the role_bound work_item_id so the chain can read
+        // observation_event_ids from it.
+        let rb_wi_id: String = {
+            let writer = state.writer.lock().await;
+            writer
+                .query_row(
+                    "SELECT id FROM dadbear_work_items
+                      WHERE slug = 'p8-prod' AND primitive = 'role_bound'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let inputs = serde_json::json!({
+            "work_item_id": rb_wi_id,
+            "target_node_id": "L1-007",
+            "layer": 1,
+            "reason": "descendant annotation cascade to L1",
+        });
+        chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p8-prod",
+            Some("L1-007"),
+            inputs,
+        )
+        .await
+        .expect("immediate-redistill chain must run end-to-end");
+
+        // Step 6: find the queued re_distill work item + its
+        // observation_event_ids. If the chain didn't propagate them,
+        // the supervisor can't route cascade_annotations and the test
+        // will fail at the LLM mock.
+        let (re_wi_id, re_target_id, re_layer, re_obs_ids):
+            (String, String, i64, Option<String>) = {
+            let writer = state.writer.lock().await;
+            writer
+                .query_row(
+                    "SELECT id, target_id, layer, observation_event_ids
+                       FROM dadbear_work_items
+                      WHERE slug = 'p8-prod' AND primitive = 're_distill'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .expect("chain must have queued one re_distill work item")
+        };
+        assert_eq!(re_target_id, "L1-007", "re_distill target is ancestor");
+        assert_eq!(re_layer, 1);
+        // Phase 8 tail-2 invariant: the queued re_distill work item
+        // MUST carry forward the triggering role_bound's
+        // observation_event_ids. Pre-fix this was always "[]" and the
+        // supervisor couldn't route cascade_annotations.
+        let obs_ids_str = re_obs_ids.as_deref().unwrap_or("[]");
+        assert_ne!(
+            obs_ids_str, "[]",
+            "re_distill work item MUST carry forward observation_event_ids \
+             from the role_bound trigger — got empty array which means the \
+             chain-side propagation in queue_re_distill_for_target broke"
+        );
+        let parsed_ids: Vec<i64> = serde_json::from_str(obs_ids_str)
+            .expect("observation_event_ids must be a valid JSON array");
+        assert!(
+            !parsed_ids.is_empty(),
+            "propagated observation_event_ids must be non-empty; got: {obs_ids_str}"
+        );
+
+        // Move to previewed (supervisor CAS precondition).
+        {
+            let writer = state.writer.lock().await;
+            writer
+                .execute(
+                    "UPDATE dadbear_work_items SET state = 'previewed'
+                      WHERE id = ?1",
+                    rusqlite::params![re_wi_id],
+                )
+                .unwrap();
+        }
+
+        // Baseline: L1-007 has its pre-re-distill state.
+        let (pre_distilled, pre_bv): (String, i64) = {
+            let writer = state.writer.lock().await;
+            writer
+                .query_row(
+                    "SELECT distilled, build_version
+                       FROM pyramid_nodes
+                      WHERE slug = 'p8-prod' AND id = 'L1-007'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(pre_distilled, "L1 old distilled");
+        assert_eq!(pre_bv, 1);
+
+        // Step 7: invoke the supervisor arm helper WITH the work
+        // item's observation_event_ids threaded through — this is the
+        // exact shape the real supervisor loop passes (dadbear_supervisor
+        // line 777 after the Phase 8 tail-2 patch).
+        let event_bus = std::sync::Arc::new(
+            crate::pyramid::event_bus::BuildEventBus::new(),
+        );
+        crate::pyramid::dadbear_supervisor::run_re_distill_supervisor_arm(
+            &db_path,
+            &re_wi_id,
+            "p8-prod",
+            &re_target_id,
+            re_layer,
+            "re_distill",
+            &config,
+            "openai/gpt-4o-mini",
+            &event_bus,
+            re_obs_ids.as_deref(),
+        )
+        .await
+        .expect(
+            "supervisor re_distill arm must succeed against mocked LLM — \
+             if it fails with UnmatchedRequest / 501, the descendant \
+             annotation content did NOT reach the ancestor re-distill \
+             prompt (cascade routing is broken)",
+        );
+
+        // Step 8: L1-007 (the ANCESTOR, not the annotated descendant)
+        // MUST carry the mocked manifest's new content.
+        let (post_distilled, post_headline, post_bv): (String, String, i64) = {
+            let writer = state.writer.lock().await;
+            writer
+                .query_row(
+                    "SELECT distilled, headline,
+                            COALESCE(build_version, 1)
+                       FROM pyramid_nodes
+                      WHERE slug = 'p8-prod' AND id = 'L1-007'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        };
+        assert!(
+            post_distilled.contains(
+                "NEW L1 distilled incorporates descendant observation"
+            ),
+            "ancestor L1-007 distilled MUST carry the manifest update \
+             triggered by a descendant-only annotation — got: {post_distilled}"
+        );
+        assert!(
+            post_headline.contains("descendant-annotation cascade"),
+            "ancestor L1-007 headline must reflect the manifest; got: {post_headline}"
+        );
+        assert_eq!(
+            post_bv, 2,
+            "ancestor build_version must bump 1 → 2 on the re-distill"
+        );
+
+        // Descendant L0-042 should NOT have been touched (no re_distill
+        // targets L0 in this flow — the annotated node is the source of
+        // cascade content, not the re-distill target).
+        let (l0_distilled, l0_bv): (String, i64) = {
+            let writer = state.writer.lock().await;
+            writer
+                .query_row(
+                    "SELECT distilled, build_version
+                       FROM pyramid_nodes
+                      WHERE slug = 'p8-prod' AND id = 'L0-042'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(l0_distilled, "L0 body content");
+        assert_eq!(l0_bv, 1);
     }
 
     // ── Test 2c: cascade_annotations watermark — prior re-distill filters
@@ -33153,7 +33594,7 @@ mod phase8_post_build_tests {
         // uses node.created_at instead), both rows would come back.
         let out = crate::pyramid::stale_helpers_upper::
             public_load_cascade_annotations_for_target_test_only(
-                &conn, "p8-wm", "L1-WM",
+                &conn, "p8-wm", "L1-WM", None,
             )
             .unwrap();
         assert_eq!(
@@ -33200,7 +33641,7 @@ mod phase8_post_build_tests {
 
         let out = crate::pyramid::stale_helpers_upper::
             public_load_cascade_annotations_for_target_test_only(
-                &conn, "p8-cap", "L1-CAP",
+                &conn, "p8-cap", "L1-CAP", None,
             )
             .unwrap();
         assert_eq!(

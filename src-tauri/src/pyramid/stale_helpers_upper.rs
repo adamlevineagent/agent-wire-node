@@ -2136,13 +2136,42 @@ pub(crate) async fn persist_change_manifest_with_bus(
 ///
 /// Returns the live canonical node ID after the update — same as input in
 /// the normal case, the new id in the identity-change case.
+///
+/// **Phase 8 tail-2 — production annotation routing.**
+///
+/// `annotated_node_ids` lets annotation-triggered re-distill callers pass
+/// the DESCENDANT node(s) the annotation lives on. The change-manifest
+/// prompt's `cascade_annotations` section is then populated from
+/// annotations on those descendants — not from annotations on the
+/// re-distill target (which is an ANCESTOR in the production path and
+/// holds no annotations of its own).
+///
+/// Stale-check callers (L0 file-change, node stale sweep) pass `None` —
+/// annotations are queried on the target itself, preserving the legacy
+/// semantics where the stale node IS the annotated node.
 pub async fn execute_supersession(
     node_id: &str,
     db_path: &str,
     slug: &str,
     base_config: &LlmConfig,
     model: &str,
+    annotated_node_ids: Option<Vec<String>>,
 ) -> Result<String> {
+    // FIXME(phase-9): execute_supersession bypasses LockManager::write(slug)
+    // that other supersession sites honor. The in-place update is currently
+    // bounded by `build_version` compare-and-swap (optimistic), which is
+    // safe against lost writes but not architecturally aligned with the
+    // lock contract. Phase 9 hardening should wrap this body in a
+    // LockManager::write(slug) guard so the re_distill arm participates
+    // in the same serialization order as stale-check callers.
+    //
+    // FIXME(phase-9): annotation-arrival-during-dispatch race — if an
+    // annotation arrives between the work-item's compile (when
+    // observation_event_ids is snapshotted) and the LLM apply (when
+    // cascade_annotations is read), the new annotation is NOT included
+    // in THIS re-distill and WILL be picked up by the NEXT. Narrow
+    // window; acceptable for tail-2. Phase 9 should tighten via
+    // watermark-by-max-annotation-id or re-emit-after-applied semantics.
     let requested_node_id = node_id.to_string();
     let resolved_node_id = tokio::task::spawn_blocking({
         let db = db_path.to_string();
@@ -2195,6 +2224,15 @@ pub async fn execute_supersession(
     // is `Clone`-only via its current shape — simpler to add a second
     // blocking query than to widen SupersessionNodeContext.
     //
+    // Phase 8 tail-2 — production routing fix. When the caller passes
+    // `annotated_node_ids` (the set of descendants whose annotations
+    // triggered this re-distill), annotations are loaded for THOSE nodes,
+    // not for `resolved_node_id` itself. In production the target is an
+    // ancestor and holds no annotations of its own — pre-tail-2 we were
+    // loading an empty set and producing no-op manifests for 14/15
+    // annotation types. See `emit_annotation_observation_events` for the
+    // emission side that stamps `metadata_json.annotated_node_id`.
+    //
     // Failure here is NOT fatal: if the annotation read errors (e.g.
     // schema skew during migration, locked DB race), we log and fall
     // back to an empty list. The re-distill still runs, just without the
@@ -2204,6 +2242,7 @@ pub async fn execute_supersession(
         let db = db_owned.clone();
         let nid = nid.clone();
         let s = s.clone();
+        let annotated_ids_opt = annotated_node_ids.clone();
         move || -> Vec<CascadeAnnotation> {
             let conn = match super::db::open_pyramid_connection(Path::new(&db)) {
                 Ok(c) => c,
@@ -2212,7 +2251,14 @@ pub async fn execute_supersession(
                     return Vec::new();
                 }
             };
-            match load_cascade_annotations_for_target(&conn, &s, &nid) {
+            let annotated_ids_ref: Option<&[String]> =
+                annotated_ids_opt.as_deref();
+            match load_cascade_annotations_for_target(
+                &conn,
+                &s,
+                &nid,
+                annotated_ids_ref,
+            ) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(
@@ -2826,20 +2872,40 @@ fn load_supersession_node_context(
 fn load_cascade_annotations_for_target(
     conn: &Connection,
     slug: &str,
-    node_id: &str,
+    target_node_id: &str,
+    annotated_node_ids: Option<&[String]>,
 ) -> Result<Vec<CascadeAnnotation>> {
-    // Most recent re-distill applied_at (watermark ceiling).
+    // Phase 8 tail-2 — production routing fix.
+    //
+    // `annotated_node_ids` decouples WHERE-the-annotations-live from
+    // WHICH-node-is-being-re-distilled. In production the annotated
+    // node is a DESCENDANT; `emit_annotation_observation_events` emits
+    // `annotation_written` on the ANCESTORS (each ancestor becomes a
+    // re_distill target) with `metadata_json.annotated_node_id` pointing
+    // at the descendant the user wrote on. Pre-tail-2, this helper
+    // queried annotations on `target_node_id` itself — empty for every
+    // ancestor re-distill, so the LLM saw no annotation content and
+    // produced a no-op manifest. The fix is to accept the set of
+    // annotated descendants explicitly and query `node_id IN (...)`.
+    //
+    // `None` (stale-check / test callers) → fall back to target_node_id
+    // (preserves the legacy semantics where the stale node IS the
+    // annotated node).
+
+    // Most recent re-distill applied_at (watermark ceiling) on the TARGET
+    // — NOT on the annotated descendants. Each ancestor's watermark
+    // advances when IT re-distills, independent of other ancestors.
     let last_redistill_at: Option<String> = conn
         .query_row(
             "SELECT MAX(applied_at) FROM dadbear_result_applications
               WHERE slug = ?1 AND target_id = ?2
                 AND action LIKE 're_distilled:%'",
-            rusqlite::params![slug, node_id],
+            rusqlite::params![slug, target_node_id],
             |row| row.get::<_, Option<String>>(0),
         )
         .unwrap_or(None);
 
-    // Fallback: node's created_at when no prior re-distill exists.
+    // Fallback: target's created_at when no prior re-distill exists.
     let watermark: String = match last_redistill_at {
         Some(ts) => ts,
         None => conn
@@ -2847,10 +2913,46 @@ fn load_cascade_annotations_for_target(
                 "SELECT COALESCE(created_at, datetime('now','-100 years'))
                    FROM pyramid_nodes
                   WHERE slug = ?1 AND id = ?2",
-                rusqlite::params![slug, node_id],
+                rusqlite::params![slug, target_node_id],
                 |row| row.get::<_, String>(0),
             )
             .unwrap_or_else(|_| "1970-01-01 00:00:00".to_string()),
+    };
+
+    // Resolve the set of node_ids whose annotations we load. Production
+    // annotation-triggered re-distill passes the DESCENDANT(s) the
+    // annotation lives on; stale-check / test callers pass None and we
+    // fall back to the target itself (backward-compat).
+    //
+    // Dedupe + drop empties before querying: the supervisor may pass the
+    // same annotated_node_id for multiple observation events that
+    // coalesced into one work item.
+    let resolved_annotation_node_ids: Vec<String> = match annotated_node_ids {
+        Some(ids) => {
+            let mut seen = std::collections::BTreeSet::new();
+            for id in ids {
+                let trimmed = id.trim();
+                if !trimmed.is_empty() {
+                    seen.insert(trimmed.to_string());
+                }
+            }
+            if seen.is_empty() {
+                // Loud fallback: caller passed Some(&[]) or Some(all-empty).
+                // The annotated_node_ids argument exists so the supervisor
+                // can route annotation content to ancestors; an empty set
+                // implies a metadata-loading bug upstream.
+                warn!(
+                    slug = %slug,
+                    target_node_id = %target_node_id,
+                    "cascade_annotations: annotated_node_ids passed as empty set \
+                     — falling back to target_node_id (likely a metadata-loading bug)"
+                );
+                vec![target_node_id.to_string()]
+            } else {
+                seen.into_iter().collect()
+            }
+        }
+        None => vec![target_node_id.to_string()],
     };
 
     // `>=` not `>` on the watermark comparison: SQLite `datetime('now')`
@@ -2864,28 +2966,47 @@ fn load_cascade_annotations_for_target(
     // Prompt cap: pull `cap + 1` so we can detect overflow without a
     // second COUNT query, then emit a loud observation event carrying
     // the exact number skipped. The cap itself stays prompt-bounded.
+    //
+    // IN-clause is assembled dynamically — rusqlite doesn't take slice
+    // binds for `IN`, so we build `?2, ?3, ...` placeholders and push
+    // params in matching order (slug=?1, ids=?2..N+1, watermark=?N+2,
+    // limit=?N+3).
     let probe = CASCADE_ANNOTATION_PROMPT_CAP.saturating_add(1);
-    let mut stmt = conn.prepare(
+    let placeholders: String = (0..resolved_annotation_node_ids.len())
+        .map(|i| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let watermark_idx = resolved_annotation_node_ids.len() + 2;
+    let limit_idx = watermark_idx + 1;
+    let sql = format!(
         "SELECT id, annotation_type, author, content, question_context,
                 created_at
            FROM pyramid_annotations
-          WHERE slug = ?1 AND node_id = ?2 AND created_at >= ?3
+          WHERE slug = ?1 AND node_id IN ({placeholders}) AND created_at >= ?{watermark_idx}
           ORDER BY created_at ASC, id ASC
-          LIMIT ?4",
-    )?;
-    let rows = stmt.query_map(
-        rusqlite::params![slug, node_id, watermark, probe as i64],
-        |row| {
-            Ok(CascadeAnnotation {
-                id: row.get(0)?,
-                annotation_type: row.get(1)?,
-                author: row.get(2)?,
-                content: row.get(3)?,
-                question_context: row.get(4)?,
-                created_at: row.get(5)?,
-            })
-        },
-    )?;
+          LIMIT ?{limit_idx}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+        Vec::with_capacity(resolved_annotation_node_ids.len() + 3);
+    params.push(Box::new(slug.to_string()));
+    for id in &resolved_annotation_node_ids {
+        params.push(Box::new(id.clone()));
+    }
+    params.push(Box::new(watermark.clone()));
+    params.push(Box::new(probe as i64));
+    let param_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt.query_map(param_refs.as_slice(), |row| {
+        Ok(CascadeAnnotation {
+            id: row.get(0)?,
+            annotation_type: row.get(1)?,
+            author: row.get(2)?,
+            content: row.get(3)?,
+            question_context: row.get(4)?,
+            created_at: row.get(5)?,
+        })
+    })?;
     let mut out = Vec::new();
     for r in rows {
         if let Ok(a) = r {
@@ -2903,14 +3024,24 @@ fn load_cascade_annotations_for_target(
         out.truncate(CASCADE_ANNOTATION_PROMPT_CAP);
         // Do a second COUNT — cheap given the same indexed predicate —
         // so the event carries the true skipped total rather than a
-        // floor-only estimate.
+        // floor-only estimate. Reuses the same resolved id set.
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM pyramid_annotations
+              WHERE slug = ?1 AND node_id IN ({placeholders}) AND created_at >= ?{watermark_idx}"
+        );
+        let mut count_params: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(resolved_annotation_node_ids.len() + 2);
+        count_params.push(Box::new(slug.to_string()));
+        for id in &resolved_annotation_node_ids {
+            count_params.push(Box::new(id.clone()));
+        }
+        count_params.push(Box::new(watermark.clone()));
+        let count_param_refs: Vec<&dyn rusqlite::ToSql> =
+            count_params.iter().map(|p| p.as_ref()).collect();
         let total: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pyramid_annotations
-                  WHERE slug = ?1 AND node_id = ?2 AND created_at >= ?3",
-                rusqlite::params![slug, node_id, watermark],
-                |row| row.get::<_, i64>(0),
-            )
+            .query_row(&count_sql, count_param_refs.as_slice(), |row| {
+                row.get::<_, i64>(0)
+            })
             .unwrap_or((CASCADE_ANNOTATION_PROMPT_CAP as i64) + 1);
         let skipped = total - (CASCADE_ANNOTATION_PROMPT_CAP as i64);
         let metadata = serde_json::json!({
@@ -2918,6 +3049,7 @@ fn load_cascade_annotations_for_target(
             "total_eligible": total,
             "skipped": skipped,
             "watermark": watermark,
+            "annotated_node_ids": resolved_annotation_node_ids,
         })
         .to_string();
         // Best-effort: a failure to write the observation row must not
@@ -2931,13 +3063,14 @@ fn load_cascade_annotations_for_target(
             None,
             None,
             None,
-            Some(node_id),
+            Some(target_node_id),
             None,
             Some(&metadata),
         );
         warn!(
             slug = %slug,
-            node_id = %node_id,
+            target_node_id = %target_node_id,
+            annotated_node_ids = ?resolved_annotation_node_ids,
             cap = CASCADE_ANNOTATION_PROMPT_CAP,
             total_eligible = total,
             skipped = skipped,
@@ -2971,9 +3104,10 @@ const CASCADE_ANNOTATION_PROMPT_CAP: usize = 50;
 pub(crate) fn public_load_cascade_annotations_for_target_test_only(
     conn: &Connection,
     slug: &str,
-    node_id: &str,
+    target_node_id: &str,
+    annotated_node_ids: Option<&[String]>,
 ) -> Result<Vec<CascadeAnnotation>> {
-    load_cascade_annotations_for_target(conn, slug, node_id)
+    load_cascade_annotations_for_target(conn, slug, target_node_id, annotated_node_ids)
 }
 
 /// Phase 8 tail verifier: test-only wrapper exposing the prompt-sanitizer

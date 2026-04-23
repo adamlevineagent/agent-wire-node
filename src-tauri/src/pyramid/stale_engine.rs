@@ -1031,8 +1031,11 @@ pub async fn drain_and_dispatch(
                     }
 
                     for node_id in &node_ids {
+                        // Stale-check L0 file_change: annotations (if any)
+                        // live on this target — pass None so the helper
+                        // queries annotations on target_id itself.
                         if let Err(e) = stale_helpers_upper::execute_supersession(
-                            node_id, &db, &s, &cfg, &mdl,
+                            node_id, &db, &s, &cfg, &mdl, None,
                         ).await {
                             error!(slug = %s, target = %result.target_id, node_id = %node_id, error = %e, "execute_supersession (L0 file_change) failed");
                         } else {
@@ -1177,8 +1180,11 @@ pub async fn drain_and_dispatch(
             let mut results = results;
             for result in &mut results {
                 if result.stale == 1 {
+                    // Stale-check node-sweep: same rationale as L0
+                    // branch above — annotations, if any, live on
+                    // target; None → fall back to target_id.
                     if let Err(e) = stale_helpers_upper::execute_supersession(
-                        &result.target_id, &db, &s, &cfg, &mdl,
+                        &result.target_id, &db, &s, &cfg, &mdl, None,
                     ).await {
                         error!(slug = %s, target = %result.target_id, error = %e, "execute_supersession failed");
                     } else {

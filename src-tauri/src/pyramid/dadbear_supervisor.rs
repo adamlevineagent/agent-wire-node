@@ -774,6 +774,12 @@ impl DadbearSupervisor {
                     .as_deref()
                     .unwrap_or(&item.model_tier)
                     .to_string();
+                // Phase 8 tail-2: thread the work item's
+                // observation_event_ids into the arm so it can resolve
+                // the annotated descendant node id set from the event
+                // metadata emitted at routes.rs:
+                // emit_annotation_observation_events.
+                let obs_ids = item.observation_event_ids.clone();
                 run_re_distill_supervisor_arm(
                     &db_path,
                     &wi_id,
@@ -784,6 +790,7 @@ impl DadbearSupervisor {
                     &config,
                     &model,
                     &event_bus,
+                    obs_ids.as_deref(),
                 )
                 .await?;
                 return Ok(());
@@ -1228,12 +1235,18 @@ impl DadbearSupervisor {
                         let model = item.resolved_model_id.as_deref()
                             .unwrap_or(&item.model_tier);
 
+                        // Stale-check path: annotations (if any) live on
+                        // THIS target, not on a descendant, so pass None
+                        // and let load_cascade_annotations_for_target
+                        // fall back to `target_id`. This is the legacy
+                        // semantic the helper preserves.
                         match crate::pyramid::stale_helpers_upper::execute_supersession(
                             &target_id,
                             &self.db_path,
                             &slug,
                             &config,
                             model,
+                            None,
                         )
                         .await
                         {
@@ -2314,6 +2327,28 @@ fn emit_state_changed(
 /// Failed re-distills leave the watermark where it was, so the next run
 /// re-includes the same annotations — no silent loss of annotation
 /// feedback on retry.
+/// Phase 8 tail-2 — production routing fix.
+///
+/// `observation_event_ids_json` is the work item's `observation_event_ids`
+/// column (a JSON array like `[12,13]`). Each referenced event is a
+/// `dadbear_observation_events` row whose `metadata_json.annotated_node_id`
+/// records the DESCENDANT the annotation was written on. The supervisor
+/// collects those descendant ids and passes them to `execute_supersession`
+/// as `annotated_node_ids` so `load_cascade_annotations_for_target`
+/// queries annotations on the descendants (where they live) rather than
+/// on the re-distill target (an ancestor, which holds none).
+///
+/// When a single annotation rolls up to multiple ancestors the compiler
+/// coalesces them into one work item per ancestor, each with the SAME
+/// `annotated_node_id`. When multiple annotations on multiple descendants
+/// all roll up to ONE ancestor, that ancestor's work item has multiple
+/// `observation_event_ids`, each with a different `annotated_node_id` —
+/// this helper unions them.
+///
+/// Absent metadata → loud `RAISE EXCEPTION`-style log + empty list so the
+/// routing gap is visible (feedback_loud_deferrals). `None` passes through
+/// to the helper's backward-compat fallback (annotations queried on the
+/// target itself), which is what stale-check callers want.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_re_distill_supervisor_arm(
     db_path: &str,
@@ -2325,6 +2360,7 @@ pub(crate) async fn run_re_distill_supervisor_arm(
     config: &LlmConfig,
     model: &str,
     event_bus: &Arc<BuildEventBus>,
+    observation_event_ids_json: Option<&str>,
 ) -> Result<()> {
     if target_id.is_empty() {
         tracing::warn!(
@@ -2354,12 +2390,128 @@ pub(crate) async fn run_re_distill_supervisor_arm(
         return Ok(());
     }
 
+    // Phase 8 tail-2 — resolve the annotated descendant id set from the
+    // work item's observation_event_ids column. Read every referenced
+    // event row, parse metadata_json, collect `annotated_node_id`, union
+    // into the set the change-manifest prompt should pull annotations
+    // from.
+    //
+    // None is returned ONLY when the work item has no observation event
+    // ids at all (e.g. hand-enqueued via the test-only stale path). In
+    // that case the helper falls back to target_id. When event ids ARE
+    // present but NONE of them carry a valid annotated_node_id we
+    // return Some(empty) and let load_cascade_annotations_for_target
+    // log loudly + fall back — this is the "loud deferral" the memory
+    // feedback wants.
+    let annotated_node_ids: Option<Vec<String>> = if let Some(ids_json) =
+        observation_event_ids_json
+    {
+        let db_path_read = db_path.to_string();
+        let slug_read = slug.to_string();
+        let ids_json_owned = ids_json.to_string();
+        let target_id_read = target_id.to_string();
+        let wi_id_read = wi_id.to_string();
+        tokio::task::spawn_blocking(move || -> Option<Vec<String>> {
+            let event_ids: Vec<i64> =
+                serde_json::from_str(&ids_json_owned).unwrap_or_default();
+            if event_ids.is_empty() {
+                // No events on this work item at all — fall through to
+                // target_id via None.
+                tracing::debug!(
+                    work_item_id = %wi_id_read,
+                    slug = %slug_read,
+                    "re_distill: no observation_event_ids on work item — \
+                     cascade_annotations will fall back to target_id"
+                );
+                return None;
+            }
+            let conn = match Connection::open(&db_path_read) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        work_item_id = %wi_id_read,
+                        "re_distill: failed to open DB for annotated_node_id lookup \
+                         — falling back to target_id"
+                    );
+                    return None;
+                }
+            };
+            let mut seen = std::collections::BTreeSet::new();
+            for ev_id in &event_ids {
+                let md: Option<Option<String>> = conn
+                    .query_row(
+                        "SELECT metadata_json FROM dadbear_observation_events
+                          WHERE slug = ?1 AND id = ?2",
+                        params![slug_read, ev_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .ok();
+                let Some(Some(md_str)) = md else {
+                    // Event not found or metadata_json null. A loud
+                    // log — this is the only signal we'll see that the
+                    // routing metadata got lost between emit + dispatch.
+                    tracing::warn!(
+                        work_item_id = %wi_id_read,
+                        event_id = %ev_id,
+                        slug = %slug_read,
+                        "re_distill: observation event has no metadata_json — \
+                         cannot extract annotated_node_id"
+                    );
+                    continue;
+                };
+                let parsed: Result<serde_json::Value, _> =
+                    serde_json::from_str(&md_str);
+                let Ok(val) = parsed else {
+                    tracing::warn!(
+                        work_item_id = %wi_id_read,
+                        event_id = %ev_id,
+                        slug = %slug_read,
+                        "re_distill: observation event metadata_json is not \
+                         valid JSON — cannot extract annotated_node_id"
+                    );
+                    continue;
+                };
+                if let Some(nid) =
+                    val.get("annotated_node_id").and_then(|v| v.as_str())
+                {
+                    let trimmed = nid.trim();
+                    if !trimmed.is_empty() {
+                        seen.insert(trimmed.to_string());
+                    }
+                }
+            }
+            if seen.is_empty() {
+                // Events exist but none carried annotated_node_id —
+                // return Some(empty) so the helper logs the loud
+                // warning + falls back. This is the "loud deferral"
+                // case, NOT the quiet "no events at all" fallback.
+                tracing::warn!(
+                    work_item_id = %wi_id_read,
+                    slug = %slug_read,
+                    target_id = %target_id_read,
+                    event_count = event_ids.len(),
+                    "re_distill: no annotated_node_id found in any observation \
+                     event metadata — cascade_annotations will fall back loudly"
+                );
+                Some(Vec::new())
+            } else {
+                Some(seen.into_iter().collect())
+            }
+        })
+        .await
+        .unwrap_or(None)
+    } else {
+        None
+    };
+
     let supersession_result = crate::pyramid::stale_helpers_upper::execute_supersession(
         target_id,
         db_path,
         slug,
         config,
         model,
+        annotated_node_ids,
     )
     .await;
 

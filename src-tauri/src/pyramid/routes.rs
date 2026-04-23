@@ -4515,6 +4515,24 @@ async fn emit_annotation_observation_events(
     Ok(())
 }
 
+/// Phase 8 tail-2 — test-only wrapper exposing
+/// `emit_annotation_observation_events` so the cross-module integration
+/// test in `db.rs::phase8_post_build_tests` can drive the REAL emission
+/// path (walks parent_id chain, stamps `metadata_json.annotated_node_id`
+/// = annotation.node_id, skips the annotated node itself) rather than a
+/// test-only event writer that can silently drift from the production
+/// shape. `#[cfg(test)]` gated so it cannot leak into production API
+/// surface.
+#[cfg(test)]
+#[doc(hidden)]
+pub(crate) async fn emit_annotation_observation_events_test_only(
+    writer: &Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+    slug: &str,
+    annotation: &PyramidAnnotation,
+) -> anyhow::Result<()> {
+    emit_annotation_observation_events(writer, slug, annotation).await
+}
+
 /// Background hook that runs after an annotation is saved. Phase 6c-B
 /// flipped this from an 11-variant `AnnotationType` match to vocab-driven
 /// dispatch: the vocabulary registry is now the source of truth for which

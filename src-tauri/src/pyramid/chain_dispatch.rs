@@ -813,14 +813,48 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 "[mechanical] queue_re_distill_for_target slug={} target={} layer={} reason={}",
                 ctx.slug, target_node_id, layer, reason
             );
+            // Phase 8 tail-2: propagate observation_event_ids from the
+            // triggering (role_bound) work item onto the queued
+            // re_distill. This is the routing breadcrumb the supervisor
+            // arm uses to resolve `annotated_node_id` metadata when it
+            // calls `execute_supersession(..., annotated_node_ids=Some)`.
+            // Pre-tail-2 this field was hard-coded to "[]", so the
+            // supervisor had no way to find the descendant annotation —
+            // the re-distill target (an ancestor) holds no annotations
+            // of its own and the prompt's cascade_annotations section
+            // was empty, producing no-op manifests for 14/15 annotation
+            // types. Carrying the event ids forward closes the routing
+            // gap the Phase 8 wanderer flagged.
+            let triggering_wi_id = input
+                .get("work_item_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             let wi_id = format!("wi-{}", uuid::Uuid::new_v4());
             let conn_guard = ctx.db_writer.lock().await;
+            let propagated_obs_ids: String = if let Some(trig_id) =
+                triggering_wi_id.as_deref()
+            {
+                let obs_ids: Option<String> = conn_guard
+                    .query_row(
+                        "SELECT observation_event_ids FROM dadbear_work_items WHERE id = ?1",
+                        rusqlite::params![trig_id],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                match obs_ids {
+                    Some(s) if !s.trim().is_empty() => s,
+                    _ => "[]".to_string(),
+                }
+            } else {
+                "[]".to_string()
+            };
             let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
             let epoch_id = format!("epoch-chain-{}", uuid::Uuid::new_v4());
             let batch_id = format!("batch-chain-{}", uuid::Uuid::new_v4());
             let metadata = serde_json::json!({
                 "queued_by_chain": "starter-chain",
                 "reason": reason,
+                "triggering_work_item_id": triggering_wi_id,
             });
             conn_guard.execute(
                 "INSERT INTO dadbear_work_items
@@ -843,7 +877,7 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                     "",                 // ?10 user_prompt
                     "mid",              // ?11 model_tier
                     metadata.to_string(), // ?12 result_json
-                    "[]",               // ?13 observation_event_ids
+                    propagated_obs_ids, // ?13 observation_event_ids
                     now,                // ?14 compiled_at
                     "compiled",         // ?15 state
                     now,                // ?16 state_changed_at

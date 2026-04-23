@@ -13349,10 +13349,30 @@ pub async fn execute_chain_for_target(
         //
         // Caller-set / upstream-preserved target_node_id always wins — we
         // only insert when absent, matching the initial-input merge semantics.
+        //
+        // Phase 8 tail-2: same rationale for `work_item_id`. The chain's
+        // `queue_re_distill_for_target` mechanical primitive reads
+        // `work_item_id` from input to propagate observation_event_ids
+        // onto the queued re_distill row. Step 1 output
+        // (`{emitted: true, event_id: N}`) drops `work_item_id`, so
+        // without this re-merge step 2 loses the breadcrumb and the
+        // descendant annotation never reaches the ancestor re-distill
+        // prompt. Identical pattern to target_node_id above — initial
+        // input is the authority, per-step re-merge fills the gap when
+        // the prior step's output doesn't echo it.
         if let Value::Object(ref mut map) = resolved_input {
             if let Some(tid) = target_id {
                 map.entry("target_node_id".to_string())
                     .or_insert_with(|| Value::String(tid.to_string()));
+            }
+            if let Some(initial_wi_id) = initial_input
+                .get("work_item_id")
+                .and_then(|v| v.as_str())
+            {
+                map.entry("work_item_id".to_string())
+                    .or_insert_with(|| {
+                        Value::String(initial_wi_id.to_string())
+                    });
             }
         }
 
