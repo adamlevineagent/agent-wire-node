@@ -25625,5 +25625,212 @@ mod phase6b_post_build_tests {
              accept chains that use it"
         );
     }
+
+    // ── Verifier fix: depth guard survives intra-chain step output threading ─
+    //
+    // Regression coverage for the bug where `_sub_chain_depth` rode only on
+    // the step's input envelope. A multi-step sub-chain whose intermediate
+    // step produces output that omits the depth field would reset the
+    // cycle-guard counter to 0 at the next `call_starter_chain`. The fix is
+    // to populate `dispatch_ctx.sub_chain_depth` from the initial input so
+    // the ctx (which does NOT rotate with per-step outputs) carries depth
+    // for the lifetime of the chain run. Here we invoke execute_chain_for_target
+    // directly with an envelope at MAX_SUB_CHAIN_DEPTH and prove the dispatched
+    // `call_starter_chain` still sees the ctx-depth and raises.
+    #[tokio::test]
+    async fn call_starter_chain_depth_guard_rides_ctx_across_output_threading() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p6b_ctx", &ContentType::Code, "/tmp/p6b_ctx").unwrap();
+        let state = pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        // Single-step parent chain. `step.input` is an object that DOES NOT
+        // include `_sub_chain_depth` — so any depth must come from the
+        // dispatch_ctx (seeded by the top-level `inputs` envelope). Without
+        // the verifier fix, ctx_depth=0 + input_depth=0 → guard resets.
+        let parent_step = ChainStep {
+            name: "call_sub".into(),
+            primitive: "custom".into(),
+            mechanical: true,
+            rust_function: Some("call_starter_chain".into()),
+            input: Some(serde_json::json!({
+                "chain_id": "starter-evidence-tester",
+                "input": {"claim": "x", "evidence": []}
+            })),
+            ..Default::default()
+        };
+        let chain = minimal_chain_with_steps("test-ctx-depth-survives", vec![parent_step]);
+
+        // Top-level inputs envelope carries the depth at MAX. The verifier
+        // fix reads this once at the top of execute_chain_for_target and
+        // pins it on dispatch_ctx.sub_chain_depth.
+        let err = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p6b_ctx",
+            None,
+            serde_json::json!({"_sub_chain_depth": chain_dispatch::MAX_SUB_CHAIN_DEPTH}),
+        )
+        .await
+        .expect_err(
+            "depth-guard must fire on ctx.sub_chain_depth alone — \
+             envelope depth is not re-injected into step.input literals",
+        );
+
+        let msg = err.to_string() + " " + &err.root_cause().to_string();
+        assert!(
+            msg.to_lowercase().contains("depth")
+                || msg.contains("MAX_SUB_CHAIN_DEPTH")
+                || msg.contains("recursion"),
+            "ctx-depth guard error must still be the depth-guard message: {}", msg,
+        );
+    }
+
+    // ── Verifier fix: non-object `input` raises loud, not silent-drop ──────
+    //
+    // The pre-fix code went `input.get("input").cloned().unwrap_or_else(|| {})`
+    // which retained non-object values verbatim; the downstream
+    // `Value::Object(ref mut map)` block then silently no-op'd, leaving the
+    // cycle-depth + target_id stamping un-applied. Feedback_loud_deferrals:
+    // a typed envelope bug MUST fail at first run.
+    #[tokio::test]
+    async fn call_starter_chain_rejects_non_object_input_envelope() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p6b_badinput", &ContentType::Code, "/tmp/p6b_badinput").unwrap();
+        let state = pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        let parent_step = ChainStep {
+            name: "bad_input_envelope".into(),
+            primitive: "custom".into(),
+            mechanical: true,
+            rust_function: Some("call_starter_chain".into()),
+            // `input` is a string — caller-side bug that should raise.
+            input: Some(serde_json::json!({
+                "chain_id": "starter-evidence-tester",
+                "input": "not an object"
+            })),
+            ..Default::default()
+        };
+        let chain = minimal_chain_with_steps("test-non-object-input", vec![parent_step]);
+
+        let err = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p6b_badinput",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("non-object `input` must raise loud, not silently drop depth/target stamping");
+
+        let msg = err.to_string() + " " + &err.root_cause().to_string();
+        assert!(
+            msg.contains("must be a JSON object") || msg.contains("non-object") || msg.contains("object"),
+            "error must explain the type requirement: {}", msg,
+        );
+    }
+
+    // ── Verifier fix: sub-chain step failure propagates to the parent ─────
+    //
+    // The sub-chain's LLM step returns non-JSON; the starter runner's LLM
+    // dispatch must reject and that error must bubble out of
+    // call_starter_chain with the sub-chain id stamped for debuggability.
+    //
+    // Note: this tests PROPAGATION only — it uses the strongest current
+    // failure signal (unparseable response) rather than schema validation,
+    // because schema enforcement on LLM output in the starter runner is
+    // a Phase 6a concern outside 6b's scope and may sit in a future phase.
+    // If schema enforcement lands later, a parallel test should verify
+    // that failure propagates too.
+    #[tokio::test]
+    async fn call_starter_chain_propagates_sub_chain_step_failure() {
+        // Mock an LLM response whose content is not valid JSON — the
+        // evidence_tester step expects a structured object and will fail
+        // to parse. chain_dispatch surfaces that as a step error.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openrouter_body(
+                "this is plain text, not a JSON object for the evidence-tester schema",
+            ))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        create_slug(&conn, "p6b_propfail", &ContentType::Code, "/tmp/p6b_propfail").unwrap();
+        let config = mocked_llm_config(server.url()).await;
+        let state = pyramid_state_with_llm_config(conn, config);
+
+        let parent_step = ChainStep {
+            name: "invoke_bad_sub".into(),
+            primitive: "custom".into(),
+            mechanical: true,
+            rust_function: Some("call_starter_chain".into()),
+            input: Some(serde_json::json!({
+                "chain_id": "starter-evidence-tester",
+                "input": {
+                    "claim": "pyramid propagation test",
+                    "evidence": [{"ref": "ev-x", "content": "x", "source": "test"}]
+                }
+            })),
+            ..Default::default()
+        };
+        let chain = minimal_chain_with_steps("test-subchain-failure-propagates", vec![parent_step]);
+
+        // The parent chain's result either raises OR surfaces raw content
+        // without schema-checking. Regardless, a plain-text LLM response
+        // should NOT match the evidence_tester output shape; we assert
+        // propagation behavior (exactly one of the two outcomes):
+        //   • If sub-chain errors, the error surfaces through call_starter_chain
+        //     with the sub-chain id stamped on it.
+        //   • If sub-chain swallows + returns {raw: "..."} (current 6a-era
+        //     fallback), the parent sees that object — which is a propagation
+        //     success too: the parent sees the sub-chain's output unmodified.
+        // The assertion below guards against SILENT SUBSTITUTION (e.g.
+        // returning the parent's input instead of a sub-chain output).
+        let result = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p6b_propfail",
+            None,
+            serde_json::json!({"sentinel": "parent-input-should-not-leak-through"}),
+        )
+        .await;
+
+        match result {
+            Err(err) => {
+                let msg = err.to_string() + " " + &err.root_cause().to_string();
+                assert!(
+                    msg.contains("starter-evidence-tester")
+                        || msg.contains("sub-chain")
+                        || msg.contains("invoke_bad_sub"),
+                    "propagated error must name the sub-chain or parent step: {}", msg,
+                );
+            }
+            Ok(out) => {
+                // Tolerated: current LLM path returns a parsed-or-raw
+                // object shape; it may or may not resemble the schema.
+                // The critical guarantee is that the parent's `sentinel`
+                // input did NOT pass through unmodified — if it did, the
+                // sub-chain wasn't actually dispatched.
+                assert!(
+                    out.get("sentinel").is_none(),
+                    "parent input must not leak through as final output — \
+                     that would mean the sub-chain wasn't actually dispatched: {out}",
+                );
+            }
+        }
+    }
 }
 

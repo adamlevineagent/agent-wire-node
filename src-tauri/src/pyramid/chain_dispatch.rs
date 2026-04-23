@@ -882,10 +882,36 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
             // Pull the sub-chain's input envelope. `input.input` is what
             // will be threaded to the library chain's first step; default
             // to `{}` when unset (some library chains tolerate empty input).
-            let mut sub_input = input
-                .get("input")
-                .cloned()
-                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+            //
+            // Phase 6b verifier fix: strict-typed envelope. The depth/target
+            // stamping below (`Value::Object(ref mut map) = sub_input`) is a
+            // no-op when `input` is present-but-non-object, which would silently
+            // drop the cycle-guard envelope and orphan any carried target_id.
+            // Raise loudly per feedback_loud_deferrals: the caller's chain YAML
+            // has a type bug that should surface at first-run rather than as a
+            // mysterious downstream failure.
+            let mut sub_input = match input.get("input") {
+                Some(v) if v.is_object() => v.clone(),
+                None => Value::Object(serde_json::Map::new()),
+                Some(other) => {
+                    return Err(anyhow!(
+                        "call_starter_chain: `input` field for sub-chain '{}' \
+                         must be a JSON object, got `{}`. Library chains receive \
+                         their step input through this envelope; non-object values \
+                         would silently drop the cycle-depth + target_id stamping \
+                         downstream.",
+                        sub_chain_id,
+                        match other {
+                            Value::String(_) => "string",
+                            Value::Number(_) => "number",
+                            Value::Bool(_) => "boolean",
+                            Value::Null => "null",
+                            Value::Array(_) => "array",
+                            Value::Object(_) => unreachable!(),
+                        },
+                    ));
+                }
+            };
 
             // Depth guard: read `_sub_chain_depth` from the nested input if
             // the caller already set one, otherwise from the dispatch ctx.

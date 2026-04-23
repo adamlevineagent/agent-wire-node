@@ -13135,6 +13135,31 @@ pub async fn execute_chain_for_target(
             .or_insert_with(|| Value::String(slug.to_string()));
     }
 
+    // Phase 6b verifier fix: extract `_sub_chain_depth` from the caller's
+    // initial input so the dispatch context carries it across every step
+    // of THIS chain, not only via output threading.
+    //
+    // Why this matters: `call_starter_chain` writes `_sub_chain_depth` to
+    // its sub-input envelope, then recurses into `execute_chain_for_target`.
+    // Each step's output overwrites `current`; when step N's output drops
+    // `_sub_chain_depth` (almost always — mechanical outputs like
+    // `{emitted: true, event_id: N}` don't echo it), a subsequent step's
+    // `call_starter_chain` would recompute `current_depth = max(ctx, input) = 0`
+    // and the cycle guard would reset. By populating `dispatch_ctx.sub_chain_depth`
+    // ONCE from the initial_input envelope, the ctx-depth survives the
+    // per-step output rotation — and `call_starter_chain` can rely on
+    // `max(ctx.sub_chain_depth, envelope._sub_chain_depth)` as the true
+    // recursion depth.
+    //
+    // Security posture (per feedback_loud_deferrals / no_integrity_demotion):
+    // the envelope field is treated as untrusted BUT monotonic — the max()
+    // merge ensures a malicious / buggy chain envelope can only INCREASE
+    // the effective depth (hastening the cycle guard), never reset it.
+    let initial_sub_chain_depth = initial_input
+        .get("_sub_chain_depth")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+
     // Build a minimal dispatch context. We do NOT mint a build_id or wire
     // CacheDispatchBase — starter chains are short (2-5 steps) + run
     // synchronously in one supervisor tick; the LLM step cache is not
@@ -13159,7 +13184,10 @@ pub async fn execute_chain_for_target(
         state: Some(state.clone()),
         chains_dir: Some(state.chains_dir.clone()),
         target_id: target_id.map(|s| s.to_string()),
-        sub_chain_depth: None,
+        // Phase 6b verifier fix: depth travels on the ctx for the lifetime
+        // of this chain's execution loop so intra-chain recursion cannot
+        // reset the counter by dropping `_sub_chain_depth` from step output.
+        sub_chain_depth: initial_sub_chain_depth,
     };
 
     // Thread inputs through each step. `current` is what the next step sees
