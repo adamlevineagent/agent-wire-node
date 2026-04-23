@@ -38,6 +38,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 use super::config_contributions;
@@ -227,30 +228,134 @@ type CacheMap = HashMap<CacheKey, VocabEntry>;
 /// invalidated (full drop) on every publish / supersede.
 static CACHE: OnceLock<RwLock<Option<CacheMap>>> = OnceLock::new();
 
+/// Phase 9c-3-1: Cross-process vocab cache coherence.
+///
+/// The `CACHE` is per-process. Wire node (process A) publishing a vocab
+/// entry via HTTP does not invalidate the in-process cache of the MCP
+/// server (process B) sharing the same sqlite file. Without a coherence
+/// check, process B reads stale vocab for up to the cache lifetime.
+///
+/// The fix is a cheap MAX(id) poll every read. Every cache consumer runs
+/// `SELECT MAX(id) FROM pyramid_config_contributions WHERE schema_type
+/// LIKE 'vocabulary_entry:%'` first; if it exceeds this atomic, the cache
+/// is invalidated and re-populated. If equal, serve from cache. Because
+/// the SQL hits the SHARED sqlite file, cross-process writes are visible
+/// to all reader processes on the next read cycle — no IPC needed.
+///
+/// The MAX query walks the primary-key index for the latest row matching
+/// the LIKE prefix — fast on every supported sqlite build.
+///
+/// The atomic is monotone: only bumped to a value strictly greater than
+/// the current. Test-mode invalidators (seed passes, test harnesses) drop
+/// the atomic to 0 via `invalidate_cache_for_test_only`.
+static LAST_OBSERVED_VOCAB_MAX_ID: AtomicI64 = AtomicI64::new(0);
+
 fn cache_handle() -> &'static RwLock<Option<CacheMap>> {
     CACHE.get_or_init(|| RwLock::new(None))
+}
+
+/// Query the current MAX(id) of vocabulary_entry rows from the DB. This
+/// is the cross-process watermark — it reflects writes from any process
+/// sharing the same sqlite file. Returns 0 on empty table (the atomic's
+/// initial value), so a never-populated DB hits the equal-compare path
+/// and serves an empty cache without infinite re-population.
+fn query_vocab_max_id(conn: &Connection) -> Result<i64> {
+    // COALESCE(MAX(id), 0): empty table returns 0 matching the atomic
+    // default. LIKE 'vocabulary_entry:%' scans the primary-key index;
+    // sqlite picks it up via the compound schema_type prefix.
+    let max_id: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(id), 0)
+               FROM pyramid_config_contributions
+              WHERE schema_type LIKE 'vocabulary_entry:%'",
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to query vocabulary_entry MAX(id) for cache coherence")?;
+    Ok(max_id)
 }
 
 /// Drop the cache so the next read re-faults from the DB. Called from
 /// `publish_vocabulary_entry` + `supersede_vocabulary_entry`. Also
 /// callable from tests that seed rows directly.
+///
+/// Phase 9c-3-1: ALSO resets the cross-process watermark so the next
+/// reader rebuilds and re-observes the current MAX(id). Without this
+/// reset, an in-process invalidator that invalidated only the map (not
+/// the atomic) would cause the subsequent `ensure_cache` to re-populate
+/// at the OLD watermark, missing a concurrent cross-process write that
+/// also advanced the watermark.
 pub fn invalidate_cache() {
     if let Ok(mut guard) = cache_handle().write() {
         *guard = None;
     }
+    // Reset atomic to 0 so the next reader unconditionally re-queries
+    // MAX(id). Safe because the atomic is monotonic via a max-fetch
+    // update (see `bump_watermark_if_greater`) — resetting to 0 only
+    // loses the cross-process shortcut, not correctness.
+    LAST_OBSERVED_VOCAB_MAX_ID.store(0, Ordering::SeqCst);
+}
+
+/// Monotonic bump: set atomic to `new` IFF `new > current`. Prevents a
+/// late-arriving older MAX(id) (e.g. from a stale reader's context) from
+/// rolling the watermark backwards.
+fn bump_watermark_if_greater(new: i64) {
+    let mut cur = LAST_OBSERVED_VOCAB_MAX_ID.load(Ordering::SeqCst);
+    while new > cur {
+        match LAST_OBSERVED_VOCAB_MAX_ID.compare_exchange(
+            cur,
+            new,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return,
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
+/// Test-only: read the current watermark. Exposed for Phase 9c-3-1 tests
+/// that assert monotonic behavior. Not part of the stable API.
+#[doc(hidden)]
+pub fn current_watermark_for_test() -> i64 {
+    LAST_OBSERVED_VOCAB_MAX_ID.load(Ordering::SeqCst)
 }
 
 /// Lazily populate the cache from the DB. Rebuilds the full map
 /// (all active entries across all vocab_kinds) on a cache miss.
+///
+/// Phase 9c-3-1: cross-process coherence via MAX(id) poll. Every call
+/// queries the DB's current MAX(id) of vocabulary_entry rows. If greater
+/// than the process-wide atomic, the cache is invalidated + rebuilt +
+/// the atomic is advanced. If equal, the existing cache is served.
+/// Because the SQL hits the SHARED sqlite file, writes from a peer
+/// process on the same DB are observed on the next read cycle — the
+/// per-process invalidation hook still fires for local writes (fast
+/// path), but cross-process drift is self-healing on every read.
 fn ensure_cache(conn: &Connection) -> Result<()> {
-    // Read-only check first — common case.
-    if let Ok(guard) = cache_handle().read() {
-        if guard.is_some() {
-            return Ok(());
+    // Fast path: check cross-process watermark. If the DB's MAX(id) is
+    // not greater than what we've seen, the cache is still authoritative.
+    let observed_max = query_vocab_max_id(conn)?;
+    let known_max = LAST_OBSERVED_VOCAB_MAX_ID.load(Ordering::SeqCst);
+    let cache_present = cache_handle()
+        .read()
+        .map(|g| g.is_some())
+        .unwrap_or(false);
+    if observed_max <= known_max && cache_present {
+        return Ok(());
+    }
+
+    // Miss OR cross-process advance: drop stale cache (if any) and
+    // rebuild from the DB. We drop-then-repopulate under a single write
+    // so concurrent readers in the SAME process see a consistent
+    // "absent → populated" transition rather than a partial rebuild.
+    if observed_max > known_max {
+        if let Ok(mut guard) = cache_handle().write() {
+            *guard = None;
         }
     }
 
-    // Miss: build fresh from the DB and install.
+    // Build fresh from the DB and install.
     let mut map: CacheMap = HashMap::new();
     let mut stmt = conn.prepare(
         "SELECT id, schema_type, yaml_content, created_at, superseded_by_id, triggering_note
@@ -301,6 +406,14 @@ fn ensure_cache(conn: &Connection) -> Result<()> {
     if let Ok(mut guard) = cache_handle().write() {
         *guard = Some(map);
     }
+    // Phase 9c-3-1: advance the cross-process watermark to the MAX(id)
+    // we observed pre-rebuild. Monotonic bump guards against a stale
+    // older read rolling the watermark backwards. Using the pre-rebuild
+    // observation (not a fresh post-rebuild query) is deliberate — any
+    // rows written BETWEEN the query and this store would otherwise be
+    // silently skipped until the next reader noticed. The next reader
+    // re-queries and, if MAX(id) has since advanced, re-rebuilds.
+    bump_watermark_if_greater(observed_max);
     Ok(())
 }
 
