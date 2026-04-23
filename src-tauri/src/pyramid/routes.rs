@@ -4247,11 +4247,27 @@ async fn handle_annotate(
         }
     }
 
+    // Post-build accretion v5 Phase 1 verifier: HTTP write path must refuse
+    // unknown annotation types instead of silently mapping to Observation.
+    // The lossy AnnotationType::from_str is retained for reading legacy DB
+    // rows; write paths use from_str_strict per Pillar 38 absorbed bug.
+    let annotation_type = match AnnotationType::from_str_strict(&body.annotation_type) {
+        Ok(t) => t,
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::BAD_REQUEST,
+                &format!(
+                    "{}. Valid types: observation, correction, question, friction, idea, era, transition, health_check, directory, steel_man, red_team",
+                    e
+                ),
+            ));
+        }
+    };
     let annotation = PyramidAnnotation {
         id: 0, // will be set by DB
         slug: slug_name,
         node_id: body.node_id,
-        annotation_type: AnnotationType::from_str(&body.annotation_type),
+        annotation_type,
         content: body.content,
         question_context: body.question_context,
         author: body.author.unwrap_or_else(|| "system".to_string()),

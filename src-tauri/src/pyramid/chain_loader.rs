@@ -213,13 +213,30 @@ pub fn discover_chains(chains_dir: &Path) -> Result<Vec<ChainMetadata>> {
 /// `StepOperation::RoleBound`-style work item dispatches, the supervisor
 /// resolves the binding's `handler_chain_id` to a loaded chain via this
 /// function.
+///
+/// Phase 1 verifier: raises loudly if multiple chains across
+/// `defaults/`, `defaults/starter/`, and `variants/` share the same id.
+/// Silent first-match would make operator-authored variant chains
+/// indistinguishable from starter chains at resolution time and mask
+/// clashes introduced by accident. Per feedback_loud_deferrals.
 pub fn load_chain_by_id(chain_id: &str, chains_dir: &Path) -> Result<ChainDefinition> {
     let discovered = discover_chains(chains_dir)?;
-    let meta = discovered
+    let matches: Vec<_> = discovered
         .into_iter()
-        .find(|m| m.id == chain_id)
-        .ok_or_else(|| anyhow::anyhow!("chain not found by id: '{chain_id}'"))?;
-    load_chain(Path::new(&meta.file_path), chains_dir)
+        .filter(|m| m.id == chain_id)
+        .collect();
+    match matches.len() {
+        0 => Err(anyhow::anyhow!("chain not found by id: '{chain_id}'")),
+        1 => load_chain(Path::new(&matches[0].file_path), chains_dir),
+        n => {
+            let paths: Vec<String> =
+                matches.iter().map(|m| m.file_path.clone()).collect();
+            Err(anyhow::anyhow!(
+                "ambiguous chain id '{chain_id}': {n} chains share this id across discovered directories: {}",
+                paths.join(", ")
+            ))
+        }
+    }
 }
 
 /// Load just the metadata from a chain YAML file (does not resolve prompts).
@@ -608,6 +625,84 @@ mod phase16_tests {
         assert_eq!(
             children_ref, "$collect_children.children",
             "cluster_synthesis must pass the full children array so the prompt can look up cluster members"
+        );
+    }
+}
+
+#[cfg(test)]
+mod phase1_load_chain_by_id_tests {
+    //! Post-build accretion v5 Phase 1 verifier: `load_chain_by_id` must
+    //! raise loudly when multiple discovered chains share the same id,
+    //! rather than silently picking the first one. Ambiguity between
+    //! `defaults/starter/` and `variants/` is easy to introduce and
+    //! hard to debug if silent.
+    use super::load_chain_by_id;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write_chain_yaml(path: &std::path::Path, id: &str, name: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Minimal-but-valid ChainDefinition matching chain_engine.rs schema.
+        let yaml = format!(
+            r#"schema_version: 1
+id: {id}
+name: {name}
+description: test chain for ambiguity detection
+content_type: code
+version: "1.0"
+author: phase1-verifier
+defaults:
+  model_tier: stale_local
+  temperature: 0.3
+  on_error: abort
+steps:
+  - name: noop
+    primitive: mechanical
+    mechanical: true
+    rust_function: noop_echo
+"#
+        );
+        fs::write(path, yaml).unwrap();
+    }
+
+    #[test]
+    fn load_chain_by_id_raises_on_ambiguous_id() {
+        let tmp = TempDir::new().unwrap();
+        let chains_dir = tmp.path();
+        write_chain_yaml(
+            &chains_dir.join("defaults").join("starter").join("foo.yaml"),
+            "duplicated-id",
+            "starter",
+        );
+        write_chain_yaml(
+            &chains_dir.join("variants").join("foo.yaml"),
+            "duplicated-id",
+            "variant",
+        );
+        let err = load_chain_by_id("duplicated-id", chains_dir).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ambiguous"),
+            "expected ambiguity message, got: {msg}"
+        );
+        assert!(
+            msg.contains("duplicated-id"),
+            "expected chain id in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_chain_by_id_raises_on_missing_id() {
+        let tmp = TempDir::new().unwrap();
+        let chains_dir = tmp.path();
+        // No chains — directory doesn't exist yet; discover_chains must
+        // tolerate that. The error must still be "not found", not a silent
+        // default.
+        let err = load_chain_by_id("no-such-chain", chains_dir).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not found"),
+            "expected not-found message, got: {msg}"
         );
     }
 }
