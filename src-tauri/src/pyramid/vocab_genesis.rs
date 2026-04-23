@@ -37,9 +37,9 @@
 //     dispatch on their own — they govern how nodes render / what
 //     payload a node carries).
 
-// ── Annotation Types (11 genesis entries) ───────────────────────────
+// ── Annotation Types (16 genesis entries) ───────────────────────────
 //
-// Tuple shape: (name, description, handler_chain_id, reactive, creates_delta)
+// Tuple shape: (name, description, handler_chain_id, reactive, creates_delta, include_in_cascade_prompt)
 //
 // Phase 6c-B added `creates_delta` — before v5 `process_annotation_hook`
 // had a hardcoded `AnnotationType::Correction => create_delta(...)` arm.
@@ -48,19 +48,31 @@
 // creates deltas (e.g. a future `counter_correction`) with a contribution
 // write, no code deploy. Only `correction` carries `creates_delta = true`
 // in genesis to preserve the pre-v5 behavior exactly.
-pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool)] = &[
+//
+// Phase 9c-2-2 added `include_in_cascade_prompt` — operational directives
+// (gap, purpose_declaration, purpose_shift, debate_collapse) no longer
+// pollute the ancestor re-distill LLM prompt's `cascade_annotations`
+// section. Narrative-feedback types (observation, correction, question,
+// friction, idea, era, transition, health_check, directory, steel_man,
+// red_team, hypothesis) DO flow into the prompt — they ARE the content
+// the LLM should consider when re-distilling. steel_man + red_team carry
+// `true` despite also being handled by debate_steward because their
+// CONTENT (the argument body) IS narrative and belongs in the prompt.
+pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool, bool)] = &[
     (
         "observation",
         "Neutral fact-based observation attached to a node.",
         None,
         false,
         false,
+        true,
     ),
     (
         "correction",
         "Correction to an existing claim in the node.",
         None,
         false,
+        true,
         true,
     ),
     (
@@ -69,6 +81,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool)] = 
         None,
         false,
         false,
+        true,
     ),
     (
         "friction",
@@ -76,6 +89,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool)] = 
         None,
         false,
         false,
+        true,
     ),
     (
         "idea",
@@ -83,6 +97,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool)] = 
         None,
         false,
         false,
+        true,
     ),
     (
         "era",
@@ -90,6 +105,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool)] = 
         None,
         false,
         false,
+        true,
     ),
     (
         "transition",
@@ -97,6 +113,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool)] = 
         None,
         false,
         false,
+        true,
     ),
     (
         "health_check",
@@ -104,6 +121,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool)] = 
         None,
         false,
         false,
+        true,
     ),
     (
         "directory",
@@ -111,6 +129,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool)] = 
         None,
         false,
         false,
+        true,
     ),
     // v5 Phase 7 reactives — steel_man + red_team are the two Phase 7a
     // wire to emit `annotation_reacted` observation events. Phase 7c adds
@@ -125,6 +144,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool)] = 
         Some("starter-debate-steward"),
         true,
         false,
+        true,
     ),
     (
         "red_team",
@@ -132,6 +152,7 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool)] = 
         Some("starter-debate-steward"),
         true,
         false,
+        true,
     ),
     // Phase 7c — 4 v5 reactive verbs added as pure vocab entries.
     // Per project_convergence_decision.md + project_wire_canonical_vocabulary.md
@@ -147,6 +168,10 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool)] = 
         Some("starter-gap-dispatcher"),
         true,
         false,
+        // 9c-2-2: operational directive — gap dispatches a Gap node; the
+        // annotation content itself is routing metadata, not narrative the
+        // ancestor re-distill should absorb.
+        false,
     ),
     (
         "hypothesis",
@@ -154,6 +179,9 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool)] = 
         Some("starter-debate-steward"),
         true,
         false,
+        // 9c-2-2: hypothesis content IS narrative (the proposed claim) —
+        // should influence re-distill.
+        true,
     ),
     (
         "purpose_declaration",
@@ -161,12 +189,18 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool)] = 
         Some("starter-meta-layer-oracle"),
         true,
         false,
+        // 9c-2-2: operational directive — triggers crystallization path,
+        // not narrative the node re-distill should absorb.
+        false,
     ),
     (
         "purpose_shift",
         "Explicit purpose change annotation. Triggers meta_layer_oracle to re-evaluate meta-layer coverage.",
         Some("starter-meta-layer-oracle"),
         true,
+        false,
+        // 9c-2-2: operational directive — same rationale as
+        // purpose_declaration.
         false,
     ),
     // Post-build accretion v5 Phase 9c-1: close the debate-collapse
@@ -189,6 +223,10 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool)] = 
         "Collapse a Debate node back to Scaffolding (positions resolved or abandoned). Triggers starter-debate-collapse to finalize the debate and emit debate_collapsed.",
         Some("starter-debate-collapse"),
         true,
+        false,
+        // 9c-2-2: operational directive — debate_collapse content is a
+        // finalize reason string (e.g. "Pro side wins"), not substrate
+        // the ancestor re-distill should absorb as narrative.
         false,
     ),
 ];

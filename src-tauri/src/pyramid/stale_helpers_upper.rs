@@ -2283,16 +2283,6 @@ pub async fn execute_supersession(
     .await
     .unwrap_or_default();
 
-    // Phase 9a-3: snapshot the MAX(annotation_id) observed by the loader
-    // BEFORE the annotation list moves into `manifest_input`. This is the
-    // race-correct watermark ceiling for the post-apply write — it
-    // captures exactly what the prompt saw, ignoring any annotations
-    // written after the loader's SELECT (those ride the next cycle).
-    let loaded_max_annotation_id: i64 = cascade_annotations
-        .iter()
-        .map(|a| a.id)
-        .max()
-        .unwrap_or(0);
     // Same resolution logic the loader uses, kept local so we can pass it
     // to record_annotation_watermark without round-tripping through the
     // helper a second time.
@@ -2303,6 +2293,48 @@ pub async fn execute_supersession(
             .map(|s| s.clone())
             .collect(),
         _ => vec![resolved_node_id.clone()],
+    };
+
+    // Phase 9a-3 + 9c-2-2: snapshot MAX(annotation_id) across the
+    // UNFILTERED eligible set BEFORE the annotation list moves into
+    // `manifest_input`. This is the race-correct watermark ceiling for
+    // the post-apply write — it captures the highest id visible to the
+    // loader's SELECT regardless of annotation_type. Using the unfiltered
+    // max (not the max of what was returned by the cascade loader) means
+    // operational annotations filtered by `include_in_cascade_prompt=false`
+    // still advance the watermark, preventing an eternal re-query of the
+    // filtered id on every subsequent cycle. The prior id_watermark
+    // (what was already advanced past) is read again here; the sibling
+    // load that built `cascade_annotations` above used the same value.
+    let loaded_max_annotation_id: i64 = {
+        let db = db_owned.clone();
+        let s = s.clone();
+        let wm_ids = watermark_target_ids.clone();
+        let target = resolved_node_id.clone();
+        tokio::task::spawn_blocking(move || -> i64 {
+            let conn = match super::db::open_pyramid_connection(Path::new(&db)) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, "cascade_annotations: max-id read failed to open DB");
+                    return 0;
+                }
+            };
+            // Prior watermark — keyed on (slug, re-distill-target) exactly
+            // like the filtered loader's own watermark read.
+            let prior: i64 = conn
+                .query_row(
+                    "SELECT max_annotation_id
+                       FROM pyramid_re_distill_annotation_watermarks
+                      WHERE slug = ?1 AND target_id = ?2",
+                    rusqlite::params![s, target],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0);
+            load_cascade_annotations_max_id_unfiltered(&conn, &s, &wm_ids, prior)
+                .unwrap_or(0)
+        })
+        .await
+        .unwrap_or(0)
     };
 
     // The "changed children" the LLM needs are the nodes under this one that
@@ -3058,30 +3090,89 @@ fn load_cascade_annotations_for_target(
     // binds for `IN`, so we build `?2, ?3, ...` placeholders and push
     // params in matching order (slug=?1, ids=?2..N+1, watermark=?N+2,
     // limit=?N+3).
+    // Phase 9c-2-2: resolve the allow-list of annotation_type names whose
+    // vocab entry has `include_in_cascade_prompt = true`. Operational
+    // directives (gap, purpose_declaration, purpose_shift, debate_collapse
+    // in genesis) are EXCLUDED — their annotations still live in the DB
+    // and still drive handler chains, but their CONTENT does not pollute
+    // the ancestor re-distill LLM prompt.
+    //
+    // Filter at SQL (not post-query) so the prompt cap, truncation event,
+    // and returned row set all see the same filtered stream. A separate
+    // MAX(id) query below captures the true observed id for watermark
+    // advancement — otherwise the watermark would never move past a
+    // filtered-out operational annotation and we'd re-query it forever.
+    let prompt_eligible_types: Vec<String> =
+        match super::vocab_entries::list_vocabulary(
+            conn,
+            super::vocab_entries::VOCAB_KIND_ANNOTATION_TYPE,
+        ) {
+            Ok(entries) => entries
+                .into_iter()
+                .filter(|e| e.include_in_cascade_prompt)
+                .map(|e| e.name)
+                .collect(),
+            Err(e) => {
+                // Vocab cache unavailable — err on the side of "include
+                // everything" (pre-9c-2 semantics). Loud-warn so operators
+                // see the drift; swallowing the lookup error silently would
+                // let a broken vocab silently strip the entire cascade.
+                warn!(
+                    error = %e,
+                    "cascade_annotations: vocab lookup failed — falling back \
+                     to unfiltered load (pre-9c-2-2 semantics)"
+                );
+                Vec::new()
+            }
+        };
+
     let probe = CASCADE_ANNOTATION_PROMPT_CAP.saturating_add(1);
     let placeholders: String = (0..resolved_annotation_node_ids.len())
         .map(|i| format!("?{}", i + 2))
         .collect::<Vec<_>>()
         .join(",");
     let watermark_idx = resolved_annotation_node_ids.len() + 2;
-    let limit_idx = watermark_idx + 1;
+    // Build annotation_type IN-clause when we have an allow-list; when
+    // empty (vocab lookup failed), skip the clause so we preserve the
+    // pre-9c-2-2 behavior.
+    let (type_clause, type_placeholders_start, limit_idx): (String, usize, usize) =
+        if prompt_eligible_types.is_empty() {
+            (String::new(), watermark_idx + 1, watermark_idx + 1)
+        } else {
+            let start = watermark_idx + 1;
+            let type_placeholders: String = (0..prompt_eligible_types.len())
+                .map(|i| format!("?{}", start + i))
+                .collect::<Vec<_>>()
+                .join(",");
+            let clause = format!(" AND annotation_type IN ({type_placeholders})");
+            (clause, start, start + prompt_eligible_types.len())
+        };
     let sql = format!(
         "SELECT id, annotation_type, author, content, question_context,
                 created_at
            FROM pyramid_annotations
-          WHERE slug = ?1 AND node_id IN ({placeholders}) AND id > ?{watermark_idx}
+          WHERE slug = ?1 AND node_id IN ({placeholders}) AND id > ?{watermark_idx}{type_clause}
           ORDER BY id ASC
           LIMIT ?{limit_idx}"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> =
-        Vec::with_capacity(resolved_annotation_node_ids.len() + 3);
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(
+        resolved_annotation_node_ids.len() + 3 + prompt_eligible_types.len(),
+    );
     params.push(Box::new(slug.to_string()));
     for id in &resolved_annotation_node_ids {
         params.push(Box::new(id.clone()));
     }
     params.push(Box::new(id_watermark));
+    // Annotation_type allow-list params (empty allow-list → no IN clause).
+    for t in &prompt_eligible_types {
+        params.push(Box::new(t.clone()));
+    }
     params.push(Box::new(probe as i64));
+    // Paranoia: the last-pushed param MUST match ?{limit_idx}. Computed
+    // above; referencing `type_placeholders_start` to keep the allocation
+    // reasoning visible.
+    let _ = type_placeholders_start;
     let param_refs: Vec<&dyn rusqlite::ToSql> =
         params.iter().map(|p| p.as_ref()).collect();
     let rows = stmt.query_map(param_refs.as_slice(), |row| {
@@ -3287,6 +3378,45 @@ pub(crate) fn read_annotation_watermark_test_only(
 /// Operator-tunable follow-up: move this into the contribution-backed
 /// config surface alongside the other re-distill knobs.
 const CASCADE_ANNOTATION_PROMPT_CAP: usize = 50;
+
+/// Phase 9c-2-2: compute `MAX(id)` across ALL eligible annotations
+/// (the UNFILTERED set — including operational types the
+/// `include_in_cascade_prompt=false` filter strips from the prompt).
+/// Callers use this as the race-correct watermark ceiling: even when
+/// an operational annotation is filtered from the LLM prompt, the
+/// watermark must still advance past it so the next re-distill doesn't
+/// keep re-querying an eternally-filtered id.
+pub(crate) fn load_cascade_annotations_max_id_unfiltered(
+    conn: &Connection,
+    slug: &str,
+    annotated_node_ids: &[String],
+    id_watermark: i64,
+) -> Result<i64> {
+    if annotated_node_ids.is_empty() {
+        return Ok(0);
+    }
+    let placeholders: String = (0..annotated_node_ids.len())
+        .map(|i| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let watermark_idx = annotated_node_ids.len() + 2;
+    let sql = format!(
+        "SELECT COALESCE(MAX(id), 0)
+           FROM pyramid_annotations
+          WHERE slug = ?1 AND node_id IN ({placeholders}) AND id > ?{watermark_idx}"
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+        Vec::with_capacity(annotated_node_ids.len() + 2);
+    params.push(Box::new(slug.to_string()));
+    for id in annotated_node_ids {
+        params.push(Box::new(id.clone()));
+    }
+    params.push(Box::new(id_watermark));
+    let param_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|p| p.as_ref()).collect();
+    let max_id: i64 = conn.query_row(&sql, param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
+    Ok(max_id)
+}
 
 /// Phase 8 tail: test-only wrapper exposing
 /// `load_cascade_annotations_for_target` so the watermark-regression test

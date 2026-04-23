@@ -263,6 +263,7 @@ async fn publish_then_refetch_over_http_surfaces_new_entry() {
             handler_chain_id: Some("starter-debate-steward".to_string()),
             reactive: true,
             creates_delta: false,
+            include_in_cascade_prompt: true,
             created_at: String::new(),
             superseded_by: None,
             supersede_reason: None,

@@ -127,6 +127,26 @@ pub struct VocabEntry {
     /// keep their current non-delta semantics.
     #[serde(default)]
     pub creates_delta: bool,
+    /// For annotation_type entries: `true` means this annotation's
+    /// content should be included in the `cascade_annotations` section
+    /// of the ancestor re-distill LLM prompt. Phase 9c-2-2 splits
+    /// narrative-feedback annotation types (observation / correction /
+    /// question / friction / idea / hypothesis / steel_man / red_team /
+    /// era / transition / health_check / directory) from operational
+    /// directives (gap / purpose_declaration / purpose_shift /
+    /// debate_collapse) — the former are content the LLM should
+    /// consider when re-distilling; the latter are operational chatter
+    /// that would pollute the prompt without improving the distill.
+    ///
+    /// Default: `true` for existing (pre-9c-2) contributions via
+    /// `#[serde(default = "default_include_in_cascade_prompt")]`. This
+    /// preserves the pre-9c-2 behavior (every annotation flowed in)
+    /// for any non-genesis row missing the field — a conservative
+    /// choice because it's safer to over-include than to silently drop
+    /// narrative content. Operators supersede individual entries to
+    /// flip the default to `false` for operational types they add.
+    #[serde(default = "default_include_in_cascade_prompt")]
+    pub include_in_cascade_prompt: bool,
     pub created_at: String,
     /// If this row was superseded by another row, the successor's
     /// integer `id`. None for the currently-active row.
@@ -152,6 +172,20 @@ struct VocabBody {
     /// `VocabEntry::creates_delta`.
     #[serde(default)]
     pub creates_delta: bool,
+    /// Phase 9c-2-2: narrative-feedback vs operational-directive flag.
+    /// Default `true` via `default_include_in_cascade_prompt` so legacy
+    /// rows (missing the field entirely) behave exactly as pre-9c-2 —
+    /// every annotation type flowed into the prompt.
+    #[serde(default = "default_include_in_cascade_prompt")]
+    pub include_in_cascade_prompt: bool,
+}
+
+/// Serde default for `include_in_cascade_prompt` — preserves the
+/// pre-9c-2 "every annotation flows" semantics for legacy rows.
+/// Operators flip the flag to `false` on operational types via
+/// `supersede_vocabulary_entry`.
+fn default_include_in_cascade_prompt() -> bool {
+    true
 }
 
 /// HTTP response shape for `GET /vocabulary/:vocab_kind`.
@@ -175,6 +209,12 @@ pub struct VocabListItem {
     /// entries published without the flag.
     #[serde(default)]
     pub creates_delta: bool,
+    /// Phase 9c-2-2: surfaced so MCP / frontend can show whether an
+    /// annotation type contributes to ancestor re-distill prompts or
+    /// is an operational directive held back from the prompt. See
+    /// `VocabEntry::include_in_cascade_prompt` for rationale.
+    #[serde(default = "default_include_in_cascade_prompt")]
+    pub include_in_cascade_prompt: bool,
 }
 
 // ── Cache ───────────────────────────────────────────────────────────
@@ -250,6 +290,7 @@ fn ensure_cache(conn: &Connection) -> Result<()> {
             handler_chain_id: body.handler_chain_id,
             reactive: body.reactive,
             creates_delta: body.creates_delta,
+            include_in_cascade_prompt: body.include_in_cascade_prompt,
             created_at,
             superseded_by: None,
             supersede_reason: triggering_note,
@@ -384,6 +425,7 @@ fn load_entry_by_schema_type(
                 handler_chain_id: body.handler_chain_id,
                 reactive: body.reactive,
                 creates_delta: body.creates_delta,
+                include_in_cascade_prompt: body.include_in_cascade_prompt,
                 created_at,
                 superseded_by,
                 supersede_reason: triggering_note,
@@ -450,6 +492,7 @@ pub fn publish_vocabulary_entry(
         handler_chain_id: entry.handler_chain_id.clone(),
         reactive: entry.reactive,
         creates_delta: entry.creates_delta,
+        include_in_cascade_prompt: entry.include_in_cascade_prompt,
     };
     let yaml = body_to_yaml(&body)?;
     let schema_type = compound_schema_type(&entry.vocab_kind, &entry.name);
@@ -500,8 +543,8 @@ pub fn publish_vocabulary_entry(
 
 /// Supersede the active entry for `(vocab_kind, name)` with a new
 /// row. At least one of `new_description` / `new_handler_chain_id`
-/// / `new_reactive` / `new_creates_delta` should be Some — unchanged
-/// fields inherit from the prior row.
+/// / `new_reactive` / `new_creates_delta` / `new_include_in_cascade_prompt`
+/// should be Some — unchanged fields inherit from the prior row.
 ///
 /// Emits a `vocabulary_superseded` observation event. Loud-raises if
 /// no active entry exists.
@@ -513,6 +556,7 @@ pub fn supersede_vocabulary_entry(
     new_handler_chain_id: Option<Option<&str>>,
     new_reactive: Option<bool>,
     new_creates_delta: Option<bool>,
+    new_include_in_cascade_prompt: Option<bool>,
     reason: Option<&str>,
 ) -> Result<VocabEntry> {
     validate_vocab_identifiers(vocab_kind, name)?;
@@ -534,6 +578,8 @@ pub fn supersede_vocabulary_entry(
         },
         reactive: new_reactive.unwrap_or(prior.reactive),
         creates_delta: new_creates_delta.unwrap_or(prior.creates_delta),
+        include_in_cascade_prompt: new_include_in_cascade_prompt
+            .unwrap_or(prior.include_in_cascade_prompt),
     };
     let new_yaml = body_to_yaml(&new_body)?;
     let schema_type = compound_schema_type(vocab_kind, name);
@@ -704,7 +750,7 @@ fn emit_vocabulary_event_with_reason(
 /// so operators see the drift.
 pub fn seed_genesis_vocabulary(conn: &Connection) -> Result<()> {
     // Annotation types (16 — 11 original + 4 Phase 7c verbs + debate_collapse Phase 9c-1)
-    for (name, description, handler_chain_id, reactive, creates_delta) in
+    for (name, description, handler_chain_id, reactive, creates_delta, include_in_cascade_prompt) in
         GENESIS_ANNOTATION_TYPES
     {
         seed_if_missing(
@@ -715,10 +761,13 @@ pub fn seed_genesis_vocabulary(conn: &Connection) -> Result<()> {
             *handler_chain_id,
             *reactive,
             *creates_delta,
+            *include_in_cascade_prompt,
         )?;
     }
 
-    // Node shapes (4) — never reactive, no handler, never creates_delta
+    // Node shapes (4) — never reactive, no handler, never creates_delta.
+    // include_in_cascade_prompt defaults to true (harmless — node_shape
+    // entries are not annotation types and never hit the cascade filter).
     for (name, description) in GENESIS_NODE_SHAPES {
         seed_if_missing(
             conn,
@@ -728,10 +777,13 @@ pub fn seed_genesis_vocabulary(conn: &Connection) -> Result<()> {
             None,
             false,
             false,
+            true,
         )?;
     }
 
-    // Role names (11 incl. cascade_handler) — always have handler_chain_id, non-reactive
+    // Role names (11 incl. cascade_handler) — always have handler_chain_id,
+    // non-reactive. include_in_cascade_prompt defaults to true (same
+    // rationale as node_shape above — not an annotation type).
     for (name, description, handler_chain_id) in GENESIS_ROLE_NAMES {
         seed_if_missing(
             conn,
@@ -741,6 +793,7 @@ pub fn seed_genesis_vocabulary(conn: &Connection) -> Result<()> {
             Some(*handler_chain_id),
             false,
             false,
+            true,
         )?;
     }
 
@@ -767,6 +820,7 @@ fn seed_if_missing(
     handler_chain_id: Option<&str>,
     reactive: bool,
     creates_delta: bool,
+    include_in_cascade_prompt: bool,
 ) -> Result<()> {
     validate_vocab_identifiers(vocab_kind, name)?;
     let schema_type = compound_schema_type(vocab_kind, name);
@@ -791,6 +845,7 @@ fn seed_if_missing(
         handler_chain_id: handler_chain_id.map(|s| s.to_string()),
         reactive,
         creates_delta,
+        include_in_cascade_prompt,
     };
     let yaml = body_to_yaml(&body)?;
 
@@ -866,6 +921,7 @@ pub fn handle_get_vocabulary(
             handler_chain_id: e.handler_chain_id,
             reactive: e.reactive,
             creates_delta: e.creates_delta,
+            include_in_cascade_prompt: e.include_in_cascade_prompt,
         })
         .collect();
     Ok(VocabListResponse {
