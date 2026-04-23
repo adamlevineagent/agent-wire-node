@@ -116,6 +116,17 @@ pub struct VocabEntry {
     /// (hypothesis / gap / purpose_declaration / purpose_shift) will
     /// be published with `reactive: true` when those variants exist.
     pub reactive: bool,
+    /// For annotation_type entries: `true` means arrival creates a delta
+    /// on the matching thread (the pre-v5 behavior hardcoded for
+    /// `correction`). Phase 6c-B lifted this out of a Rust match arm
+    /// into a vocab flag — generalize-not-enumerate per
+    /// `feedback_generalize_not_enumerate`. `correction` is the only
+    /// genesis entry with `creates_delta = true`; operators can publish
+    /// new annotation types that create deltas without a code deploy.
+    /// Default `false` so existing genesis entries without this flag
+    /// keep their current non-delta semantics.
+    #[serde(default)]
+    pub creates_delta: bool,
     pub created_at: String,
     /// If this row was superseded by another row, the successor's
     /// integer `id`. None for the currently-active row.
@@ -137,6 +148,10 @@ struct VocabBody {
     pub handler_chain_id: Option<String>,
     #[serde(default)]
     pub reactive: bool,
+    /// Phase 6c-B: lifted out of Rust match arms into vocab. See
+    /// `VocabEntry::creates_delta`.
+    #[serde(default)]
+    pub creates_delta: bool,
 }
 
 /// HTTP response shape for `GET /vocabulary/:vocab_kind`.
@@ -155,6 +170,11 @@ pub struct VocabListItem {
     pub description: String,
     pub handler_chain_id: Option<String>,
     pub reactive: bool,
+    /// Phase 6c-B: exposed so MCP / frontend can surface which vocab
+    /// entries will trigger a delta on arrival. Default false for
+    /// entries published without the flag.
+    #[serde(default)]
+    pub creates_delta: bool,
 }
 
 // ── Cache ───────────────────────────────────────────────────────────
@@ -229,6 +249,7 @@ fn ensure_cache(conn: &Connection) -> Result<()> {
             description: body.description,
             handler_chain_id: body.handler_chain_id,
             reactive: body.reactive,
+            creates_delta: body.creates_delta,
             created_at,
             superseded_by: None,
             supersede_reason: triggering_note,
@@ -362,6 +383,7 @@ fn load_entry_by_schema_type(
                 description: body.description,
                 handler_chain_id: body.handler_chain_id,
                 reactive: body.reactive,
+                creates_delta: body.creates_delta,
                 created_at,
                 superseded_by,
                 supersede_reason: triggering_note,
@@ -427,6 +449,7 @@ pub fn publish_vocabulary_entry(
         description: entry.description.clone(),
         handler_chain_id: entry.handler_chain_id.clone(),
         reactive: entry.reactive,
+        creates_delta: entry.creates_delta,
     };
     let yaml = body_to_yaml(&body)?;
     let schema_type = compound_schema_type(&entry.vocab_kind, &entry.name);
@@ -477,8 +500,8 @@ pub fn publish_vocabulary_entry(
 
 /// Supersede the active entry for `(vocab_kind, name)` with a new
 /// row. At least one of `new_description` / `new_handler_chain_id`
-/// / `new_reactive` should be Some — unchanged fields inherit from
-/// the prior row.
+/// / `new_reactive` / `new_creates_delta` should be Some — unchanged
+/// fields inherit from the prior row.
 ///
 /// Emits a `vocabulary_superseded` observation event. Loud-raises if
 /// no active entry exists.
@@ -489,6 +512,7 @@ pub fn supersede_vocabulary_entry(
     new_description: Option<&str>,
     new_handler_chain_id: Option<Option<&str>>,
     new_reactive: Option<bool>,
+    new_creates_delta: Option<bool>,
     reason: Option<&str>,
 ) -> Result<VocabEntry> {
     validate_vocab_identifiers(vocab_kind, name)?;
@@ -509,6 +533,7 @@ pub fn supersede_vocabulary_entry(
             None => prior.handler_chain_id.clone(),
         },
         reactive: new_reactive.unwrap_or(prior.reactive),
+        creates_delta: new_creates_delta.unwrap_or(prior.creates_delta),
     };
     let new_yaml = body_to_yaml(&new_body)?;
     let schema_type = compound_schema_type(vocab_kind, name);
@@ -671,7 +696,9 @@ fn emit_vocabulary_event_with_reason(
 /// so operators see the drift.
 pub fn seed_genesis_vocabulary(conn: &Connection) -> Result<()> {
     // Annotation types (11)
-    for (name, description, handler_chain_id, reactive) in GENESIS_ANNOTATION_TYPES {
+    for (name, description, handler_chain_id, reactive, creates_delta) in
+        GENESIS_ANNOTATION_TYPES
+    {
         seed_if_missing(
             conn,
             VOCAB_KIND_ANNOTATION_TYPE,
@@ -679,10 +706,11 @@ pub fn seed_genesis_vocabulary(conn: &Connection) -> Result<()> {
             description,
             *handler_chain_id,
             *reactive,
+            *creates_delta,
         )?;
     }
 
-    // Node shapes (4) — never reactive, no handler
+    // Node shapes (4) — never reactive, no handler, never creates_delta
     for (name, description) in GENESIS_NODE_SHAPES {
         seed_if_missing(
             conn,
@@ -690,6 +718,7 @@ pub fn seed_genesis_vocabulary(conn: &Connection) -> Result<()> {
             name,
             description,
             None,
+            false,
             false,
         )?;
     }
@@ -702,6 +731,7 @@ pub fn seed_genesis_vocabulary(conn: &Connection) -> Result<()> {
             name,
             description,
             Some(*handler_chain_id),
+            false,
             false,
         )?;
     }
@@ -786,6 +816,7 @@ fn seed_if_missing(
     description: &str,
     handler_chain_id: Option<&str>,
     reactive: bool,
+    creates_delta: bool,
 ) -> Result<()> {
     validate_vocab_identifiers(vocab_kind, name)?;
     let schema_type = compound_schema_type(vocab_kind, name);
@@ -809,6 +840,7 @@ fn seed_if_missing(
         description: description.to_string(),
         handler_chain_id: handler_chain_id.map(|s| s.to_string()),
         reactive,
+        creates_delta,
     };
     let yaml = body_to_yaml(&body)?;
 
@@ -883,6 +915,7 @@ pub fn handle_get_vocabulary(
             description: e.description,
             handler_chain_id: e.handler_chain_id,
             reactive: e.reactive,
+            creates_delta: e.creates_delta,
         })
         .collect();
     Ok(VocabListResponse {

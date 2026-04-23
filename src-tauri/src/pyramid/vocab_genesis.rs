@@ -16,11 +16,16 @@
 //
 // Shape notes:
 //   - annotation types carry a `reactive` flag. `steel_man` + `red_team`
-//     are `true` today (Phase 7 will wire them to emit
-//     `annotation_reacted`); `hypothesis`, `gap`, `purpose_declaration`,
-//     `purpose_shift` are seeded with `reactive: true` so their INTENT
-//     is captured in the registry before Phase 7 implements the
-//     dispatch. Non-reactive types carry `false`.
+//     are `true` today — Phase 6c-B's `process_annotation_hook` emits
+//     `annotation_reacted` observation events on any reactive type,
+//     which Phase 7 will consume for chain dispatch. The four
+//     "next-v5" reactive verbs (`hypothesis`, `gap`,
+//     `purpose_declaration`, `purpose_shift`) are NOT in the genesis
+//     tuple below — adding them is a vocab publish (contribution
+//     write), not a code deploy, per the 6c-B flip.
+//   - annotation types also carry a `creates_delta` flag (6c-B). True
+//     for `correction` only in genesis; lifts the pre-v5 hardcoded
+//     `AnnotationType::Correction => create_delta(...)` arm into vocab.
 //   - role names carry `handler_chain_id` values matching Phase 1's
 //     `GENESIS_BINDINGS` table in `role_binding.rs`. `cascade_handler`
 //     is also included here — it was previously seeded separately by
@@ -33,12 +38,21 @@
 
 // ── Annotation Types (11 genesis entries) ───────────────────────────
 //
-// Tuple shape: (name, description, handler_chain_id, reactive)
-pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool)] = &[
+// Tuple shape: (name, description, handler_chain_id, reactive, creates_delta)
+//
+// Phase 6c-B added `creates_delta` — before v5 `process_annotation_hook`
+// had a hardcoded `AnnotationType::Correction => create_delta(...)` arm.
+// That arm is now vocab-driven: the hook reads `creates_delta` from the
+// vocab entry, so operators can publish a new annotation_type that also
+// creates deltas (e.g. a future `counter_correction`) with a contribution
+// write, no code deploy. Only `correction` carries `creates_delta = true`
+// in genesis to preserve the pre-v5 behavior exactly.
+pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool, bool)] = &[
     (
         "observation",
         "Neutral fact-based observation attached to a node.",
         None,
+        false,
         false,
     ),
     (
@@ -46,11 +60,13 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool)] = &[
         "Correction to an existing claim in the node.",
         None,
         false,
+        true,
     ),
     (
         "question",
         "Open question raised against the node — candidate for FAQ / evidence loop.",
         None,
+        false,
         false,
     ),
     (
@@ -58,11 +74,13 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool)] = &[
         "Friction point: something a user or agent struggled with.",
         None,
         false,
+        false,
     ),
     (
         "idea",
         "Speculative idea or proposal tied to the node's content.",
         None,
+        false,
         false,
     ),
     (
@@ -70,11 +88,13 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool)] = &[
         "Temporal era marker — anchors a chronicle range to the node.",
         None,
         false,
+        false,
     ),
     (
         "transition",
         "Transition marker — denotes a shift from one era / phase to the next.",
         None,
+        false,
         false,
     ),
     (
@@ -82,11 +102,13 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool)] = &[
         "Self-applied health check result (pass / fail / notes).",
         None,
         false,
+        false,
     ),
     (
         "directory",
         "Directory-scope annotation — applies to a folder rather than a single file.",
         None,
+        false,
         false,
     ),
     // v5 Phase 7 reactives — steel_man + red_team are the two Phase 7 will
@@ -102,12 +124,14 @@ pub const GENESIS_ANNOTATION_TYPES: &[(&str, &str, Option<&str>, bool)] = &[
         "Good-faith reconstruction of an opposing position. Triggers debate_steward.",
         Some("starter-debate-steward"),
         true,
+        false,
     ),
     (
         "red_team",
         "Adversarial challenge to a position. Triggers debate_steward.",
         Some("starter-debate-steward"),
         true,
+        false,
     ),
 ];
 

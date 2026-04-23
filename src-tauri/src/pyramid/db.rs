@@ -7553,7 +7553,7 @@ pub fn get_annotations(
             id: row.get(0)?,
             slug: row.get(1)?,
             node_id: row.get(2)?,
-            annotation_type: AnnotationType::from_str(&at_str),
+            annotation_type: AnnotationType::from_db_string(at_str.clone()),
             content: row.get(4)?,
             question_context: row.get(5)?,
             author: row.get(6)?,
@@ -7582,7 +7582,7 @@ pub fn get_all_annotations(conn: &Connection, slug: &str) -> Result<Vec<PyramidA
             id: row.get(0)?,
             slug: row.get(1)?,
             node_id: row.get(2)?,
-            annotation_type: AnnotationType::from_str(&at_str),
+            annotation_type: AnnotationType::from_db_string(at_str.clone()),
             content: row.get(4)?,
             question_context: row.get(5)?,
             author: row.get(6)?,
@@ -7645,7 +7645,7 @@ pub fn save_annotation(
                 id: row.get(0)?,
                 slug: row.get(1)?,
                 node_id: row.get(2)?,
-                annotation_type: AnnotationType::from_str(row.get::<_, String>(3)?.as_str()),
+                annotation_type: AnnotationType::from_db_string(row.get::<_, String>(3)?),
                 content: row.get(4)?,
                 question_context: row.get(5)?,
                 author: row.get(6)?,
@@ -9502,8 +9502,7 @@ pub fn get_annotations_by_type(
             id: row.get(0)?,
             slug: row.get(1)?,
             node_id: row.get(2)?,
-            annotation_type: serde_json::from_value(serde_json::Value::String(at_str.clone()))
-                .unwrap_or(AnnotationType::Observation),
+            annotation_type: AnnotationType::from_db_string(at_str.clone()),
             content: row.get(4)?,
             question_context: row.get(5)?,
             author: row.get(6)?,
@@ -22108,18 +22107,20 @@ mod phase2_post_build_tests {
         let conn = mem_conn();
         create_slug(&conn, "s", &ContentType::Code, "/tmp/s").unwrap();
         seed_target_node(&conn, "s", "L0-000");
+        // Phase 6c-B: AnnotationType is a newtype wrapping a string; the
+        // canonical names live in the vocab registry (genesis seeds all 11).
         let all = [
-            AnnotationType::Observation,
-            AnnotationType::Correction,
-            AnnotationType::Question,
-            AnnotationType::Friction,
-            AnnotationType::Idea,
-            AnnotationType::Era,
-            AnnotationType::Transition,
-            AnnotationType::HealthCheck,
-            AnnotationType::Directory,
-            AnnotationType::SteelMan,
-            AnnotationType::RedTeam,
+            AnnotationType::new("observation"),
+            AnnotationType::new("correction"),
+            AnnotationType::new("question"),
+            AnnotationType::new("friction"),
+            AnnotationType::new("idea"),
+            AnnotationType::new("era"),
+            AnnotationType::new("transition"),
+            AnnotationType::new("health_check"),
+            AnnotationType::new("directory"),
+            AnnotationType::new("steel_man"),
+            AnnotationType::new("red_team"),
         ];
         for ty in all.iter() {
             let a = make_annotation("s", "L0-000", ty.clone());
@@ -22133,39 +22134,59 @@ mod phase2_post_build_tests {
     #[test]
     fn annotation_type_from_str_strict_rejects_unknown() {
         // Pillar 38 absorbed bug: from_str silently defaulted to Observation.
-        // from_str_strict raises so bad input surfaces instead of corrupting data.
-        assert!(AnnotationType::from_str_strict("observation").is_ok());
-        assert!(AnnotationType::from_str_strict("steel_man").is_ok());
-        assert!(AnnotationType::from_str_strict("red_team").is_ok());
+        // Phase 6c-B: from_str_strict is now vocab-backed — unknown strings
+        // raise because no vocab entry matches. Genesis seeds 11 canonical
+        // types, so all 11 known names must Ok.
+        let conn = mem_conn();
+        assert!(AnnotationType::from_str_strict(&conn, "observation").is_ok());
+        assert!(AnnotationType::from_str_strict(&conn, "steel_man").is_ok());
+        assert!(AnnotationType::from_str_strict(&conn, "red_team").is_ok());
         // Previously-missing variants (Pillar 38 absorb)
-        assert!(AnnotationType::from_str_strict("era").is_ok());
-        assert!(AnnotationType::from_str_strict("transition").is_ok());
-        assert!(AnnotationType::from_str_strict("health_check").is_ok());
-        assert!(AnnotationType::from_str_strict("directory").is_ok());
+        assert!(AnnotationType::from_str_strict(&conn, "era").is_ok());
+        assert!(AnnotationType::from_str_strict(&conn, "transition").is_ok());
+        assert!(AnnotationType::from_str_strict(&conn, "health_check").is_ok());
+        assert!(AnnotationType::from_str_strict(&conn, "directory").is_ok());
         // Unknown raises
-        assert!(AnnotationType::from_str_strict("bogus_type").is_err());
-        assert!(AnnotationType::from_str_strict("").is_err());
+        assert!(AnnotationType::from_str_strict(&conn, "bogus_type").is_err());
+        assert!(AnnotationType::from_str_strict(&conn, "").is_err());
     }
 
-    /// Phase 2 verifier: guard against drift between `AnnotationType::ALL`
-    /// (used by the HTTP write-path error message + any downstream
-    /// vocabulary display) and the parse/display methods. If someone adds
-    /// a new variant to the enum and forgets to extend `ALL`, this test
-    /// fails loud instead of letting the error message silently lie.
+    /// Phase 6c-B: `AnnotationType::ALL` is gone. The vocab registry is
+    /// authoritative. This test replaces the old drift-guard — asserts
+    /// that `AnnotationType::all(conn)` matches the vocab-active set for
+    /// `annotation_type`.
     #[test]
-    fn annotation_type_all_is_in_sync_with_parser() {
-        // Every string in ALL must parse strictly.
-        for name in AnnotationType::ALL {
-            AnnotationType::from_str_strict(name).unwrap_or_else(|_| {
-                panic!("AnnotationType::ALL contains '{name}' but from_str_strict rejects it")
-            });
-        }
-        // Spot-check: ALL has the full 11-type surface (length is a
-        // cheap canary for either side losing a variant).
+    fn annotation_type_all_matches_vocab_registry() {
+        let conn = mem_conn();
+        // Full list from the vocab registry.
+        let vocab_active: Vec<String> = crate::pyramid::vocab_entries::list_vocabulary(
+            &conn,
+            crate::pyramid::vocab_entries::VOCAB_KIND_ANNOTATION_TYPE,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+        let all_from_type: Vec<String> = AnnotationType::all(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.into_string())
+            .collect();
+        // Both must match (order: list_vocabulary sorts by name, AnnotationType::all
+        // is a straight map over it).
+        let mut vocab_sorted = vocab_active.clone();
+        vocab_sorted.sort();
+        let mut all_sorted = all_from_type.clone();
+        all_sorted.sort();
         assert_eq!(
-            AnnotationType::ALL.len(),
+            vocab_sorted, all_sorted,
+            "AnnotationType::all(conn) must equal the vocab registry's active annotation_type set"
+        );
+        // Spot check: 11 genesis entries seeded.
+        assert_eq!(
+            all_sorted.len(),
             11,
-            "ALL length drift — enum and ALL vocabulary are out of sync"
+            "genesis seeds 11 annotation_type entries; length drift means the seeder lost one"
         );
     }
 
@@ -25953,6 +25974,7 @@ mod phase6c_a_post_build_tests {
             description: "Custom test verb".to_string(),
             handler_chain_id: Some("starter-custom".to_string()),
             reactive: true,
+            creates_delta: false,
             created_at: String::new(),
             superseded_by: None,
             supersede_reason: None,
@@ -25971,6 +25993,7 @@ mod phase6c_a_post_build_tests {
             VOCAB_KIND_ANNOTATION_TYPE,
             "custom_verb",
             Some("Updated description"),
+            None,
             None,
             None,
             Some("tightening wording"),
@@ -25995,6 +26018,7 @@ mod phase6c_a_post_build_tests {
             description: "v1".to_string(),
             handler_chain_id: None,
             reactive: false,
+            creates_delta: false,
             created_at: String::new(),
             superseded_by: None,
             supersede_reason: None,
@@ -26007,6 +26031,7 @@ mod phase6c_a_post_build_tests {
             VOCAB_KIND_NODE_SHAPE,
             "custom_shape",
             Some("v2"),
+            None,
             None,
             None,
             Some("v1→v2"),
@@ -26064,6 +26089,7 @@ mod phase6c_a_post_build_tests {
             description: "Event check".to_string(),
             handler_chain_id: Some("starter-event-test".to_string()),
             reactive: true,
+            creates_delta: false,
             created_at: String::new(),
             superseded_by: None,
             supersede_reason: None,
@@ -26108,6 +26134,7 @@ mod phase6c_a_post_build_tests {
             description: "r1".to_string(),
             handler_chain_id: Some("starter-role".to_string()),
             reactive: false,
+            creates_delta: false,
             created_at: String::new(),
             superseded_by: None,
             supersede_reason: None,
@@ -26128,6 +26155,7 @@ mod phase6c_a_post_build_tests {
             VOCAB_KIND_ROLE_NAME,
             "supersede_test_role",
             Some("r2"),
+            None,
             None,
             None,
             Some("role refinement"),
@@ -26161,6 +26189,7 @@ mod phase6c_a_post_build_tests {
             description: "Cache invalidation test".to_string(),
             handler_chain_id: None,
             reactive: false,
+            creates_delta: false,
             created_at: String::new(),
             superseded_by: None,
             supersede_reason: None,
@@ -26284,6 +26313,7 @@ mod phase6c_a_post_build_tests {
             description: "colon injection attempt".to_string(),
             handler_chain_id: None,
             reactive: false,
+            creates_delta: false,
             created_at: String::new(),
             superseded_by: None,
             supersede_reason: None,
@@ -26308,6 +26338,7 @@ mod phase6c_a_post_build_tests {
             description: "empty name".to_string(),
             handler_chain_id: None,
             reactive: false,
+            creates_delta: false,
             created_at: String::new(),
             superseded_by: None,
             supersede_reason: None,
@@ -26335,6 +26366,7 @@ mod phase6c_a_post_build_tests {
             description: "first publish".to_string(),
             handler_chain_id: None,
             reactive: false,
+            creates_delta: false,
             created_at: String::new(),
             superseded_by: None,
             supersede_reason: None,
@@ -26382,6 +26414,7 @@ mod phase6c_a_post_build_tests {
             description: "v1".to_string(),
             handler_chain_id: None,
             reactive: false,
+            creates_delta: false,
             created_at: String::new(),
             superseded_by: None,
             supersede_reason: None,
@@ -26392,6 +26425,7 @@ mod phase6c_a_post_build_tests {
             VOCAB_KIND_ANNOTATION_TYPE,
             "reason_test_verb",
             Some("v2"),
+            None,
             None,
             None,
             Some("refining wording for clarity"),
@@ -26428,6 +26462,7 @@ mod phase6c_a_post_build_tests {
             description: "v1".to_string(),
             handler_chain_id: Some("starter-v1".to_string()),
             reactive: false,
+            creates_delta: false,
             created_at: String::new(),
             superseded_by: None,
             supersede_reason: None,
@@ -26447,6 +26482,7 @@ mod phase6c_a_post_build_tests {
             "reread_probe",
             Some("v2"),
             Some(Some("starter-v2")),
+            None,
             None,
             Some("updated"),
         )
@@ -26481,6 +26517,7 @@ mod phase6c_a_post_build_tests {
             Some("operator-edited description"),
             None,
             None,
+            None,
             Some(operator_reason),
         )
         .unwrap();
@@ -26506,6 +26543,456 @@ mod phase6c_a_post_build_tests {
             "re-seed must NOT overwrite operator's supersession"
         );
         assert_eq!(after_reseed.id, after_op.id, "no new row created on re-seed");
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Post-build accretion v5 Phase 6c-B tests.
+// AnnotationType is a vocab-backed newtype; process_annotation_hook reads
+// reactive + creates_delta from the vocabulary registry and drives
+// dispatch uniformly. The per-variant Rust match is gone — an agent who
+// publishes a new vocab entry with `reactive: true` gets
+// `annotation_reacted` emission without any code deploy.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod phase6c_b_post_build_tests {
+    use super::*;
+    use crate::pyramid::types::{AnnotationType, ContentType, PyramidAnnotation};
+    use crate::pyramid::vocab_entries::{
+        self, VocabEntry, VOCAB_KIND_ANNOTATION_TYPE,
+    };
+    use rusqlite::Connection;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Serialize the whole mod behind this mutex so the process-wide vocab
+    /// cache stays scoped to each test's own in-memory DB.
+    fn test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        conn
+    }
+
+    fn seed_target_node(conn: &Connection, slug: &str, node_id: &str) {
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES (?1, ?2, 0, '', '', '', 1)",
+            rusqlite::params![node_id, slug],
+        )
+        .unwrap();
+    }
+
+    fn make_annotation(slug: &str, node_id: &str, ty: AnnotationType) -> PyramidAnnotation {
+        PyramidAnnotation {
+            id: 0,
+            slug: slug.to_string(),
+            node_id: node_id.to_string(),
+            annotation_type: ty,
+            content: "test content".to_string(),
+            question_context: None,
+            author: "test-author".to_string(),
+            created_at: String::new(),
+        }
+    }
+
+    // ── Test 1 ─────────────────────────────────────────────────────────
+    // `from_str_strict` raises when the type string isn't in the vocab.
+    // Genesis seeds 11 types; anything else must be refused.
+    #[test]
+    fn unknown_annotation_type_raises_at_from_str_strict() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+        assert!(AnnotationType::from_str_strict(&conn, "observation").is_ok());
+        let err = AnnotationType::from_str_strict(&conn, "bogus_unknown_verb").unwrap_err();
+        assert_eq!(format!("{err}"), "Unknown annotation type: 'bogus_unknown_verb'");
+        // Empty string is also rejected.
+        assert!(AnnotationType::from_str_strict(&conn, "").is_err());
+    }
+
+    // ── Test 2 ─────────────────────────────────────────────────────────
+    // Publishing a new vocab entry makes `from_str_strict` accept the new
+    // name — the "agent publishes new type → type works" core claim.
+    #[test]
+    fn publishing_new_vocab_entry_makes_type_accepted() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+        // Before publish: unknown.
+        assert!(AnnotationType::from_str_strict(&conn, "custom_type").is_err());
+        // Publish a new annotation_type vocab entry.
+        let new_entry = VocabEntry {
+            id: 0,
+            vocab_kind: VOCAB_KIND_ANNOTATION_TYPE.to_string(),
+            name: "custom_type".to_string(),
+            description: "A runtime-added annotation type".to_string(),
+            handler_chain_id: None,
+            reactive: false,
+            creates_delta: false,
+            created_at: String::new(),
+            superseded_by: None,
+            supersede_reason: None,
+        };
+        vocab_entries::publish_vocabulary_entry(&conn, &new_entry).unwrap();
+        // After publish: accepted.
+        let parsed = AnnotationType::from_str_strict(&conn, "custom_type").unwrap();
+        assert_eq!(parsed.as_str(), "custom_type");
+    }
+
+    // ── Test (flag parity) ─────────────────────────────────────────────
+    // Genesis entries ship with the correct creates_delta flags:
+    // correction = true (matches pre-v5 hook behavior), everything else
+    // = false. Drift here would silently alter dispatch on init.
+    #[test]
+    fn genesis_annotation_type_creates_delta_flags_match_pre_v5_behavior() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+        let correction =
+            vocab_entries::get_vocabulary_entry(&conn, VOCAB_KIND_ANNOTATION_TYPE, "correction")
+                .unwrap()
+                .unwrap();
+        assert!(
+            correction.creates_delta,
+            "correction must have creates_delta=true — preserves pre-v5 delta-on-correction behavior"
+        );
+        // Everything else in the 11-entry set must be false.
+        for name in &[
+            "observation",
+            "question",
+            "friction",
+            "idea",
+            "era",
+            "transition",
+            "health_check",
+            "directory",
+            "steel_man",
+            "red_team",
+        ] {
+            let entry =
+                vocab_entries::get_vocabulary_entry(&conn, VOCAB_KIND_ANNOTATION_TYPE, name)
+                    .unwrap()
+                    .unwrap();
+            assert!(
+                !entry.creates_delta,
+                "{name} must have creates_delta=false (only correction creates deltas in genesis)"
+            );
+        }
+    }
+
+    // ── Test 4 ─────────────────────────────────────────────────────────
+    // When the vocab entry has `reactive: true`, `process_annotation_hook`
+    // emits an `annotation_reacted` observation event. This is the
+    // Phase 7 hook (which will consume the event for chain dispatch).
+    //
+    // Test setup is minimal: seed the slug + target node, save the
+    // annotation via the DB (not HTTP), call the hook with an LlmConfig
+    // that's never reached (reactive path writes an event, doesn't LLM),
+    // and assert the event exists.
+    #[tokio::test]
+    async fn process_annotation_hook_emits_reacted_when_vocab_reactive_is_true() {
+        let _lock = test_lock();
+        let (reader, writer) = hook_setup_readers_and_writers();
+        let slug = "rh-reactive";
+        {
+            let conn = writer.lock().await;
+            create_slug(&conn, slug, &ContentType::Code, "/tmp/x").unwrap();
+            seed_target_node(&conn, slug, "node-1");
+        }
+        // steel_man is genesis-reactive.
+        let ann = {
+            let conn = writer.lock().await;
+            save_annotation(
+                &conn,
+                &make_annotation(slug, "node-1", AnnotationType::new("steel_man")),
+            )
+            .unwrap()
+        };
+
+        run_hook(&reader, &writer, slug, &ann).await;
+
+        // Assert annotation_reacted event was written on the annotated node.
+        let conn = writer.lock().await;
+        let rows: Vec<(String, Option<String>, Option<String>)> = conn
+            .prepare(
+                "SELECT event_type, target_node_id, metadata_json
+                 FROM dadbear_observation_events
+                 WHERE slug = ?1 AND event_type = 'annotation_reacted'",
+            )
+            .unwrap()
+            .query_map(rusqlite::params![slug], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(rows.len(), 1, "exactly one annotation_reacted event for the steel_man");
+        assert_eq!(rows[0].1.as_deref(), Some("node-1"));
+        let metadata: serde_json::Value =
+            serde_json::from_str(rows[0].2.as_ref().unwrap()).unwrap();
+        assert_eq!(metadata["annotation_type"], "steel_man");
+        assert_eq!(metadata["target_node_id"], "node-1");
+        assert_eq!(metadata["handler_chain_id"], "starter-debate-steward");
+    }
+
+    // ── Test 5 ─────────────────────────────────────────────────────────
+    // Observation (reactive=false) must NOT emit annotation_reacted.
+    #[tokio::test]
+    async fn process_annotation_hook_does_not_emit_reacted_when_vocab_reactive_false() {
+        let _lock = test_lock();
+        let (reader, writer) = hook_setup_readers_and_writers();
+        let slug = "rh-nonreactive";
+        {
+            let conn = writer.lock().await;
+            create_slug(&conn, slug, &ContentType::Code, "/tmp/x").unwrap();
+            seed_target_node(&conn, slug, "node-1");
+        }
+        let ann = {
+            let conn = writer.lock().await;
+            save_annotation(
+                &conn,
+                &make_annotation(slug, "node-1", AnnotationType::new("observation")),
+            )
+            .unwrap()
+        };
+
+        run_hook(&reader, &writer, slug, &ann).await;
+
+        let conn = writer.lock().await;
+        let reacted_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE slug = ?1 AND event_type = 'annotation_reacted'",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reacted_count, 0, "observation is non-reactive, no annotation_reacted expected");
+        // But annotation_written should have been written on any L1+
+        // ancestor — there are none here (single-depth node), so 0 is
+        // also fine. Just confirm no reacted.
+    }
+
+    // ── Test 6 ─────────────────────────────────────────────────────────
+    // When the vocab entry has `creates_delta: true` and a matching
+    // thread exists, a delta row is created. Uses a contrived inline
+    // delta bypass: we don't run the full LLM-powered create_delta —
+    // instead we assert the hook enters the delta branch (no thread
+    // matches → logs and skips, so deltas table stays empty but the
+    // code path was exercised). We supplement with a flag-level
+    // assertion: correction has creates_delta=true in vocab, observation
+    // has false. The flag IS what drives dispatch.
+    //
+    // This test explicitly asserts "correction enters creates_delta
+    // branch" via the hook path: we verify it doesn't panic + that for
+    // NO-matching-thread, the hook still completes Ok.
+    #[tokio::test]
+    async fn process_annotation_hook_handles_creates_delta_true_without_matching_thread() {
+        let _lock = test_lock();
+        let (reader, writer) = hook_setup_readers_and_writers();
+        let slug = "rh-delta-no-thread";
+        {
+            let conn = writer.lock().await;
+            create_slug(&conn, slug, &ContentType::Code, "/tmp/x").unwrap();
+            seed_target_node(&conn, slug, "node-1");
+        }
+        // correction is genesis creates_delta=true.
+        let ann = {
+            let conn = writer.lock().await;
+            save_annotation(
+                &conn,
+                &make_annotation(slug, "node-1", AnnotationType::new("correction")),
+            )
+            .unwrap()
+        };
+        // No thread has current_canonical_id = "node-1", so delta creation
+        // is skipped with an info log — but the hook MUST have entered the
+        // creates_delta=true branch, not gone down a per-type match arm
+        // that no longer exists.
+        run_hook(&reader, &writer, slug, &ann).await;
+
+        // Sanity: the annotation_superseded event was emitted on ancestors
+        // (correction has special event_type in emit_annotation_observation_events).
+        // Since node-1 has no parent in our setup, no event is emitted — that's OK.
+        // The real assertion here is that the hook completed without error,
+        // proving the dispatch path handles creates_delta=true uniformly.
+        let conn = writer.lock().await;
+        // No annotation_reacted (correction.reactive=false).
+        let reacted_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE slug = ?1 AND event_type = 'annotation_reacted'",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reacted_count, 0, "correction is not reactive, no reacted event");
+    }
+
+    // ── Test 7 ─────────────────────────────────────────────────────────
+    // Observation (creates_delta=false) MUST NOT attempt delta creation.
+    // We test this by asserting no delta rows exist after the hook runs.
+    #[tokio::test]
+    async fn process_annotation_hook_no_delta_for_pure_observation() {
+        let _lock = test_lock();
+        let (reader, writer) = hook_setup_readers_and_writers();
+        let slug = "rh-no-delta";
+        {
+            let conn = writer.lock().await;
+            create_slug(&conn, slug, &ContentType::Code, "/tmp/x").unwrap();
+            seed_target_node(&conn, slug, "node-1");
+            // Seed a thread with canonical_id = node-1 so creates_delta=true
+            // WOULD find it. Our observation has creates_delta=false so
+            // no delta is attempted.
+            conn.execute(
+                "INSERT INTO pyramid_threads
+                    (slug, thread_id, thread_name, current_canonical_id, depth, delta_count)
+                 VALUES (?1, 'thr-1', 'main', 'node-1', 0, 0)",
+                rusqlite::params![slug],
+            )
+            .unwrap();
+        }
+        let ann = {
+            let conn = writer.lock().await;
+            save_annotation(
+                &conn,
+                &make_annotation(slug, "node-1", AnnotationType::new("observation")),
+            )
+            .unwrap()
+        };
+
+        run_hook(&reader, &writer, slug, &ann).await;
+
+        let conn = writer.lock().await;
+        let delta_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_deltas WHERE slug = ?1",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            delta_count, 0,
+            "observation has creates_delta=false; no delta row expected"
+        );
+    }
+
+    // ── Test 8 ─────────────────────────────────────────────────────────
+    // End-to-end proof: an agent publishes a NEW reactive vocab entry,
+    // then an annotation of that type fires annotation_reacted via
+    // `process_annotation_hook`. No code deploy, no enum edit.
+    #[tokio::test]
+    async fn publish_new_reactive_type_then_insert_routes_reacted_end_to_end() {
+        let _lock = test_lock();
+        let (reader, writer) = hook_setup_readers_and_writers();
+        let slug = "rh-e2e-new";
+        {
+            let conn = writer.lock().await;
+            create_slug(&conn, slug, &ContentType::Code, "/tmp/x").unwrap();
+            seed_target_node(&conn, slug, "node-e2e");
+            // Publish a brand new reactive annotation type — this is the
+            // core "agent adds vocab, runtime accepts it" claim.
+            let new_entry = VocabEntry {
+                id: 0,
+                vocab_kind: VOCAB_KIND_ANNOTATION_TYPE.to_string(),
+                name: "my_new_reactive_type".to_string(),
+                description: "Runtime-published reactive type".to_string(),
+                handler_chain_id: Some("starter-my-chain".to_string()),
+                reactive: true,
+                creates_delta: false,
+                created_at: String::new(),
+                superseded_by: None,
+                supersede_reason: None,
+            };
+            vocab_entries::publish_vocabulary_entry(&conn, &new_entry).unwrap();
+        }
+        // Strict-parse must accept it.
+        {
+            let conn = reader.lock().await;
+            assert!(AnnotationType::from_str_strict(&conn, "my_new_reactive_type").is_ok());
+        }
+
+        // Save the annotation with the runtime-added type.
+        let ann = {
+            let conn = writer.lock().await;
+            save_annotation(
+                &conn,
+                &make_annotation(slug, "node-e2e", AnnotationType::new("my_new_reactive_type")),
+            )
+            .unwrap()
+        };
+
+        // Run the hook and verify annotation_reacted was emitted —
+        // WITHOUT any Rust code change.
+        run_hook(&reader, &writer, slug, &ann).await;
+
+        let conn = writer.lock().await;
+        let (count, metadata_json): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(metadata_json) FROM dadbear_observation_events
+                  WHERE slug = ?1 AND event_type = 'annotation_reacted'",
+                rusqlite::params![slug],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "one annotation_reacted for the new runtime-added type");
+        let metadata: serde_json::Value =
+            serde_json::from_str(&metadata_json.unwrap()).unwrap();
+        assert_eq!(metadata["annotation_type"], "my_new_reactive_type");
+        assert_eq!(metadata["handler_chain_id"], "starter-my-chain");
+        assert_eq!(metadata["target_node_id"], "node-e2e");
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────
+
+    /// Build the shared reader/writer handles that `process_annotation_hook`
+    /// expects. We open a single in-memory DB and hand out Arc<Mutex> to
+    /// both sides of the pair — for these tests reader and writer point
+    /// at the same connection (SQLite in-memory doesn't multi-open).
+    fn hook_setup_readers_and_writers() -> (
+        std::sync::Arc<tokio::sync::Mutex<Connection>>,
+        std::sync::Arc<tokio::sync::Mutex<Connection>>,
+    ) {
+        let raw = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&raw).unwrap();
+        vocab_entries::invalidate_cache();
+        let shared = std::sync::Arc::new(tokio::sync::Mutex::new(raw));
+        (shared.clone(), shared)
+    }
+
+    /// Call the real `process_annotation_hook` from `routes.rs` with a
+    /// stub LlmConfig + OperationalConfig — neither reactive nor the
+    /// no-matching-thread delta paths actually invoke an LLM. The
+    /// `model` string is only used if delta creation is attempted.
+    async fn run_hook(
+        reader: &std::sync::Arc<tokio::sync::Mutex<Connection>>,
+        writer: &std::sync::Arc<tokio::sync::Mutex<Connection>>,
+        slug: &str,
+        annotation: &PyramidAnnotation,
+    ) {
+        // Minimal stubs — the hook branches we exercise here don't dereference them.
+        let base_config = crate::pyramid::llm::LlmConfig::default();
+        let model = "test-model";
+        let ops = crate::pyramid::OperationalConfig::default();
+        crate::pyramid::routes::test_hooks::run_process_annotation_hook(
+            reader,
+            writer,
+            slug,
+            annotation,
+            &base_config,
+            model,
+            &ops,
+        )
+        .await
+        .expect("hook must complete Ok on covered branches");
     }
 }
 

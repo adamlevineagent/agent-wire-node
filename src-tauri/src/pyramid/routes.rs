@@ -4302,21 +4302,31 @@ async fn handle_annotate(
         }
     }
 
-    // Post-build accretion v5 Phase 1 verifier: HTTP write path must refuse
-    // unknown annotation types instead of silently mapping to Observation.
-    // The lossy AnnotationType::from_str is retained for reading legacy DB
-    // rows; write paths use from_str_strict per Pillar 38 absorbed bug.
-    let annotation_type = match AnnotationType::from_str_strict(&body.annotation_type) {
-        Ok(t) => t,
-        Err(e) => {
-            return Ok(json_error(
-                warp::http::StatusCode::BAD_REQUEST,
-                &format!(
-                    "{}. Valid types: {}",
-                    e,
-                    AnnotationType::ALL.join(", ")
-                ),
-            ));
+    // Post-build accretion v5 Phase 6c-B: HTTP write path validates against
+    // the vocabulary registry (`pyramid_config_contributions` rows with
+    // schema_type `vocabulary_entry:annotation_type:*`). Agents who publish
+    // a new vocab entry can POST annotations of that type immediately — no
+    // code deploy. Pillar 38 absorbed bug: unknown types RAISE (the pre-v5
+    // lossy `from_str` silently mapped to Observation).
+    let annotation_type = {
+        let conn = state.reader.lock().await;
+        match AnnotationType::from_str_strict(&conn, &body.annotation_type) {
+            Ok(t) => t,
+            Err(e) => {
+                let valid = AnnotationType::all(&conn)
+                    .map(|types| {
+                        types
+                            .iter()
+                            .map(|t| t.as_str().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_else(|_| String::from("<vocab lookup failed>"));
+                return Ok(json_error(
+                    warp::http::StatusCode::BAD_REQUEST,
+                    &format!("{}. Valid types: {}", e, valid),
+                ));
+            }
         }
     };
     let annotation = PyramidAnnotation {
@@ -4402,9 +4412,20 @@ async fn emit_annotation_observation_events(
     slug: &str,
     annotation: &PyramidAnnotation,
 ) -> anyhow::Result<()> {
-    let event_type = match annotation.annotation_type {
-        AnnotationType::Correction => "annotation_superseded",
-        _ => "annotation_written",
+    // Phase 6c-B: dispatch on the canonical string rather than enum variants
+    // so new vocab-defined types "just work". `correction` gets the stronger
+    // `annotation_superseded` signal; everything else is `annotation_written`.
+    // If a future vocab entry needs `annotation_superseded` semantics, it
+    // should be lifted to a vocab flag (like `creates_delta`) rather than
+    // re-hardcoded here. FIXME(6c-B): this string special-case is a tactical
+    // residual — the long-term fix is an `event_type_on_emit` field on the
+    // vocab entry, defaulting to "annotation_written" and allowing
+    // "annotation_superseded". Not scoped for this phase to keep the surface
+    // minimal; the match is still only one string comparison.
+    let event_type = if annotation.annotation_type.as_str() == ANNOTATION_TYPE_CORRECTION {
+        "annotation_superseded"
+    } else {
+        "annotation_written"
     };
 
     let metadata_json = serde_json::json!({
@@ -4485,9 +4506,12 @@ async fn emit_annotation_observation_events(
     Ok(())
 }
 
-/// Background hook that runs after an annotation is saved.
-/// Correction annotations create deltas on the matching thread.
-/// Other types are logged for future FAQ/review processing.
+/// Background hook that runs after an annotation is saved. Phase 6c-B
+/// flipped this from an 11-variant `AnnotationType` match to vocab-driven
+/// dispatch: the vocabulary registry is now the source of truth for which
+/// annotation types create deltas (`creates_delta`) and which are reactive
+/// (`reactive` → emits `annotation_reacted`). Publishing a new vocab entry
+/// with either flag works at runtime with no code deploy — the whole point.
 async fn process_annotation_hook(
     reader: &Arc<tokio::sync::Mutex<rusqlite::Connection>>,
     writer: &Arc<tokio::sync::Mutex<rusqlite::Connection>>,
@@ -4503,6 +4527,10 @@ async fn process_annotation_hook(
     // The annotated node itself is excluded — the annotation is already
     // attached to it; re-distillation only makes sense for the parents whose
     // summaries now depend on a fact they haven't seen.
+    //
+    // Every annotation emits `annotation_written` events regardless of
+    // vocab flags — this is the pre-v5 cascade contract and Phase 8 is
+    // what flips it to role_bound. Keep emission unconditional.
     if let Err(e) = emit_annotation_observation_events(writer, slug, annotation).await {
         tracing::warn!(
             "[annotation] failed to emit observation events for annotation #{}: {}",
@@ -4511,135 +4539,151 @@ async fn process_annotation_hook(
         );
     }
 
-    match annotation.annotation_type {
-        AnnotationType::Correction => {
-            // Correction annotations create deltas on the relevant thread
-            let threads = {
-                let conn = reader.lock().await;
-                db::get_threads(&conn, slug)?
-            };
+    // Vocab-driven dispatch. The vocab_kind=annotation_type entry was
+    // already validated at HTTP ingress (from_str_strict), so a missing
+    // entry here means either a race (supersession mid-flight) or a
+    // direct DB write that bypassed the ingress check. Per
+    // `feedback_loud_deferrals` we RAISE rather than silently skipping
+    // the dispatch — a missing entry at hook time is a bug the operator
+    // needs to see.
+    let type_str = annotation.annotation_type.as_str().to_string();
+    let vocab_entry = {
+        let conn = reader.lock().await;
+        super::vocab_entries::get_vocabulary_entry(
+            &conn,
+            super::vocab_entries::VOCAB_KIND_ANNOTATION_TYPE,
+            &type_str,
+        )?
+    };
+    let vocab_entry = vocab_entry.ok_or_else(|| {
+        anyhow::anyhow!(
+            "vocabulary entry missing for annotation_type '{type_str}' at hook time \
+             (annotation #{} on slug '{slug}') — validated at ingress, so this is a \
+             race or direct-DB write",
+            annotation.id
+        )
+    })?;
 
-            // Find the thread whose canonical node matches the annotated node
-            let target_thread = threads
-                .iter()
-                .find(|t| t.current_canonical_id == annotation.node_id);
-
-            if let Some(thread) = target_thread {
-                let delta_content = format!(
-                    "CORRECTION (from annotation #{}): {}",
-                    annotation.id, annotation.content
-                );
-
-                delta::create_delta(
-                    reader,
-                    writer,
-                    slug,
-                    &thread.thread_id,
-                    &delta_content,
-                    Some(&annotation.node_id),
-                    base_config,
-                    model,
-                    ops,
-                )
-                .await?;
-
-                tracing::info!(
-                    "[annotation] correction annotation #{} created delta on thread '{}'",
-                    annotation.id,
-                    thread.thread_id
-                );
-            } else {
-                tracing::info!("[annotation] correction annotation #{} on node '{}' — no matching thread found, skipping delta",
-                    annotation.id, annotation.node_id);
-            }
-        }
-
-        AnnotationType::Observation | AnnotationType::Idea => {
-            // Observations and ideas flag the thread for review
-            tracing::info!(
-                "[annotation] {} annotation #{} on node '{}' — logged for FAQ processing",
-                annotation.annotation_type.as_str(),
+    // ── (1) Delta creation — vocab-flagged ──────────────────────────
+    //
+    // Pre-v5 this was a hardcoded `AnnotationType::Correction =>
+    // create_delta(...)` arm. Now `creates_delta` on the vocab entry
+    // controls it — an operator publishing a new annotation type that
+    // should also spawn deltas just sets the flag; zero code change.
+    if vocab_entry.creates_delta {
+        let threads = {
+            let conn = reader.lock().await;
+            db::get_threads(&conn, slug)?
+        };
+        let target_thread = threads
+            .iter()
+            .find(|t| t.current_canonical_id == annotation.node_id);
+        if let Some(thread) = target_thread {
+            let delta_content = format!(
+                "{} (from annotation #{}): {}",
+                type_str.to_uppercase(),
                 annotation.id,
-                annotation.node_id
+                annotation.content
             );
-        }
-
-        AnnotationType::Question => {
-            // Questions get processed by the FAQ system (separate workstream)
+            delta::create_delta(
+                reader,
+                writer,
+                slug,
+                &thread.thread_id,
+                &delta_content,
+                Some(&annotation.node_id),
+                base_config,
+                model,
+                ops,
+            )
+            .await?;
             tracing::info!(
-                "[annotation] question annotation #{} on node '{}' — logged for FAQ processing",
+                "[annotation] {} annotation #{} created delta on thread '{}' (creates_delta=true)",
+                type_str,
                 annotation.id,
-                annotation.node_id
+                thread.thread_id
             );
-        }
-
-        AnnotationType::Friction => {
-            // Friction is logged but doesn't trigger deltas
+        } else {
             tracing::info!(
-                "[annotation] friction annotation #{} on node '{}' — logged",
-                annotation.id,
-                annotation.node_id
-            );
-        }
-
-        AnnotationType::Era => {
-            // ERA annotations mark project phase boundaries on vine nodes
-            tracing::info!(
-                "[annotation] ERA annotation #{} on node '{}' — vine intelligence",
-                annotation.id,
-                annotation.node_id
-            );
-        }
-
-        AnnotationType::Transition => {
-            // Transition annotations classify phase shifts between ERAs
-            tracing::info!(
-                "[annotation] transition annotation #{} on node '{}' — vine intelligence",
-                annotation.id,
-                annotation.node_id
-            );
-        }
-
-        AnnotationType::HealthCheck => {
-            // Health check results from vine integrity pass
-            tracing::info!(
-                "[annotation] health_check annotation #{} on node '{}' — vine integrity",
-                annotation.id,
-                annotation.node_id
-            );
-        }
-
-        AnnotationType::Directory => {
-            // Sub-apex directory wiring for vine navigation
-            tracing::info!(
-                "[annotation] directory annotation #{} on node '{}' — vine directory",
-                annotation.id,
-                annotation.node_id
-            );
-        }
-
-        AnnotationType::SteelMan => {
-            // Post-build accretion v5: structural accretion only at this hook.
-            // Debate steward (Phase 7) consumes steel-man annotations via the
-            // debate_spawned event pipeline once enough positions accrue.
-            tracing::info!(
-                "[annotation] steel-man annotation #{} on node '{}' — awaiting debate_steward",
-                annotation.id,
-                annotation.node_id
-            );
-        }
-
-        AnnotationType::RedTeam => {
-            // Post-build accretion v5: structural accretion only at this hook.
-            // Debate steward (Phase 7) consumes red-team annotations as position
-            // counter-arguments via debate_spawned event pipeline.
-            tracing::info!(
-                "[annotation] red-team annotation #{} on node '{}' — awaiting debate_steward",
+                "[annotation] {} annotation #{} on node '{}' — creates_delta=true but no matching thread, skipping delta",
+                type_str,
                 annotation.id,
                 annotation.node_id
             );
         }
     }
+
+    // ── (2) Reactive emission — vocab-flagged ───────────────────────
+    //
+    // Phase 6c-B spec: reactive annotations emit `annotation_reacted`
+    // observation events with metadata carrying the annotation id, type,
+    // target node, and handler_chain_id (so Phase 7 consumers like the
+    // judge chain can dispatch without re-reading the vocab entry).
+    // Pre-v5 this was hidden under the SteelMan / RedTeam arms — now
+    // vocab-driven. `hypothesis` / `gap` / `purpose_declaration` /
+    // `purpose_shift` types can be added as a contribution and will
+    // immediately emit without a code deploy.
+    if vocab_entry.reactive {
+        let metadata_json = serde_json::json!({
+            "annotation_id": annotation.id,
+            "annotation_type": annotation.annotation_type.as_str(),
+            "target_node_id": annotation.node_id,
+            "handler_chain_id": vocab_entry.handler_chain_id,
+            "author": annotation.author,
+        })
+        .to_string();
+        let conn = writer.lock().await;
+        if let Err(e) = super::observation_events::write_observation_event(
+            &conn,
+            slug,
+            "annotation",                  // source
+            "annotation_reacted",          // event_type
+            None,                          // source_path
+            None,                          // file_path
+            None,                          // content_hash
+            None,                          // previous_hash
+            Some(&annotation.node_id),     // target_node_id — annotated node itself
+            None,                          // layer — not ancestry-scoped
+            Some(&metadata_json),
+        ) {
+            tracing::warn!(
+                "[annotation] failed to emit annotation_reacted for annotation #{}: {}",
+                annotation.id,
+                e
+            );
+        } else {
+            tracing::info!(
+                "[annotation] {} annotation #{} on node '{}' — emitted annotation_reacted (handler_chain={:?})",
+                type_str,
+                annotation.id,
+                annotation.node_id,
+                vocab_entry.handler_chain_id
+            );
+        }
+    } else {
+        // Non-reactive: logged only. The specific per-variant log
+        // messages the 11-arm match used to carry ("ERA annotation...
+        // vine intelligence", "health_check... vine integrity", etc.)
+        // are dropped in favor of a uniform message. That's a minor
+        // observability downgrade but the per-variant strings were
+        // diagnostic flavoring, not load-bearing. Restored as a single
+        // tag field below.
+        tracing::info!(
+            "[annotation] {} annotation #{} on node '{}' — logged (non-reactive)",
+            type_str,
+            annotation.id,
+            annotation.node_id
+        );
+    }
+
+    // Note on vocab_entry.handler_chain_id when !reactive: the vocab
+    // entry may declare a handler chain for types that aren't "reactive
+    // in the attention sense" (e.g. a future type that fires a chain
+    // after some other signal, not on every arrival). This hook does
+    // NOT dispatch such chains directly — chain dispatch is owned by
+    // the role-routing path (Phase 7 / Phase 8) which consumes
+    // observation events. Emitting annotation_reacted only when
+    // reactive=true keeps that contract clean.
 
     // FAQ processing — for any annotation with question_context
     if annotation.question_context.is_some() {
@@ -10454,6 +10498,33 @@ async fn handle_reading_search(
     }
 }
 
+// ── Test-only re-exports ─────────────────────────────────────────────────
+//
+// Phase 6c-B: `process_annotation_hook` is `async fn` private to this
+// module. The Phase 6c-B test module in `db.rs` needs to drive it to
+// prove vocab-driven dispatch end-to-end. Expose it through a tiny
+// `#[cfg(test)]` shim so the test-only surface is explicit and the
+// production callers keep the private path.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use super::*;
+
+    /// Invoke `process_annotation_hook` from a test context. Signature
+    /// mirrors the private function exactly; this is a no-op wrapper.
+    pub async fn run_process_annotation_hook(
+        reader: &Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+        writer: &Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+        slug: &str,
+        annotation: &PyramidAnnotation,
+        base_config: &super::super::llm::LlmConfig,
+        model: &str,
+        ops: &super::super::OperationalConfig,
+    ) -> anyhow::Result<()> {
+        super::process_annotation_hook(reader, writer, slug, annotation, base_config, model, ops)
+            .await
+    }
+}
+
 // ── annotation → observation → re_distill integration tests ──────────────
 //
 // Exercises the closed loop added in the annotation-cascade fix:
@@ -10519,7 +10590,7 @@ mod annotation_observation_tests {
         seed_pyramid_with_tree(&raw, "anno-pyr");
         let writer = Arc::new(Mutex::new(raw));
 
-        let ann = make_annotation("L0-leaf", AnnotationType::Observation, 101);
+        let ann = make_annotation("L0-leaf", AnnotationType::new("observation"), 101);
         emit_annotation_observation_events(&writer, "anno-pyr", &ann)
             .await
             .unwrap();
@@ -10554,7 +10625,7 @@ mod annotation_observation_tests {
         seed_pyramid_with_tree(&raw, "anno-pyr");
         let writer = Arc::new(Mutex::new(raw));
 
-        let ann = make_annotation("L0-leaf", AnnotationType::Correction, 202);
+        let ann = make_annotation("L0-leaf", AnnotationType::new("correction"), 202);
         emit_annotation_observation_events(&writer, "anno-pyr", &ann)
             .await
             .unwrap();
@@ -10587,7 +10658,7 @@ mod annotation_observation_tests {
         .unwrap();
         let writer = Arc::new(Mutex::new(raw));
 
-        let ann = make_annotation("missing-id", AnnotationType::Observation, 303);
+        let ann = make_annotation("missing-id", AnnotationType::new("observation"), 303);
         emit_annotation_observation_events(&writer, "anno-pyr", &ann)
             .await
             .expect("missing nodes must not poison annotation save");
@@ -10611,7 +10682,7 @@ mod annotation_observation_tests {
         let writer = Arc::new(Mutex::new(raw));
 
         // Write annotation observation events for two ancestors.
-        let ann = make_annotation("L0-leaf", AnnotationType::Observation, 404);
+        let ann = make_annotation("L0-leaf", AnnotationType::new("observation"), 404);
         emit_annotation_observation_events(&writer, "anno-pyr", &ann)
             .await
             .unwrap();
@@ -10652,7 +10723,7 @@ mod annotation_observation_tests {
         let writer = Arc::new(Mutex::new(raw));
 
         for id in [501i64, 502, 503] {
-            let ann = make_annotation("L0-leaf", AnnotationType::Observation, id);
+            let ann = make_annotation("L0-leaf", AnnotationType::new("observation"), id);
             emit_annotation_observation_events(&writer, "anno-pyr", &ann)
                 .await
                 .unwrap();

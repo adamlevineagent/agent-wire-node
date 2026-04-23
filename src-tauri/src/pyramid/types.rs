@@ -745,31 +745,55 @@ pub struct PyramidAnnotation {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum AnnotationType {
-    Observation,
-    Correction,
-    Question,
-    Friction,
-    Idea,
-    Era,
-    Transition,
-    #[serde(rename = "health_check")]
-    HealthCheck,
-    #[serde(rename = "directory")]
-    Directory,
-    // Post-build accretion v5 additions (steel-man / red-team for debate nodes)
-    #[serde(rename = "steel_man")]
-    SteelMan,
-    #[serde(rename = "red_team")]
-    RedTeam,
-}
+/// Annotation type as a vocab-validated newtype wrapper.
+///
+/// Phase 6c-B: this was an 11-variant Rust enum until v5; the enum was the
+/// source of truth AND parsers/dispatch arms encoded type-specific behavior
+/// in match-legs. That made the registry (Phase 6c-A) dead plumbing —
+/// publishing a new vocab entry had zero runtime effect.
+///
+/// Now the newtype wraps the canonical string and the
+/// `pyramid_config_contributions` vocabulary registry is the authoritative
+/// list. `from_str_strict(conn, s)` validates against the registry so an
+/// agent who publishes a new vocab entry for `my_new_type` can POST an
+/// annotation with that type the moment the entry is active — no code
+/// deploy.
+///
+/// Serde transparent keeps wire compat: it serializes to / deserializes
+/// from the plain string. The DB column stores the same string via
+/// `as_str()`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AnnotationType(String);
+
+// ── Canonical string constants for the 11 genesis annotation types ──
+//
+// These are NOT an authoritative list (the vocabulary registry is) — they
+// exist so internal Rust call sites that already know a specific genesis
+// type (vine.rs writing an ERA annotation, `emit_annotation_observation_events`
+// detecting "correction") don't have to hit the vocab cache just to spell
+// the canonical string. Adding a new vocab type via contribution does NOT
+// require adding a constant here; these are convenience for the baked-in
+// names that predate the registry.
+pub const ANNOTATION_TYPE_OBSERVATION: &str = "observation";
+pub const ANNOTATION_TYPE_CORRECTION: &str = "correction";
+pub const ANNOTATION_TYPE_QUESTION: &str = "question";
+pub const ANNOTATION_TYPE_FRICTION: &str = "friction";
+pub const ANNOTATION_TYPE_IDEA: &str = "idea";
+pub const ANNOTATION_TYPE_ERA: &str = "era";
+pub const ANNOTATION_TYPE_TRANSITION: &str = "transition";
+pub const ANNOTATION_TYPE_HEALTH_CHECK: &str = "health_check";
+pub const ANNOTATION_TYPE_DIRECTORY: &str = "directory";
+pub const ANNOTATION_TYPE_STEEL_MAN: &str = "steel_man";
+pub const ANNOTATION_TYPE_RED_TEAM: &str = "red_team";
 
 /// Raised when a string does not match a known annotation type.
-/// Used by `AnnotationType::from_str_strict`. Production write paths should
-/// use the strict form; read paths may fall back to the lossy `from_str` to
-/// handle legacy rows.
+/// Used by `AnnotationType::from_str_strict`. Production write paths must
+/// use the strict form so unknown types raise (Pillar 38 absorbed bug:
+/// the old lossy `from_str` silently mapped unknown → Observation). Legacy
+/// read paths use `AnnotationType::from_db_string` which wraps whatever
+/// the DB had, knowing the DB column can only contain strings that were
+/// accepted at write time.
 #[derive(Debug, thiserror::Error)]
 #[error("Unknown annotation type: '{0}'")]
 pub struct UnknownAnnotationType(pub String);
@@ -793,84 +817,88 @@ pub struct FaqNode {
 }
 
 impl AnnotationType {
-    /// Canonical enumeration of every annotation type, in the order the
-    /// Rust enum declares them. Exposed so error messages and vocabulary
-    /// lists generate from this single source of truth instead of being
-    /// repeated as drift-prone string literals next to every ingress.
-    /// Post-build accretion v5 Phase 2 verifier: added to kill the
-    /// hand-rolled list that had been living in `routes.rs`.
-    pub const ALL: &'static [&'static str] = &[
-        "observation",
-        "correction",
-        "question",
-        "friction",
-        "idea",
-        "era",
-        "transition",
-        "health_check",
-        "directory",
-        "steel_man",
-        "red_team",
-    ];
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AnnotationType::Observation => "observation",
-            AnnotationType::Correction => "correction",
-            AnnotationType::Question => "question",
-            AnnotationType::Friction => "friction",
-            AnnotationType::Idea => "idea",
-            AnnotationType::Era => "era",
-            AnnotationType::Transition => "transition",
-            AnnotationType::HealthCheck => "health_check",
-            AnnotationType::Directory => "directory",
-            AnnotationType::SteelMan => "steel_man",
-            AnnotationType::RedTeam => "red_team",
-        }
+    /// Raw constructor — wraps an arbitrary string. Use for internal call
+    /// sites that already know the string is a canonical genesis name
+    /// (e.g. `vine.rs` building an `era` annotation, DB read path
+    /// re-wrapping a value that was validated at write time). Write paths
+    /// that accept external input (HTTP, MCP CLI) MUST use
+    /// `from_str_strict` instead so unknown values raise.
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
     }
 
-    /// Lossy parse — retained for reading legacy DB rows. Unknown values
-    /// warn + default to Observation. Prefer `from_str_strict` in new write
-    /// paths so vocabulary drift surfaces instead of silently corrupting data.
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "observation" => AnnotationType::Observation,
-            "correction" => AnnotationType::Correction,
-            "question" => AnnotationType::Question,
-            "friction" => AnnotationType::Friction,
-            "idea" => AnnotationType::Idea,
-            "era" => AnnotationType::Era,
-            "transition" => AnnotationType::Transition,
-            "health_check" => AnnotationType::HealthCheck,
-            "directory" => AnnotationType::Directory,
-            "steel_man" => AnnotationType::SteelMan,
-            "red_team" => AnnotationType::RedTeam,
-            other => {
-                tracing::warn!("Unknown annotation type: '{other}', defaulting to Observation");
-                AnnotationType::Observation
+    /// The canonical string form. Stored in `pyramid_annotations.annotation_type`
+    /// and used as the wire-protocol string in JSON.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the wrapper and return the inner string.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
+    /// Wrap a value read from the DB. Does NOT validate against the
+    /// vocabulary — the DB column can only contain strings that were
+    /// accepted at write time (write paths use `from_str_strict`). Kept
+    /// as a named helper so the intent is clear at read call sites vs
+    /// the generic `new` constructor.
+    pub fn from_db_string(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    /// Strict parse — validates `s` against the vocabulary registry
+    /// (`pyramid_config_contributions` rows with
+    /// `schema_type LIKE 'vocabulary_entry:annotation_type:%'`). Unknown
+    /// values raise `UnknownAnnotationType`. Use in every write path
+    /// (CLI, MCP, HTTP) so agents publishing new vocab entries can
+    /// IMMEDIATELY post annotations of that type without a code deploy —
+    /// the whole point of Phase 6c-B.
+    ///
+    /// Pillar 38 absorbed bug: the pre-v5 lossy `from_str` silently
+    /// defaulted unknowns to Observation; the strict form refuses.
+    pub fn from_str_strict(
+        conn: &rusqlite::Connection,
+        s: &str,
+    ) -> std::result::Result<Self, UnknownAnnotationType> {
+        match super::vocab_entries::get_vocabulary_entry(
+            conn,
+            super::vocab_entries::VOCAB_KIND_ANNOTATION_TYPE,
+            s,
+        ) {
+            Ok(Some(_)) => Ok(Self(s.to_string())),
+            Ok(None) => Err(UnknownAnnotationType(s.to_string())),
+            Err(e) => {
+                // Vocabulary read failure should not silently-accept
+                // unknown strings. Log the DB error and refuse — the
+                // caller sees UnknownAnnotationType which surfaces in
+                // HTTP as 400, and the DB error is in the trace.
+                tracing::error!(
+                    "vocabulary lookup failed while validating annotation_type '{s}': {e}"
+                );
+                Err(UnknownAnnotationType(s.to_string()))
             }
         }
     }
 
-    /// Strict parse — raises on unknown values. Use in any new write path
-    /// (CLI, MCP, HTTP) so unknown types are refused rather than silently
-    /// mapped to Observation. Pillar 38 absorbed bug: the lossy `from_str`
-    /// has been corrupting annotations written with unknown type strings.
-    pub fn from_str_strict(s: &str) -> std::result::Result<Self, UnknownAnnotationType> {
-        match s {
-            "observation" => Ok(AnnotationType::Observation),
-            "correction" => Ok(AnnotationType::Correction),
-            "question" => Ok(AnnotationType::Question),
-            "friction" => Ok(AnnotationType::Friction),
-            "idea" => Ok(AnnotationType::Idea),
-            "era" => Ok(AnnotationType::Era),
-            "transition" => Ok(AnnotationType::Transition),
-            "health_check" => Ok(AnnotationType::HealthCheck),
-            "directory" => Ok(AnnotationType::Directory),
-            "steel_man" => Ok(AnnotationType::SteelMan),
-            "red_team" => Ok(AnnotationType::RedTeam),
-            other => Err(UnknownAnnotationType(other.to_string())),
-        }
+    /// Active set of annotation types from the vocabulary registry,
+    /// sorted by name. Replaces the pre-v5 `AnnotationType::ALL`
+    /// static slice. If vocab lookup fails, returns an empty Vec plus
+    /// an error — callers that want the bare list (e.g. error-message
+    /// rendering in HTTP 400 response) should fall back to the
+    /// genesis constants on error.
+    pub fn all(conn: &rusqlite::Connection) -> anyhow::Result<Vec<Self>> {
+        let entries = super::vocab_entries::list_vocabulary(
+            conn,
+            super::vocab_entries::VOCAB_KIND_ANNOTATION_TYPE,
+        )?;
+        Ok(entries.into_iter().map(|e| Self(e.name)).collect())
+    }
+}
+
+impl std::fmt::Display for AnnotationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
