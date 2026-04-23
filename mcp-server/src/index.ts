@@ -11,7 +11,10 @@ import {
   getToolCatalog,
   getToolCatalogEntry,
   getToolCatalogByCategory,
-  ANNOTATION_TYPES,
+  getAnnotationTypesSync,
+  refreshAnnotationTypes,
+  validateAnnotationType,
+  FALLBACK_ANNOTATION_TYPES,
 } from "./lib.js";
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -355,10 +358,19 @@ server.tool(
       .optional()
       .describe("Optional: the question or task context that prompted this annotation"),
     annotation_type: z
-      .enum(ANNOTATION_TYPES)
+      .string()
       .optional()
       .describe(
-        `Optional: annotation type — ${ANNOTATION_TYPES.map((t) => `'${t}'`).join(", ")} (default: 'observation'). Unknown values are rejected at the MCP layer before hitting the Wire Node.`
+        // Phase 6c-C: dynamic vocabulary. The cached type list is
+        // surfaced in the description so tools see current types at
+        // listing time, but validation happens in the handler body
+        // (Option C) so operator-published types that arrive between
+        // MCP server starts are still accepted via cache-miss refresh.
+        `Optional: annotation type (default: 'observation'). Currently known types: ` +
+          `${((getAnnotationTypesSync() ?? [...FALLBACK_ANNOTATION_TYPES]).map((t) => `'${t}'`).join(", "))}. ` +
+          `New types can be published by writing a vocabulary_entry contribution — ` +
+          `they are accepted without a code deploy. Unknown values are rejected ` +
+          `by the MCP handler with a helpful error.`
       ),
     author: z
       .string()
@@ -366,13 +378,31 @@ server.tool(
       .describe("Optional: author identifier (e.g. 'my-agent', 'auditor-1'). Defaults to 'mcp-agent'."),
   },
   async ({ slug, node_id, content, question_context, annotation_type, author }) => {
+    // Phase 6c-C: validate against the dynamic vocabulary cache (with
+    // opportunistic refresh on miss) instead of a static z.enum.
+    let validatedType: string | undefined;
+    if (annotation_type !== undefined) {
+      const result = await validateAnnotationType(annotation_type);
+      if (!result.ok) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ error: result.error, validTypes: result.validTypes }, null, 2),
+            },
+          ],
+        };
+      }
+      validatedType = result.name;
+    }
+
     const body: Record<string, string> = {
       node_id,
       content,
       author: author || "mcp-agent",
     };
     if (question_context) body.question_context = question_context;
-    if (annotation_type) body.annotation_type = annotation_type;
+    if (validatedType) body.annotation_type = validatedType;
 
     const resp = await pyramidFetch(
       `/pyramid/${encodeURIComponent(slug)}/annotate`,
@@ -1024,6 +1054,21 @@ server.tool(
 async function main(): Promise<void> {
   // Non-blocking connectivity check (logs warning, doesn't prevent startup)
   await checkConnectivity();
+
+  // Phase 6c-C: warm the vocabulary cache. Fire-and-let-fallback; if
+  // the Wire node is down, `refreshAnnotationTypes` installs the genesis
+  // fallback and emits a warning. We don't await a hard-fail here —
+  // graceful-degraded MCP is the goal.
+  try {
+    const types = await refreshAnnotationTypes();
+    console.error(
+      `[pyramid-mcp] Vocabulary warmed: ${types.length} annotation_type entries cached`
+    );
+  } catch (err) {
+    console.error(
+      `[pyramid-mcp] WARNING: vocabulary warm-up failed: ${err instanceof Error ? err.message : String(err)} — using fallback`
+    );
+  }
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

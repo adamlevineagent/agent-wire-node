@@ -3,24 +3,21 @@
 // See .lab/architecture/agent-wire-node-post-build-plan-v5.md
 
 // ── Annotation verbs ────────────────────────────────────────────────────
-// All 11 values — previously-missing Era/Transition/HealthCheck/Directory
-// + new SteelMan/RedTeam — surfaced here so the UI dropdown is in sync with
-// the Rust enum. MCP CLI's VALID_ANNOTATION_TYPES fixed in parallel (Phase 2
-// WS2-D Pillar 38 absorbed).
-export type AnnotationType =
-  | "observation"
-  | "correction"
-  | "question"
-  | "friction"
-  | "idea"
-  | "era"
-  | "transition"
-  | "health_check"
-  | "directory"
-  | "steel_man"
-  | "red_team";
+// Phase 6c-C: annotation types are now sourced at runtime from the Wire
+// node's `GET /vocabulary/annotation_type` registry (the zero-auth
+// endpoint shipped in 6c-A). Compile-time literal unions would reject
+// operator-published types that arrive without a code deploy — the whole
+// point of the vocabulary registry is that new types (e.g.
+// `counter_correction`) are accepted by every surface through contribution
+// writes. Components that need a dropdown of valid types should use
+// `useAnnotationTypes()` from `src/hooks/useVocabulary.ts`.
+//
+// The `FALLBACK_ANNOTATION_TYPES` constant is kept as a safety net for
+// compile-time code that needs a starter list before the network fetch
+// completes (loading states, etc.).
+export type AnnotationType = string;
 
-export const ANNOTATION_TYPES: AnnotationType[] = [
+export const FALLBACK_ANNOTATION_TYPES: string[] = [
   "observation",
   "correction",
   "question",

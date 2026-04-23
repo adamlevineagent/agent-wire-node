@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist-test/
 target/
 .signing-key*.txt
 .signing-key*.txt.pub

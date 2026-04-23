@@ -17,7 +17,11 @@ import {
   getToolCatalog,
   getToolCatalogEntry,
   getToolCatalogByCategory,
-  ANNOTATION_TYPES,
+  FALLBACK_ANNOTATION_TYPES,
+  refreshAnnotationTypes,
+  getAnnotationTypesSync,
+  validateAnnotationType,
+  renderVocabTypeList,
 } from "./lib.js";
 
 // ── Arg Parsing ──────────────────────────────────────────────────────────────
@@ -57,24 +61,63 @@ const command = positional[0];
 // Pretty is the default; --compact turns it off
 const pretty = flags.compact !== "true";
 
-// ── Valid Annotation Types ───────────────────────────────────────────────────
+// ── Valid Annotation Types (Phase 6c-C: dynamic) ────────────────────────────
+//
+// The CLI is short-lived (per-invocation), so the vocab cache only survives
+// the lifetime of one command run. We lazily fetch the list the first time
+// a command needs it (either to validate --type or to render help text).
+// If the Wire node is unreachable, `refreshAnnotationTypes` installs the
+// hardcoded genesis fallback and the CLI proceeds in graceful-degraded
+// mode — the user still gets working help text + validation of the genesis
+// set, just not of any newly-published operator types.
+//
+// Single source of truth: the Wire node's `GET /vocabulary/annotation_type`
+// endpoint (6c-A). Eliminates the old triple-duplication (Rust enum +
+// lib.ts const + this file's VALID_ANNOTATION_TYPES) in favor of the
+// contribution-driven registry.
 
-// Single source of truth lives in lib.ts → ANNOTATION_TYPES. The CLI, the
-// MCP zod schema (index.ts), and the command registry (lib.ts) all read
-// from the same list so help text, Zod validation, and the input validator
-// cannot drift from each other or from the Rust `AnnotationType` enum.
-const VALID_ANNOTATION_TYPES = ANNOTATION_TYPES;
+let annotationTypeCachePromise: Promise<readonly string[]> | null = null;
+
+/** Fetch (or return the cached) vocabulary for this CLI invocation. */
+function ensureAnnotationTypes(): Promise<readonly string[]> {
+  if (annotationTypeCachePromise === null) {
+    annotationTypeCachePromise = refreshAnnotationTypes().catch(() => {
+      return [...FALLBACK_ANNOTATION_TYPES];
+    });
+  }
+  return annotationTypeCachePromise;
+}
 
 /** Render the annotation-type vocabulary for a help-text flag description,
- * wrapped across two lines to keep narrow terminal output readable. */
+ * wrapped across two lines to keep narrow terminal output readable. Reads
+ * whatever is in the cache at call time — help-text shown before the
+ * vocab fetch completes uses the genesis fallback. */
 function renderAnnotationTypeHelp(indent: string): string {
-  const types = [...ANNOTATION_TYPES];
-  // Two-line wrap: first 5 on line 1, the rest on continuations.
-  const first = types.slice(0, 5).join(" | ");
-  const rest = types.slice(5);
-  const mid = rest.slice(0, 4).join(" | ");
-  const last = rest.slice(4).join(" | ");
-  return `${first} |\n${indent}${mid} |\n${indent}${last}`;
+  const types = getAnnotationTypesSync() ?? [...FALLBACK_ANNOTATION_TYPES];
+  return renderVocabTypeList(types, indent);
+}
+
+/** Dynamic annotate-help renderer. Called after the vocab fetch so the
+ * displayed type list is current. */
+function renderAnnotateHelp(): string {
+  return `annotate — Add an annotation to a pyramid node
+
+Usage: pyramid-cli annotate <slug> <node_id> <content> [options]
+
+Arguments:
+  <slug>      Pyramid slug
+  <node_id>   Node ID to annotate
+  <content>   Annotation text
+
+Options:
+  --question "..."   Question this answers (triggers FAQ creation)
+  --author "..."     Your agent name (default: cli-agent)
+  --type <type>      ${renderAnnotationTypeHelp("                     ")}
+                     (default: observation)
+
+Vocabulary is read dynamically from the Wire node's /vocabulary/annotation_type
+endpoint. New types can be published as vocabulary_entry contributions — the
+CLI will accept them without a code deploy.`;
 }
 
 // ── Per-command Help ─────────────────────────────────────────────────────────
@@ -164,20 +207,11 @@ Arguments:
   <slug>      Pyramid slug
   [node_id]   Optional node ID to filter annotations`,
 
-  annotate: `annotate — Add an annotation to a pyramid node
-
-Usage: pyramid-cli annotate <slug> <node_id> <content> [options]
-
-Arguments:
-  <slug>      Pyramid slug
-  <node_id>   Node ID to annotate
-  <content>   Annotation text
-
-Options:
-  --question "..."   Question this answers (triggers FAQ creation)
-  --author "..."     Your agent name (default: cli-agent)
-  --type <type>      ${renderAnnotationTypeHelp("                     ")}
-                     (default: observation)`,
+  // Phase 6c-C: `annotate` help is rendered at display time via
+  // `renderAnnotateHelp()` so it reflects the currently-cached vocab
+  // (including operator-published types). Placeholder kept here only
+  // for COMMAND_HELP keys lookup; callers must call the function.
+  annotate: "__DYNAMIC_ANNOTATE_HELP__",
 
   tree: `tree — Structural overview of a pyramid
 
@@ -769,6 +803,8 @@ function enc(s: string): string {
 async function run(): Promise<void> {
   // Handle --help, -h, or no command
   if (!command || (flags.help === "true" && !command)) {
+    // Phase 6c-C: fetch vocab so top-level --help renders current types.
+    await ensureAnnotationTypes();
     printUsage();
     if (!command) process.exit(1);
     process.exit(0);
@@ -776,8 +812,17 @@ async function run(): Promise<void> {
 
   // Per-command help: if command exists and --help is set, show command-specific help
   if (flags.help === "true" && command) {
-    const help = COMMAND_HELP[command];
-    if (help) {
+    // Phase 6c-C: fetch vocab once before rendering per-command help so
+    // dynamic help text (currently just `annotate`) reflects the live
+    // registry.
+    if (command === "annotate" || command === "help") {
+      await ensureAnnotationTypes();
+    }
+    const help =
+      command === "annotate"
+        ? renderAnnotateHelp()
+        : COMMAND_HELP[command];
+    if (help && help !== "__DYNAMIC_ANNOTATE_HELP__") {
       process.stderr.write(help + "\n");
       process.exit(0);
     } else {
@@ -1011,17 +1056,21 @@ async function run(): Promise<void> {
       const nodeId = requireArg(2, "node_id");
       const content = requireArg(3, "content");
 
-      // Fix #4: validate --type values
+      // Phase 6c-C: validate --type via the dynamic vocabulary endpoint.
+      // `validateAnnotationType` hits the cache, auto-refreshes on miss
+      // (so an operator who just published a new type gets accepted
+      // without a code deploy), and returns a helpful error pointing
+      // to contribution-publish as the extension path.
       const annotationType = flags.type || undefined;
-      if (annotationType && !(VALID_ANNOTATION_TYPES as readonly string[]).includes(annotationType)) {
-        process.stderr.write(
-          `Error: invalid annotation type '${annotationType}'.\n` +
-          `Valid types: ${VALID_ANNOTATION_TYPES.join(", ")}\n`
-        );
-        process.exit(1);
+      if (annotationType) {
+        const result = await validateAnnotationType(annotationType);
+        if (!result.ok) {
+          process.stderr.write(`Error: ${result.error}\n`);
+          process.exit(1);
+        }
       }
 
-      // Fix #8: default to "observation" with note when --type not specified
+      // Default to "observation" with note when --type not specified
       const typeDefaulted = !annotationType;
       const resolvedType = annotationType || "observation";
 
@@ -1437,6 +1486,10 @@ async function run(): Promise<void> {
     // ── Self-Documenting Help ─────────────────────────────────────────
 
     case "help": {
+      // Phase 6c-C: warm vocab cache so catalog entries render current
+      // types in dynamic fields (e.g. annotate.flags.type.description).
+      await ensureAnnotationTypes();
+
       const topic = positional[1]; // optional: command name
       const categoryFilter = flags.category;
 
