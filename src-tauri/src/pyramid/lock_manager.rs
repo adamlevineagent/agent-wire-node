@@ -462,10 +462,16 @@ impl Drop for SlugReadGuard {
 /// - Under `debug_assertions` (dev + test builds): panic with a clear
 ///   message naming the caller's obligation. Tests catch missing
 ///   acquisitions loudly; non-compliant code never ships.
-/// - In release builds: `tracing::error!` and continue. Matches the
-///   project's mid-migration risk tolerance (feedback_loud_deferrals:
-///   loud but non-fatal in production so a false-negative doesn't
-///   crash an end-user node).
+/// - In release builds: `tracing::error!` + `anyhow::bail!`. Phase
+///   9c-3 verifier pass flipped this from "continue" to "bail" per
+///   `feedback_loud_deferrals` + `feedback_no_integrity_demotion`:
+///   a missing write guard is a correctness bug in the caller, not
+///   a recoverable condition. The original "continue" rationale
+///   ("the race window is already exposed") is wrong — `execute_
+///   supersession` returns `Result`, callers already handle failure,
+///   and silently proceeding into an un-serialized write risks DB
+///   corruption. Surface the error so the caller can abort the
+///   arm cleanly.
 ///
 /// The canonical call sites that supply this invariant today:
 /// - `stale_helpers_upper::execute_supersession` (Phase 9a-2 lock
@@ -473,9 +479,9 @@ impl Drop for SlugReadGuard {
 ///
 /// Discovered-wrong callers would otherwise violate the invariant
 /// silently until a race manifested as a DB inconsistency.
-pub fn assert_write_lock_held(slug: &str, caller: &str) {
+pub fn assert_write_lock_held(slug: &str, caller: &str) -> anyhow::Result<()> {
     if LockManager::global().is_write_locked(slug) {
-        return;
+        return Ok(());
     }
     #[cfg(debug_assertions)]
     {
@@ -493,9 +499,13 @@ pub fn assert_write_lock_held(slug: &str, caller: &str) {
             slug = %slug,
             caller = %caller,
             "Phase 9c-3-2 lock-held assertion FAILED: caller did not acquire \
-             LockManager::global().write(slug) before calling. Continuing in \
-             release builds per mid-migration risk tolerance; fix the call \
-             site immediately."
+             LockManager::global().write(slug) before calling. Refusing to \
+             proceed; fix the call site immediately."
+        );
+        anyhow::bail!(
+            "{caller}: LockManager write guard is NOT held on slug='{slug}'. \
+             Caller must acquire `LockManager::global().write(slug).await` \
+             before invoking {caller} (Phase 9c-3-2 / verifier pass)."
         );
     }
 }

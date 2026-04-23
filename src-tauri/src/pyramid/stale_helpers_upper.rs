@@ -2183,9 +2183,10 @@ pub async fn execute_supersession(
 ) -> Result<String> {
     // Phase 9c-3-2: defensive lock assertion. Fails loud if the caller
     // did not acquire `LockManager::global().write(slug)` before calling
-    // this function. See the Phase 9a-2 lock contract note in this
-    // function's docstring.
-    crate::pyramid::lock_manager::assert_write_lock_held(slug, "execute_supersession");
+    // this function. Debug: panic. Release: Err bail (verifier-pass
+    // flip — refuse to proceed without the guard, surface to caller).
+    // See the Phase 9a-2 lock contract note in this function's docstring.
+    crate::pyramid::lock_manager::assert_write_lock_held(slug, "execute_supersession")?;
     // Phase 9a-3: annotation-arrival-during-dispatch race — the race window
     // between compile-snapshot of observation_event_ids and the LLM apply
     // is now bounded by a MAX(annotation_id)-indexed watermark stored in

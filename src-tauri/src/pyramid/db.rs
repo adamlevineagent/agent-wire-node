@@ -36314,12 +36314,15 @@ mod phase9c3_post_build_tests {
         use crate::pyramid::lock_manager::{assert_write_lock_held, LockManager};
         let slug = "p9c3_assert_pass";
         let _g = LockManager::global().write(slug).await;
-        // Should NOT panic.
-        assert_write_lock_held(slug, "phase9c3_test_ok_case");
+        // Should NOT panic and MUST return Ok.
+        assert_write_lock_held(slug, "phase9c3_test_ok_case")
+            .expect("assertion must pass when guard is held");
     }
 
     // ── 9c-3-2.5: assertion FAILS loud when lock NOT held ───────────────
     // In debug builds this panics; catch via std::panic::catch_unwind.
+    // In release builds (verifier-pass flip) it returns Err — not
+    // exercised here because test suites run under debug_assertions.
     #[cfg(debug_assertions)]
     #[tokio::test]
     async fn assert_write_lock_held_panics_when_missing() {
@@ -36328,7 +36331,9 @@ mod phase9c3_post_build_tests {
         let slug = "p9c3_assert_missing";
         // Deliberately NO write guard acquired.
         let outcome = std::panic::catch_unwind(|| {
-            assert_write_lock_held(slug, "phase9c3_test_missing_case");
+            // Ignore the Result return value — the call is expected to
+            // panic before it returns.
+            let _ = assert_write_lock_held(slug, "phase9c3_test_missing_case");
         });
         assert!(
             outcome.is_err(),
