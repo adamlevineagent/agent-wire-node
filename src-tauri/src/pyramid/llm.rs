@@ -2181,6 +2181,45 @@ pub async fn call_model_unified_with_audit_and_ctx(
         CacheProbeOutcome::MissOrBypass(lookup) => lookup,
     };
 
+    // walker-v3-completion Wave 5: dispatch-spine guard.
+    //
+    // Every non-cache-hit LLM call must reach the walker with EITHER a
+    // DispatchDecision attached to the StepContext OR a model_override
+    // set on LlmCallOptions. Both absent = silent provider-skip cascade
+    // (every branch returns walker_v3_no_model and the call fails with
+    // no user-actionable error). Fail loud instead.
+    //
+    // The canonical path to attach Decision is
+    // `make_step_ctx_from_llm_config(.., slot, model?, provider_id?)`
+    // which builds Decision via `with_dispatch_decision_if_available`.
+    // Legacy non-slot constructors (`_with_model`, manual
+    // `StepContext::new`) bypass this unless paired with
+    // `with_dispatch_decision_if_available` — see plan
+    // docs/plans/walker-v3-completion-decision-attachment.md §4, §5.
+    let decision_present = ctx
+        .and_then(|c| c.dispatch_decision.as_ref())
+        .is_some();
+    let override_present = options.model_override.is_some();
+    if !decision_present && !override_present {
+        let step_name = ctx.map(|c| c.step_name.as_str()).unwrap_or("<no_ctx>");
+        let primitive = ctx.map(|c| c.primitive.as_str()).unwrap_or("<no_ctx>");
+        tracing::error!(
+            event = "walker_dispatch_spine_missing",
+            step_name = %step_name,
+            primitive = %primitive,
+            "walker-v3-completion: call site has neither DispatchDecision \
+             (via make_step_ctx_from_llm_config with a slot) nor \
+             LlmCallOptions.model_override. Walker would iterate providers \
+             and skip each with walker_v3_no_model. See plan §4-§5.",
+        );
+        return Err(anyhow!(
+            "walker dispatch spine missing: step_name={step_name}, \
+             primitive={primitive}. Call site must attach a Decision via \
+             make_step_ctx_from_llm_config with a slot, OR set \
+             LlmCallOptions.model_override. Walker v3 Completion."
+        ));
+    }
+
     // Resolve the provider trait impl + credential for this call. The
     // registry path is preferred; if no registry is attached to the
     // config we synthesize an `OpenRouterProvider` from the legacy
@@ -5676,6 +5715,17 @@ routing_rules:
     //     test drives via an empty api_key so no real HTTP happens.
     //   - Pool semaphore at concurrency 0 = permanently-saturated.
 
+    /// walker-v3-completion Wave 5 test helper: LlmCallOptions with a
+    /// model_override set so the dispatch-spine guard at call_model_unified_
+    /// with_audit_and_ctx entry doesn't fire. These tests exercise walker
+    /// cascade behavior downstream of the guard.
+    fn walker_test_options() -> LlmCallOptions {
+        LlmCallOptions {
+            model_override: Some("test/walker-spine-override".to_string()),
+            ..Default::default()
+        }
+    }
+
     fn walker_test_policy(
         pool_concurrency: usize,
         route_entries: Vec<&str>,
@@ -5862,7 +5912,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
 
@@ -5899,7 +5949,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
 
@@ -5914,6 +5964,77 @@ routing_rules:
         assert!(
             msg.contains("3 entries"),
             "expected '3 entries' (fleet + market + unknown-pool), got: {msg}",
+        );
+    }
+
+    // ── walker-v3-completion Wave 5 guard test ─────────────────────────
+    //
+    // The dispatch-spine guard at `call_model_unified_with_audit_and_ctx`
+    // entry fails loud when a call arrives with no DispatchDecision AND
+    // no LlmCallOptions.model_override. This prevents the silent
+    // bypass cascade where the walker iterates every provider, skips
+    // each with walker_v3_no_model, and returns a no-viable-route error
+    // that hides the actual problem (call site never declared a tier).
+
+    #[tokio::test]
+    async fn walker_dispatch_spine_guard_fails_loud_when_decision_and_override_absent() {
+        let policy = walker_test_policy(1, vec!["unknown-provider"]);
+        let config = walker_test_config(policy);
+
+        let result = call_model_unified_with_audit_and_ctx(
+            &config,
+            None, // no StepContext → no Decision
+            None, // no AuditContext
+            "sys",
+            "usr",
+            0.0,
+            16,
+            None,
+            LlmCallOptions::default(), // no model_override
+        )
+        .await;
+
+        let err = result.expect_err("guard should fire when both Decision and override are absent");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("walker dispatch spine missing"),
+            "expected 'walker dispatch spine missing' in error, got: {msg}",
+        );
+        assert!(
+            msg.contains("make_step_ctx_from_llm_config"),
+            "expected error to point caller at canonical helper, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn walker_dispatch_spine_guard_passes_when_model_override_present() {
+        // With model_override set, the guard is satisfied; walker proceeds
+        // and the unknown-provider pool entry exhausts the route normally.
+        let policy = walker_test_policy(1, vec!["unknown-provider"]);
+        let config = walker_test_config(policy);
+
+        let result = call_model_unified_with_audit_and_ctx(
+            &config,
+            None,
+            None,
+            "sys",
+            "usr",
+            0.0,
+            16,
+            None,
+            walker_test_options(), // has model_override
+        )
+        .await;
+
+        let err = result.expect_err("walker should exhaust normally");
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("walker dispatch spine missing"),
+            "guard must not fire when model_override is set; got: {msg}",
+        );
+        assert!(
+            msg.contains("no viable route"),
+            "expected normal walker-exhaust error, got: {msg}",
         );
     }
 
@@ -5934,7 +6055,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
 
@@ -5972,7 +6093,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
 
@@ -5996,7 +6117,7 @@ routing_rules:
         let policy = walker_test_policy(1, vec!["fleet", "unknown-pool"]);
         let config = walker_test_config(policy);
 
-        let mut options = LlmCallOptions::default();
+        let mut options = walker_test_options();
         options.skip_fleet_dispatch = true;
 
         let result = call_model_unified_with_audit_and_ctx(
@@ -6025,7 +6146,7 @@ routing_rules:
         let policy = walker_test_policy(1, vec!["fleet", "unknown-pool"]);
         let config = walker_test_config(policy);
 
-        let mut options = LlmCallOptions::default();
+        let mut options = walker_test_options();
         options.dispatch_origin = DispatchOrigin::FleetReceived;
 
         let result = call_model_unified_with_audit_and_ctx(
@@ -6075,7 +6196,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
 
@@ -6100,7 +6221,7 @@ routing_rules:
         let policy = walker_test_policy(1, vec!["market", "unknown-pool"]);
         let config = walker_test_config(policy);
 
-        let mut options = LlmCallOptions::default();
+        let mut options = walker_test_options();
         options.dispatch_origin = DispatchOrigin::MarketReceived;
 
         let result = call_model_unified_with_audit_and_ctx(
@@ -6155,7 +6276,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
 
@@ -6252,7 +6373,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await
         .expect_err("walker should exhaust after market miss + unknown pool");
@@ -6379,7 +6500,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await
         .expect("local queue hop should resolve through fake GPU loop");
@@ -6729,7 +6850,7 @@ routing_rules:
             0.2,
             4096,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await
         .expect("cache hit must return Ok");
@@ -6760,7 +6881,7 @@ routing_rules:
             0.2,
             4096,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
         assert!(
@@ -6830,7 +6951,7 @@ routing_rules:
             0.2,
             4096,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
         // The HTTP path failed (no real provider) — that's the proof
@@ -6894,7 +7015,7 @@ routing_rules:
             0.2,
             4096,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
         // After the verification-failure path, the row should be
@@ -7016,7 +7137,7 @@ routing_rules:
             0.2,
             4096,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await
         .expect("cache hit must return Ok");
@@ -7094,7 +7215,7 @@ routing_rules:
             0.2,
             4096,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
 
@@ -7157,7 +7278,7 @@ routing_rules:
             0.2,
             4096,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await
         .expect("cache hit returns Ok");
@@ -7765,7 +7886,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
 
@@ -7956,7 +8077,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         );
 
         // The queue enqueue blocks forever without a GPU loop. Time out
@@ -8234,7 +8355,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
 
@@ -8298,7 +8419,7 @@ routing_rules:
         let (config, db) = walker_test_config_with_queue(policy);
         let db_path = db.path().to_string_lossy().to_string();
 
-        let mut options = LlmCallOptions::default();
+        let mut options = walker_test_options();
         options.dispatch_origin = DispatchOrigin::Local; // outer call
 
         let _ = tokio::time::timeout(
