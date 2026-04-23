@@ -32484,7 +32484,12 @@ mod phase8_post_build_tests {
 
         let config = mocked_llm_config(server.url()).await;
         // execute_supersession is the exact call the Phase 8-2 supervisor
-        // re_distill arm makes.
+        // re_distill arm makes. Phase 9c-3-2: acquire the slug write
+        // guard BEFORE the call — the defensive lock assertion inside
+        // `execute_supersession` fails loud in debug builds without one.
+        let _slug_lock = crate::pyramid::lock_manager::LockManager::global()
+            .write("p8-crown")
+            .await;
         let resolved = crate::pyramid::stale_helpers_upper::execute_supersession(
             "L1-CROWN",
             &db_path,
@@ -32496,6 +32501,7 @@ mod phase8_post_build_tests {
         .await
         .expect("execute_supersession must succeed against mocked LLM");
         assert_eq!(resolved, "L1-CROWN", "node identity must NOT change");
+        drop(_slug_lock);
 
         // ── THE CROWN JEWEL ASSERTIONS ─────────────────────────────────
         // pyramid_nodes.distilled / headline MUST reflect the mocked
@@ -33208,6 +33214,13 @@ mod phase8_post_build_tests {
         // target_id. The new production path (annotations on
         // DESCENDANTS) is covered by the new
         // `annotation_on_descendant_updates_ancestor...` test below.
+        //
+        // Phase 9c-3-2: acquire the slug write guard BEFORE the call
+        // so the defensive lock assertion inside `execute_supersession`
+        // is satisfied (debug-build panic otherwise).
+        let _slug_lock = crate::pyramid::lock_manager::LockManager::global()
+            .write("p8-tail")
+            .await;
         let resolved = crate::pyramid::stale_helpers_upper::execute_supersession(
             "L1-TAIL",
             &db_path,
@@ -33222,6 +33235,7 @@ mod phase8_post_build_tests {
              UnmatchedRequest, the annotation content did NOT reach the \
              LLM prompt (cascade_annotations channel is broken)",
         );
+        drop(_slug_lock);
         assert_eq!(resolved, "L1-TAIL", "node identity must NOT change");
 
         // Post-condition: node was updated with the manifest's new content.
@@ -36236,6 +36250,89 @@ mod phase9c3_post_build_tests {
         assert_eq!(
             after_read_2, after_publish,
             "watermark must be stable under read-only traffic"
+        );
+    }
+
+    // ── 9c-3-2.1: lock_manager is_write_locked tracks guard lifetime ────
+    #[tokio::test]
+    async fn lock_manager_tracks_write_guard_lifetime() {
+        let _lock = test_lock();
+        use crate::pyramid::lock_manager::LockManager;
+        let slug = "p9c3_lock_track";
+        assert!(
+            !LockManager::global().is_write_locked(slug),
+            "fresh slug must not report locked"
+        );
+        {
+            let _g = LockManager::global().write(slug).await;
+            assert!(
+                LockManager::global().is_write_locked(slug),
+                "slug must report locked while guard is held"
+            );
+        }
+        assert!(
+            !LockManager::global().is_write_locked(slug),
+            "slug must report unlocked after guard drops"
+        );
+    }
+
+    // ── 9c-3-2.2: read guards track via is_read_locked ──────────────────
+    #[tokio::test]
+    async fn lock_manager_tracks_read_guard_lifetime() {
+        let _lock = test_lock();
+        use crate::pyramid::lock_manager::LockManager;
+        let slug = "p9c3_read_track";
+        assert!(!LockManager::global().is_read_locked(slug));
+        let _g = LockManager::global().read(slug).await;
+        assert!(LockManager::global().is_read_locked(slug));
+        drop(_g);
+        assert!(!LockManager::global().is_read_locked(slug));
+    }
+
+    // ── 9c-3-2.3: multiple readers coexist (counter > 1) ────────────────
+    #[tokio::test]
+    async fn lock_manager_read_counter_supports_multiple_readers() {
+        let _lock = test_lock();
+        use crate::pyramid::lock_manager::LockManager;
+        let slug = "p9c3_read_multi";
+        let g1 = LockManager::global().read(slug).await;
+        let g2 = LockManager::global().read(slug).await;
+        assert!(LockManager::global().is_read_locked(slug));
+        drop(g1);
+        assert!(
+            LockManager::global().is_read_locked(slug),
+            "still held by second reader"
+        );
+        drop(g2);
+        assert!(!LockManager::global().is_read_locked(slug));
+    }
+
+    // ── 9c-3-2.4: assertion PASSES when write guard is held ─────────────
+    #[tokio::test]
+    async fn assert_write_lock_held_passes_when_held() {
+        let _lock = test_lock();
+        use crate::pyramid::lock_manager::{assert_write_lock_held, LockManager};
+        let slug = "p9c3_assert_pass";
+        let _g = LockManager::global().write(slug).await;
+        // Should NOT panic.
+        assert_write_lock_held(slug, "phase9c3_test_ok_case");
+    }
+
+    // ── 9c-3-2.5: assertion FAILS loud when lock NOT held ───────────────
+    // In debug builds this panics; catch via std::panic::catch_unwind.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn assert_write_lock_held_panics_when_missing() {
+        let _lock = test_lock();
+        use crate::pyramid::lock_manager::assert_write_lock_held;
+        let slug = "p9c3_assert_missing";
+        // Deliberately NO write guard acquired.
+        let outcome = std::panic::catch_unwind(|| {
+            assert_write_lock_held(slug, "phase9c3_test_missing_case");
+        });
+        assert!(
+            outcome.is_err(),
+            "assert_write_lock_held must panic when the guard is not held"
         );
     }
 

@@ -2165,10 +2165,14 @@ pub(crate) async fn persist_change_manifest_with_bus(
 /// - `stale_engine` L0 file_change + L1+ confirmed-stale branches — each
 ///   acquires the write lock around the `execute_supersession` call.
 ///
-/// Test-only call sites in `db.rs` (phase8_post_build_tests) invoke without
-/// a lock because they are single-threaded. Production code MUST hold the
-/// write lock; the lock-acquired assertion at the top of this function
-/// catches new non-compliant call sites at runtime.
+/// Phase 9c-3-2: the lock-acquired assertion at the top of this
+/// function catches new non-compliant call sites at runtime. In debug
+/// builds (dev + test), a missing write guard panics with the caller's
+/// obligation spelled out. In release builds, the assertion logs a loud
+/// `tracing::error!` and continues — matches the mid-migration risk
+/// tolerance (loud but non-fatal in production so a false-negative
+/// doesn't crash an end-user node). All Phase 8/9 test call sites were
+/// audited and updated in Phase 9c-3-2 to acquire the guard.
 pub async fn execute_supersession(
     node_id: &str,
     db_path: &str,
@@ -2177,6 +2181,11 @@ pub async fn execute_supersession(
     model: &str,
     annotated_node_ids: Option<Vec<String>>,
 ) -> Result<String> {
+    // Phase 9c-3-2: defensive lock assertion. Fails loud if the caller
+    // did not acquire `LockManager::global().write(slug)` before calling
+    // this function. See the Phase 9a-2 lock contract note in this
+    // function's docstring.
+    crate::pyramid::lock_manager::assert_write_lock_held(slug, "execute_supersession");
     // Phase 9a-3: annotation-arrival-during-dispatch race — the race window
     // between compile-snapshot of observation_event_ids and the LLM apply
     // is now bounded by a MAX(annotation_id)-indexed watermark stored in
