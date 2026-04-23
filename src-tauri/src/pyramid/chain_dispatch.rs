@@ -2401,6 +2401,124 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 ctx.slug, node_id, node_depth, e,
             ))?;
 
+            // ── Phase 9b-5: resolve covered Gap-shaped substrate nodes ──
+            //
+            // When the synthesizer covers a Gap node with a meta-layer,
+            // the gap's demand is satisfied by the crystallization.
+            // Two mutations, both under the same writer lock we already
+            // hold:
+            //   1. Flip the GapTopic.demand_state to "closed" (so the
+            //      node's shape payload reflects the resolution).
+            //   2. Call mark_gap_resolved_with_reason (closes
+            //      pyramid_gaps row + emits gap_resolved observation
+            //      event — the compiler routes that event via
+            //      role_for_event → meta_layer_oracle, closing the
+            //      feedback loop: synthesis covers gap → gap resolved
+            //      → oracle may crystallize further meta-layer).
+            //
+            // Multiple Gap-shaped covered nodes: each resolves
+            // independently, each gets its own `gap_resolved` event.
+            // Per Phase 8-4 contract: resolution_reason =
+            // "covered_by_meta_layer", resolved_by = "starter-synthesizer".
+            //
+            // Per-gap failure is non-fatal to the overall meta-layer
+            // create. Log loud and continue; the crystallized event
+            // still fires (operators see the pyramid state was
+            // updated) — re-running the chain can re-attempt any
+            // missed gaps.
+            let mut resolved_gaps: Vec<String> = Vec::new();
+            for covered_id in &covered_substrate_nodes {
+                let shape_view = match super::db::get_node_shape(&conn_guard, &ctx.slug, covered_id) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => continue,   // covered node missing (shouldn't happen; skip)
+                    Err(e) => {
+                        tracing::warn!(
+                            slug = %ctx.slug,
+                            node = %covered_id,
+                            error = %e,
+                            "create_meta_layer_node: get_node_shape failed for covered node — skipping gap-resolution attempt"
+                        );
+                        continue;
+                    }
+                };
+                if shape_view.shape.as_str() != NODE_SHAPE_GAP {
+                    continue;
+                }
+                // Unpack GapTopic for the demand_state transition.
+                let Some(ShapePayload::Gap(mut gap)) = shape_view.payload else {
+                    tracing::warn!(
+                        slug = %ctx.slug,
+                        node = %covered_id,
+                        "create_meta_layer_node: node shape='gap' but payload missing — skipping"
+                    );
+                    continue;
+                };
+                if gap.demand_state == "closed" {
+                    // Already resolved; still cheap to re-emit the
+                    // gap_resolved event so the oracle sees the
+                    // covering in THIS crystallization (idempotent).
+                } else {
+                    gap.demand_state = "closed".to_string();
+                    let new_payload = match serde_json::to_string(&gap) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(
+                                slug = %ctx.slug,
+                                node = %covered_id,
+                                error = %e,
+                                "create_meta_layer_node: failed to re-serialize GapTopic — skipping"
+                            );
+                            continue;
+                        }
+                    };
+                    if let Err(e) = conn_guard.execute(
+                        "UPDATE pyramid_nodes
+                            SET shape_payload_json = ?1
+                          WHERE slug = ?2 AND id = ?3",
+                        rusqlite::params![new_payload, ctx.slug, covered_id],
+                    ) {
+                        tracing::warn!(
+                            slug = %ctx.slug,
+                            node = %covered_id,
+                            error = %e,
+                            "create_meta_layer_node: GapTopic demand_state UPDATE failed — skipping"
+                        );
+                        continue;
+                    }
+                }
+                // Emit gap_resolved + best-effort update the legacy
+                // pyramid_gaps row. mark_gap_resolved_with_reason
+                // emits the observation event unconditionally; the
+                // UPDATE-by-key is best-effort (post-6c Gap-shaped
+                // nodes may not have a pyramid_gaps row at all — the
+                // shape payload is the authoritative source, not the
+                // legacy table). Node_id becomes the synthetic
+                // question_id so chronicle consumers can drill back.
+                //
+                // gap.concern is used for the UPDATE's question_id
+                // match so any legacy row seeded from the same
+                // annotation cohort is closed in the same call.
+                // Resolution reason + resolved_by are stable tokens
+                // per Phase 8-4 contract.
+                if let Err(e) = super::db::mark_gap_resolved_with_reason(
+                    &conn_guard,
+                    &ctx.slug,
+                    covered_id,
+                    &gap.description,
+                    "covered_by_meta_layer",
+                    "starter-synthesizer",
+                ) {
+                    tracing::warn!(
+                        slug = %ctx.slug,
+                        node = %covered_id,
+                        error = %e,
+                        "create_meta_layer_node: mark_gap_resolved_with_reason failed"
+                    );
+                } else {
+                    resolved_gaps.push(covered_id.clone());
+                }
+            }
+
             // Emit meta_layer_crystallized observation event. Metadata
             // carries the fields the downstream compiler's role_for_event
             // arm will key off (+ purpose_id for chronicle drill-down).
@@ -2411,6 +2529,7 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 "purpose_id": purpose_id,
                 "parent_meta_layer_id": parent_meta_layer_id,
                 "depth": node_depth,
+                "resolved_gap_node_ids": resolved_gaps,
             })
             .to_string();
             let crystallized_event_id = super::observation_events::write_observation_event(
@@ -2434,6 +2553,7 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 "depth": node_depth,
                 "covered_substrate_node_ids": covered_substrate_nodes,
                 "crystallized_event_id": crystallized_event_id,
+                "resolved_gap_node_ids": resolved_gaps,
             }))
         }
         "oracle_finalize" => {
