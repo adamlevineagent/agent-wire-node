@@ -182,19 +182,11 @@ pub trait ProviderReadiness {
 // compute_market_ctx / compute_market_ops) and deletes these placeholders.
 
 #[allow(dead_code)]
-pub struct LocalReadinessStub;
-#[allow(dead_code)]
 pub struct OpenRouterReadinessStub;
 #[allow(dead_code)]
 pub struct FleetReadinessStub;
 #[allow(dead_code)]
 pub struct MarketReadinessStub;
-
-impl ProviderReadiness for LocalReadinessStub {
-    fn can_dispatch_now(&self, _params: &ResolvedProviderParams) -> ReadinessResult {
-        ReadinessResult::Ready
-    }
-}
 
 impl ProviderReadiness for OpenRouterReadinessStub {
     fn can_dispatch_now(&self, _params: &ResolvedProviderParams) -> ReadinessResult {
@@ -214,21 +206,296 @@ impl ProviderReadiness for MarketReadinessStub {
     }
 }
 
+// ── LocalReadiness (§2.6 Phase 2 real impl) ────────────────────────────────
+//
+// Replaces the Phase 0a-1 LocalReadinessStub. Readiness order:
+//   1. params.active == false                  → NotReady { Inactive }
+//   2. params.model_list absent/empty          → NotReady { NoModelListForSlot }
+//   3. probe cache miss OR reachable==false    → NotReady { OllamaOffline }
+//   4. probe cache has NO overlap with
+//      params.model_list                       → NotReady { OllamaOffline }
+//   5. otherwise                               → Ready
+//
+// The probe cache is the sync-read shared state populated by the
+// background task spawned at boot. `LocalReadiness` never blocks on
+// network I/O — it only reads what the task has already stored.
+//
+// The probe check is deliberately positioned after the cheaper checks
+// so a common misconfiguration ("operator disabled local" / "operator
+// never declared models at this slot") returns a specific reason
+// without consulting the probe cache at all.
+#[allow(dead_code)]
+pub struct LocalReadiness {
+    /// Handle to the shared Ollama probe cache. `Default::default()`
+    /// wires up to the global singleton; tests that need explicit
+    /// setup call `seed_cache_for_test` on `walker_ollama_probe`
+    /// directly before invoking readiness.
+    probe_handle: crate::pyramid::walker_ollama_probe::LocalProbeHandle,
+}
+
+impl LocalReadiness {
+    /// Production constructor. Reads the global cache the background
+    /// probe task writes into.
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self {
+            probe_handle:
+                crate::pyramid::walker_ollama_probe::LocalProbeHandle::global(),
+        }
+    }
+}
+
+impl Default for LocalReadiness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProviderReadiness for LocalReadiness {
+    fn can_dispatch_now(&self, params: &ResolvedProviderParams) -> ReadinessResult {
+        // 1. Operator-disabled local provider.
+        if !params.active {
+            return ReadinessResult::NotReady {
+                reason: NotReadyReason::Inactive,
+            };
+        }
+
+        // 2. No model declared at this (slot, Local) scope.
+        let model_list = match params.model_list.as_ref() {
+            Some(list) if !list.is_empty() => list,
+            _ => {
+                return ReadinessResult::NotReady {
+                    reason: NotReadyReason::NoModelListForSlot,
+                };
+            }
+        };
+
+        // 3. Consult the probe cache. Absent entry = "background task
+        // has not yet populated this base_url" → conservative offline
+        // until the first probe lands. The SYSTEM_DEFAULT base_url is
+        // used when the resolver didn't surface one (shouldn't happen
+        // for Local, but defensive).
+        let base_url = params
+            .ollama_base_url
+            .clone()
+            .unwrap_or_else(|| {
+                crate::pyramid::walker_resolver::OLLAMA_BASE_URL_DEFAULT.to_string()
+            });
+        let probe = match self.probe_handle.probe_for(&base_url) {
+            Some(p) => p,
+            None => {
+                return ReadinessResult::NotReady {
+                    reason: NotReadyReason::OllamaOffline,
+                };
+            }
+        };
+        if !probe.reachable {
+            return ReadinessResult::NotReady {
+                reason: NotReadyReason::OllamaOffline,
+            };
+        }
+
+        // 4. At least one declared model must be installed in Ollama.
+        // `probe.models` comes from /api/tags and uses exact slugs
+        // (e.g. `llama3.2:latest`, `gemma3:27b`). Matching is exact
+        // so an operator declaring `llama3.2` in walker_provider_local
+        // but with `llama3.2:latest` installed will NOT match — this
+        // is intentional; tag-ambiguity is a real misconfig mode and
+        // the Decision chronicle's NotReady reason surfaces it cleanly.
+        let any_installed = model_list.iter().any(|m| probe.models.iter().any(|p| p == m));
+        if !any_installed {
+            return ReadinessResult::NotReady {
+                reason: NotReadyReason::OllamaOffline,
+            };
+        }
+
+        ReadinessResult::Ready
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn all_four_stubs_return_ready() {
+    fn three_non_local_stubs_return_ready() {
+        // LocalReadinessStub was replaced in Phase 2 by LocalReadiness,
+        // which is cache-aware and NOT unconditionally Ready. The three
+        // remaining stubs (OpenRouter/Fleet/Market) stay Ready until
+        // Phases 3/4 replace them with real impls.
         let p = ResolvedProviderParams::default();
         for r in [
-            LocalReadinessStub.can_dispatch_now(&p),
             OpenRouterReadinessStub.can_dispatch_now(&p),
             FleetReadinessStub.can_dispatch_now(&p),
             MarketReadinessStub.can_dispatch_now(&p),
         ] {
             assert!(matches!(r, ReadinessResult::Ready));
         }
+    }
+
+    // ── LocalReadiness (Phase 2) ─────────────────────────────────────────────
+
+    use crate::pyramid::walker_ollama_probe::{
+        clear_cache_for_tests, invalidate_cached_probe, write_cached_probe, CachedProbe,
+    };
+
+    fn params_for_local(
+        active: bool,
+        model_list: Option<Vec<String>>,
+        base_url: &str,
+    ) -> ResolvedProviderParams {
+        ResolvedProviderParams {
+            active,
+            model_list,
+            ollama_base_url: Some(base_url.to_string()),
+            ollama_probe_interval_secs: Some(300),
+            ..ResolvedProviderParams::default()
+        }
+    }
+
+    #[test]
+    fn local_readiness_inactive_returns_not_ready_inactive() {
+        let p = params_for_local(
+            false,
+            Some(vec!["gemma3:27b".into()]),
+            "http://test-inactive.invalid:11434/v1",
+        );
+        match LocalReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::Inactive,
+            } => {}
+            other => panic!("expected Inactive, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn local_readiness_no_model_list_returns_not_ready_no_model_list_for_slot() {
+        // model_list = None
+        let p = params_for_local(true, None, "http://test-nomodel.invalid:11434/v1");
+        match LocalReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::NoModelListForSlot,
+            } => {}
+            other => panic!("expected NoModelListForSlot (None), got {:?}", other),
+        }
+        // model_list = Some(empty)
+        let p2 = params_for_local(
+            true,
+            Some(vec![]),
+            "http://test-emptymodel.invalid:11434/v1",
+        );
+        match LocalReadiness::new().can_dispatch_now(&p2) {
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::NoModelListForSlot,
+            } => {}
+            other => panic!("expected NoModelListForSlot (empty), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn local_readiness_ollama_offline_returns_not_ready_ollama_offline() {
+        // No cache entry for this base_url → OllamaOffline.
+        let url = "http://test-offline.invalid:11434/v1";
+        invalidate_cached_probe(url);
+        let p = params_for_local(true, Some(vec!["gemma3:27b".into()]), url);
+        match LocalReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::OllamaOffline,
+            } => {}
+            other => panic!("expected OllamaOffline (absent cache), got {:?}", other),
+        }
+
+        // Cache entry with reachable=false → OllamaOffline.
+        write_cached_probe(
+            url,
+            CachedProbe {
+                reachable: false,
+                models: vec![],
+                at: std::time::Instant::now(),
+            },
+        );
+        match LocalReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::OllamaOffline,
+            } => {}
+            other => panic!("expected OllamaOffline (reachable=false), got {:?}", other),
+        }
+        invalidate_cached_probe(url);
+    }
+
+    #[test]
+    fn local_readiness_model_in_installed_list_returns_ready() {
+        let url = "http://test-ready.invalid:11434/v1";
+        write_cached_probe(
+            url,
+            CachedProbe {
+                reachable: true,
+                models: vec!["gemma3:27b".into(), "llama3.2:latest".into()],
+                at: std::time::Instant::now(),
+            },
+        );
+        let p = params_for_local(true, Some(vec!["gemma3:27b".into()]), url);
+        match LocalReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::Ready => {}
+            other => panic!("expected Ready, got {:?}", other),
+        }
+        invalidate_cached_probe(url);
+    }
+
+    #[test]
+    fn local_readiness_model_not_installed_returns_not_ready_ollama_offline() {
+        let url = "http://test-nomatch.invalid:11434/v1";
+        write_cached_probe(
+            url,
+            CachedProbe {
+                reachable: true,
+                // Operator declared `gemma3:27b` but Ollama has only llama3.
+                models: vec!["llama3.2:latest".into()],
+                at: std::time::Instant::now(),
+            },
+        );
+        let p = params_for_local(true, Some(vec!["gemma3:27b".into()]), url);
+        match LocalReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::NotReady {
+                reason: NotReadyReason::OllamaOffline,
+            } => {}
+            other => panic!(
+                "expected OllamaOffline (no model overlap), got {:?}",
+                other
+            ),
+        }
+        invalidate_cached_probe(url);
+    }
+
+    #[test]
+    fn local_readiness_probe_cached_hits_dont_reprobe() {
+        // The trait is sync; readiness never performs I/O itself. A
+        // cache write is the only source of truth. This test verifies
+        // that successive readiness calls against the same base_url
+        // read the same entry (no self-mutation, no staleness advance).
+        let url = "http://test-cached.invalid:11434/v1";
+        write_cached_probe(
+            url,
+            CachedProbe {
+                reachable: true,
+                models: vec!["gemma3:27b".into()],
+                at: std::time::Instant::now(),
+            },
+        );
+        let p = params_for_local(true, Some(vec!["gemma3:27b".into()]), url);
+        let r = LocalReadiness::new();
+        for _ in 0..5 {
+            assert!(matches!(r.can_dispatch_now(&p), ReadinessResult::Ready));
+        }
+        invalidate_cached_probe(url);
+    }
+
+    // Clear the cache at the end of the test module as a belt-and-
+    // suspenders against other integration tests running in the same
+    // process seeing our entries.
+    #[test]
+    fn zzz_local_readiness_cache_cleanup() {
+        clear_cache_for_tests();
     }
 
     #[test]

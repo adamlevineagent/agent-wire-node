@@ -47,7 +47,7 @@ use crate::pyramid::compute_chronicle::{
 };
 use crate::pyramid::walker_cache::ScopeCache;
 use crate::pyramid::walker_readiness::{
-    FleetReadinessStub, LocalReadinessStub, MarketReadinessStub, NotReadyReason,
+    FleetReadinessStub, LocalReadiness, MarketReadinessStub, NotReadyReason,
     OpenRouterReadinessStub, ProviderReadiness, ReadinessResult, ResolvedProviderParams,
 };
 use crate::pyramid::walker_resolver::{
@@ -454,7 +454,9 @@ fn resolve_all_params(
 /// Returned as a boxed trait object so callers can uniformly dispatch.
 fn readiness_for(pt: ProviderType) -> Box<dyn ProviderReadiness> {
     match pt {
-        ProviderType::Local => Box::new(LocalReadinessStub),
+        // Phase 2 (plan §2.6): real probe-cache-backed LocalReadiness.
+        // OpenRouter/Fleet/Market still Phase 3/4 stubs returning Ready.
+        ProviderType::Local => Box::new(LocalReadiness::new()),
         ProviderType::OpenRouter => Box::new(OpenRouterReadinessStub),
         ProviderType::Fleet => Box::new(FleetReadinessStub),
         ProviderType::Market => Box::new(MarketReadinessStub),
@@ -618,9 +620,44 @@ mod tests {
 
     #[test]
     fn test_decision_build_all_providers_ready() {
-        // Empty DB = SYSTEM_DEFAULTS everywhere. All 4 stubs return
-        // Ready → effective_call_order matches DEFAULT_CALL_ORDER.
+        // Empty DB = SYSTEM_DEFAULTS everywhere. OpenRouter/Fleet/Market
+        // stubs return Ready unconditionally; Local (Phase 2 real impl)
+        // consults the Ollama probe cache — an unseeded cache returns
+        // OllamaOffline, which would drop Local from the call order.
+        // Seed a walker_provider_local contribution pointing at a
+        // test-unique base_url AND seed the cache entry for that url.
+        // Using a unique url per test avoids cross-contamination with
+        // tests that invalidate the SYSTEM_DEFAULT url.
+        use crate::pyramid::walker_ollama_probe::{
+            invalidate_cached_probe, write_cached_probe, CachedProbe,
+        };
+        let base_url = "http://test-decision-allready.invalid:11434/v1";
+        write_cached_probe(
+            base_url,
+            CachedProbe {
+                reachable: true,
+                models: vec!["gemma3:27b".into()],
+                at: std::time::Instant::now(),
+            },
+        );
         let (_dir, conn) = make_db();
+        insert_active(
+            &conn,
+            "c-wpl-mid",
+            "walker_provider_local",
+            None,
+            &format!(
+                r#"
+schema_type: walker_provider_local
+version: 1
+overrides:
+  active: true
+  ollama_base_url: {base_url}
+  model_list:
+    mid: [gemma3:27b]
+"#
+            ),
+        );
         let d = DispatchDecision::build("mid", &conn).expect("build must succeed");
         assert!(!d.synthetic);
         assert_eq!(d.slot, "mid");
@@ -628,8 +665,45 @@ mod tests {
         for pt in DEFAULT_CALL_ORDER {
             assert!(d.per_provider.contains_key(&pt));
         }
-        // Cache snapshot preserved.
-        assert!(d.scope_snapshot.source_contribution_ids.is_empty());
+        invalidate_cached_probe(base_url);
+    }
+
+    #[test]
+    fn test_decision_build_drops_local_when_ollama_offline() {
+        // Phase 2: Local is gated by the real readiness impl. With a
+        // walker_provider_local contribution declaring a test-unique
+        // base_url + a model_list but NO probe cache entry, Local
+        // returns OllamaOffline and is dropped from effective_call_order.
+        use crate::pyramid::walker_ollama_probe::invalidate_cached_probe;
+        let base_url = "http://test-decision-offline.invalid:11434/v1";
+        invalidate_cached_probe(base_url);
+        let (_dir, conn) = make_db();
+        insert_active(
+            &conn,
+            "c-wpl-offline",
+            "walker_provider_local",
+            None,
+            &format!(
+                r#"
+schema_type: walker_provider_local
+version: 1
+overrides:
+  active: true
+  ollama_base_url: {base_url}
+  model_list:
+    mid: [gemma3:27b]
+"#
+            ),
+        );
+        let d = DispatchDecision::build("mid", &conn).expect(
+            "non-Local providers are still Ready stubs → decision builds",
+        );
+        assert!(
+            !d.effective_call_order.contains(&ProviderType::Local),
+            "Local must be absent when probe cache is unseeded, got {:?}",
+            d.effective_call_order
+        );
+        assert!(!d.per_provider.contains_key(&ProviderType::Local));
     }
 
     #[test]

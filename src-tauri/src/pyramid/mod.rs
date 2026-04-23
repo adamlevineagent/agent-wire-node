@@ -111,6 +111,7 @@ pub mod vocabulary;
 pub mod v3_migration;
 pub mod walker_cache;
 pub mod walker_decision;
+pub mod walker_ollama_probe;
 pub mod walker_readiness;
 pub mod walker_resolver;
 pub mod watcher;

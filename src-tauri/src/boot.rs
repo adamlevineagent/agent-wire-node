@@ -591,6 +591,60 @@ pub async fn run_walker_cache_boot(
         "ConfigSynced → scope_cache rebuild bridge is up"
     );
 
+    // Step 7.5 (Phase 2, plan §2.6 + §3): spawn the Ollama probe task.
+    // Reads the current scope_chain via ArcSwap::load_full and resolves
+    // `ollama_base_url` + `ollama_probe_interval_secs` for the Local
+    // provider. The task loops for process lifetime, writing probe
+    // results into walker_ollama_probe's global cache. LocalReadiness
+    // reads that cache synchronously during Decision build.
+    //
+    // Resolver path: `ollama_base_url` is per-provider (scope-4) not
+    // per-slot, so we resolve at any slot name — "mid" is used here as
+    // a stable anchor. The value is shared across all slots via scope
+    // inheritance; there's no per-slot variance to probe separately.
+    //
+    // Invalidation on ConfigSynced is intentionally NOT wired here —
+    // the probe task ticks at the resolved interval and naturally picks
+    // up the new base_url on the next tick. A fast-path invalidation
+    // listener is a Phase 6 UX nicety, not a Phase 2 correctness
+    // concern (readiness is strictly conservative during the gap).
+    let probe_cache_reader = Arc::clone(&cache_writer);
+    let _ollama_probe_handle = tokio::spawn(async move {
+        loop {
+            // Resolve current base_url + interval from the live scope
+            // chain. Defaults (SYSTEM_DEFAULT url / 300s interval) cover
+            // the first-boot empty-chain case.
+            let (base_url, interval_secs) = {
+                let cache = probe_cache_reader.load_full();
+                let chain = &*cache.scope_chain;
+                let url = crate::pyramid::walker_resolver::resolve_ollama_base_url(
+                    chain,
+                    "mid",
+                    crate::pyramid::walker_resolver::ProviderType::Local,
+                );
+                let interval = crate::pyramid::walker_resolver::resolve_ollama_probe_interval_secs(
+                    chain,
+                    "mid",
+                    crate::pyramid::walker_resolver::ProviderType::Local,
+                );
+                (url, interval)
+            };
+            crate::pyramid::walker_ollama_probe::probe_and_store(&base_url).await;
+            let sleep = if interval_secs == 0 {
+                std::time::Duration::from_secs(60)
+            } else {
+                std::time::Duration::from_secs(interval_secs)
+            };
+            tokio::time::sleep(sleep).await;
+        }
+    });
+    tracing::info!(
+        event = "boot_step",
+        step = 7,
+        name = "ollama_probe_task_spawned",
+        "Walker v3 Phase 2 Ollama probe task is up"
+    );
+
     // Step 9: flip AppMode to Ready. Steps 8 (stale_engine), 10 (HTTP),
     // 11 (chain executor + DADBEAR) are main.rs's responsibility — this
     // coordinator hands control back once the reloader is in steady state.
