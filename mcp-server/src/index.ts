@@ -345,72 +345,79 @@ server.tool(
   }
 );
 
-// 8. pyramid_annotate
-server.tool(
-  "pyramid_annotate",
-  "Add an annotation to a pyramid node. Annotations capture agent-discovered knowledge, corrections, or insights that enrich the pyramid over time.",
-  {
-    slug: z.string().describe("Pyramid slug identifier"),
-    node_id: z.string().describe("Node ID to annotate (e.g. L2-000, L1-003)"),
-    content: z.string().describe("Annotation content — the knowledge, correction, or insight to attach"),
-    question_context: z
-      .string()
-      .optional()
-      .describe("Optional: the question or task context that prompted this annotation"),
-    annotation_type: z
-      .string()
-      .optional()
-      .describe(
-        // Phase 6c-C: dynamic vocabulary. The cached type list is
-        // surfaced in the description so tools see current types at
-        // listing time, but validation happens in the handler body
-        // (Option C) so operator-published types that arrive between
-        // MCP server starts are still accepted via cache-miss refresh.
-        `Optional: annotation type (default: 'observation'). Currently known types: ` +
-          `${((getAnnotationTypesSync() ?? [...FALLBACK_ANNOTATION_TYPES]).map((t) => `'${t}'`).join(", "))}. ` +
-          `New types can be published by writing a vocabulary_entry contribution — ` +
-          `they are accepted without a code deploy. Unknown values are rejected ` +
-          `by the MCP handler with a helpful error.`
-      ),
-    author: z
-      .string()
-      .optional()
-      .describe("Optional: author identifier (e.g. 'my-agent', 'auditor-1'). Defaults to 'mcp-agent'."),
-  },
-  async ({ slug, node_id, content, question_context, annotation_type, author }) => {
-    // Phase 6c-C: validate against the dynamic vocabulary cache (with
-    // opportunistic refresh on miss) instead of a static z.enum.
-    let validatedType: string | undefined;
-    if (annotation_type !== undefined) {
-      const result = await validateAnnotationType(annotation_type);
-      if (!result.ok) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify({ error: result.error, validTypes: result.validTypes }, null, 2),
-            },
-          ],
-        };
+// 8. pyramid_annotate — registered lazily from `main()` AFTER the
+// vocab cache is warmed, so the Zod `.describe()` string captures the
+// currently-published annotation-type list (not just the genesis
+// fallback). MCP clients calling `tools/list` see the live set. The
+// runtime handler still re-validates against the cache (with
+// opportunistic refresh on miss) so types published between restarts
+// are still accepted — the description is advisory, validation is
+// the source of truth. See 6c-C verifier pass Target 5.
+function registerAnnotateTool(): void {
+  server.tool(
+    "pyramid_annotate",
+    "Add an annotation to a pyramid node. Annotations capture agent-discovered knowledge, corrections, or insights that enrich the pyramid over time.",
+    {
+      slug: z.string().describe("Pyramid slug identifier"),
+      node_id: z.string().describe("Node ID to annotate (e.g. L2-000, L1-003)"),
+      content: z.string().describe("Annotation content — the knowledge, correction, or insight to attach"),
+      question_context: z
+        .string()
+        .optional()
+        .describe("Optional: the question or task context that prompted this annotation"),
+      annotation_type: z
+        .string()
+        .optional()
+        .describe(
+          // Phase 6c-C: dynamic vocabulary. Surface the current cache
+          // to MCP clients via tools/list. Handler re-validates so
+          // types published since the last warm still pass.
+          `Optional: annotation type (default: 'observation'). Currently known types: ` +
+            `${((getAnnotationTypesSync() ?? [...FALLBACK_ANNOTATION_TYPES]).map((t) => `'${t}'`).join(", "))}. ` +
+            `New types can be published by writing a vocabulary_entry contribution — ` +
+            `they are accepted without a code deploy. Unknown values are rejected ` +
+            `by the MCP handler with a helpful error.`
+        ),
+      author: z
+        .string()
+        .optional()
+        .describe("Optional: author identifier (e.g. 'my-agent', 'auditor-1'). Defaults to 'mcp-agent'."),
+    },
+    async ({ slug, node_id, content, question_context, annotation_type, author }) => {
+      // Phase 6c-C: validate against the dynamic vocabulary cache (with
+      // opportunistic refresh on miss) instead of a static z.enum.
+      let validatedType: string | undefined;
+      if (annotation_type !== undefined) {
+        const result = await validateAnnotationType(annotation_type);
+        if (!result.ok) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({ error: result.error, validTypes: result.validTypes }, null, 2),
+              },
+            ],
+          };
+        }
+        validatedType = result.name;
       }
-      validatedType = result.name;
+
+      const body: Record<string, string> = {
+        node_id,
+        content,
+        author: author || "mcp-agent",
+      };
+      if (question_context) body.question_context = question_context;
+      if (validatedType) body.annotation_type = validatedType;
+
+      const resp = await pyramidFetch(
+        `/pyramid/${encodeURIComponent(slug)}/annotate`,
+        { method: "POST", body }
+      );
+      return toToolResult(resp);
     }
-
-    const body: Record<string, string> = {
-      node_id,
-      content,
-      author: author || "mcp-agent",
-    };
-    if (question_context) body.question_context = question_context;
-    if (validatedType) body.annotation_type = validatedType;
-
-    const resp = await pyramidFetch(
-      `/pyramid/${encodeURIComponent(slug)}/annotate`,
-      { method: "POST", body }
-    );
-    return toToolResult(resp);
-  }
-);
+  );
+}
 
 // 9. pyramid_create_question_slug
 server.tool(
@@ -1064,11 +1071,40 @@ async function main(): Promise<void> {
     console.error(
       `[pyramid-mcp] Vocabulary warmed: ${types.length} annotation_type entries cached`
     );
+    // Drift check: when the fetch succeeds, compare the live set against
+    // the TS `FALLBACK_ANNOTATION_TYPES` and log any divergence. This
+    // is a tripwire for the hardcoded genesis fallback going stale
+    // against the Rust `GENESIS_ANNOTATION_TYPES` (6c-A source of truth)
+    // — operators running MCP against a Wire node that's briefly down
+    // would otherwise silently serve a stale fallback. Log-only; we
+    // don't refuse to start.
+    const fetched = new Set(types);
+    const fallback = new Set(FALLBACK_ANNOTATION_TYPES);
+    const missingFromFallback = [...fetched].filter((t) => !fallback.has(t));
+    const missingFromFetch = [...fallback].filter((t) => !fetched.has(t));
+    if (missingFromFallback.length > 0 || missingFromFetch.length > 0) {
+      console.error(
+        `[pyramid-mcp] WARNING: TS FALLBACK_ANNOTATION_TYPES drift from Wire node registry. ` +
+          (missingFromFallback.length > 0
+            ? `Present in registry but missing from fallback: ${missingFromFallback.join(", ")}. `
+            : "") +
+          (missingFromFetch.length > 0
+            ? `Present in fallback but missing from registry: ${missingFromFetch.join(", ")}. `
+            : "") +
+          `Update mcp-server/src/lib.ts::FALLBACK_ANNOTATION_TYPES to match ` +
+          `src-tauri/src/pyramid/vocab_genesis.rs::GENESIS_ANNOTATION_TYPES.`
+      );
+    }
   } catch (err) {
     console.error(
       `[pyramid-mcp] WARNING: vocabulary warm-up failed: ${err instanceof Error ? err.message : String(err)} — using fallback`
     );
   }
+
+  // Register pyramid_annotate AFTER the warm so its Zod `.describe()`
+  // captures the live annotation-type list (not just the genesis
+  // fallback). See 6c-C verifier pass Target 5.
+  registerAnnotateTool();
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
