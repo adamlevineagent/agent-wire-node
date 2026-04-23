@@ -22512,4 +22512,228 @@ mod phase3_post_build_tests {
             &crate::pyramid::chain_executor::execute_chain_for_target,
         );
     }
+
+    // ── Wanderer: binding_unresolved dedup across ticks ────────────────
+    //
+    // Stuck cursor scenario: a role_bound event at id=N has no binding.
+    // Every compile tick re-reads event N (cursor held below N), resolution
+    // fails, and the compiler wants to emit a `binding_unresolved` chronicle
+    // event. Without per-source-event dedup this floods the observation
+    // table (17,280 rows/day per stuck role at the 5s tick interval) and
+    // the rows never age out because retention only prunes below the min
+    // compilation cursor — which is itself held by the same unresolved
+    // binding.
+
+    #[test]
+    fn binding_unresolved_is_emitted_at_most_once_per_source_event_across_ticks() {
+        let conn = mem_conn();
+        seed_slug(&conn, "pc3bu");
+        // Park debate_steward so resolve_binding raises.
+        conn.execute(
+            "UPDATE pyramid_role_bindings
+             SET superseded_by = id
+             WHERE slug = 'pc3bu' AND role_name = 'debate_steward'",
+            [],
+        )
+        .unwrap();
+        let e1 = observation_events::write_observation_event(
+            &conn, "pc3bu", "internal", "debate_spawned",
+            None, None, None, None, Some("L2-200"), Some(2), None,
+        ).unwrap();
+
+        // Tick 1: emits 1 binding_unresolved.
+        dadbear_compiler::run_compilation_for_slug(&conn, "pc3bu", None, None).unwrap();
+        let count_after_1: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                 WHERE slug = 'pc3bu' AND event_type = 'binding_unresolved'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_after_1, 1, "tick 1 must emit exactly one binding_unresolved");
+
+        // Tick 2-3: same held event should NOT re-emit.
+        for tick in 2..=5 {
+            dadbear_compiler::run_compilation_for_slug(&conn, "pc3bu", None, None).unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM dadbear_observation_events
+                     WHERE slug = 'pc3bu' AND event_type = 'binding_unresolved'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "tick {} must NOT re-emit binding_unresolved for the same source_event_id={}",
+                tick, e1
+            );
+        }
+    }
+
+    #[test]
+    fn binding_unresolved_is_per_source_event_id_not_per_role() {
+        // A DIFFERENT held event (different id) against the same unresolved
+        // role should still emit its own chronicle entry — operators need
+        // to see each distinct stuck event, not just one-per-role.
+        let conn = mem_conn();
+        seed_slug(&conn, "pc3bu2");
+        conn.execute(
+            "UPDATE pyramid_role_bindings
+             SET superseded_by = id
+             WHERE slug = 'pc3bu2' AND role_name = 'debate_steward'",
+            [],
+        )
+        .unwrap();
+        // Two distinct debate_spawned events against different target nodes.
+        let _e1 = observation_events::write_observation_event(
+            &conn, "pc3bu2", "internal", "debate_spawned",
+            None, None, None, None, Some("L2-300"), Some(2), None,
+        ).unwrap();
+        let _e2 = observation_events::write_observation_event(
+            &conn, "pc3bu2", "internal", "debate_spawned",
+            None, None, None, None, Some("L2-301"), Some(2), None,
+        ).unwrap();
+        dadbear_compiler::run_compilation_for_slug(&conn, "pc3bu2", None, None).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                 WHERE slug = 'pc3bu2' AND event_type = 'binding_unresolved'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "each distinct source_event_id must emit its own binding_unresolved");
+    }
+
+    // ── Wanderer: cursor gating — multi-hold 10-event scenario ─────────
+    //
+    // Thread 2's exact scenario from the wander prompt: 10 events, events
+    // 3 and 7 hold (unresolved bindings). 1,2,4,5,6,8,9,10 compile
+    // successfully. Correct cursor: 2 (largest compiled id below the
+    // smallest held id).
+
+    #[test]
+    fn cursor_gating_holds_at_smallest_held_id_when_multiple_events_hold() {
+        let conn = mem_conn();
+        seed_slug(&conn, "pc3mh");
+        // Park both debate_steward and gap_dispatcher so TWO different
+        // role_bound event types fail resolution independently.
+        conn.execute(
+            "UPDATE pyramid_role_bindings
+             SET superseded_by = id
+             WHERE slug = 'pc3mh'
+               AND role_name IN ('debate_steward', 'gap_dispatcher')",
+            [],
+        )
+        .unwrap();
+
+        let e1 = observation_events::write_observation_event(
+            &conn, "pc3mh", "watcher", "file_created", None, Some("/tmp/1"), None, None, None, None, None,
+        ).unwrap();
+        let e2 = observation_events::write_observation_event(
+            &conn, "pc3mh", "watcher", "file_created", None, Some("/tmp/2"), None, None, None, None, None,
+        ).unwrap();
+        let e3 = observation_events::write_observation_event(
+            &conn, "pc3mh", "internal", "debate_spawned", None, None, None, None, Some("L2-A"), Some(2), None,
+        ).unwrap();
+        let _e4 = observation_events::write_observation_event(
+            &conn, "pc3mh", "watcher", "file_created", None, Some("/tmp/4"), None, None, None, None, None,
+        ).unwrap();
+        let _e5 = observation_events::write_observation_event(
+            &conn, "pc3mh", "watcher", "file_created", None, Some("/tmp/5"), None, None, None, None, None,
+        ).unwrap();
+        let _e6 = observation_events::write_observation_event(
+            &conn, "pc3mh", "watcher", "file_created", None, Some("/tmp/6"), None, None, None, None, None,
+        ).unwrap();
+        let _e7 = observation_events::write_observation_event(
+            &conn, "pc3mh", "internal", "gap_detected", None, None, None, None, Some("L2-B"), Some(2), None,
+        ).unwrap();
+        let _e8 = observation_events::write_observation_event(
+            &conn, "pc3mh", "watcher", "file_created", None, Some("/tmp/8"), None, None, None, None, None,
+        ).unwrap();
+        let _e9 = observation_events::write_observation_event(
+            &conn, "pc3mh", "watcher", "file_created", None, Some("/tmp/9"), None, None, None, None, None,
+        ).unwrap();
+        let _e10 = observation_events::write_observation_event(
+            &conn, "pc3mh", "watcher", "file_created", None, Some("/tmp/10"), None, None, None, None, None,
+        ).unwrap();
+
+        let result = dadbear_compiler::run_compilation_for_slug(
+            &conn, "pc3mh", None, None,
+        )
+        .unwrap();
+
+        // Smallest held id is e3 — cursor advances to the largest compiled
+        // id strictly less than e3, which is e2.
+        assert_eq!(
+            result.new_cursor, e2,
+            "cursor must hold at largest-compiled-below-smallest-held = e2, got {}",
+            result.new_cursor
+        );
+        assert!(result.new_cursor < e3, "cursor must not cross held e3");
+        // 8 file_created events compile as extracts (e1,e2,e4,e5,e6,e8,e9,e10).
+        assert_eq!(result.items_compiled, 8);
+
+        // Tick 2: cursor stays at e2 until operator fixes the bindings.
+        let result2 = dadbear_compiler::run_compilation_for_slug(
+            &conn, "pc3mh", None, None,
+        )
+        .unwrap();
+        assert_eq!(result2.new_cursor, e2, "tick 2 must still hold at e2");
+    }
+
+    #[test]
+    fn cursor_advances_past_held_event_after_binding_is_fixed() {
+        // Round-trip: initially debate_steward missing → cursor holds;
+        // operator restores binding → next tick advances past the held
+        // event and every later event it was blocking.
+        let conn = mem_conn();
+        seed_slug(&conn, "pc3recover");
+        conn.execute(
+            "UPDATE pyramid_role_bindings
+             SET superseded_by = id
+             WHERE slug = 'pc3recover' AND role_name = 'debate_steward'",
+            [],
+        )
+        .unwrap();
+        let e1 = observation_events::write_observation_event(
+            &conn, "pc3recover", "watcher", "file_created", None, Some("/tmp/r1"), None, None, None, None, None,
+        ).unwrap();
+        let _e2 = observation_events::write_observation_event(
+            &conn, "pc3recover", "internal", "debate_spawned", None, None, None, None, Some("L2-R"), Some(2), None,
+        ).unwrap();
+        let _e3 = observation_events::write_observation_event(
+            &conn, "pc3recover", "watcher", "file_created", None, Some("/tmp/r3"), None, None, None, None, None,
+        ).unwrap();
+
+        // Tick 1: cursor holds at e1 (below held e2).
+        let r1 = dadbear_compiler::run_compilation_for_slug(
+            &conn, "pc3recover", None, None,
+        )
+        .unwrap();
+        assert_eq!(r1.new_cursor, e1);
+
+        // Operator fixes the binding. Re-add debate_steward → starter.
+        crate::pyramid::role_binding::set_binding(
+            &conn, "pc3recover", "debate_steward", "starter-debate-steward",
+        )
+        .unwrap();
+
+        // Tick 2: e2 now resolves, e3 dedups (pre-existing compiled work
+        // item). Note tick 1 also emitted a `binding_unresolved` row
+        // (chronicle observability) at id = e3+1 and it compiles now too,
+        // so the cursor should be AT LEAST past _e3 — it passes every
+        // previously-held event including the chronicle entry.
+        let r2 = dadbear_compiler::run_compilation_for_slug(
+            &conn, "pc3recover", None, None,
+        )
+        .unwrap();
+        assert!(
+            r2.new_cursor >= _e3,
+            "after binding fix, cursor ({}) must advance past the previously-held event (_e3={})",
+            r2.new_cursor, _e3
+        );
+    }
 }

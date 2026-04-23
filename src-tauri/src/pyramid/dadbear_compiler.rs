@@ -460,23 +460,53 @@ pub fn compile_observations(
                         error = %e,
                         "role_bound resolution failed — cursor held, retry next tick"
                     );
-                    // Emit chronicle entry for observability
-                    let _ = crate::pyramid::observation_events::write_observation_event(
-                        conn,
-                        slug,
-                        "dadbear",
-                        "binding_unresolved",
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(&format!(
-                            r#"{{"role":"{}","event_type":"{}","source_event_id":{}}}"#,
-                            role_name, event.event_type, event.id
-                        )),
-                    );
+                    // Emit chronicle entry for observability — but at most
+                    // once per (source_event_id) pair. Without this guard,
+                    // a stuck cursor (operator hasn't fixed the missing
+                    // role binding) would re-emit `binding_unresolved` for
+                    // the same source event on every compile tick.
+                    //
+                    // At 5s tick interval that's 17,280 rows/day per stuck
+                    // role — retention only prunes below the min cursor,
+                    // which is itself held by the same unresolved binding,
+                    // so the rows accumulate indefinitely in
+                    // `dadbear_observation_events`. One row per unresolved
+                    // (source_event_id) is enough for an operator to see
+                    // the drift in the chronicle; subsequent ticks still
+                    // log a `warn!` line so the issue is visible in the
+                    // running logs. Wanderer fix Phase 3.
+                    let source_id_fragment =
+                        format!(r#""source_event_id":{}"#, event.id);
+                    let already_emitted: bool = conn
+                        .query_row(
+                            "SELECT EXISTS(
+                                SELECT 1 FROM dadbear_observation_events
+                                 WHERE slug = ?1
+                                   AND event_type = 'binding_unresolved'
+                                   AND metadata_json LIKE ?2
+                             )",
+                            params![slug, format!("%{source_id_fragment}%")],
+                            |row| row.get::<_, bool>(0),
+                        )
+                        .unwrap_or(false);
+                    if !already_emitted {
+                        let _ = crate::pyramid::observation_events::write_observation_event(
+                            conn,
+                            slug,
+                            "dadbear",
+                            "binding_unresolved",
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(&format!(
+                                r#"{{"role":"{}","event_type":"{}","source_event_id":{}}}"#,
+                                role_name, event.event_type, event.id
+                            )),
+                        );
+                    }
                     // Cursor does NOT advance — retry next tick.
                     continue;
                 }
