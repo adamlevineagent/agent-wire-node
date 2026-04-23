@@ -498,3 +498,146 @@ fn phase_a_then_phase_b_end_to_end() {
         .unwrap();
     assert_eq!(snap_body, original_bytes);
 }
+
+/// Regression test for the bundled-vs-migrated unique-index collision.
+///
+/// Production boot order: `walk_bundled_contributions_manifest` runs
+/// first and inserts active `walker_provider_openrouter`,
+/// `walker_call_order`, and friends (slug=NULL, source='bundled').
+/// Then `run_walker_cache_boot` calls Phase A which also wants to
+/// INSERT `status='active'` rows for those same schema_types. With the
+/// `uq_config_contrib_active` partial unique index enforced on
+/// `(COALESCE(slug,'__global__'), schema_type) WHERE status='active'`,
+/// the second INSERT collides and SupersessionConflict bubbles up as
+/// `V3MigrationError::Other` — boot aborts on any operator DB with
+/// pyramid_tier_routing rows.
+///
+/// This test seeds bundled-style active rows BEFORE Phase A runs and
+/// asserts Phase A completes successfully, leaving exactly one active
+/// row per affected (schema_type, slug) pair.
+#[test]
+fn phase_a_coexists_with_bundled_walker_rows() {
+    let (_dir, path) = make_integration_db();
+    let mut conn = Connection::open(&path).unwrap();
+    // Standard legacy state: marker=v2, 4 tier_routing rows (including
+    // openrouter + ollama-local + market), an active dispatch_policy.
+    seed_realistic_legacy_state(&conn);
+
+    // Simulate the bundled manifest walk that runs at every boot before
+    // Phase A. We only need the walker_* schema_types that Phase A
+    // writes; schema_annotation + schema_definition + skill rows aren't
+    // relevant to the collision.
+    for (contrib_id, schema_type, body) in [
+        (
+            "bundled-walker_provider_openrouter-default-v1",
+            "walker_provider_openrouter",
+            "schema_type: walker_provider_openrouter\nversion: 1\noverrides:\n  model_list:\n    mid:\n      - \"inception/mercury-2\"\n",
+        ),
+        (
+            "bundled-walker_provider_local-default-v1",
+            "walker_provider_local",
+            "schema_type: walker_provider_local\nversion: 1\noverrides:\n  model_list: {}\n",
+        ),
+        (
+            "bundled-walker_provider_fleet-default-v1",
+            "walker_provider_fleet",
+            "schema_type: walker_provider_fleet\nversion: 1\noverrides:\n  model_list: {}\n",
+        ),
+        (
+            "bundled-walker_provider_market-default-v1",
+            "walker_provider_market",
+            "schema_type: walker_provider_market\nversion: 1\noverrides:\n  active: false\n  model_list: {}\n",
+        ),
+        (
+            "bundled-walker_call_order-default-v1",
+            "walker_call_order",
+            "schema_type: walker_call_order\nversion: 1\norder: [market, local, openrouter, fleet]\n",
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions \
+               (contribution_id, schema_type, slug, yaml_content, status, source) \
+             VALUES (?1, ?2, NULL, ?3, 'active', 'bundled')",
+            rusqlite::params![contrib_id, schema_type, body],
+        )
+        .unwrap();
+    }
+
+    // Phase A must NOT hard-fail on uq_config_contrib_active even with
+    // the bundled rows present.
+    let report =
+        run_v3_phase_a_migration(&mut conn, None).expect("Phase A must survive bundled seeds");
+    assert_eq!(
+        report.marker_transitioned_to,
+        "v3-db-migrated-config-pending"
+    );
+    assert!(
+        !report.walker_provider_contributions_written.is_empty(),
+        "Phase A must have written at least one walker_provider_* row"
+    );
+    assert!(
+        report.walker_call_order_written.is_some(),
+        "Phase A must have written a walker_call_order row"
+    );
+
+    // Post-condition: exactly one ACTIVE row per walker_* schema_type
+    // with slug=NULL. The prior bundled rows must be 'superseded'.
+    for schema_type in [
+        "walker_provider_openrouter",
+        "walker_provider_local",
+        "walker_provider_market",
+        "walker_call_order",
+    ] {
+        let active_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_config_contributions \
+                 WHERE schema_type = ?1 \
+                   AND slug IS NULL \
+                   AND status = 'active' \
+                   AND superseded_by_id IS NULL",
+                rusqlite::params![schema_type],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            active_count, 1,
+            "expected exactly one active {schema_type} row (slug=NULL); got {active_count}"
+        );
+    }
+
+    // The new active walker_provider_openrouter row must point back at
+    // the superseded bundled row via supersedes_id, and the bundled row
+    // must carry superseded_by_id forward. This is the provenance
+    // contract Phase 6 rollback relies on.
+    let (new_supersedes, bundled_forward): (Option<String>, Option<String>) = {
+        let new_supersedes: Option<String> = conn
+            .query_row(
+                "SELECT supersedes_id FROM pyramid_config_contributions \
+                 WHERE schema_type = 'walker_provider_openrouter' \
+                   AND slug IS NULL \
+                   AND status = 'active' \
+                   AND superseded_by_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let bundled_forward: Option<String> = conn
+            .query_row(
+                "SELECT superseded_by_id FROM pyramid_config_contributions \
+                 WHERE contribution_id = 'bundled-walker_provider_openrouter-default-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (new_supersedes, bundled_forward)
+    };
+    assert_eq!(
+        new_supersedes.as_deref(),
+        Some("bundled-walker_provider_openrouter-default-v1"),
+        "new walker_provider_openrouter row must point supersedes_id at the bundled row"
+    );
+    assert!(
+        bundled_forward.is_some(),
+        "bundled walker_provider_openrouter row must have superseded_by_id backfilled"
+    );
+}

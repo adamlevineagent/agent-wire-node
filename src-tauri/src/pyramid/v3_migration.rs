@@ -346,10 +346,20 @@ pub fn run_v3_phase_a_migration(
         .unwrap_or_default();
 
     // ── 5. Write walker_provider_* contributions. ────────────────────
+    //
+    // The bundled walker_provider_{openrouter,local,fleet,market} seeds
+    // land via `walk_bundled_contributions_manifest` at every boot —
+    // that runs BEFORE Phase A on the same boot. Without pre-INSERT
+    // supersession the migration's Strict-mode INSERT collides on
+    // `uq_config_contrib_active` and Phase A hard-aborts boot on any
+    // operator DB that carries legacy routing rows. Supersede the prior
+    // bundled active row ahead of the INSERT and record it as the new
+    // row's `supersedes_id`.
     let mut written_ids: Vec<String> = Vec::new();
     for (pt, rows) in &grouped {
         let body = build_walker_provider_body(*pt, rows, &config_fallback_chain);
         let id = uuid::Uuid::new_v4().to_string();
+        let prior_id = supersede_prior_active_pre_insert(&tx, pt.schema_type())?;
         write_envelope_in_tx(
             &tx,
             ContributionEnvelopeInput {
@@ -358,7 +368,7 @@ pub fn run_v3_phase_a_migration(
                 schema_type: pt.schema_type().to_string(),
                 body,
                 wire_native_metadata_json: None,
-                supersedes_id: None,
+                supersedes_id: prior_id.clone(),
                 triggering_note: Some(format!(
                     "Walker v3 Phase A migration from pyramid_tier_routing (provider_id={})",
                     pt.as_str()
@@ -372,6 +382,9 @@ pub fn run_v3_phase_a_migration(
                 write_mode: WriteMode::Strict,
             },
         )?;
+        if let Some(prior) = prior_id {
+            backfill_superseded_by_id(&tx, &prior, &id)?;
+        }
         written_ids.push(id);
     }
 
@@ -388,6 +401,10 @@ pub fn run_v3_phase_a_migration(
             &config_fallback_chain,
         );
         let id = uuid::Uuid::new_v4().to_string();
+        let prior_id = supersede_prior_active_pre_insert(
+            &tx,
+            ProviderType::OpenRouter.schema_type(),
+        )?;
         write_envelope_in_tx(
             &tx,
             ContributionEnvelopeInput {
@@ -396,7 +413,7 @@ pub fn run_v3_phase_a_migration(
                 schema_type: ProviderType::OpenRouter.schema_type().to_string(),
                 body,
                 wire_native_metadata_json: None,
-                supersedes_id: None,
+                supersedes_id: prior_id.clone(),
                 triggering_note: Some(
                     "Walker v3 Phase A migration — pyramid_config.json primary/fallback fold"
                         .to_string(),
@@ -410,6 +427,9 @@ pub fn run_v3_phase_a_migration(
                 write_mode: WriteMode::Strict,
             },
         )?;
+        if let Some(prior) = prior_id {
+            backfill_superseded_by_id(&tx, &prior, &id)?;
+        }
         written_ids.push(id);
     }
 
@@ -794,6 +814,14 @@ fn migrate_walker_call_order(
     }
 
     let id = uuid::Uuid::new_v4().to_string();
+    // The bundled `walker_call_order` row lands via
+    // `walk_bundled_contributions_manifest` at every boot BEFORE Phase
+    // A runs. Without pre-INSERT supersession the Strict-mode INSERT
+    // below collides on the `uq_config_contrib_active` unique index and
+    // Phase A hard-aborts boot on any operator DB with a seeded bundled
+    // manifest. Supersede the prior row ahead of the INSERT and record
+    // it as `supersedes_id`.
+    let prior_id = supersede_prior_active_pre_insert(tx, "walker_call_order")?;
     write_envelope_in_tx(
         tx,
         ContributionEnvelopeInput {
@@ -802,7 +830,7 @@ fn migrate_walker_call_order(
             schema_type: "walker_call_order".to_string(),
             body: body_out,
             wire_native_metadata_json: None,
-            supersedes_id: None,
+            supersedes_id: prior_id.clone(),
             triggering_note: Some(
                 "Walker v3 Phase A migration — dispatch_policy.routing_rules.route_to"
                     .to_string(),
@@ -816,55 +844,68 @@ fn migrate_walker_call_order(
             write_mode: WriteMode::Strict,
         },
     )?;
-    // The bundled walker_call_order row (if loaded at boot) would
-    // conflict with the new one on the unique-active index. The bundled
-    // loader supersedes itself via the envelope writer's conflict path;
-    // but at Phase A time the walker_call_order bundled default might
-    // also be active. Defense-in-depth: supersede the bundled row if
-    // present (and not the row we just wrote). Rest of the bundled
-    // schema-annotation / schema-definition / generation skill rows
-    // aren't affected — they're different schema_types.
-    supersede_prior_active_if_present(tx, "walker_call_order", &id)?;
+    if let Some(prior) = prior_id {
+        backfill_superseded_by_id(tx, &prior, &id)?;
+    }
 
     Ok(Some(id))
 }
 
-/// If there's an active non-superseded contribution for
-/// `(schema_type, slug=NULL)` other than `new_id`, mark it superseded
-/// with the new row. Keeps the unique-active invariant (§2.16.1)
-/// satisfied when migration writes over a bundled default.
-fn supersede_prior_active_if_present(
+/// Pre-INSERT variant: if there's an active, non-superseded row for
+/// `(schema_type, slug=NULL)`, flip it to `status = 'superseded'` so the
+/// `uq_config_contrib_active` unique index lets the caller's imminent
+/// INSERT land. Returns `Some(prior_id)` so the caller can:
+///   1. pass it as `supersedes_id` on the new envelope INSERT, and
+///   2. backfill `superseded_by_id = new_id` after the INSERT committed.
+///
+/// Rationale: `walker_provider_openrouter`, `walker_call_order`, and the
+/// other walker_* schema_types are seeded by
+/// `walk_bundled_contributions_manifest` at every boot — BEFORE Phase A
+/// runs. Without this pre-step, Phase A's INSERT collides on the unique
+/// index and SupersessionConflict bubbles up as a hard boot abort on
+/// any operator DB that actually carries legacy routing rows.
+fn supersede_prior_active_pre_insert(
     tx: &rusqlite::Transaction<'_>,
     schema_type: &str,
-    new_id: &str,
-) -> std::result::Result<(), V3MigrationError> {
+) -> std::result::Result<Option<String>, V3MigrationError> {
     let prior_id: Option<String> = tx
         .query_row(
             "SELECT contribution_id FROM pyramid_config_contributions \
              WHERE schema_type = ?1 \
                AND slug IS NULL \
                AND status = 'active' \
-               AND contribution_id != ?2 \
-               AND superseded_by_id IS NULL",
-            rusqlite::params![schema_type, new_id],
+               AND superseded_by_id IS NULL \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT 1",
+            rusqlite::params![schema_type],
             |row| row.get(0),
         )
         .optional()?;
-    if let Some(prior) = prior_id {
+    if let Some(ref prior) = prior_id {
         tx.execute(
             "UPDATE pyramid_config_contributions \
-             SET status = 'superseded', superseded_by_id = ?1 \
-             WHERE contribution_id = ?2",
-            rusqlite::params![new_id, prior],
-        )?;
-        // Forward-link from new row to the prior one via supersedes_id.
-        tx.execute(
-            "UPDATE pyramid_config_contributions \
-             SET supersedes_id = ?1 \
-             WHERE contribution_id = ?2 AND supersedes_id IS NULL",
-            rusqlite::params![prior, new_id],
+             SET status = 'superseded' \
+             WHERE contribution_id = ?1",
+            rusqlite::params![prior],
         )?;
     }
+    Ok(prior_id)
+}
+
+/// Post-INSERT companion to `supersede_prior_active_pre_insert`: backfill
+/// the `superseded_by_id` pointer from the now-superseded prior row to
+/// the new row.
+fn backfill_superseded_by_id(
+    tx: &rusqlite::Transaction<'_>,
+    prior_id: &str,
+    new_id: &str,
+) -> std::result::Result<(), V3MigrationError> {
+    tx.execute(
+        "UPDATE pyramid_config_contributions \
+         SET superseded_by_id = ?1 \
+         WHERE contribution_id = ?2",
+        rusqlite::params![new_id, prior_id],
+    )?;
     Ok(())
 }
 
@@ -1252,61 +1293,68 @@ pub fn run_v3_phase_b_migration(
 
     let bytes_before = pre_bytes.as_ref().map(|s| s.len()).unwrap_or(0);
 
-    // ── 3 + 6: SQL-side transaction (snapshot + marker supersession) ─
+    // ── 3. Snapshot the pre-rewrite body — COMMIT BEFORE FILE RENAME ─
     //
-    // Open the transaction first so we can roll back on any failure
-    // before the file rename. Step 5 (file rename) is performed between
-    // the snapshot insert and the marker supersession but OUTSIDE the
-    // SQL transaction — SQLite cannot rollback a rename(2).
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-
-    // ── 3. Snapshot the pre-rewrite body ─────────────────────────────
+    // Previously the snapshot insert, the file rename, AND the marker
+    // supersession all lived in a single transaction. If the eventual
+    // `tx.commit()` failed AFTER the rename succeeded (disk full, FS
+    // corruption mid-flight), the snapshot INSERT would roll back while
+    // the file on disk was already rewritten. The next boot would then
+    // snapshot the post-rewrite state, permanently losing the
+    // pre-rewrite body that operator rollback (Phase 6) needs.
     //
-    // Ensure the table exists (Phase A creates it, but a fresh-test
-    // path could hit Phase B without Phase A's snapshot_legacy_state
-    // having run). Columns extended beyond Phase A's minimal legacy
-    // column list to hold the raw JSON body; old rows (none today —
-    // Phase A has never populated this table) use NULL in the new
-    // columns.
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS _pre_v3_snapshot_config (
-           snapshot_at TEXT NOT NULL,
-           primary_model TEXT,
-           fallback_model_1 TEXT,
-           fallback_model_2 TEXT,
-           source_table TEXT NOT NULL
-         );",
-    )
-    .map_err(V3PhaseBError::SnapshotFailed)?;
-    // Add the body + source_file columns if the table predates them.
-    // `ALTER TABLE ADD COLUMN` is idempotent via pragma check; simpler
-    // to query sqlite_master's column list and emit the ADDs for keys
-    // that aren't present yet.
-    ensure_snapshot_config_columns(&tx).map_err(V3PhaseBError::SnapshotFailed)?;
-
-    // Only insert a snapshot row when we actually have a pre-rewrite
-    // body to capture. If the file is absent, nothing to snapshot.
-    if let Some(raw) = &pre_bytes {
-        // Pull the three legacy model fields into their dedicated
-        // columns so rollback can reconstruct without reparsing.
-        let (pm, fb1, fb2) = if let Some(v) = &parsed_value {
-            (
-                v.get("primary_model").and_then(|x| x.as_str()).map(String::from),
-                v.get("fallback_model_1").and_then(|x| x.as_str()).map(String::from),
-                v.get("fallback_model_2").and_then(|x| x.as_str()).map(String::from),
+    // Split into two transactions: (a) snapshot-only tx commits first
+    // so the pre-rewrite body is durable on disk even if anything
+    // downstream fails; (b) marker supersession tx runs after the file
+    // rename. Snapshot insertion is guarded against duplicates via
+    // `WHERE NOT EXISTS` so a retry after a mid-run failure doesn't
+    // append a second snapshot row.
+    {
+        let snap_tx =
+            conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        snap_tx
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS _pre_v3_snapshot_config (
+                   snapshot_at TEXT NOT NULL,
+                   primary_model TEXT,
+                   fallback_model_1 TEXT,
+                   fallback_model_2 TEXT,
+                   source_table TEXT NOT NULL
+                 );",
             )
-        } else {
-            (None, None, None)
-        };
-        tx.execute(
-            "INSERT INTO _pre_v3_snapshot_config \
-               (snapshot_at, primary_model, fallback_model_1, fallback_model_2, \
-                source_table, body, source_file) \
-             VALUES (datetime('now'), ?1, ?2, ?3, 'pyramid_config.json', ?4, 'pyramid_config.json')",
-            rusqlite::params![pm, fb1, fb2, raw],
-        )
-        .map_err(V3PhaseBError::SnapshotFailed)?;
+            .map_err(V3PhaseBError::SnapshotFailed)?;
+        ensure_snapshot_config_columns(&snap_tx).map_err(V3PhaseBError::SnapshotFailed)?;
+
+        if let Some(raw) = &pre_bytes {
+            let (pm, fb1, fb2) = if let Some(v) = &parsed_value {
+                (
+                    v.get("primary_model").and_then(|x| x.as_str()).map(String::from),
+                    v.get("fallback_model_1").and_then(|x| x.as_str()).map(String::from),
+                    v.get("fallback_model_2").and_then(|x| x.as_str()).map(String::from),
+                )
+            } else {
+                (None, None, None)
+            };
+            // Idempotency guard: don't re-snapshot if a row already
+            // exists for pyramid_config.json. Retries after mid-run
+            // failures must not stack duplicate snapshot rows.
+            snap_tx
+                .execute(
+                    "INSERT INTO _pre_v3_snapshot_config \
+                       (snapshot_at, primary_model, fallback_model_1, fallback_model_2, \
+                        source_table, body, source_file) \
+                     SELECT datetime('now'), ?1, ?2, ?3, 'pyramid_config.json', ?4, 'pyramid_config.json' \
+                     WHERE NOT EXISTS (SELECT 1 FROM _pre_v3_snapshot_config \
+                                       WHERE source_file = 'pyramid_config.json')",
+                    rusqlite::params![pm, fb1, fb2, raw],
+                )
+                .map_err(V3PhaseBError::SnapshotFailed)?;
+        }
+        snap_tx.commit()?;
     }
+
+    // ── 4 + 5 + 6: file rewrite + marker supersession tx ─────────────
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
     // ── 4. Strip legacy keys from the parsed JSON ────────────────────
     //
@@ -1331,9 +1379,14 @@ pub fn run_v3_phase_b_migration(
 
             // ── 5. Atomic rewrite: temp-file + rename(2) ─────────────
             //
-            // NOTE: this happens between snapshot insert (committed
-            // below) and marker supersession. If it fails, we roll
-            // back the SQL tx so the snapshot doesn't get half-stored.
+            // The snapshot insert was already committed in its own tx
+            // above, so rollback here is cheap — it only discards the
+            // marker supersession work this tx was going to do. The
+            // pre-rewrite body remains durable in `_pre_v3_snapshot_config`
+            // for Phase 6 rollback. If the rename fails the marker stays
+            // at `v3-db-migrated-config-pending` and the next boot
+            // retries Phase B (which skips re-snapshot via the NOT
+            // EXISTS guard).
             if let Err(e) = write_temp_and_rename(&tmp_path, &config_path, &serialized) {
                 tx.rollback().ok();
                 return Err(V3PhaseBError::ConfigFileIoError(e));
