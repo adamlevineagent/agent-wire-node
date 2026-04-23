@@ -22,7 +22,10 @@ use super::llm::{self, AuditContext, LlmConfig, LlmResponse};
 use super::naming::headline_from_analysis;
 use super::step_context::{compute_prompt_hash, StepContext as CacheStepContext};
 use super::transform_runtime;
-use super::types::{Correction, Decision, PyramidNode, Term, Topic};
+use super::types::{
+    Correction, DebatePosition, DebateTopic, Decision, NodeShape, PyramidNode, RedTeamEntry,
+    Term, Topic, NODE_SHAPE_DEBATE,
+};
 use super::{OperationalConfig, Tier1Config};
 
 // ── Step context ────────────────────────────────────────────────────────────
@@ -616,6 +619,10 @@ const MECHANICAL_FUNCTIONS: &[&str] = &[
     "log_and_complete",
     // Post-build accretion v5 Phase 6b — sub-chain invocation primitive.
     "call_starter_chain",
+    // Post-build accretion v5 Phase 7a — debate_steward chain primitives.
+    "emit_debate_steward_invoked",
+    "load_annotation_and_target",
+    "append_annotation_to_debate_node",
 ];
 
 /// Post-build accretion v5 Phase 6b: hard ceiling on sub-chain recursion.
@@ -840,6 +847,566 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 ctx.slug, summary
             );
             Ok(input.clone())
+        }
+        // ── Post-build accretion v5 Phase 7a: debate_steward primitives ─────
+        //
+        // The three primitives below back `starter-debate-steward.yaml`, the
+        // chain dispatched when a `steel_man` / `red_team` annotation fires
+        // `annotation_reacted`. Each accepts the starter-runner threaded
+        // input shape (target_node_id / work_item_id / slug merged by the
+        // executor) and reads what it needs. Loud-raise on missing required
+        // fields per `feedback_loud_deferrals`.
+        "emit_debate_steward_invoked" => {
+            // Chronicle-only observability event. Writes one row into
+            // `dadbear_observation_events` naming the target + annotation.
+            //
+            // Passes the input object through to the output so later steps
+            // in `starter-debate-steward` keep seeing the work_item_id /
+            // target_id / annotation_id fields the supervisor stamped on
+            // the initial call. The chain executor's step-to-step threading
+            // only re-merges `target_node_id` + `slug`; every other field
+            // (work_item_id, annotation_id, annotation_type) must survive
+            // via output. Without this merge `load_annotation_and_target`
+            // would lose `work_item_id` after step 1 and fail the
+            // triggering-event backfill.
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str());
+            let annotation_id = input.get("annotation_id").and_then(|v| v.as_i64());
+            let annotation_type = input
+                .get("annotation_type")
+                .and_then(|v| v.as_str());
+            let mut meta = serde_json::Map::new();
+            if let Some(tid) = target_node_id {
+                meta.insert(
+                    "target_node_id".to_string(),
+                    Value::String(tid.to_string()),
+                );
+            }
+            if let Some(aid) = annotation_id {
+                meta.insert("annotation_id".to_string(), Value::from(aid));
+            }
+            if let Some(at) = annotation_type {
+                meta.insert(
+                    "annotation_type".to_string(),
+                    Value::String(at.to_string()),
+                );
+            }
+            let metadata_json = if meta.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&Value::Object(meta))?)
+            };
+            info!(
+                "[mechanical] emit_debate_steward_invoked slug={} target={:?} annotation_id={:?} annotation_type={:?}",
+                ctx.slug, target_node_id, annotation_id, annotation_type
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "debate_steward_invoked",
+                None,
+                None,
+                None,
+                None,
+                target_node_id,
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            Ok(Value::Object(out))
+        }
+        "load_annotation_and_target" => {
+            // Resolves the triggering observation-event metadata (the
+            // annotation_id + annotation_type), loads the matching
+            // `pyramid_annotations` row, and reads the target node's
+            // shape + payload. Returned as a single object that the next
+            // step (append_annotation_to_debate_node) threads on.
+            //
+            // `annotation_id` / `annotation_type` can be provided directly
+            // in the input envelope (future callers) OR derived by looking
+            // up the triggering observation event via the work_item's
+            // observation_event_ids column (today's path — the supervisor
+            // role_bound arm builds input from only work_item_id/step_name/
+            // target_id/layer, so metadata is recovered here).
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "load_annotation_and_target: missing target_node_id"
+                ))?
+                .to_string();
+
+            let mut annotation_id = input.get("annotation_id").and_then(|v| v.as_i64());
+            let mut annotation_type = input
+                .get("annotation_type")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            // Back-fill from the triggering observation event if the
+            // caller didn't inline annotation metadata.
+            if annotation_id.is_none() || annotation_type.is_none() {
+                let work_item_id = input
+                    .get("work_item_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                if let Some(wid) = work_item_id.as_deref() {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    // Pull observation_event_ids; parse [N,...]; read the
+                    // first event's metadata_json for annotation_* fields.
+                    let obs_ids_json: Option<String> = conn_guard
+                        .query_row(
+                            "SELECT observation_event_ids FROM dadbear_work_items WHERE id = ?1",
+                            rusqlite::params![wid],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    if let Some(ids_json) = obs_ids_json {
+                        if let Ok(ids) = serde_json::from_str::<Vec<i64>>(&ids_json) {
+                            if let Some(eid) = ids.first() {
+                                let meta: Option<String> = conn_guard
+                                    .query_row(
+                                        "SELECT metadata_json FROM dadbear_observation_events WHERE id = ?1",
+                                        rusqlite::params![eid],
+                                        |row| row.get(0),
+                                    )
+                                    .ok()
+                                    .flatten();
+                                if let Some(m) = meta {
+                                    if let Ok(v) = serde_json::from_str::<Value>(&m) {
+                                        if annotation_id.is_none() {
+                                            annotation_id =
+                                                v.get("annotation_id").and_then(|x| x.as_i64());
+                                        }
+                                        if annotation_type.is_none() {
+                                            annotation_type = v
+                                                .get("annotation_type")
+                                                .and_then(|x| x.as_str())
+                                                .map(String::from);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    drop(conn_guard);
+                }
+            }
+
+            // Load the annotation body (if we have an id) and the target
+            // node's shape view.
+            let conn_guard = ctx.db_reader.lock().await;
+
+            let annotation_obj: Value = if let Some(aid) = annotation_id {
+                let row: Option<(i64, String, String, String, Option<String>, String, String, String)> = conn_guard
+                    .query_row(
+                        "SELECT id, slug, node_id, annotation_type, question_context, author,
+                                content, created_at
+                         FROM pyramid_annotations WHERE id = ?1",
+                        rusqlite::params![aid],
+                        |r| Ok((
+                            r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?,
+                            r.get(5)?, r.get(6)?, r.get(7)?,
+                        )),
+                    )
+                    .ok();
+                if let Some((id, slug, node_id, aty, qctx, author, content, created_at)) = row {
+                    // Keep annotation_type from the DB row canonical; the
+                    // metadata-derived value was only a hint.
+                    if annotation_type.as_deref() != Some(aty.as_str()) {
+                        annotation_type = Some(aty.clone());
+                    }
+                    serde_json::json!({
+                        "id": id,
+                        "slug": slug,
+                        "node_id": node_id,
+                        "annotation_type": aty,
+                        "question_context": qctx,
+                        "author": author,
+                        "content": content,
+                        "created_at": created_at,
+                    })
+                } else {
+                    Value::Null
+                }
+            } else {
+                Value::Null
+            };
+
+            // Target node: (depth, headline, distilled) + shape view.
+            let node_row: Option<(i64, String, String)> = conn_guard
+                .query_row(
+                    "SELECT depth, headline, distilled FROM pyramid_nodes
+                     WHERE slug = ?1 AND id = ?2",
+                    rusqlite::params![ctx.slug, target_node_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok();
+            let shape_view = super::db::get_node_shape(&conn_guard, &ctx.slug, &target_node_id)?;
+            drop(conn_guard);
+
+            let target_obj = if let Some((depth, headline, distilled)) = node_row {
+                let current_shape = shape_view
+                    .as_ref()
+                    .map(|v| v.shape.as_str().to_string())
+                    .unwrap_or_else(|| "scaffolding".to_string());
+                let current_payload = shape_view
+                    .as_ref()
+                    .and_then(|v| v.payload.as_ref())
+                    .and_then(|p| serde_json::to_value(p).ok())
+                    .unwrap_or(Value::Null);
+                serde_json::json!({
+                    "id": target_node_id,
+                    "depth": depth,
+                    "headline": headline,
+                    "distilled": distilled,
+                    "current_shape": current_shape,
+                    "current_payload": current_payload,
+                })
+            } else {
+                Value::Null
+            };
+
+            info!(
+                "[mechanical] load_annotation_and_target slug={} target={} annotation_id={:?} annotation_type={:?}",
+                ctx.slug, target_node_id, annotation_id, annotation_type,
+            );
+
+            // Preserve input fields so threading keeps work_item_id / layer
+            // / step_name alive for any downstream step that wants them.
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert(
+                "target_node_id".to_string(),
+                Value::String(target_node_id.clone()),
+            );
+            out.insert(
+                "annotation_id".to_string(),
+                annotation_id.map(Value::from).unwrap_or(Value::Null),
+            );
+            out.insert(
+                "annotation_type".to_string(),
+                annotation_type
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+            out.insert("annotation".to_string(), annotation_obj);
+            out.insert("target_node".to_string(), target_obj);
+            Ok(Value::Object(out))
+        }
+        "append_annotation_to_debate_node" => {
+            // Core write. Given the target node + a steel_man / red_team
+            // annotation, either:
+            //   (a) Upgrade a Scaffolding node to Debate, seeding the first
+            //       position (steel_man) or first red_team (red_team).
+            //   (b) Append to an existing Debate's positions[] /
+            //       red_teams[] (idempotent — the same annotation_id is
+            //       never added twice).
+            // Emits `debate_spawned` on the Scaffolding→Debate upgrade.
+            //
+            // The debate_role mapping (steel_man → position, red_team →
+            // red_team) is hardcoded in this primitive today because the
+            // vocabulary registry doesn't carry a `debate_role` field yet.
+            // Phase 7b+ should lift this to a vocab attribute so new
+            // debate-mode annotation types can be published without a
+            // code deploy (feedback_generalize_not_enumerate).
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "append_annotation_to_debate_node: missing target_node_id"
+                ))?
+                .to_string();
+            // Inputs may come as threaded context from load_annotation_and_target,
+            // or may be set directly by callers.
+            let annotation_id: Option<i64> = input.get("annotation_id").and_then(|v| v.as_i64());
+            let annotation_type: Option<String> = input
+                .get("annotation_type")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let annotation_obj = input.get("annotation").cloned().unwrap_or(Value::Null);
+
+            // No annotation context → idempotent no-op. This path is hit
+            // when the work item was compiled from a `debate_spawned`
+            // observation event (which carries no annotation), keeping
+            // the Phase 3 mapping stable while avoiding infinite
+            // re-spawn: the second pass finds the target already Debate
+            // AND no annotation to append, returns "no_op".
+            if annotation_id.is_none() {
+                info!(
+                    "[mechanical] append_annotation_to_debate_node slug={} target={} → no_op (no annotation_id in input — likely debate_spawned retrigger)",
+                    ctx.slug, target_node_id
+                );
+                return Ok(serde_json::json!({
+                    "action": "no_op",
+                    "reason": "no annotation_id in input",
+                }));
+            }
+            let annotation_id = annotation_id.unwrap();
+
+            // Pull annotation content + author, preferring the threaded
+            // `annotation` object from load_annotation_and_target; fall back
+            // to a DB read when absent.
+            let (ann_content, ann_author) = {
+                let content = annotation_obj
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let author = annotation_obj
+                    .get("author")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                if let (Some(c), Some(a)) = (content.clone(), author.clone()) {
+                    (c, a)
+                } else {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let row: Option<(String, String, String)> = conn_guard
+                        .query_row(
+                            "SELECT content, author, annotation_type FROM pyramid_annotations WHERE id = ?1",
+                            rusqlite::params![annotation_id],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        )
+                        .ok();
+                    drop(conn_guard);
+                    let (c, a) = row
+                        .as_ref()
+                        .map(|(c, a, _)| (c.clone(), a.clone()))
+                        .unwrap_or_default();
+                    (c, a)
+                }
+            };
+
+            // Resolve annotation_type the same way — prefer input, fall back
+            // to a DB read.
+            let annotation_type = if let Some(t) = annotation_type {
+                t
+            } else {
+                let conn_guard = ctx.db_reader.lock().await;
+                let row: Option<String> = conn_guard
+                    .query_row(
+                        "SELECT annotation_type FROM pyramid_annotations WHERE id = ?1",
+                        rusqlite::params![annotation_id],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                drop(conn_guard);
+                row.unwrap_or_default()
+            };
+
+            // Hardcoded debate-role mapping (future: vocab-driven).
+            let is_steel_man = annotation_type == "steel_man";
+            let is_red_team = annotation_type == "red_team";
+            if !is_steel_man && !is_red_team {
+                return Err(anyhow!(
+                    "append_annotation_to_debate_node: unsupported annotation_type '{}' — \
+                     only steel_man / red_team carry a debate_role today. Publish a vocab \
+                     entry with a debate_role field (Phase 7b+) to extend.",
+                    annotation_type
+                ));
+            }
+
+            // Read current shape to decide create vs append. We use the
+            // writer mutex for the whole transition so concurrent
+            // annotations on the same target serialize.
+            let conn_guard = ctx.db_writer.lock().await;
+            let shape_view =
+                super::db::get_node_shape(&conn_guard, &ctx.slug, &target_node_id)?;
+            let current_shape = shape_view
+                .as_ref()
+                .map(|v| v.shape.clone())
+                .unwrap_or_else(NodeShape::scaffolding);
+
+            let position_label_for_steel_man = format!("annotation#{annotation_id}");
+            let red_team_from_position = "main";
+
+            let (action, updated_debate, shape_was_upgraded) = if current_shape.is_scaffolding() {
+                // Create fresh Debate.
+                let (positions, action_label) = if is_steel_man {
+                    (
+                        vec![DebatePosition {
+                            label: position_label_for_steel_man.clone(),
+                            steel_manning: ann_content.clone(),
+                            red_teams: vec![],
+                            evidence_anchors: vec![],
+                        }],
+                        "created_debate",
+                    )
+                } else {
+                    // Red team without any existing position: seed an
+                    // empty "main" position carrying the red_team.
+                    (
+                        vec![DebatePosition {
+                            label: red_team_from_position.to_string(),
+                            steel_manning: String::new(),
+                            red_teams: vec![RedTeamEntry {
+                                from_position: red_team_from_position.to_string(),
+                                argument: ann_content.clone(),
+                                evidence_anchors: vec![],
+                            }],
+                            evidence_anchors: vec![],
+                        }],
+                        "created_debate",
+                    )
+                };
+                let concern_line = input
+                    .get("target_node")
+                    .and_then(|t| t.get("headline"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| {
+                        format!("Debate on node {}", target_node_id)
+                    });
+                let debate = DebateTopic {
+                    concern: concern_line,
+                    positions,
+                    cross_refs: vec![],
+                    vote_lean: None,
+                };
+                (action_label, debate, true)
+            } else if current_shape.as_str() == NODE_SHAPE_DEBATE {
+                // Mutate existing debate payload. Idempotent — we don't
+                // append if the annotation's author already appears for
+                // the same label.
+                let mut debate = match shape_view.unwrap().payload {
+                    Some(super::types::ShapePayload::Debate(d)) => d,
+                    other => {
+                        return Err(anyhow!(
+                            "append_annotation_to_debate_node: target '{}' is shape 'debate' but \
+                             payload does not deserialize as DebateTopic (got {:?})",
+                            target_node_id,
+                            other.is_some()
+                        ));
+                    }
+                };
+                let action_label = if is_steel_man {
+                    let label = position_label_for_steel_man.clone();
+                    let already = debate.positions.iter().any(|p| {
+                        p.label == label || (p.steel_manning == ann_content && !ann_content.is_empty())
+                    });
+                    if !already {
+                        debate.positions.push(DebatePosition {
+                            label,
+                            steel_manning: ann_content.clone(),
+                            red_teams: vec![],
+                            evidence_anchors: vec![],
+                        });
+                    }
+                    if already { "no_op" } else { "appended_position" }
+                } else {
+                    // red_team → append to the first (or "main") position's
+                    // red_teams[]. If none exist yet, seed one.
+                    if debate.positions.is_empty() {
+                        debate.positions.push(DebatePosition {
+                            label: red_team_from_position.to_string(),
+                            steel_manning: String::new(),
+                            red_teams: vec![],
+                            evidence_anchors: vec![],
+                        });
+                    }
+                    let pos = debate.positions.first_mut().unwrap();
+                    let already = pos.red_teams.iter().any(|r| {
+                        r.argument == ann_content && r.from_position == ann_author
+                    });
+                    if !already {
+                        pos.red_teams.push(RedTeamEntry {
+                            from_position: ann_author.clone(),
+                            argument: ann_content.clone(),
+                            evidence_anchors: vec![],
+                        });
+                    }
+                    if already { "no_op" } else { "appended_red_team" }
+                };
+                (action_label, debate, false)
+            } else {
+                return Err(anyhow!(
+                    "append_annotation_to_debate_node: target '{}' has shape '{}' — only \
+                     Scaffolding and Debate are supported by this primitive.",
+                    target_node_id,
+                    current_shape
+                ));
+            };
+
+            // Write back. Scaffolding → Debate sets node_shape =
+            // 'debate'; existing Debate just updates shape_payload_json.
+            let payload_json = serde_json::to_string(&updated_debate)?;
+            conn_guard.execute(
+                "UPDATE pyramid_nodes
+                 SET node_shape = ?1, shape_payload_json = ?2
+                 WHERE slug = ?3 AND id = ?4",
+                rusqlite::params![
+                    NODE_SHAPE_DEBATE,
+                    payload_json,
+                    ctx.slug,
+                    target_node_id,
+                ],
+            )?;
+
+            // Emit debate_spawned only on the shape upgrade (and only
+            // when we actually did a write — "no_op" still gets here but
+            // shape_was_upgraded is false).
+            let mut spawned_event_id: Option<i64> = None;
+            if shape_was_upgraded {
+                let initial_label = updated_debate
+                    .positions
+                    .first()
+                    .map(|p| p.label.clone())
+                    .unwrap_or_default();
+                let initial_kind = if is_steel_man { "steel_man" } else { "red_team" };
+                let meta = serde_json::json!({
+                    "target_node_id": target_node_id,
+                    "initial_position_label": initial_label,
+                    "initial_position_or_red_team": initial_kind,
+                    "annotation_id": annotation_id,
+                })
+                .to_string();
+                let eid = super::observation_events::write_observation_event(
+                    &conn_guard,
+                    &ctx.slug,
+                    "chain",
+                    "debate_spawned",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&target_node_id),
+                    None,
+                    Some(&meta),
+                )?;
+                spawned_event_id = Some(eid);
+            }
+            drop(conn_guard);
+
+            info!(
+                "[mechanical] append_annotation_to_debate_node slug={} target={} action={} debate_spawned_event_id={:?}",
+                ctx.slug, target_node_id, action, spawned_event_id
+            );
+
+            let updated_payload_value =
+                serde_json::to_value(&updated_debate).unwrap_or(Value::Null);
+            Ok(serde_json::json!({
+                "action": action,
+                "target_node_id": target_node_id,
+                "annotation_id": annotation_id,
+                "annotation_type": annotation_type,
+                "shape_was_upgraded": shape_was_upgraded,
+                "debate_spawned_event_id": spawned_event_id,
+                "updated_payload": updated_payload_value,
+            }))
         }
         // ── Post-build accretion v5 Phase 6b: sub-chain invocation ──────────
         //

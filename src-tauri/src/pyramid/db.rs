@@ -27587,3 +27587,608 @@ mod phase6c_d_post_build_tests {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 7a (post-build accretion v5): debate_steward chain + Debate writer.
+// Tests verify:
+//   1. steel_man annotation upgrades Scaffolding target to Debate
+//   2. red_team annotation on existing Debate appends red_team entry
+//   3. starter-debate-steward chain loads via chain_loader
+//   4. debate_spawned event is emitted on Scaffolding → Debate upgrade
+//   5. debate_spawned event does not cause infinite-recursion compile
+//   6. append_annotation_to_debate_node is idempotent on replay
+//   7. compiler routes annotation_reacted via vocab's handler_chain_id
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod phase7a_post_build_tests {
+    use super::*;
+    use crate::pyramid::chain_engine::{ChainDefaults, ChainDefinition, ChainStep};
+    use crate::pyramid::types::{
+        AnnotationType, ContentType, DebatePosition, DebateTopic, NodeShape, PyramidAnnotation,
+        RedTeamEntry, ShapePayload, NODE_SHAPE_DEBATE,
+    };
+    use crate::pyramid::{chain_executor, chain_loader, dadbear_compiler, observation_events, vocab_entries};
+    use rusqlite::Connection;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+    use std::collections::HashMap;
+    use tokio::sync::Mutex as TokioMutex;
+
+    /// Serialize the mod behind this mutex so vocab_entries' process-wide
+    /// cache stays scoped to each test's own in-memory DB.
+    fn test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn chains_dir_path() -> PathBuf {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        PathBuf::from(manifest).parent().unwrap().join("chains")
+    }
+
+    fn test_pyramid_state(conn: Connection) -> Arc<crate::pyramid::PyramidState> {
+        let db = Arc::new(TokioMutex::new(conn));
+        let config = crate::pyramid::llm::LlmConfig::default();
+        Arc::new(crate::pyramid::PyramidState {
+            reader: db.clone(),
+            writer: db,
+            config: Arc::new(tokio::sync::RwLock::new(config)),
+            active_build: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            data_dir: None,
+            stale_engines: Arc::new(TokioMutex::new(HashMap::new())),
+            file_watchers: Arc::new(TokioMutex::new(HashMap::new())),
+            vine_builds: Arc::new(TokioMutex::new(HashMap::new())),
+            use_chain_engine: AtomicBool::new(false),
+            use_ir_executor: AtomicBool::new(true),
+            event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
+            operational: Arc::new(crate::pyramid::OperationalConfig::default()),
+            chains_dir: chains_dir_path(),
+            remote_query_rate_limiter: Arc::new(TokioMutex::new(HashMap::new())),
+            absorption_gate: Arc::new(TokioMutex::new(crate::pyramid::AbsorptionGate::new())),
+            build_event_bus: Arc::new(crate::pyramid::event_bus::BuildEventBus::new()),
+            supabase_url: None,
+            supabase_anon_key: None,
+            csrf_secret: [0u8; 32],
+            dadbear_handle: Arc::new(TokioMutex::new(None)),
+            dadbear_supervisor_handle: Arc::new(TokioMutex::new(None)),
+            dadbear_in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            provider_registry: {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                Arc::new(crate::pyramid::provider::ProviderRegistry::new(store))
+            },
+            credential_store: {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                store
+            },
+            schema_registry: Arc::new(crate::pyramid::schema_registry::SchemaRegistry::new()),
+            cross_pyramid_router: Arc::new(
+                crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
+            ),
+            ollama_pull_cancel: Arc::new(AtomicBool::new(false)),
+            ollama_pull_in_progress: Arc::new(TokioMutex::new(None)),
+        })
+    }
+
+    fn fresh_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        conn
+    }
+
+    fn seed_scaffolding_node(conn: &Connection, slug: &str, node_id: &str) {
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES (?1, ?2, 1, 'debate target headline', 'distilled', '', 1)",
+            rusqlite::params![node_id, slug],
+        )
+        .unwrap();
+    }
+
+    fn seed_existing_debate_node(
+        conn: &Connection,
+        slug: &str,
+        node_id: &str,
+        debate: &DebateTopic,
+    ) {
+        let payload = serde_json::to_string(debate).unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version,
+                 node_shape, shape_payload_json)
+             VALUES (?1, ?2, 1, 'existing debate', 'existing debate distilled', '', 1, ?3, ?4)",
+            rusqlite::params![node_id, slug, NODE_SHAPE_DEBATE, payload],
+        )
+        .unwrap();
+    }
+
+    fn save_ann(conn: &Connection, slug: &str, node_id: &str, ty: &str, content: &str, author: &str) -> PyramidAnnotation {
+        let ann = PyramidAnnotation {
+            id: 0,
+            slug: slug.to_string(),
+            node_id: node_id.to_string(),
+            annotation_type: AnnotationType::new(ty),
+            content: content.to_string(),
+            question_context: None,
+            author: author.to_string(),
+            created_at: String::new(),
+        };
+        save_annotation(conn, &ann).unwrap()
+    }
+
+    /// Emit the annotation_reacted observation event exactly as 6c-B's
+    /// `process_annotation_hook` does. Needed here because these tests
+    /// drive the chain directly (no HTTP → no hook). Keeps the metadata
+    /// shape in lockstep with routes::process_annotation_hook.
+    fn emit_annotation_reacted(
+        conn: &Connection,
+        slug: &str,
+        annotation: &PyramidAnnotation,
+        handler_chain_id: &str,
+    ) -> i64 {
+        let metadata = serde_json::json!({
+            "annotation_id": annotation.id,
+            "annotation_type": annotation.annotation_type.as_str(),
+            "target_node_id": annotation.node_id,
+            "handler_chain_id": handler_chain_id,
+            "author": annotation.author,
+        })
+        .to_string();
+        observation_events::write_observation_event(
+            conn,
+            slug,
+            "annotation",
+            "annotation_reacted",
+            None,
+            None,
+            None,
+            None,
+            Some(&annotation.node_id),
+            None,
+            Some(&metadata),
+        )
+        .unwrap()
+    }
+
+    // ── Test 1: SteelMan annotation upgrades Scaffolding to Debate ─────
+
+    #[tokio::test]
+    async fn steel_man_annotation_upgrades_scaffolding_to_debate() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7a1", &ContentType::Code, "/tmp/p7a1").unwrap();
+        seed_scaffolding_node(&conn, "p7a1", "node-debate-1");
+        let ann = save_ann(
+            &conn,
+            "p7a1",
+            "node-debate-1",
+            "steel_man",
+            "Good-faith reconstruction: the policy reduces harm on balance.",
+            "alice",
+        );
+        emit_annotation_reacted(&conn, "p7a1", &ann, "starter-debate-steward");
+
+        // Compile tick — routes annotation_reacted through vocab handler_chain_id.
+        let result =
+            dadbear_compiler::run_compilation_for_slug(&conn, "p7a1", None, None).unwrap();
+        assert!(
+            result.items_compiled >= 1,
+            "at least one work item from annotation_reacted"
+        );
+        let (wi_id, primitive, step_name, resolved_chain_id, state): (
+            String, String, String, Option<String>, String,
+        ) = conn
+            .query_row(
+                "SELECT id, primitive, step_name, resolved_chain_id, state
+                   FROM dadbear_work_items
+                  WHERE slug = 'p7a1' AND step_name = 'cascade_reacted'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("role_bound work item for annotation_reacted must exist");
+        assert_eq!(primitive, "role_bound");
+        assert_eq!(step_name, "cascade_reacted");
+        assert_eq!(
+            resolved_chain_id.as_deref(),
+            Some("starter-debate-steward"),
+            "vocab handler_chain_id must be stamped onto the work item"
+        );
+        assert_eq!(state, "compiled");
+
+        // Execute the chain directly.
+        let state_pyr = test_pyramid_state(conn);
+        let chain = chain_loader::load_chain_by_id(
+            "starter-debate-steward",
+            &state_pyr.chains_dir,
+        )
+        .expect("starter-debate-steward must load");
+        let initial_inputs = serde_json::json!({
+            "work_item_id": wi_id,
+            "step_name": step_name,
+            "target_id": "node-debate-1",
+            "layer": 1,
+        });
+        let _out = chain_executor::execute_chain_for_target(
+            &state_pyr,
+            &chain,
+            "p7a1",
+            Some("node-debate-1"),
+            initial_inputs,
+        )
+        .await
+        .expect("debate_steward chain must succeed");
+
+        // Assert target node is now Debate-shaped with one steel_man position.
+        let writer = state_pyr.writer.lock().await;
+        let view =
+            get_node_shape(&writer, "p7a1", "node-debate-1").unwrap().unwrap();
+        assert_eq!(view.shape.as_str(), "debate");
+        match view.payload {
+            Some(ShapePayload::Debate(d)) => {
+                assert_eq!(d.positions.len(), 1);
+                assert!(d.positions[0].steel_manning.contains("policy reduces harm"));
+            }
+            other => panic!("expected Debate payload, got {other:?}"),
+        }
+    }
+
+    // ── Test 2: RedTeam on existing Debate appends red_team ────────────
+
+    #[tokio::test]
+    async fn red_team_annotation_on_existing_debate_appends_red_team() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7a2", &ContentType::Code, "/tmp/p7a2").unwrap();
+        let existing = DebateTopic {
+            concern: "Pre-existing concern".to_string(),
+            positions: vec![DebatePosition {
+                label: "pos-1".to_string(),
+                steel_manning: "Initial steel_man".to_string(),
+                red_teams: vec![],
+                evidence_anchors: vec![],
+            }],
+            cross_refs: vec![],
+            vote_lean: None,
+        };
+        seed_existing_debate_node(&conn, "p7a2", "node-debate-2", &existing);
+        let ann = save_ann(
+            &conn,
+            "p7a2",
+            "node-debate-2",
+            "red_team",
+            "But have you considered the counter-example?",
+            "bob",
+        );
+        emit_annotation_reacted(&conn, "p7a2", &ann, "starter-debate-steward");
+
+        let result =
+            dadbear_compiler::run_compilation_for_slug(&conn, "p7a2", None, None).unwrap();
+        assert!(result.items_compiled >= 1);
+        let wi_id: String = conn
+            .query_row(
+                "SELECT id FROM dadbear_work_items
+                  WHERE slug = 'p7a2' AND step_name = 'cascade_reacted'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let state_pyr = test_pyramid_state(conn);
+        let chain = chain_loader::load_chain_by_id(
+            "starter-debate-steward",
+            &state_pyr.chains_dir,
+        )
+        .unwrap();
+        let initial_inputs = serde_json::json!({
+            "work_item_id": wi_id,
+            "step_name": "cascade_reacted",
+            "target_id": "node-debate-2",
+            "layer": 1,
+        });
+        let _out = chain_executor::execute_chain_for_target(
+            &state_pyr, &chain, "p7a2",
+            Some("node-debate-2"), initial_inputs,
+        )
+        .await
+        .expect("debate_steward chain must succeed");
+
+        // Existing Debate's positions[0] should now have one red_team.
+        let writer = state_pyr.writer.lock().await;
+        let view =
+            get_node_shape(&writer, "p7a2", "node-debate-2").unwrap().unwrap();
+        assert_eq!(view.shape.as_str(), "debate");
+        match view.payload {
+            Some(ShapePayload::Debate(d)) => {
+                assert_eq!(d.positions.len(), 1, "no extra Debate / no extra position");
+                assert_eq!(d.positions[0].red_teams.len(), 1);
+                assert_eq!(
+                    d.positions[0].red_teams[0].argument,
+                    "But have you considered the counter-example?"
+                );
+                assert_eq!(d.positions[0].red_teams[0].from_position, "bob");
+            }
+            other => panic!("expected Debate payload, got {other:?}"),
+        }
+    }
+
+    // ── Test 3: debate_steward chain loads via chain_loader ─────────────
+
+    #[test]
+    fn debate_steward_chain_loads_via_chain_loader() {
+        let chains_dir = chains_dir_path();
+        let loaded = chain_loader::load_chain_by_id("starter-debate-steward", &chains_dir)
+            .expect("starter-debate-steward must load");
+        assert_eq!(loaded.id, "starter-debate-steward");
+        assert!(!loaded.steps.is_empty());
+        for step in &loaded.steps {
+            assert!(step.mechanical, "Phase 7a ships mechanical-only");
+            assert!(step.rust_function.is_some());
+        }
+        // Step graph must be: emit → load → append → complete.
+        let names: Vec<&str> = loaded.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["emit_invoked", "load_context", "append_to_debate", "complete"],
+            "canonical 4-step mechanical graph"
+        );
+    }
+
+    // ── Test 4: debate_spawned event emitted on shape upgrade ──────────
+
+    #[tokio::test]
+    async fn debate_spawned_event_emitted_on_shape_upgrade() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7a4", &ContentType::Code, "/tmp/p7a4").unwrap();
+        seed_scaffolding_node(&conn, "p7a4", "node-4");
+        let ann = save_ann(&conn, "p7a4", "node-4", "steel_man", "content", "alice");
+        emit_annotation_reacted(&conn, "p7a4", &ann, "starter-debate-steward");
+        dadbear_compiler::run_compilation_for_slug(&conn, "p7a4", None, None).unwrap();
+        let wi_id: String = conn.query_row(
+            "SELECT id FROM dadbear_work_items
+              WHERE slug = 'p7a4' AND step_name = 'cascade_reacted'",
+            [], |r| r.get(0)).unwrap();
+        let state_pyr = test_pyramid_state(conn);
+        let chain = chain_loader::load_chain_by_id(
+            "starter-debate-steward", &state_pyr.chains_dir).unwrap();
+        chain_executor::execute_chain_for_target(
+            &state_pyr, &chain, "p7a4", Some("node-4"),
+            serde_json::json!({
+                "work_item_id": wi_id,
+                "target_id": "node-4",
+                "step_name": "cascade_reacted",
+                "layer": 1,
+            }),
+        ).await.unwrap();
+        let writer = state_pyr.writer.lock().await;
+        let (count, metadata): (i64, Option<String>) = writer.query_row(
+            "SELECT COUNT(*), MAX(metadata_json) FROM dadbear_observation_events
+              WHERE slug = 'p7a4' AND event_type = 'debate_spawned'",
+            [], |r| Ok((r.get(0)?, r.get(1)?))
+        ).unwrap();
+        assert_eq!(count, 1, "one debate_spawned on Scaffolding→Debate upgrade");
+        let m = metadata.expect("metadata required");
+        assert!(m.contains("node-4"), "metadata must carry target_node_id: {m}");
+        assert!(
+            m.contains("initial_position_label") || m.contains("annotation#"),
+            "metadata must carry initial_position_label: {m}"
+        );
+    }
+
+    // ── Test 5: debate_spawned does not cause infinite recursion ────────
+    //
+    // Two distinct safety properties:
+    //  (a) Running the `starter-debate-steward` chain a second time
+    //      against the SAME (already-Debate) target does not emit a
+    //      second `debate_spawned` — idempotency on shape upgrade.
+    //  (b) The compiler's semantic-path-id dedup blocks a second
+    //      role_bound work item for the same (slug, primitive,
+    //      target) tuple inside the same epoch, so even if two
+    //      source events (`annotation_reacted` then `debate_spawned`)
+    //      both point at node-5, only ONE role_bound work item lives
+    //      at a time. Phase 8+'s per-step-name semantic path will
+    //      loosen this collision, but the infinite-loop guarantee
+    //      survives either way because the chain is idempotent.
+
+    #[tokio::test]
+    async fn debate_spawned_event_does_not_cause_infinite_recursion() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7a5", &ContentType::Code, "/tmp/p7a5").unwrap();
+        seed_scaffolding_node(&conn, "p7a5", "node-5");
+        let ann = save_ann(&conn, "p7a5", "node-5", "steel_man", "original", "alice");
+        emit_annotation_reacted(&conn, "p7a5", &ann, "starter-debate-steward");
+
+        // Tick 1: compile the annotation_reacted into a debate_steward work item.
+        let r1 = dadbear_compiler::run_compilation_for_slug(&conn, "p7a5", None, None).unwrap();
+        assert!(r1.items_compiled >= 1);
+        let wi_id: String = conn.query_row(
+            "SELECT id FROM dadbear_work_items
+              WHERE slug = 'p7a5' AND step_name = 'cascade_reacted'",
+            [], |r| r.get(0)).unwrap();
+
+        let state_pyr = test_pyramid_state(conn);
+        let chain = chain_loader::load_chain_by_id(
+            "starter-debate-steward", &state_pyr.chains_dir).unwrap();
+        // Run chain — emits debate_spawned.
+        chain_executor::execute_chain_for_target(
+            &state_pyr, &chain, "p7a5", Some("node-5"),
+            serde_json::json!({
+                "work_item_id": wi_id,
+                "target_id": "node-5",
+                "step_name": "cascade_reacted",
+                "layer": 1,
+            }),
+        ).await.unwrap();
+        // Confirm exactly one debate_spawned after the first chain run.
+        {
+            let writer = state_pyr.writer.lock().await;
+            let count: i64 = writer.query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE slug = 'p7a5' AND event_type = 'debate_spawned'",
+                [], |r| r.get(0)).unwrap();
+            assert_eq!(count, 1);
+        }
+
+        // Re-run the SAME chain body on the SAME target with the SAME
+        // annotation. This simulates every restart-path into the
+        // debate_steward chain (a second compile tick, a retry from
+        // the supervisor, a role-binding supersede that re-dispatches
+        // the same work item). The chain MUST be idempotent: no
+        // second debate_spawned, no duplicated position, no stack
+        // blowup.
+        chain_executor::execute_chain_for_target(
+            &state_pyr, &chain, "p7a5", Some("node-5"),
+            serde_json::json!({
+                "work_item_id": wi_id,
+                "target_id": "node-5",
+                "step_name": "cascade_reacted",
+                "layer": 1,
+            }),
+        ).await.expect("replay must succeed");
+
+        let writer = state_pyr.writer.lock().await;
+        let debate_spawned_count: i64 = writer.query_row(
+            "SELECT COUNT(*) FROM dadbear_observation_events
+              WHERE slug = 'p7a5' AND event_type = 'debate_spawned'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            debate_spawned_count, 1,
+            "exactly one debate_spawned total — chain is idempotent on replay"
+        );
+        // Compiler semantic-path-id guard: a second compile tick pulls
+        // in the debate_spawned event, but the semantic-path-id
+        // (slug:epoch:role_bound:0:node-5) collides with the existing
+        // cascade_reacted work item, so INSERT OR IGNORE dedups it.
+        // Either way we never create a second role_bound work item
+        // targeting node-5 in this epoch.
+        let r2 = dadbear_compiler::run_compilation_for_slug(&writer, "p7a5", None, None).unwrap();
+        let role_bound_count: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_work_items
+                  WHERE slug = 'p7a5' AND primitive = 'role_bound' AND target_id = 'node-5'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            role_bound_count, 1,
+            "only one role_bound work item per target in-epoch (r2={r2:?})"
+        );
+    }
+
+    // ── Test 6: append_annotation_to_debate_node is idempotent ─────────
+
+    #[tokio::test]
+    async fn append_annotation_to_debate_node_is_idempotent() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7a6", &ContentType::Code, "/tmp/p7a6").unwrap();
+        seed_scaffolding_node(&conn, "p7a6", "node-6");
+        let ann = save_ann(&conn, "p7a6", "node-6", "steel_man", "same content", "alice");
+        emit_annotation_reacted(&conn, "p7a6", &ann, "starter-debate-steward");
+        dadbear_compiler::run_compilation_for_slug(&conn, "p7a6", None, None).unwrap();
+        let wi_id: String = conn.query_row(
+            "SELECT id FROM dadbear_work_items
+              WHERE slug = 'p7a6' AND step_name = 'cascade_reacted'",
+            [], |r| r.get(0)).unwrap();
+        let state_pyr = test_pyramid_state(conn);
+        let chain = chain_loader::load_chain_by_id(
+            "starter-debate-steward", &state_pyr.chains_dir).unwrap();
+
+        let inputs = serde_json::json!({
+            "work_item_id": wi_id,
+            "target_id": "node-6",
+            "step_name": "cascade_reacted",
+            "layer": 1,
+        });
+        // Run twice.
+        let _out1 = chain_executor::execute_chain_for_target(
+            &state_pyr, &chain, "p7a6", Some("node-6"), inputs.clone(),
+        ).await.unwrap();
+        let _out2 = chain_executor::execute_chain_for_target(
+            &state_pyr, &chain, "p7a6", Some("node-6"), inputs,
+        ).await.unwrap();
+
+        let writer = state_pyr.writer.lock().await;
+        let view =
+            get_node_shape(&writer, "p7a6", "node-6").unwrap().unwrap();
+        match view.payload {
+            Some(ShapePayload::Debate(d)) => {
+                assert_eq!(
+                    d.positions.len(), 1,
+                    "position must not be duplicated on re-run"
+                );
+            }
+            other => panic!("expected Debate, got {other:?}"),
+        }
+        // Also: at most 1 debate_spawned event (only the first run upgraded).
+        let spawn_count: i64 = writer.query_row(
+            "SELECT COUNT(*) FROM dadbear_observation_events
+              WHERE slug = 'p7a6' AND event_type = 'debate_spawned'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(spawn_count, 1);
+    }
+
+    // ── Test 7: compiler routes annotation_reacted via vocab handler ────
+
+    #[tokio::test]
+    async fn compiler_routes_annotation_reacted_via_vocab_handler_chain_id() {
+        // Direct proof for 7a-1: the compiler pulls handler_chain_id from
+        // the event's metadata_json and stamps it onto the work item. A
+        // vocab-published handler wins over the default role_for_event
+        // mapping (which would have returned cascade_handler).
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7a7", &ContentType::Code, "/tmp/p7a7").unwrap();
+        seed_scaffolding_node(&conn, "p7a7", "node-7");
+        let ann = save_ann(&conn, "p7a7", "node-7", "steel_man", "c", "a");
+        emit_annotation_reacted(&conn, "p7a7", &ann, "starter-debate-steward");
+        dadbear_compiler::run_compilation_for_slug(&conn, "p7a7", None, None).unwrap();
+        let resolved: Option<String> = conn.query_row(
+            "SELECT resolved_chain_id FROM dadbear_work_items
+              WHERE slug = 'p7a7' AND step_name = 'cascade_reacted'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(resolved.as_deref(), Some("starter-debate-steward"),
+            "annotation_reacted must be routed via vocab handler_chain_id, not role_for_event");
+    }
+
+    // ── Test 8: missing handler_chain_id in metadata is a loud hold ─────
+
+    #[test]
+    fn compiler_holds_cursor_when_annotation_reacted_metadata_missing_handler() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7a8", &ContentType::Code, "/tmp/p7a8").unwrap();
+        // Write an annotation_reacted observation event with NO
+        // handler_chain_id in its metadata. The compiler must hold the
+        // cursor + emit a binding_unresolved chronicle row.
+        observation_events::write_observation_event(
+            &conn, "p7a8", "annotation", "annotation_reacted",
+            None, None, None, None, Some("node-8"), None,
+            Some(r#"{"annotation_id":1,"annotation_type":"steel_man","target_node_id":"node-8"}"#),
+        ).unwrap();
+        let result = dadbear_compiler::run_compilation_for_slug(
+            &conn, "p7a8", None, None).unwrap();
+        assert_eq!(
+            result.items_compiled, 0,
+            "must not compile a work item when handler_chain_id is missing"
+        );
+        let binding_unresolved: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM dadbear_observation_events
+              WHERE slug = 'p7a8' AND event_type = 'binding_unresolved'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(binding_unresolved, 1, "must emit binding_unresolved chronicle once");
+    }
+}
+

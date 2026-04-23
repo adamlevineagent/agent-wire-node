@@ -41,6 +41,7 @@ use rusqlite::Connection;
 ///                  | "meta_layer_crystallized"       // v5: meta-layer emerged
 ///                  | "binding_unresolved"            // v5: observability for RAISE
 ///                  | "cascade_handler_invoked"       // v5: chronicle cascade trace
+///                  | "debate_steward_invoked"        // v5 Phase 7a: debate_steward chain fired
 ///                  | "vocabulary_published"          // v5 6c-A: vocab entry publish
 ///                  | "vocabulary_superseded"         // v5 6c-A: vocab entry supersede
 /// - `source_path`: filesystem path for the observation source (NULL for internal events)

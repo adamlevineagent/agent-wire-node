@@ -1,0 +1,53 @@
+schema_version: 1
+id: starter-debate-steward
+name: Debate Steward — append annotation to Debate node (Phase 7a MVP)
+description: >
+  Starter binding for the debate_steward role. Fires on annotation_reacted
+  events whose vocab entry nominates this chain (steel_man / red_team
+  today). The chain either upgrades a Scaffolding target to Debate shape
+  (seeding the first position / red_team) or appends to the existing
+  Debate payload.
+
+  Phase 7a ships mechanical-only. Phase 7b+ can add LLM judgement steps
+  (concern rewording, duplicate-position detection, steel_manning
+  reconciliation) behind `when:` guards so the mechanical append still
+  runs when judgement is not warranted.
+
+  Steps:
+    1. emit_debate_steward_invoked — chronicle trace.
+    2. load_annotation_and_target — resolves annotation + current shape.
+    3. append_annotation_to_debate_node — core write (create / append /
+       no_op). Emits debate_spawned on shape upgrade.
+    4. log_and_complete — terminal no-op so the work item CASes to
+       applied even on no_op paths.
+content_type: code
+version: "1.0.0"
+author: post-build-accretion-v5
+
+defaults:
+  model_tier: mid
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  - name: emit_invoked
+    primitive: custom
+    mechanical: true
+    rust_function: emit_debate_steward_invoked
+
+  - name: load_context
+    primitive: custom
+    mechanical: true
+    rust_function: load_annotation_and_target
+
+  - name: append_to_debate
+    primitive: custom
+    mechanical: true
+    rust_function: append_annotation_to_debate_node
+
+  - name: complete
+    primitive: custom
+    mechanical: true
+    rust_function: log_and_complete
+
+post_build: []

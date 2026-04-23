@@ -400,6 +400,16 @@ pub fn ensure_default_chains(
             "starter-reconciler.yaml",
             include_str!("../../../chains/defaults/starter/starter-reconciler.yaml"),
         ),
+        // Post-build accretion v5 Phase 7a: debate_steward role handler.
+        // Genesis binding points debate_steward at this chain id; the
+        // vocab-driven routing in dadbear_compiler reads the triggering
+        // annotation's `handler_chain_id` metadata and dispatches here
+        // when the annotation type's vocab entry nominates it (steel_man
+        // + red_team today).
+        (
+            "starter-debate-steward.yaml",
+            include_str!("../../../chains/defaults/starter/starter-debate-steward.yaml"),
+        ),
     ];
     for (filename, content) in starter_chains {
         let path = chains_dir.join("defaults").join("starter").join(filename);
