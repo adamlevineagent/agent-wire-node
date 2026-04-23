@@ -446,78 +446,104 @@ pub fn compile_observations(
         // and capture the handler chain id. On resolution failure, we do
         // NOT advance the cursor past this event so the next tick retries.
         //
-        // v5 Phase 7a: annotation_reacted is now routed via the TRIGGERING
+        // v5 Phase 7a: annotation_reacted is routed via the TRIGGERING
         // VOCAB ENTRY's handler_chain_id (stamped into the event's
         // metadata_json by `process_annotation_hook` in 6c-B) rather than
-        // via role_for_event → resolve_binding. The vocab entry IS the
-        // binding post-6c-B: steel_man / red_team both point at
-        // `starter-debate-steward`, while role_for_event("annotation_reacted")
-        // still returns `cascade_handler` (a different chain). Reading the
-        // vocab-supplied handler keeps the two genesis reactive types
-        // dispatching to the debate_steward chain and lets an agent
-        // publish a NEW reactive annotation type with any handler_chain_id
-        // and have it route correctly on the very next compile tick — no
-        // code deploy, no `role_for_event` arm to add.
+        // via role_for_event → resolve_binding.
         //
-        // Missing metadata is a loud raise per feedback_loud_deferrals: 6c-B
+        // v5 audit 7a-gen: generalized — ANY role_bound event whose
+        // metadata carries a non-empty `handler_chain_id` takes the
+        // override path (the vocab-supplied handler wins over
+        // role_for_event). Before this audit the condition was hardcoded
+        // to `event.event_type == "annotation_reacted"`, which forced a
+        // code deploy every time a new role_bound event type wanted
+        // vocab-driven dispatch. Post-audit, new role_bound emitters
+        // just stamp `handler_chain_id` into their metadata and they
+        // route via the override without touching the compiler.
+        //
+        // Safety audit (per feedback_architectural_lens): grepped every
+        // `handler_chain_id` write site in observation-event metadata —
+        // (1) process_annotation_hook emits annotation_reacted
+        //     (intentional; this IS the generalized path);
+        // (2) emit_vocabulary_event_with_reason emits vocabulary_published
+        //     and vocabulary_superseded to the `__global__` slug. Those
+        //     event types are NOT in map_event_to_primitive, so they
+        //     never reach this role_bound branch regardless of their
+        //     metadata shape;
+        // (3) two test helpers in db.rs that mirror (1) for test driving.
+        // No accidental `handler_chain_id` metadata fields exist today,
+        // so the generalization is safe.
+        //
+        // Missing metadata on an event type that explicitly relies on
+        // the override path (today: annotation_reacted) is a loud raise
+        // per feedback_loud_deferrals: process_annotation_hook
         // unconditionally stamps `handler_chain_id` on every
-        // `annotation_reacted` event, so an event without it is either a
+        // annotation_reacted event, so an event without it is either a
         // direct-DB write bypassing the hook or a downgrade bug. Cursor
         // holds on the event so the operator sees the stuck row.
+        //
+        // For event types that DON'T depend on the override (e.g.
+        // debate_spawned, gap_resolved), missing handler_chain_id is
+        // expected — they fall through to role_for_event → resolve_binding.
         let resolved_chain_id: Option<String> = if primitive == "role_bound" {
-            if event.event_type == "annotation_reacted" {
-                let handler = event
-                    .metadata_json
-                    .as_deref()
-                    .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
-                    .and_then(|v| {
-                        v.get("handler_chain_id")
-                            .and_then(|h| h.as_str())
-                            .map(String::from)
-                    });
-                match handler {
-                    Some(h) if !h.is_empty() => Some(h),
-                    _ => {
-                        warn!(
-                            slug = %slug,
-                            event_type = %event.event_type,
-                            event_id = event.id,
-                            "annotation_reacted missing handler_chain_id in metadata — \
-                             process_annotation_hook should have stamped it. Cursor held; \
-                             fix the event row or republish the annotation's vocab entry."
-                        );
-                        // Surface once into the chronicle, same loud-hold
-                        // posture the role-binding arm below uses.
-                        let source_id_fragment = format!(r#""source_event_id":{}"#, event.id);
-                        let already_emitted: bool = conn
-                            .query_row(
-                                "SELECT EXISTS(
-                                    SELECT 1 FROM dadbear_observation_events
-                                     WHERE slug = ?1
-                                       AND event_type = 'binding_unresolved'
-                                       AND metadata_json LIKE ?2
-                                 )",
-                                params![slug, format!("%{source_id_fragment}%")],
-                                |row| row.get::<_, bool>(0),
-                            )
-                            .unwrap_or(false);
-                        if !already_emitted {
-                            let _ = crate::pyramid::observation_events::write_observation_event(
-                                conn,
-                                slug,
-                                "dadbear",
-                                "binding_unresolved",
-                                None, None, None, None, None, None,
-                                Some(&format!(
-                                    r#"{{"reason":"annotation_reacted_missing_handler_chain_id","event_type":"{}","source_event_id":{}}}"#,
-                                    event.event_type, event.id
-                                )),
-                            );
-                        }
-                        // Cursor holds.
-                        continue;
-                    }
+            let meta_handler: Option<String> = event
+                .metadata_json
+                .as_deref()
+                .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                .and_then(|v| {
+                    v.get("handler_chain_id")
+                        .and_then(|h| h.as_str())
+                        .filter(|h| !h.is_empty())
+                        .map(String::from)
+                });
+
+            // Event types that MUST have handler_chain_id (vocab-driven
+            // dispatch is load-bearing): annotation_reacted today.
+            // Missing metadata on these is a loud-hold.
+            const METADATA_HANDLER_REQUIRED: &[&str] = &["annotation_reacted"];
+
+            if let Some(handler) = meta_handler {
+                Some(handler)
+            } else if METADATA_HANDLER_REQUIRED.contains(&event.event_type.as_str()) {
+                warn!(
+                    slug = %slug,
+                    event_type = %event.event_type,
+                    event_id = event.id,
+                    "{} missing handler_chain_id in metadata — \
+                     process_annotation_hook should have stamped it. Cursor held; \
+                     fix the event row or republish the annotation's vocab entry.",
+                    event.event_type,
+                );
+                // Surface once into the chronicle, same loud-hold
+                // posture the role-binding arm below uses.
+                let source_id_fragment = format!(r#""source_event_id":{}"#, event.id);
+                let already_emitted: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM dadbear_observation_events
+                             WHERE slug = ?1
+                               AND event_type = 'binding_unresolved'
+                               AND metadata_json LIKE ?2
+                         )",
+                        params![slug, format!("%{source_id_fragment}%")],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap_or(false);
+                if !already_emitted {
+                    let _ = crate::pyramid::observation_events::write_observation_event(
+                        conn,
+                        slug,
+                        "dadbear",
+                        "binding_unresolved",
+                        None, None, None, None, None, None,
+                        Some(&format!(
+                            r#"{{"reason":"{}_missing_handler_chain_id","event_type":"{}","source_event_id":{}}}"#,
+                            event.event_type, event.event_type, event.id
+                        )),
+                    );
                 }
+                // Cursor holds.
+                continue;
             } else {
             let role_name = match role_for_event(&event.event_type) {
                 Some(r) => r,

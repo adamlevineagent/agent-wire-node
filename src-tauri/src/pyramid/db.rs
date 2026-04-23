@@ -28309,6 +28309,73 @@ mod phase7a_post_build_tests {
             [], |r| r.get(0)).unwrap();
         assert_eq!(binding_unresolved, 1, "must emit binding_unresolved chronicle once");
     }
+
+    // ── v5 audit 7a-gen: handler_chain_id override generalizes across types ─
+
+    #[test]
+    fn compiler_routes_any_role_bound_event_via_metadata_handler_chain_id() {
+        // v5 audit 7a-gen: the compiler's metadata-driven handler_chain_id
+        // override used to be hardcoded to `event.event_type ==
+        // "annotation_reacted"`. Post-audit it applies to ANY role_bound
+        // event whose metadata carries a non-empty handler_chain_id. Test:
+        // stamp a custom handler_chain_id on a `debate_spawned` event
+        // (a role_bound type whose default role is debate_steward) and
+        // assert the compiler stamps the custom handler onto the work
+        // item — not the vocab-resolved debate_steward chain.
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7agen", &ContentType::Code, "/tmp/p7agen").unwrap();
+
+        let meta = r#"{"target_node_id":"node-x","handler_chain_id":"starter-custom-debate-v2"}"#;
+        observation_events::write_observation_event(
+            &conn, "p7agen", "chain", "debate_spawned",
+            None, None, None, None, Some("node-x"), Some(1),
+            Some(meta),
+        ).unwrap();
+
+        dadbear_compiler::run_compilation_for_slug(&conn, "p7agen", None, None).unwrap();
+
+        let resolved: Option<String> = conn.query_row(
+            "SELECT resolved_chain_id FROM dadbear_work_items
+              WHERE slug = 'p7agen' AND step_name = 'debate_spawn'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some("starter-custom-debate-v2"),
+            "metadata handler_chain_id must win over role_for_event for any role_bound event"
+        );
+    }
+
+    #[test]
+    fn compiler_falls_back_to_role_for_event_when_metadata_has_no_handler() {
+        // Inverse of the generalization test: a role_bound event WITHOUT
+        // handler_chain_id in its metadata (and not in the
+        // METADATA_HANDLER_REQUIRED list) falls through to
+        // role_for_event → resolve_binding. debate_spawned's default role
+        // is debate_steward whose genesis binding points at
+        // starter-debate-steward.
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7agen2", &ContentType::Code, "/tmp/p7agen2").unwrap();
+
+        observation_events::write_observation_event(
+            &conn, "p7agen2", "chain", "debate_spawned",
+            None, None, None, None, Some("node-y"), Some(1),
+            Some(r#"{"target_node_id":"node-y"}"#),
+        ).unwrap();
+
+        dadbear_compiler::run_compilation_for_slug(&conn, "p7agen2", None, None).unwrap();
+
+        let resolved: Option<String> = conn.query_row(
+            "SELECT resolved_chain_id FROM dadbear_work_items
+              WHERE slug = 'p7agen2' AND step_name = 'debate_spawn'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some("starter-debate-steward"),
+            "without metadata handler, fall through to role_for_event → resolve_binding"
+        );
+    }
 }
 
 
