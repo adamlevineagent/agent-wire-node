@@ -264,6 +264,7 @@ async fn publish_then_refetch_over_http_surfaces_new_entry() {
             reactive: true,
             creates_delta: false,
             include_in_cascade_prompt: true,
+            event_type_on_emit: None,
             created_at: String::new(),
             superseded_by: None,
             supersede_reason: None,

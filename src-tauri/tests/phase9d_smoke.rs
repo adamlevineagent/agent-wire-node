@@ -1038,6 +1038,7 @@ async fn smoke_vocab_publish_enables_new_annotation_type_over_http() {
             reactive: true,
             creates_delta: false,
             include_in_cascade_prompt: true,
+            event_type_on_emit: None,
             created_at: String::new(),
             superseded_by: None,
             supersede_reason: None,
