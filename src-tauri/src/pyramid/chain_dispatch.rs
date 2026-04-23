@@ -23,8 +23,8 @@ use super::naming::headline_from_analysis;
 use super::step_context::{compute_prompt_hash, StepContext as CacheStepContext};
 use super::transform_runtime;
 use super::types::{
-    Correction, DebatePosition, DebateTopic, Decision, NodeShape, PyramidNode, RedTeamEntry,
-    Term, Topic, NODE_SHAPE_DEBATE,
+    Correction, DebatePosition, DebateTopic, Decision, MetaLayerTopic, NodeShape, PyramidNode,
+    RedTeamEntry, Term, Topic, NODE_SHAPE_DEBATE, NODE_SHAPE_META_LAYER,
 };
 use super::{OperationalConfig, Tier1Config};
 
@@ -623,6 +623,13 @@ const MECHANICAL_FUNCTIONS: &[&str] = &[
     "emit_debate_steward_invoked",
     "load_annotation_and_target",
     "append_annotation_to_debate_node",
+    // Post-build accretion v5 Phase 7b — meta_layer_oracle upgrade + synthesizer chain.
+    "emit_oracle_invoked",
+    "decide_crystallization",
+    "dispatch_synthesizer",
+    "emit_synthesizer_invoked",
+    "load_substrate_nodes",
+    "create_meta_layer_node",
 ];
 
 /// Post-build accretion v5 Phase 6b: hard ceiling on sub-chain recursion.
@@ -1465,6 +1472,812 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                 "shape_was_upgraded": shape_was_upgraded,
                 "debate_spawned_event_id": spawned_event_id,
                 "updated_payload": updated_payload_value,
+            }))
+        }
+        // ── Post-build accretion v5 Phase 7b: meta_layer_oracle + synthesizer ─
+        //
+        // The six primitives below back two starter chains:
+        //   * starter-meta-layer-oracle.yaml — decides whether a
+        //     purpose_shifted / gap_resolved event warrants a meta-layer,
+        //     and hands off to the synthesizer when it does.
+        //   * starter-synthesizer.yaml — produces the new meta-layer node.
+        //
+        // Scope-boundary discipline (feedback_loud_deferrals):
+        //   - `decide_crystallization` uses a three-arm heuristic today.
+        //     An UNKNOWN event_type returns should_crystallize=false WITH
+        //     a non-empty reasoning string — this is a deliberate,
+        //     documented skip path, not a silent stub. Phase 8+ replaces
+        //     the heuristic with an LLM judge.
+        //   - `create_meta_layer_node` never hardcodes LLM-output shape
+        //     constraints (feedback_pillar37_no_hedging); counts /
+        //     token budgets stay in YAML.
+        "emit_oracle_invoked" => {
+            // Chronicle trace for the meta_layer_oracle role's first step.
+            // Stamps source=chain, event_type=meta_layer_oracle_invoked.
+            // Metadata carries source_event_id (from the work item's
+            // observation_event_ids column), purpose_id (resolved via
+            // load_or_create_purpose), and the triggering event_type so
+            // downstream observers can reconstruct what fired this chain
+            // without joining back through work_items.
+            //
+            // Preserves the full input object as the step's output so
+            // subsequent steps still see work_item_id / target_id / layer —
+            // same preserve-through-output pattern as
+            // emit_debate_steward_invoked (Phase 7a).
+            let work_item_id = input
+                .get("work_item_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str());
+
+            // Resolve source_event_id + trigger event_type via the work
+            // item's observation_event_ids column. Best-effort: a missing
+            // work_item_id / missing ids column degrades to None (still
+            // useful for the meta_layer_crystallized flow which comes in
+            // with an envelope rather than a work item).
+            let (source_event_id, trigger_event_type): (Option<i64>, Option<String>) =
+                if let Some(wid) = work_item_id.as_deref() {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let obs_ids_json: Option<String> = conn_guard
+                        .query_row(
+                            "SELECT observation_event_ids FROM dadbear_work_items WHERE id = ?1",
+                            rusqlite::params![wid],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    let first_id: Option<i64> = obs_ids_json
+                        .as_deref()
+                        .and_then(|j| serde_json::from_str::<Vec<i64>>(j).ok())
+                        .and_then(|v| v.first().copied());
+                    let event_type: Option<String> = if let Some(eid) = first_id {
+                        conn_guard
+                            .query_row(
+                                "SELECT event_type FROM dadbear_observation_events WHERE id = ?1",
+                                rusqlite::params![eid],
+                                |row| row.get(0),
+                            )
+                            .ok()
+                    } else {
+                        None
+                    };
+                    drop(conn_guard);
+                    (first_id, event_type)
+                } else {
+                    (None, None)
+                };
+
+            // Resolve purpose_id. load_or_create_purpose is the canonical
+            // read; we use the reader connection here because a stock
+            // self-heal insert is still fine on the reader (rusqlite
+            // sqlite3_open_v2 shares the same file; `create_slug` has
+            // already run).
+            let purpose_id: Option<i64> = {
+                let conn_guard = ctx.db_reader.lock().await;
+                super::purpose::load_or_create_purpose(&conn_guard, &ctx.slug)
+                    .ok()
+                    .map(|p| p.id)
+            };
+
+            let mut meta = serde_json::Map::new();
+            if let Some(eid) = source_event_id {
+                meta.insert("source_event_id".to_string(), Value::from(eid));
+            }
+            if let Some(pid) = purpose_id {
+                meta.insert("purpose_id".to_string(), Value::from(pid));
+            }
+            if let Some(ref t) = trigger_event_type {
+                meta.insert("trigger_event_type".to_string(), Value::String(t.clone()));
+            }
+            if let Some(tid) = target_node_id {
+                meta.insert("target_node_id".to_string(), Value::String(tid.to_string()));
+            }
+            let metadata_json = if meta.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&Value::Object(meta))?)
+            };
+
+            info!(
+                "[mechanical] emit_oracle_invoked slug={} trigger={:?} purpose_id={:?} source_event_id={:?}",
+                ctx.slug, trigger_event_type, purpose_id, source_event_id,
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "meta_layer_oracle_invoked",
+                None,
+                None,
+                None,
+                None,
+                target_node_id,
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+
+            // Preserve input fields so threading keeps work_item_id / target
+            // / trigger_event_type alive for subsequent steps (decide_
+            // crystallization, dispatch_synthesizer).
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            if let Some(eid) = source_event_id {
+                out.entry("source_event_id".to_string())
+                    .or_insert(Value::from(eid));
+            }
+            if let Some(pid) = purpose_id {
+                out.entry("purpose_id".to_string())
+                    .or_insert(Value::from(pid));
+            }
+            if let Some(ref t) = trigger_event_type {
+                out.entry("trigger_event_type".to_string())
+                    .or_insert(Value::String(t.clone()));
+            }
+            Ok(Value::Object(out))
+        }
+        "decide_crystallization" => {
+            // Heuristic decision: given the slug's active purpose + the
+            // triggering event type, return
+            //   { should_crystallize, purpose_question, reasoning,
+            //     covered_substrate_nodes: [...] }
+            //
+            // Rules (Phase 7b MVP):
+            //   purpose_shifted → always crystallize. The shift is a
+            //     deliberate operator signal; covered_substrate_nodes
+            //     defaults to the current L0 node ids (substrate for the
+            //     new meta-layer is the whole lower pyramid).
+            //   gap_resolved    → crystallize iff the originating gap
+            //     carried candidate_resolutions (there IS substrate to
+            //     synthesize on). If no candidates, skip with reasoning.
+            //   else            → skip with reasoning naming the event.
+            //
+            // UNKNOWN event types return should_crystallize=false WITH a
+            // non-empty `reasoning` field — this is a DELIBERATE skip
+            // path, not a silent stub (feedback_loud_deferrals). Skipping
+            // on unknown events is the correct semantic: the oracle only
+            // acts on events it understands. Adding a new crystallization
+            // trigger requires extending this heuristic (or Phase 8+'s
+            // LLM judge) explicitly.
+            //
+            // Note on feedback_generalize_not_enumerate: if this match
+            // grows beyond ~3 arms, lift it to a vocab lookup where each
+            // role-triggering event_type carries a crystallization hint
+            // in its vocab entry. Today the three arms are load-bearing
+            // and well-understood; extracting prematurely would add
+            // indirection without benefit.
+            let trigger_event_type = input
+                .get("trigger_event_type")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            // Load active purpose for the slug so purpose_question (the
+            // LLM input) is rooted in the operator's declaration rather
+            // than a stand-in.
+            let purpose = {
+                let conn_guard = ctx.db_reader.lock().await;
+                super::purpose::load_or_create_purpose(&conn_guard, &ctx.slug)?
+            };
+            let purpose_question = purpose.purpose_text.clone();
+            let purpose_id = purpose.id;
+
+            // Resolve covered_substrate_nodes from whatever context we have.
+            // For purpose_shifted events there's no target, so we default
+            // to the slug's current L0 node ids. For gap_resolved the
+            // target_node_id IS the gap, and its candidate_resolutions
+            // (read via get_node_shape) determine whether there's
+            // substrate.
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            let (should_crystallize, reasoning, covered_substrate_nodes): (
+                bool,
+                String,
+                Vec<String>,
+            ) = match trigger_event_type.as_deref() {
+                Some("purpose_shifted") => {
+                    // Full L0 is the substrate for a purpose-shift meta-layer.
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let nodes = super::db::get_nodes_at_depth(&conn_guard, &ctx.slug, 0)
+                        .unwrap_or_default();
+                    drop(conn_guard);
+                    let ids: Vec<String> = nodes.into_iter().map(|n| n.id).collect();
+                    let reason = format!(
+                        "purpose_shifted is a deliberate operator signal; crystallizing a \
+                         meta-layer over L0 substrate ({} node(s)) aligned to the new purpose.",
+                        ids.len()
+                    );
+                    (true, reason, ids)
+                }
+                Some("gap_resolved") => {
+                    // Inspect the gap node's candidate_resolutions.
+                    let has_candidates = if let Some(tid) = target_node_id.as_deref() {
+                        let conn_guard = ctx.db_reader.lock().await;
+                        let view = super::db::get_node_shape(&conn_guard, &ctx.slug, tid).ok().flatten();
+                        drop(conn_guard);
+                        match view.and_then(|v| v.payload) {
+                            Some(super::types::ShapePayload::Gap(g)) => {
+                                !g.candidate_resolutions.is_empty()
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    };
+                    if has_candidates {
+                        let ids: Vec<String> = target_node_id
+                            .as_ref()
+                            .map(|t| vec![t.clone()])
+                            .unwrap_or_default();
+                        let reason = format!(
+                            "gap_resolved on '{}' carried candidate_resolutions — substrate \
+                             exists for a meta-layer synthesis.",
+                            target_node_id.as_deref().unwrap_or("<unknown>")
+                        );
+                        (true, reason, ids)
+                    } else {
+                        let reason = format!(
+                            "gap_resolved on '{}' has no candidate_resolutions — no substrate \
+                             to synthesize on; skipping crystallization.",
+                            target_node_id.as_deref().unwrap_or("<unknown>")
+                        );
+                        (false, reason, vec![])
+                    }
+                }
+                Some(other) => {
+                    let reason = format!(
+                        "event_type '{}' is not a crystallization trigger in the Phase 7b \
+                         heuristic — skipping. Extend decide_crystallization (or wait for \
+                         Phase 8+'s LLM judge) to opt new triggers in.",
+                        other
+                    );
+                    (false, reason, vec![])
+                }
+                None => {
+                    // No triggering event type visible — the chain was
+                    // invoked outside the normal observation-event path.
+                    // Skip with reasoning, don't raise: both the oracle's
+                    // own dispatch_synthesizer (when:-gated) and the
+                    // terminal log_and_complete still fire, CASing the
+                    // work item to `applied`.
+                    (
+                        false,
+                        "no trigger_event_type in input envelope — skipping crystallization \
+                         (chain invoked outside the observation-event path)."
+                            .to_string(),
+                        vec![],
+                    )
+                }
+            };
+
+            info!(
+                "[mechanical] decide_crystallization slug={} trigger={:?} should_crystallize={} \
+                 substrate_count={} purpose_id={}",
+                ctx.slug,
+                trigger_event_type,
+                should_crystallize,
+                covered_substrate_nodes.len(),
+                purpose_id,
+            );
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert(
+                "should_crystallize".to_string(),
+                Value::from(should_crystallize),
+            );
+            out.insert(
+                "purpose_question".to_string(),
+                Value::String(purpose_question),
+            );
+            out.insert("reasoning".to_string(), Value::String(reasoning));
+            out.insert(
+                "covered_substrate_nodes".to_string(),
+                Value::Array(
+                    covered_substrate_nodes
+                        .into_iter()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+            out.insert("purpose_id".to_string(), Value::from(purpose_id));
+            Ok(Value::Object(out))
+        }
+        "dispatch_synthesizer" => {
+            // Wrapper that reads the threaded decide_crystallization output
+            // from the step input and invokes starter-synthesizer as a
+            // sub-chain. Split from a raw `call_starter_chain` step so the
+            // oracle YAML doesn't rely on $ref resolution inside
+            // `step.input` (starter runner doesn't resolve those — see
+            // execute_chain_for_target's step.input handling).
+            //
+            // The when-guard on this step (`$decide_crystallization.should_crystallize == true`)
+            // prevents us from reaching this arm when the heuristic said
+            // skip, but we double-check defensively: a mis-authored chain
+            // that strips the guard would otherwise silently invoke the
+            // synthesizer on empty substrate.
+            let should = input
+                .get("should_crystallize")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !should {
+                return Err(anyhow!(
+                    "dispatch_synthesizer: reached with should_crystallize=false. The \
+                     oracle chain's when-guard `$decide_crystallization.should_crystallize == true` \
+                     was removed or bypassed. Restore the guard; this step must never fire \
+                     on a skip decision."
+                ));
+            }
+
+            let purpose_question = input
+                .get("purpose_question")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "dispatch_synthesizer: input missing `purpose_question` string — \
+                     decide_crystallization did not run or its output was stripped from threading."
+                ))?
+                .to_string();
+            let covered_substrate_nodes: Vec<Value> = input
+                .get("covered_substrate_nodes")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let parent_meta_layer_id = input
+                .get("parent_meta_layer_id")
+                .cloned()
+                .unwrap_or(Value::Null);
+
+            info!(
+                "[mechanical] dispatch_synthesizer slug={} substrate_count={} parent_meta_layer={:?}",
+                ctx.slug,
+                covered_substrate_nodes.len(),
+                parent_meta_layer_id,
+            );
+
+            // Build the call_starter_chain envelope and delegate. Same
+            // depth-guarded recursive path as the Phase 6b sub-chain
+            // primitive; we just shape the input here instead of requiring
+            // the YAML author to duplicate the envelope shape.
+            let sub_call_input = serde_json::json!({
+                "chain_id": "starter-synthesizer",
+                "input": {
+                    "purpose_question": purpose_question,
+                    "covered_substrate_nodes": covered_substrate_nodes,
+                    "parent_meta_layer_id": parent_meta_layer_id,
+                }
+            });
+
+            // Box::pin + recursion through the SAME mechanical dispatch
+            // ensures every invariant `call_starter_chain` enforces
+            // (depth guard, ctx.state presence, chain_loader load)
+            // applies here too.
+            let result: Value = Box::pin(dispatch_mechanical(
+                "call_starter_chain",
+                &sub_call_input,
+                ctx,
+            ))
+            .await?;
+            Ok(result)
+        }
+        "emit_synthesizer_invoked" => {
+            // Chronicle trace for the synthesizer role's first step.
+            // source=chain, event_type=synthesizer_invoked.
+            // Metadata carries the purpose_question + covered_substrate_nodes
+            // count so chronicle consumers can see WHY the synthesizer
+            // fired without re-reading the work item's observation_event_ids.
+            let purpose_question = input
+                .get("purpose_question")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let covered_substrate_nodes: Vec<String> = input
+                .get("covered_substrate_nodes")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let parent_meta_layer_id = input
+                .get("parent_meta_layer_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            let mut meta = serde_json::Map::new();
+            if let Some(ref q) = purpose_question {
+                meta.insert(
+                    "purpose_question".to_string(),
+                    Value::String(q.chars().take(200).collect()),
+                );
+            }
+            meta.insert(
+                "covered_substrate_node_count".to_string(),
+                Value::from(covered_substrate_nodes.len() as i64),
+            );
+            if let Some(ref p) = parent_meta_layer_id {
+                meta.insert(
+                    "parent_meta_layer_id".to_string(),
+                    Value::String(p.clone()),
+                );
+            }
+            let metadata_json = Some(serde_json::to_string(&Value::Object(meta))?);
+
+            info!(
+                "[mechanical] emit_synthesizer_invoked slug={} substrate_count={} parent={:?}",
+                ctx.slug,
+                covered_substrate_nodes.len(),
+                parent_meta_layer_id,
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "synthesizer_invoked",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            Ok(Value::Object(out))
+        }
+        "load_substrate_nodes" => {
+            // Batch-read each node in `covered_substrate_nodes` + the
+            // slug's active purpose. Returned object is the envelope the
+            // synthesize_meta_layer LLM step receives as its prompt
+            // context:
+            //   {
+            //     purpose_question, purpose_text, parent_meta_layer_id,
+            //     nodes: [{id, distilled, topics}, ...],
+            //     covered_substrate_nodes
+            //   }
+            // feedback_loud_deferrals: if a covered id doesn't resolve,
+            // we omit it from `nodes` but keep it in `covered_substrate_nodes`
+            // so the LLM is aware the caller listed it. A fully-empty
+            // resolution set raises — the synthesizer has nothing to say.
+            let purpose_question = input
+                .get("purpose_question")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "load_substrate_nodes: missing `purpose_question` in input"
+                ))?
+                .to_string();
+            let parent_meta_layer_id = input
+                .get("parent_meta_layer_id")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let covered_substrate_nodes: Vec<String> = input
+                .get("covered_substrate_nodes")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Resolve purpose_text via the slug's active purpose (not the
+            // input's purpose_question — purpose_question IS the purpose
+            // text today, but we separate the two fields so Phase 8+ can
+            // split the operator's declaration from a decomposed-question
+            // prompt without a schema change).
+            let (purpose_text, max_depth) = {
+                let conn_guard = ctx.db_reader.lock().await;
+                let p = super::purpose::load_or_create_purpose(&conn_guard, &ctx.slug)?;
+                // Find the max depth across covered substrate nodes while
+                // we're under the lock — create_meta_layer_node uses it to
+                // pin the new node's depth at parent_depth+1.
+                let mut max_depth: i64 = 0;
+                for id in &covered_substrate_nodes {
+                    let node = super::db::get_node(&conn_guard, &ctx.slug, id)?;
+                    if let Some(n) = node {
+                        if n.depth > max_depth {
+                            max_depth = n.depth;
+                        }
+                    }
+                }
+                (p.purpose_text, max_depth)
+            };
+
+            // Load each covered node's (distilled, topics) projection.
+            // We keep this read tight — no corrections / decisions —
+            // because the LLM prompt only needs distilled + topic labels.
+            let mut nodes_out: Vec<Value> = Vec::new();
+            {
+                let conn_guard = ctx.db_reader.lock().await;
+                for id in &covered_substrate_nodes {
+                    if let Some(node) = super::db::get_node(&conn_guard, &ctx.slug, id)? {
+                        let topics_json = serde_json::to_value(&node.topics).unwrap_or(Value::Null);
+                        nodes_out.push(serde_json::json!({
+                            "id": node.id,
+                            "distilled": node.distilled,
+                            "topics": topics_json,
+                        }));
+                    } else {
+                        warn!(
+                            "[mechanical] load_substrate_nodes slug={} id='{}' not found — \
+                             omitting from synthesis context (id will still appear in \
+                             covered_substrate_nodes so the LLM sees the ask).",
+                            ctx.slug, id
+                        );
+                    }
+                }
+                drop(conn_guard);
+            }
+
+            if nodes_out.is_empty() && !covered_substrate_nodes.is_empty() {
+                return Err(anyhow!(
+                    "load_substrate_nodes: none of the {} covered substrate node ids resolved \
+                     against slug '{}' — the synthesizer has no substrate to synthesize on. \
+                     This is almost certainly an upstream bug in decide_crystallization or \
+                     the caller's envelope, not an expected empty state.",
+                    covered_substrate_nodes.len(),
+                    ctx.slug,
+                ));
+            }
+
+            info!(
+                "[mechanical] load_substrate_nodes slug={} covered={} resolved={} max_depth={}",
+                ctx.slug,
+                covered_substrate_nodes.len(),
+                nodes_out.len(),
+                max_depth,
+            );
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert(
+                "purpose_question".to_string(),
+                Value::String(purpose_question),
+            );
+            out.insert("purpose_text".to_string(), Value::String(purpose_text));
+            out.insert(
+                "parent_meta_layer_id".to_string(),
+                parent_meta_layer_id,
+            );
+            out.insert("nodes".to_string(), Value::Array(nodes_out));
+            out.insert(
+                "covered_substrate_nodes".to_string(),
+                Value::Array(
+                    covered_substrate_nodes
+                        .into_iter()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+            out.insert("_max_substrate_depth".to_string(), Value::from(max_depth));
+            Ok(Value::Object(out))
+        }
+        "create_meta_layer_node" => {
+            // Writer. Given the LLM step's output (headline, distilled,
+            // topics, covered_substrate_node_ids), construct a new
+            // MetaLayer node in pyramid_nodes and emit
+            // meta_layer_crystallized.
+            //
+            // Threading contract: the synthesize_meta_layer step's output
+            // is threaded in as `input`, BUT we also need context the LLM
+            // step didn't echo (purpose_question, parent_meta_layer_id,
+            // _max_substrate_depth). The starter runner re-merges only
+            // target_node_id + slug per-step, so we pull the missing
+            // context through the step_outputs accumulator via the
+            // threaded input's own fields when the caller preserved them,
+            // and we additionally tolerate them being provided inline in
+            // the input envelope by a future direct-call path.
+            //
+            // Two-column invariant: node_shape is stored as the canonical
+            // string (NODE_SHAPE_META_LAYER) + shape_payload_json carries
+            // a JSON-serialized MetaLayerTopic. pyramid_nodes uses a
+            // parallel (topics, corrections, ...) column set too; we
+            // leave those NULL/empty for meta-layer nodes — readers
+            // consult shape_payload_json via get_node_shape() for
+            // MetaLayer content.
+            let headline = input
+                .get("headline")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "create_meta_layer_node: missing `headline` string in input — \
+                     synthesize_meta_layer LLM step did not produce the required field."
+                ))?
+                .to_string();
+            let distilled = input
+                .get("distilled")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "create_meta_layer_node: missing `distilled` string in input"
+                ))?
+                .to_string();
+
+            // covered_substrate_node_ids comes from the LLM step (the
+            // audit trail: which substrate nodes actually shaped the
+            // synthesis). If missing, fall back to covered_substrate_nodes
+            // from the earlier load step so the payload never records an
+            // empty substrate list against a non-trivial meta-layer.
+            let covered_substrate_nodes: Vec<String> = input
+                .get("covered_substrate_node_ids")
+                .and_then(|v| v.as_array())
+                .or_else(|| input.get("covered_substrate_nodes").and_then(|v| v.as_array()))
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Pull purpose_question + parent_meta_layer_id. These fields
+            // come in via the threaded envelope when upstream steps echo
+            // their input, but the default chain_executor threading
+            // replaces `current` with each step's OUTPUT — and the LLM
+            // synthesize step's output only carries the structured
+            // response fields, not the load step's input. So self-resolve
+            // purpose_question from the slug's active purpose when it's
+            // not explicitly set in the input envelope. Matches the
+            // purpose.load_or_create_purpose contract used elsewhere in
+            // the oracle / synthesizer chains.
+            //
+            // purpose_id similarly falls through to a fresh read when
+            // the caller didn't stamp one — keeps the MetaLayer
+            // chronicle event's metadata tight to the active purpose id.
+            let purpose_question = match input.get("purpose_question").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let p = super::purpose::load_or_create_purpose(&conn_guard, &ctx.slug)?;
+                    p.purpose_text
+                }
+            };
+            let parent_meta_layer_id = input
+                .get("parent_meta_layer_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let purpose_id = match input.get("purpose_id").and_then(|v| v.as_i64()) {
+                Some(id) => Some(id),
+                None => {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    super::purpose::load_or_create_purpose(&conn_guard, &ctx.slug)
+                        .ok()
+                        .map(|p| p.id)
+                }
+            };
+
+            // Compute the new node's depth. Meta layers sit above their
+            // substrate, so depth = max(covered_substrate_depths) + 1.
+            // Prefer the _max_substrate_depth hint from load_substrate_nodes
+            // (single query, correct); fall back to a fresh read when the
+            // hint is absent (direct-call path).
+            let parent_depth: i64 = match input.get("_max_substrate_depth").and_then(|v| v.as_i64())
+            {
+                Some(d) => d,
+                None => {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let mut max_depth: i64 = 0;
+                    for id in &covered_substrate_nodes {
+                        if let Some(n) = super::db::get_node(&conn_guard, &ctx.slug, id)? {
+                            if n.depth > max_depth {
+                                max_depth = n.depth;
+                            }
+                        }
+                    }
+                    drop(conn_guard);
+                    max_depth
+                }
+            };
+            let node_depth = parent_depth + 1;
+
+            // New node id. Format: L{depth}-ML-{short-uuid}. The short-
+            // uuid tail keeps the id human-readable in chronicle traces
+            // while guaranteeing uniqueness across concurrent oracle runs
+            // on the same slug.
+            let short_uuid: String = uuid::Uuid::new_v4()
+                .to_string()
+                .chars()
+                .take(8)
+                .collect();
+            let node_id = format!("L{}-ML-{}", node_depth, short_uuid);
+
+            let payload = MetaLayerTopic {
+                purpose_question: purpose_question.clone(),
+                parent_meta_layer_id: parent_meta_layer_id.clone(),
+                covered_substrate_nodes: covered_substrate_nodes.clone(),
+            };
+            let payload_json = serde_json::to_string(&payload)?;
+
+            info!(
+                "[mechanical] create_meta_layer_node slug={} id={} depth={} covered={} parent_ml={:?}",
+                ctx.slug,
+                node_id,
+                node_depth,
+                covered_substrate_nodes.len(),
+                parent_meta_layer_id,
+            );
+
+            let conn_guard = ctx.db_writer.lock().await;
+
+            // Scaffolding-default column set matches what test seeds use.
+            // `topics` / `corrections` / `decisions` / `terms` / `dead_ends`
+            // are NULL-safe: MetaLayer content lives in shape_payload_json.
+            conn_guard.execute(
+                "INSERT INTO pyramid_nodes
+                    (id, slug, depth, headline, distilled, self_prompt,
+                     build_version, node_shape, shape_payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, '', 1, ?6, ?7)",
+                rusqlite::params![
+                    node_id,
+                    ctx.slug,
+                    node_depth,
+                    headline,
+                    distilled,
+                    NODE_SHAPE_META_LAYER,
+                    payload_json,
+                ],
+            )
+            .map_err(|e| anyhow!(
+                "create_meta_layer_node: failed to insert pyramid_nodes row \
+                 (slug={} id={} depth={}): {}",
+                ctx.slug, node_id, node_depth, e,
+            ))?;
+
+            // Emit meta_layer_crystallized observation event. Metadata
+            // carries the fields the downstream compiler's role_for_event
+            // arm will key off (+ purpose_id for chronicle drill-down).
+            let meta = serde_json::json!({
+                "meta_layer_node_id": node_id,
+                "covered_substrate_node_ids": covered_substrate_nodes,
+                "purpose_question": purpose_question,
+                "purpose_id": purpose_id,
+                "parent_meta_layer_id": parent_meta_layer_id,
+                "depth": node_depth,
+            })
+            .to_string();
+            let crystallized_event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "meta_layer_crystallized",
+                None,
+                None,
+                None,
+                None,
+                Some(&node_id),
+                Some(node_depth),
+                Some(&meta),
+            )?;
+            drop(conn_guard);
+
+            Ok(serde_json::json!({
+                "created": true,
+                "meta_layer_node_id": node_id,
+                "depth": node_depth,
+                "covered_substrate_node_ids": covered_substrate_nodes,
+                "crystallized_event_id": crystallized_event_id,
             }))
         }
         // ── Post-build accretion v5 Phase 6b: sub-chain invocation ──────────

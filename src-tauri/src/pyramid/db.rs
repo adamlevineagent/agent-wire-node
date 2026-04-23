@@ -23826,11 +23826,34 @@ mod phase5_post_build_tests {
     // load the chain directly → execute_chain_for_target on the target →
     // CAS work item to `applied`. This demonstrates the entire Phase 5
     // pipeline: role_bound work item now reaches `applied`, not `failed`.
+    //
+    // Phase 7b update: the oracle chain now actually dispatches the
+    // starter-synthesizer sub-chain on purpose_shifted, which runs an LLM
+    // step. We mock the LLM via mockito (reusing Phase 6 test infrastructure)
+    // so the end-to-end path remains observable without a live provider.
 
     #[tokio::test]
     async fn role_bound_work_item_reaches_applied_via_execute_chain_for_target() {
         use crate::pyramid::dadbear_compiler;
         use crate::pyramid::purpose;
+
+        // Mock the LLM: the synthesizer's synthesize_meta_layer step returns
+        // a valid JSON object matching the response_schema.
+        let mut server = mockito::Server::new_async().await;
+        let mock_content = r#"{
+            "headline":"Phase 5 end-to-end coverage",
+            "distilled":"Purpose shift drives oracle-gated meta-layer synthesis over current L0 substrate.",
+            "topics":[],
+            "covered_substrate_node_ids":[]
+        }"#;
+        let _m = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(super::phase6_post_build_tests::openrouter_body(mock_content))
+            .expect_at_least(0)
+            .create_async()
+            .await;
 
         let conn = Connection::open_in_memory().unwrap();
         init_pyramid_db(&conn).unwrap();
@@ -23880,11 +23903,14 @@ mod phase5_post_build_tests {
         assert_eq!(resolved_chain_id.as_deref(), Some("starter-meta-layer-oracle"));
         assert_eq!(state_col, "compiled");
 
-        // 3. Construct a pyramid state reusing the same DB. Directly load
-        //    + run the bound chain + CAS the work item to `applied`. This
-        //    mirrors what the supervisor arm does at
+        // 3. Construct a pyramid state reusing the same DB with the mocked
+        //    LLM config wired in so the synthesizer's LLM step (Phase 7b)
+        //    resolves against mockito rather than a live provider. Directly
+        //    load + run the bound chain + CAS the work item to `applied`.
+        //    This mirrors what the supervisor arm does at
         //    dadbear_supervisor.rs:755 (role_bound arm).
-        let state = test_pyramid_state(conn);
+        let config = super::phase6_post_build_tests::mocked_llm_config(server.url()).await;
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(conn, config);
         let chain = chain_loader::load_chain_by_id(
             &resolved_chain_id.as_deref().unwrap(),
             &state.chains_dir,
@@ -24275,7 +24301,11 @@ mod phase6_post_build_tests {
     /// Phase 6b: returns `Arc<PyramidState>` so the updated
     /// `execute_chain_for_target(&Arc<PyramidState>, ...)` signature
     /// works without per-test-site Arc-wrapping.
-    fn pyramid_state_with_llm_config(
+    ///
+    /// Phase 7b: `pub(super)` so phase5's e2e test (which now exercises the
+    /// oracle → synthesizer path end-to-end) can reuse the same mocked
+    /// provider wiring without duplicating it.
+    pub(super) fn pyramid_state_with_llm_config(
         conn: Connection,
         config: crate::pyramid::llm::LlmConfig,
     ) -> Arc<crate::pyramid::PyramidState> {
@@ -24332,7 +24362,9 @@ mod phase6_post_build_tests {
     /// The server must mock `POST /chat/completions` with a JSON OpenRouter
     /// envelope (`choices[0].message.content`) whose content is whatever
     /// the test wants the judge step to produce.
-    async fn mocked_llm_config(base_url: String) -> crate::pyramid::llm::LlmConfig {
+    ///
+    /// Phase 7b: `pub(super)` so phase5 + phase7b tests can share wiring.
+    pub(super) async fn mocked_llm_config(base_url: String) -> crate::pyramid::llm::LlmConfig {
         use crate::pyramid::credentials::CredentialStore;
         use crate::pyramid::dispatch_policy::{
             BuildCoordinationConfig, DispatchPolicy, EscalationConfig, MatchConfig,
@@ -24427,7 +24459,9 @@ mod phase6_post_build_tests {
 
     /// Build a minimal OpenRouter-shape chat/completions response body
     /// that returns `content` as the assistant message.
-    fn openrouter_body(content: &str) -> String {
+    ///
+    /// Phase 7b: `pub(super)` so phase5 + phase7b tests can share wiring.
+    pub(super) fn openrouter_body(content: &str) -> String {
         let escaped = serde_json::to_string(content).unwrap();
         format!(
             r#"{{
@@ -28211,3 +28245,621 @@ mod phase7a_post_build_tests {
     }
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Post-build accretion v5 Phase 7b: meta_layer_oracle upgrade + starter-synthesizer
+//
+// Covers 7b-1 through 7b-7:
+//   * starter-meta-layer-oracle.yaml upgraded from 1-step MVP to 4-step
+//     decide + dispatch + complete.
+//   * starter-synthesizer.yaml ships with load + LLM + writer steps.
+//   * decide_crystallization heuristic behavior (purpose_shifted always,
+//     gap_resolved if candidates, else skip).
+//   * create_meta_layer_node writes a MetaLayer-shaped node + emits
+//     meta_layer_crystallized.
+//   * Crown jewel: purpose_shifted → oracle → synthesizer → meta-layer
+//     node created end-to-end with a mocked LLM.
+//
+// Shares the phase6 mockito wiring helpers via `pub(super)` so the test
+// surface stays lean.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod phase7b_post_build_tests {
+    use super::*;
+    use crate::pyramid::chain_engine::{ChainDefaults, ChainDefinition};
+    use crate::pyramid::types::{ContentType, ShapePayload, NODE_SHAPE_META_LAYER};
+    use crate::pyramid::{chain_executor, chain_loader, dadbear_compiler, vocab_entries};
+    use rusqlite::Connection;
+    use serde_json::json;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Same process-wide lock pattern phase7a uses. Tests that exercise
+    /// `dadbear_compiler::run_compilation_for_slug` end-to-end hit the
+    /// process-wide vocab cache (in `vocab_entries`), which would otherwise
+    /// race with sibling-module tests running in parallel. We serialize
+    /// ourselves behind this lock AND invalidate the cache in `fresh_db()`
+    /// so each test faults from its own in-memory DB.
+    fn test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn chains_dir_path() -> PathBuf {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        PathBuf::from(manifest).parent().unwrap().join("chains")
+    }
+
+    fn fresh_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        conn
+    }
+
+    // ── 7b-7.1: oracle YAML parses as the canonical 4-step chain ───────────
+
+    #[test]
+    fn oracle_upgraded_chain_has_four_steps() {
+        let chains_dir = chains_dir_path();
+        let loaded = chain_loader::load_chain_by_id("starter-meta-layer-oracle", &chains_dir)
+            .expect("starter-meta-layer-oracle must load");
+        assert_eq!(loaded.id, "starter-meta-layer-oracle");
+        assert_eq!(
+            loaded.steps.len(),
+            4,
+            "Phase 7b oracle has 4 steps: emit → decide → dispatch → complete"
+        );
+        let names: Vec<&str> = loaded.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "emit_oracle_invoked",
+                "decide_crystallization",
+                "dispatch_synthesizer",
+                "oracle_log_and_complete",
+            ],
+            "canonical 4-step shape"
+        );
+        // All four are mechanical in Phase 7b (LLM judge comes in Phase 8+).
+        for step in &loaded.steps {
+            assert!(
+                step.mechanical,
+                "Phase 7b oracle ships mechanical-only; step '{}' was LLM",
+                step.name
+            );
+            assert!(step.rust_function.is_some());
+        }
+        // The dispatch step carries a when-guard on decide_crystallization.
+        let dispatch_step = loaded
+            .steps
+            .iter()
+            .find(|s| s.name == "dispatch_synthesizer")
+            .unwrap();
+        assert!(
+            dispatch_step.when.is_some(),
+            "dispatch_synthesizer must carry a when-guard"
+        );
+    }
+
+    // ── 7b-7.2: synthesizer YAML parses with expected step set ─────────────
+
+    #[test]
+    fn synthesizer_chain_loads_and_has_expected_steps() {
+        let chains_dir = chains_dir_path();
+        let loaded = chain_loader::load_chain_by_id("starter-synthesizer", &chains_dir)
+            .expect("starter-synthesizer must load");
+        assert_eq!(loaded.id, "starter-synthesizer");
+        let names: Vec<&str> = loaded.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "emit_synthesizer_invoked",
+                "load_substrate_nodes",
+                "synthesize_meta_layer",
+                "create_meta_layer_node",
+            ],
+            "canonical 4-step synthesizer shape"
+        );
+        // The synthesize step is LLM (primitive synthesize); others mechanical.
+        let synth_step = loaded
+            .steps
+            .iter()
+            .find(|s| s.name == "synthesize_meta_layer")
+            .unwrap();
+        assert!(!synth_step.mechanical, "synthesize step must be LLM");
+        assert_eq!(synth_step.primitive, "synthesize");
+        assert!(
+            synth_step.response_schema.is_some(),
+            "synthesize step must declare a structured response_schema"
+        );
+        // Structured-output keys live in the schema, so no numeric tuning
+        // in Rust — feedback_pillar37_no_hedging check on the prompt itself.
+    }
+
+    // ── 7b-7.3: decide_crystallization heuristic — purpose_shifted ─────────
+
+    #[tokio::test]
+    async fn decide_crystallization_heuristic_returns_true_for_purpose_shifted() {
+        let _lock = test_lock();
+        // Drive through the chain runner so the dispatch ctx + slug
+        // context are the same the oracle uses in production. Seed an L0
+        // node so covered_substrate_nodes has a non-empty value.
+        let conn = fresh_db();
+        create_slug(&conn, "p7b1", &ContentType::Code, "/tmp/p7b1").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L0-A', 'p7b1', 0, 'L0 A', 'L0 A distilled', '', 1)",
+            [],
+        )
+        .unwrap();
+
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+
+        // Build a minimal 1-step chain that invokes decide_crystallization
+        // directly with a synthetic trigger_event_type. Matches the real
+        // oracle call site: the dispatch_ctx is built by
+        // execute_chain_for_target from the same PyramidState + slug.
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7b-decide-only".into(),
+            name: "Phase 7b decide-only".into(),
+            description: "decide_crystallization heuristic test".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "phase7b-test".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".into(),
+            },
+            steps: vec![crate::pyramid::chain_engine::ChainStep {
+                name: "decide".into(),
+                primitive: "custom".into(),
+                mechanical: true,
+                rust_function: Some("decide_crystallization".into()),
+                ..Default::default()
+            }],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+        let out = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7b1",
+            None,
+            json!({
+                "trigger_event_type": "purpose_shifted",
+            }),
+        )
+        .await
+        .expect("decide chain must run");
+        assert_eq!(
+            out["should_crystallize"], json!(true),
+            "purpose_shifted must always crystallize"
+        );
+        assert!(out["reasoning"].as_str().unwrap().contains("purpose_shifted"));
+        assert!(
+            out["covered_substrate_nodes"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
+            "covered_substrate_nodes must resolve the slug's L0 ids"
+        );
+    }
+
+    // ── 7b-7.4: decide_crystallization — unknown event skips ───────────────
+
+    #[tokio::test]
+    async fn decide_crystallization_returns_false_for_unknown_event_type() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7b2", &ContentType::Code, "/tmp/p7b2").unwrap();
+
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7b-decide-only-2".into(),
+            name: "Phase 7b decide-only 2".into(),
+            description: "unknown trigger test".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "phase7b-test".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".into(),
+            },
+            steps: vec![crate::pyramid::chain_engine::ChainStep {
+                name: "decide".into(),
+                primitive: "custom".into(),
+                mechanical: true,
+                rust_function: Some("decide_crystallization".into()),
+                ..Default::default()
+            }],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+        let out = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7b2",
+            None,
+            json!({
+                "trigger_event_type": "foo_not_a_real_event",
+            }),
+        )
+        .await
+        .expect("decide chain must run");
+        assert_eq!(
+            out["should_crystallize"], json!(false),
+            "unknown event_type must skip (not silent — reasoning is populated)"
+        );
+        let reasoning = out["reasoning"].as_str().unwrap_or("");
+        assert!(
+            !reasoning.is_empty(),
+            "loud-deferral: skip path must name the reason"
+        );
+        assert!(
+            reasoning.contains("foo_not_a_real_event"),
+            "reasoning should cite the unknown event_type, got: {reasoning}"
+        );
+        assert_eq!(
+            out["covered_substrate_nodes"], json!([]),
+            "skip → empty substrate list"
+        );
+    }
+
+    // ── 7b-7.5: create_meta_layer_node writes a correct row ────────────────
+
+    #[tokio::test]
+    async fn create_meta_layer_node_writes_node_with_correct_shape_and_payload() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7b3", &ContentType::Code, "/tmp/p7b3").unwrap();
+        // Seed two L0 substrate nodes so depth math is non-trivial (max 0 → ML at depth 1).
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L0-A', 'p7b3', 0, 'A', 'distilled A', '', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L0-B', 'p7b3', 0, 'B', 'distilled B', '', 1)",
+            [],
+        )
+        .unwrap();
+
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7b-create-only".into(),
+            name: "Phase 7b create-only".into(),
+            description: "create_meta_layer_node writer test".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "phase7b-test".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".into(),
+            },
+            steps: vec![crate::pyramid::chain_engine::ChainStep {
+                name: "create".into(),
+                primitive: "custom".into(),
+                mechanical: true,
+                rust_function: Some("create_meta_layer_node".into()),
+                ..Default::default()
+            }],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+        let out = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7b3",
+            None,
+            json!({
+                "headline": "Test meta layer",
+                "distilled": "Synthesis over L0-A and L0-B aligned to test purpose.",
+                "covered_substrate_node_ids": ["L0-A", "L0-B"],
+                "purpose_question": "What is the test purpose?",
+                "parent_meta_layer_id": null,
+                "purpose_id": 1,
+            }),
+        )
+        .await
+        .expect("create_meta_layer_node must run");
+        assert_eq!(out["created"], json!(true));
+        let ml_id = out["meta_layer_node_id"].as_str().unwrap().to_string();
+        assert_eq!(out["depth"], json!(1), "meta-layer sits at parent_depth+1");
+
+        // Read back the row and validate the shape + typed payload.
+        let writer = state.writer.lock().await;
+        let view = get_node_shape(&writer, "p7b3", &ml_id)
+            .expect("shape read must succeed")
+            .expect("node must exist");
+        assert_eq!(
+            view.shape.as_str(),
+            NODE_SHAPE_META_LAYER,
+            "node_shape column stores canonical meta_layer string"
+        );
+        match view.payload {
+            Some(ShapePayload::MetaLayer(m)) => {
+                assert_eq!(m.purpose_question, "What is the test purpose?");
+                assert_eq!(m.parent_meta_layer_id, None);
+                assert_eq!(m.covered_substrate_nodes, vec!["L0-A", "L0-B"]);
+            }
+            other => panic!("expected MetaLayer payload, got {other:?}"),
+        }
+        // Headline + distilled surface through the scaffolding columns.
+        let (headline, distilled, depth): (String, String, i64) = writer
+            .query_row(
+                "SELECT headline, distilled, depth FROM pyramid_nodes
+                  WHERE slug = 'p7b3' AND id = ?1",
+                rusqlite::params![ml_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(headline, "Test meta layer");
+        assert!(distilled.contains("Synthesis"));
+        assert_eq!(depth, 1);
+    }
+
+    // ── 7b-7.6: create_meta_layer_node emits the crystallized event ────────
+
+    #[tokio::test]
+    async fn create_meta_layer_node_emits_meta_layer_crystallized_event() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7b4", &ContentType::Code, "/tmp/p7b4").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L0-X', 'p7b4', 0, 'X', 'distilled X', '', 1)",
+            [],
+        )
+        .unwrap();
+
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7b-create-emit".into(),
+            name: "Phase 7b create + emit".into(),
+            description: "create_meta_layer_node event test".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "phase7b-test".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".into(),
+            },
+            steps: vec![crate::pyramid::chain_engine::ChainStep {
+                name: "create".into(),
+                primitive: "custom".into(),
+                mechanical: true,
+                rust_function: Some("create_meta_layer_node".into()),
+                ..Default::default()
+            }],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+        chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p7b4",
+            None,
+            json!({
+                "headline": "Emit test",
+                "distilled": "Substrate-rooted synthesis.",
+                "covered_substrate_node_ids": ["L0-X"],
+                "purpose_question": "Emit-path purpose question.",
+                "parent_meta_layer_id": null,
+                "purpose_id": 42,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let writer = state.writer.lock().await;
+        let (count, metadata): (i64, Option<String>) = writer
+            .query_row(
+                "SELECT COUNT(*), MAX(metadata_json) FROM dadbear_observation_events
+                  WHERE slug = 'p7b4' AND event_type = 'meta_layer_crystallized'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "exactly one meta_layer_crystallized event");
+        let meta = metadata.expect("metadata must be populated");
+        assert!(meta.contains("Emit-path purpose question"), "{meta}");
+        assert!(meta.contains("L0-X"), "{meta}");
+        assert!(
+            meta.contains("purpose_id")
+                && (meta.contains(":42") || meta.contains(": 42")),
+            "purpose_id must ride in metadata: {meta}"
+        );
+    }
+
+    // ── 7b-7.7: CROWN JEWEL — purpose_shifted → oracle → synthesizer e2e ──
+
+    #[tokio::test]
+    async fn purpose_shifted_flows_through_oracle_to_synthesizer_end_to_end() {
+        use crate::pyramid::purpose;
+        let _lock = test_lock();
+
+        // Mock the LLM so the synthesizer's synthesize_meta_layer step
+        // gets a well-formed structured response.
+        let mut server = mockito::Server::new_async().await;
+        let mock_content = r#"{
+            "headline":"Crown-jewel synthesis",
+            "distilled":"Oracle fired, synthesizer ran, meta-layer crystallized over L0 substrate.",
+            "topics":[
+                {"topic":"coverage","anchor_nodes":["L0-crown-A"]}
+            ],
+            "covered_substrate_node_ids":["L0-crown-A"]
+        }"#;
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(super::phase6_post_build_tests::openrouter_body(mock_content))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let conn = fresh_db();
+        create_slug(&conn, "p7bcj", &ContentType::Code, "/tmp/p7bcj").unwrap();
+        // Seed an L0 substrate node so decide_crystallization has a
+        // non-empty covered_substrate_nodes to pass to the synthesizer.
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L0-crown-A', 'p7bcj', 0, 'Crown A', 'Crown A distilled', '', 1)",
+            [],
+        )
+        .unwrap();
+
+        // Drive the full production path: supersede_purpose fires a
+        // purpose_shifted observation event; the compiler routes it to
+        // meta_layer_oracle via role_for_event + genesis binding.
+        purpose::supersede_purpose(
+            &conn,
+            "p7bcj",
+            "Phase 7b crown-jewel purpose — drive oracle through synthesizer.",
+            Some("phase7b-crown-jewel"),
+            None,
+            None,
+        )
+        .expect("supersede_purpose must succeed");
+
+        let result = dadbear_compiler::run_compilation_for_slug(&conn, "p7bcj", None, None)
+            .expect("compile tick must succeed");
+        assert!(
+            result.items_compiled >= 1,
+            "at least one work_item from purpose_shifted; got {}",
+            result.items_compiled
+        );
+        let (wi_id, resolved_chain_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT id, resolved_chain_id FROM dadbear_work_items
+                  WHERE slug = 'p7bcj' AND step_name = 'oracle_purpose_shift'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved_chain_id.as_deref(),
+            Some("starter-meta-layer-oracle")
+        );
+
+        // Execute the oracle chain with the mocked LLM in scope.
+        let config = super::phase6_post_build_tests::mocked_llm_config(server.url()).await;
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(conn, config);
+        let chain = chain_loader::load_chain_by_id(
+            "starter-meta-layer-oracle",
+            &state.chains_dir,
+        )
+        .unwrap();
+        let inputs = json!({
+            "work_item_id": wi_id,
+            "step_name": "oracle_purpose_shift",
+            "target_id": serde_json::Value::Null,
+            "layer": 0,
+        });
+        chain_executor::execute_chain_for_target(&state, &chain, "p7bcj", None, inputs)
+            .await
+            .expect("oracle chain must complete end-to-end");
+
+        // Mock must have been hit at least once (proves the synthesizer
+        // LLM step actually fired).
+        mock.assert_async().await;
+
+        // A MetaLayer node was written.
+        let writer = state.writer.lock().await;
+        let (ml_id, ml_shape, ml_depth): (String, String, i64) = writer
+            .query_row(
+                "SELECT id, node_shape, depth FROM pyramid_nodes
+                  WHERE slug = 'p7bcj' AND node_shape = 'meta_layer'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("a meta-layer node must exist after the crown-jewel path");
+        assert_eq!(ml_shape, NODE_SHAPE_META_LAYER);
+        assert_eq!(ml_depth, 1, "meta-layer sits above L0 substrate");
+
+        // The payload deserialises as MetaLayerTopic.
+        let view = get_node_shape(&writer, "p7bcj", &ml_id).unwrap().unwrap();
+        match view.payload {
+            Some(ShapePayload::MetaLayer(m)) => {
+                assert_eq!(
+                    m.purpose_question,
+                    "Phase 7b crown-jewel purpose — drive oracle through synthesizer."
+                );
+                assert_eq!(m.parent_meta_layer_id, None);
+            }
+            other => panic!("expected MetaLayer payload, got {other:?}"),
+        }
+
+        // Three chronicle events prove the chain hit each role in order:
+        // meta_layer_oracle_invoked, synthesizer_invoked, meta_layer_crystallized.
+        for event_type in ["meta_layer_oracle_invoked", "synthesizer_invoked", "meta_layer_crystallized"] {
+            let count: i64 = writer
+                .query_row(
+                    "SELECT COUNT(*) FROM dadbear_observation_events
+                      WHERE slug = 'p7bcj' AND event_type = ?1",
+                    rusqlite::params![event_type],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "exactly one '{event_type}' event must have landed"
+            );
+        }
+
+        // CAS the oracle work item to applied to mirror the supervisor arm.
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let rows = writer
+            .execute(
+                "UPDATE dadbear_work_items
+                    SET state = 'applied', state_changed_at = ?1, applied_at = ?1
+                  WHERE id = ?2 AND state = 'compiled'",
+                rusqlite::params![now, wi_id],
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "applied CAS must succeed");
+        let final_state: String = writer
+            .query_row(
+                "SELECT state FROM dadbear_work_items WHERE id = ?1",
+                rusqlite::params![wi_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(final_state, "applied");
+    }
+}

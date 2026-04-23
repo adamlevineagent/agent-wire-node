@@ -1,0 +1,91 @@
+schema_version: 1
+id: starter-synthesizer
+name: Synthesizer — produce meta-layer node from substrate (Phase 7b)
+description: >
+  Starter binding for the `synthesizer` role. Invoked either:
+    - by starter-meta-layer-oracle (as a sub-chain) when a purpose_shifted
+      or gap_resolved event warrants crystallization, OR
+    - directly by the supervisor's role_bound dispatch when a
+      meta_layer_crystallized event fires (recursive meta-layer
+      construction — see dadbear_compiler::role_for_event).
+
+  Input envelope (threaded through the starter runner):
+      {
+        "purpose_question": "<what question this meta-layer answers>",
+        "covered_substrate_nodes": ["<node_id>", ...],
+        "parent_meta_layer_id": null | "<existing meta-layer id>"
+      }
+
+  Steps:
+    1. emit_synthesizer_invoked — chronicle trace.
+    2. load_substrate_nodes — batch-read the covered substrate nodes'
+       distilled text + topics, plus the active purpose text for the slug.
+       Returns an augmented envelope threaded to the LLM step.
+    3. synthesize_meta_layer — LLM synthesis (primitive: synthesize) with a
+       structured response_schema so the writer sees a known shape.
+       `instruction: $prompts/starter/synthesize_meta_layer.md`,
+       `model_tier: mid`.
+    4. create_meta_layer_node — mechanical writer. INSERTs a new node into
+       pyramid_nodes with node_shape='meta_layer' + a MetaLayerTopic
+       payload, pins headline + distilled from the LLM step, and emits a
+       `meta_layer_crystallized` observation event.
+
+  Temperature, token counts, and other knobs that shape LLM output live in
+  YAML (not Rust) per feedback_pillar37_no_hedging.
+content_type: code
+version: "1.0.0"
+author: post-build-accretion-v5
+
+defaults:
+  model_tier: mid
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  - name: emit_synthesizer_invoked
+    primitive: custom
+    mechanical: true
+    rust_function: emit_synthesizer_invoked
+
+  - name: load_substrate_nodes
+    primitive: custom
+    mechanical: true
+    rust_function: load_substrate_nodes
+
+  - name: synthesize_meta_layer
+    primitive: synthesize
+    instruction: $prompts/starter/synthesize_meta_layer.md
+    model_tier: mid
+    response_schema:
+      type: object
+      additionalProperties: false
+      required: [headline, distilled, topics, covered_substrate_node_ids]
+      properties:
+        headline:
+          type: string
+        distilled:
+          type: string
+        topics:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [topic, anchor_nodes]
+            properties:
+              topic:
+                type: string
+              anchor_nodes:
+                type: array
+                items:
+                  type: string
+        covered_substrate_node_ids:
+          type: array
+          items:
+            type: string
+
+  - name: create_meta_layer_node
+    primitive: custom
+    mechanical: true
+    rust_function: create_meta_layer_node
+
+post_build: []

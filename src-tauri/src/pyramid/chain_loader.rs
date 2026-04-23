@@ -410,6 +410,15 @@ pub fn ensure_default_chains(
             "starter-debate-steward.yaml",
             include_str!("../../../chains/defaults/starter/starter-debate-steward.yaml"),
         ),
+        // Post-build accretion v5 Phase 7b: synthesizer role handler.
+        // Invoked by starter-meta-layer-oracle as a sub-chain when
+        // purpose_shifted / gap_resolved triggers a crystallization, AND
+        // bound directly on meta_layer_crystallized events for recursive
+        // meta-layer construction (dadbear_compiler::role_for_event).
+        (
+            "starter-synthesizer.yaml",
+            include_str!("../../../chains/defaults/starter/starter-synthesizer.yaml"),
+        ),
     ];
     for (filename, content) in starter_chains {
         let path = chains_dir.join("defaults").join("starter").join(filename);
@@ -466,6 +475,12 @@ pub fn ensure_default_chains(
         (
             "reconciler.md",
             include_str!("../../../chains/prompts/starter/reconciler.md"),
+        ),
+        // Post-build accretion v5 Phase 7b: synthesizer prompt consumed
+        // by starter-synthesizer.yaml's synthesize_meta_layer LLM step.
+        (
+            "synthesize_meta_layer.md",
+            include_str!("../../../chains/prompts/starter/synthesize_meta_layer.md"),
         ),
     ];
     for (filename, content) in starter_prompts {
