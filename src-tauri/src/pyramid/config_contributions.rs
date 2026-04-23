@@ -2097,6 +2097,23 @@ pub fn sync_config_to_operational_with_registry(
             }
             trigger_dadbear_config_changed(bus, contribution.slug.as_deref());
         }
+        other if other.starts_with(crate::pyramid::vocab_entries::VOCAB_SCHEMA_PREFIX) => {
+            // Post-build accretion v5 Phase 6c-A: vocabulary entries
+            // (annotation types, node shapes, role names) use the
+            // compound schema_type `vocabulary_entry:<kind>:<name>`.
+            // They have no operational table — consumers read from
+            // the contribution store directly via
+            // `vocab_entries::list_vocabulary` /
+            // `get_vocabulary_entry`. The publish / supersede paths
+            // emit `vocabulary_published` / `vocabulary_superseded`
+            // observation events at the write site, not here, so
+            // sync is a cache-invalidate + no-op.
+            crate::pyramid::vocab_entries::invalidate_cache();
+            debug!(
+                schema_type = %other,
+                "vocabulary_entry synced; no operational table — cache invalidated"
+            );
+        }
         other => {
             // Per the spec: unknown types are a bug — fail loudly
             // rather than silently skipping sync.

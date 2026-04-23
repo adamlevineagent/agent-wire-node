@@ -2671,6 +2671,24 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         );
     }
 
+    // ── Post-build accretion v5 Phase 6c-A: vocabulary genesis seed ─────
+    //
+    // Seed the 25 genesis vocabulary entries (11 annotation types,
+    // 4 node shapes, 10 role names) as `vocabulary_entry:<kind>:<name>`
+    // rows in `pyramid_config_contributions`. Idempotent via existence
+    // check on the compound schema_type — existing active rows are
+    // left alone; only missing entries are inserted.
+    //
+    // Runs AFTER the Phase 5 role-binding backfill so the role_binding
+    // table's state matches what the vocab registry enumerates. Same
+    // error-handling shape as the sibling backfill calls: loud log on
+    // failure, don't abort init (vocab can re-seed on next boot).
+    if let Err(e) = super::vocab_entries::seed_genesis_vocabulary(conn) {
+        tracing::error!(
+            "post-build-v5 Phase 6c-A vocabulary genesis seed failed during init_pyramid_db: {e}"
+        );
+    }
+
     Ok(())
 }
 
@@ -25830,6 +25848,397 @@ mod phase6b_post_build_tests {
                      that would mean the sub-chain wasn't actually dispatched: {out}",
                 );
             }
+        }
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Post-build accretion v5 Phase 6c-A tests.
+// See .lab/architecture/agent-wire-node-post-build-plan-v5.md Phase 6c-A.
+//
+// Vocabulary contribution storage + read API + genesis seed.
+// Kills hardcoded AnnotationType / NodeShape / role_name vocabularies —
+// they're now contribution-driven registry entries.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod phase6c_a_post_build_tests {
+    use super::*;
+    use crate::pyramid::vocab_entries::{
+        self, VocabEntry, VOCAB_KIND_ANNOTATION_TYPE, VOCAB_KIND_NODE_SHAPE, VOCAB_KIND_ROLE_NAME,
+    };
+    use rusqlite::Connection;
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        // Invalidate cache so tests that run in-parallel see fresh state
+        // from each test's own in-memory DB.
+        vocab_entries::invalidate_cache();
+        conn
+    }
+
+    fn count_active(conn: &Connection, vocab_kind: &str) -> usize {
+        let prefix = format!("vocabulary_entry:{vocab_kind}:");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_config_contributions
+                  WHERE schema_type LIKE ?1 || '%'
+                    AND status = 'active'
+                    AND superseded_by_id IS NULL",
+                rusqlite::params![prefix],
+                |r| r.get(0),
+            )
+            .unwrap();
+        count as usize
+    }
+
+    #[test]
+    fn genesis_seeds_11_annotation_types_4_shapes_10_roles() {
+        let conn = mem_conn();
+        // 11 annotation types: observation, correction, question, friction,
+        // idea, era, transition, health_check, directory, steel_man, red_team.
+        assert_eq!(count_active(&conn, "annotation_type"), 11);
+        // 4 node shapes: scaffolding, debate, meta_layer, gap.
+        assert_eq!(count_active(&conn, "node_shape"), 4);
+        // 11 role names: 10 from Phase 1 GENESIS_BINDINGS + cascade_handler.
+        // The genesis seed table includes cascade_handler even though Phase 1's
+        // GENESIS_BINDINGS doesn't (it's separately seeded per-slug by create_slug).
+        assert_eq!(count_active(&conn, "role_name"), 11);
+    }
+
+    #[test]
+    fn genesis_is_idempotent() {
+        let conn = mem_conn();
+        let before_at = count_active(&conn, "annotation_type");
+        let before_ns = count_active(&conn, "node_shape");
+        let before_rn = count_active(&conn, "role_name");
+        // Second init_pyramid_db call (against same connection) must not
+        // duplicate any entries.
+        init_pyramid_db(&conn).unwrap();
+        // Invalidate cache since we just wrote through the seeder again.
+        vocab_entries::invalidate_cache();
+        assert_eq!(count_active(&conn, "annotation_type"), before_at);
+        assert_eq!(count_active(&conn, "node_shape"), before_ns);
+        assert_eq!(count_active(&conn, "role_name"), before_rn);
+    }
+
+    #[test]
+    fn list_vocabulary_returns_active_only() {
+        let mut conn = mem_conn();
+        // Publish a custom annotation_type entry.
+        let custom = VocabEntry {
+            id: 0, // ignored by publish
+            vocab_kind: VOCAB_KIND_ANNOTATION_TYPE.to_string(),
+            name: "custom_verb".to_string(),
+            description: "Custom test verb".to_string(),
+            handler_chain_id: Some("starter-custom".to_string()),
+            reactive: true,
+            created_at: String::new(),
+            superseded_by: None,
+            supersede_reason: None,
+        };
+        vocab_entries::publish_vocabulary_entry(&conn, &custom).unwrap();
+
+        let before = vocab_entries::list_vocabulary(&conn, VOCAB_KIND_ANNOTATION_TYPE).unwrap();
+        assert!(
+            before.iter().any(|e| e.name == "custom_verb"),
+            "custom_verb should be active after publish"
+        );
+
+        // Supersede with a new description — old row becomes superseded.
+        vocab_entries::supersede_vocabulary_entry(
+            &mut conn,
+            VOCAB_KIND_ANNOTATION_TYPE,
+            "custom_verb",
+            Some("Updated description"),
+            None,
+            None,
+            Some("tightening wording"),
+        )
+        .unwrap();
+
+        let after = vocab_entries::list_vocabulary(&conn, VOCAB_KIND_ANNOTATION_TYPE).unwrap();
+        // Exactly one active entry with this name.
+        let hits: Vec<_> = after.iter().filter(|e| e.name == "custom_verb").collect();
+        assert_eq!(hits.len(), 1, "exactly one active custom_verb after supersede");
+        assert_eq!(hits[0].description, "Updated description");
+    }
+
+    #[test]
+    fn supersede_dance_preserves_chain() {
+        let mut conn = mem_conn();
+        let custom = VocabEntry {
+            id: 0,
+            vocab_kind: VOCAB_KIND_NODE_SHAPE.to_string(),
+            name: "custom_shape".to_string(),
+            description: "v1".to_string(),
+            handler_chain_id: None,
+            reactive: false,
+            created_at: String::new(),
+            superseded_by: None,
+            supersede_reason: None,
+        };
+        let v1 = vocab_entries::publish_vocabulary_entry(&conn, &custom).unwrap();
+        assert!(v1.id > 0);
+
+        let v2 = vocab_entries::supersede_vocabulary_entry(
+            &mut conn,
+            VOCAB_KIND_NODE_SHAPE,
+            "custom_shape",
+            Some("v2"),
+            None,
+            None,
+            Some("v1→v2"),
+        )
+        .unwrap();
+        assert!(v2.id > v1.id, "successor id must be higher");
+
+        // Walk: prior row (v1) should now have `superseded_by` = v2.id.
+        let prior_row: (i64, Option<String>, String) = conn
+            .query_row(
+                "SELECT id, superseded_by_id, status FROM pyramid_config_contributions
+                  WHERE id = ?1",
+                rusqlite::params![v1.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(prior_row.0, v1.id);
+        assert!(
+            prior_row.1.is_some(),
+            "prior row must have superseded_by_id set"
+        );
+        assert_eq!(prior_row.2, "superseded");
+
+        // Successor (v2) should be the active row.
+        let successor_status: String = conn
+            .query_row(
+                "SELECT status FROM pyramid_config_contributions WHERE id = ?1",
+                rusqlite::params![v2.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(successor_status, "active");
+    }
+
+    #[test]
+    fn publish_new_annotation_type_emits_vocabulary_published() {
+        let conn = mem_conn();
+
+        // Count vocab_published events BEFORE (genesis seed emits many).
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE source = 'vocabulary' AND event_type = 'vocabulary_published'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(before >= 25, "genesis seed must emit >= 25 published events (got {before})");
+
+        let custom = VocabEntry {
+            id: 0,
+            vocab_kind: VOCAB_KIND_ANNOTATION_TYPE.to_string(),
+            name: "event_test_verb".to_string(),
+            description: "Event check".to_string(),
+            handler_chain_id: Some("starter-event-test".to_string()),
+            reactive: true,
+            created_at: String::new(),
+            superseded_by: None,
+            supersede_reason: None,
+        };
+        vocab_entries::publish_vocabulary_entry(&conn, &custom).unwrap();
+
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE source = 'vocabulary' AND event_type = 'vocabulary_published'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, before + 1, "publish must emit exactly one event");
+
+        // Inspect the most-recent event — metadata must carry the right fields.
+        let metadata_json: String = conn
+            .query_row(
+                "SELECT metadata_json FROM dadbear_observation_events
+                  WHERE source = 'vocabulary' AND event_type = 'vocabulary_published'
+                  ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_json).unwrap();
+        assert_eq!(metadata["vocab_kind"], "annotation_type");
+        assert_eq!(metadata["name"], "event_test_verb");
+        assert_eq!(metadata["handler_chain_id"], "starter-event-test");
+        assert_eq!(metadata["reactive"], true);
+    }
+
+    #[test]
+    fn supersede_emits_vocabulary_superseded() {
+        let mut conn = mem_conn();
+        let custom = VocabEntry {
+            id: 0,
+            vocab_kind: VOCAB_KIND_ROLE_NAME.to_string(),
+            name: "supersede_test_role".to_string(),
+            description: "r1".to_string(),
+            handler_chain_id: Some("starter-role".to_string()),
+            reactive: false,
+            created_at: String::new(),
+            superseded_by: None,
+            supersede_reason: None,
+        };
+        vocab_entries::publish_vocabulary_entry(&conn, &custom).unwrap();
+
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE source = 'vocabulary' AND event_type = 'vocabulary_superseded'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        vocab_entries::supersede_vocabulary_entry(
+            &mut conn,
+            VOCAB_KIND_ROLE_NAME,
+            "supersede_test_role",
+            Some("r2"),
+            None,
+            None,
+            Some("role refinement"),
+        )
+        .unwrap();
+
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE source = 'vocabulary' AND event_type = 'vocabulary_superseded'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, before + 1, "supersede must emit a vocabulary_superseded event");
+    }
+
+    #[test]
+    fn cache_invalidates_on_publish() {
+        let conn = mem_conn();
+        // Prime the cache by a list call.
+        let before = vocab_entries::list_vocabulary(&conn, VOCAB_KIND_ANNOTATION_TYPE).unwrap();
+        let had_new_entry_before = before.iter().any(|e| e.name == "cache_probe");
+        assert!(!had_new_entry_before, "cache_probe should not exist before publish");
+
+        let custom = VocabEntry {
+            id: 0,
+            vocab_kind: VOCAB_KIND_ANNOTATION_TYPE.to_string(),
+            name: "cache_probe".to_string(),
+            description: "Cache invalidation test".to_string(),
+            handler_chain_id: None,
+            reactive: false,
+            created_at: String::new(),
+            superseded_by: None,
+            supersede_reason: None,
+        };
+        vocab_entries::publish_vocabulary_entry(&conn, &custom).unwrap();
+
+        // Re-read — must see the new entry (cache must have been
+        // invalidated + re-populated).
+        let after = vocab_entries::list_vocabulary(&conn, VOCAB_KIND_ANNOTATION_TYPE).unwrap();
+        assert!(
+            after.iter().any(|e| e.name == "cache_probe"),
+            "cache_probe must appear after publish — cache invalidation broken"
+        );
+    }
+
+    #[test]
+    fn http_get_vocabulary_annotation_type_returns_11_genesis_entries() {
+        let conn = mem_conn();
+        let response =
+            vocab_entries::handle_get_vocabulary(&conn, VOCAB_KIND_ANNOTATION_TYPE).unwrap();
+        assert_eq!(response.vocab_kind, "annotation_type");
+        assert_eq!(
+            response.entries.len(),
+            11,
+            "genesis ships 11 annotation types, got {}",
+            response.entries.len()
+        );
+        // Spot-check: observation is non-reactive, steel_man is reactive.
+        let observation = response
+            .entries
+            .iter()
+            .find(|e| e.name == "observation")
+            .expect("observation must exist in genesis");
+        assert_eq!(observation.reactive, false);
+        assert!(observation.handler_chain_id.is_none());
+
+        let steel_man = response
+            .entries
+            .iter()
+            .find(|e| e.name == "steel_man")
+            .expect("steel_man must exist in genesis");
+        assert_eq!(steel_man.reactive, true);
+        assert_eq!(
+            steel_man.handler_chain_id.as_deref(),
+            Some("starter-debate-steward")
+        );
+    }
+
+    #[test]
+    fn steel_man_and_red_team_genesis_entries_are_reactive_with_debate_steward_handler() {
+        let conn = mem_conn();
+        for name in &["steel_man", "red_team"] {
+            let entry = vocab_entries::get_vocabulary_entry(
+                &conn,
+                VOCAB_KIND_ANNOTATION_TYPE,
+                name,
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name} must exist in genesis"));
+            assert_eq!(
+                entry.reactive, true,
+                "{name} must be reactive (Phase 7 dispatches annotation_reacted)"
+            );
+            assert_eq!(
+                entry.handler_chain_id.as_deref(),
+                Some("starter-debate-steward"),
+                "{name} must bind to starter-debate-steward"
+            );
+        }
+    }
+
+    #[test]
+    fn role_name_genesis_handler_chains_match_phase1_genesis_bindings() {
+        let conn = mem_conn();
+        // Phase 1's GENESIS_BINDINGS: (role_name, starter_chain_id). The
+        // Phase 6c-A registry must mirror these exactly (plus include
+        // cascade_handler, which Phase 1 seeds separately).
+        let expected: &[(&str, &str)] = &[
+            ("accretion_handler", "starter-accretion-handler"),
+            ("reconciler", "starter-reconciler"),
+            ("evidence_tester", "starter-evidence-tester"),
+            ("judge", "starter-judge"),
+            ("debate_steward", "starter-debate-steward"),
+            ("meta_layer_oracle", "starter-meta-layer-oracle"),
+            ("synthesizer", "starter-synthesizer"),
+            ("gap_dispatcher", "starter-gap-dispatcher"),
+            ("sweep", "starter-sweep"),
+            ("authorize_question", "starter-authorize-question"),
+            ("cascade_handler", "starter-cascade-judge-gated"),
+        ];
+        for (name, expected_chain) in expected {
+            let entry = vocab_entries::get_vocabulary_entry(&conn, VOCAB_KIND_ROLE_NAME, name)
+                .unwrap()
+                .unwrap_or_else(|| panic!("role {name} missing from genesis"));
+            assert_eq!(
+                entry.handler_chain_id.as_deref(),
+                Some(*expected_chain),
+                "role {name}: expected handler={expected_chain}, got {:?}",
+                entry.handler_chain_id
+            );
         }
     }
 }

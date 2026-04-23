@@ -2757,10 +2757,51 @@ pub fn pyramid_routes(
     let rm = rm_d.or(rm_c).unify().boxed();
     let top33 = top32.or(rm).unify().boxed();
 
+    // ── Post-build accretion v5 Phase 6c-A: vocabulary registry read ──
+    //
+    // GET /vocabulary/:vocab_kind — public read, NO AUTH. Exposes the
+    // contribution-driven vocabulary registry (annotation_type,
+    // node_shape, role_name) so MCP + frontend (6c-C) can discover
+    // valid values at runtime instead of hardcoding them. Top-level
+    // path (not under /pyramid/) because vocab is global, not
+    // per-slug.
+    //
+    // Distinct from the existing `/pyramid/:slug/vocabulary/*`
+    // routes (those expose the per-slug apex vocabulary catalog from
+    // `vocabulary.rs` — completely different concept).
+    let vocab_registry = route!(warp::path("vocabulary")
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::any().map({
+            let state = state.clone();
+            move || state.clone()
+        }))
+        .and_then(handle_vocab_registry_list));
+
+    let top34 = top33.or(vocab_registry).unify().boxed();
+
     // public_html is now mounted separately at the server level so it can
     // get a permissive CORS filter (the desktop API allowlist would block
     // form POSTs from the tunnel host).
-    top33
+    top34
+}
+
+/// GET /vocabulary/:vocab_kind — public read of the vocabulary
+/// registry. Returns active entries only. Zero auth required.
+/// Phase 6c-A.
+async fn handle_vocab_registry_list(
+    vocab_kind: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match crate::pyramid::vocab_entries::handle_get_vocabulary(&conn, &vocab_kind) {
+        Ok(response) => Ok(json_ok(&response)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
 }
 
 /// Mount the post-agents-retro `/p/` web surface routes. These are

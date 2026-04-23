@@ -110,6 +110,8 @@ pub mod vine;
 pub mod vine_composition;
 pub mod vine_prompts;
 pub mod vocabulary;
+pub mod vocab_entries;
+pub mod vocab_genesis;
 pub mod walker_cache;
 pub mod walker_readiness;
 pub mod watcher;

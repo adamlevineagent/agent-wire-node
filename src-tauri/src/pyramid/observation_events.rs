@@ -23,6 +23,11 @@ use rusqlite::Connection;
 ///                                                //             etc.) via the
 ///                                                //             emit_cascade_handler_invoked
 ///                                                //             mechanical primitive
+///             | "vocabulary"                     // v5 Phase 6c-A: vocab entry publish /
+///                                                //                 supersede (annotation
+///                                                //                 types, node shapes,
+///                                                //                 role names — stored as
+///                                                //                 contribution subtype)
 /// - `event_type`: "file_modified" | "file_created" | "file_deleted" | "file_renamed"
 ///                  | "cascade_stale" | "edge_stale" | "evidence_growth" | "vine_stale"
 ///                  | "targeted_stale" | "full_sweep"
@@ -36,6 +41,8 @@ use rusqlite::Connection;
 ///                  | "meta_layer_crystallized"       // v5: meta-layer emerged
 ///                  | "binding_unresolved"            // v5: observability for RAISE
 ///                  | "cascade_handler_invoked"       // v5: chronicle cascade trace
+///                  | "vocabulary_published"          // v5 6c-A: vocab entry publish
+///                  | "vocabulary_superseded"         // v5 6c-A: vocab entry supersede
 /// - `source_path`: filesystem path for the observation source (NULL for internal events)
 /// - `file_path`: filesystem path of the affected file (NULL for internal events)
 /// - `content_hash`: SHA-256 of new content (NULL for deletes/internal)
