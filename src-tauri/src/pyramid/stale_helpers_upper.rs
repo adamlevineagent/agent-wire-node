@@ -19,6 +19,9 @@ use super::llm::{
 };
 use super::naming::{clean_headline, headline_for_node};
 use super::stale_engine::batch_items;
+use super::step_context::make_step_ctx_from_llm_config;
+// StepContext + compute_prompt_hash kept for test fixtures (line ~4566).
+#[allow(unused_imports)]
 use super::step_context::{compute_prompt_hash, StepContext};
 use super::types::{
     ChangeManifest, ChildSwap, ConnectionCheckResult, ConnectionResult, ManifestValidationError,
@@ -596,22 +599,31 @@ pub async fn dispatch_node_stale_check(
         [{\"node_id\": \"...\", \"stale\": true, \"reason\": \"one sentence\"}]",
     );
 
-    // W3c: legacy clone_with_model_override removed. Model threads via
-    // LlmCallOptions.model_override below.
-    let ctx = StepContext::new(
-        batch[0].slug.clone(),
-        format!("stale-node-batch-{}", batch[0].slug),
-        "node_stale_check",
-        "stale_check",
-        batch[0].layer as i64,
-        None,
-        db_path.to_string(),
-    )
-    .with_model_resolution("stale_local", model.to_string())
-    .with_prompt_hash(compute_prompt_hash(system_prompt));
+    // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+    let stale_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+    let ctx = match &stale_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "node_stale_check",
+                "stale_check",
+                batch[0].layer as i64,
+                None,
+                system_prompt,
+                "stale_l0",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
     let llm_resp = call_model_unified_with_options_and_ctx(
         base_config,
-        Some(&ctx),
+        ctx.as_ref(),
         system_prompt,
         &user_prompt,
         0.1,
@@ -930,22 +942,31 @@ pub async fn dispatch_connection_check(
             [{\"connection_id\": \"...\", \"still_valid\": true, \"reason\": \"one sentence\"}]",
         );
 
-        // W3c: legacy clone_with_model_override removed. Model threads
-        // via LlmCallOptions.model_override below.
-        let ctx = StepContext::new(
-            slug.to_string(),
-            format!("stale-connection-check-{}", slug),
-            "connection_stale_check",
-            "stale_check",
-            old_depth as i64,
-            None,
-            db_path.to_string(),
-        )
-        .with_model_resolution("stale_local", model.to_string())
-        .with_prompt_hash(compute_prompt_hash(system_prompt));
+        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+        let stale_resolved = base_config
+            .provider_registry
+            .as_ref()
+            .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+        let ctx = match &stale_resolved {
+            Some(resolved) => {
+                make_step_ctx_from_llm_config(
+                    base_config,
+                    "connection_stale_check",
+                    "stale_check",
+                    old_depth as i64,
+                    None,
+                    system_prompt,
+                    "stale_l0",
+                    Some(model),
+                    Some(&resolved.provider.id),
+                )
+                .await
+            }
+            None => None,
+        };
         let llm_resp = call_model_unified_with_options_and_ctx(
             base_config,
-            Some(&ctx),
+            ctx.as_ref(),
             system_prompt,
             &user_prompt,
             0.1,
@@ -1278,22 +1299,31 @@ pub async fn dispatch_edge_stale_check(
             truncate_str(&edge_data.new_content, 500),
         );
 
-        // W3c: legacy clone_with_model_override removed. Model threads
-        // via LlmCallOptions.model_override below.
-        let ctx = StepContext::new(
-            mutation.slug.clone(),
-            format!("stale-edge-check-{}", mutation.slug),
-            "edge_stale_check",
-            "stale_check",
-            mutation.layer as i64,
-            None,
-            db_path.to_string(),
-        )
-        .with_model_resolution("stale_local", model.to_string())
-        .with_prompt_hash(compute_prompt_hash(system_prompt));
+        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+        let stale_resolved = base_config
+            .provider_registry
+            .as_ref()
+            .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+        let ctx = match &stale_resolved {
+            Some(resolved) => {
+                make_step_ctx_from_llm_config(
+                    base_config,
+                    "edge_stale_check",
+                    "stale_check",
+                    mutation.layer as i64,
+                    None,
+                    system_prompt,
+                    "stale_l0",
+                    Some(model),
+                    Some(&resolved.provider.id),
+                )
+                .await
+            }
+            None => None,
+        };
         let llm_resp = call_model_unified_with_options_and_ctx(
             base_config,
-            Some(&ctx),
+            ctx.as_ref(),
             system_prompt,
             &user_prompt,
             0.1,
@@ -1354,20 +1384,31 @@ pub async fn dispatch_edge_stale_check(
                 truncate_str(&edge_data.new_content, 300),
             );
 
-            let re_eval_ctx = StepContext::new(
-                mutation.slug.clone(),
-                format!("stale-edge-reeval-{}", mutation.slug),
-                "edge_stale_reeval",
-                "stale_check",
-                mutation.layer as i64,
-                None,
-                db_path.to_string(),
-            )
-            .with_model_resolution("stale_local", model.to_string())
-            .with_prompt_hash(compute_prompt_hash(system_prompt));
+            // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+            let re_eval_resolved = base_config
+                .provider_registry
+                .as_ref()
+                .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+            let re_eval_ctx = match &re_eval_resolved {
+                Some(resolved) => {
+                    make_step_ctx_from_llm_config(
+                        base_config,
+                        "edge_stale_reeval",
+                        "stale_check",
+                        mutation.layer as i64,
+                        None,
+                        system_prompt,
+                        "stale_l0",
+                        Some(model),
+                        Some(&resolved.provider.id),
+                    )
+                    .await
+                }
+                None => None,
+            };
             let re_eval_llm_resp = call_model_unified_with_options_and_ctx(
                 base_config,
-                Some(&re_eval_ctx),
+                re_eval_ctx.as_ref(),
                 system_prompt,
                 &re_eval_prompt,
                 0.3,
@@ -2172,22 +2213,42 @@ pub async fn execute_supersession(
     // single node, not a chunk. `primitive: "manifest_generation"`
     // distinguishes it from extract/synthesis steps in the cache's
     // lookup indices.
+    // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+    // slot="stale_upper" (Rust rename of "stale_remote"; first-class walker
+    // tier → xiaomi/mimo-v2.5-pro 1M-context per bundled seed). Change-
+    // manifest generation can be large (upper-layer context), which is why
+    // mimo-v2.5-pro's 1M window is the right pick.
     let cache_build_id = format!(
         "stale-{}-{}",
         resolved_node_id, node_ctx.current_build_version
     );
-    let prompt_hash = super::step_context::compute_prompt_hash(&load_change_manifest_prompt_body());
-    let cache_ctx = super::step_context::StepContext::new(
+    let scoped_config = base_config.clone_with_cache_access(
         slug.to_string(),
         cache_build_id,
-        "change_manifest",
-        "manifest_generation",
-        node_ctx.depth,
+        std::sync::Arc::<str>::from(db_path.to_string()),
         None,
-        db_path.to_string(),
-    )
-    .with_model_resolution("stale_remote", model)
-    .with_prompt_hash(prompt_hash);
+    );
+    let stale_resolved = scoped_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("stale_upper", None, None, None).ok());
+    let cache_ctx = match &stale_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                &scoped_config,
+                "change_manifest",
+                "manifest_generation",
+                node_ctx.depth,
+                None,
+                &load_change_manifest_prompt_body(),
+                "stale_upper",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
 
     // Ask the LLM for a targeted change manifest. On LLM failure the spec's
     // "Manifest Validation → Failure handling" section is unambiguous:
@@ -2205,7 +2266,7 @@ pub async fn execute_supersession(
         base_config,
         model,
         reason_tag,
-        Some(&cache_ctx),
+        cache_ctx.as_ref(),
     )
     .await
     {
@@ -3084,22 +3145,31 @@ async fn execute_supersession_identity_change(
         )
     };
 
-    // W3c: legacy clone_with_model_override removed; model threads via
-    // LlmCallOptions.model_override.
-    let supersession_ctx = StepContext::new(
-        slug.to_string(),
-        format!("supersession-apply-{}", slug),
-        "supersession_apply",
-        "supersession",
-        node_data.depth,
-        None,
-        db_path.to_string(),
-    )
-    .with_model_resolution("stale_local", model.to_string())
-    .with_prompt_hash(compute_prompt_hash(system_prompt));
+    // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+    let supersession_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+    let supersession_ctx = match &supersession_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "supersession_apply",
+                "supersession",
+                node_data.depth,
+                None,
+                system_prompt,
+                "stale_l0",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
     let supersession_llm_resp = call_model_unified_with_options_and_ctx(
         base_config,
-        Some(&supersession_ctx),
+        supersession_ctx.as_ref(),
         system_prompt,
         &user_prompt,
         0.2,
