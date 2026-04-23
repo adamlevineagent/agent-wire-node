@@ -31,6 +31,11 @@ use rusqlite::Connection;
 ///             | "scheduler"                      // Phase 9b: pyramid_scheduler periodic
 ///                                                //           tick + volume-threshold
 ///                                                //           annotation hook
+///             | "operator"                       // v5 Phase 9c-3-3: events emitted in
+///                                                //                  response to an
+///                                                //                  explicit operator
+///                                                //                  HTTP action
+///                                                //                  (debate_reopened)
 /// - `event_type`: "file_modified" | "file_created" | "file_deleted" | "file_renamed"
 ///                  | "cascade_stale" | "edge_stale" | "evidence_growth" | "vine_stale"
 ///                  | "targeted_stale" | "full_sweep"
@@ -38,6 +43,14 @@ use rusqlite::Connection;
 ///                  | "annotation_reacted"            // v5: vote event
 ///                  | "debate_spawned"                // v5: silent->named
 ///                  | "debate_collapsed"              // v5: debate resolved
+///                  | "debate_reopened"               // v5 Phase 9c-3-3: operator-driven
+///                                                     //                  re-open of a
+///                                                     //                  collapsed debate;
+///                                                     //                  bypasses the
+///                                                     //                  post-collapse
+///                                                     //                  cooldown on the
+///                                                     //                  next annotation
+///                                                     //                  append
 ///                  | "gap_detected"                  // v5: gap surfaced
 ///                  | "gap_resolved"                  // v5: gap closed
 ///                  | "purpose_shifted"               // v5: purpose superseded
@@ -175,6 +188,57 @@ pub fn emit_debate_collapsed(
         slug,
         "chain",
         "debate_collapsed",
+        None, None, None, None,
+        Some(debate_node_id),
+        layer,
+        Some(&metadata),
+    )
+}
+
+/// v5 Phase 9c-3-3: emit a `debate_reopened` observation event.
+///
+/// An operator-driven re-open of a previously-collapsed debate. The
+/// post-collapse append-race cooldown in
+/// `append_annotation_to_debate_node` (Phase 9c-2-3) blocks the legitimate
+/// re-open case because it can't tell the difference between a late-
+/// arriving steel_man (race) and an operator's deliberate decision to
+/// re-open. This event is the explicit re-open signal: on the next
+/// steel_man / red_team annotation append, the cooldown check observes
+/// that the most-recent `debate_reopened` event is newer than the most-
+/// recent `debate_collapsed` event, and the append proceeds.
+///
+/// Pure observability otherwise — `map_event_to_primitive` maps this to
+/// `log_only` and `role_for_event` returns None so the emitted event
+/// does not itself kick off a chain.
+///
+/// `reason`: short human-readable explanation (e.g.
+/// "new evidence surfaced", "collapse was premature").
+/// `reopened_by`: operator / agent identifier.
+/// `referenced_collapse_event_id`: id of the `debate_collapsed` event
+/// this re-open targets, for chronicle traceability. Optional because
+/// operator callers may not have the id to hand; the cooldown-bypass
+/// check uses timestamp ordering regardless.
+pub fn emit_debate_reopened(
+    conn: &Connection,
+    slug: &str,
+    debate_node_id: &str,
+    layer: Option<i64>,
+    reason: &str,
+    reopened_by: &str,
+    referenced_collapse_event_id: Option<i64>,
+) -> Result<i64> {
+    let metadata = serde_json::json!({
+        "debate_node_id": debate_node_id,
+        "reason": reason,
+        "reopened_by": reopened_by,
+        "referenced_collapse_event_id": referenced_collapse_event_id,
+    })
+    .to_string();
+    write_observation_event(
+        conn,
+        slug,
+        "operator",
+        "debate_reopened",
         None, None, None, None,
         Some(debate_node_id),
         layer,

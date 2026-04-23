@@ -36336,6 +36336,181 @@ mod phase9c3_post_build_tests {
         );
     }
 
+    // ── 9c-3-3.1: emit_debate_reopened writes chronicle row ─────────────
+    #[test]
+    fn emit_debate_reopened_writes_observation_event() {
+        let _lock = test_lock();
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        create_slug(&conn, "p9c3r", &ContentType::Code, "/tmp/p9c3r").unwrap();
+
+        let event_id = crate::pyramid::observation_events::emit_debate_reopened(
+            &conn,
+            "p9c3r",
+            "L1-NODE",
+            Some(1),
+            "new evidence",
+            "alice",
+            Some(42),
+        )
+        .unwrap();
+        assert!(event_id > 0);
+
+        let (event_type, source, metadata_blob): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT event_type, source, metadata_json
+                   FROM dadbear_observation_events
+                  WHERE id = ?1",
+                rusqlite::params![event_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(event_type, "debate_reopened");
+        assert_eq!(source, "operator");
+        let metadata: serde_json::Value =
+            serde_json::from_str(&metadata_blob.unwrap()).unwrap();
+        assert_eq!(metadata["debate_node_id"], serde_json::json!("L1-NODE"));
+        assert_eq!(metadata["reason"], serde_json::json!("new evidence"));
+        assert_eq!(metadata["reopened_by"], serde_json::json!("alice"));
+        assert_eq!(
+            metadata["referenced_collapse_event_id"],
+            serde_json::json!(42)
+        );
+    }
+
+    // ── 9c-3-3.3: reopen event AFTER collapse → cooldown SQL check sees it ─
+    // The cooldown-bypass logic lives in append_annotation_to_debate_node
+    // and is implicit: SELECT id of latest reopen > latest collapse id.
+    // Verify the query returns the expected row when a reopen follows.
+    #[test]
+    fn reopen_after_collapse_bypasses_cooldown_query() {
+        use crate::pyramid::observation_events;
+        let _lock = test_lock();
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        create_slug(&conn, "p9c33a", &ContentType::Code, "/tmp/p9c33a").unwrap();
+
+        let collapse_id = observation_events::emit_debate_collapsed(
+            &conn,
+            "p9c33a",
+            "L2-D",
+            Some(2),
+            "Pro wins",
+            0,
+            "bob",
+        )
+        .unwrap();
+
+        // Emit the reopen event (operator intent).
+        let reopen_id = observation_events::emit_debate_reopened(
+            &conn,
+            "p9c33a",
+            "L2-D",
+            Some(2),
+            "new evidence",
+            "alice",
+            Some(collapse_id),
+        )
+        .unwrap();
+        assert!(reopen_id > collapse_id);
+
+        // The cooldown-bypass check (mirrors the SQL in chain_dispatch).
+        let reopened_since: Option<i64> = conn
+            .query_row(
+                "SELECT id
+                   FROM dadbear_observation_events
+                  WHERE slug = ?1
+                    AND event_type = 'debate_reopened'
+                    AND target_node_id = ?2
+                    AND id > ?3
+                  ORDER BY id DESC LIMIT 1",
+                rusqlite::params!["p9c33a", "L2-D", collapse_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok();
+        assert_eq!(
+            reopened_since,
+            Some(reopen_id),
+            "cooldown-bypass query must return the reopen event id"
+        );
+    }
+
+    // ── 9c-3-3.4: reopen BEFORE any collapse → bypass query finds nothing ─
+    // (Operator policy: POST /reopen with no prior collapse should 400
+    // at the HTTP layer. But even if an event slipped in, the cooldown-
+    // bypass query is id > latest_collapse_id so an older reopen is
+    // correctly ignored.)
+    #[test]
+    fn reopen_before_collapse_does_not_bypass() {
+        use crate::pyramid::observation_events;
+        let _lock = test_lock();
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        vocab_entries::invalidate_cache();
+        create_slug(&conn, "p9c33b", &ContentType::Code, "/tmp/p9c33b").unwrap();
+
+        // Write an out-of-order reopen first.
+        let _reopen_id = observation_events::emit_debate_reopened(
+            &conn,
+            "p9c33b",
+            "L2-D",
+            Some(2),
+            "early reopen",
+            "alice",
+            None,
+        )
+        .unwrap();
+        let collapse_id = observation_events::emit_debate_collapsed(
+            &conn,
+            "p9c33b",
+            "L2-D",
+            Some(2),
+            "Pro wins",
+            0,
+            "bob",
+        )
+        .unwrap();
+
+        // Bypass query must NOT find anything (no reopen strictly after
+        // the latest collapse).
+        let reopened_since: Option<i64> = conn
+            .query_row(
+                "SELECT id
+                   FROM dadbear_observation_events
+                  WHERE slug = ?1
+                    AND event_type = 'debate_reopened'
+                    AND target_node_id = ?2
+                    AND id > ?3
+                  ORDER BY id DESC LIMIT 1",
+                rusqlite::params!["p9c33b", "L2-D", collapse_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok();
+        assert!(
+            reopened_since.is_none(),
+            "bypass query must not return stale pre-collapse reopen"
+        );
+    }
+
+    // ── 9c-3-3.2: debate_reopened maps to log_only (compiler) ───────────
+    #[test]
+    fn debate_reopened_event_maps_to_log_only() {
+        let _lock = test_lock();
+        let mapped = crate::pyramid::dadbear_compiler::map_event_to_primitive("debate_reopened");
+        assert!(mapped.is_some(), "debate_reopened must have explicit mapping");
+        let (primitive, step_name, _tier) = mapped.unwrap();
+        assert_eq!(primitive, "log_only");
+        assert_eq!(step_name, "debate_reopened_log");
+        // And role_for_event returns None → no dispatched chain.
+        let role = crate::pyramid::dadbear_compiler::role_for_event("debate_reopened");
+        assert!(
+            role.is_none(),
+            "debate_reopened must not dispatch a chain (None role)"
+        );
+    }
+
     // ── 9c-3-1.3: fast-path avoids table scan when no changes ───────────
     // The coherence poll is SELECT COALESCE(MAX(id), 0) FROM ... WHERE
     // schema_type LIKE 'vocabulary_entry:%'. Verify that subsequent reads

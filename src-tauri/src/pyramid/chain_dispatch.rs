@@ -1374,9 +1374,9 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                     // (UTC, 1-second resolution). We compute age via
                     // `strftime('%s','now') - strftime('%s', detected_at)`
                     // which is seconds apart.
-                    let recent: Option<(String, String)> = conn_guard
+                    let recent: Option<(i64, String, String)> = conn_guard
                         .query_row(
-                            "SELECT detected_at, COALESCE(metadata_json, '{}')
+                            "SELECT id, detected_at, COALESCE(metadata_json, '{}')
                                FROM dadbear_observation_events
                               WHERE slug = ?1
                                 AND event_type = 'debate_collapsed'
@@ -1384,41 +1384,80 @@ async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDisp
                               ORDER BY id DESC
                               LIMIT 1",
                             rusqlite::params![ctx.slug, target_node_id],
-                            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
                         )
                         .optional()?;
-                    if let Some((detected_at, metadata)) = recent {
-                        let age_secs: i64 = conn_guard
+                    if let Some((collapse_event_id, detected_at, metadata)) = recent {
+                        // Phase 9c-3-3: check for a debate_reopened event
+                        // AFTER the latest debate_collapsed on this node.
+                        // If present, the cooldown is bypassed — the
+                        // operator has signalled that the collapse should
+                        // not block further annotations. Strict `id >`
+                        // comparison rules out the reopened-then-collapsed
+                        // sequence (new collapse re-engages the cooldown;
+                        // operator can re-open again if legitimate).
+                        let reopened_since: Option<i64> = conn_guard
                             .query_row(
-                                "SELECT CAST(strftime('%s', 'now') AS INTEGER)
-                                        - CAST(strftime('%s', ?1) AS INTEGER)",
-                                rusqlite::params![detected_at],
+                                "SELECT id
+                                   FROM dadbear_observation_events
+                                  WHERE slug = ?1
+                                    AND event_type = 'debate_reopened'
+                                    AND target_node_id = ?2
+                                    AND id > ?3
+                                  ORDER BY id DESC
+                                  LIMIT 1",
+                                rusqlite::params![ctx.slug, target_node_id, collapse_event_id],
                                 |r| r.get::<_, i64>(0),
                             )
-                            .unwrap_or(i64::MAX);
-                        if age_secs >= 0 && (age_secs as u64) < cooldown_secs {
-                            // Pull reason from the event's metadata_json
-                            // for the error message; default to "unknown"
-                            // if the blob is malformed.
-                            let reason = serde_json::from_str::<serde_json::Value>(&metadata)
-                                .ok()
-                                .and_then(|v| v.get("reason").cloned())
-                                .and_then(|v| v.as_str().map(String::from))
-                                .unwrap_or_else(|| "unknown".to_string());
-                            drop(conn_guard);
-                            return Err(anyhow!(
-                                "append_annotation_to_debate_node: cannot append \
-                                 {annotation_type} annotation to scaffolding node '{}' — \
-                                 debate was collapsed {age_secs}s ago (reason: {reason}) \
-                                 within the post-collapse cooldown window \
-                                 ({cooldown_secs}s). To re-open this debate, operator \
-                                 must wait for the cooldown to elapse OR supersede \
-                                 SchedulerConfig.collapse_cooldown_secs. Feedback: \
-                                 a new annotation during the cooldown would resurrect \
-                                 the just-collapsed debate, inverting finalize_debate_node's \
-                                 semantic (feedback_loud_deferrals + 9c-1 verifier flag).",
-                                target_node_id
-                            ));
+                            .optional()?;
+                        if reopened_since.is_some() {
+                            // Bypass: operator re-opened the debate after
+                            // the latest collapse. Proceed into the
+                            // scaffolding create-Debate branch below as
+                            // if no collapse happened.
+                            tracing::info!(
+                                slug = %ctx.slug,
+                                target_node_id = %target_node_id,
+                                collapse_event_id = collapse_event_id,
+                                reopen_event_id = reopened_since.unwrap(),
+                                "append_annotation_to_debate_node: post-collapse cooldown bypassed \
+                                 by debate_reopened event (Phase 9c-3-3)"
+                            );
+                        } else {
+                            let age_secs: i64 = conn_guard
+                                .query_row(
+                                    "SELECT CAST(strftime('%s', 'now') AS INTEGER)
+                                            - CAST(strftime('%s', ?1) AS INTEGER)",
+                                    rusqlite::params![detected_at],
+                                    |r| r.get::<_, i64>(0),
+                                )
+                                .unwrap_or(i64::MAX);
+                            if age_secs >= 0 && (age_secs as u64) < cooldown_secs {
+                                // Pull reason from the event's metadata_json
+                                // for the error message; default to "unknown"
+                                // if the blob is malformed.
+                                let reason = serde_json::from_str::<serde_json::Value>(&metadata)
+                                    .ok()
+                                    .and_then(|v| v.get("reason").cloned())
+                                    .and_then(|v| v.as_str().map(String::from))
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                drop(conn_guard);
+                                return Err(anyhow!(
+                                    "append_annotation_to_debate_node: cannot append \
+                                     {annotation_type} annotation to scaffolding node '{}' — \
+                                     debate was collapsed {age_secs}s ago (reason: {reason}) \
+                                     within the post-collapse cooldown window \
+                                     ({cooldown_secs}s). To re-open this debate, operator \
+                                     must POST /pyramid/<slug>/debates/<node_id>/reopen \
+                                     (Phase 9c-3-3) OR wait for the cooldown to elapse \
+                                     OR supersede SchedulerConfig.collapse_cooldown_secs. \
+                                     Feedback: a new annotation during the cooldown would \
+                                     resurrect the just-collapsed debate, inverting \
+                                     finalize_debate_node's semantic \
+                                     (feedback_loud_deferrals + 9c-1 verifier flag).",
+                                    target_node_id
+                                ));
+                            }
                         }
                     }
                 } else {

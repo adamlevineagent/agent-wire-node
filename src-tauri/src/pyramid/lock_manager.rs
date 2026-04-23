@@ -94,7 +94,7 @@
 //! hold the guard across the entire operation. Drop the guard (let it go out
 //! of scope) to release.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 

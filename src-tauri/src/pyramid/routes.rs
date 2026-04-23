@@ -555,6 +555,24 @@ struct CollapseDebateBody {
     author: Option<String>,
 }
 
+/// Post-build accretion v5 Phase 9c-3-3: `POST /pyramid/:slug/debates/:node_id/reopen`.
+/// Operator-facing admin endpoint to re-open a previously-collapsed debate.
+/// Writes a `debate_reopened` observation event; the next annotation append
+/// observes the event and bypasses the post-collapse cooldown check.
+///
+/// Does NOT re-create the debate node. The subsequent steel_man / red_team
+/// annotation (posted via /annotate) will take the Scaffolding branch,
+/// create a fresh DebateTopic, and re-elevate the node to debate shape.
+#[derive(Deserialize, Default)]
+struct ReopenDebateBody {
+    /// Short human-readable reason. Default `"operator_reopened"`.
+    #[serde(default)]
+    reason: Option<String>,
+    /// Optional operator identity. Default `"operator"`.
+    #[serde(default)]
+    author: Option<String>,
+}
+
 // ── WS-VOCAB query parameter structs ────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -2864,10 +2882,32 @@ pub fn pyramid_routes(
 
     let top36 = top35.or(collapse_debate).unify().boxed();
 
+    // ── Post-build accretion v5 Phase 9c-3-3: operator debate reopen ──
+    //
+    // POST /pyramid/:slug/debates/:node_id/reopen — operator-facing
+    // admin path that writes a `debate_reopened` observation event on
+    // the target node. The next steel_man/red_team annotation append
+    // observes the event and bypasses the post-collapse cooldown.
+    // Does NOT itself recreate the debate — that happens when the
+    // operator POSTs the follow-up annotation. Local-only auth (mutation).
+    let reopen_debate = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("debates"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("reopen"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::content_length_limit(1_048_576))
+        .and(warp::body::json::<ReopenDebateBody>())
+        .and_then(handle_reopen_debate));
+
+    let top37 = top36.or(reopen_debate).unify().boxed();
+
     // public_html is now mounted separately at the server level so it can
     // get a permissive CORS filter (the desktop API allowlist would block
     // form POSTs from the tunnel host).
-    top36
+    top37
 }
 
 /// GET /vocabulary/:vocab_kind — public read of the vocabulary
@@ -3380,6 +3420,168 @@ async fn handle_collapse_debate(
 
     Ok(
         warp::reply::with_status(warp::reply::json(&saved), warp::http::StatusCode::OK)
+            .into_response(),
+    )
+}
+
+/// Post-build accretion v5 Phase 9c-3-3: operator-facing admin endpoint
+/// to re-open a previously-collapsed debate.
+///
+/// POST /pyramid/:slug/debates/:node_id/reopen
+/// Body (all optional):
+///   { "reason": "New evidence surfaced.", "author": "alice" }
+///
+/// Writes a `debate_reopened` observation event on the target node.
+/// The next steel_man / red_team annotation append observes the event
+/// and bypasses the post-collapse cooldown check (Phase 9c-2-3 guard).
+/// Does NOT itself create the debate node — the operator's follow-up
+/// annotation is what takes the Scaffolding branch and re-materializes
+/// the DebateTopic. This split is deliberate: the reopen signal is
+/// operator-level intent; the substrate re-materialization is the
+/// annotation path, which already carries the position content and
+/// author attribution the debate needs to resume.
+///
+/// Status codes:
+///   200 — reopen event written, event id returned
+///   404 — slug or node not found
+///   400 — no prior `debate_collapsed` event exists for the node
+///         (nothing to reopen; operator likely intended a fresh debate
+///         via /annotate instead). Loud per feedback_loud_deferrals.
+///   500 — persistence failure
+async fn handle_reopen_debate(
+    slug_name: String,
+    node_id: String,
+    state: Arc<PyramidState>,
+    body: ReopenDebateBody,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Validate slug + node + prior-collapse exists.
+    let latest_collapse_event_id: i64;
+    {
+        let conn = state.reader.lock().await;
+        match slug::get_slug(&conn, &slug_name) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("slug '{slug_name}' not found"),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+        match db::get_node(&conn, &slug_name, &node_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("node '{node_id}' not found in slug '{slug_name}'"),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+        // Look up the most recent `debate_collapsed` event for this
+        // (slug, node_id). No prior collapse → 400. This is a loud
+        // deferral: the operator's intent (re-open a collapsed debate)
+        // is nonsensical if nothing was collapsed. feedback_loud_deferrals.
+        let most_recent: Option<i64> = match conn.query_row(
+            "SELECT id FROM dadbear_observation_events
+              WHERE slug = ?1
+                AND event_type = 'debate_collapsed'
+                AND target_node_id = ?2
+              ORDER BY id DESC
+              LIMIT 1",
+            rusqlite::params![slug_name, node_id],
+            |r| r.get::<_, i64>(0),
+        ) {
+            Ok(id) => Some(id),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to look up prior collapse event: {e}"),
+                ));
+            }
+        };
+        latest_collapse_event_id = match most_recent {
+            Some(id) => id,
+            None => {
+                return Ok(json_error(
+                    warp::http::StatusCode::BAD_REQUEST,
+                    &format!(
+                        "cannot reopen debate on node '{node_id}' — no prior \
+                         `debate_collapsed` event exists for this (slug, node). \
+                         To start a fresh debate, POST a steel_man / red_team \
+                         annotation via /annotate. (9c-3-3 loud-deferral.)"
+                    ),
+                ));
+            }
+        };
+    }
+
+    let reason = body
+        .reason
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "operator_reopened".to_string());
+    let author = body
+        .author
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "operator".to_string());
+
+    // Look up node layer for the event row (optional but preserves
+    // parity with emit_debate_collapsed).
+    let layer: Option<i64> = {
+        let conn = state.reader.lock().await;
+        conn.query_row(
+            "SELECT depth FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
+            rusqlite::params![slug_name, node_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok()
+    };
+
+    // Write the event.
+    let event_id = {
+        let conn = state.writer.lock().await;
+        match crate::pyramid::observation_events::emit_debate_reopened(
+            &conn,
+            &slug_name,
+            &node_id,
+            layer,
+            &reason,
+            &author,
+            Some(latest_collapse_event_id),
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to emit debate_reopened event: {e}"),
+                ));
+            }
+        }
+    };
+
+    let payload = serde_json::json!({
+        "event_id": event_id,
+        "slug": slug_name,
+        "node_id": node_id,
+        "referenced_collapse_event_id": latest_collapse_event_id,
+        "reason": reason,
+        "author": author,
+    });
+    Ok(
+        warp::reply::with_status(warp::reply::json(&payload), warp::http::StatusCode::OK)
             .into_response(),
     )
 }

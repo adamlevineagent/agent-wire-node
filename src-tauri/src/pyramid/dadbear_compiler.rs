@@ -171,6 +171,17 @@ pub(crate) fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, 
         // maps it to a dedicated `debate_collapsed_log` step_name so
         // has_active_work_item dedup stays clean, and spawns no work item.
         "debate_collapsed" => Some(("log_only", "debate_collapsed_log", "stale_remote")),
+        // v5 Phase 9c-3-3: debate_reopened is operator-driven signal that
+        // a collapsed debate should accept new annotations again. Pure
+        // observability from the compiler's perspective — the actual
+        // effect is on `append_annotation_to_debate_node`'s cooldown
+        // check (if the latest event for the node is a debate_reopened
+        // newer than the latest debate_collapsed, the cooldown is
+        // bypassed). log_only + a dedicated step_name keeps chronicle
+        // dedup clean. `role_for_event` returns None below so the
+        // emitted event does not kick off a chain — it exists to gate
+        // the NEXT annotation append.
+        "debate_reopened" => Some(("log_only", "debate_reopened_log", "stale_remote")),
         // v5 audit P3: gap_detected is observability-only. The actual
         // dispatch already fired via annotation_reacted → handler_chain_id
         // (6c-B flip), so compiling a second work item for gap_detected
@@ -951,6 +962,13 @@ pub(crate) fn role_for_event(event_type: &str) -> Option<&'static str> {
         // against a node that has already been collapsed to scaffolding.
         "debate_spawned" => Some("debate_steward"),
         "debate_collapsed" => None,
+        // v5 Phase 9c-3-3: debate_reopened is observability-only. The
+        // emitted event is a gate for the NEXT annotation append's
+        // cooldown check — it does not itself dispatch a chain. If an
+        // operator wants the reopened debate to re-engage the steward,
+        // they POST a fresh steel_man/red_team annotation, which fires
+        // the standard debate_steward path.
+        "debate_reopened" => None,
         // v5 audit P3: gap_detected is observability-only — the actual
         // dispatch already fired via annotation_reacted → handler_chain_id.
         "gap_detected" => None,
