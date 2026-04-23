@@ -1,14 +1,31 @@
-//! Walker v3 Phase 0a-1 commit 5 + Phase 0a-2 WS5 smoke against a real
-//! dev DB snapshot.
+//! Walker v3 Phase 0a-1 commit 5 + Phase 0a-2 WS5 + Phase 0b WS-E + Phase 1
+//! W4 smoke tests against a real dev DB snapshot.
 //!
-//! Run with:
-//!   PYRAMID_DB=/tmp/walker-v3-smoke-XXXXX/pyramid.db \
+//! Run with (PYRAMID_DB pointed at the real file you want to smoke-test
+//! against; PYRAMID_CONFIG_JSON only needed for `phase_b_rewrites_live_config_json`):
+//!
+//!   PYRAMID_DB=/path/to/pyramid.db \
+//!   PYRAMID_CONFIG_JSON=/path/to/pyramid_config.json \
 //!   cargo test --test walker_v3_smoke_live_db -- --nocapture --ignored
 //!
-//! Validates: migration runs cleanly on the copy, creates uq_config_contrib_active
-//! + _pre_v3_dedup_snapshot, preserves 155 active rows (0 dups = 0 moved),
-//! and is idempotent on a second call. Second test (Phase 0a-2 WS5) exercises
-//! `run_walker_cache_boot` against the copy and asserts Booting → Ready.
+//! Each test snapshots the source files into its OWN tempdir at start
+//! (see `snapshot_live_db_for_smoke` below). Tests are therefore safe to
+//! run in parallel — they never mutate the source files referenced by
+//! the env vars, only their per-test tempdir copies. The `TempDir` is
+//! dropped at test exit, cleaning up automatically.
+//!
+//! Validation surface:
+//!  1. `migration_runs_cleanly_on_live_db_copy` — Phase 0a-1 commit 5
+//!     `ensure_config_contrib_active_unique_index` is idempotent on the
+//!     real shape, creates the unique index + dedup snapshot.
+//!  2. `boot_coordinator_runs_clean_against_live_db_copy` — Phase 0a-2 WS5
+//!     `run_walker_cache_boot` walks Booting → Ready in <5s on the
+//!     real DB shape (will run Phase A + Phase B migration if needed).
+//!  3. `phase_0b_scope_cache_populates_from_live_db` — Phase 0b WS-E
+//!     `walker_resolver::build_scope_cache` produces a populated chain
+//!     after the bundled manifest is loaded.
+//!  4. `phase_b_rewrites_live_config_json` — Phase 1 W4 strips legacy
+//!     keys from pyramid_config.json + transitions marker to v3.
 
 use rusqlite::Connection;
 use std::sync::Arc;
@@ -18,11 +35,67 @@ use wire_node_lib::app_mode::{new_app_mode, AppMode};
 use wire_node_lib::boot::{run_walker_cache_boot, BootResult};
 use wire_node_lib::pyramid::event_bus::BuildEventBus;
 
+/// Per-test snapshot of the live DB (and optionally pyramid_config.json)
+/// into a fresh tempdir. The returned `TempDir` keeps the tempdir alive
+/// for the test lifetime; drop wipes it.
+///
+/// Why per-test (not shared) tempdirs: cargo runs tests in this binary
+/// in parallel by default. If all 4 smoke tests pointed at the same
+/// PYRAMID_DB file, they'd race on Phase A migration / unique-index
+/// creation / config-rewrite. Per-test tempdirs eliminate the race
+/// without needing any cross-test locking.
+struct SmokeFixture {
+    _td: tempfile::TempDir,
+    pub db_path: std::path::PathBuf,
+    pub config_path: Option<std::path::PathBuf>,
+    pub data_dir: std::path::PathBuf,
+}
+
+fn snapshot_live_db_for_smoke() -> SmokeFixture {
+    let src_db = std::env::var("PYRAMID_DB")
+        .expect("set PYRAMID_DB=<path-to-real-pyramid.db>");
+    let td = tempfile::tempdir().expect("create per-test tempdir");
+    let dst_db = td.path().join("pyramid.db");
+    std::fs::copy(&src_db, &dst_db).expect("copy pyramid.db into tempdir");
+    // Best-effort copy of WAL + SHM (may not exist if DB was cleanly
+    // shut down). Ignore errors — SQLite tolerates absent WAL/SHM.
+    let _ = std::fs::copy(format!("{src_db}-wal"), td.path().join("pyramid.db-wal"));
+    let _ = std::fs::copy(format!("{src_db}-shm"), td.path().join("pyramid.db-shm"));
+    let config_path = std::env::var("PYRAMID_CONFIG_JSON").ok().map(|src| {
+        let dst = td.path().join("pyramid_config.json");
+        std::fs::copy(&src, &dst).expect("copy pyramid_config.json into tempdir");
+        dst
+    });
+    let data_dir = td.path().to_path_buf();
+
+    // Operator-equivalent fixture cleanup: mark any in-progress builds
+    // as 'failed' so Phase A's `InProgressBuildsBlock` check passes.
+    // Real operators do this via the Phase-6 boot-recovery modal
+    // ([Resume] / [Mark failed] / [Rollback to v2]); here we
+    // pre-mark for the smoke. Skipped if the table doesn't exist
+    // (some DBs predate pyramid_builds entirely).
+    {
+        let conn = Connection::open(&dst_db).expect("open db copy for fixture cleanup");
+        let _ = conn.execute(
+            "UPDATE pyramid_builds SET status='failed' \
+             WHERE status IN ('running','paused_for_resume')",
+            [],
+        );
+    }
+
+    SmokeFixture {
+        _td: td,
+        db_path: dst_db,
+        config_path,
+        data_dir,
+    }
+}
+
 #[test]
 #[ignore]
 fn migration_runs_cleanly_on_live_db_copy() {
-    let path = std::env::var("PYRAMID_DB")
-        .expect("set PYRAMID_DB=/tmp/walker-v3-smoke-XXXXX/pyramid.db");
+    let fx = snapshot_live_db_for_smoke();
+    let path = fx.db_path.to_string_lossy().to_string();
     let conn = Connection::open(&path).expect("open db copy");
 
     let pre_active: i64 = conn
@@ -144,8 +217,8 @@ fn migration_runs_cleanly_on_live_db_copy() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn boot_coordinator_runs_clean_against_live_db_copy() {
-    let path = std::env::var("PYRAMID_DB")
-        .expect("set PYRAMID_DB=/tmp/walker-v3-smoke-XXXXX/pyramid.db");
+    let fx = snapshot_live_db_for_smoke();
+    let path = fx.db_path.to_string_lossy().to_string();
 
     let app_mode = new_app_mode();
     assert_eq!(
@@ -225,8 +298,8 @@ fn phase_0b_scope_cache_populates_from_live_db() {
     };
     use wire_node_lib::pyramid::wire_migration::walk_bundled_contributions_manifest;
 
-    let path = std::env::var("PYRAMID_DB")
-        .expect("set PYRAMID_DB=/tmp/walker-v3-smoke-XXXXX/pyramid.db");
+    let fx = snapshot_live_db_for_smoke();
+    let path = fx.db_path.to_string_lossy().to_string();
     let conn = Connection::open(&path).expect("open db copy");
 
     // ── Phase 1: pre-manifest baseline ──────────────────────────────
@@ -322,31 +395,67 @@ fn phase_0b_scope_cache_populates_from_live_db() {
             .map(|p| p.as_str())
             .collect::<Vec<_>>()
     );
-    assert_eq!(
-        decision.effective_call_order,
-        DEFAULT_CALL_ORDER.to_vec(),
-        "bundled walker_call_order must yield DEFAULT_CALL_ORDER"
+    // Post-Phase-3/4 readiness drops providers that fail their checks:
+    //   - Market: bundled active=false → Inactive
+    //   - Local: walker_ollama_probe unseeded → OllamaOffline
+    //   - Fleet: walker_fleet_probe unseeded → NoReachablePeer
+    //   - OpenRouter: still a stub → always Ready
+    // So the bundled-only effective_call_order is a SUBSEQUENCE of
+    // DEFAULT_CALL_ORDER (preserves order) with OpenRouter present.
+    assert!(
+        !decision.effective_call_order.is_empty(),
+        "at least OpenRouter must remain (always-Ready stub)"
     );
-    for pt in DEFAULT_CALL_ORDER {
-        assert!(
-            decision.per_provider.contains_key(&pt),
-            "per_provider must include {pt:?}"
+    assert!(
+        decision
+            .effective_call_order
+            .contains(&ProviderType::OpenRouter),
+        "OpenRouter must be present in effective_call_order \
+         (always-Ready stub guarantees it)"
+    );
+    {
+        // Subsequence check: filter DEFAULT_CALL_ORDER by what's in
+        // effective and assert positional equality.
+        let expected: Vec<_> = DEFAULT_CALL_ORDER
+            .iter()
+            .filter(|p| decision.effective_call_order.contains(p))
+            .copied()
+            .collect();
+        assert_eq!(
+            decision.effective_call_order, expected,
+            "effective_call_order must preserve DEFAULT_CALL_ORDER positional order"
         );
     }
-    // Market carries active=false per bundled seed.
-    let mkt = decision
-        .per_provider
-        .get(&ProviderType::Market)
-        .expect("market present");
+    for pt in &decision.effective_call_order {
+        assert!(
+            decision.per_provider.contains_key(pt),
+            "per_provider must include every entry in effective_call_order ({pt:?})"
+        );
+    }
+    // Per-provider entries only exist for providers in effective_call_order
+    // (those that passed readiness). Market is correctly absent because
+    // bundled walker_provider_market ships active=false → MarketReadiness
+    // returns Inactive → dropped. Verify the bundled `active=false` via
+    // the resolver directly (Decision can't surface it for dropped
+    // providers).
+    use wire_node_lib::pyramid::walker_resolver::{
+        build_scope_cache_pair, resolve_active,
+    };
+    let scope_pair = build_scope_cache_pair(&conn).expect("rebuild scope chain");
     assert!(
-        !mkt.active,
-        "bundled walker_provider_market ships active=false"
+        !resolve_active(&scope_pair.chain, "mid", ProviderType::Market),
+        "bundled walker_provider_market must ship active=false at scope 4"
     );
-    // OpenRouter mid model_list is [inception/mercury-2].
+    assert!(
+        !decision.per_provider.contains_key(&ProviderType::Market),
+        "Market must be dropped from per_provider when readiness returned Inactive"
+    );
+
+    // OpenRouter mid model_list is [inception/mercury-2] per bundled seed.
     let or = decision
         .per_provider
         .get(&ProviderType::OpenRouter)
-        .expect("openrouter present");
+        .expect("openrouter present (always-Ready stub)");
     assert_eq!(
         or.model_list.as_deref(),
         Some(&["inception/mercury-2".to_string()][..]),
@@ -379,15 +488,13 @@ fn phase_b_rewrites_live_config_json() {
         should_run_phase_b, V3MigrationError,
     };
 
-    let db_path = std::env::var("PYRAMID_DB")
-        .expect("set PYRAMID_DB=/tmp/walker-v3-smoke-XXXXX/pyramid.db");
-    let config_path_str = std::env::var("PYRAMID_CONFIG_JSON")
-        .expect("set PYRAMID_CONFIG_JSON=/tmp/walker-v3-smoke-XXXXX/pyramid_config.json");
-    let config_path = std::path::PathBuf::from(&config_path_str);
-    let data_dir = config_path
-        .parent()
-        .expect("PYRAMID_CONFIG_JSON must have a parent dir")
-        .to_path_buf();
+    let fx = snapshot_live_db_for_smoke();
+    let db_path = fx.db_path.clone();
+    let config_path = fx
+        .config_path
+        .clone()
+        .expect("set PYRAMID_CONFIG_JSON for phase_b_rewrites_live_config_json");
+    let data_dir = fx.data_dir.clone();
 
     let bytes_before_smoke = std::fs::read_to_string(&config_path)
         .expect("read seeded pyramid_config.json copy")
