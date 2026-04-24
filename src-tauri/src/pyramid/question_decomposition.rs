@@ -168,9 +168,10 @@ pub struct QuestionTree {
 /// A single node in the question tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionNode {
-    /// Stable deterministic ID: `q-{sha256_hex_first_12}`.
-    /// NOT produced by the LLM — assigned from normalized question text so a
-    /// shared semantic question keeps one identity across DAG parents.
+    /// Stable local handle ID, e.g. `Q-L2-003`.
+    /// NOT produced by the LLM. The allocator assigns layer-shaped handles and
+    /// keeps a semantic de-dupe map so a shared question still has one identity
+    /// across DAG parents.
     #[serde(default)]
     pub id: String,
     /// The natural language question.
@@ -210,15 +211,17 @@ pub struct DecompositionPreview {
 
 /// Assign deterministic IDs to every node in the question tree.
 ///
-/// ID format: `q-{sha256_hex_first_12}` where the hash input is the normalized
-/// question text. Visual/storage depth is deliberately excluded: a semantic
-/// question should have one canonical identity even when multiple parents or
-/// future repair passes route to it from different depths.
+/// ID format: `Q-L{visual_layer}-{index:03}` where `visual_layer` is the
+/// question's pyramid layer (`Q-L1-*` for evidence-facing leaf questions).
+/// A semantic key still de-dupes repeated/shared question text before a new
+/// handle is allocated.
 ///
 /// This is intentionally independent of final tree height: decomposition can
 /// persist a finalized subtree before sibling branches finish.
 pub fn assign_question_ids(tree: &mut QuestionTree) {
-    assign_ids_recursive(&mut tree.apex, 0);
+    let max_tree_depth = compute_max_depth(&tree.apex);
+    let mut allocator = QuestionIdAllocator::default();
+    assign_ids_recursive(&mut tree.apex, 0, max_tree_depth, &mut allocator);
 }
 
 /// Compute the max depth of the tree (number of edges from root to deepest leaf).
@@ -235,24 +238,67 @@ fn compute_max_depth(node: &QuestionNode) -> u32 {
 
 /// Recursively assign IDs. `tree_depth` is root-down storage depth:
 /// apex/root = 0, first-level sub-questions = 1, and so on.
-fn assign_ids_recursive(node: &mut QuestionNode, tree_depth: u32) {
-    assign_node_id(node, tree_depth);
+fn assign_ids_recursive(
+    node: &mut QuestionNode,
+    tree_depth: u32,
+    max_tree_depth: u32,
+    allocator: &mut QuestionIdAllocator,
+) {
+    assign_node_id(node, tree_depth, max_tree_depth, allocator);
     for child in &mut node.children {
-        assign_ids_recursive(child, tree_depth + 1);
+        assign_ids_recursive(child, tree_depth + 1, max_tree_depth, allocator);
     }
 }
 
-fn assign_node_id(node: &mut QuestionNode, tree_depth: u32) {
-    node.id = make_question_id(&node.question, &node.about, tree_depth);
+fn assign_node_id(
+    node: &mut QuestionNode,
+    tree_depth: u32,
+    max_tree_depth: u32,
+    allocator: &mut QuestionIdAllocator,
+) {
+    let visual_layer = visual_layer_from_tree_depth(max_tree_depth + 1, tree_depth);
+    node.id = allocator.get_or_allocate(&node.question, visual_layer);
 }
 
-/// Build a deterministic question ID from semantic question text.
-fn make_question_id(question: &str, _about: &str, _tree_depth: u32) -> String {
-    use sha2::{Digest, Sha256};
-    let input = normalize_question_identity(question);
-    let hash = Sha256::digest(input.as_bytes());
-    let hex_str = hex::encode(hash);
-    format!("q-{}", &hex_str[..12])
+#[derive(Debug, Default, Clone)]
+struct QuestionIdAllocator {
+    id_by_semantic_key: HashMap<String, String>,
+    next_index_by_layer: HashMap<i64, usize>,
+}
+
+impl QuestionIdAllocator {
+    fn register_existing(&mut self, question: &str, id: &str) {
+        self.id_by_semantic_key
+            .entry(normalize_question_identity(question))
+            .or_insert_with(|| id.to_string());
+        if let Some((layer, index)) = parse_question_handle_id(id) {
+            let next = self.next_index_by_layer.entry(layer).or_insert(0);
+            *next = (*next).max(index + 1);
+        }
+    }
+
+    fn get_or_allocate(&mut self, question: &str, visual_layer: i64) -> String {
+        let key = normalize_question_identity(question);
+        if let Some(existing) = self.id_by_semantic_key.get(&key) {
+            return existing.clone();
+        }
+
+        let next = self.next_index_by_layer.entry(visual_layer).or_insert(0);
+        let id = format!("Q-L{}-{:03}", visual_layer, *next);
+        *next += 1;
+        self.id_by_semantic_key.insert(key, id.clone());
+        id
+    }
+}
+
+fn visual_layer_from_tree_depth(max_visual_layer: u32, tree_depth: u32) -> i64 {
+    max_visual_layer.saturating_sub(tree_depth).max(1) as i64
+}
+
+fn parse_question_handle_id(id: &str) -> Option<(i64, usize)> {
+    let rest = id.strip_prefix("Q-L")?;
+    let (layer, index) = rest.split_once('-')?;
+    Some((layer.parse().ok()?, index.parse().ok()?))
 }
 
 fn normalize_question_identity(question: &str) -> String {
@@ -707,11 +753,14 @@ struct QuestionDagDraft {
     parents_by_child: HashMap<String, Vec<String>>,
     children_by_parent: HashMap<String, Vec<String>>,
     apex_id: String,
+    id_allocator: QuestionIdAllocator,
 }
 
 impl QuestionDagDraft {
     fn new(apex: QuestionNode) -> Self {
         let apex_id = apex.id.clone();
+        let mut id_allocator = QuestionIdAllocator::default();
+        id_allocator.register_existing(&apex.question, &apex.id);
         let mut nodes = HashMap::new();
         let mut depths = HashMap::new();
         depths.insert(apex_id.clone(), 0);
@@ -722,10 +771,13 @@ impl QuestionDagDraft {
             parents_by_child: HashMap::new(),
             children_by_parent: HashMap::new(),
             apex_id,
+            id_allocator,
         }
     }
 
     fn upsert_node(&mut self, node: QuestionNode, tree_depth: u32) {
+        self.id_allocator
+            .register_existing(&node.question, &node.id);
         self.depths.entry(node.id.clone()).or_insert(tree_depth);
         self.nodes
             .entry(node.id.clone())
@@ -738,6 +790,16 @@ impl QuestionDagDraft {
                 existing.is_leaf = existing.is_leaf && node.is_leaf;
             })
             .or_insert(node);
+    }
+
+    fn get_or_allocate_id(
+        &mut self,
+        question: &str,
+        tree_depth: u32,
+        max_visual_layer: u32,
+    ) -> String {
+        let visual_layer = visual_layer_from_tree_depth(max_visual_layer, tree_depth);
+        self.id_allocator.get_or_allocate(question, visual_layer)
     }
 
     fn add_edge(&mut self, parent_id: &str, child_id: &str) {
@@ -959,7 +1021,8 @@ pub async fn decompose_question_incremental(
         );
 
         let apex_about = "all top-level nodes at once".to_string();
-        let apex_id = make_question_id(&config.apex_question, &apex_about, 0);
+        let mut id_allocator = QuestionIdAllocator::default();
+        let apex_id = id_allocator.get_or_allocate(&config.apex_question, config.max_depth as i64);
         let dag = QuestionDagDraft::new(QuestionNode {
             id: apex_id,
             question: config.apex_question.clone(),
@@ -1076,7 +1139,8 @@ pub async fn decompose_question_incremental(
 
             let forced_leaf = child.raw.is_leaf || child_tree_depth + 1 >= config.max_depth;
             let (about, creates) = node_scope_for_tree_depth(child_tree_depth, forced_leaf);
-            let node_id = make_question_id(&child.raw.question, &about, child_tree_depth);
+            let node_id =
+                dag.get_or_allocate_id(&child.raw.question, child_tree_depth, config.max_depth);
             let node = QuestionNode {
                 id: node_id.clone(),
                 question: child.raw.question,
@@ -3114,6 +3178,26 @@ That should cover it."#;
         assert_eq!(all_question_ids.len(), unique_question_ids.len());
     }
 
+    #[test]
+    fn assign_question_ids_uses_layer_handle_ids_not_hashes() {
+        let shared = make_leaf("Which evidence matters to both branches?");
+        let mut tree = make_tree(vec![
+            make_branch("Branch A", vec![shared.clone()]),
+            make_branch("Branch B", vec![shared]),
+        ]);
+        assign_question_ids(&mut tree);
+
+        assert_eq!(tree.apex.id, "Q-L3-000");
+        assert_eq!(tree.apex.children[0].id, "Q-L2-000");
+        assert_eq!(tree.apex.children[1].id, "Q-L2-001");
+        assert_eq!(tree.apex.children[0].children[0].id, "Q-L1-000");
+        assert_eq!(
+            tree.apex.children[0].children[0].id,
+            tree.apex.children[1].children[0].id
+        );
+        assert!(!tree.apex.children[0].children[0].id.starts_with("q-"));
+    }
+
     // ── Tree depth tests ──────────────────────────────────────────────────
 
     #[test]
@@ -3379,42 +3463,42 @@ That should cover it."#;
     #[test]
     fn question_dag_resume_frontier_uses_canonical_edges() {
         let rows = vec![
-            question_row("q-apex", 0, false, None),
-            question_row("q-a", 1, false, None),
-            question_row("q-b", 1, false, None),
+            question_row("Q-L3-000", 0, false, None),
+            question_row("Q-L2-000", 1, false, None),
+            question_row("Q-L2-001", 1, false, None),
         ];
         let edges = vec![
-            question_edge("q-apex", "q-a", 0),
-            question_edge("q-apex", "q-b", 1),
+            question_edge("Q-L3-000", "Q-L2-000", 0),
+            question_edge("Q-L3-000", "Q-L2-001", 1),
         ];
         let dag = question_dag_from_rows(rows, edges).unwrap();
 
-        assert_eq!(dag.apex_id, "q-apex");
+        assert_eq!(dag.apex_id, "Q-L3-000");
         assert_eq!(
             undecomposed_frontier_ids(&dag, 3),
-            vec!["q-a".to_string(), "q-b".to_string()]
+            vec!["Q-L2-000".to_string(), "Q-L2-001".to_string()]
         );
     }
 
     #[test]
     fn question_dag_from_rows_preserves_multi_parent_child() {
         let rows = vec![
-            question_row("q-apex", 0, false, None),
-            question_row("q-a", 1, false, None),
-            question_row("q-b", 1, false, None),
-            question_row("q-shared", 2, true, None),
+            question_row("Q-L3-000", 0, false, None),
+            question_row("Q-L2-000", 1, false, None),
+            question_row("Q-L2-001", 1, false, None),
+            question_row("Q-L1-000", 2, true, None),
         ];
         let edges = vec![
-            question_edge("q-apex", "q-a", 0),
-            question_edge("q-apex", "q-b", 1),
-            question_edge("q-a", "q-shared", 0),
-            question_edge("q-b", "q-shared", 0),
+            question_edge("Q-L3-000", "Q-L2-000", 0),
+            question_edge("Q-L3-000", "Q-L2-001", 1),
+            question_edge("Q-L2-000", "Q-L1-000", 0),
+            question_edge("Q-L2-001", "Q-L1-000", 0),
         ];
         let dag = question_dag_from_rows(rows, edges).unwrap();
 
         assert_eq!(
-            dag.parents_by_child.get("q-shared").cloned().unwrap(),
-            vec!["q-a".to_string(), "q-b".to_string()]
+            dag.parents_by_child.get("Q-L1-000").cloned().unwrap(),
+            vec!["Q-L2-000".to_string(), "Q-L2-001".to_string()]
         );
         assert!(undecomposed_frontier_ids(&dag, 3).is_empty());
     }
