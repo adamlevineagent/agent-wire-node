@@ -111,6 +111,25 @@ pub async fn detect_contradictions(
          existing claims."
     );
 
+    // Declared intent per docstring: mercury-2 (fast, focused analysis) = "mid"
+    // tier. Resolve through provider registry so the walker sees a
+    // provider-valid model id. Fail-loud if registry has no "mid" tier —
+    // walker-v3 W3c removed the legacy primary_model fallback and this is a
+    // top-level entry point with no outer DispatchDecision to cascade to.
+    let resolved = llm_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "supersession_detect_contradictions: provider registry has no 'mid' tier \
+                 routing. Configure a walker_provider_openrouter contribution with a \
+                 'mid' slot model_list entry."
+            )
+        })?;
+    let resolved_model_id = resolved.tier.model_id.clone();
+    let resolved_provider_id = Some(resolved.provider.id.clone());
+
     let cache_ctx = make_step_ctx_from_llm_config(
         llm_config,
         "supersession_detect_contradictions",
@@ -118,7 +137,11 @@ pub async fn detect_contradictions(
         affected_l0_node.depth,
         None,
         system_prompt,
-    );
+        "mid",
+        Some(&resolved_model_id),
+        resolved_provider_id.as_deref(),
+    )
+    .await;
     let response = llm::call_model_unified_and_ctx(
         llm_config,
         cache_ctx.as_ref(),

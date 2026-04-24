@@ -75,7 +75,10 @@ fn resolve_prompt_refs(def: &mut ChainDefinition, chains_dir: &Path) -> Result<(
     resolve_step_refs(&mut def.steps, chains_dir)
 }
 
-fn resolve_step_refs(steps: &mut [crate::pyramid::chain_engine::ChainStep], chains_dir: &Path) -> Result<()> {
+fn resolve_step_refs(
+    steps: &mut [crate::pyramid::chain_engine::ChainStep],
+    chains_dir: &Path,
+) -> Result<()> {
     let resolve_prompt = |prompt_ref: &str, step_name: &str, field_name: &str| -> Result<String> {
         if let Some(rel_path) = prompt_ref.strip_prefix("$prompts/") {
             // Phase 5: try the contribution store first via the
@@ -138,7 +141,8 @@ fn resolve_step_refs(steps: &mut [crate::pyramid::chain_engine::ChainStep], chai
         }
 
         if let Some(ref heal_instr) = step.heal_instruction {
-            step.heal_instruction = Some(resolve_prompt(heal_instr, &step.name, "heal_instruction")?);
+            step.heal_instruction =
+                Some(resolve_prompt(heal_instr, &step.name, "heal_instruction")?);
         }
 
         if let Some(instruction_map) = step.instruction_map.as_mut() {
@@ -291,10 +295,7 @@ fn load_chain_metadata(yaml_path: &Path, is_default: bool) -> Result<ChainMetada
 /// **Tier 2 (no source tree / release standalone):** Bootstrap with embedded defaults,
 /// but only write files that don't already exist. Preserves user's runtime chain files
 /// across app restarts.
-pub fn ensure_default_chains(
-    chains_dir: &Path,
-    source_chains_dir: Option<&Path>,
-) -> Result<()> {
+pub fn ensure_default_chains(chains_dir: &Path, source_chains_dir: Option<&Path>) -> Result<()> {
     // Create directory structure
     let dirs_to_create = [
         chains_dir.join("defaults"),
@@ -307,7 +308,9 @@ pub fn ensure_default_chains(
         chains_dir.join("defaults").join("starter"),
         chains_dir.join("variants"),
         chains_dir.join("prompts").join("conversation"),
-        chains_dir.join("prompts").join("conversation-chronological"),
+        chains_dir
+            .join("prompts")
+            .join("conversation-chronological"),
         chains_dir.join("prompts").join("conversation-episodic"),
         chains_dir.join("prompts").join("code"),
         chains_dir.join("prompts").join("document"),
@@ -348,8 +351,14 @@ pub fn ensure_default_chains(
         ("conversation.yaml", DEFAULT_CONVERSATION_CHAIN),
         ("code.yaml", DEFAULT_CODE_CHAIN),
         ("document.yaml", DEFAULT_DOCUMENT_CHAIN),
-        ("question.yaml", include_str!("../../../chains/defaults/question.yaml")),
-        ("extract-only.yaml", include_str!("../../../chains/defaults/extract-only.yaml")),
+        (
+            "question.yaml",
+            include_str!("../../../chains/defaults/question.yaml"),
+        ),
+        (
+            "extract-only.yaml",
+            include_str!("../../../chains/defaults/extract-only.yaml"),
+        ),
         // Phase 16: topical vine recipe for vine-of-vines composition and
         // folder ingestion (Phase 17). Vines route to this chain via
         // chain_registry::resolve_chain_for_slug.
@@ -559,20 +568,39 @@ pub fn ensure_default_chains(
     }
 
     // Write planner system prompt (bundled at compile time) — bootstrap only
-    let planner_prompt_path = chains_dir.join("prompts").join("planner").join("planner-system.md");
+    let planner_prompt_path = chains_dir
+        .join("prompts")
+        .join("planner")
+        .join("planner-system.md");
     if !planner_prompt_path.exists() {
         let prompt_content = include_str!("../../../chains/prompts/planner/planner-system.md");
-        std::fs::write(&planner_prompt_path, prompt_content)
-            .with_context(|| format!("failed to write planner prompt: {}", planner_prompt_path.display()))?;
+        std::fs::write(&planner_prompt_path, prompt_content).with_context(|| {
+            format!(
+                "failed to write planner prompt: {}",
+                planner_prompt_path.display()
+            )
+        })?;
         tracing::info!(path = %planner_prompt_path.display(), "bootstrapped bundled planner-system.md");
     }
 
     // Write question prompts (bundled at compile time) — bootstrap only
     let question_prompts: &[(&str, &str)] = &[
-        ("enhance_question.md", include_str!("../../../chains/prompts/question/enhance_question.md")),
-        ("decompose.md", include_str!("../../../chains/prompts/question/decompose.md")),
-        ("decompose_delta.md", include_str!("../../../chains/prompts/question/decompose_delta.md")),
-        ("extraction_schema.md", include_str!("../../../chains/prompts/question/extraction_schema.md")),
+        (
+            "enhance_question.md",
+            include_str!("../../../chains/prompts/question/enhance_question.md"),
+        ),
+        (
+            "decompose.md",
+            include_str!("../../../chains/prompts/question/decompose.md"),
+        ),
+        (
+            "decompose_delta.md",
+            include_str!("../../../chains/prompts/question/decompose_delta.md"),
+        ),
+        (
+            "extraction_schema.md",
+            include_str!("../../../chains/prompts/question/extraction_schema.md"),
+        ),
     ];
     for (filename, content) in question_prompts {
         let path = chains_dir.join("prompts").join("question").join(filename);
@@ -585,8 +613,14 @@ pub fn ensure_default_chains(
 
     // Write shared prompts (bundled at compile time) — bootstrap only
     let shared_prompts: &[(&str, &str)] = &[
-        ("heal_json.md", include_str!("../../../chains/prompts/shared/heal_json.md")),
-        ("merge_sub_chunks.md", include_str!("../../../chains/prompts/shared/merge_sub_chunks.md")),
+        (
+            "heal_json.md",
+            include_str!("../../../chains/prompts/shared/heal_json.md"),
+        ),
+        (
+            "merge_sub_chunks.md",
+            include_str!("../../../chains/prompts/shared/merge_sub_chunks.md"),
+        ),
     ];
     for (filename, content) in shared_prompts {
         let path = chains_dir.join("prompts").join("shared").join(filename);
@@ -606,8 +640,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         std::fs::create_dir_all(dst)
             .with_context(|| format!("failed to create dir: {}", dst.display()))?;
     }
-    for entry in std::fs::read_dir(src)
-        .with_context(|| format!("failed to read dir: {}", src.display()))?
+    for entry in
+        std::fs::read_dir(src).with_context(|| format!("failed to read dir: {}", src.display()))?
     {
         let entry = entry?;
         let src_path = entry.path();
@@ -615,8 +649,13 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         if src_path.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
-            std::fs::write(&dst_path, std::fs::read(&src_path)?)
-                .with_context(|| format!("failed to copy {} → {}", src_path.display(), dst_path.display()))?;
+            std::fs::write(&dst_path, std::fs::read(&src_path)?).with_context(|| {
+                format!(
+                    "failed to copy {} → {}",
+                    src_path.display(),
+                    dst_path.display()
+                )
+            })?;
         }
     }
     Ok(())

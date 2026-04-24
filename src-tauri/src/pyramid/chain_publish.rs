@@ -143,8 +143,7 @@ pub async fn publish_chain_to_wire(
 
     // Publish to Wire
     let publisher = PyramidPublisher::new(wire_url, wire_auth);
-    let bundle_json = serde_json::to_value(&bundle)
-        .context("failed to serialize chain bundle")?;
+    let bundle_json = serde_json::to_value(&bundle).context("failed to serialize chain bundle")?;
 
     let title = format!("Chain: {} (v{})", chain_def.name, chain_def.version);
     let teaser = if chain_def.description.len() > 200 {
@@ -183,8 +182,9 @@ pub async fn publish_chain_to_wire(
                 handle_path.as_deref().unwrap_or(&wire_uuid),
                 &wire_uuid,
             )?;
-            let final_record = db::get_chain_publication(&conn, chain_id)?
-                .ok_or_else(|| anyhow::anyhow!("failed to read back chain publication after publish"))?;
+            let final_record = db::get_chain_publication(&conn, chain_id)?.ok_or_else(|| {
+                anyhow::anyhow!("failed to read back chain publication after publish")
+            })?;
             tracing::info!(
                 chain_id = chain_id,
                 wire_uuid = %wire_uuid,
@@ -234,12 +234,13 @@ pub fn fork_chain(
     // Write the forked chain YAML to variants/ directory
     let variants_dir = chains_dir.join("variants");
     if !variants_dir.exists() {
-        std::fs::create_dir_all(&variants_dir)
-            .with_context(|| format!("failed to create variants dir: {}", variants_dir.display()))?;
+        std::fs::create_dir_all(&variants_dir).with_context(|| {
+            format!("failed to create variants dir: {}", variants_dir.display())
+        })?;
     }
 
-    let new_yaml = serde_yaml::to_string(&chain_def)
-        .context("failed to serialize forked chain YAML")?;
+    let new_yaml =
+        serde_yaml::to_string(&chain_def).context("failed to serialize forked chain YAML")?;
 
     let new_path = variants_dir.join(format!("{}.yaml", new_chain_id));
     std::fs::write(&new_path, &new_yaml)
@@ -267,8 +268,7 @@ pub fn fork_chain(
 /// Find a chain YAML file by chain_id. Searches defaults/ then variants/.
 fn find_chain_file(chains_dir: &Path, chain_id: &str) -> Result<PathBuf> {
     // First try discovering all chains and matching by ID
-    let chains = discover_chains(chains_dir)
-        .with_context(|| "failed to discover chains")?;
+    let chains = discover_chains(chains_dir).with_context(|| "failed to discover chains")?;
 
     for meta in &chains {
         if meta.id == chain_id {
@@ -506,13 +506,8 @@ mod tests {
         db::save_chain_publication(&conn, &source).unwrap();
 
         // Fork it
-        db::fork_chain_publication(
-            &conn,
-            "conversation-default",
-            "conversation-custom",
-            "adam",
-        )
-        .unwrap();
+        db::fork_chain_publication(&conn, "conversation-default", "conversation-custom", "adam")
+            .unwrap();
 
         // Check the fork record
         let fork = db::get_chain_publication(&conn, "conversation-custom")
@@ -564,7 +559,10 @@ mod tests {
         assert_eq!(list.len(), 2, "should list one entry per chain_id");
 
         // conversation-default should be at version 2 (latest)
-        let conv = list.iter().find(|p| p.chain_id == "conversation-default").unwrap();
+        let conv = list
+            .iter()
+            .find(|p| p.chain_id == "conversation-default")
+            .unwrap();
         assert_eq!(conv.version, 2);
 
         // code-default should be at version 1

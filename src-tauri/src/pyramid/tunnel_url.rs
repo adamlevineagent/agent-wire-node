@@ -121,10 +121,7 @@ impl TunnelUrl {
             self.0.scheme(),
             // host_str is Some(_) by construction — parse() rejects missing host.
             self.0.host_str().unwrap(),
-            self.0
-                .port()
-                .map(|p| format!(":{}", p))
-                .unwrap_or_default(),
+            self.0.port().map(|p| format!(":{}", p)).unwrap_or_default(),
             absolute_path
         )
     }
@@ -301,8 +298,7 @@ mod tests {
 
     #[test]
     fn authority_returns_scheme_host_port() {
-        let t = TunnelUrl::parse("https://example.com:8443/ignored")
-            .expect("should parse");
+        let t = TunnelUrl::parse("https://example.com:8443/ignored").expect("should parse");
         let (scheme, host, port) = t.authority();
         assert_eq!(scheme, "https");
         assert_eq!(host, Some("example.com"));
@@ -345,7 +341,10 @@ mod tests {
     #[test]
     fn deserialize_rejects_missing_scheme() {
         let r: Result<TunnelUrl, _> = serde_json::from_str("\"example.com\"");
-        assert!(r.is_err(), "expected deserialize failure for missing scheme");
+        assert!(
+            r.is_err(),
+            "expected deserialize failure for missing scheme"
+        );
     }
 
     #[test]

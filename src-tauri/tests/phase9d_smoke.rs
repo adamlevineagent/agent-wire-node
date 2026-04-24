@@ -431,9 +431,6 @@ async fn mocked_llm_config(base_url: String) -> wire_node_lib::pyramid::llm::Llm
     wire_node_lib::pyramid::llm::LlmConfig {
         api_key: "sk-or-test-p9d".into(),
         auth_token: String::new(),
-        primary_model: "openai/gpt-4o-mini".into(),
-        fallback_model_1: "openai/gpt-4o-mini".into(),
-        fallback_model_2: "openai/gpt-4o-mini".into(),
         provider_registry: Some(registry),
         dispatch_policy: Some(policy),
         provider_pools: Some(pools),

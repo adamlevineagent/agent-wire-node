@@ -138,12 +138,7 @@ async fn sweep_bucket(bucket: &Bucket, max_age: Duration) {
 /// Mutate-and-test a bucket entry. Returns `Ok(())` if the request fits in
 /// the current window, `Err(retry_after_seconds)` if it would exceed the
 /// limit.
-async fn hit_bucket(
-    bucket: &Bucket,
-    key: &str,
-    limit: u32,
-    window: Duration,
-) -> Result<(), u64> {
+async fn hit_bucket(bucket: &Bucket, key: &str, limit: u32, window: Duration) -> Result<(), u64> {
     let now = Instant::now();
     let mut map = bucket.lock().await;
     let entry = map.entry(key.to_string()).or_insert(BucketEntry {

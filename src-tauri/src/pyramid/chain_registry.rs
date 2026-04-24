@@ -118,9 +118,8 @@ pub fn remove_assignment(conn: &Connection, slug: &str) -> Result<()> {
 
 /// List all per-slug assignments. Returns Vec of (slug, chain_id).
 pub fn list_assignments(conn: &Connection) -> Result<Vec<(String, String)>> {
-    let mut stmt = conn.prepare(
-        "SELECT slug, chain_id FROM pyramid_chain_assignments ORDER BY slug",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT slug, chain_id FROM pyramid_chain_assignments ORDER BY slug")?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -147,8 +146,17 @@ pub fn upsert_chain_defaults(
          VALUES (?1, ?2, ?3, ?4)",
     )?;
     for m in mappings {
-        let evidence_mode = if m.evidence_mode.is_empty() { "*" } else { &m.evidence_mode };
-        stmt.execute(rusqlite::params![m.content_type, evidence_mode, m.chain_id, contribution_id])?;
+        let evidence_mode = if m.evidence_mode.is_empty() {
+            "*"
+        } else {
+            &m.evidence_mode
+        };
+        stmt.execute(rusqlite::params![
+            m.content_type,
+            evidence_mode,
+            m.chain_id,
+            contribution_id
+        ])?;
     }
     Ok(())
 }

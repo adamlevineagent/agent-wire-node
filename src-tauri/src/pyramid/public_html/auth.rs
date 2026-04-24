@@ -76,10 +76,7 @@ pub enum PublicAuthSource {
 /// `x-forwarded-for`) are ONLY honored when the immediate peer is on a
 /// loopback interface — i.e. behind a known local reverse proxy / tunnel.
 /// Otherwise we use the raw peer ip and ignore any forged forwarded headers.
-pub fn client_key(
-    headers: &warp::http::HeaderMap,
-    peer: Option<std::net::SocketAddr>,
-) -> String {
+pub fn client_key(headers: &warp::http::HeaderMap, peer: Option<std::net::SocketAddr>) -> String {
     let peer_is_loopback = peer.map(|p| p.ip().is_loopback()).unwrap_or(false);
     if peer_is_loopback {
         if let Some(v) = headers
@@ -145,12 +142,7 @@ fn epoch_minute_div5() -> u64 {
         .unwrap_or(0)
 }
 
-fn csrf_nonce_at(
-    secret: &[u8; 32],
-    session_token: &str,
-    slug: &str,
-    window: u64,
-) -> String {
+fn csrf_nonce_at(secret: &[u8; 32], session_token: &str, slug: &str, window: u64) -> String {
     let msg = format!("{}:{}:{}", session_token, slug, window);
     let mac = hmac_sha256(secret, msg.as_bytes());
     hex::encode(mac)
@@ -166,12 +158,7 @@ pub fn csrf_nonce(secret: &[u8; 32], session_token: &str, slug: &str) -> String 
 
 /// Constant-time CSRF verification accepting the current OR previous
 /// 5-minute window (so a nonce minted near a boundary still passes).
-pub fn verify_csrf(
-    secret: &[u8; 32],
-    nonce: &str,
-    session_token: &str,
-    slug: &str,
-) -> bool {
+pub fn verify_csrf(secret: &[u8; 32], nonce: &str, session_token: &str, slug: &str) -> bool {
     let window = epoch_minute_div5();
     let cur = csrf_nonce_at(secret, session_token, slug, window);
     if ct_eq(nonce, &cur) {
@@ -307,12 +294,9 @@ pub fn with_public_or_session_auth(
                     if !wire_token.is_empty() {
                         let session_opt = {
                             let conn = state.reader.lock().await;
-                            crate::pyramid::public_html::web_sessions::lookup(
-                                &conn,
-                                &wire_token,
-                            )
-                            .ok()
-                            .flatten()
+                            crate::pyramid::public_html::web_sessions::lookup(&conn, &wire_token)
+                                .ok()
+                                .flatten()
                         };
                         if let Some(sess) = session_opt {
                             // Owner-mode sentinel: web_sessions rows minted by
@@ -327,8 +311,8 @@ pub fn with_public_or_session_auth(
                             {
                                 return Ok(PublicAuthSource::LocalOperator);
                             }
-                            let anon_tok = read_cookie(&headers, ANON_SESSION_COOKIE)
-                                .unwrap_or_default();
+                            let anon_tok =
+                                read_cookie(&headers, ANON_SESSION_COOKIE).unwrap_or_default();
                             return Ok(PublicAuthSource::WebSession {
                                 user_id: sess.supabase_user_id,
                                 email: sess.email,
@@ -465,7 +449,9 @@ mod tests {
         let mut h = warp::http::HeaderMap::new();
         h.insert(
             "cookie",
-            "anon_session=abc; wire_session=xyz; foo=bar".parse().unwrap(),
+            "anon_session=abc; wire_session=xyz; foo=bar"
+                .parse()
+                .unwrap(),
         );
         assert_eq!(read_cookie(&h, "anon_session"), Some("abc".to_string()));
         assert_eq!(read_cookie(&h, "wire_session"), Some("xyz".to_string()));

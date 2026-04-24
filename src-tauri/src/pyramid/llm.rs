@@ -37,6 +37,140 @@ use super::step_context::{
     StepContext,
 };
 use super::types::TokenUsage;
+use super::walker_resolver::ProviderType as WalkerProviderType;
+
+// ── Walker v3 DispatchDecision accessors (Phase 1 W2a consumer migration) ────
+//
+// Phase 1 W2a (plan §6) migrated read sites of legacy model/context
+// fields onto the Decision spine (`StepContext.dispatch_decision`).
+// W3c (this phase) deleted the legacy `LlmConfig.primary_model`,
+// `fallback_model_{1,2}`, `primary_context_limit`, and
+// `fallback_1_context_limit` fields; the Decision is now the sole
+// runtime source. Sites that previously chained
+// `.unwrap_or_else(|| config.primary_model.clone())` now either
+//   - stamp `"<unknown>"` with a tracing::warn (provenance strings), or
+//   - return `Err(EntryError::RouteSkipped)` / `continue` (dispatch paths).
+//
+// These helpers cover only the reads that repeat ≥3× in this file.
+// Open-coded site-specific shapes (e.g. context-cascade at the HTTP
+// retry loop) stay inline because adding parameters to a helper for a
+// single caller just hides the cascade mechanics.
+
+/// Pull the first entry of the OpenRouter `model_list` from the
+/// current `DispatchDecision`, if one is attached. Returns `None` if
+/// no Decision is attached, or if the Decision has no OpenRouter
+/// per-provider params, or if that params row has no `model_list`.
+/// Callers decide what `None` means for their context — `<unknown>`
+/// for provenance stamps, RouteSkipped for dispatch sites.
+fn first_provider_model_from_decision(
+    step_ctx: Option<&StepContext>,
+    provider_type: WalkerProviderType,
+) -> Option<String> {
+    step_ctx
+        .and_then(|c| c.dispatch_decision.as_ref())
+        .and_then(|d| d.per_provider.get(&provider_type))
+        .and_then(|p| p.model_list.as_ref())
+        .and_then(|ml| ml.first().cloned())
+}
+
+fn first_openrouter_model_from_decision(step_ctx: Option<&StepContext>) -> Option<String> {
+    first_provider_model_from_decision(step_ctx, WalkerProviderType::OpenRouter)
+}
+
+fn audit_response_parsed_ok(
+    audit: Option<&AuditContext>,
+    response_format: Option<&serde_json::Value>,
+    content: &str,
+) -> bool {
+    let expects_json = response_format.is_some()
+        || audit
+            .map(|a| matches!(a.call_purpose.as_str(), "chain_dispatch" | "ir_dispatch"))
+            .unwrap_or(false);
+
+    if expects_json {
+        extract_json(content).is_ok()
+    } else {
+        true
+    }
+}
+
+/// Clone the full OpenRouter `model_list` from the current
+/// `DispatchDecision`. Used by sites that need the whole cascade
+/// (context-exceeded model promotion / context-limit lookup).
+fn provider_model_list_from_decision(
+    step_ctx: Option<&StepContext>,
+    provider_type: WalkerProviderType,
+) -> Option<Vec<String>> {
+    step_ctx
+        .and_then(|c| c.dispatch_decision.as_ref())
+        .and_then(|d| d.per_provider.get(&provider_type))
+        .and_then(|p| p.model_list.clone())
+}
+
+/// Pull the per-provider `context_limit` from the current
+/// `DispatchDecision` for OpenRouter. Returns `None` when the
+/// Decision is absent or the field was unresolved. Paired with the
+/// legacy `config.primary_context_limit` fallback at the call site.
+fn provider_context_limit_from_decision(
+    step_ctx: Option<&StepContext>,
+    provider_type: WalkerProviderType,
+) -> Option<u64> {
+    step_ctx
+        .and_then(|c| c.dispatch_decision.as_ref())
+        .and_then(|d| d.per_provider.get(&provider_type))
+        .and_then(|p| p.context_limit)
+}
+
+fn openrouter_context_limit_from_decision(step_ctx: Option<&StepContext>) -> Option<u64> {
+    provider_context_limit_from_decision(step_ctx, WalkerProviderType::OpenRouter)
+}
+
+/// Phase 5 §C: consult the Decision's `on_partial_failure` policy at
+/// a walker-loop post-failure point. Returns `true` when the policy
+/// is `FailLoud` and the walker should emit
+/// `dispatch_failed_policy_blocked` and bubble a terminal instead of
+/// cascading. Returns `false` for `Cascade` (default, existing
+/// behavior) and for `RetrySame` (walker-level retries inside the
+/// cascade loop spin without meaningful provider-side retry
+/// semantics; the per-provider dispatchers already handle their own
+/// retry budgets — see dispatch_market_entry's saturation retry).
+///
+/// `RetrySame` degrading to `FailLoud` when the breaker is tripped is
+/// handled in `walker_breaker::on_partial_failure_action`. This
+/// helper is the llm-side wiring that consumes that decision.
+fn check_fail_loud_stops(
+    step_ctx: Option<&StepContext>,
+    provider_type: WalkerProviderType,
+) -> bool {
+    use crate::pyramid::walker_breaker::{on_partial_failure_action, PartialFailureAction};
+    let Some(ctx) = step_ctx else { return false };
+    let Some(decision) = ctx.dispatch_decision.as_ref() else {
+        return false;
+    };
+    let breaker_reset = decision
+        .per_provider
+        .get(&provider_type)
+        .map(|p| p.breaker_reset)
+        .unwrap_or(crate::pyramid::walker_resolver::BreakerReset::PerBuild);
+    let build_id_opt = if ctx.build_id.is_empty() {
+        None
+    } else {
+        Some(ctx.build_id.as_str())
+    };
+    let slot = if ctx.model_tier.is_empty() {
+        &decision.slot
+    } else {
+        &ctx.model_tier
+    };
+    let action = on_partial_failure_action(
+        decision.on_partial_failure,
+        build_id_opt,
+        slot,
+        provider_type,
+        breaker_reset,
+    );
+    matches!(action, PartialFailureAction::FailLoud)
+}
 
 // ── Global rate limiter: configurable sliding window ────────────────────────
 
@@ -106,21 +240,32 @@ async fn rate_limit_wait(max_requests: usize, window_secs: f64) {
 // All emitters are fire-and-forget: they do not block the walker on DB
 // write, matching the existing `emit_network_*` pattern.
 
-fn walker_chronicle_db_path(
-    ctx: Option<&StepContext>,
-    config: &LlmConfig,
-) -> Option<String> {
-    ctx.map(|c| c.db_path.clone())
-        .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()))
+fn walker_chronicle_db_path(ctx: Option<&StepContext>, config: &LlmConfig) -> Option<String> {
+    ctx.map(|c| c.db_path.clone()).or_else(|| {
+        config
+            .cache_access
+            .as_ref()
+            .map(|ca| ca.db_path.to_string())
+    })
 }
 
-fn walker_resolved_model(
-    ctx: Option<&StepContext>,
-    config: &LlmConfig,
-) -> String {
+fn walker_resolved_model(ctx: Option<&StepContext>, _config: &LlmConfig) -> String {
+    // W3c: Decision is now the sole source. Legacy
+    // `config.primary_model` fallback deleted. When neither a
+    // step-local resolved_model_id nor the Decision's OpenRouter slot
+    // carries a model, stamp a loud sentinel — provenance rows go
+    // out with "<unknown>" so operator telemetry can spot gaps, but
+    // dispatch doesn't silently pick up a stale default.
     ctx.and_then(|c| c.resolved_model_id.clone())
         .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| config.primary_model.clone())
+        .or_else(|| first_openrouter_model_from_decision(ctx))
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                event = "walker_resolved_model_unknown",
+                "walker-v3: walker_resolved_model found no Decision / resolved_model_id; stamping '<unknown>' for provenance",
+            );
+            "<unknown>".to_string()
+        })
 }
 
 /// Map a walker-market classified `reason` slug to its specific
@@ -143,7 +288,10 @@ fn map_market_slug_to_specific_event(reason: &str) -> Option<&'static str> {
     // auth reasons produced by `read_api_creds` on 401. Match on the
     // leading token so reasons carrying extra context (e.g.
     // "unknown_slug:foo") still match the primary slug.
-    let primary = reason.split(|c: char| c == ':' || c == '(').next().unwrap_or(reason);
+    let primary = reason
+        .split(|c: char| c == ':' || c == '(')
+        .next()
+        .unwrap_or(reason);
     match primary {
         // /purchase 401 `quote_jwt_expired` (or bare `quote_expired`).
         "quote_jwt_expired" | "quote_expired" => {
@@ -156,9 +304,7 @@ fn map_market_slug_to_specific_event(reason: &str) -> Option<&'static str> {
         // /quote 409 `budget_exceeded`. Also emitted from the
         // MarketSurfaceCache pre-quote rate check when that gains a
         // per-entry `max_budget_credits` to compare against.
-        "budget_exceeded" => {
-            Some(super::compute_chronicle::EVENT_NETWORK_RATE_ABOVE_BUDGET)
-        }
+        "budget_exceeded" => Some(super::compute_chronicle::EVENT_NETWORK_RATE_ABOVE_BUDGET),
         // /fill 409 `dispatch_deadline_exceeded` — reservation expired.
         "dispatch_deadline_exceeded" => {
             Some(super::compute_chronicle::EVENT_NETWORK_DISPATCH_DEADLINE_MISSED)
@@ -176,10 +322,9 @@ fn map_market_slug_to_specific_event(reason: &str) -> Option<&'static str> {
         // Any 401-level auth failure across the three stages —
         // stage-tagged reasons from `read_api_creds` plus Wire's
         // explicit 401 slug `unauthorized`.
-        "quote_auth_failed"
-        | "purchase_auth_failed"
-        | "fill_auth_failed"
-        | "unauthorized" => Some(super::compute_chronicle::EVENT_NETWORK_AUTH_EXPIRED),
+        "quote_auth_failed" | "purchase_auth_failed" | "fill_auth_failed" | "unauthorized" => {
+            Some(super::compute_chronicle::EVENT_NETWORK_AUTH_EXPIRED)
+        }
         _ => None,
     }
 }
@@ -195,22 +340,30 @@ fn emit_walker_chronicle(
     let Some(db_path) = walker_chronicle_db_path(ctx, config) else {
         return;
     };
-    let model_id = walker_resolved_model(ctx, config);
-    let job_path = super::compute_chronicle::generate_job_path(
-        ctx, None, &model_id, source,
-    );
+    let metadata_model_id = metadata
+        .get("model_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let model_id = metadata_model_id.unwrap_or_else(|| walker_resolved_model(ctx, config));
+    let job_path = super::compute_chronicle::generate_job_path(ctx, None, &model_id, source);
     let source_owned = source.to_string();
     let entry_owned = entry_provider_id.to_string();
     let chronicle_ctx = if let Some(sc) = ctx {
         super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-            sc, &job_path, event_type, &source_owned,
+            sc,
+            &job_path,
+            event_type,
+            &source_owned,
         )
     } else {
         super::compute_chronicle::ChronicleEventContext::minimal(
-            &job_path, event_type, &source_owned,
+            &job_path,
+            event_type,
+            &source_owned,
         )
-        .with_model_id(model_id.clone())
-    };
+    }
+    .with_model_id(model_id.clone());
     // Merge entry_provider_id + model_id into metadata so queries can filter
     // by either without every call site duplicating those fields.
     let mut meta = metadata;
@@ -282,18 +435,26 @@ async fn dispatch_fleet_entry(
         response_format,
     } = args;
 
-    let fleet_job_path = super::compute_chronicle::generate_job_path(
-        ctx, None, &config.primary_model, "fleet",
-    );
-    let fleet_start = std::time::Instant::now();
-    let fleet_db_path = ctx
-        .map(|c| c.db_path.clone())
-        .or_else(|| {
-            config
-                .cache_access
-                .as_ref()
-                .map(|ca| ca.db_path.to_string())
+    // W3c: Decision is the sole source of the fleet chronicle
+    // model label. `<unknown>` is stamped when Decision is absent;
+    // dispatch itself does not depend on this value.
+    let fleet_label_model = first_provider_model_from_decision(ctx, WalkerProviderType::Fleet)
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                event = "fleet_label_model_unknown",
+                "walker-v3: no Decision fleet model for fleet chronicle label; stamping '<unknown>'",
+            );
+            "<unknown>".to_string()
         });
+    let fleet_job_path =
+        super::compute_chronicle::generate_job_path(ctx, None, &fleet_label_model, "fleet");
+    let fleet_start = std::time::Instant::now();
+    let fleet_db_path = ctx.map(|c| c.db_path.clone()).or_else(|| {
+        config
+            .cache_access
+            .as_ref()
+            .map(|ca| ca.db_path.to_string())
+    });
 
     // Clamp to at least 1s — a zero would cause the orphan sweep to evict
     // the entry on its first tick, before the callback can arrive.
@@ -303,8 +464,7 @@ async fn dispatch_fleet_entry(
 
     // Oneshot channel — filled by server.rs /v1/fleet/result handler when
     // the peer's callback arrives, or dropped by the orphan sweep.
-    let (sender, receiver) =
-        tokio::sync::oneshot::channel::<crate::fleet::FleetAsyncResult>();
+    let (sender, receiver) = tokio::sync::oneshot::channel::<crate::fleet::FleetAsyncResult>();
 
     // Register pending entry BEFORE dispatch POST so a very-fast peer
     // callback cannot beat our registration and produce a spurious orphan.
@@ -335,28 +495,32 @@ async fn dispatch_fleet_entry(
     )
     .await;
 
-    let spawn_chronicle =
-        |event_type: &'static str, metadata: serde_json::Value| {
-            if let Some(ref db_path) = fleet_db_path {
-                let db_path = db_path.clone();
-                let chronicle_ctx = if let Some(sc) = ctx {
-                    super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-                        sc, &fleet_job_path, event_type, "fleet",
-                    )
-                } else {
-                    super::compute_chronicle::ChronicleEventContext::minimal(
-                        &fleet_job_path, event_type, "fleet",
-                    )
-                    .with_model_id(config.primary_model.clone())
-                };
-                let chronicle_ctx = chronicle_ctx.with_metadata(metadata);
-                tokio::task::spawn_blocking(move || {
-                    if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                        let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
-                    }
-                });
-            }
-        };
+    let spawn_chronicle = |event_type: &'static str, metadata: serde_json::Value| {
+        if let Some(ref db_path) = fleet_db_path {
+            let db_path = db_path.clone();
+            let chronicle_ctx = if let Some(sc) = ctx {
+                super::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                    sc,
+                    &fleet_job_path,
+                    event_type,
+                    "fleet",
+                )
+            } else {
+                super::compute_chronicle::ChronicleEventContext::minimal(
+                    &fleet_job_path,
+                    event_type,
+                    "fleet",
+                )
+                .with_model_id(fleet_label_model.clone())
+            };
+            let chronicle_ctx = chronicle_ctx.with_metadata(metadata);
+            tokio::task::spawn_blocking(move || {
+                if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                    let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                }
+            });
+        }
+    };
 
     match dispatch_result {
         Ok(ack) => {
@@ -424,7 +588,9 @@ async fn dispatch_fleet_entry(
                         actual_cost_usd: None, // fleet is free (same operator)
                         provider_id: Some("fleet".to_string()),
                         fleet_peer_id: Some(
-                            peer.handle_path.clone().unwrap_or_else(|| peer.node_id.clone()),
+                            peer.handle_path
+                                .clone()
+                                .unwrap_or_else(|| peer.node_id.clone()),
                         ),
                         fleet_peer_model: fleet_resp.peer_model.clone(),
                     })
@@ -578,21 +744,42 @@ struct MarketDispatchArgs<'a> {
     market_ctx: &'a crate::pyramid::compute_market_ctx::ComputeMarketRequesterContext,
     model_id: String,
     max_budget: i64,
-    /// Safety-rail timeout for the /fill await when Wire's
-    /// `dispatch_deadline_at` can't be parsed (should never happen in
-    /// practice; defensive fallback only). Canonical path uses
-    /// `purchase_resp.dispatch_deadline_at + small grace` — see
-    /// [compute-market-saturation-decisions-2026-04-21.md D3]: the
-    /// deadline is a load-bearing economic contract, not a node-local
-    /// timer.
+    /// Configured post-fill wait budget for a purchased market job.
+    /// This is user-tunable via `compute_participation_policy.
+    /// market_dispatch_max_wait_ms`; fallbacks must wait this long
+    /// before treating an accepted market job as dead.
     max_wait_ms: u64,
+    retry_http_count: u32,
     /// Wall-clock patience budget per chunk for the saturation-retry
-    /// loop. Drawn from
-    /// `compute_participation_policy.market_saturation_patience_secs`.
+    /// loop. Walker v3 Phase 3 sources this from the DispatchDecision's
+    /// per_provider[Market].patience_secs (SYSTEM_DEFAULT 3600), falling
+    /// back to `compute_participation_policy.market_saturation_patience_secs`
+    /// only when no Decision is in scope (legacy preview paths).
+    ///
     /// When the cumulative backoff across retries exceeds this,
     /// `dispatch_market_entry` bubbles RouteSkipped with reason
     /// `market_saturation_patience_exhausted` and the cascade advances.
     market_saturation_patience_secs: u64,
+    /// Walker v3 Phase 3: if true, the saturation-retry patience clock
+    /// resets every time walker re-quotes with a different `model_id`
+    /// (e.g. after cascading through a multi-slug model_list). If
+    /// false (SYSTEM_DEFAULT), the patience clock is cumulative across
+    /// all retries for the chunk.
+    ///
+    /// Currently `dispatch_market_entry` is invoked per-model-slug from
+    /// the walker's outer loop, so this parameter is consumed there
+    /// (not inside the saturation loop). The field is threaded through
+    /// for chronicle visibility and to keep the plumbing consistent
+    /// with §3's "Decision carries all params" contract.
+    patience_clock_resets_per_model: bool,
+    /// Walker v3 Phase 3 consumer: the resolver-supplied breaker_reset
+    /// variant. Phase 3 only THREADS this through — Phase 5 owns the
+    /// per-build circuit breaker state machine; when that lands it
+    /// reads `args.breaker_reset` to decide whether a failure trips
+    /// the breaker permanently (`PerBuild`), on the next probe
+    /// (`ProbeBased`), or after a timer (`TimeSecs`).
+    #[allow(dead_code)]
+    breaker_reset: crate::pyramid::walker_resolver::BreakerReset,
     max_tokens: i64,
     temperature: f32,
     input_tokens_est: i64,
@@ -610,11 +797,6 @@ struct MarketDispatchArgs<'a> {
 /// that a fresh-offer cohort drains within a few retries, long enough
 /// not to hammer Wire."
 const SATURATION_BACKOFF_FALLBACK_MS: u64 = 15_000;
-
-/// Grace appended to Wire's `dispatch_deadline_at` when computing
-/// walker's /fill-await tokio timeout. Covers clock skew + callback
-/// transit latency between provider → Wire → requester tunnel.
-const DISPATCH_DEADLINE_GRACE_SECS: u64 = 10;
 
 /// If `err` is `all_offers_saturated_for_model` (per body.error slug),
 /// return Some(Duration) to back off before re-quoting. Walker should
@@ -638,11 +820,7 @@ fn saturation_backoff_from_api_err(
     // The slug check is a belt-and-suspenders against header-stripping
     // proxies. Under the canonical Wire path, X-Wire-Retry: transient
     // also pairs with the slug; either signal alone is enough here.
-    let slug = err
-        .body
-        .get("error")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let slug = err.body.get("error").and_then(|v| v.as_str()).unwrap_or("");
     if slug != "all_offers_saturated_for_model" {
         return None;
     }
@@ -701,18 +879,37 @@ async fn apply_saturation_backoff(
     true
 }
 
-/// Parse Wire's `dispatch_deadline_at` (RFC 3339 UTC) into a Duration
-/// from now. Returns None on parse failure or if the deadline is
-/// already in the past; caller falls back to the safety-rail
-/// max_wait_ms.
-fn duration_until_deadline(dispatch_deadline_at: &str) -> Option<std::time::Duration> {
-    let deadline = chrono::DateTime::parse_from_rfc3339(dispatch_deadline_at).ok()?;
-    let now = chrono::Utc::now();
-    let delta = deadline.with_timezone(&chrono::Utc).signed_duration_since(now);
-    if delta.num_milliseconds() <= 0 {
-        return None;
+fn market_result_wait_timeout(max_wait_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(max_wait_ms.max(1))
+}
+
+fn market_response_model_id(response: &LlmResponse) -> Option<&str> {
+    response
+        .provider_id
+        .as_deref()
+        .and_then(|provider_id| provider_id.strip_prefix("market:"))
+        .filter(|model_id| !model_id.is_empty())
+}
+
+fn is_quote_expired_slug(slug: &str) -> bool {
+    matches!(slug, "quote_jwt_expired" | "quote_expired")
+}
+
+fn fill_error_may_have_accepted_job(api_err: &crate::http_utils::ApiErrorWithHints) -> bool {
+    if api_err.status == 0 {
+        return true;
     }
-    delta.to_std().ok()
+
+    if !(500..=599).contains(&api_err.status) {
+        return false;
+    }
+
+    let slug = api_err
+        .body
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    slug.is_empty() || slug.trim_start().starts_with('<')
 }
 
 async fn dispatch_market_entry(
@@ -727,7 +924,10 @@ async fn dispatch_market_entry(
         model_id,
         max_budget,
         max_wait_ms,
+        retry_http_count,
         market_saturation_patience_secs,
+        patience_clock_resets_per_model: _patience_clock_resets_per_model,
+        breaker_reset: _breaker_reset,
         max_tokens,
         temperature,
         input_tokens_est,
@@ -746,6 +946,7 @@ async fn dispatch_market_entry(
     let patience_deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(market_saturation_patience_secs);
     let mut saturation_attempt: u32 = 0;
+    let mut quote_expiry_attempt: u32 = 0;
 
     // Snapshot node_id from AuthState — canonical runtime identity,
     // populated at registration and kept live via heartbeat/session.
@@ -782,7 +983,7 @@ async fn dispatch_market_entry(
     // and re-enters the loop. /fill and onward are post-loop — once
     // we've successfully /purchased, the job is reserved and
     // execution proceeds.
-    let (quote_resp, purchase_resp) = loop {
+    let (_quote_resp, purchase_resp) = loop {
         // ── /quote ────────────────────────────────────────────────────
         let quote_body = cqf::ComputeQuoteBody {
             model_id: model_id.clone(),
@@ -799,6 +1000,30 @@ async fn dispatch_market_entry(
         let quote_resp = match cqf::quote(&market_ctx.auth, &market_ctx.config, quote_body).await {
             Ok(r) => r,
             Err(api_err) => {
+                let slug = api_err
+                    .body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if is_quote_expired_slug(slug) && quote_expiry_attempt < retry_http_count {
+                    quote_expiry_attempt += 1;
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_NETWORK_QUOTE_EXPIRED,
+                        walker_source_label,
+                        entry_provider_id,
+                        serde_json::json!({
+                            "reason": slug,
+                            "branch": "market",
+                            "classification": "retry_same_market",
+                            "attempt": quote_expiry_attempt,
+                            "max_attempts": retry_http_count,
+                            "model_id": model_id.as_str(),
+                        }),
+                    );
+                    continue;
+                }
                 if let Some(backoff) = saturation_backoff_from_api_err(&api_err) {
                     saturation_attempt += 1;
                     let min_drain_ms = api_err
@@ -843,7 +1068,7 @@ async fn dispatch_market_entry(
                 "reservation_fee": quote_resp.price_breakdown.reservation_fee,
                 "estimated_total": quote_resp.price_breakdown.estimated_total,
                 "queue_position": quote_resp.price_breakdown.queue_position,
-                "model_id": model_id,
+                "model_id": model_id.as_str(),
             }),
         );
 
@@ -879,6 +1104,30 @@ async fn dispatch_market_entry(
         {
             Ok(r) => r,
             Err(api_err) => {
+                let slug = api_err
+                    .body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if is_quote_expired_slug(slug) && quote_expiry_attempt < retry_http_count {
+                    quote_expiry_attempt += 1;
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_NETWORK_QUOTE_EXPIRED,
+                        walker_source_label,
+                        entry_provider_id,
+                        serde_json::json!({
+                            "reason": slug,
+                            "branch": "market",
+                            "classification": "retry_same_market",
+                            "attempt": quote_expiry_attempt,
+                            "max_attempts": retry_http_count,
+                            "model_id": model_id.as_str(),
+                        }),
+                    );
+                    continue;
+                }
                 if let Some(backoff) = saturation_backoff_from_api_err(&api_err) {
                     saturation_attempt += 1;
                     let min_drain_ms = api_err
@@ -923,7 +1172,7 @@ async fn dispatch_market_entry(
             "request_id": purchase_resp.request_id,
             "job_id": purchase_resp.job_id,
             "dispatch_deadline_at": purchase_resp.dispatch_deadline_at,
-            "model_id": model_id,
+            "model_id": model_id.as_str(),
         }),
     );
 
@@ -946,7 +1195,11 @@ async fn dispatch_market_entry(
             messages,
             // Absence means "use max_tokens_quoted" per rev 2.1 spec §2.3;
             // we only pass a ceiling when the caller explicitly set one.
-            max_tokens: if max_tokens > 0 { Some(max_tokens) } else { None },
+            max_tokens: if max_tokens > 0 {
+                Some(max_tokens)
+            } else {
+                None
+            },
             temperature,
             relay_count: 0,
             privacy_tier: "direct".to_string(),
@@ -957,38 +1210,56 @@ async fn dispatch_market_entry(
         idempotency_key: purchase_resp.request_id.clone(),
     };
 
-    // Fire /fill; on error the registered rx is dropped when this fn
-    // returns (we also explicitly take() below for timeouts inside
-    // await_result). If /fill errors, clean up the pending entry so a
-    // late push hits already_settled.
+    // Fire /fill. Some transport/5xx failures are ambiguous: Wire may
+    // have accepted and dispatched the job, but the response path failed
+    // on the way back to us. In that case keep the pending waiter alive
+    // and give the market result the configured budget before fallbacks
+    // are allowed to run.
     if let Err(api_err) = cqf::fill(&market_ctx.auth, &market_ctx.config, fill_request).await {
-        let _ = market_ctx.pending_jobs.take(&purchase_resp.uuid_job_id).await;
+        if fill_error_may_have_accepted_job(&api_err) {
+            tracing::warn!(
+                uuid_job_id = %purchase_resp.uuid_job_id,
+                status = api_err.status,
+                body = %api_err.body,
+                max_wait_ms,
+                "ambiguous /fill failure after purchase; waiting for possible market result",
+            );
+            return cqf::await_result(
+                rx,
+                &purchase_resp.uuid_job_id,
+                &market_ctx.pending_jobs,
+                market_result_wait_timeout(max_wait_ms),
+            )
+            .await;
+        }
+        let _ = market_ctx
+            .pending_jobs
+            .take(&purchase_resp.uuid_job_id)
+            .await;
         return Err(cqf::classify_wire_error(&api_err, "fill"));
     }
 
     // ── Await oneshot ────────────────────────────────────────────────
     //
-    // Canonical deadline (per D3): parse Wire's
-    // `purchase_resp.dispatch_deadline_at` (RFC 3339) and await until
-    // that + a small grace (DISPATCH_DEADLINE_GRACE_SECS). Wire owns
-    // the deadline; walker has no independent timer.
-    //
-    // Fallback: if the deadline string fails to parse (shouldn't
-    // happen in practice — Wire always emits RFC 3339 UTC — but we're
-    // defensive), use the legacy `max_wait_ms` safety rail so the
-    // await doesn't become unbounded. A parse failure also logs a
-    // warning so operators notice the contract drift.
-    let timeout = match duration_until_deadline(&purchase_resp.dispatch_deadline_at) {
-        Some(d) => d + std::time::Duration::from_secs(DISPATCH_DEADLINE_GRACE_SECS),
-        None => {
-            tracing::warn!(
-                dispatch_deadline_at = %purchase_resp.dispatch_deadline_at,
-                "dispatch_deadline_at parse failed or already elapsed; falling back to max_wait_ms safety rail",
-            );
-            std::time::Duration::from_millis(max_wait_ms)
-        }
-    };
-    cqf::await_result(rx, &purchase_resp.uuid_job_id, &market_ctx.pending_jobs, timeout).await
+    // `/fill` returned Ok, so Wire/provider accepted the dispatch. From
+    // this point on, fallbacks must wait the operator's configured
+    // market result budget before considering the job dead. Wire's
+    // `dispatch_deadline_at` is the fill-admission/reservation deadline,
+    // not the requester-side result timeout.
+    let timeout = market_result_wait_timeout(max_wait_ms);
+    tracing::debug!(
+        uuid_job_id = %purchase_resp.uuid_job_id,
+        dispatch_deadline_at = %purchase_resp.dispatch_deadline_at,
+        max_wait_ms,
+        "awaiting accepted market job using configured market wait budget",
+    );
+    cqf::await_result(
+        rx,
+        &purchase_resp.uuid_job_id,
+        &market_ctx.pending_jobs,
+        timeout,
+    )
+    .await
 }
 
 // ── Response types ───────────────────────────────────────────────────────────
@@ -1029,11 +1300,6 @@ pub struct LlmResponse {
 pub struct LlmConfig {
     pub api_key: String,
     pub auth_token: String,
-    pub primary_model: String,
-    pub fallback_model_1: String,
-    pub fallback_model_2: String,
-    pub primary_context_limit: usize,
-    pub fallback_1_context_limit: usize,
     /// Max retry attempts for LLM calls (loaded from Tier1Config).
     pub max_retries: u32,
     /// Base timeout in seconds for LLM calls (loaded from Tier2Config).
@@ -1113,7 +1379,8 @@ pub struct LlmConfig {
     /// branch is skipped and execution falls through to pool
     /// acquisition. See
     /// `docs/plans/call-model-unified-market-integration.md` §3.5.
-    pub compute_market_context: Option<crate::pyramid::compute_market_ctx::ComputeMarketRequesterContext>,
+    pub compute_market_context:
+        Option<crate::pyramid::compute_market_ctx::ComputeMarketRequesterContext>,
     /// Rev 2.1 `/api/v1/compute/market-surface` cache (Wave 3).
     /// Walker consults this on the `"market"` branch as an advisory
     /// pre-filter — `/quote` remains the authoritative viability check.
@@ -1121,7 +1388,8 @@ pub struct LlmConfig {
     /// (60s cadence aligned with Wire's `Cache-Control: max-age=60`).
     /// `None` in tests / pre-init — walker treats a missing cache as
     /// "cold" and advances silently per plan §5.1.
-    pub market_surface_cache: Option<std::sync::Arc<crate::pyramid::market_surface_cache::MarketSurfaceCache>>,
+    pub market_surface_cache:
+        Option<std::sync::Arc<crate::pyramid::market_surface_cache::MarketSurfaceCache>>,
 }
 
 /// Phase 12: cache plumbing that lives on an LlmConfig so every call
@@ -1180,11 +1448,6 @@ impl std::fmt::Debug for LlmConfig {
         f.debug_struct("LlmConfig")
             .field("api_key", &"[redacted]")
             .field("auth_token", &"[redacted]")
-            .field("primary_model", &self.primary_model)
-            .field("fallback_model_1", &self.fallback_model_1)
-            .field("fallback_model_2", &self.fallback_model_2)
-            .field("primary_context_limit", &self.primary_context_limit)
-            .field("fallback_1_context_limit", &self.fallback_1_context_limit)
             .field("max_retries", &self.max_retries)
             .field("base_timeout_secs", &self.base_timeout_secs)
             .field("max_timeout_secs", &self.max_timeout_secs)
@@ -1208,18 +1471,39 @@ impl std::fmt::Debug for LlmConfig {
                 &self.credential_store.as_ref().map(|_| "<store>"),
             )
             .field("cache_access", &self.cache_access)
-            .field("dispatch_policy", &self.dispatch_policy.as_ref().map(|_| "<policy>"))
-            .field("provider_pools", &self.provider_pools.as_ref().map(|_| "<pools>"))
-            .field("compute_queue", &self.compute_queue.as_ref().map(|_| "<queue>"))
-            .field("fleet_roster", &self.fleet_roster.as_ref().map(|_| "<fleet>"))
-            .field("fleet_dispatch", &self.fleet_dispatch.as_ref().map(|_| "<fleet_dispatch>"))
+            .field(
+                "dispatch_policy",
+                &self.dispatch_policy.as_ref().map(|_| "<policy>"),
+            )
+            .field(
+                "provider_pools",
+                &self.provider_pools.as_ref().map(|_| "<pools>"),
+            )
+            .field(
+                "compute_queue",
+                &self.compute_queue.as_ref().map(|_| "<queue>"),
+            )
+            .field(
+                "fleet_roster",
+                &self.fleet_roster.as_ref().map(|_| "<fleet>"),
+            )
+            .field(
+                "fleet_dispatch",
+                &self.fleet_dispatch.as_ref().map(|_| "<fleet_dispatch>"),
+            )
             .field(
                 "compute_market_context",
-                &self.compute_market_context.as_ref().map(|_| "<compute_market_context>"),
+                &self
+                    .compute_market_context
+                    .as_ref()
+                    .map(|_| "<compute_market_context>"),
             )
             .field(
                 "market_surface_cache",
-                &self.market_surface_cache.as_ref().map(|_| "<market_surface_cache>"),
+                &self
+                    .market_surface_cache
+                    .as_ref()
+                    .map(|_| "<market_surface_cache>"),
             )
             .finish()
     }
@@ -1230,11 +1514,6 @@ impl Default for LlmConfig {
         Self {
             api_key: String::new(),
             auth_token: String::new(),
-            primary_model: "inception/mercury-2".into(),
-            fallback_model_1: "qwen/qwen3.5-flash-02-23".into(),
-            fallback_model_2: "x-ai/grok-4.20-beta".into(),
-            primary_context_limit: 120_000,
-            fallback_1_context_limit: 900_000,
             max_retries: 5,
             base_timeout_secs: 120,
             max_timeout_secs: 600,
@@ -1295,16 +1574,6 @@ impl LlmConfig {
             chain_name: None,
             content_type: None,
         });
-        cloned
-    }
-
-    pub fn clone_with_model_override(&self, model: &str) -> Self {
-        let mut cloned = self.clone();
-        cloned.primary_model = model.to_string();
-        // Pin both fallbacks to the same model so the cascade stays
-        // on-model — mirrors the legacy `config_for_model` semantics.
-        cloned.fallback_model_1 = model.to_string();
-        cloned.fallback_model_2 = model.to_string();
         cloned
     }
 
@@ -1612,40 +1881,13 @@ pub(crate) fn classify_pool_404(body: &str) -> EntryError {
     }
 }
 
-/// Resolve the model string for a single walker route entry (Option C
-/// hybrid — post-ship C1 fix).
-///
-/// Priority:
-///   1. `entry.model_id` — explicit per-route operator override.
-///   2. Tier-routing lookup — `entry.tier_name` → TierRoutingEntry; the
-///      row's `provider_id` MUST match `entry.provider_id` or we fall
-///      through (never cross-provider a mismatched slug).
-///   3. `primary_model_fallback` — caller passes the legacy
-///      `config.primary_model` (or whatever context-cascade value the
-///      walker settled on); used when neither 1 nor 2 produced a model.
-///
-/// Exposed as `pub(crate)` for unit tests. The walker inlines this same
-/// logic in the dispatch loop to keep the single log line about which
-/// priority fired, but the resolver here is the authoritative spec.
-pub(crate) fn resolve_route_model(
-    entry: &crate::pyramid::dispatch_policy::RouteEntry,
-    registry: Option<&std::sync::Arc<crate::pyramid::provider::ProviderRegistry>>,
-    primary_model_fallback: &str,
-) -> String {
-    if let Some(ref explicit) = entry.model_id {
-        return explicit.clone();
-    }
-    if let Some(tier_name) = entry.tier_name.as_deref() {
-        if let Some(reg) = registry {
-            if let Some(tier_row) = reg.get_tier(tier_name) {
-                if tier_row.provider_id == entry.provider_id {
-                    return tier_row.model_id;
-                }
-            }
-        }
-    }
-    primary_model_fallback.to_string()
-}
+// walker-v3 W2a: `resolve_route_model` retired — the walker v3
+// dispatch path reads models directly from `decision.per_provider[...]
+// .model_list`, and the `RouteEntry.model_id` / `tier_name` overrides
+// are both marked "Gone" in plan §5.1. The fn was `pub(crate)` with
+// no non-test callers post-W2 migration; the related unit tests were
+// dropped with it. Cross-provider-mismatch prevention is now enforced
+// by scope keying on `ProviderType` (plan §2.7).
 
 #[derive(Debug, Clone, Default)]
 pub struct LlmCallOptions {
@@ -1666,6 +1908,13 @@ pub struct LlmCallOptions {
     /// label on the compute-queue entry so provider-side history
     /// distinguishes market-received from fleet-received jobs.
     pub dispatch_origin: DispatchOrigin,
+    /// W3c: explicit per-call model override (§2.9 "reqs.model" pattern).
+    /// Replaces the legacy `LlmConfig::clone_with_model_override` shape —
+    /// fleet-received and market-received worker paths set this to the
+    /// slug the remote requester asked for, so the cascade never picks
+    /// up a different slug from the Decision. When None, the Decision's
+    /// model_list / tier_routing / aliases pipeline runs normally.
+    pub model_override: Option<String>,
 }
 
 // ── Provider synthesis (Phase 3 bridge) ──────────────────────────────────────
@@ -1685,7 +1934,12 @@ pub struct LlmCallOptions {
 /// backend handled the call.
 pub(crate) fn build_call_provider(
     config: &LlmConfig,
-) -> Result<(Box<dyn LlmProvider>, Option<ResolvedSecret>, ProviderType, String)> {
+) -> Result<(
+    Box<dyn LlmProvider>,
+    Option<ResolvedSecret>,
+    ProviderType,
+    String,
+)> {
     if let Some(registry) = &config.provider_registry {
         // Use the active provider: ollama-local when local mode is on,
         // openrouter otherwise. active_provider_id() checks which
@@ -1715,21 +1969,42 @@ pub(crate) fn build_call_provider(
     } else {
         Some(ResolvedSecret::new(config.api_key.clone()))
     };
-    Ok((Box::new(provider), secret, ProviderType::Openrouter, "openrouter".to_string()))
+    Ok((
+        Box::new(provider),
+        secret,
+        ProviderType::Openrouter,
+        "openrouter".to_string(),
+    ))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Resolve the context limit for the current model based on config.
-fn resolve_context_limit(model: &str, config: &LlmConfig) -> usize {
-    if model == config.primary_model {
-        config.primary_context_limit
-    } else if model == config.fallback_model_1 {
-        config.fallback_1_context_limit
-    } else {
-        // fallback_model_2 or unknown — use the largest limit
-        config.fallback_1_context_limit.max(config.primary_context_limit)
+///
+/// W2a: when a `DispatchDecision` is attached to the StepContext and
+/// the resolved OpenRouter `ResolvedProviderParams.context_limit` is
+/// W3c: Decision is now the sole source of per-model context_limit.
+/// When the Decision is absent (pre-walker call sites or tests that
+/// don't attach a StepContext), return `usize::MAX` so the
+/// downstream `.saturating_sub(input).min(48_000)` clamp in
+/// `call_model_unified` produces the default 48k ceiling.
+fn resolve_context_limit(
+    _model: &str,
+    _config: &LlmConfig,
+    step_ctx: Option<&StepContext>,
+) -> usize {
+    if let Some(limit) = openrouter_context_limit_from_decision(step_ctx) {
+        // Decision-resolved context_limit is authoritative when present.
+        // usize cast is safe for any realistic context window.
+        return limit as usize;
     }
+    // No Decision attached (pre-walker test or synthetic call site).
+    // Return a large sentinel; caller clamps to its own ceiling.
+    tracing::debug!(
+        event = "resolve_context_limit_no_decision",
+        "walker-v3: no Decision attached for context_limit lookup; falling through to caller's clamp",
+    );
+    usize::MAX
 }
 
 /// Estimate token count for pre-flight model selection using tiktoken cl100k_base.
@@ -1947,12 +2222,26 @@ pub async fn call_model_unified_with_audit_and_ctx(
     let cache_lookup = match try_cache_lookup_or_key(ctx, system_prompt, user_prompt) {
         CacheProbeOutcome::Hit(response) => {
             if let Some(audit_ctx) = audit {
+                // W3c: Decision-resolved model after step-local id.
+                // Legacy `config.primary_model` fallback removed —
+                // audit rows stamp `<unknown>` when nothing resolves.
                 let model_for_row = ctx
                     .and_then(|c| c.resolved_model_id.clone())
                     .filter(|m| !m.is_empty())
-                    .unwrap_or_else(|| config.primary_model.clone());
+                    .or_else(|| first_openrouter_model_from_decision(ctx))
+                    .unwrap_or_else(|| {
+                        tracing::warn!(
+                            event = "cache_hit_audit_model_unknown",
+                            "walker-v3: no Decision model for cache-hit audit row; stamping '<unknown>'",
+                        );
+                        "<unknown>".to_string()
+                    });
                 let latency_ms = probe_started.elapsed().as_millis() as i64;
                 let conn = audit_ctx.conn.lock().await;
+                let actual_model_for_row = market_response_model_id(&response)
+                    .or(response.fleet_peer_model.as_deref())
+                    .unwrap_or(model_for_row.as_str());
+                let parsed_ok = audit_response_parsed_ok(audit, response_format, &response.content);
                 let _ = super::db::insert_llm_audit_cache_hit(
                     &conn,
                     &audit_ctx.slug,
@@ -1961,10 +2250,11 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     &audit_ctx.step_name,
                     &audit_ctx.call_purpose,
                     audit_ctx.depth,
-                    &model_for_row,
+                    actual_model_for_row,
                     system_prompt,
                     user_prompt,
                     &response.content,
+                    parsed_ok,
                     response.usage.prompt_tokens,
                     response.usage.completion_tokens,
                     latency_ms,
@@ -1975,6 +2265,43 @@ pub async fn call_model_unified_with_audit_and_ctx(
         }
         CacheProbeOutcome::MissOrBypass(lookup) => lookup,
     };
+
+    // walker-v3-completion Wave 5: dispatch-spine guard.
+    //
+    // Every non-cache-hit LLM call must reach the walker with EITHER a
+    // DispatchDecision attached to the StepContext OR a model_override
+    // set on LlmCallOptions. Both absent = silent provider-skip cascade
+    // (every branch returns walker_v3_no_model and the call fails with
+    // no user-actionable error). Fail loud instead.
+    //
+    // The canonical path to attach Decision is
+    // `make_step_ctx_from_llm_config(.., slot, model?, provider_id?)`
+    // which builds Decision via `with_dispatch_decision_if_available`.
+    // Legacy non-slot constructors (`_with_model`, manual
+    // `StepContext::new`) bypass this unless paired with
+    // `with_dispatch_decision_if_available` — see plan
+    // docs/plans/walker-v3-completion-decision-attachment.md §4, §5.
+    let decision_present = ctx.and_then(|c| c.dispatch_decision.as_ref()).is_some();
+    let override_present = options.model_override.is_some();
+    if !decision_present && !override_present {
+        let step_name = ctx.map(|c| c.step_name.as_str()).unwrap_or("<no_ctx>");
+        let primitive = ctx.map(|c| c.primitive.as_str()).unwrap_or("<no_ctx>");
+        tracing::error!(
+            event = "walker_dispatch_spine_missing",
+            step_name = %step_name,
+            primitive = %primitive,
+            "walker-v3-completion: call site has neither DispatchDecision \
+             (via make_step_ctx_from_llm_config with a slot) nor \
+             LlmCallOptions.model_override. Walker would iterate providers \
+             and skip each with walker_v3_no_model. See plan §4-§5.",
+        );
+        return Err(anyhow!(
+            "walker dispatch spine missing: step_name={step_name}, \
+             primitive={primitive}. Call site must attach a Decision via \
+             make_step_ctx_from_llm_config with a slot, OR set \
+             LlmCallOptions.model_override. Walker v3 Completion."
+        ));
+    }
 
     // Resolve the provider trait impl + credential for this call. The
     // registry path is preferred; if no registry is attached to the
@@ -2001,8 +2328,6 @@ pub async fn call_model_unified_with_audit_and_ctx(
         policy.resolve_route(work_type, "", step_name, depth)
     });
 
-
-
     // ── Phase 18b: Audit pending row insert ─────────────────────────
     //
     // Mirror the legacy `call_model_audited` flow: insert a pending row
@@ -2010,6 +2335,16 @@ pub async fn call_model_unified_with_audit_and_ctx(
     // is updated to 'complete' or 'failed' below. Queueing and fleet
     // dispatch both happen earlier, so this row now tracks only the
     // actual execution path that will perform the provider HTTP call.
+    // W3c: audit-pending row stamps the pre-dispatch "expected"
+    // model from the Decision. Legacy `config.primary_model` fallback
+    // removed — pending rows stamp `<unknown>` when nothing resolves.
+    let audit_pending_model = first_openrouter_model_from_decision(ctx).unwrap_or_else(|| {
+        tracing::warn!(
+            event = "audit_pending_model_unknown",
+            "walker-v3: no Decision for audit-pending model stamp; using '<unknown>'",
+        );
+        "<unknown>".to_string()
+    });
     let audit_id: Option<i64> = if let Some(audit_ctx) = audit {
         let conn = audit_ctx.conn.lock().await;
         super::db::insert_llm_audit_pending(
@@ -2020,7 +2355,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
             &audit_ctx.step_name,
             &audit_ctx.call_purpose,
             audit_ctx.depth,
-            &config.primary_model,
+            &audit_pending_model,
             system_prompt,
             user_prompt,
         )
@@ -2131,8 +2466,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         &entry.provider_id,
                         serde_json::json!({ "reason": "no_market_context" }),
                     );
-                    skip_reasons
-                        .push(format!("{}:no_market_context", entry.provider_id));
+                    skip_reasons.push(format!("{}:no_market_context", entry.provider_id));
                     continue;
                 }
             };
@@ -2142,10 +2476,8 @@ pub async fn call_model_unified_with_audit_and_ctx(
             // a callback URL to Wire. Callback URL is captured here.
             let callback_url = {
                 let ts = market_ctx.tunnel_state.read().await;
-                let connected = matches!(
-                    ts.status,
-                    crate::tunnel::TunnelConnectionStatus::Connected
-                );
+                let connected =
+                    matches!(ts.status, crate::tunnel::TunnelConnectionStatus::Connected);
                 if !connected {
                     None
                 } else {
@@ -2166,22 +2498,33 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         &entry.provider_id,
                         serde_json::json!({ "reason": "tunnel_not_connected" }),
                     );
-                    skip_reasons
-                        .push(format!("{}:tunnel_not_connected", entry.provider_id));
+                    skip_reasons.push(format!("{}:tunnel_not_connected", entry.provider_id));
                     continue;
                 }
             };
 
             // Resolve the canonical model id for this entry.
-            let market_model_id = entry
+            // W3c: per-route override → step-resolved model →
+            // Decision OpenRouter head. Legacy `config.primary_model`
+            // fallback removed — skip this market entry if nothing
+            // resolves (no model to /quote against).
+            let market_model_id = match entry
                 .model_id
                 .clone()
                 .filter(|m| !m.is_empty())
-                .or_else(|| {
-                    ctx.and_then(|c| c.resolved_model_id.clone())
-                        .filter(|m| !m.is_empty())
-                })
-                .unwrap_or_else(|| config.primary_model.clone());
+                .or_else(|| first_provider_model_from_decision(ctx, WalkerProviderType::Market))
+            {
+                Some(m) => m,
+                None => {
+                    tracing::warn!(
+                        event = "walker_v3_market_no_model",
+                        provider_id = %entry.provider_id,
+                        "walker-v3: no Decision Market model for market entry; advancing route",
+                    );
+                    skip_reasons.push(format!("{}:walker_v3_no_model", entry.provider_id));
+                    continue;
+                }
+            };
 
             // Advisory cache pre-check (plan §4.2 "Acquire"). Cache is
             // advisory only; /quote is authoritative. Missing cache →
@@ -2198,26 +2541,80 @@ pub async fn call_model_unified_with_audit_and_ctx(
                             &entry.provider_id,
                             serde_json::json!({
                                 "reason": "no_offers_for_model",
-                                "model_id": market_model_id,
+                                "model_id": market_model_id.as_str(),
                             }),
                         );
-                        skip_reasons
-                            .push(format!("{}:no_offers_for_model", entry.provider_id));
+                        skip_reasons.push(format!("{}:no_offers_for_model", entry.provider_id));
                         continue;
                     }
                 }
                 // Cache miss / cold → fall through and let /quote speak.
             }
 
-            // Read the participation policy's market_dispatch_max_wait_ms
-            // out of the DB once per market entry. On any failure we fall
-            // back to the default (60s) — absence of a policy row means
-            // "use defaults", not "block market".
+            // Walker v3 Phase 3: resolve patience budget + max_wait_ms
+            // from the Decision (per_provider[Market]) with legacy
+            // compute_participation_policy as fallback. The Decision
+            // values are the single-source-of-truth in §3's parameter
+            // catalog; the legacy DB read stays as a safety rail for
+            // synthetic / preview paths that may not carry a Decision
+            // yet (full migration is Phase 1 W2).
+            let market_max_wait_ms: u64 = ctx
+                .and_then(|c| c.dispatch_decision.as_ref())
+                .and_then(|d| {
+                    d.per_provider
+                        .get(&crate::pyramid::walker_resolver::ProviderType::Market)
+                })
+                .map(|p| {
+                    // Phase 3 walker_provider_market does not yet surface
+                    // a distinct max_wait_ms param. Set a harmless
+                    // sentinel and let the participation-policy read
+                    // below supply the post-fill market wait budget.
+                    let _ = p;
+                    0u64
+                })
+                .unwrap_or(0);
+            let market_saturation_patience_secs_from_decision: Option<u64> = ctx
+                .and_then(|c| c.dispatch_decision.as_ref())
+                .and_then(|d| {
+                    d.per_provider
+                        .get(&crate::pyramid::walker_resolver::ProviderType::Market)
+                })
+                .map(|p| p.patience_secs);
+            let market_max_budget_from_decision: Option<i64> = ctx
+                .and_then(|c| c.dispatch_decision.as_ref())
+                .and_then(|d| {
+                    d.per_provider
+                        .get(&crate::pyramid::walker_resolver::ProviderType::Market)
+                })
+                .and_then(|p| p.max_budget_credits);
+            let market_breaker_reset_from_decision = ctx
+                .and_then(|c| c.dispatch_decision.as_ref())
+                .and_then(|d| {
+                    d.per_provider
+                        .get(&crate::pyramid::walker_resolver::ProviderType::Market)
+                })
+                .map(|p| p.breaker_reset.clone())
+                .unwrap_or(crate::pyramid::walker_resolver::BreakerReset::PerBuild);
+            let market_patience_clock_resets_per_model = ctx
+                .and_then(|c| c.dispatch_decision.as_ref())
+                .and_then(|d| {
+                    d.per_provider
+                        .get(&crate::pyramid::walker_resolver::ProviderType::Market)
+                })
+                .map(|p| p.patience_clock_resets_per_model)
+                .unwrap_or(false);
+            // Fall back to the participation-policy values for
+            // `market_max_wait_ms` (post-fill result wait budget) and,
+            // when the Decision doesn't supply patience, for
+            // patience_secs too.
             let (market_max_wait_ms, market_saturation_patience_secs): (u64, u64) = {
-                let db_path = ctx
-                    .map(|c| c.db_path.clone())
-                    .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
-                match db_path {
+                let db_path = ctx.map(|c| c.db_path.clone()).or_else(|| {
+                    config
+                        .cache_access
+                        .as_ref()
+                        .map(|ca| ca.db_path.to_string())
+                });
+                let policy = match db_path {
                     Some(dbp) => tokio::task::spawn_blocking(move || {
                         rusqlite::Connection::open(&dbp)
                             .ok()
@@ -2238,22 +2635,131 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     .flatten()
                     .unwrap_or((900_000, 3600)),
                     None => (900_000, 3600),
-                }
+                };
+                // If the Decision supplied a patience value, use it;
+                // otherwise use the legacy policy value.
+                let patience = market_saturation_patience_secs_from_decision.unwrap_or(policy.1);
+                let _ = market_max_wait_ms; // reserved for future per-step deadline
+                (policy.0, patience)
             };
+
+            // ── Walker v3 Phase 3: /quote pre-gate ────────────────────
+            //
+            // BEFORE /quote, check the sync market-probe cache: for the
+            // offers we know about, is there any offer whose
+            // `typical_serve_ms_p50_7d × peer_queue_depth` fits inside
+            // the usable dispatch deadline
+            // (`market_max_wait_ms − dispatch_deadline_grace_secs`)?
+            // If NO cached offer passes, skip this entry without
+            // paying a reservation fee — walker would otherwise burn
+            // credits on an offer it can't rationally hit.
+            //
+            // Cache miss OR Indeterminate verdicts are treated as
+            // "might work" — the static deadline is load-bearing and
+            // we never synthesize a skip on missing data. This is
+            // project_compute_market_saturation_fix.md's contract: the
+            // pre-gate DETECTS unviability, never stretches the
+            // deadline, and never over-skips on cold caches.
+            {
+                use crate::pyramid::walker_market_probe::{
+                    evaluate_pre_gate, read_cached_model, PreGateVerdict,
+                };
+                // Dispatch-deadline grace from the Decision (SYSTEM_DEFAULT
+                // 10s). Fall through to SYSTEM_DEFAULT when the Decision
+                // isn't populated (legacy paths pre-W2 migration).
+                let grace_secs = ctx
+                    .and_then(|c| c.dispatch_decision.as_ref())
+                    .and_then(|d| {
+                        d.per_provider
+                            .get(&crate::pyramid::walker_resolver::ProviderType::Market)
+                    })
+                    .map(|p| p.dispatch_deadline_grace_secs)
+                    .unwrap_or(10);
+
+                if let Some(cached_model) =
+                    crate::pyramid::walker_market_probe::read_cached_model(&market_model_id)
+                        .or_else(|| {
+                            // Fallback: projector hasn't run against the
+                            // async cache yet — skip pre-gate rather than
+                            // synthesizing unviability on a cold probe.
+                            let _ = read_cached_model; // grep anchor
+                            None
+                        })
+                {
+                    if !cached_model.offers_detail.is_empty() {
+                        let mut any_passes = false;
+                        let mut first_skip: Option<(u64, u64, String)> = None;
+                        for offer in &cached_model.offers_detail {
+                            match evaluate_pre_gate(
+                                market_max_wait_ms,
+                                grace_secs,
+                                offer,
+                                cached_model.model_typical_serve_ms_p50_7d,
+                            ) {
+                                PreGateVerdict::Proceed | PreGateVerdict::Indeterminate => {
+                                    any_passes = true;
+                                    break;
+                                }
+                                PreGateVerdict::Skip {
+                                    estimated_serve_ms,
+                                    usable_deadline_ms,
+                                } => {
+                                    if first_skip.is_none() {
+                                        first_skip = Some((
+                                            estimated_serve_ms,
+                                            usable_deadline_ms,
+                                            offer.offer_id.clone(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        if !any_passes {
+                            let (est, usable, offer_id) =
+                                first_skip.unwrap_or((0, 0, String::new()));
+                            emit_walker_chronicle(
+                                ctx,
+                                config,
+                                super::compute_chronicle::EVENT_OFFER_SKIPPED_PRE_GATE_DEADLINE,
+                                &walker_source_label,
+                                &entry.provider_id,
+                                serde_json::json!({
+                                    "offer_id": offer_id,
+                                    "estimated_serve_ms": est,
+                                    "usable_deadline_ms": usable,
+                                    "dispatch_deadline_grace_secs": grace_secs,
+                                    "model_id": market_model_id.as_str(),
+                                    "branch": "market",
+                                }),
+                            );
+                            skip_reasons.push(format!(
+                                "{}:offer_skipped_pre_gate_deadline",
+                                entry.provider_id
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            }
 
             last_attempted_provider_id = Some(entry.provider_id.clone());
 
             // ── Dispatch via helper ──────────────────────────────────
             //
-            // Per-entry `max_budget_credits` cap fed into Wire's /quote
-            // `max_budget` field. Absent → NO_BUDGET_CAP sentinel
-            // (2^53 - 1, JS Number.MAX_SAFE_INTEGER; round-trips f64
-            // cleanly). Wire's 409 budget_exceeded fires when the
-            // estimated total exceeds this — walker advances via
+            // Per-dispatch `max_budget_credits` cap. Two sources in
+            // precedence order:
+            //   1. DispatchDecision.per_provider[Market].max_budget_credits
+            //      (walker v3 §3) — resolver-sourced, per-slot.
+            //   2. Legacy RouteEntry.max_budget_credits — retained as a
+            //      fallback during the Phase 1 W2 migration.
+            // Missing both → NO_BUDGET_CAP sentinel (2^53 - 1, JS
+            // Number.MAX_SAFE_INTEGER; round-trips f64 cleanly). Wire's
+            // 409 budget_exceeded fires when the estimated total
+            // exceeds max_budget; walker advances via
             // EntryError::RouteSkipped, network_rate_above_budget
             // chronicle, next entry tried.
-            let max_budget = entry
-                .max_budget_credits
+            let max_budget = market_max_budget_from_decision
+                .or(entry.max_budget_credits)
                 .unwrap_or(crate::pyramid::dispatch_policy::NO_BUDGET_CAP);
 
             let max_tokens_i64 = if _max_tokens == 0 {
@@ -2269,7 +2775,17 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 model_id: market_model_id.clone(),
                 max_budget,
                 max_wait_ms: market_max_wait_ms,
+                retry_http_count: ctx
+                    .and_then(|c| c.dispatch_decision.as_ref())
+                    .and_then(|d| {
+                        d.per_provider
+                            .get(&crate::pyramid::walker_resolver::ProviderType::Market)
+                    })
+                    .map(|p| p.retry_http_count)
+                    .unwrap_or(3),
                 market_saturation_patience_secs,
+                patience_clock_resets_per_model: market_patience_clock_resets_per_model,
+                breaker_reset: market_breaker_reset_from_decision,
                 max_tokens: max_tokens_i64,
                 temperature,
                 input_tokens_est: est_input_tokens as i64,
@@ -2283,25 +2799,39 @@ pub async fn call_model_unified_with_audit_and_ctx(
 
             match market_outcome {
                 Ok(response) => {
+                    // Phase 5 §F: record market success against the
+                    // per-build breaker. Resets consecutive_failures
+                    // for this (build_id, slot, market) cell.
+                    crate::pyramid::walker_breaker::record_success_from_ctx(
+                        ctx,
+                        crate::pyramid::walker_resolver::ProviderType::Market,
+                    );
                     let latency_ms = call_started.elapsed().as_millis() as i64;
                     let walker_ms = walker_started.elapsed().as_millis() as i64;
+                    let actual_model_id = market_response_model_id(&response)
+                        .unwrap_or(market_model_id.as_str())
+                        .to_string();
+                    let provider_id = response.provider_id.as_deref().unwrap_or("market");
 
                     // Optional cache store on success.
                     try_cache_store(ctx, cache_lookup.as_ref(), &response, call_started);
 
                     if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
                         let conn = audit_ctx.conn.lock().await;
+                        let parsed_ok =
+                            audit_response_parsed_ok(audit, response_format, &response.content);
                         let _ = super::db::complete_llm_audit(
                             &conn,
                             id,
                             &response.content,
-                            true,
+                            parsed_ok,
                             response.usage.prompt_tokens,
                             response.usage.completion_tokens,
                             latency_ms,
                             response.generation_id.as_deref(),
                             Some(entry.provider_id.as_str()),
                         );
+                        let _ = super::db::update_llm_audit_model(&conn, id, &actual_model_id);
                     }
 
                     emit_walker_chronicle(
@@ -2315,6 +2845,10 @@ pub async fn call_model_unified_with_audit_and_ctx(
                             "total_walker_ms": walker_ms,
                             "attempts": entry_idx + 1,
                             "branch": "market",
+                            "model_id": actual_model_id.as_str(),
+                            "actual_model_id": actual_model_id.as_str(),
+                            "requested_model_id": market_model_id.as_str(),
+                            "provider_id": provider_id,
                         }),
                     );
 
@@ -2337,6 +2871,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                                 "reason": reason,
                                 "branch": "market",
                                 "classification": "retryable",
+                                "model_id": market_model_id.as_str(),
                             }),
                         );
                     }
@@ -2346,10 +2881,50 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         super::compute_chronicle::EVENT_NETWORK_ROUTE_RETRYABLE_FAIL,
                         &walker_source_label,
                         &entry.provider_id,
-                        serde_json::json!({ "reason": reason, "branch": "market" }),
+                        serde_json::json!({
+                            "reason": reason,
+                            "branch": "market",
+                            "model_id": market_model_id.as_str(),
+                        }),
                     );
-                    skip_reasons
-                        .push(format!("{}:retryable({})", entry.provider_id, reason));
+                    // Phase 5 §F: Retryable reflects a genuine
+                    // provider-side failure (HTTP 5xx, connection
+                    // reset, quote expired) so it counts against the
+                    // breaker. Saturation retries are exhausted
+                    // internally by dispatch_market_entry and surface
+                    // as RouteSkipped (not here).
+                    crate::pyramid::walker_breaker::record_failure_from_ctx(
+                        ctx,
+                        crate::pyramid::walker_resolver::ProviderType::Market,
+                    );
+                    // Phase 5 §C: consult on_partial_failure policy
+                    // from the Decision. `FailLoud` bubbles a terminal;
+                    // `RetrySame` is not supported on the Retryable
+                    // branch inside the walker loop (walker already
+                    // has its own saturation-retry inside
+                    // dispatch_market_entry; RetrySame at the walker
+                    // level adds no value and would spin). Fall back
+                    // to Cascade for RetrySame here.
+                    if check_fail_loud_stops(
+                        ctx,
+                        crate::pyramid::walker_resolver::ProviderType::Market,
+                    ) {
+                        emit_walker_chronicle(
+                            ctx,
+                            config,
+                            super::compute_chronicle::EVENT_DISPATCH_FAILED_POLICY_BLOCKED,
+                            &walker_source_label,
+                            &entry.provider_id,
+                            serde_json::json!({
+                                "reason": reason.clone(),
+                                "branch": "market",
+                                "policy": "fail_loud",
+                            }),
+                        );
+                        emit_step_error(ctx, &reason);
+                        return Err(anyhow!(format!("policy=fail_loud: {}", reason)));
+                    }
+                    skip_reasons.push(format!("{}:retryable({})", entry.provider_id, reason));
                     continue;
                 }
                 Err(EntryError::RouteSkipped { reason }) => {
@@ -2364,6 +2939,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                                 "reason": reason,
                                 "branch": "market",
                                 "classification": "route_skipped",
+                                "model_id": market_model_id.as_str(),
                             }),
                         );
                     }
@@ -2373,13 +2949,23 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         super::compute_chronicle::EVENT_NETWORK_ROUTE_SKIPPED,
                         &walker_source_label,
                         &entry.provider_id,
-                        serde_json::json!({ "reason": reason, "branch": "market" }),
+                        serde_json::json!({
+                            "reason": reason,
+                            "branch": "market",
+                            "model_id": market_model_id.as_str(),
+                        }),
                     );
-                    skip_reasons
-                        .push(format!("{}:route_skipped({})", entry.provider_id, reason));
+                    skip_reasons.push(format!("{}:route_skipped({})", entry.provider_id, reason));
                     continue;
                 }
                 Err(EntryError::CallTerminal { reason }) => {
+                    // Phase 5 §F: CallTerminal is a genuine provider
+                    // failure (auth expired, dispatch deadline missed)
+                    // — counts against the breaker.
+                    crate::pyramid::walker_breaker::record_failure_from_ctx(
+                        ctx,
+                        crate::pyramid::walker_resolver::ProviderType::Market,
+                    );
                     // CallTerminal also covers stage-tagged auth
                     // reasons (`quote_auth_failed` / `fill_auth_failed`)
                     // that should surface as `network_auth_expired` for
@@ -2396,6 +2982,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                                 "reason": reason.clone(),
                                 "branch": "market",
                                 "classification": "call_terminal",
+                                "model_id": market_model_id.as_str(),
                             }),
                         );
                     }
@@ -2405,7 +2992,11 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         super::compute_chronicle::EVENT_NETWORK_ROUTE_TERMINAL_FAIL,
                         &walker_source_label,
                         &entry.provider_id,
-                        serde_json::json!({ "reason": reason.clone(), "branch": "market" }),
+                        serde_json::json!({
+                            "reason": reason.clone(),
+                            "branch": "market",
+                            "model_id": market_model_id.as_str(),
+                        }),
                     );
                     if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
                         let conn = audit_ctx.conn.lock().await;
@@ -2468,8 +3059,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         &entry.provider_id,
                         serde_json::json!({ "reason": "fleet_ctx_missing" }),
                     );
-                    skip_reasons
-                        .push(format!("{}:fleet_ctx_missing", entry.provider_id));
+                    skip_reasons.push(format!("{}:fleet_ctx_missing", entry.provider_id));
                     continue;
                 }
             };
@@ -2494,8 +3084,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         &entry.provider_id,
                         serde_json::json!({ "reason": "tunnel_not_connected" }),
                     );
-                    skip_reasons
-                        .push(format!("{}:tunnel_not_connected", entry.provider_id));
+                    skip_reasons.push(format!("{}:tunnel_not_connected", entry.provider_id));
                     continue;
                 }
             };
@@ -2511,20 +3100,54 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         &entry.provider_id,
                         serde_json::json!({ "reason": "fleet_roster_missing" }),
                     );
-                    skip_reasons
-                        .push(format!("{}:fleet_roster_missing", entry.provider_id));
+                    skip_reasons.push(format!("{}:fleet_roster_missing", entry.provider_id));
                     continue;
                 }
             };
 
+            // Walker v3 Phase 4: read fleet_peer_min_staleness_secs +
+            // fleet_prefer_cached from the Decision's per_provider[Fleet]
+            // params. Legacy fallback to fleet_delivery_policy's
+            // `peer_staleness_secs` for synthetic / preview paths that
+            // don't carry a Decision yet. `fleet_prefer_cached` has no
+            // legacy equivalent; default SYSTEM_DEFAULT (true) applies.
+            let fleet_min_staleness_secs: u64 = ctx
+                .and_then(|c| c.dispatch_decision.as_ref())
+                .and_then(|d| {
+                    d.per_provider
+                        .get(&crate::pyramid::walker_resolver::ProviderType::Fleet)
+                })
+                .and_then(|p| p.fleet_peer_min_staleness_secs)
+                .unwrap_or(policy_snap.peer_staleness_secs);
+            let _fleet_prefer_cached: bool = ctx
+                .and_then(|c| c.dispatch_decision.as_ref())
+                .and_then(|d| {
+                    d.per_provider
+                        .get(&crate::pyramid::walker_resolver::ProviderType::Fleet)
+                })
+                .and_then(|p| p.fleet_prefer_cached)
+                .unwrap_or(crate::pyramid::walker_resolver::FLEET_PREFER_CACHED_DEFAULT);
+
             // Acquire: non-blocking peer lookup. No permit held — fleet
             // is not pool-limited.
+            //
+            // `find_peer_for_rule` ranks by lowest total_queue_depth.
+            // Walker v3's `fleet_prefer_cached` is captured above; the
+            // current roster implementation does not track per-peer
+            // "has this model cached" beyond announce-declared
+            // models_loaded, so the prefer-cached preference is
+            // consumed upstream by FleetReadiness (model_list vs
+            // announced_models match) and by this peer-selection
+            // function via `find_peer_for_rule`'s rule match. A
+            // future peer-probe module (Phase 6 nicety) can use the
+            // _fleet_prefer_cached signal for a first-pass filter
+            // that prefers peers with the requested slug in their
+            // models_loaded before falling back to queue-depth sort.
             let (peer, jwt) = {
                 let roster = roster_handle.read().await;
-                match roster.find_peer_for_rule(
-                    &route_ref.matched_rule_name,
-                    policy_snap.peer_staleness_secs,
-                ) {
+                match roster
+                    .find_peer_for_rule(&route_ref.matched_rule_name, fleet_min_staleness_secs)
+                {
                     Some(peer) => {
                         let jwt = roster.fleet_jwt.clone().unwrap_or_default();
                         (peer.clone(), jwt)
@@ -2538,8 +3161,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                             &entry.provider_id,
                             serde_json::json!({ "reason": "no_fleet_peer" }),
                         );
-                        skip_reasons
-                            .push(format!("{}:no_fleet_peer", entry.provider_id));
+                        skip_reasons.push(format!("{}:no_fleet_peer", entry.provider_id));
                         continue;
                     }
                 }
@@ -2583,22 +3205,52 @@ pub async fn call_model_unified_with_audit_and_ctx(
 
             match fleet_outcome {
                 Ok(response) => {
+                    // Phase 5 §F: record fleet success.
+                    crate::pyramid::walker_breaker::record_success_from_ctx(
+                        ctx,
+                        crate::pyramid::walker_resolver::ProviderType::Fleet,
+                    );
                     let latency_ms = call_started.elapsed().as_millis() as i64;
                     let walker_ms = walker_started.elapsed().as_millis() as i64;
+                    let mut metadata = serde_json::json!({
+                        "latency_ms": latency_ms,
+                        "total_walker_ms": walker_ms,
+                        "attempts": entry_idx + 1,
+                        "branch": "fleet",
+                        "provider_id": response.provider_id.as_deref(),
+                        "fleet_peer_id": response.fleet_peer_id.as_deref(),
+                    });
+                    if let Some(model_id) = response.fleet_peer_model.as_deref() {
+                        if let Some(obj) = metadata.as_object_mut() {
+                            obj.insert(
+                                "model_id".to_string(),
+                                serde_json::Value::String(model_id.to_string()),
+                            );
+                            obj.insert(
+                                "actual_model_id".to_string(),
+                                serde_json::Value::String(model_id.to_string()),
+                            );
+                        }
+                    }
 
                     if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
                         let conn = audit_ctx.conn.lock().await;
+                        let parsed_ok =
+                            audit_response_parsed_ok(audit, response_format, &response.content);
                         let _ = super::db::complete_llm_audit(
                             &conn,
                             id,
                             &response.content,
-                            true,
+                            parsed_ok,
                             response.usage.prompt_tokens,
                             response.usage.completion_tokens,
                             latency_ms,
                             response.generation_id.as_deref(),
                             Some(entry.provider_id.as_str()),
                         );
+                        if let Some(model_id) = response.fleet_peer_model.as_deref() {
+                            let _ = super::db::update_llm_audit_model(&conn, id, model_id);
+                        }
                     }
 
                     emit_walker_chronicle(
@@ -2607,16 +3259,18 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         super::compute_chronicle::EVENT_WALKER_RESOLVED,
                         &walker_source_label,
                         &entry.provider_id,
-                        serde_json::json!({
-                            "latency_ms": latency_ms,
-                            "total_walker_ms": walker_ms,
-                            "attempts": entry_idx + 1,
-                        }),
+                        metadata,
                     );
 
                     return Ok(response);
                 }
                 Err(EntryError::Retryable { reason }) => {
+                    // Phase 5 §F: fleet Retryable = genuine peer-side
+                    // failure (HTTP 5xx, connection reset, JWT expired).
+                    crate::pyramid::walker_breaker::record_failure_from_ctx(
+                        ctx,
+                        crate::pyramid::walker_resolver::ProviderType::Fleet,
+                    );
                     emit_walker_chronicle(
                         ctx,
                         config,
@@ -2625,8 +3279,27 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         &entry.provider_id,
                         serde_json::json!({ "reason": reason }),
                     );
-                    skip_reasons
-                        .push(format!("{}:retryable({})", entry.provider_id, reason));
+                    // Phase 5 §C: fail_loud policy bubbles terminal.
+                    if check_fail_loud_stops(
+                        ctx,
+                        crate::pyramid::walker_resolver::ProviderType::Fleet,
+                    ) {
+                        emit_walker_chronicle(
+                            ctx,
+                            config,
+                            super::compute_chronicle::EVENT_DISPATCH_FAILED_POLICY_BLOCKED,
+                            &walker_source_label,
+                            &entry.provider_id,
+                            serde_json::json!({
+                                "reason": reason.clone(),
+                                "branch": "fleet",
+                                "policy": "fail_loud",
+                            }),
+                        );
+                        emit_step_error(ctx, &reason);
+                        return Err(anyhow!(format!("policy=fail_loud: {}", reason)));
+                    }
+                    skip_reasons.push(format!("{}:retryable({})", entry.provider_id, reason));
                     continue;
                 }
                 Err(EntryError::RouteSkipped { reason }) => {
@@ -2638,13 +3311,17 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         &entry.provider_id,
                         serde_json::json!({ "reason": reason }),
                     );
-                    skip_reasons.push(format!(
-                        "{}:route_skipped({})",
-                        entry.provider_id, reason
-                    ));
+                    skip_reasons.push(format!("{}:route_skipped({})", entry.provider_id, reason));
                     continue;
                 }
                 Err(EntryError::CallTerminal { reason }) => {
+                    // Phase 5 §F: defensive record; fleet CallTerminal
+                    // is not spec'd to fire today, but if it does, the
+                    // breaker should see it as a genuine failure.
+                    crate::pyramid::walker_breaker::record_failure_from_ctx(
+                        ctx,
+                        crate::pyramid::walker_resolver::ProviderType::Fleet,
+                    );
                     // Per §4.1 plan: no fleet branch returns CallTerminal.
                     // Defensive: bubble for unknown-variant future-proofing.
                     emit_walker_chronicle(
@@ -2687,18 +3364,29 @@ pub async fn call_model_unified_with_audit_and_ctx(
         // Gating: skip_concurrency_gate suppresses re-enqueueing for the
         // GPU-loop replay (inner walker sets it via prepare_for_replay).
         // Route.bypass_pool similarly skips the queue hop.
-        if entry.is_local
-            && !options.skip_concurrency_gate
-            && !walker_bypass_pool
-        {
+        if entry.is_local && !options.skip_concurrency_gate && !walker_bypass_pool {
             if let Some(ref queue_handle) = config.compute_queue {
-                let queue_model_id = entry
+                // W3c: per-route override → step-resolved model →
+                // Decision OpenRouter head. Legacy `config.primary_model`
+                // fallback removed — skip the queue hop if nothing
+                // resolves (no model slug to enqueue on).
+                let queue_model_id = match entry
                     .model_id
                     .clone()
                     .filter(|m| !m.is_empty())
-                    .or_else(|| ctx.and_then(|c| c.resolved_model_id.clone()))
-                    .filter(|m| !m.is_empty())
-                    .unwrap_or_else(|| config.primary_model.clone());
+                    .or_else(|| first_provider_model_from_decision(ctx, WalkerProviderType::Local))
+                {
+                    Some(m) => m,
+                    None => {
+                        tracing::warn!(
+                            event = "walker_v3_queue_no_model",
+                            provider_id = %entry.provider_id,
+                            "walker-v3: no Decision Local model for local queue hop; advancing route",
+                        );
+                        skip_reasons.push(format!("{}:walker_v3_no_model", entry.provider_id));
+                        continue;
+                    }
+                };
 
                 let (tx, rx) = tokio::sync::oneshot::channel();
 
@@ -2711,10 +3399,8 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 // Label the queue-entry source so downstream chronicle
                 // emitters attribute the job to its true origin.
                 let entry_source = options.dispatch_origin.source_label().to_string();
-                let chronicle_job_path_val = options
-                    .chronicle_job_path
-                    .clone()
-                    .unwrap_or_else(|| {
+                let chronicle_job_path_val =
+                    options.chronicle_job_path.clone().unwrap_or_else(|| {
                         super::compute_chronicle::generate_job_path(
                             ctx,
                             None,
@@ -2759,19 +3445,27 @@ pub async fn call_model_unified_with_audit_and_ctx(
 
                 // WP-1: Chronicle enqueue event
                 {
-                    let db_path = ctx
-                        .map(|c| c.db_path.clone())
-                        .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
+                    let db_path = ctx.map(|c| c.db_path.clone()).or_else(|| {
+                        config
+                            .cache_access
+                            .as_ref()
+                            .map(|ca| ca.db_path.to_string())
+                    });
                     let chronicle_ctx = if let Some(sc) = ctx {
                         super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-                            sc, &chronicle_job_path_val, "enqueued", &entry_source,
+                            sc,
+                            &chronicle_job_path_val,
+                            "enqueued",
+                            &entry_source,
                         )
                     } else {
                         super::compute_chronicle::ChronicleEventContext::minimal(
-                            &chronicle_job_path_val, "enqueued", &entry_source,
+                            &chronicle_job_path_val,
+                            "enqueued",
+                            &entry_source,
                         )
-                        .with_model_id(queue_model_id.clone())
-                    };
+                    }
+                    .with_model_id(queue_model_id.clone());
                     let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
                         "queue_depth": depth,
                         "queue_model_depth": depth,
@@ -2779,7 +3473,8 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     if let Some(db_path) = db_path {
                         tokio::task::spawn_blocking(move || {
                             if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                                let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                                let _ =
+                                    super::compute_chronicle::record_event(&conn, &chronicle_ctx);
                             }
                         });
                     }
@@ -2817,16 +3512,23 @@ pub async fn call_model_unified_with_audit_and_ctx(
 
                         if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
                             let conn = audit_ctx.conn.lock().await;
+                            let parsed_ok =
+                                audit_response_parsed_ok(audit, response_format, &response.content);
                             let _ = super::db::complete_llm_audit(
                                 &conn,
                                 id,
                                 &response.content,
-                                true,
+                                parsed_ok,
                                 response.usage.prompt_tokens,
                                 response.usage.completion_tokens,
                                 latency_ms,
                                 response.generation_id.as_deref(),
                                 Some(entry.provider_id.as_str()),
+                            );
+                            let _ = super::db::update_llm_audit_model(
+                                &conn,
+                                id,
+                                queue_model_id.as_str(),
                             );
                         }
 
@@ -2840,6 +3542,10 @@ pub async fn call_model_unified_with_audit_and_ctx(
                                 "latency_ms": latency_ms,
                                 "total_walker_ms": walker_ms,
                                 "attempts": entry_idx + 1,
+                                "branch": "local_queue",
+                                "model_id": queue_model_id.as_str(),
+                                "actual_model_id": queue_model_id.as_str(),
+                                "provider_id": response.provider_id.as_deref(),
                             }),
                         );
 
@@ -2926,8 +3632,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                             &entry.provider_id,
                             serde_json::json!({ "reason": "credentials_missing" }),
                         );
-                        skip_reasons
-                            .push(format!("{}:credentials_missing", entry.provider_id));
+                        skip_reasons.push(format!("{}:credentials_missing", entry.provider_id));
                         continue;
                     }
                 },
@@ -2940,8 +3645,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         &entry.provider_id,
                         serde_json::json!({ "reason": "provider_not_registered" }),
                     );
-                    skip_reasons
-                        .push(format!("{}:provider_not_registered", entry.provider_id));
+                    skip_reasons.push(format!("{}:provider_not_registered", entry.provider_id));
                     continue;
                 }
             }
@@ -2965,8 +3669,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         &entry.provider_id,
                         serde_json::json!({ "reason": "provider_build_failed" }),
                     );
-                    skip_reasons
-                        .push(format!("{}:provider_build_failed", entry.provider_id));
+                    skip_reasons.push(format!("{}:provider_build_failed", entry.provider_id));
                     continue;
                 }
             }
@@ -3003,8 +3706,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                             &entry.provider_id,
                             serde_json::json!({ "reason": reason }),
                         );
-                        skip_reasons
-                            .push(format!("{}:unavailable({})", entry.provider_id, reason));
+                        skip_reasons.push(format!("{}:unavailable({})", entry.provider_id, reason));
                         continue;
                     }
                 }
@@ -3026,7 +3728,14 @@ pub async fn call_model_unified_with_audit_and_ctx(
         //
         // The resolved model drives the HTTP body, context-limit lookup,
         // and every downstream audit/chronicle emit for this entry.
-        let entry_model_override = entry.model_id.clone();
+        // W3c: the per-call `options.model_override` (§2.9 reqs.model)
+        // outranks `entry.model_id` — fleet-received and market-received
+        // workers set this to the slug the remote requester asked for,
+        // and that contract is non-negotiable.
+        let entry_model_override = options
+            .model_override
+            .clone()
+            .or_else(|| entry.model_id.clone());
         let tier_routed_model: Option<String> = if entry_model_override.is_some() {
             None
         } else {
@@ -3052,20 +3761,85 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 })
             })
         };
-        let mut use_model = if let Some(ref model) = entry_model_override {
+        // W3c: context cascade — positional resolve against the
+        // Decision's OpenRouter model_list. Positions map to:
+        //   model_list[0] = primary, [1] = fallback_1, [2] = fallback_2.
+        // The legacy `config.primary_model` / `fallback_model_{1,2}` +
+        // `config.*_context_limit` fallbacks were deleted in W3c. When
+        // the Decision's model_list is absent AND neither entry.model_id
+        // nor tier_routing covers the call, there is no runtime slug to
+        // send — return a RouteSkipped so the walker advances to the
+        // next route (or surfaces the error to the caller).
+        let decision_provider_type = if entry.is_local {
+            WalkerProviderType::Local
+        } else {
+            WalkerProviderType::OpenRouter
+        };
+        let decision_or_models = provider_model_list_from_decision(ctx, decision_provider_type);
+        let cascade_primary = decision_or_models
+            .as_ref()
+            .and_then(|ml| ml.first().cloned());
+        let cascade_fallback_1 = decision_or_models
+            .as_ref()
+            .and_then(|ml| ml.get(1).cloned());
+        let cascade_fallback_2 = decision_or_models
+            .as_ref()
+            .and_then(|ml| ml.get(2).cloned());
+        // Decision's context_limit corresponds to the "primary" slot
+        // (position 0). Without it, no cascade thresholds exist — the
+        // caller picks position 0 unconditionally.
+        let decision_primary_ctx_limit =
+            provider_context_limit_from_decision(ctx, decision_provider_type);
+        // Pick the model slug for this entry. `None` means "no slug
+        // available for this route" — advance to the next walker entry.
+        let use_model_opt: Option<String> = if let Some(ref model) = entry_model_override {
             info!("[entry-model->{}]", short_name(model));
-            model.clone()
+            Some(model.clone())
         } else if let Some(ref model) = tier_routed_model {
             info!("[tier-model->{}]", short_name(model));
-            model.clone()
-        } else if est_input_tokens > config.fallback_1_context_limit {
-            info!("[fallback->{}]", short_name(&config.fallback_model_2));
-            config.fallback_model_2.clone()
-        } else if est_input_tokens > config.primary_context_limit {
-            info!("[fallback->{}]", short_name(&config.fallback_model_1));
-            config.fallback_model_1.clone()
+            Some(model.clone())
+        } else if let Some(limit) = decision_primary_ctx_limit {
+            // Tier-wide cascade only fires when Decision provides a
+            // context_limit. Position [2] for above-limit inputs, else [0].
+            if est_input_tokens > limit as usize {
+                if let Some(ref m) = cascade_fallback_2 {
+                    info!("[fallback->{}]", short_name(m));
+                    Some(m.clone())
+                } else if let Some(ref m) = cascade_fallback_1 {
+                    info!("[fallback->{}]", short_name(m));
+                    Some(m.clone())
+                } else {
+                    cascade_primary.clone()
+                }
+            } else {
+                cascade_primary.clone()
+            }
         } else {
-            config.primary_model.clone()
+            // No context_limit → pick position 0 unconditionally.
+            cascade_primary.clone()
+        };
+        let mut use_model = match use_model_opt {
+            Some(m) => m,
+            None => {
+                tracing::warn!(
+                    event = "walker_v3_no_model_available",
+                    provider_id = %entry.provider_id,
+                    "walker-v3: no provider-specific Decision model_list / entry / tier override for route; advancing",
+                );
+                emit_walker_chronicle(
+                    ctx,
+                    config,
+                    super::compute_chronicle::EVENT_NETWORK_ROUTE_UNAVAILABLE,
+                    &walker_source_label,
+                    &entry.provider_id,
+                    serde_json::json!({ "reason": "walker_v3_no_model_available" }),
+                );
+                skip_reasons.push(format!(
+                    "{}:walker_v3_no_model_available",
+                    entry.provider_id
+                ));
+                continue;
+            }
         };
 
         let client = &*HTTP_CLIENT;
@@ -3089,8 +3863,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     &entry.provider_id,
                     serde_json::json!({ "reason": "prepare_headers_failed" }),
                 );
-                skip_reasons
-                    .push(format!("{}:prepare_headers_failed", entry.provider_id));
+                skip_reasons.push(format!("{}:prepare_headers_failed", entry.provider_id));
                 continue;
             }
         };
@@ -3126,7 +3899,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     });
                 }
                 // Compute effective max_tokens.
-                let model_limit = resolve_context_limit(&use_model, config);
+                let model_limit = resolve_context_limit(&use_model, config, ctx);
                 let effective_max_tokens = model_limit
                     .saturating_sub(est_input_tokens)
                     .min(48_000)
@@ -3246,12 +4019,29 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         || body_lower.contains("too many tokens")
                         || body_lower.contains("token limit");
 
-                    if is_context_exceeded && use_model != config.fallback_model_2 {
+                    // W3c: context-exceeded cascade — promote against
+                    // the Decision's OpenRouter model_list positions.
+                    // All three cascade slots are `Option<String>` now
+                    // (legacy LlmConfig.primary_model/fallback_* deleted).
+                    let already_at_fb2 = cascade_fallback_2
+                        .as_ref()
+                        .map(|m| &use_model == m)
+                        .unwrap_or(false);
+                    if is_context_exceeded && !already_at_fb2 {
                         let prev_model = use_model.clone();
-                        if use_model == config.primary_model {
-                            use_model = config.fallback_model_1.clone();
+                        let at_primary = cascade_primary
+                            .as_ref()
+                            .map(|m| &use_model == m)
+                            .unwrap_or(false);
+                        let next = if at_primary {
+                            cascade_fallback_1
+                                .clone()
+                                .or_else(|| cascade_fallback_2.clone())
                         } else {
-                            use_model = config.fallback_model_2.clone();
+                            cascade_fallback_2.clone()
+                        };
+                        if let Some(m) = next {
+                            use_model = m;
                         }
                         warn!(
                             "[LLM] Context exceeded on {}, cascading to {}",
@@ -3414,49 +4204,49 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     }
                 };
 
-                let parsed: ParsedLlmResponse =
-                    match entry_provider_impl.parse_response(&body_text) {
-                        Ok(p) => p,
-                        Err(e) => {
+                let parsed: ParsedLlmResponse = match entry_provider_impl.parse_response(&body_text)
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(
+                            "[LLM] response envelope parse failed on {} attempt {}: {}",
+                            short_name(&use_model),
+                            attempt + 1,
+                            e
+                        );
+                        if config.llm_debug_logging {
+                            let preview_len = body_text.len().min(2000);
                             warn!(
-                                "[LLM] response envelope parse failed on {} attempt {}: {}",
-                                short_name(&use_model),
-                                attempt + 1,
-                                e
-                            );
-                            if config.llm_debug_logging {
-                                let preview_len = body_text.len().min(2000);
-                                warn!(
                                     "[LLM-DEBUG] Raw response body that failed envelope parse (model={}, len={}):\n{}",
                                     short_name(&use_model),
                                     body_text.len(),
                                     &body_text[..preview_len],
                                 );
-                            }
-                            if attempt + 1 < config.max_retries {
-                                info!("  parse error, retry {}...", attempt + 1);
-                                emit_step_retry(
-                                    ctx,
-                                    attempt as i64,
-                                    config.max_retries as i64,
-                                    &format!("parse error: {}", e),
-                                    (config.retry_base_sleep_secs as i64) * 1000,
-                                );
-                                tokio::time::sleep(std::time::Duration::from_secs(
-                                    config.retry_base_sleep_secs,
-                                ))
-                                .await;
-                                attempt += 1;
-                                continue;
-                            }
-                            break 'http Err(EntryError::Retryable {
-                                reason: format!(
-                                    "failed to parse response after {} attempts: {}",
-                                    config.max_retries, e
-                                ),
-                            });
                         }
-                    };
+                        if attempt + 1 < config.max_retries {
+                            info!("  parse error, retry {}...", attempt + 1);
+                            emit_step_retry(
+                                ctx,
+                                attempt as i64,
+                                config.max_retries as i64,
+                                &format!("parse error: {}", e),
+                                (config.retry_base_sleep_secs as i64) * 1000,
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(
+                                config.retry_base_sleep_secs,
+                            ))
+                            .await;
+                            attempt += 1;
+                            continue;
+                        }
+                        break 'http Err(EntryError::Retryable {
+                            reason: format!(
+                                "failed to parse response after {} attempts: {}",
+                                config.max_retries, e
+                            ),
+                        });
+                    }
+                };
 
                 let usage = parsed.usage.clone();
                 let generation_id = parsed.generation_id.clone();
@@ -3543,13 +4333,10 @@ pub async fn call_model_unified_with_audit_and_ctx(
 
                 // WP-8 cloud_returned chronicle (unchanged).
                 if entry_provider_type == ProviderType::Openrouter {
-                    let cloud_job_path =
-                        saved_chronicle_job_path.clone().unwrap_or_else(|| {
-                            super::compute_chronicle::generate_job_path(
-                                ctx, None, &use_model, "cloud",
-                            )
-                        });
-                    let chronicle_ctx = if let Some(sc) = ctx {
+                    let cloud_job_path = saved_chronicle_job_path.clone().unwrap_or_else(|| {
+                        super::compute_chronicle::generate_job_path(ctx, None, &use_model, "cloud")
+                    });
+                    let chronicle_ctx = (if let Some(sc) = ctx {
                         super::compute_chronicle::ChronicleEventContext::from_step_ctx(
                             sc,
                             &cloud_job_path,
@@ -3562,8 +4349,8 @@ pub async fn call_model_unified_with_audit_and_ctx(
                             "cloud_returned",
                             "cloud",
                         )
-                        .with_model_id(use_model.clone())
-                    };
+                    })
+                    .with_model_id(use_model.clone());
                     let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
                         "provider_id": response.provider_id,
                         "latency_ms": latency_ms,
@@ -3573,18 +4360,17 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         "generation_id": response.generation_id,
                         "actual_cost_usd": response.actual_cost_usd,
                     }));
-                    let db_path = ctx
-                        .map(|c| c.db_path.clone())
-                        .or_else(|| {
-                            config.cache_access.as_ref().map(|ca| ca.db_path.to_string())
-                        });
+                    let db_path = ctx.map(|c| c.db_path.clone()).or_else(|| {
+                        config
+                            .cache_access
+                            .as_ref()
+                            .map(|ca| ca.db_path.to_string())
+                    });
                     if let Some(db_path) = db_path {
                         tokio::task::spawn_blocking(move || {
                             if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                                let _ = super::compute_chronicle::record_event(
-                                    &conn,
-                                    &chronicle_ctx,
-                                );
+                                let _ =
+                                    super::compute_chronicle::record_event(&conn, &chronicle_ctx);
                             }
                         });
                     }
@@ -3598,25 +4384,40 @@ pub async fn call_model_unified_with_audit_and_ctx(
         // walker iterations (or waiters on the same pool) can proceed.
         drop(_entry_permit);
 
+        // Phase 5 §F: pool entries split into Local vs OpenRouter for
+        // breaker attribution. The `is_local` flag is the same split
+        // used by the per-entry local-execution gate above.
+        let pool_provider_type = if entry.is_local {
+            crate::pyramid::walker_resolver::ProviderType::Local
+        } else {
+            crate::pyramid::walker_resolver::ProviderType::OpenRouter
+        };
+
         match http_outcome {
             Ok(response) => {
+                // Phase 5 §F: record pool success for the mapped
+                // ProviderType. See pool_provider_type above.
+                crate::pyramid::walker_breaker::record_success_from_ctx(ctx, pool_provider_type);
                 let latency_ms = call_started.elapsed().as_millis() as i64;
                 let walker_ms = walker_started.elapsed().as_millis() as i64;
 
                 // Audit complete row — stamp winning entry's provider_id.
                 if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
                     let conn = audit_ctx.conn.lock().await;
+                    let parsed_ok =
+                        audit_response_parsed_ok(audit, response_format, &response.content);
                     let _ = super::db::complete_llm_audit(
                         &conn,
                         id,
                         &response.content,
-                        true,
+                        parsed_ok,
                         response.usage.prompt_tokens,
                         response.usage.completion_tokens,
                         latency_ms,
                         response.generation_id.as_deref(),
                         Some(entry.provider_id.as_str()),
                     );
+                    let _ = super::db::update_llm_audit_model(&conn, id, use_model.as_str());
                 }
 
                 // walker_resolved chronicle.
@@ -3630,12 +4431,18 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         "latency_ms": latency_ms,
                         "total_walker_ms": walker_ms,
                         "attempts": entry_idx + 1,
+                        "model_id": use_model.as_str(),
+                        "actual_model_id": use_model.as_str(),
+                        "provider_id": response.provider_id.as_deref(),
                     }),
                 );
 
                 return Ok(response);
             }
             Err(EntryError::Retryable { reason }) => {
+                // Phase 5 §F: pool Retryable = genuine HTTP failure
+                // against openrouter/local pool provider.
+                crate::pyramid::walker_breaker::record_failure_from_ctx(ctx, pool_provider_type);
                 emit_walker_chronicle(
                     ctx,
                     config,
@@ -3644,6 +4451,23 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     &entry.provider_id,
                     serde_json::json!({ "reason": reason }),
                 );
+                // Phase 5 §C: fail_loud bubbles terminal.
+                if check_fail_loud_stops(ctx, pool_provider_type) {
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_DISPATCH_FAILED_POLICY_BLOCKED,
+                        &walker_source_label,
+                        &entry.provider_id,
+                        serde_json::json!({
+                            "reason": reason.clone(),
+                            "branch": "pool",
+                            "policy": "fail_loud",
+                        }),
+                    );
+                    emit_step_error(ctx, &reason);
+                    return Err(anyhow!(format!("policy=fail_loud: {}", reason)));
+                }
                 skip_reasons.push(format!("{}:retryable({})", entry.provider_id, reason));
                 continue;
             }
@@ -3660,6 +4484,11 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 continue;
             }
             Err(EntryError::CallTerminal { reason }) => {
+                // Phase 5 §F: pool CallTerminal = terminal 4xx,
+                // parse-failed-permanently, or `max_retries` HTTP
+                // exhaustion. Records against the breaker before
+                // bubbling.
+                crate::pyramid::walker_breaker::record_failure_from_ctx(ctx, pool_provider_type);
                 emit_walker_chronicle(
                     ctx,
                     config,
@@ -3732,6 +4561,8 @@ fn serialize_response_for_cache(response: &LlmResponse) -> String {
         "generation_id": response.generation_id,
         "actual_cost_usd": response.actual_cost_usd,
         "provider_id": response.provider_id,
+        "fleet_peer_id": response.fleet_peer_id,
+        "fleet_peer_model": response.fleet_peer_model,
     })
     .to_string()
 }
@@ -3775,8 +4606,14 @@ fn parse_cached_response(cached: &super::step_context::CachedStepOutput) -> Resu
         generation_id,
         actual_cost_usd,
         provider_id,
-        fleet_peer_id: value.get("fleet_peer_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        fleet_peer_model: value.get("fleet_peer_model").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        fleet_peer_id: value
+            .get("fleet_peer_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        fleet_peer_model: value
+            .get("fleet_peer_model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     })
 }
 
@@ -3964,7 +4801,10 @@ fn try_cache_lookup_or_key(
     if sc.force_fresh {
         info!(
             "[LLM-CACHE] FORCE-FRESH slug={} step={} depth={} key={}",
-            sc.slug, sc.step_name, sc.depth, &lookup.cache_key[..16]
+            sc.slug,
+            sc.step_name,
+            sc.depth,
+            &lookup.cache_key[..16]
         );
         return CacheProbeOutcome::MissOrBypass(Some(lookup));
     }
@@ -3995,9 +4835,7 @@ fn try_cache_lookup_or_key(
     };
     let probe = match tokio::runtime::Handle::try_current() {
         Ok(h) => match h.runtime_flavor() {
-            tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(probe_body)
-            }
+            tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(probe_body),
             // CurrentThread (incl. the default `#[tokio::test]`): run
             // the blocking probe inline. The DB open + SELECT are
             // sub-millisecond; running them on the scheduler thread is
@@ -4082,9 +4920,8 @@ fn try_cache_lookup_or_key(
                     );
                     // Phase 12 verifier fix: runtime-flavor-aware delete.
                     let delete_body = || -> Result<()> {
-                        let conn = super::db::open_pyramid_connection(std::path::Path::new(
-                            &sc.db_path,
-                        ))?;
+                        let conn =
+                            super::db::open_pyramid_connection(std::path::Path::new(&sc.db_path))?;
                         super::db::delete_cache_entry(&conn, &sc.slug, &lookup.cache_key)
                     };
                     let _ = match tokio::runtime::Handle::try_current() {
@@ -4191,12 +5028,7 @@ fn try_cache_store(
     let store_body = move || -> Result<()> {
         let conn = super::db::open_pyramid_connection(std::path::Path::new(&db_path))?;
         if force_fresh {
-            super::db::supersede_cache_entry(
-                &conn,
-                &slug_for_write,
-                &cache_key_for_write,
-                &entry,
-            )?;
+            super::db::supersede_cache_entry(&conn, &slug_for_write, &cache_key_for_write, &entry)?;
         } else {
             super::db::store_cache(&conn, &entry)?;
         }
@@ -4204,9 +5036,7 @@ fn try_cache_store(
     };
     let store_result = match tokio::runtime::Handle::try_current() {
         Ok(h) => match h.runtime_flavor() {
-            tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(store_body)
-            }
+            tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(store_body),
             _ => store_body(),
         },
         Err(_) => store_body(),
@@ -4271,6 +5101,39 @@ pub async fn call_model_and_ctx(
     Ok(resp.content)
 }
 
+/// W3c replacement for the old `config.clone_with_model_override(model)` →
+/// `call_model_and_ctx(&cfg, ..)` pattern used across the maintenance
+/// subsystem (faq, delta, meta, stale_helpers, webbing). Threads the
+/// explicit model slug through `LlmCallOptions.model_override`
+/// (§2.9 reqs.model), so the dispatch layer honors it ahead of any
+/// Decision/tier slot without needing a per-call `LlmConfig` clone.
+pub async fn call_model_with_override_and_ctx(
+    config: &LlmConfig,
+    model: &str,
+    ctx: Option<&StepContext>,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f32,
+    max_tokens: usize,
+) -> Result<String> {
+    let options = LlmCallOptions {
+        model_override: Some(model.to_string()),
+        ..Default::default()
+    };
+    let resp = call_model_unified_with_options_and_ctx(
+        config,
+        ctx,
+        system_prompt,
+        user_prompt,
+        temperature,
+        max_tokens,
+        None,
+        options,
+    )
+    .await?;
+    Ok(resp.content)
+}
+
 /// Call OpenRouter with automatic model cascade and retry logic.
 /// Same as `call_model()` but also returns token usage from the API response.
 ///
@@ -4320,6 +5183,36 @@ pub async fn call_model_with_usage_and_ctx(
     Ok((resp.content, resp.usage))
 }
 
+/// W3c: variant of `call_model_with_usage_and_ctx` that pins the
+/// dispatched model via `LlmCallOptions.model_override`. Same §2.9
+/// reqs.model contract as `call_model_with_override_and_ctx`.
+pub async fn call_model_with_usage_with_override_and_ctx(
+    config: &LlmConfig,
+    model: &str,
+    ctx: Option<&StepContext>,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f32,
+    max_tokens: usize,
+) -> Result<(String, TokenUsage)> {
+    let options = LlmCallOptions {
+        model_override: Some(model.to_string()),
+        ..Default::default()
+    };
+    let resp = call_model_unified_with_options_and_ctx(
+        config,
+        ctx,
+        system_prompt,
+        user_prompt,
+        temperature,
+        max_tokens,
+        None,
+        options,
+    )
+    .await?;
+    Ok((resp.content, resp.usage))
+}
+
 /// Phase 12 retrofit wrapper: `call_model_unified` with a StepContext
 /// threaded through the cache-aware path. Equivalent to
 /// `call_model_unified_with_options_and_ctx` with default options.
@@ -4344,7 +5237,6 @@ pub async fn call_model_unified_and_ctx(
     )
     .await
 }
-
 
 /// Call OpenRouter with structured output enforcement via JSON schema.
 ///
@@ -4587,155 +5479,16 @@ pub fn extract_json(text: &str) -> Result<Value> {
     ))
 }
 
-// ── Direct (non-cascading) entry point ─────────────────────────────────────
-
-/// Call a specific OpenRouter model directly, bypassing the default 3-tier cascade.
-///
-/// Used for ASCII-art generation (WS-L) where the cascade would always pick
-/// Mercury-2, which empirically fails at this task. The caller pins a specific
-/// model_id (e.g. `x-ai/grok-4.20-beta`) and receives the raw content string.
-///
-/// Unlike `call_model_unified`, this function:
-///   * Never cascades on HTTP 400 / context-exceeded.
-///   * Takes no `temperature` / `response_format` (art generation is freeform).
-///   * Uses a fixed conservative timeout (`base_timeout_secs`).
-///
-/// Retries on transient errors (`retryable_status_codes`, network, null content)
-/// up to `config.max_retries`, same as the unified path.
-pub async fn call_model_direct(
-    config: &LlmConfig,
-    model_id: &str,
-    system_prompt: &str,
-    user_prompt: &str,
-    max_tokens: u32,
-) -> Result<String> {
-    let (provider_impl, secret, provider_type, provider_id) = build_call_provider(config)?;
-    let client = &*HTTP_CLIENT;
-    let url = provider_impl.chat_completions_url();
-    let built_headers = provider_impl.prepare_headers(secret.as_ref())?;
-    let local_timeout_scale = if provider_type == ProviderType::OpenaiCompat { 5 } else { 1 };
-    let timeout = std::time::Duration::from_secs(config.base_timeout_secs * local_timeout_scale);
-
-    for attempt in 0..config.max_retries {
-        let mut body = serde_json::json!({
-            "model": model_id,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "max_tokens": max_tokens
-        });
-        provider_impl.augment_request_body(&mut body, &RequestMetadata::default());
-
-        // Rate limiting: per-pool when available, global fallback otherwise.
-        if config.provider_pools.is_none() {
-            rate_limit_wait(config.rate_limit_max_requests, config.rate_limit_window_secs).await;
-        }
-
-        // Per-provider concurrency pool (Phase A dispatch).
-        let _pool_permit: Option<tokio::sync::OwnedSemaphorePermit> = if let Some(pools) = &config.provider_pools {
-            pools.acquire(&provider_id).await.ok()
-        } else {
-            None
-        };
-        // Global semaphore fallback (for tests/pre-init without pools)
-        let _local_permit = if _pool_permit.is_none() && provider_type == ProviderType::OpenaiCompat {
-            Some(LOCAL_PROVIDER_SEMAPHORE.acquire().await.map_err(|e| anyhow!("local provider semaphore closed: {e}"))?)
-        } else {
-            None
-        };
-
-        let mut request = client.post(&url).timeout(timeout);
-        for (k, v) in &built_headers {
-            request = request.header(k, v);
-        }
-        let resp = request.json(&body).send().await;
-        drop(_pool_permit);
-        drop(_local_permit);
-
-        let resp = match resp {
-            Ok(r) => r,
-            Err(e) => {
-                if attempt + 1 < config.max_retries {
-                    info!("  [direct:{}] request error ({}), retry {}...", short_name(model_id), e, attempt + 1);
-                    tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
-                    continue;
-                }
-                return Err(anyhow!("call_model_direct({}) request failed: {}", model_id, e));
-            }
-        };
-
-        let status = resp.status().as_u16();
-        if config.retryable_status_codes.contains(&status) {
-            let wait = config.retry_base_sleep_secs * 2u64.pow(attempt + 1);
-            info!("  [direct:{}] HTTP {}, waiting {}s...", short_name(model_id), status, wait);
-            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-            continue;
-        }
-        if !resp.status().is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            if attempt + 1 < config.max_retries {
-                info!("  [direct:{}] HTTP {}, retry {}...", short_name(model_id), status, attempt + 1);
-                tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
-                continue;
-            }
-            return Err(anyhow!("HTTP {} after {} attempts: {}", status, config.max_retries, body_text));
-        }
-
-        let body_text = match resp.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                if attempt + 1 < config.max_retries {
-                    tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
-                    continue;
-                }
-                return Err(anyhow!("Failed to read response: {}", e));
-            }
-        };
-
-        let parsed = match provider_impl.parse_response(&body_text) {
-            Ok(p) => p,
-            Err(e) => {
-                if attempt + 1 < config.max_retries {
-                    warn!(
-                        "[direct:{}] parse error, retry {}: {}",
-                        short_name(model_id),
-                        attempt + 1,
-                        e
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs))
-                        .await;
-                    continue;
-                }
-                return Err(anyhow!(
-                    "parse failed after {} attempts: {}",
-                    config.max_retries,
-                    e
-                ));
-            }
-        };
-
-        if parsed.content.is_empty() {
-            if attempt + 1 < config.max_retries {
-                info!(
-                    "  [direct:{}] empty content, retry {}...",
-                    short_name(model_id),
-                    attempt + 1
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs))
-                    .await;
-                continue;
-            }
-            return Err(anyhow!(
-                "empty content after {} attempts",
-                config.max_retries
-            ));
-        }
-        return Ok(parsed.content);
-    }
-
-    Err(anyhow!("call_model_direct({}): max retries exceeded", model_id))
-}
+// walker-v3-completion Wave 7: DELETED `call_model_direct` (was at this
+// location, ~200 LOC). It bypassed `call_model_unified_with_audit_and_ctx`
+// entirely — direct HTTP POST — so it never reached the Wave 5
+// dispatch-spine guard and never routed through the walker's cascade.
+// The single caller (ascii_art.rs banner generation) was migrated to
+// `call_model_unified_with_options_and_ctx(config, None, ...,
+// LlmCallOptions { model_override: Some(resolved_model), .. })` which
+// preserves the "pin this slug, no cascade" semantic via OpenRouter
+// branch's entry_model_override while going through the canonical
+// unified path + guard.
 
 // ── Phase 11: Provider health hook ──────────────────────────────────────────
 //
@@ -4766,13 +5519,9 @@ fn maybe_record_provider_error(
             return;
         };
         let policy = super::provider_health::CostReconciliationPolicy::default();
-        if let Err(e) = super::provider_health::record_provider_error(
-            &conn,
-            &provider_id,
-            kind,
-            &policy,
-            None,
-        ) {
+        if let Err(e) =
+            super::provider_health::record_provider_error(&conn, &provider_id, kind, &policy, None)
+        {
             tracing::debug!(
                 provider_id = provider_id.as_str(),
                 error = %e,
@@ -4798,11 +5547,10 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         );
-        let credentials_path = std::env::temp_dir()
-            .join(format!("wire-node-credentials-{}.yaml", unique_suffix));
+        let credentials_path =
+            std::env::temp_dir().join(format!("wire-node-credentials-{}.yaml", unique_suffix));
         let credential_store = std::sync::Arc::new(
-            crate::pyramid::credentials::CredentialStore::load_from_path(credentials_path)
-                .unwrap(),
+            crate::pyramid::credentials::CredentialStore::load_from_path(credentials_path).unwrap(),
         );
         let provider_registry = std::sync::Arc::new(
             crate::pyramid::provider::ProviderRegistry::new(credential_store.clone()),
@@ -4832,10 +5580,12 @@ routing_rules:
             crate::pyramid::provider_pools::ProviderPools::new(dispatch_policy.as_ref()),
         );
         let compute_queue = crate::compute_queue::ComputeQueueHandle::new();
-        let fleet_roster =
-            std::sync::Arc::new(tokio::sync::RwLock::new(crate::fleet::FleetRoster::default()));
-        let tunnel_state_for_dispatch =
-            std::sync::Arc::new(tokio::sync::RwLock::new(crate::tunnel::TunnelState::default()));
+        let fleet_roster = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::fleet::FleetRoster::default(),
+        ));
+        let tunnel_state_for_dispatch = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::tunnel::TunnelState::default(),
+        ));
         let fleet_dispatch = std::sync::Arc::new(crate::fleet::FleetDispatchContext {
             tunnel_state: tunnel_state_for_dispatch.clone(),
             fleet_roster: fleet_roster.clone(),
@@ -4922,6 +5672,17 @@ routing_rules:
     //     test drives via an empty api_key so no real HTTP happens.
     //   - Pool semaphore at concurrency 0 = permanently-saturated.
 
+    /// walker-v3-completion Wave 5 test helper: LlmCallOptions with a
+    /// model_override set so the dispatch-spine guard at call_model_unified_
+    /// with_audit_and_ctx entry doesn't fire. These tests exercise walker
+    /// cascade behavior downstream of the guard.
+    fn walker_test_options() -> LlmCallOptions {
+        LlmCallOptions {
+            model_override: Some("test/walker-spine-override".to_string()),
+            ..Default::default()
+        }
+    }
+
     fn walker_test_policy(
         pool_concurrency: usize,
         route_entries: Vec<&str>,
@@ -4969,20 +5730,126 @@ routing_rules:
     fn walker_test_config(
         policy: std::sync::Arc<crate::pyramid::dispatch_policy::DispatchPolicy>,
     ) -> LlmConfig {
-        let pools = std::sync::Arc::new(
-            crate::pyramid::provider_pools::ProviderPools::new(policy.as_ref()),
-        );
+        let pools = std::sync::Arc::new(crate::pyramid::provider_pools::ProviderPools::new(
+            policy.as_ref(),
+        ));
         LlmConfig {
             api_key: String::new(),
             auth_token: String::new(),
-            primary_model: "test-primary".into(),
-            fallback_model_1: "test-fallback1".into(),
-            fallback_model_2: "test-fallback2".into(),
+            // W3c: legacy primary_model/fallback_model_{1,2} fields deleted.
+            // Tests that need a specific dispatched model pass it via
+            // `LlmCallOptions.model_override`.
             dispatch_policy: Some(policy),
             provider_pools: Some(pools),
             max_retries: 1,
             ..Default::default()
         }
+    }
+
+    fn test_market_surface_market() -> agent_wire_contracts::MarketSurfaceMarket {
+        serde_json::from_value(serde_json::json!({
+            "active_providers": 1,
+            "active_offers_total": 1,
+            "models_offered": 1,
+            "total_queue_capacity": 0,
+            "total_queue_depth": 0,
+            "capacity_utilization": 0.0,
+            "settled_24h": {
+                "jobs": 0,
+                "credits": 0,
+                "failure_rate": 0.0,
+                "median_latency_p95_ms": null,
+                "median_tps": null,
+            },
+            "economic": {
+                "float_pool": {
+                    "balance": 0,
+                    "max": 0,
+                    "inflow_24h": 0,
+                    "outflow_24h": 0,
+                    "destroyed_24h": 0,
+                    "minted_24h": 0,
+                },
+                "wire_take_24h": 0,
+                "graph_fund_24h": 0,
+                "reservation_fees_24h": 0,
+            },
+            "velocity_1h": {
+                "new_offers": 0,
+                "retired_offers": 0,
+                "rate_changes": 0,
+                "jobs_matched": 0,
+            },
+            "last_updated_at": "2026-04-23T19:00:00Z",
+        }))
+        .expect("fixture shape must match MarketSurfaceMarket")
+    }
+
+    fn test_market_surface_model(
+        model_id: &str,
+        active_offers: i64,
+    ) -> agent_wire_contracts::MarketSurfaceModel {
+        serde_json::from_value(serde_json::json!({
+            "model_id": model_id,
+            "provider_count": 1,
+            "active_offers": active_offers,
+            "price": {
+                "rate_per_m_input": { "min": null, "median": null, "max": null },
+                "rate_per_m_output": { "min": null, "median": null, "max": null },
+            },
+            "queue": {
+                "total_capacity": 0,
+                "current_depth": 0,
+                "unbounded_offers": 0,
+            },
+            "performance": {
+                "p50_latency_ms": null,
+                "p95_latency_ms": null,
+                "median_tps": null,
+                "success_rate_7d": null,
+            },
+            "top_of_book": { "cheapest_with_headroom": null },
+            "demand_24h": {
+                "jobs_matched": 0,
+                "jobs_settled": 0,
+                "queue_fill_events": 0,
+            },
+            "last_offer_update_at": null,
+            "model_typical_serve_ms_p50_7d": null,
+            "offers": null,
+            "depth": null,
+        }))
+        .expect("fixture shape must match MarketSurfaceModel")
+    }
+
+    fn test_dispatch_decision_with_models(
+        slot: &str,
+        models_by_provider: Vec<(crate::pyramid::walker_resolver::ProviderType, Vec<&str>)>,
+    ) -> std::sync::Arc<crate::pyramid::walker_decision::DispatchDecision> {
+        let mut effective_call_order = Vec::new();
+        let mut per_provider = std::collections::HashMap::new();
+        for (provider_type, model_list) in models_by_provider {
+            effective_call_order.push(provider_type);
+            per_provider.insert(
+                provider_type,
+                crate::pyramid::walker_readiness::ResolvedProviderParams {
+                    model_list: Some(model_list.into_iter().map(|m| m.to_string()).collect()),
+                    active: true,
+                    ..Default::default()
+                },
+            );
+        }
+        std::sync::Arc::new(crate::pyramid::walker_decision::DispatchDecision {
+            slot: slot.to_string(),
+            effective_call_order,
+            per_provider,
+            scope_snapshot: std::sync::Arc::new(
+                crate::pyramid::walker_cache::ScopeCache::new_empty(),
+            ),
+            on_partial_failure: crate::pyramid::walker_resolver::PartialFailurePolicy::Cascade,
+            built_at: std::time::SystemTime::now(),
+            synthetic: false,
+        })
     }
 
     #[tokio::test]
@@ -5002,7 +5869,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
 
@@ -5039,7 +5906,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
 
@@ -5054,6 +5921,77 @@ routing_rules:
         assert!(
             msg.contains("3 entries"),
             "expected '3 entries' (fleet + market + unknown-pool), got: {msg}",
+        );
+    }
+
+    // ── walker-v3-completion Wave 5 guard test ─────────────────────────
+    //
+    // The dispatch-spine guard at `call_model_unified_with_audit_and_ctx`
+    // entry fails loud when a call arrives with no DispatchDecision AND
+    // no LlmCallOptions.model_override. This prevents the silent
+    // bypass cascade where the walker iterates every provider, skips
+    // each with walker_v3_no_model, and returns a no-viable-route error
+    // that hides the actual problem (call site never declared a tier).
+
+    #[tokio::test]
+    async fn walker_dispatch_spine_guard_fails_loud_when_decision_and_override_absent() {
+        let policy = walker_test_policy(1, vec!["unknown-provider"]);
+        let config = walker_test_config(policy);
+
+        let result = call_model_unified_with_audit_and_ctx(
+            &config,
+            None, // no StepContext → no Decision
+            None, // no AuditContext
+            "sys",
+            "usr",
+            0.0,
+            16,
+            None,
+            LlmCallOptions::default(), // no model_override
+        )
+        .await;
+
+        let err = result.expect_err("guard should fire when both Decision and override are absent");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("walker dispatch spine missing"),
+            "expected 'walker dispatch spine missing' in error, got: {msg}",
+        );
+        assert!(
+            msg.contains("make_step_ctx_from_llm_config"),
+            "expected error to point caller at canonical helper, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn walker_dispatch_spine_guard_passes_when_model_override_present() {
+        // With model_override set, the guard is satisfied; walker proceeds
+        // and the unknown-provider pool entry exhausts the route normally.
+        let policy = walker_test_policy(1, vec!["unknown-provider"]);
+        let config = walker_test_config(policy);
+
+        let result = call_model_unified_with_audit_and_ctx(
+            &config,
+            None,
+            None,
+            "sys",
+            "usr",
+            0.0,
+            16,
+            None,
+            walker_test_options(), // has model_override
+        )
+        .await;
+
+        let err = result.expect_err("walker should exhaust normally");
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("walker dispatch spine missing"),
+            "guard must not fire when model_override is set; got: {msg}",
+        );
+        assert!(
+            msg.contains("no viable route"),
+            "expected normal walker-exhaust error, got: {msg}",
         );
     }
 
@@ -5074,7 +6012,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
 
@@ -5112,7 +6050,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
 
@@ -5136,19 +6074,11 @@ routing_rules:
         let policy = walker_test_policy(1, vec!["fleet", "unknown-pool"]);
         let config = walker_test_config(policy);
 
-        let mut options = LlmCallOptions::default();
+        let mut options = walker_test_options();
         options.skip_fleet_dispatch = true;
 
         let result = call_model_unified_with_audit_and_ctx(
-            &config,
-            None,
-            None,
-            "sys",
-            "usr",
-            0.0,
-            16,
-            None,
-            options,
+            &config, None, None, "sys", "usr", 0.0, 16, None, options,
         )
         .await;
 
@@ -5173,19 +6103,11 @@ routing_rules:
         let policy = walker_test_policy(1, vec!["fleet", "unknown-pool"]);
         let config = walker_test_config(policy);
 
-        let mut options = LlmCallOptions::default();
+        let mut options = walker_test_options();
         options.dispatch_origin = DispatchOrigin::FleetReceived;
 
         let result = call_model_unified_with_audit_and_ctx(
-            &config,
-            None,
-            None,
-            "sys",
-            "usr",
-            0.0,
-            16,
-            None,
-            options,
+            &config, None, None, "sys", "usr", 0.0, 16, None, options,
         )
         .await;
 
@@ -5231,7 +6153,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
 
@@ -5256,19 +6178,11 @@ routing_rules:
         let policy = walker_test_policy(1, vec!["market", "unknown-pool"]);
         let config = walker_test_config(policy);
 
-        let mut options = LlmCallOptions::default();
+        let mut options = walker_test_options();
         options.dispatch_origin = DispatchOrigin::MarketReceived;
 
         let result = call_model_unified_with_audit_and_ctx(
-            &config,
-            None,
-            None,
-            "sys",
-            "usr",
-            0.0,
-            16,
-            None,
-            options,
+            &config, None, None, "sys", "usr", 0.0, 16, None, options,
         )
         .await;
 
@@ -5300,9 +6214,9 @@ routing_rules:
         // Tunnel state defaults to Disconnected with no URL.
         let auth = std::sync::Arc::new(tokio::sync::RwLock::new(AuthState::default()));
         let wire_cfg = std::sync::Arc::new(tokio::sync::RwLock::new(WireNodeConfig::default()));
-        let tunnel = std::sync::Arc::new(
-            tokio::sync::RwLock::new(crate::tunnel::TunnelState::default()),
-        );
+        let tunnel = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::tunnel::TunnelState::default(),
+        ));
         config.compute_market_context = Some(ComputeMarketRequesterContext {
             auth,
             config: wire_cfg,
@@ -5319,7 +6233,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
 
@@ -5332,6 +6246,239 @@ routing_rules:
         assert!(
             msg.contains("2 entries"),
             "expected '2 entries' (market gate-failed + unknown-pool), got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn walker_market_branch_uses_market_decision_model_for_cache_and_chronicle() {
+        use crate::auth::AuthState;
+        use crate::pyramid::compute_market_ctx::ComputeMarketRequesterContext;
+        use crate::pyramid::market_surface_cache::{CacheData, MarketSurfaceCache};
+        use crate::pyramid::pending_jobs::PendingJobs;
+        use crate::pyramid::step_context::StepContext;
+        use crate::pyramid::tunnel_url::TunnelUrl;
+        use crate::tunnel::{TunnelConnectionStatus, TunnelState};
+        use crate::WireNodeConfig;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let policy = walker_test_policy(1, vec!["market", "unknown-pool"]);
+        let (mut config, db) = walker_test_config_with_queue(policy);
+        let db_path = db.path().to_string_lossy().to_string();
+
+        let mut models = HashMap::new();
+        models.insert(
+            "gemma4:26b".to_string(),
+            test_market_surface_model("gemma4:26b", 0),
+        );
+        let market_cache = Arc::new(MarketSurfaceCache::with_test_data(CacheData {
+            market: test_market_surface_market(),
+            models,
+            generated_at: chrono::Utc::now(),
+        }));
+        config.market_surface_cache = Some(market_cache);
+
+        let auth = Arc::new(tokio::sync::RwLock::new(AuthState::default()));
+        let wire_cfg = Arc::new(tokio::sync::RwLock::new(WireNodeConfig::default()));
+        let tunnel = Arc::new(tokio::sync::RwLock::new(TunnelState {
+            tunnel_id: Some("tunnel-1".into()),
+            tunnel_url: Some(
+                TunnelUrl::parse("https://walker-market-test.example.com")
+                    .expect("fixture tunnel url should parse"),
+            ),
+            tunnel_token: Some("tok".into()),
+            status: TunnelConnectionStatus::Connected,
+        }));
+        config.compute_market_context = Some(ComputeMarketRequesterContext {
+            auth,
+            config: wire_cfg,
+            pending_jobs: PendingJobs::new(),
+            tunnel_state: tunnel,
+        });
+
+        let decision = test_dispatch_decision_with_models(
+            "synth_heavy",
+            vec![
+                (
+                    crate::pyramid::walker_resolver::ProviderType::Market,
+                    vec!["gemma4:26b"],
+                ),
+                (
+                    crate::pyramid::walker_resolver::ProviderType::OpenRouter,
+                    vec!["moonshotai/kimi-k2.6"],
+                ),
+            ],
+        );
+        let step_ctx = StepContext::new(
+            "walker-short-circuit-test",
+            "build-1",
+            "market-step",
+            "chain_llm",
+            0,
+            None,
+            db_path.clone(),
+        )
+        .with_model_resolution("synth_heavy", "moonshotai/kimi-k2.6")
+        .with_dispatch_decision(decision);
+
+        let err = call_model_unified_with_audit_and_ctx(
+            &config,
+            Some(&step_ctx),
+            None,
+            "sys",
+            "usr",
+            0.0,
+            16,
+            None,
+            walker_test_options(),
+        )
+        .await
+        .expect_err("walker should exhaust after market miss + unknown pool");
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no viable route"),
+            "expected walker exhaustion, got: {msg}",
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (row_model_id, meta): (String, String) = conn
+            .query_row(
+                "SELECT COALESCE(model_id, ''), COALESCE(metadata, '')
+                 FROM pyramid_compute_events
+                 WHERE event_type = 'network_model_unavailable'
+                 ORDER BY id ASC
+                 LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("expected market unavailability row");
+        let meta_json: serde_json::Value =
+            serde_json::from_str(&meta).expect("metadata should be valid JSON");
+        assert_eq!(
+            row_model_id, "gemma4:26b",
+            "chronicle model_id column should use the Market decision model, not the step's OpenRouter model; metadata={meta}",
+        );
+        assert_eq!(
+            meta_json.get("entry_provider_id").and_then(|v| v.as_str()),
+            Some("market"),
+            "expected market branch metadata, got {meta_json:?}",
+        );
+        assert_eq!(
+            meta_json.get("model_id").and_then(|v| v.as_str()),
+            Some("gemma4:26b"),
+            "metadata should carry the Market model slug, got {meta_json:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn walker_local_queue_uses_local_decision_model_when_route_entry_has_none() {
+        use crate::pyramid::dispatch_policy::{
+            BuildCoordinationConfig, DispatchPolicy, EscalationConfig, MatchConfig,
+            ProviderPoolConfig, RouteEntry, RoutingRule,
+        };
+        use crate::pyramid::step_context::StepContext;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let mut pool_configs = BTreeMap::new();
+        pool_configs.insert(
+            "ollama-local".into(),
+            ProviderPoolConfig {
+                concurrency: 1,
+                rate_limit: None,
+            },
+        );
+        let policy = Arc::new(DispatchPolicy {
+            rules: vec![RoutingRule {
+                name: "local_only".into(),
+                match_config: MatchConfig {
+                    work_type: None,
+                    min_depth: None,
+                    step_pattern: None,
+                },
+                route_to: vec![RouteEntry {
+                    provider_id: "ollama-local".into(),
+                    model_id: None,
+                    tier_name: None,
+                    is_local: true,
+                    max_budget_credits: None,
+                }],
+                bypass_pool: false,
+                sequential: false,
+            }],
+            escalation: EscalationConfig::default(),
+            build_coordination: BuildCoordinationConfig::default(),
+            pool_configs,
+            max_batch_cost_usd: None,
+            max_daily_cost_usd: None,
+        });
+        let (config, db) = walker_test_config_with_queue(policy);
+        let db_path = db.path().to_string_lossy().to_string();
+        let queue_handle = config
+            .compute_queue
+            .clone()
+            .expect("walker_test_config_with_queue must attach compute_queue");
+        let _gpu_handle = spawn_fake_gpu_loop(queue_handle, "local queue ok");
+
+        let decision = test_dispatch_decision_with_models(
+            "mid",
+            vec![
+                (
+                    crate::pyramid::walker_resolver::ProviderType::Local,
+                    vec!["gemma4:26b"],
+                ),
+                (
+                    crate::pyramid::walker_resolver::ProviderType::OpenRouter,
+                    vec!["moonshotai/kimi-k2.6"],
+                ),
+            ],
+        );
+        let step_ctx = StepContext::new(
+            "walker-short-circuit-test",
+            "build-1",
+            "local-step",
+            "chain_llm",
+            0,
+            None,
+            db_path.clone(),
+        )
+        .with_model_resolution("mid", "moonshotai/kimi-k2.6")
+        .with_dispatch_decision(decision);
+
+        let response = call_model_unified_with_audit_and_ctx(
+            &config,
+            Some(&step_ctx),
+            None,
+            "sys",
+            "usr",
+            0.0,
+            16,
+            None,
+            walker_test_options(),
+        )
+        .await
+        .expect("local queue hop should resolve through fake GPU loop");
+        assert_eq!(response.content, "local queue ok");
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let queued_model: String = conn
+            .query_row(
+                "SELECT COALESCE(model_id, '')
+                 FROM pyramid_compute_events
+                 WHERE event_type = 'enqueued'
+                 ORDER BY id ASC
+                 LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("expected an enqueued row for the local queue hop");
+        assert_eq!(
+            queued_model, "gemma4:26b",
+            "local queue hop should use the Local decision model, not the step's OpenRouter model",
         );
     }
 
@@ -5349,9 +6496,9 @@ routing_rules:
 
         let auth = std::sync::Arc::new(tokio::sync::RwLock::new(AuthState::default()));
         let wire_cfg = std::sync::Arc::new(tokio::sync::RwLock::new(WireNodeConfig::default()));
-        let tunnel = std::sync::Arc::new(
-            tokio::sync::RwLock::new(crate::tunnel::TunnelState::default()),
-        );
+        let tunnel = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::tunnel::TunnelState::default(),
+        ));
         let mkt = ComputeMarketRequesterContext {
             auth,
             config: wire_cfg,
@@ -5366,7 +6513,10 @@ routing_rules:
             model_id: "test-model".into(),
             max_budget: (1i64 << 53) - 1,
             max_wait_ms: 60_000,
+            retry_http_count: 3,
             market_saturation_patience_secs: 3600,
+            patience_clock_resets_per_model: false,
+            breaker_reset: crate::pyramid::walker_resolver::BreakerReset::PerBuild,
             max_tokens: 0,
             temperature: 0.0,
             input_tokens_est: 0,
@@ -5378,6 +6528,67 @@ routing_rules:
         };
         // Don't actually dispatch — we'd need a live Wire server. The
         // struct construction is the load-bearing assertion.
+    }
+
+    #[test]
+    fn market_result_wait_timeout_honors_configured_budget() {
+        let timeout = market_result_wait_timeout(900_000);
+        assert_eq!(timeout, std::time::Duration::from_secs(15 * 60));
+    }
+
+    #[test]
+    fn market_result_wait_timeout_never_zeroes_out() {
+        let timeout = market_result_wait_timeout(0);
+        assert_eq!(timeout, std::time::Duration::from_millis(1));
+    }
+
+    #[test]
+    fn market_response_model_id_reads_actual_provider_model() {
+        let response = LlmResponse {
+            content: "ok".into(),
+            usage: TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            },
+            generation_id: None,
+            actual_cost_usd: None,
+            provider_id: Some("market:gemma4:26b".into()),
+            fleet_peer_id: None,
+            fleet_peer_model: None,
+        };
+        assert_eq!(market_response_model_id(&response), Some("gemma4:26b"));
+    }
+
+    #[test]
+    fn ambiguous_fill_5xx_keeps_market_waiter_alive() {
+        let err = crate::http_utils::ApiErrorWithHints {
+            status: 503,
+            body: serde_json::json!({
+                "error": "<!DOCTYPE html><title>Service Unavailable</title>"
+            }),
+            hints: crate::http_utils::RetryHints::default(),
+        };
+        assert!(fill_error_may_have_accepted_job(&err));
+    }
+
+    #[test]
+    fn explicit_fill_4xx_does_not_keep_market_waiter_alive() {
+        let err = crate::http_utils::ApiErrorWithHints {
+            status: 409,
+            body: serde_json::json!({ "error": "dispatch_deadline_exceeded" }),
+            hints: crate::http_utils::RetryHints::default(),
+        };
+        assert!(!fill_error_may_have_accepted_job(&err));
+    }
+
+    #[test]
+    fn fill_transport_error_keeps_market_waiter_alive() {
+        let err = crate::http_utils::ApiErrorWithHints {
+            status: 0,
+            body: serde_json::json!({ "transport": "connection reset" }),
+            hints: crate::http_utils::RetryHints::default(),
+        };
+        assert!(fill_error_may_have_accepted_job(&err));
     }
 
     #[test]
@@ -5657,7 +6868,7 @@ routing_rules:
             0.2,
             4096,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await
         .expect("cache hit must return Ok");
@@ -5688,7 +6899,7 @@ routing_rules:
             0.2,
             4096,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
         assert!(
@@ -5758,7 +6969,7 @@ routing_rules:
             0.2,
             4096,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
         // The HTTP path failed (no real provider) — that's the proof
@@ -5822,7 +7033,7 @@ routing_rules:
             0.2,
             4096,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
         // After the verification-failure path, the row should be
@@ -5885,6 +7096,20 @@ routing_rules:
         }
     }
 
+    fn latest_audit_parsed_ok(db_path: &std::path::Path, slug: &str) -> bool {
+        let conn = super::super::db::open_pyramid_db(db_path).expect("reopen for audit row");
+        let parsed_ok: i64 = conn
+            .query_row(
+                "SELECT parsed_ok FROM pyramid_llm_audit
+                 WHERE slug = ?1
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .expect("latest audit row");
+        parsed_ok != 0
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_phase18b_audited_cache_hit_writes_cache_hit_audit_row() {
         // L8 acceptance: when an audited LLM call serves from cache,
@@ -5944,7 +7169,7 @@ routing_rules:
             0.2,
             4096,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await
         .expect("cache hit must return Ok");
@@ -5969,6 +7194,72 @@ routing_rules:
             count_audit_rows(db.path(), "p18b-l8", None),
             1,
             "exactly one audit row total"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_chain_dispatch_cache_hit_marks_malformed_content_parse_failed() {
+        let slug = "p18b-chain-cache-bad";
+        let db = temp_pyramid_db_with_slug(slug);
+        let system = "chain dispatch cache hit system";
+        let user = "chain dispatch cache hit user";
+        let model_id = "test/model-chain";
+        let prompt_hash = "phash-chain";
+
+        let inputs_hash = compute_inputs_hash(system, user);
+        let cache_key = compute_cache_key(&inputs_hash, prompt_hash, model_id);
+        pre_populate_cache(
+            db.path(),
+            slug,
+            &cache_key,
+            &inputs_hash,
+            prompt_hash,
+            model_id,
+            "```json\n{\"headline\":\"missing close\"\n```",
+        );
+
+        let ctx = StepContext::new(
+            slug,
+            "build-chain",
+            "source_extract",
+            "chain_llm",
+            0,
+            None,
+            db.path().to_string_lossy().to_string(),
+        )
+        .with_model_resolution("extractor", model_id)
+        .with_prompt_hash(prompt_hash);
+
+        let audit = AuditContext {
+            conn: audit_conn_for(db.path(), slug),
+            slug: slug.to_string(),
+            build_id: "build-chain".to_string(),
+            node_id: Some("Q-L0-003".to_string()),
+            step_name: "source_extract".to_string(),
+            call_purpose: "chain_dispatch".to_string(),
+            depth: Some(0),
+        };
+
+        let cfg = LlmConfig::default();
+        let response = call_model_unified_with_audit_and_ctx(
+            &cfg,
+            Some(&ctx),
+            Some(&audit),
+            system,
+            user,
+            0.2,
+            4096,
+            None,
+            walker_test_options(),
+        )
+        .await
+        .expect("cache hit still returns cached text to the chain parser");
+
+        assert!(response.content.contains("missing close"));
+        assert_eq!(count_audit_rows(db.path(), slug, Some(true)), 1);
+        assert!(
+            !latest_audit_parsed_ok(db.path(), slug),
+            "chain-dispatch cache-hit audit must reflect content JSON parse failure"
         );
     }
 
@@ -6022,7 +7313,7 @@ routing_rules:
             0.2,
             4096,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
 
@@ -6085,7 +7376,7 @@ routing_rules:
             0.2,
             4096,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await
         .expect("cache hit returns Ok");
@@ -6141,16 +7432,16 @@ routing_rules:
             )),
         });
         let auth = std::sync::Arc::new(tokio::sync::RwLock::new(crate::auth::AuthState::default()));
-        let node_config = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::WireNodeConfig::default(),
-        ));
+        let node_config =
+            std::sync::Arc::new(tokio::sync::RwLock::new(crate::WireNodeConfig::default()));
         let pending_jobs = crate::pyramid::pending_jobs::PendingJobs::new();
-        let compute_market_context = crate::pyramid::compute_market_ctx::ComputeMarketRequesterContext {
-            auth,
-            config: node_config,
-            pending_jobs,
-            tunnel_state,
-        };
+        let compute_market_context =
+            crate::pyramid::compute_market_ctx::ComputeMarketRequesterContext {
+                auth,
+                config: node_config,
+                pending_jobs,
+                tunnel_state,
+            };
 
         LlmConfig {
             dispatch_policy: Some(dispatch_policy),
@@ -6165,7 +7456,10 @@ routing_rules:
 
     fn assert_all_dispatch_handles_cleared(cfg: &LlmConfig) {
         assert!(cfg.compute_queue.is_none(), "compute_queue must be cleared");
-        assert!(cfg.fleet_dispatch.is_none(), "fleet_dispatch must be cleared");
+        assert!(
+            cfg.fleet_dispatch.is_none(),
+            "fleet_dispatch must be cleared"
+        );
         assert!(cfg.fleet_roster.is_none(), "fleet_roster must be cleared");
         assert!(
             cfg.compute_market_context.is_none(),
@@ -6223,8 +7517,14 @@ routing_rules:
     #[test]
     fn branch_allowed_pool_always_ok() {
         assert!(branch_allowed(RouteBranch::Pool, DispatchOrigin::Local));
-        assert!(branch_allowed(RouteBranch::Pool, DispatchOrigin::FleetReceived));
-        assert!(branch_allowed(RouteBranch::Pool, DispatchOrigin::MarketReceived));
+        assert!(branch_allowed(
+            RouteBranch::Pool,
+            DispatchOrigin::FleetReceived
+        ));
+        assert!(branch_allowed(
+            RouteBranch::Pool,
+            DispatchOrigin::MarketReceived
+        ));
     }
 
     #[test]
@@ -6274,25 +7574,13 @@ routing_rules:
 
     #[test]
     fn entry_error_reason_accessor_uniform_across_variants() {
+        assert_eq!(EntryError::Retryable { reason: "r".into() }.reason(), "r");
         assert_eq!(
-            EntryError::Retryable {
-                reason: "r".into()
-            }
-            .reason(),
-            "r"
-        );
-        assert_eq!(
-            EntryError::RouteSkipped {
-                reason: "s".into()
-            }
-            .reason(),
+            EntryError::RouteSkipped { reason: "s".into() }.reason(),
             "s"
         );
         assert_eq!(
-            EntryError::CallTerminal {
-                reason: "t".into()
-            }
-            .reason(),
+            EntryError::CallTerminal { reason: "t".into() }.reason(),
             "t"
         );
     }
@@ -6325,6 +7613,14 @@ routing_rules:
             map_market_slug_to_specific_event("quote_expired"),
             Some(super::super::compute_chronicle::EVENT_NETWORK_QUOTE_EXPIRED),
         );
+    }
+
+    #[test]
+    fn quote_expired_slugs_retry_same_market() {
+        assert!(is_quote_expired_slug("quote_jwt_expired"));
+        assert!(is_quote_expired_slug("quote_expired"));
+        assert!(!is_quote_expired_slug("quote_no_longer_winning"));
+        assert!(!is_quote_expired_slug("provider_queue_full"));
     }
 
     #[test]
@@ -6374,9 +7670,7 @@ routing_rules:
     fn map_market_slug_insufficient_balance_is_balance_insufficient() {
         assert_eq!(
             map_market_slug_to_specific_event("insufficient_balance"),
-            Some(
-                super::super::compute_chronicle::EVENT_NETWORK_BALANCE_INSUFFICIENT_FOR_MARKET,
-            ),
+            Some(super::super::compute_chronicle::EVENT_NETWORK_BALANCE_INSUFFICIENT_FOR_MARKET,),
         );
     }
 
@@ -6384,9 +7678,7 @@ routing_rules:
     fn map_market_slug_balance_depleted_is_balance_insufficient() {
         assert_eq!(
             map_market_slug_to_specific_event("balance_depleted"),
-            Some(
-                super::super::compute_chronicle::EVENT_NETWORK_BALANCE_INSUFFICIENT_FOR_MARKET,
-            ),
+            Some(super::super::compute_chronicle::EVENT_NETWORK_BALANCE_INSUFFICIENT_FOR_MARKET,),
         );
     }
 
@@ -6433,7 +7725,8 @@ routing_rules:
 
     // ──────────────────────────────────────────────────────────────────────
     // Post-ship walker bug fixes (W1 + C1) — classify_pool_400 +
-    // resolve_route_model + cascade-crossing regression guard.
+    // cascade-crossing regression guard (resolve_route_model tests
+    // retired in walker-v3 W3a along with the fn itself).
     // ──────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -6530,157 +7823,6 @@ routing_rules:
         let _ = classify_pool_400(&body); // no panic
     }
 
-    #[test]
-    fn resolve_route_model_priority_1_explicit_entry_model_id() {
-        use crate::pyramid::dispatch_policy::RouteEntry;
-        let entry = RouteEntry {
-            provider_id: "openrouter".into(),
-            model_id: Some("explicit/model".into()),
-            tier_name: Some("some_tier".into()),
-            is_local: false,
-            max_budget_credits: None,
-        };
-        // Registry passed as None — explicit override must win regardless.
-        let got = resolve_route_model(&entry, None, "stale/primary");
-        assert_eq!(got, "explicit/model");
-    }
-
-    #[test]
-    fn resolve_route_model_priority_2_tier_routing_match() {
-        use crate::pyramid::dispatch_policy::RouteEntry;
-        use crate::pyramid::provider::{Provider, ProviderRegistry, ProviderType, TierRoutingEntry};
-        use crate::pyramid::credentials::CredentialStore;
-        use std::sync::Arc;
-
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(CredentialStore::load(tmp.path()).unwrap());
-        std::mem::forget(tmp);
-
-        let registry = Arc::new(ProviderRegistry::new(store));
-        // tier_routing has FK → provider_id; ensure provider row exists.
-        registry
-            .save_provider(
-                &conn,
-                Provider {
-                    id: "openrouter".into(),
-                    display_name: "OR".into(),
-                    provider_type: ProviderType::Openrouter,
-                    base_url: "https://openrouter.ai/api/v1".into(),
-                    api_key_ref: Some("OPENROUTER_KEY".into()),
-                    auto_detect_context: false,
-                    supports_broadcast: false,
-                    broadcast_config_json: None,
-                    config_json: "{}".into(),
-                    enabled: true,
-                },
-            )
-            .unwrap();
-        registry
-            .save_tier_routing(
-                &conn,
-                TierRoutingEntry {
-                    tier_name: "my_tier".into(),
-                    provider_id: "openrouter".into(),
-                    model_id: "tier/model-from-routing".into(),
-                    context_limit: Some(128_000),
-                    max_completion_tokens: None,
-                    pricing_json: "{}".into(),
-                    supported_parameters_json: None,
-                    notes: None,
-                },
-            )
-            .unwrap();
-
-        let entry = RouteEntry {
-            provider_id: "openrouter".into(),
-            model_id: None,
-            tier_name: Some("my_tier".into()),
-            is_local: false,
-            max_budget_credits: None,
-        };
-        let got = resolve_route_model(&entry, Some(&registry), "stale/primary");
-        assert_eq!(got, "tier/model-from-routing");
-    }
-
-    #[test]
-    fn resolve_route_model_priority_2_skips_when_tier_provider_mismatch() {
-        // Tier routing row is for a DIFFERENT provider than the route
-        // entry. Resolver must NOT cross-provider an incompatible slug —
-        // it falls through to the primary_model fallback. This is the
-        // regression guard for the original C1 bug.
-        use crate::pyramid::dispatch_policy::RouteEntry;
-        use crate::pyramid::provider::{Provider, ProviderRegistry, ProviderType, TierRoutingEntry};
-        use crate::pyramid::credentials::CredentialStore;
-        use std::sync::Arc;
-
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(CredentialStore::load(tmp.path()).unwrap());
-        std::mem::forget(tmp);
-
-        let registry = Arc::new(ProviderRegistry::new(store));
-        registry
-            .save_provider(
-                &conn,
-                Provider {
-                    id: "ollama-local".into(),
-                    display_name: "Ollama".into(),
-                    provider_type: ProviderType::OpenaiCompat,
-                    base_url: "http://127.0.0.1:11434/v1".into(),
-                    api_key_ref: None,
-                    auto_detect_context: false,
-                    supports_broadcast: false,
-                    broadcast_config_json: None,
-                    config_json: "{}".into(),
-                    enabled: true,
-                },
-            )
-            .unwrap();
-        registry
-            .save_tier_routing(
-                &conn,
-                TierRoutingEntry {
-                    tier_name: "local_tier".into(),
-                    provider_id: "ollama-local".into(),
-                    model_id: "gemma4:26b".into(),
-                    context_limit: Some(32_000),
-                    max_completion_tokens: None,
-                    pricing_json: "{}".into(),
-                    supported_parameters_json: None,
-                    notes: None,
-                },
-            )
-            .unwrap();
-
-        let entry = RouteEntry {
-            provider_id: "openrouter".into(),
-            model_id: None,
-            tier_name: Some("local_tier".into()),
-            is_local: false,
-            max_budget_credits: None,
-        };
-        let got = resolve_route_model(&entry, Some(&registry), "fallback/primary");
-        // Must fall through — NOT "gemma4:26b".
-        assert_eq!(got, "fallback/primary");
-    }
-
-    #[test]
-    fn resolve_route_model_priority_3_primary_fallback() {
-        use crate::pyramid::dispatch_policy::RouteEntry;
-        let entry = RouteEntry {
-            provider_id: "openrouter".into(),
-            model_id: None,
-            tier_name: None,
-            is_local: false,
-            max_budget_credits: None,
-        };
-        let got = resolve_route_model(&entry, None, "fallback/primary");
-        assert_eq!(got, "fallback/primary");
-    }
-
     #[tokio::test]
     async fn walker_advances_past_openrouter_400_model_rejection_to_ollama_local() {
         // Integration-style regression guard for the cascade-crossing
@@ -6706,9 +7848,7 @@ routing_rules:
             .mock("POST", "/chat/completions")
             .with_status(400)
             .with_header("content-type", "application/json")
-            .with_body(
-                r#"{"error":{"message":"gemma4:26b is not a valid model ID"}}"#,
-            )
+            .with_body(r#"{"error":{"message":"gemma4:26b is not a valid model ID"}}"#)
             .expect_at_least(1)
             .create_async()
             .await;
@@ -6827,16 +7967,14 @@ routing_rules:
             max_batch_cost_usd: None,
             max_daily_cost_usd: None,
         });
-        let pools = Arc::new(
-            crate::pyramid::provider_pools::ProviderPools::new(policy.as_ref()),
-        );
+        let pools = Arc::new(crate::pyramid::provider_pools::ProviderPools::new(
+            policy.as_ref(),
+        ));
 
         let config = LlmConfig {
             api_key: "sk-or-v1-test".into(),
             auth_token: String::new(),
-            primary_model: "openai/gpt-4o-mini".into(),
-            fallback_model_1: "openai/gpt-4o-mini".into(),
-            fallback_model_2: "openai/gpt-4o-mini".into(),
+            // W3c: legacy primary_model/fallback_model_{1,2} fields deleted.
             provider_registry: Some(registry.clone()),
             dispatch_policy: Some(policy),
             provider_pools: Some(pools),
@@ -6854,7 +7992,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
 
@@ -6900,11 +8038,15 @@ routing_rules:
                 );
             }
         }
+        // W3c: legacy LlmConfig.primary_model fallback deleted. Tests
+        // that exercise the queue / market routes now pin an explicit
+        // model_id on the route entry so the walker has a concrete slug
+        // to enqueue / quote against.
         let route_to = route_entries
             .into_iter()
             .map(|(pid, is_local)| RouteEntry {
                 provider_id: pid.to_string(),
-                model_id: None,
+                model_id: Some(format!("walker-test/{}-model", pid)),
                 tier_name: None,
                 is_local,
                 max_budget_credits: None,
@@ -6981,17 +8123,15 @@ routing_rules:
         let db = temp_pyramid_db_with_slug("walker-short-circuit-test");
         let db_path: Arc<str> = db.path().to_string_lossy().to_string().into();
 
-        let pools = Arc::new(
-            crate::pyramid::provider_pools::ProviderPools::new(policy.as_ref()),
-        );
+        let pools = Arc::new(crate::pyramid::provider_pools::ProviderPools::new(
+            policy.as_ref(),
+        ));
         let queue = crate::compute_queue::ComputeQueueHandle::new();
 
         let config = LlmConfig {
             api_key: String::new(),
             auth_token: String::new(),
-            primary_model: "walker-short-circuit/test-model".into(),
-            fallback_model_1: "fallback1".into(),
-            fallback_model_2: "fallback2".into(),
+            // W3c: legacy primary_model/fallback_model_{1,2} fields deleted.
             dispatch_policy: Some(policy),
             provider_pools: Some(pools),
             compute_queue: Some(queue),
@@ -7029,10 +8169,8 @@ routing_rules:
         // timeout to fire after the chronicle events have been emitted
         // (spawn_blocking → DB flush).
 
-        let policy = walker_test_policy_with_local_pool(
-            1,
-            vec![("market", false), ("ollama-local", true)],
-        );
+        let policy =
+            walker_test_policy_with_local_pool(1, vec![("market", false), ("ollama-local", true)]);
         let (config, db) = walker_test_config_with_queue(policy);
         let db_path = db.path().to_string_lossy().to_string();
 
@@ -7045,7 +8183,7 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         );
 
         // The queue enqueue blocks forever without a GPU loop. Time out
@@ -7064,9 +8202,9 @@ routing_rules:
         );
 
         // Find the market route-unavailable row and the enqueued row.
-        let market_idx = rows.iter().position(|(_, ev, tag)| {
-            ev == "network_route_unavailable" && tag == "market"
-        });
+        let market_idx = rows
+            .iter()
+            .position(|(_, ev, tag)| ev == "network_route_unavailable" && tag == "market");
         let enqueued_idx = rows.iter().position(|(_, ev, _)| ev == "enqueued");
 
         let market_idx = market_idx.expect(
@@ -7074,8 +8212,8 @@ routing_rules:
              — pre-fix this row is absent because the pre-walker short-circuit \
              enqueued before market ran. Trail: {rows:?}",
         );
-        let enqueued_idx = enqueued_idx
-            .expect("expected an `enqueued` event for the local pool entry");
+        let enqueued_idx =
+            enqueued_idx.expect("expected an `enqueued` event for the local pool entry");
 
         assert!(
             market_idx < enqueued_idx,
@@ -7280,9 +8418,9 @@ routing_rules:
             max_batch_cost_usd: None,
             max_daily_cost_usd: None,
         });
-        let pools = Arc::new(
-            crate::pyramid::provider_pools::ProviderPools::new(policy.as_ref()),
-        );
+        let pools = Arc::new(crate::pyramid::provider_pools::ProviderPools::new(
+            policy.as_ref(),
+        ));
 
         // Tempdir DB for chronicle observation.
         let db_file = temp_pyramid_db_with_slug("walker-cascade-test");
@@ -7296,9 +8434,7 @@ routing_rules:
         let config = LlmConfig {
             api_key: "sk-or-test".into(),
             auth_token: String::new(),
-            primary_model: "openai/gpt-4o-mini".into(),
-            fallback_model_1: "openai/gpt-4o-mini".into(),
-            fallback_model_2: "openai/gpt-4o-mini".into(),
+            // W3c: legacy primary_model/fallback_model_{1,2} fields deleted.
             provider_registry: Some(registry.clone()),
             dispatch_policy: Some(policy),
             provider_pools: Some(pools),
@@ -7325,11 +8461,13 @@ routing_rules:
             0.0,
             16,
             None,
-            LlmCallOptions::default(),
+            walker_test_options(),
         )
         .await;
 
-        let resp = result.expect("walker must resolve via ollama-local after cascading through market+fleet+openrouter");
+        let resp = result.expect(
+            "walker must resolve via ollama-local after cascading through market+fleet+openrouter",
+        );
         assert!(
             resp.content.contains("cascade ok from fake gpu"),
             "expected fake GPU loop response content, got: {:?}",
@@ -7345,17 +8483,21 @@ routing_rules:
         let rows = read_chronicle_trail(&db_path_str);
 
         let find = |want_event: &str, want_tag: &str| -> Option<usize> {
-            rows.iter().position(|(_, ev, tag)| ev == want_event && tag == want_tag)
+            rows.iter()
+                .position(|(_, ev, tag)| ev == want_event && tag == want_tag)
         };
 
-        let market_i = find("network_route_unavailable", "market")
-            .expect(&format!("market route_unavailable missing — trail={rows:?}"));
+        let market_i = find("network_route_unavailable", "market").expect(&format!(
+            "market route_unavailable missing — trail={rows:?}"
+        ));
         let fleet_i = find("network_route_unavailable", "fleet")
             .expect(&format!("fleet route_unavailable missing — trail={rows:?}"));
-        let openrouter_i = find("network_route_skipped", "openrouter")
-            .expect(&format!("openrouter route_skipped missing — trail={rows:?}"));
-        let resolved_i = find("walker_resolved", "ollama-local")
-            .expect(&format!("walker_resolved for ollama-local missing — trail={rows:?}"));
+        let openrouter_i = find("network_route_skipped", "openrouter").expect(&format!(
+            "openrouter route_skipped missing — trail={rows:?}"
+        ));
+        let resolved_i = find("walker_resolved", "ollama-local").expect(&format!(
+            "walker_resolved for ollama-local missing — trail={rows:?}"
+        ));
 
         assert!(
             market_i < fleet_i && fleet_i < openrouter_i && openrouter_i < resolved_i,
@@ -7378,14 +8520,12 @@ routing_rules:
         // emit is the expected inner behavior; outer behavior is
         // "market runs").
 
-        let policy = walker_test_policy_with_local_pool(
-            1,
-            vec![("market", false), ("ollama-local", true)],
-        );
+        let policy =
+            walker_test_policy_with_local_pool(1, vec![("market", false), ("ollama-local", true)]);
         let (config, db) = walker_test_config_with_queue(policy);
         let db_path = db.path().to_string_lossy().to_string();
 
-        let mut options = LlmCallOptions::default();
+        let mut options = walker_test_options();
         options.dispatch_origin = DispatchOrigin::Local; // outer call
 
         let _ = tokio::time::timeout(
@@ -7405,4 +8545,3 @@ routing_rules:
         );
     }
 }
-

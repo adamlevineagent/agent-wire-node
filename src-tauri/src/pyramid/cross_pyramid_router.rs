@@ -178,17 +178,12 @@ impl CrossPyramidEventRouter {
                         // the error is logged and the loop
                         // continues — we don't want one bad emit
                         // to kill the forwarder.
-                        if let Err(e) =
-                            app_handle.emit("cross-build-event", event.clone())
-                        {
+                        if let Err(e) = app_handle.emit("cross-build-event", event.clone()) {
                             debug!("cross-pyramid forwarder emit failed: {}", e);
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        debug!(
-                            "cross-pyramid forwarder lagged by {} events, continuing",
-                            n
-                        );
+                        debug!("cross-pyramid forwarder lagged by {} events, continuing", n);
                         continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {

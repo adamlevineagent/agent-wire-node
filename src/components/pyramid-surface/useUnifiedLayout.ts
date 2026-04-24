@@ -18,9 +18,19 @@ interface RawTreeNode {
     depth: number;
     headline: string;
     distilled: string;
+    node_kind?: string | null;
+    question?: string | null;
+    question_about?: string | null;
+    question_creates?: string | null;
+    question_prompt_hint?: string | null;
+    answer_node_id?: string | null;
+    answer_headline?: string | null;
+    answer_distilled?: string | null;
+    answered?: boolean | null;
     self_prompt?: string | null;
     thread_id?: string | null;
     source_path?: string | null;
+    parent_ids?: string[];
     children: RawTreeNode[];
 }
 
@@ -29,16 +39,32 @@ interface FlatInput {
     depth: number;
     headline: string;
     distilled: string;
+    nodeKind?: string | null;
+    question?: string | null;
+    questionAbout?: string | null;
+    questionCreates?: string | null;
+    questionPromptHint?: string | null;
+    answerNodeId?: string | null;
+    answerHeadline?: string | null;
+    answerDistilled?: string | null;
+    answered?: boolean | null;
     selfPrompt?: string | null;
     threadId?: string | null;
     sourcePath?: string | null;
     parentId: string | null;
+    parentIds: string[];
     childIds: string[];
 }
 
 interface DagEdge {
     childId: string;
     parentId: string;
+}
+
+function pushEdgeOnce(edges: DagEdge[], edge: DagEdge): void {
+    if (!edges.some((e) => e.childId === edge.childId && e.parentId === edge.parentId)) {
+        edges.push(edge);
+    }
 }
 
 export function flattenTree(
@@ -49,7 +75,12 @@ export function flattenTree(
 ): { nodes: FlatInput[]; edges: DagEdge[] } {
     const result: FlatInput[] = [];
     for (const node of roots) {
-        if (parentId) edges.push({ childId: node.id, parentId });
+        const parentIds = node.parent_ids && node.parent_ids.length > 0
+            ? node.parent_ids
+            : parentId ? [parentId] : [];
+        for (const pid of parentIds) {
+            pushEdgeOnce(edges, { childId: node.id, parentId: pid });
+        }
         if (!seen.has(node.id)) {
             seen.add(node.id);
             result.push({
@@ -57,10 +88,20 @@ export function flattenTree(
                 depth: node.depth,
                 headline: node.headline,
                 distilled: node.distilled,
+                nodeKind: node.node_kind,
+                question: node.question,
+                questionAbout: node.question_about,
+                questionCreates: node.question_creates,
+                questionPromptHint: node.question_prompt_hint,
+                answerNodeId: node.answer_node_id,
+                answerHeadline: node.answer_headline,
+                answerDistilled: node.answer_distilled,
+                answered: node.answered,
                 selfPrompt: node.self_prompt,
                 threadId: node.thread_id,
                 sourcePath: node.source_path,
-                parentId,
+                parentId: parentIds[0] ?? null,
+                parentIds,
                 childIds: node.children.map((c) => c.id),
             });
             const sub = flattenTree(node.children, node.id, seen, edges);
@@ -87,7 +128,9 @@ export function addBedrockLayer(nodes: FlatInput[]): FlatInput[] {
             depth: -1,
             headline: path.split('/').pop() ?? path,
             distilled: path,
+            nodeKind: 'source',
             parentId: null,
+            parentIds: [],
             childIds: l0Ids,
         });
     }
@@ -171,10 +214,20 @@ export function computeLayout(
                 depth: node.depth,
                 headline: node.headline,
                 distilled: node.distilled,
+                nodeKind: node.nodeKind,
+                question: node.question,
+                questionAbout: node.questionAbout,
+                questionCreates: node.questionCreates,
+                questionPromptHint: node.questionPromptHint,
+                answerNodeId: node.answerNodeId,
+                answerHeadline: node.answerHeadline,
+                answerDistilled: node.answerDistilled,
+                answered: node.answered,
                 selfPrompt: node.selfPrompt,
                 threadId: node.threadId,
                 sourcePath: node.sourcePath,
                 parentId: node.parentId,
+                parentIds: node.parentIds,
                 childIds: node.childIds,
                 x,
                 y,

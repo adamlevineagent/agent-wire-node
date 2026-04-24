@@ -15,8 +15,8 @@
 use std::sync::Arc;
 
 use crate::pyramid::types::{
-    BuildLayerState, BuildProgress, BuildStatus, CharacterizationResult, LayerEvent,
-    LayerProgress, LogEntry, NodeStatus,
+    BuildLayerState, BuildProgress, BuildStatus, CharacterizationResult, LayerEvent, LayerProgress,
+    LogEntry, NodeStatus,
 };
 use crate::pyramid::{BuildHandle, PyramidState};
 
@@ -38,7 +38,13 @@ pub async fn spawn_question_build(
     max_depth: u32,
     from_depth: i64,
     characterization: Option<CharacterizationResult>,
-) -> Result<(serde_json::Value, tokio::sync::oneshot::Receiver<Result<(), String>>), String> {
+) -> Result<
+    (
+        serde_json::Value,
+        tokio::sync::oneshot::Receiver<Result<(), String>>,
+    ),
+    String,
+> {
     if question.trim().is_empty() {
         return Err("question cannot be empty".to_string());
     }
@@ -314,13 +320,16 @@ pub async fn spawn_question_build(
         }
     });
 
-    Ok((serde_json::json!({
-        "status": "started",
-        "slug": slug,
-        "build_type": "question_decomposition",
-        "question": question,
-        "granularity": granularity,
-        "max_depth": max_depth,
-        "from_depth": from_depth,
-    }), completion_rx))
+    Ok((
+        serde_json::json!({
+            "status": "started",
+            "slug": slug,
+            "build_type": "question_decomposition",
+            "question": question,
+            "granularity": granularity,
+            "max_depth": max_depth,
+            "from_depth": from_depth,
+        }),
+        completion_rx,
+    ))
 }

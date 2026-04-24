@@ -207,10 +207,7 @@ pub fn collapse_stale_delta_chains(
 ///
 /// Both thresholds are configurable via Tier3Config.collapse_threshold,
 /// but the caller can also pass explicit values.
-pub fn should_auto_collapse(
-    conn: &Connection,
-    slug: &str,
-) -> Result<Vec<String>> {
+pub fn should_auto_collapse(conn: &Connection, slug: &str) -> Result<Vec<String>> {
     // Use Tier3Config defaults for thresholds
     let version_threshold = super::Tier3Config::default().collapse_threshold;
     let idle_minutes = 60; // 1 hour default idle time
@@ -244,9 +241,10 @@ pub fn should_auto_collapse_with_config(
     let idle_offset = format!("-{} minutes", idle_minutes);
 
     let candidates: Vec<String> = stmt
-        .query_map(rusqlite::params![slug, history_threshold, idle_offset], |row| {
-            row.get::<_, String>(0)
-        })?
+        .query_map(
+            rusqlite::params![slug, history_threshold, idle_offset],
+            |row| row.get::<_, String>(0),
+        )?
         .filter_map(|r| r.ok())
         .collect();
 
@@ -264,7 +262,11 @@ pub fn should_auto_collapse_with_config(
 // ── Collapse log queries ────────────────────────────────────────────────────
 
 /// Query the collapse log for a slug. Returns recent collapse events.
-pub fn get_collapse_log(conn: &Connection, slug: &str, limit: i64) -> Result<Vec<CollapseLogEntry>> {
+pub fn get_collapse_log(
+    conn: &Connection,
+    slug: &str,
+    limit: i64,
+) -> Result<Vec<CollapseLogEntry>> {
     let mut stmt = conn.prepare(
         "SELECT id, slug, node_id, versions_before, versions_after, preserved, collapsed_at
          FROM pyramid_collapse_log
@@ -398,11 +400,16 @@ mod tests {
         }
 
         // Collapse with preserve_history=false
-        let result =
-            collapse_node_delta_chain(&conn, "test-collapse", "n-1", false).unwrap();
+        let result = collapse_node_delta_chain(&conn, "test-collapse", "n-1", false).unwrap();
 
-        assert_eq!(result.versions_before, 5, "Should report 5 total versions before collapse");
-        assert_eq!(result.versions_after, 1, "Should report 1 version after collapse");
+        assert_eq!(
+            result.versions_before, 5,
+            "Should report 5 total versions before collapse"
+        );
+        assert_eq!(
+            result.versions_after, 1,
+            "Should report 1 version after collapse"
+        );
         assert!(!result.preserved, "Should not preserve history");
 
         // Verify: all version rows deleted
@@ -492,41 +499,22 @@ mod tests {
         // Node with 12 total versions, old timestamps (more than 1 hour ago)
         insert_node(&conn, "auto-test", "old-node", 2, 12);
         for v in 1..=11 {
-            insert_version_at(
-                &conn,
-                "auto-test",
-                "old-node",
-                v,
-                "2025-01-01 00:00:00",
-            );
+            insert_version_at(&conn, "auto-test", "old-node", v, "2025-01-01 00:00:00");
         }
 
         // Node with 12 total versions, recent timestamps (should NOT be returned)
         insert_node(&conn, "auto-test", "recent-node", 2, 12);
         for v in 1..=11 {
             // Use a far-future timestamp to guarantee "recent"
-            insert_version_at(
-                &conn,
-                "auto-test",
-                "recent-node",
-                v,
-                "2099-12-31 23:59:59",
-            );
+            insert_version_at(&conn, "auto-test", "recent-node", v, "2099-12-31 23:59:59");
         }
 
         // Node with only 2 total versions (below threshold)
         insert_node(&conn, "auto-test", "small-node", 2, 2);
-        insert_version_at(
-            &conn,
-            "auto-test",
-            "small-node",
-            1,
-            "2025-01-01 00:00:00",
-        );
+        insert_version_at(&conn, "auto-test", "small-node", 1, "2025-01-01 00:00:00");
 
         // Use explicit config: threshold=10, idle=60 minutes
-        let candidates =
-            should_auto_collapse_with_config(&conn, "auto-test", 10, 60).unwrap();
+        let candidates = should_auto_collapse_with_config(&conn, "auto-test", 10, 60).unwrap();
 
         assert!(
             candidates.contains(&"old-node".to_string()),
@@ -565,7 +553,10 @@ mod tests {
         let entry = &log[0];
         assert_eq!(entry.slug, "log-test");
         assert_eq!(entry.node_id, "logged-node");
-        assert_eq!(entry.versions_before, 4, "4 total versions (3 history + 1 live)");
+        assert_eq!(
+            entry.versions_before, 4,
+            "4 total versions (3 history + 1 live)"
+        );
         assert_eq!(entry.versions_after, 1);
         assert!(entry.preserved, "Should be preserved");
         assert!(!entry.collapsed_at.is_empty(), "Should have a timestamp");

@@ -13,12 +13,12 @@
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use tracing::{info, warn};
 
 use super::llm::{self, LlmConfig};
 use super::question_decomposition;
-use super::step_context::{compute_prompt_hash, StepContext};
+use super::step_context::make_step_ctx_from_llm_config;
 use super::types::CharacterizationResult;
 use super::Tier1Config;
 
@@ -157,27 +157,25 @@ Analyze this material and produce the characterization."#,
         Some(resolved) => {
             let model_id = resolved.tier.model_id.clone();
             let provider_id = resolved.provider.id.clone();
-            let context_limit = resolved.tier.context_limit;
-            let mut cloned = llm_config.clone();
-            cloned.primary_model = model_id.clone();
-            if let Some(ctx_limit) = context_limit {
-                cloned.primary_context_limit = ctx_limit;
-            }
+            let _context_limit = resolved.tier.context_limit;
+            // W3c: no longer overriding LlmConfig.primary_model /
+            // primary_context_limit — those fields are deleted. The
+            // resolved model_id below threads into dispatch via
+            // LlmCallOptions.model_override on the call path.
+            let cloned = llm_config.clone();
             ("max", model_id, Some(provider_id), cloned)
         }
         None => {
-            warn!(
-                "characterize: provider registry unavailable — falling back to \
-                 llm_config.primary_model='{}' (declared intent was max-tier). \
-                 This will fail on any route whose provider does not accept that model id.",
-                llm_config.primary_model,
-            );
-            (
-                "primary",
-                llm_config.primary_model.clone(),
-                None,
-                llm_config.clone(),
-            )
+            // W3c: legacy `llm_config.primary_model` fallback removed.
+            // Characterize is a top-level entry point with no outer
+            // Decision; if the registry can't resolve the "max" tier we
+            // can't dispatch at all.
+            return Err(anyhow!(
+                "characterize: provider registry has no 'max' tier routing \
+                 and walker-v3 W3c removed the legacy LlmConfig.primary_model \
+                 fallback. Configure a walker_provider_openrouter contribution \
+                 with a 'max' slot model_list entry.",
+            ));
         }
     };
 
@@ -185,38 +183,18 @@ Analyze this material and produce the characterization."#,
     for attempt in 0..2u32 {
         let temp = if attempt == 0 { temperature } else { 0.1 };
 
-        // Build StepContext inline so the resolved tier + model id are
-        // stamped correctly. The retrofit helper labels everything as
-        // tier="primary" with model=primary_model, which is the hardwiring
-        // this fix exists to bypass.
-        let cache_ctx: Option<StepContext> = call_config.cache_access.as_ref().and_then(|cache| {
-            if system_prompt.is_empty() {
-                return None;
-            }
-            let prompt_hash = compute_prompt_hash(&system_prompt);
-            let mut ctx = StepContext::new(
-                cache.slug.clone(),
-                cache.build_id.clone(),
-                "characterize",
-                "characterize",
-                0,
-                None,
-                cache.db_path.to_string(),
-            )
-            .with_model_resolution(resolved_tier_name, resolved_model_id.clone())
-            .with_prompt_hash(prompt_hash);
-            if let Some(ref pid) = resolved_provider_id {
-                ctx = ctx.with_provider(pid.clone());
-            }
-            if let Some(ref bus) = cache.bus {
-                ctx = ctx.with_bus(bus.clone());
-            }
-            if let Some(ref cn) = cache.chain_name {
-                let ct = cache.content_type.as_deref().unwrap_or("");
-                ctx = ctx.with_chain_context(cn.clone(), ct.to_string());
-            }
-            Some(ctx)
-        });
+        let cache_ctx = make_step_ctx_from_llm_config(
+            &call_config,
+            "characterize",
+            "characterize",
+            0,
+            None,
+            &system_prompt,
+            resolved_tier_name,
+            Some(&resolved_model_id),
+            resolved_provider_id.as_deref(),
+        )
+        .await;
 
         let response = llm::call_model_unified_and_ctx(
             &call_config,

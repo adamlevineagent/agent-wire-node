@@ -1,5 +1,5 @@
 import type { PyramidRenderer } from './PyramidRenderer';
-import type { SurfaceNode, SurfaceEdge, NodeEncoding, OverlayState, HitTestResult, VizPrimitive, BuildVizState } from './types';
+import type { SurfaceNode, SurfaceEdge, NodeEncoding, OverlayState, HitTestResult, VizStepConfig, BuildVizState } from './types';
 import { NodeVisualState, EdgeCategory } from './types';
 
 // ── Node color map ──────────────────────────────────────────────────
@@ -73,7 +73,8 @@ const EDGE_STYLES: Record<string, EdgeStyle> = {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-function nodeTitle(node: Pick<SurfaceNode, 'headline' | 'id' | 'selfPrompt'>): string {
+function nodeTitle(node: Pick<SurfaceNode, 'headline' | 'id' | 'selfPrompt' | 'question'>): string {
+    if (node.question?.trim()) return node.question;
     if (node.selfPrompt?.trim()) return node.selfPrompt;
     return node.headline?.trim() ? node.headline : node.id;
 }
@@ -163,7 +164,7 @@ export class CanvasRenderer implements PyramidRenderer {
     private nodeEncodings = new Map<string, NodeEncoding>();
     private pulsePhase = 0;
     private lastPulseTime = 0;
-    private activeVizPrimitive: VizPrimitive | null = null;
+    private activeVizConfig: VizStepConfig | null = null;
     private buildVizState: BuildVizState | null = null;
     private linkIntensities = new Map<string, number>();
     private densityLabelThreshold = 0;
@@ -232,8 +233,8 @@ export class CanvasRenderer implements PyramidRenderer {
         this.nodeEncodings = new Map(encodings);
     }
 
-    setActiveVizPrimitive(primitive: VizPrimitive | null): void {
-        this.activeVizPrimitive = primitive;
+    setActiveVizConfig(config: VizStepConfig | null): void {
+        this.activeVizConfig = config;
     }
 
     setBuildVizState(state: BuildVizState): void {
@@ -552,19 +553,47 @@ export class CanvasRenderer implements PyramidRenderer {
         ctx: CanvasRenderingContext2D,
         nodes: SurfaceNode[],
     ): void {
-        if (!this.activeVizPrimitive || !this.buildVizState) return;
+        const activeVizPrimitive = this.activeVizConfig?.type;
+        if (!activeVizPrimitive || !this.buildVizState) return;
 
-        if (this.activeVizPrimitive === 'node_fill' || this.activeVizPrimitive === 'progress_only') {
-            return; // No overlay for these primitives
+        if (activeVizPrimitive === 'node_fill') {
+            return;
         }
 
-        if (this.activeVizPrimitive === 'edge_draw') {
+        if (activeVizPrimitive === 'progress_only') {
+            this.drawProgressOnlyOverlay(ctx, nodes);
+        } else if (activeVizPrimitive === 'edge_draw') {
             this.drawEdgeDrawOverlay(ctx, nodes);
-        } else if (this.activeVizPrimitive === 'verdict_mark') {
+        } else if (activeVizPrimitive === 'verdict_mark') {
             this.drawVerdictMarkOverlay(ctx, nodes);
-        } else if (this.activeVizPrimitive === 'cluster_form') {
+        } else if (activeVizPrimitive === 'cluster_form') {
             this.drawClusterFormOverlay(ctx, nodes);
         }
+    }
+
+    private drawProgressOnlyOverlay(
+        ctx: CanvasRenderingContext2D,
+        nodes: SurfaceNode[],
+    ): void {
+        if (nodes.length === 0) return;
+
+        const pulse = 0.5 + 0.5 * Math.sin(this.pulsePhase);
+        const alpha = 0.10 + 0.10 * pulse;
+        const radiusPad = 3 + 2 * pulse;
+
+        ctx.save();
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = `rgba(0, 255, 255, ${alpha})`;
+        ctx.shadowBlur = 6;
+        ctx.shadowColor = `rgba(0, 255, 255, ${alpha})`;
+
+        for (const node of nodes) {
+            ctx.beginPath();
+            ctx.arc(node.x, node.y, node.radius + radiusPad, 0, Math.PI * 2);
+            ctx.stroke();
+        }
+
+        ctx.restore();
     }
 
     private drawEdgeDrawOverlay(
@@ -612,8 +641,11 @@ export class CanvasRenderer implements PyramidRenderer {
         ctx: CanvasRenderingContext2D,
         nodes: SurfaceNode[],
     ): void {
-        const verdicts = this.buildVizState?.verdictsByNode;
-        if (!verdicts || verdicts.size === 0) return;
+        const verdicts = new Map(this.buildVizState?.verdictsBySource ?? []);
+        for (const [nodeId, verdict] of this.buildVizState?.verdictsByNode ?? []) {
+            verdicts.set(nodeId, verdict);
+        }
+        if (verdicts.size === 0) return;
 
         for (const [nodeId, verdict] of verdicts) {
             const node = nodes.find((n) => n.id === nodeId);

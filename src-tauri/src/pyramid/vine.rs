@@ -80,9 +80,11 @@ fn spawn_write_drain(
                         ref parent_id,
                     } => db::update_parent(&conn, slug, node_id, parent_id),
                     build::WriteOp::UpdateStats { ref slug } => db::update_slug_stats(&conn, slug),
-                    build::WriteOp::UpdateFileHash { ref slug, ref file_path, ref node_id } => {
-                        db::append_node_id_to_file_hash(&conn, slug, file_path, node_id)
-                    }
+                    build::WriteOp::UpdateFileHash {
+                        ref slug,
+                        ref file_path,
+                        ref node_id,
+                    } => db::append_node_id_to_file_hash(&conn, slug, file_path, node_id),
                     build::WriteOp::Flush { done } => {
                         let _ = done.send(());
                         Ok(())
@@ -548,105 +550,13 @@ pub fn assemble_vine_l0(
 }
 
 // ── Vine Build Pipeline Helper ───────────────────────────────────────────────
-
-/// Run the build pipeline for a single slug, setting up all required channels.
-/// Extracted from routes.rs to be shared between HTTP builds and vine bunch builds.
-///
-/// Phase 16: takes an optional `state` reference so the `ContentType::Vine`
-/// branch can dispatch the topical-vine chain via
-/// `build::build_topical_vine`. Existing callers that build conversation
-/// bunches pass `None` because they never hit the vine branch.
-pub async fn run_build_pipeline(
-    reader: Arc<Mutex<Connection>>,
-    writer: Arc<Mutex<Connection>>,
-    llm_config: &LlmConfig,
-    slug: &str,
-    content_type: ContentType,
-    cancel: &CancellationToken,
-    bus: Option<&super::event_bus::BuildEventBus>,
-    state: Option<&PyramidState>,
-) -> Result<i32> {
-    // Use shared writer drain helper (single implementation, not duplicated)
-    let (write_tx, writer_handle) = spawn_write_drain(writer);
-
-    // Create progress channel. When a BuildEventBus is supplied, tee onto the
-    // bus so the public web surface (post-agents-retro WS) can subscribe
-    // per-slug. The downstream debug-log consumer is unaffected.
-    let (progress_tx, raw_progress_rx) = mpsc::channel::<BuildProgress>(64);
-    let mut progress_rx = if let Some(bus) = bus {
-        super::event_bus::tee_build_progress_to_bus(bus, slug.to_string(), raw_progress_rx)
-    } else {
-        raw_progress_rx
-    };
-    let slug_for_progress = slug.to_string();
-    let progress_handle = tokio::spawn(async move {
-        while let Some(prog) = progress_rx.recv().await {
-            tracing::debug!(
-                "Build progress for '{}': {}/{}",
-                slug_for_progress,
-                prog.done,
-                prog.total
-            );
-        }
-    });
-
-    // Dispatch by content type
-    let result = match content_type {
-        ContentType::Conversation => {
-            build::build_conversation(reader, &write_tx, llm_config, slug, cancel, &progress_tx)
-                .await
-        }
-        ContentType::Code => {
-            build::build_code(reader, &write_tx, llm_config, slug, cancel, &progress_tx).await
-        }
-        ContentType::Document => {
-            build::build_docs(reader, &write_tx, llm_config, slug, cancel, &progress_tx).await
-        }
-        ContentType::Vine => {
-            // Phase 16: vines are built by dispatching the topical vine
-            // chain through the chain executor. The executor pulls child
-            // apex data from `pyramid_vine_compositions` via the
-            // cross_build_input primitive and composes bedrock + sub-vine
-            // children uniformly.
-            match state {
-                Some(s) => build::build_topical_vine(s, slug, cancel, &progress_tx).await,
-                None => Err(anyhow!(
-                    "Vine build requires PyramidState: use run_build_from or pass state \
-                     to run_build_pipeline. Phase 16 dispatches vines via the topical-vine chain."
-                )),
-            }
-        }
-        ContentType::Question => Err(anyhow!(
-            "Question build uses question-driven pipeline, not run_build_pipeline"
-        )),
-    };
-
-    // Clean up channels
-    drop(write_tx);
-    drop(progress_tx);
-    let _ = writer_handle.await;
-    let _ = progress_handle.await;
-
-    // WS-EVENTS §15.21: SlopeChanged catch-all at legacy build-pipeline
-    // completion. `build::build_conversation` / `build_code` / `build_docs`
-    // don't have the bus threaded through yet (intentionally unrefactored
-    // per WS-EVENTS scope — brief forbids restructuring those call sites),
-    // so we emit once here on success to guarantee WS-PRIMER subscribers
-    // see a cache-invalidation edge after every successful legacy build.
-    // Empty `affected_layers` = "revalidate everything".
-    if result.is_ok() {
-        if let Some(bus) = bus {
-            let _ = bus.tx.send(super::event_bus::TaggedBuildEvent {
-                slug: slug.to_string(),
-                kind: super::event_bus::TaggedKind::SlopeChanged {
-                    affected_layers: Vec::new(),
-                },
-            });
-        }
-    }
-
-    result
-}
+//
+// walker-v3 W3a: `run_build_pipeline` retired with the legacy build
+// pipeline. Its sole remaining caller (the chain-fail fallback in
+// `build_vine_bunch`) was removed in the same commit, and no other
+// site called it. Chain engine dispatch via
+// `build_runner::run_build_from_with_evidence_mode` is the only
+// supported path.
 
 // ── Vine DB CRUD ─────────────────────────────────────────────────────────────
 
@@ -888,11 +798,13 @@ pub async fn build_bunch(
         let mut idx = bunch_index;
         loop {
             let candidate = format!("{vine_slug}--bunch-{idx:03}");
-            let has_chunks = conn.query_row(
-                "SELECT COUNT(*) FROM pyramid_chunks WHERE slug = ?1",
-                rusqlite::params![candidate],
-                |row| row.get::<_, i64>(0),
-            ).unwrap_or(0);
+            let has_chunks = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pyramid_chunks WHERE slug = ?1",
+                    rusqlite::params![candidate],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0);
             if has_chunks == 0 {
                 break candidate;
             }
@@ -955,10 +867,14 @@ pub async fn build_bunch(
             file_watchers: state.file_watchers.clone(),
             vine_builds: state.vine_builds.clone(),
             use_chain_engine: std::sync::atomic::AtomicBool::new(
-                state.use_chain_engine.load(std::sync::atomic::Ordering::Relaxed),
+                state
+                    .use_chain_engine
+                    .load(std::sync::atomic::Ordering::Relaxed),
             ),
             use_ir_executor: std::sync::atomic::AtomicBool::new(
-                state.use_ir_executor.load(std::sync::atomic::Ordering::Relaxed),
+                state
+                    .use_ir_executor
+                    .load(std::sync::atomic::Ordering::Relaxed),
             ),
             event_bus: state.event_bus.clone(),
             operational: state.operational.clone(),
@@ -987,21 +903,41 @@ pub async fn build_bunch(
         while let Some(op) = write_rx.recv().await {
             let conn = write_writer.lock().await;
             let result = match op {
-                build::WriteOp::SaveNode { ref node, ref topics_json } => {
-                    db::save_node(&conn, node, topics_json.as_deref())
-                }
-                build::WriteOp::SaveStep { ref slug, ref step_type, chunk_index, depth, ref node_id, ref output_json, ref model, elapsed } => {
-                    db::save_step(&conn, slug, step_type, chunk_index, depth, node_id, output_json, model, elapsed)
-                }
-                build::WriteOp::UpdateParent { ref slug, ref node_id, ref parent_id } => {
-                    db::update_parent(&conn, slug, node_id, parent_id)
-                }
-                build::WriteOp::UpdateStats { ref slug } => {
-                    db::update_slug_stats(&conn, slug)
-                }
-                build::WriteOp::UpdateFileHash { ref slug, ref file_path, ref node_id } => {
-                    db::append_node_id_to_file_hash(&conn, slug, file_path, node_id)
-                }
+                build::WriteOp::SaveNode {
+                    ref node,
+                    ref topics_json,
+                } => db::save_node(&conn, node, topics_json.as_deref()),
+                build::WriteOp::SaveStep {
+                    ref slug,
+                    ref step_type,
+                    chunk_index,
+                    depth,
+                    ref node_id,
+                    ref output_json,
+                    ref model,
+                    elapsed,
+                } => db::save_step(
+                    &conn,
+                    slug,
+                    step_type,
+                    chunk_index,
+                    depth,
+                    node_id,
+                    output_json,
+                    model,
+                    elapsed,
+                ),
+                build::WriteOp::UpdateParent {
+                    ref slug,
+                    ref node_id,
+                    ref parent_id,
+                } => db::update_parent(&conn, slug, node_id, parent_id),
+                build::WriteOp::UpdateStats { ref slug } => db::update_slug_stats(&conn, slug),
+                build::WriteOp::UpdateFileHash {
+                    ref slug,
+                    ref file_path,
+                    ref node_id,
+                } => db::append_node_id_to_file_hash(&conn, slug, file_path, node_id),
                 build::WriteOp::Flush { done } => {
                     let _ = done.send(());
                     Ok(())
@@ -1037,25 +973,12 @@ pub async fn build_bunch(
             info!("Bunch '{bunch_slug}' built via chain executor: {node_count} nodes");
         }
         Err(e) => {
-            warn!("Bunch '{bunch_slug}' chain build failed, falling back to legacy: {e}");
-            // Fallback to legacy pipeline if chain executor fails
-            let reader = if let Some(data_dir) = state.data_dir.as_ref() {
-                let build_conn = db::open_pyramid_connection(&data_dir.join("pyramid.db"))?;
-                Arc::new(Mutex::new(build_conn))
-            } else {
-                state.reader.clone()
-            };
-            let writer = state.writer.clone();
-            // Phase 12 verifier fix: attach cache_access so build.rs retrofit
-            // sites reach the step cache.
-            let llm_config = state
-                .llm_config_with_cache(&bunch_slug, &format!("vine-fallback-{}", bunch_slug))
-                .await;
-            run_build_pipeline(
-                reader, writer, &llm_config, &bunch_slug,
-                ContentType::Conversation, cancel, Some(&state.build_event_bus),
-                Some(state),
-            ).await?;
+            // walker-v3 W3a: legacy fallback retired. The chain engine
+            // is the only supported dispatch path per plan §5.6.3; if
+            // the chain build fails here, surface it — no silent
+            // fallback to the removed build_conversation/build_code/
+            // build_docs path.
+            return Err(anyhow!("Vine bunch '{bunch_slug}' chain build failed: {e}"));
         }
     }
 
@@ -1318,6 +1241,7 @@ pub async fn build_vine_l1(
         super::vine_prompts::VINE_CLUSTER_PROMPT,
         &inventory_json,
         "vine-l1-cluster",
+        "mid",
     )
     .await?;
 
@@ -1449,6 +1373,7 @@ pub async fn build_vine_l1(
             SYNTHESIZE_RECURSIVE_PROMPT,
             &user_prompt,
             &format!("vine-l1-{cluster_idx}"),
+            "mid",
         )
         .await
         {
@@ -1467,18 +1392,17 @@ pub async fn build_vine_l1(
                     1,
                     &l1_id,
                     &output_json,
-                    &llm_config.primary_model,
+                    // W3c: legacy `llm_config.primary_model` removed. Step
+                    // telemetry stamps `<unknown>` here until vine runs
+                    // through the walker Decision spine. Provenance only.
+                    "<unknown>",
                     elapsed,
                 )
                 .await;
 
                 let children: Vec<String> = l0_nodes.iter().map(|n| n.id.clone()).collect();
                 let mut node = match chain_dispatch::build_node_from_output(
-                    &analysis,
-                    &l1_id,
-                    vine_slug,
-                    1,
-                    None,
+                    &analysis, &l1_id, vine_slug, 1, None,
                 ) {
                     Ok(n) => n,
                     Err(e) => {
@@ -1488,7 +1412,12 @@ pub async fn build_vine_l1(
                 };
                 node.children = children.clone();
                 // Backfill distilled from narrative for downstream consumers
-                node.distilled = node.narrative.levels.first().map(|l| l.text.clone()).unwrap_or_default();
+                node.distilled = node
+                    .narrative
+                    .levels
+                    .first()
+                    .map(|l| l.text.clone())
+                    .unwrap_or_default();
                 build::send_save_node(&write_tx, node, Some(topics_json)).await;
 
                 // Set parent pointers on L0 nodes
@@ -1613,6 +1542,7 @@ pub async fn build_vine_upper(
                         SYNTHESIZE_RECURSIVE_PROMPT,
                         &user_prompt,
                         &format!("vine-synth-d{next_depth}-{pair_idx}"),
+                        "mid",
                     )
                     .await
                     {
@@ -1651,17 +1581,14 @@ pub async fn build_vine_upper(
                         next_depth,
                         &node_id,
                         &output_json,
-                        &llm_config.primary_model,
+                        // W3c: see sibling at ~line 1373. Provenance stamp only.
+                        "<unknown>",
                         elapsed,
                     )
                     .await;
 
                     let mut node = match chain_dispatch::build_node_from_output(
-                        &analysis,
-                        &node_id,
-                        vine_slug,
-                        next_depth,
-                        None,
+                        &analysis, &node_id, vine_slug, next_depth, None,
                     ) {
                         Ok(n) => n,
                         Err(e) => {
@@ -1673,8 +1600,10 @@ pub async fn build_vine_upper(
                             fallback.chunk_index = None;
                             fallback.children = vec![left.id.clone(), right.id.clone()];
                             build::send_save_node(&write_tx, fallback, None).await;
-                            build::send_update_parent(&write_tx, vine_slug, &left.id, &node_id).await;
-                            build::send_update_parent(&write_tx, vine_slug, &right.id, &node_id).await;
+                            build::send_update_parent(&write_tx, vine_slug, &left.id, &node_id)
+                                .await;
+                            build::send_update_parent(&write_tx, vine_slug, &right.id, &node_id)
+                                .await;
                             i += 2;
                             pair_idx += 1;
                             continue;
@@ -1682,7 +1611,12 @@ pub async fn build_vine_upper(
                     };
                     node.children = vec![left.id.clone(), right.id.clone()];
                     // Backfill distilled from narrative for downstream consumers
-                    node.distilled = node.narrative.levels.first().map(|l| l.text.clone()).unwrap_or_default();
+                    node.distilled = node
+                        .narrative
+                        .levels
+                        .first()
+                        .map(|l| l.text.clone())
+                        .unwrap_or_default();
                     build::send_save_node(&write_tx, node, Some(topics_json)).await;
                     build::send_update_parent(&write_tx, vine_slug, &left.id, &node_id).await;
                     build::send_update_parent(&write_tx, vine_slug, &right.id, &node_id).await;
@@ -1741,21 +1675,35 @@ pub async fn build_vine_upper(
         if top_nodes.len() > 1 {
             let apex_depth = depth + 1;
             let forced_id = format!("L{apex_depth}-000");
-            info!("Forcing apex: merging {} L{depth} nodes into {forced_id}", top_nodes.len());
+            info!(
+                "Forcing apex: merging {} L{depth} nodes into {forced_id}",
+                top_nodes.len()
+            );
 
-            let combined_headline = top_nodes.iter()
+            let combined_headline = top_nodes
+                .iter()
                 .map(|n| n.headline.as_str())
                 .collect::<Vec<_>>()
                 .join(" / ");
-            let combined_distilled = top_nodes.iter()
-                .filter_map(|n| if n.distilled.is_empty() { None } else { Some(n.distilled.as_str()) })
+            let combined_distilled = top_nodes
+                .iter()
+                .filter_map(|n| {
+                    if n.distilled.is_empty() {
+                        None
+                    } else {
+                        Some(n.distilled.as_str())
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n\n");
             let children: Vec<String> = top_nodes.iter().map(|n| n.id.clone()).collect();
             let mut merged_topics = Vec::new();
             for n in &top_nodes {
                 for t in &n.topics {
-                    if !merged_topics.iter().any(|mt: &super::types::Topic| mt.name == t.name) {
+                    if !merged_topics
+                        .iter()
+                        .any(|mt: &super::types::Topic| mt.name == t.name)
+                    {
                         merged_topics.push(t.clone());
                     }
                 }
@@ -1764,7 +1712,10 @@ pub async fn build_vine_upper(
             // Merge episodic fields from the best top node (first non-empty)
             let best = top_nodes.first().unwrap(); // top_nodes.len() > 1 guaranteed
             let truncated_headline = if combined_headline.chars().count() > 200 {
-                format!("{}...", combined_headline.chars().take(197).collect::<String>())
+                format!(
+                    "{}...",
+                    combined_headline.chars().take(197).collect::<String>()
+                )
             } else {
                 combined_headline
             };
@@ -2106,6 +2057,7 @@ async fn detect_vine_eras(
             super::vine_prompts::VINE_PHASE_CHECK_PROMPT,
             &user_prompt,
             &format!("vine-era-check-{idx}"),
+            "mid",
         )
         .await
         {
@@ -2274,6 +2226,7 @@ async fn classify_vine_transitions(
             super::vine_prompts::VINE_TRANSITION_PROMPT,
             &user_prompt,
             &format!("vine-transition-{i}"),
+            "mid",
         )
         .await
         {
@@ -2394,6 +2347,7 @@ async fn resolve_vine_entities(
         super::vine_prompts::VINE_ENTITY_RESOLUTION_PROMPT,
         &clusters_json,
         "vine-entity-resolution",
+        "mid",
     )
     .await
     {

@@ -64,11 +64,7 @@ pub async fn execute_manifest(
 }
 
 /// Execute a single manifest operation and return its result.
-fn execute_single_op(
-    conn: &Connection,
-    slug: &str,
-    op: &ManifestOperation,
-) -> ManifestOpResult {
+fn execute_single_op(conn: &Connection, slug: &str, op: &ManifestOperation) -> ManifestOpResult {
     match op {
         ManifestOperation::Hydrate {
             node_id,
@@ -83,15 +79,11 @@ fn execute_single_op(
             execute_densify(conn, slug, missing_node_id)
         }
 
-        ManifestOperation::Colocate { seed_node_id } => {
-            execute_colocate(conn, slug, seed_node_id)
-        }
+        ManifestOperation::Colocate { seed_node_id } => execute_colocate(conn, slug, seed_node_id),
 
         ManifestOperation::Lookahead { node_ids } => execute_lookahead(conn, slug, node_ids),
 
-        ManifestOperation::Investigation { node_id } => {
-            execute_investigation(conn, slug, node_id)
-        }
+        ManifestOperation::Investigation { node_id } => execute_investigation(conn, slug, node_id),
 
         ManifestOperation::Ask {
             pyramid_slug,
@@ -153,11 +145,7 @@ fn execute_hydrate(
 ///
 /// Plan §9.3: "Dehydration at runtime is a pure projection operation over
 /// the multi-dimensional content the synthesis prompt produced at write time."
-fn execute_dehydrate(
-    conn: &Connection,
-    slug: &str,
-    node_id: &str,
-) -> ManifestOpResult {
+fn execute_dehydrate(conn: &Connection, slug: &str, node_id: &str) -> ManifestOpResult {
     match db::get_live_node(conn, slug, node_id) {
         Ok(Some(node)) => {
             // Project to vocabulary floor: headline + topic names + entity names.
@@ -214,11 +202,7 @@ fn execute_compress(buffer_range: (usize, usize)) -> ManifestOpResult {
 /// Densify: Fire async demand-gen for the missing node. Returns the node_id
 /// so the caller knows a request was filed. The actual generation happens
 /// asynchronously via the demand-gen infrastructure.
-fn execute_densify(
-    conn: &Connection,
-    slug: &str,
-    missing_node_id: &str,
-) -> ManifestOpResult {
+fn execute_densify(conn: &Connection, slug: &str, missing_node_id: &str) -> ManifestOpResult {
     // Check whether the node actually exists (if it does, no densification needed).
     match db::get_live_node(conn, slug, missing_node_id) {
         Ok(Some(_node)) => ManifestOpResult {
@@ -256,11 +240,7 @@ fn execute_densify(
 /// Colocate: Follow web edges from a seed node, return related nodes.
 /// This implements the "pull in nodes related to a seed via ties_to"
 /// operation from §9.2.
-fn execute_colocate(
-    conn: &Connection,
-    slug: &str,
-    seed_node_id: &str,
-) -> ManifestOpResult {
+fn execute_colocate(conn: &Connection, slug: &str, seed_node_id: &str) -> ManifestOpResult {
     // First verify the seed exists
     let seed = match db::get_live_node(conn, slug, seed_node_id) {
         Ok(Some(n)) => n,
@@ -325,11 +305,7 @@ fn execute_colocate(
 }
 
 /// Load neighbor node IDs via web edges for a given canonical node.
-fn load_web_edge_neighbors(
-    conn: &Connection,
-    slug: &str,
-    node_id: &str,
-) -> Result<Vec<String>> {
+fn load_web_edge_neighbors(conn: &Connection, slug: &str, node_id: &str) -> Result<Vec<String>> {
     // Find the thread for this node, then find connected threads via web edges.
     let thread_id: Option<String> = conn
         .prepare(
@@ -383,11 +359,7 @@ fn load_web_edge_neighbors(
 
 /// Lookahead: Pre-fetch nodes the agent anticipates needing. Just load and
 /// return them — the runtime caches them in the Brain Map for the next turn.
-fn execute_lookahead(
-    conn: &Connection,
-    slug: &str,
-    node_ids: &[String],
-) -> ManifestOpResult {
+fn execute_lookahead(conn: &Connection, slug: &str, node_ids: &[String]) -> ManifestOpResult {
     let mut nodes = Vec::new();
     let mut errors = Vec::new();
 
@@ -422,11 +394,7 @@ fn execute_lookahead(
 /// Investigation: Check a node's staleness status by looking at the most
 /// recent stale check log entry. Returns the staleness state so the agent
 /// knows whether to trust the content.
-fn execute_investigation(
-    conn: &Connection,
-    slug: &str,
-    node_id: &str,
-) -> ManifestOpResult {
+fn execute_investigation(conn: &Connection, slug: &str, node_id: &str) -> ManifestOpResult {
     // Verify the node exists
     let node = match db::get_live_node(conn, slug, node_id) {
         Ok(Some(n)) => n,
@@ -488,11 +456,7 @@ fn execute_investigation(
 /// Ask: Fire a question against a pyramid. Wraps demand-gen infrastructure.
 /// Returns a signal that the question was accepted. The actual answer may
 /// require async demand-driven generation.
-fn execute_ask(
-    conn: &Connection,
-    pyramid_slug: &str,
-    question: &str,
-) -> ManifestOpResult {
+fn execute_ask(conn: &Connection, pyramid_slug: &str, question: &str) -> ManifestOpResult {
     // Verify the target pyramid exists
     let slug_exists = conn
         .prepare("SELECT 1 FROM pyramid_slugs WHERE slug = ?1 AND archived_at IS NULL")
@@ -561,10 +525,7 @@ fn execute_propose_chain_update(
 ///
 /// Combines the primer (leftmost slope + canonical vocabulary) with the
 /// initial Brain Map nodes (slope nodes as full JSON).
-pub async fn cold_start(
-    state: &PyramidState,
-    slug: &str,
-) -> Result<ColdStartPayload> {
+pub async fn cold_start(state: &PyramidState, slug: &str) -> Result<ColdStartPayload> {
     let session_id = uuid::Uuid::new_v4().to_string();
 
     let conn = state.reader.lock().await;
@@ -600,7 +561,13 @@ fn log_manifest_provenance(
     conn.execute(
         "INSERT INTO pyramid_manifest_log (provenance_id, slug, session_id, operations, results)
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![provenance_id, slug, session_id, operations_json, results_json],
+        rusqlite::params![
+            provenance_id,
+            slug,
+            session_id,
+            operations_json,
+            results_json
+        ],
     )?;
     Ok(())
 }
@@ -819,11 +786,7 @@ mod tests {
         // Should have topic names (as simple strings, not full topic objects)
         let topics = floor.get("topics").and_then(|v| v.as_array());
         assert!(topics.is_some(), "Dehydrated floor should have topics");
-        let topic_names: Vec<&str> = topics
-            .unwrap()
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
+        let topic_names: Vec<&str> = topics.unwrap().iter().filter_map(|v| v.as_str()).collect();
         assert!(
             topic_names.contains(&"topic-a"),
             "Should contain topic-a name"
@@ -837,10 +800,7 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        assert!(
-            entity_names.contains(&"Adam"),
-            "Should contain entity Adam"
-        );
+        assert!(entity_names.contains(&"Adam"), "Should contain entity Adam");
 
         // Should be flagged as dehydrated
         assert_eq!(
@@ -866,7 +826,10 @@ mod tests {
 
         // Build primer directly (cold_start is async, so test the components)
         let primer_ctx = primer::build_primer(&conn, slug, None).unwrap();
-        assert!(!primer_ctx.slope_nodes.is_empty(), "Primer should have slope nodes");
+        assert!(
+            !primer_ctx.slope_nodes.is_empty(),
+            "Primer should have slope nodes"
+        );
 
         let slope = primer::get_leftmost_slope(&conn, slug).unwrap();
         let brain_map_initial: Vec<serde_json::Value> = slope
@@ -880,16 +843,19 @@ mod tests {
         );
 
         // Verify the brain map contains the apex
-        let has_apex = brain_map_initial.iter().any(|n| {
-            n.get("headline").and_then(|v| v.as_str()) == Some("Test Manifest Apex")
-        });
+        let has_apex = brain_map_initial
+            .iter()
+            .any(|n| n.get("headline").and_then(|v| v.as_str()) == Some("Test Manifest Apex"));
         assert!(has_apex, "Brain map initial should contain the apex node");
 
         // Verify the brain map contains the leftmost L0
-        let has_l0 = brain_map_initial.iter().any(|n| {
-            n.get("headline").and_then(|v| v.as_str()) == Some("L0 newest")
-        });
-        assert!(has_l0, "Brain map initial should contain the leftmost L0 node");
+        let has_l0 = brain_map_initial
+            .iter()
+            .any(|n| n.get("headline").and_then(|v| v.as_str()) == Some("L0 newest"));
+        assert!(
+            has_l0,
+            "Brain map initial should contain the leftmost L0 node"
+        );
     }
 
     #[test]
@@ -991,7 +957,11 @@ mod tests {
             "Lookahead should succeed: {:?}",
             result.error
         );
-        assert_eq!(result.nodes_returned.len(), 2, "Should return 2 prefetched nodes");
+        assert_eq!(
+            result.nodes_returned.len(),
+            2,
+            "Should return 2 prefetched nodes"
+        );
     }
 
     #[test]
@@ -1015,10 +985,7 @@ mod tests {
         assert_eq!(result.nodes_returned.len(), 1);
 
         let info = &result.nodes_returned[0];
-        assert_eq!(
-            info.get("node_id").and_then(|v| v.as_str()),
-            Some("apex"),
-        );
+        assert_eq!(info.get("node_id").and_then(|v| v.as_str()), Some("apex"),);
         // No stale check exists for this test node, so should report current
         assert_eq!(
             info.get("investigation_status").and_then(|v| v.as_str()),

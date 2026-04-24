@@ -1,9 +1,10 @@
 import { useState, useMemo } from 'react';
 import type { LlmAuditRecord } from './types';
+import type { DrillResultFull } from './inspector-types';
 
 interface ResponseTabProps {
     audit: LlmAuditRecord | null;
-    drillData?: any;
+    drillData?: DrillResultFull | null;
 }
 
 /** Render any JSON value as structured content */
@@ -60,6 +61,45 @@ function JsonValue({ value, depth = 0 }: { value: unknown; depth?: number }) {
         );
     }
     return <span>{String(value)}</span>;
+}
+
+function pruneEmpty(value: unknown): unknown {
+    if (value === null || value === undefined || value === '') return undefined;
+    if (Array.isArray(value)) {
+        const items = value.map(pruneEmpty).filter((item) => item !== undefined);
+        return items.length > 0 ? items : undefined;
+    }
+    if (typeof value === 'object') {
+        const entries = Object.entries(value as Record<string, unknown>)
+            .map(([key, entry]) => [key, pruneEmpty(entry)] as const)
+            .filter(([, entry]) => entry !== undefined);
+        return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+    }
+    return value;
+}
+
+function buildStoredRecordView(drillData: DrillResultFull): Record<string, unknown> {
+    const node = drillData.node;
+    const stored = {
+        question_node: drillData.question_node,
+        question: drillData.question ?? node?.question,
+        question_about: drillData.question_about ?? node?.question_about,
+        question_creates: drillData.question_creates ?? node?.question_creates,
+        question_prompt_hint: drillData.question_prompt_hint ?? node?.question_prompt_hint,
+        answered: drillData.answered ?? node?.answered,
+        answer_node_id: drillData.answer_node_id ?? node?.answer_node_id ?? drillData.linked_answer?.id,
+        answer_headline: drillData.answer_headline ?? node?.answer_headline ?? drillData.linked_answer?.headline,
+        answer_distilled: drillData.answer_distilled ?? node?.answer_distilled ?? drillData.linked_answer?.distilled,
+        node,
+        linked_answer: drillData.linked_answer,
+        children: drillData.children,
+        evidence: drillData.evidence,
+        gaps: drillData.gaps,
+        web_edges: drillData.web_edges,
+        remote_web_edges: drillData.remote_web_edges,
+        question_context: drillData.question_context,
+    };
+    return (pruneEmpty(stored) ?? {}) as Record<string, unknown>;
 }
 
 export function ResponseTab({ audit, drillData }: ResponseTabProps) {
@@ -121,25 +161,15 @@ export function ResponseTab({ audit, drillData }: ResponseTabProps) {
         );
     }
 
-    // Fallback: no audit record, but we have drill data — show node content as structured view
+    // Fallback: no audit record, but we have drill data — show the full stored record.
     if (drillData?.node) {
-        const node = drillData.node;
-        // Build a clean object from the node fields that are interesting
-        const nodeView: Record<string, unknown> = {};
-        if (node.distilled) nodeView.distilled = node.distilled;
-        if (node.headline) nodeView.headline = node.headline;
-        if (node.topics?.length > 0) nodeView.topics = node.topics;
-        if (node.corrections?.length > 0) nodeView.corrections = node.corrections;
-        if (node.decisions?.length > 0) nodeView.decisions = node.decisions;
-        if (node.terms?.length > 0) nodeView.terms = node.terms;
-        if (node.dead_ends?.length > 0) nodeView.dead_ends = node.dead_ends;
-        if (node.self_prompt) nodeView.self_prompt = node.self_prompt;
+        const nodeView = buildStoredRecordView(drillData);
 
         if (Object.keys(nodeView).length > 0) {
             return (
                 <div className="response-tab">
                     <div className="response-source-note">
-                        Showing stored node data (LLM audit record not available)
+                        Showing stored record data (LLM audit record not available)
                     </div>
                     <div className="response-structured">
                         <JsonValue value={nodeView} />

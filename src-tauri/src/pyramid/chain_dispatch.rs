@@ -20,14 +20,78 @@ use super::execution_plan::{ModelRequirements, Step, StepOperation};
 use super::expression::ValueEnv;
 use super::llm::{self, AuditContext, LlmConfig, LlmResponse};
 use super::naming::headline_from_analysis;
-use super::step_context::{compute_prompt_hash, StepContext as CacheStepContext};
+use super::step_context::{
+    compute_cache_key, compute_inputs_hash, compute_prompt_hash, StepContext as CacheStepContext,
+};
 use super::transform_runtime;
 use super::types::{
     Correction, DebatePosition, DebateTopic, Decision, GapTopic, MetaLayerTopic,
     MetaLayerTopicEntry, NodeShape, PyramidNode, RedTeamEntry, ShapePayload, Term, Topic,
     NODE_SHAPE_DEBATE, NODE_SHAPE_GAP, NODE_SHAPE_META_LAYER,
 };
+use super::walker_decision::DispatchDecision;
+use super::walker_resolver::ProviderType as WalkerProviderType;
 use super::{OperationalConfig, Tier1Config};
+
+// ── Walker v3 W2b: Decision-aware model read helpers ────────────────────────
+//
+// File-private helper that pulls the first OpenRouter model_list entry
+// from an attached DispatchDecision. Mirrors the private helper in
+// llm.rs (W2a scope) — duplicated here rather than exported because
+// W2a/b run in parallel and can't coordinate on a shared helper
+// location without creating merge seams. Removed in W3 when the
+// Decision becomes the sole source and the legacy fallback expressions
+// go.
+//
+// Callers chain `.unwrap_or_else(|| config.primary_model.clone())` (or
+// fall through to the provider-registry / legacy-match chain) to
+// preserve the Phase 1 legacy fallback — see §6 migration contract.
+
+fn first_openrouter_model_from_decision(
+    decision: Option<&Arc<DispatchDecision>>,
+) -> Option<String> {
+    decision
+        .and_then(|d| d.per_provider.get(&WalkerProviderType::OpenRouter))
+        .and_then(|p| p.model_list.as_ref())
+        .and_then(|ml| ml.first().cloned())
+}
+
+fn invalidate_cached_llm_response(
+    step_ctx: Option<&CacheStepContext>,
+    system_prompt: &str,
+    user_prompt: &str,
+    reason: &str,
+) {
+    let Some(sc) = step_ctx.filter(|sc| sc.cache_is_usable()) else {
+        return;
+    };
+    let Some(resolved_model) = sc
+        .resolved_model_id
+        .as_deref()
+        .filter(|model| !model.is_empty())
+    else {
+        return;
+    };
+
+    let inputs_hash = compute_inputs_hash(system_prompt, user_prompt);
+    let cache_key = compute_cache_key(&inputs_hash, &sc.prompt_hash, resolved_model);
+    let delete_result = super::db::open_pyramid_connection(std::path::Path::new(&sc.db_path))
+        .and_then(|conn| super::db::delete_cache_entry(&conn, &sc.slug, &cache_key));
+
+    match delete_result {
+        Ok(()) => warn!(
+            "[CHAIN] invalidated cached LLM response after parse failure slug={} step={} key={} reason={}",
+            sc.slug,
+            sc.step_name,
+            &cache_key[..cache_key.len().min(16)],
+            reason
+        ),
+        Err(e) => warn!(
+            "[CHAIN] failed to invalidate cached LLM response slug={} step={} reason={}: {}",
+            sc.slug, sc.step_name, reason, e
+        ),
+    }
+}
 
 // ── Step context ────────────────────────────────────────────────────────────
 
@@ -207,6 +271,133 @@ impl CacheDispatchBase {
     }
 }
 
+// ── Walker v3 W1b: outer-step DispatchDecision builder ─────────────────────
+//
+// Plan rev 1.0.2 §2.9 DispatchDecision + §6 Phase 1: the Decision is built
+// ONCE per chain step at the outer LLM dispatch entry. Every CacheStepContext
+// constructed inside the step inherits the same `Arc<DispatchDecision>` via
+// `with_dispatch_decision`, so downstream consumers (W2's target) can reach
+// the pre-resolved per-provider params + effective call order without
+// re-walking the resolver.
+//
+// Permissive-on-failure: if `DispatchDecision::build` errors (e.g. cascade
+// exhausted, all providers NotReady, DB read failure), we log and return
+// `None`. The CacheStepContext still reaches consumers with
+// `dispatch_decision = None`; legacy consumers fall back to the
+// `config.primary_model / fallback_model_{1,2}` chain so steps don't
+// hard-fail before W2 migrates the last site. `EVENT_DECISION_BUILD_FAILED`
+// is emitted by `build()` itself for the cascade-exhausted case.
+//
+// `test_capture` module below lets the W1b integration test observe the
+// Decision that the executor built without running a real LLM dispatch.
+/// Walker v3 W1b: build the step's DispatchDecision at the outer LLM
+/// dispatch entry. Exposed as `pub` so the W1b integration test can
+/// observe the Decision attachment without running a real LLM dispatch.
+/// Production call sites are the private `dispatch_llm` / `dispatch_ir_llm`
+/// paths within this module.
+pub async fn build_step_dispatch_decision(
+    ctx: &ChainDispatchContext,
+    slot: &str,
+) -> Option<Arc<DispatchDecision>> {
+    let conn = ctx.db_reader.lock().await;
+    // Phase 5 §E: pass build_id so the Decision builder can consult the
+    // per-build circuit breaker. The cache_base carries the canonical
+    // build_id established by the outer chain executor; when absent
+    // (unit tests, bring-up paths) the breaker gate is skipped — a
+    // no-op, preserving prior behavior.
+    let build_id_owned: Option<String> = ctx.cache_base.as_ref().map(|cb| cb.build_id.clone());
+    let build_id_ref: Option<&str> = build_id_owned.as_deref();
+    match DispatchDecision::build_with_build_id(slot, build_id_ref, &conn) {
+        Ok(decision) => {
+            let arc = Arc::new(decision);
+            test_capture::record_if_enabled(slot, &arc);
+            Some(arc)
+        }
+        Err(e) => {
+            tracing::warn!(
+                event = "decision_build_failed_in_executor",
+                slot = %slot,
+                error = ?e,
+                "W1b: dispatch decision build failed; falling through to legacy dispatch"
+            );
+            None
+        }
+    }
+}
+
+#[doc(hidden)]
+pub mod test_capture {
+    //! Walker v3 W1b test-observability hook.
+    //!
+    //! The W1b integration test needs to observe that the executor built
+    //! and attached a DispatchDecision at outer-step entry, WITHOUT
+    //! running a real LLM dispatch (which would require an OpenRouter
+    //! key / network + full chain_executor wiring through a 15k-line
+    //! file). Gating this hook behind `CAPTURE_ENABLED` keeps the
+    //! production dispatch path zero-cost (a single `AtomicBool::load`
+    //! per step, opt-in only when a test explicitly calls `enable`).
+    //!
+    //! Production callers never flip `CAPTURE_ENABLED`. If you find
+    //! yourself tempted to enable capture from non-test code: don't —
+    //! the capture store grows unbounded and leaks across build runs.
+    use super::DispatchDecision;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    static CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+    #[derive(Debug, Clone)]
+    pub struct CapturedDecision {
+        pub slot: String,
+        pub decision: Arc<DispatchDecision>,
+    }
+
+    fn slot_store() -> &'static Mutex<Vec<CapturedDecision>> {
+        static STORE: OnceLock<Mutex<Vec<CapturedDecision>>> = OnceLock::new();
+        STORE.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub(super) fn record_if_enabled(slot: &str, decision: &Arc<DispatchDecision>) {
+        if !CAPTURE_ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut g) = slot_store().lock() {
+            g.push(CapturedDecision {
+                slot: slot.to_string(),
+                decision: decision.clone(),
+            });
+        }
+    }
+
+    /// Enable capture for the current process. Idempotent. Tests that
+    /// want the capture path must call this at start. Safe to leave
+    /// enabled for the duration of a test binary.
+    pub fn enable() {
+        CAPTURE_ENABLED.store(true, Ordering::Relaxed);
+    }
+
+    /// Disable capture and clear the store. Called at test teardown
+    /// when capture is no longer needed.
+    pub fn disable() {
+        CAPTURE_ENABLED.store(false, Ordering::Relaxed);
+        clear();
+    }
+
+    /// Clear any captured decisions. Tests call this at start so state
+    /// doesn't leak across tests within the same process.
+    pub fn clear() {
+        if let Ok(mut g) = slot_store().lock() {
+            g.clear();
+        }
+    }
+
+    /// Return the list of captured decisions so the test can assert on
+    /// count + per-slot Decision content.
+    pub fn snapshot() -> Vec<CapturedDecision> {
+        slot_store().lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
 // ── Top-level dispatcher ────────────────────────────────────────────────────
 
 /// Dispatch a chain step to either LLM or mechanical execution.
@@ -238,7 +429,19 @@ pub async fn dispatch_step(
 // ── LLM dispatch ────────────────────────────────────────────────────────────
 
 /// Resolve the model string from step overrides, tier routing, or defaults.
-fn resolve_model(step: &ChainStep, defaults: &ChainDefaults, config: &LlmConfig) -> String {
+///
+/// Walker v3 W2b: priority-2 consults the attached `DispatchDecision`'s
+/// per-provider `model_list[OpenRouter][0]` when one is available; the
+/// provider-registry path drops to priority-3, and the legacy
+/// `match tier => primary_model / fallback_model_{1,2}` stays as the
+/// final fallback for Decision-less call sites (unit tests, bring-up
+/// paths). W3 deletes that legacy match when the struct fields go.
+fn resolve_model(
+    step: &ChainStep,
+    defaults: &ChainDefaults,
+    config: &LlmConfig,
+    dispatch_decision: Option<&Arc<DispatchDecision>>,
+) -> String {
     // Direct model override on step takes highest precedence
     if let Some(ref model) = step.model {
         return model.clone();
@@ -255,27 +458,39 @@ fn resolve_model(step: &ChainStep, defaults: &ChainDefaults, config: &LlmConfig)
         .as_deref()
         .unwrap_or(defaults.model_tier.as_str());
 
-    // Phase 3: consult provider registry tier routing (canonical source)
+    // Walker v3 W2b priority 2: the pre-built DispatchDecision is the
+    // canonical source when present. Built once at the outer dispatch
+    // entry (W1b) and threaded via step_ctx.dispatch_decision.
+    if let Some(model) = first_openrouter_model_from_decision(dispatch_decision) {
+        return model;
+    }
+
+    // Phase 3: consult provider registry tier routing (transitional
+    // fallback when no Decision is attached — e.g. unit tests / bring-up).
     if let Some(ref registry) = config.provider_registry {
         if let Ok(resolved) = registry.resolve_tier(tier, None, None, None) {
             return resolved.tier.model_id;
         }
-        warn!("[CHAIN] tier '{}' not in registry, falling back to legacy resolution", tier);
+        warn!(
+            "[CHAIN] tier '{}' not in registry, falling back to legacy resolution",
+            tier
+        );
     }
 
-    // Legacy fallback: aliases then hardcoded mapping
+    // W3c: legacy `config.primary_model` / `fallback_model_{1,2}` arms
+    // deleted. Aliases remain as an operator-level escape hatch; if
+    // neither the Decision, registry, nor an alias covers the tier we
+    // stamp `<unknown>` — the call will fail at dispatch time via
+    // `call_model_unified`'s RouteSkipped path (no model_list → skip).
     if let Some(model) = config.model_aliases.get(tier) {
         return model.clone();
     }
-    match tier {
-        "low" | "mid" => config.primary_model.clone(),
-        "high" => config.fallback_model_1.clone(),
-        "max" => config.fallback_model_2.clone(),
-        other => {
-            warn!("[CHAIN] unknown tier '{}', using primary_model", other);
-            config.primary_model.clone()
-        }
-    }
+    warn!(
+        "[CHAIN] walker-v3: tier '{}' had no Decision, no registry row, and no alias; \
+         returning '<unknown>' — dispatch will surface no-model-available",
+        tier,
+    );
+    "<unknown>".to_string()
 }
 
 /// Resolve temperature from step override or defaults.
@@ -295,27 +510,34 @@ async fn dispatch_llm(
     ctx: &ChainDispatchContext,
 ) -> Result<Value> {
     let temperature = resolve_temperature(step, defaults);
-    let resolved_model = resolve_model(step, defaults, &ctx.config);
-    let resolved_limit = resolve_context_limit(step, defaults, &ctx.config, &ctx.tier1);
+
+    // Walker v3 W1b: build the step's DispatchDecision ONCE at the outer
+    // LLM entry. Every CacheStepContext constructed below inherits the
+    // same Arc via `.with_dispatch_decision`. Permissive on failure —
+    // see `build_step_dispatch_decision` for the fallback policy.
+    // `slot` mirrors the tier used by cache-site `with_model_resolution`
+    // calls so the Decision is keyed to the same scope as the LLM call.
+    //
+    // W2b reorder: built BEFORE resolve_model so the resolver can read
+    // the Decision's OpenRouter model_list as the canonical source.
+    let slot = step
+        .model_tier
+        .clone()
+        .unwrap_or_else(|| defaults.model_tier.clone());
+    let dispatch_decision = build_step_dispatch_decision(ctx, &slot).await;
+
+    let resolved_model = resolve_model(step, defaults, &ctx.config, dispatch_decision.as_ref());
+    let _resolved_limit = resolve_context_limit(step, defaults, &ctx.config, &ctx.tier1);
     let max_tokens: usize = ctx.tier1.ir_max_tokens;
 
-    // Apply model override: if the resolved model differs from the config's
-    // primary model, create a modified config so call_model() uses it.
-    // Uses clone_with_model_override to pin ALL model slots (primary +
-    // fallback_1 + fallback_2) to the resolved model, preventing the
-    // cascade from escaping to a different provider's models.
-    let config_ref;
-    let overridden_config;
-    if resolved_model != ctx.config.primary_model
-        || resolved_limit != ctx.config.primary_context_limit
-    {
-        let mut cfg = ctx.config.clone_with_model_override(&resolved_model);
-        cfg.primary_context_limit = resolved_limit;
-        overridden_config = cfg;
-        config_ref = &overridden_config;
-    } else {
-        config_ref = &ctx.config;
-    }
+    // W3c: the deleted `LlmConfig.primary_model` + `primary_context_limit`
+    // fields used to carry the resolved model/limit down into
+    // `call_model` via `clone_with_model_override`. The Decision attached
+    // to the cache StepContext is now the sole source — `call_model_unified`
+    // reads `model_list[0]` / `context_limit` from it directly, so the
+    // override clone is unnecessary. `resolved_model` is retained for
+    // tracing / cache-row model_resolution below.
+    let config_ref = &ctx.config;
 
     // Build user prompt from resolved input
     let user_prompt =
@@ -364,6 +586,10 @@ async fn dispatch_llm(
             if let Some(bus) = &cb.bus {
                 c = c.with_bus(bus.clone());
             }
+            // Walker v3 W1b: inherit the step's outer Decision.
+            if let Some(d) = &dispatch_decision {
+                c = c.with_dispatch_decision(d.clone());
+            }
             c
         });
         let response = llm::call_model_structured_and_ctx(
@@ -380,12 +606,27 @@ async fn dispatch_llm(
         match llm::extract_json(&response) {
             Ok(json) => return Ok(json),
             Err(e) => {
-                info!("[CHAIN] step '{}' parse failed, on_parse_error={:?}", step.name, step.on_parse_error);
+                invalidate_cached_llm_response(
+                    struct_ctx.as_ref(),
+                    system_prompt,
+                    &user_prompt,
+                    "structured_primary_json_parse_failed",
+                );
+                info!(
+                    "[CHAIN] step '{}' parse failed, on_parse_error={:?}",
+                    step.name, step.on_parse_error
+                );
                 if step.on_parse_error.as_deref() == Some("heal") {
                     info!("[CHAIN] step '{}' → parse failed ({}), attempting self-healing (1 max attempts)", step.name, e);
-                    let heal_instruction = step.heal_instruction.as_deref().unwrap_or("Fix the JSON.");
+                    let heal_instruction =
+                        step.heal_instruction.as_deref().unwrap_or("Fix the JSON.");
                     let heal_sys = format!("{}\n\n{}", system_prompt, heal_instruction);
-                    let heal_user = format!("Target Schema:\n{}\n\nMalformed Response:\n{}\n\nError:\n{}", serde_json::to_string_pretty(schema).unwrap_or_default(), response, e);
+                    let heal_user = format!(
+                        "Target Schema:\n{}\n\nMalformed Response:\n{}\n\nError:\n{}",
+                        serde_json::to_string_pretty(schema).unwrap_or_default(),
+                        response,
+                        e
+                    );
                     // Phase 12: heal path inherits the cache plumbing
                     // but with a different step_name so it gets its
                     // own cache row.
@@ -411,6 +652,10 @@ async fn dispatch_llm(
                         if let Some(bus) = &cb.bus {
                             c = c.with_bus(bus.clone());
                         }
+                        // Walker v3 W1b: inherit the step's outer Decision.
+                        if let Some(d) = &dispatch_decision {
+                            c = c.with_dispatch_decision(d.clone());
+                        }
                         c
                     });
                     let retry_resp = llm::call_model_and_ctx(
@@ -422,9 +667,28 @@ async fn dispatch_llm(
                         max_tokens,
                     )
                     .await?;
-                    return llm::extract_json(&retry_resp).map_err(|he| anyhow!("Step '{}': JSON parse failed after self-healing: {}", step.name, he));
+                    return match llm::extract_json(&retry_resp) {
+                        Ok(json) => Ok(json),
+                        Err(he) => {
+                            invalidate_cached_llm_response(
+                                heal_ctx.as_ref(),
+                                &heal_sys,
+                                &heal_user,
+                                "structured_heal_json_parse_failed",
+                            );
+                            Err(anyhow!(
+                                "Step '{}': JSON parse failed after self-healing: {}",
+                                step.name,
+                                he
+                            ))
+                        }
+                    };
                 } else {
-                    return Err(anyhow!("Step '{}': structured output JSON parse failed: {}", step.name, e));
+                    return Err(anyhow!(
+                        "Step '{}': structured output JSON parse failed: {}",
+                        step.name,
+                        e
+                    ));
                 }
             }
         }
@@ -435,10 +699,10 @@ async fn dispatch_llm(
     // executor always does). This turns the legacy v2 chain path into
     // a cache-reachable path.
     let dispatch_cache_ctx = ctx.cache_base.as_ref().map(|cb| {
-        let prompt_hash = cb.get_or_compute_prompt_hash(
-            step.instruction.as_deref().unwrap_or(&step.name),
-            || system_prompt.to_string(),
-        );
+        let prompt_hash = cb
+            .get_or_compute_prompt_hash(step.instruction.as_deref().unwrap_or(&step.name), || {
+                system_prompt.to_string()
+            });
         let mut c = CacheStepContext::new(
             ctx.slug.clone(),
             cb.build_id.clone(),
@@ -458,6 +722,10 @@ async fn dispatch_llm(
         }
         if let Some(bus) = &cb.bus {
             c = c.with_bus(bus.clone());
+        }
+        // Walker v3 W1b: inherit the step's outer Decision.
+        if let Some(d) = &dispatch_decision {
+            c = c.with_dispatch_decision(d.clone());
         }
         c
     });
@@ -493,12 +761,24 @@ async fn dispatch_llm(
             Ok(json)
         }
         Err(_first_err) => {
-            info!("[CHAIN] step '{}' parse failed, on_parse_error={:?}", step.name, step.on_parse_error);
+            invalidate_cached_llm_response(
+                dispatch_cache_ctx.as_ref(),
+                system_prompt,
+                &user_prompt,
+                "primary_json_parse_failed",
+            );
+            info!(
+                "[CHAIN] step '{}' parse failed, on_parse_error={:?}",
+                step.name, step.on_parse_error
+            );
             if step.on_parse_error.as_deref() == Some("heal") {
                 info!("[CHAIN] step '{}' → parse failed ({}), attempting self-healing (1 max attempts)", step.name, _first_err);
                 let heal_instruction = step.heal_instruction.as_deref().unwrap_or("Fix the JSON.");
                 let heal_sys = format!("{}\n\n{}", system_prompt, heal_instruction);
-                let heal_user = format!("Malformed Response:\n{}\n\nError:\n{}", response, _first_err);
+                let heal_user = format!(
+                    "Malformed Response:\n{}\n\nError:\n{}",
+                    response, _first_err
+                );
                 let heal_ctx = ctx.cache_base.as_ref().map(|cb| {
                     let prompt_hash = compute_prompt_hash(&heal_sys);
                     let mut c = CacheStepContext::new(
@@ -521,6 +801,10 @@ async fn dispatch_llm(
                     if let Some(bus) = &cb.bus {
                         c = c.with_bus(bus.clone());
                     }
+                    // Walker v3 W1b: inherit the step's outer Decision.
+                    if let Some(d) = &dispatch_decision {
+                        c = c.with_dispatch_decision(d.clone());
+                    }
                     c
                 });
                 let retry_resp = llm::call_model_and_ctx(
@@ -532,7 +816,22 @@ async fn dispatch_llm(
                     max_tokens,
                 )
                 .await?;
-                return llm::extract_json(&retry_resp).map_err(|he| anyhow!("Step '{}': JSON parse failed after self-healing: {}", step.name, he));
+                return match llm::extract_json(&retry_resp) {
+                    Ok(json) => Ok(json),
+                    Err(he) => {
+                        invalidate_cached_llm_response(
+                            heal_ctx.as_ref(),
+                            &heal_sys,
+                            &heal_user,
+                            "heal_json_parse_failed",
+                        );
+                        Err(anyhow!(
+                            "Step '{}': JSON parse failed after self-healing: {}",
+                            step.name,
+                            he
+                        ))
+                    }
+                };
             } else {
                 // JSON-retry guarantee: retry at temperature 0.1
                 info!(
@@ -566,6 +865,10 @@ async fn dispatch_llm(
                     if let Some(bus) = &cb.bus {
                         c = c.with_bus(bus.clone());
                     }
+                    // Walker v3 W1b: inherit the step's outer Decision.
+                    if let Some(d) = &dispatch_decision {
+                        c = c.with_dispatch_decision(d.clone());
+                    }
                     c
                 });
                 let retry_response = llm::call_model_and_ctx(
@@ -578,13 +881,22 @@ async fn dispatch_llm(
                 )
                 .await?;
 
-                llm::extract_json(&retry_response).map_err(|e| {
-                    anyhow!(
-                        "Step '{}': JSON parse failed after retry at temp 0.1: {}",
-                        step.name,
-                        e
-                    )
-                })
+                match llm::extract_json(&retry_response) {
+                    Ok(json) => Ok(json),
+                    Err(e) => {
+                        invalidate_cached_llm_response(
+                            retry_ctx.as_ref(),
+                            system_prompt,
+                            &user_prompt,
+                            "retry_json_parse_failed",
+                        );
+                        Err(anyhow!(
+                            "Step '{}': JSON parse failed after retry at temp 0.1: {}",
+                            step.name,
+                            e
+                        ))
+                    }
+                }
             }
         }
     }
@@ -694,7 +1006,11 @@ pub const MAX_SUB_CHAIN_DEPTH: usize = 5;
 /// writer mutex and perform a short SQLite INSERT without resorting to
 /// `block_in_place` tricks. Existing placeholder arms don't await and are
 /// unaffected.
-async fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &ChainDispatchContext) -> Result<Value> {
+async fn dispatch_mechanical(
+    function_name: &str,
+    input: &Value,
+    ctx: &ChainDispatchContext,
+) -> Result<Value> {
     match function_name {
         "extract_import_graph" => {
             info!("[mechanical] extract_import_graph (placeholder)");
@@ -5318,10 +5634,7 @@ pub fn build_node_from_output(
                             .and_then(|r| r.as_str())
                             .unwrap_or("")
                             .to_string(),
-                        importance: e
-                            .get("importance")
-                            .and_then(|i| i.as_f64())
-                            .unwrap_or(0.0),
+                        importance: e.get("importance").and_then(|i| i.as_f64()).unwrap_or(0.0),
                         liveness: e
                             .get("liveness")
                             .and_then(|l| l.as_str())
@@ -5357,10 +5670,7 @@ pub fn build_node_from_output(
                             .and_then(|r| r.as_str())
                             .unwrap_or("")
                             .to_string(),
-                        importance: q
-                            .get("importance")
-                            .and_then(|i| i.as_f64())
-                            .unwrap_or(0.0),
+                        importance: q.get("importance").and_then(|i| i.as_f64()).unwrap_or(0.0),
                         chunk_ref: q
                             .get("at")
                             .or_else(|| q.get("chunk_ref"))
@@ -5396,7 +5706,9 @@ pub fn build_node_from_output(
     if let Some(decs) = output.get("decisions").and_then(|d| d.as_array()) {
         // Only re-extract if we haven't already — check if the existing
         // decisions lack stance info (legacy extraction path)
-        let has_stance = decisions.iter().any(|d| !d.stance.is_empty() && d.stance != "other");
+        let has_stance = decisions
+            .iter()
+            .any(|d| !d.stance.is_empty() && d.stance != "other");
         if !has_stance {
             decisions.clear();
             for d in decs {
@@ -5430,10 +5742,7 @@ pub fn build_node_from_output(
                         .and_then(|v| v.as_str())
                         .unwrap_or("other")
                         .to_string(),
-                    importance: d
-                        .get("importance")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0),
+                    importance: d.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.0),
                     ..Default::default()
                 });
             }
@@ -5553,37 +5862,68 @@ pub fn generate_node_id(pattern: &str, index: usize, depth: Option<i64>) -> Stri
 
 /// Resolve the model string from IR `ModelRequirements` and config.
 ///
-/// Priority:
-/// 1. `reqs.model` — direct model override on the step
-/// 2. `reqs.tier` — mapped through config tiers
-/// 3. Falls back to primary_model when tier is absent or unrecognized
-pub fn resolve_ir_model(reqs: &ModelRequirements, config: &LlmConfig) -> String {
-    // Direct model override takes highest precedence
+/// Priority (Walker v3 W2b):
+/// 1. `reqs.model` — operator-supplied explicit model override
+/// 2. `DispatchDecision.per_provider[OpenRouter].model_list[0]` — the
+///    canonical source when the outer dispatcher has built one
+///    (see §2.9 / §6 Phase 1 migration contract)
+/// 3. `config.provider_registry.resolve_tier(tier)` — transitional
+///    fallback when no Decision is attached (unit tests, bring-up)
+/// 4. Legacy hardcoded `match tier => primary_model / fallback_model_{1,2}`
+///    — final fallback; W3 removes the match when the struct fields go
+///
+/// Callers with a live `DispatchDecision` (the in-file `dispatch_ir_llm`
+/// at the outer dispatch entry) pass `Some(&arc)`; callers in
+/// `chain_executor.rs` (step-output provenance writes, cost-log rows)
+/// don't carry a Decision in scope and pass `None`, which routes them
+/// through the registry → legacy chain.
+pub fn resolve_ir_model(
+    reqs: &ModelRequirements,
+    config: &LlmConfig,
+    dispatch_decision: Option<&Arc<DispatchDecision>>,
+) -> String {
+    // Priority 1: operator-supplied explicit model override.
     if let Some(ref model) = reqs.model {
         return model.clone();
     }
+
+    // Priority 2: the pre-built DispatchDecision is the canonical source
+    // when the outer dispatcher has constructed one. Reads the first
+    // OpenRouter model_list entry — matches
+    // `first_openrouter_model_from_decision` in llm.rs so the dispatch
+    // path and the provenance path agree.
+    if let Some(model) = first_openrouter_model_from_decision(dispatch_decision) {
+        return model;
+    }
+
     let tier = reqs.tier.as_deref().unwrap_or("mid");
 
-    // Phase 3: consult provider registry tier routing (canonical source)
+    // Priority 3: consult provider registry tier routing (transitional
+    // fallback — used by unit tests and bring-up paths where no
+    // DispatchDecision is attached).
     if let Some(ref registry) = config.provider_registry {
         if let Ok(resolved) = registry.resolve_tier(tier, None, None, None) {
             return resolved.tier.model_id;
         }
-        warn!("[IR] tier '{}' not in registry, falling back to legacy resolution", tier);
+        warn!(
+            "[IR] tier '{}' not in registry, falling back to legacy resolution",
+            tier
+        );
     }
 
+    // W3c: legacy hardcoded per-tier match arms deleted. Aliases
+    // remain as the last escape hatch. Missing → `<unknown>` so
+    // dispatch surfaces "no model available" rather than silently
+    // picking up a hardcoded default.
     if let Some(model) = config.model_aliases.get(tier) {
         return model.clone();
     }
-    match tier {
-        "low" | "mid" => config.primary_model.clone(),
-        "high" => config.fallback_model_1.clone(),
-        "max" => config.fallback_model_2.clone(),
-        other => {
-            warn!("[IR] unknown tier '{}', using primary_model", other);
-            config.primary_model.clone()
-        }
-    }
+    warn!(
+        "[IR] walker-v3: tier '{}' had no Decision, no registry row, and no alias; \
+         returning '<unknown>' — dispatch will surface no-model-available",
+        tier,
+    );
+    "<unknown>".to_string()
 }
 
 /// Resolve the primary context limit (in estimated tokens) for an IR step's model.
@@ -5614,15 +5954,17 @@ fn resolve_ir_context_limit(
         }
     }
 
-    // Legacy fallback
+    // W3c: legacy fallback on `LlmConfig.primary_context_limit` replaced
+    // with Tier1Config's `primary_context_limit` (same numeric field,
+    // now authoritative in operational config).
     if config.model_aliases.contains_key(tier) {
         return tier1.high_tier_context_limit;
     }
     match tier {
-        "low" | "mid" => config.primary_context_limit,
+        "low" | "mid" => tier1.primary_context_limit,
         "high" => tier1.high_tier_context_limit,
         "max" => tier1.max_tier_context_limit,
-        _ => config.primary_context_limit,
+        _ => tier1.primary_context_limit,
     }
 }
 
@@ -5657,15 +5999,16 @@ fn resolve_context_limit(
         }
     }
 
-    // Legacy fallback
+    // W3c: legacy fallback on `LlmConfig.primary_context_limit` replaced
+    // with Tier1Config's `primary_context_limit`.
     if config.model_aliases.contains_key(tier) {
         return tier1.high_tier_context_limit;
     }
     match tier {
-        "low" | "mid" => config.primary_context_limit,
+        "low" | "mid" => tier1.primary_context_limit,
         "high" => tier1.high_tier_context_limit,
         "max" => tier1.max_tier_context_limit,
-        _ => config.primary_context_limit,
+        _ => tier1.primary_context_limit,
     }
 }
 
@@ -5690,7 +6033,10 @@ fn resolve_ir_llm_call_options(step: &Step, tier1: &Tier1Config) -> llm::LlmCall
         None
     };
 
-    llm::LlmCallOptions { min_timeout_secs, ..Default::default() }
+    llm::LlmCallOptions {
+        min_timeout_secs,
+        ..Default::default()
+    }
 }
 
 /// Dispatch an IR Step to the appropriate execution path.
@@ -5758,27 +6104,36 @@ pub async fn dispatch_ir_llm(
     ctx: &ChainDispatchContext,
 ) -> Result<(Value, LlmResponse)> {
     let temperature = resolve_ir_temperature(&step.model_requirements, &ctx.tier1);
-    let resolved_model = resolve_ir_model(&step.model_requirements, &ctx.config);
+
+    // Walker v3 W1b: build the step's DispatchDecision ONCE at the outer
+    // IR LLM entry. See dispatch_llm for the symmetric wire-in; the same
+    // Arc is threaded into every CacheStepContext constructed for this
+    // step (structured/retry variants + the standard dispatch ctx).
+    //
+    // W2b reorder: built BEFORE resolve_ir_model so the resolver can
+    // read the Decision's OpenRouter model_list as the canonical source.
+    let slot = step
+        .model_requirements
+        .tier
+        .clone()
+        .unwrap_or_else(|| "mid".to_string());
+    let dispatch_decision = build_step_dispatch_decision(ctx, &slot).await;
+
+    let resolved_model = resolve_ir_model(
+        &step.model_requirements,
+        &ctx.config,
+        dispatch_decision.as_ref(),
+    );
     let resolved_limit =
         resolve_ir_context_limit(&step.model_requirements, &ctx.config, &ctx.tier1);
     let max_tokens = resolve_ir_max_tokens(step, &ctx.tier1);
     let llm_options = resolve_ir_llm_call_options(step, &ctx.tier1);
 
-    // Apply model override: pin ALL model slots (primary + fallback_1 +
-    // fallback_2) to the resolved model so cascade stays on the same
-    // provider. Also override context limit to match the resolved tier.
-    let config_ref;
-    let overridden_config;
-    if resolved_model != ctx.config.primary_model
-        || resolved_limit != ctx.config.primary_context_limit
-    {
-        let mut cfg = ctx.config.clone_with_model_override(&resolved_model);
-        cfg.primary_context_limit = resolved_limit;
-        overridden_config = cfg;
-        config_ref = &overridden_config;
-    } else {
-        config_ref = &ctx.config;
-    }
+    // W3c: legacy `clone_with_model_override` + `primary_context_limit`
+    // override removed. The Decision attached to the IR StepContext
+    // carries both slug and context_limit; `call_model_unified` reads
+    // those directly.
+    let config_ref = &ctx.config;
 
     let raw_input_len = serde_json::to_string(resolved_input)
         .unwrap_or_default()
@@ -5814,6 +6169,7 @@ pub async fn dispatch_ir_llm(
         &resolved_model,
         system_prompt,
         &user_prompt,
+        dispatch_decision.as_ref(),
     );
 
     // If step has a response_schema, use structured outputs for guaranteed JSON
@@ -5844,13 +6200,22 @@ pub async fn dispatch_ir_llm(
             llm_options,
         )
         .await?;
-        let parsed = llm::extract_json(&response.content).map_err(|e| {
-            anyhow!(
-                "IR step '{}': structured output JSON parse failed: {}",
-                step.id,
-                e
-            )
-        })?;
+        let parsed = match llm::extract_json(&response.content) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                invalidate_cached_llm_response(
+                    cache_ctx.as_ref(),
+                    system_prompt,
+                    &user_prompt,
+                    "ir_structured_json_parse_failed",
+                );
+                return Err(anyhow!(
+                    "IR step '{}': structured output JSON parse failed: {}",
+                    step.id,
+                    e
+                ));
+            }
+        };
         return Ok((parsed, response));
     }
 
@@ -5895,6 +6260,12 @@ pub async fn dispatch_ir_llm(
             Ok((json, response))
         }
         Err(_first_err) => {
+            invalidate_cached_llm_response(
+                cache_ctx.as_ref(),
+                system_prompt,
+                &user_prompt,
+                "ir_primary_json_parse_failed",
+            );
             // JSON-retry guarantee: retry at temperature 0.1
             info!(
                 "[IR] step '{}' → JSON parse failed, retrying at temp 0.1",
@@ -5912,13 +6283,22 @@ pub async fn dispatch_ir_llm(
             )
             .await?;
 
-            let parsed = llm::extract_json(&retry_response.content).map_err(|e| {
-                anyhow!(
-                    "IR step '{}': JSON parse failed after retry at temp 0.1: {}",
-                    step.id,
-                    e
-                )
-            })?;
+            let parsed = match llm::extract_json(&retry_response.content) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    invalidate_cached_llm_response(
+                        cache_ctx.as_ref(),
+                        system_prompt,
+                        &user_prompt,
+                        "ir_retry_json_parse_failed",
+                    );
+                    return Err(anyhow!(
+                        "IR step '{}': JSON parse failed after retry at temp 0.1: {}",
+                        step.id,
+                        e
+                    ));
+                }
+            };
             Ok((parsed, retry_response))
         }
     }
@@ -5947,6 +6327,7 @@ fn build_cache_ctx_for_ir_step(
     resolved_model: &str,
     system_prompt: &str,
     user_prompt: &str,
+    dispatch_decision: Option<&Arc<DispatchDecision>>,
 ) -> Option<CacheStepContext> {
     let base = ctx.cache_base.as_ref()?;
     if resolved_model.is_empty() {
@@ -5963,10 +6344,7 @@ fn build_cache_ctx_for_ir_step(
     // Instruction key: prefer the resolved instruction string (the
     // template body as supplied by the IR). Falls back to the step id
     // when no instruction is attached (mechanical-ish LLM steps).
-    let instruction_key = step
-        .instruction
-        .clone()
-        .unwrap_or_else(|| step.id.clone());
+    let instruction_key = step.instruction.clone().unwrap_or_else(|| step.id.clone());
     let prompt_hash = base.get_or_compute_prompt_hash(&instruction_key, || {
         // Include both the system prompt and the user prompt template
         // in the body snapshot. The caller above already substituted
@@ -5988,10 +6366,7 @@ fn build_cache_ctx_for_ir_step(
     // Step metadata — primitive defaults to the step id when the
     // step has no primitive attached (legacy chain steps that use
     // `rust_function` instead).
-    let primitive = step
-        .primitive
-        .clone()
-        .unwrap_or_else(|| step.id.clone());
+    let primitive = step.primitive.clone().unwrap_or_else(|| step.id.clone());
     let depth = step
         .storage_directive
         .as_ref()
@@ -6028,6 +6403,14 @@ fn build_cache_ctx_for_ir_step(
     }
     if let Some(bus) = base.bus.as_ref() {
         cache_ctx = cache_ctx.with_bus(bus.clone());
+    }
+    // Walker v3 W1b: inherit the step's outer Decision (built ONCE per
+    // step at the `dispatch_ir_llm` entry). Downstream consumers read
+    // `step_ctx.dispatch_decision`; legacy consumers whose site hasn't
+    // been migrated to W2 still see `config.primary_model / fallback_*`
+    // on the surrounding config, so behavior is unchanged until W2.
+    if let Some(d) = dispatch_decision {
+        cache_ctx = cache_ctx.with_dispatch_decision(d.clone());
     }
     Some(cache_ctx)
 }
@@ -6084,6 +6467,71 @@ mod tests {
     #[test]
     fn test_generate_node_id_four_digit_pad() {
         assert_eq!(generate_node_id("N{index:04}", 3, None), "N0003");
+    }
+
+    #[test]
+    fn test_invalidate_cached_llm_response_deletes_exact_cache_row() {
+        let db_file = tempfile::NamedTempFile::new().expect("temp db file");
+        let conn = super::super::db::open_pyramid_db(db_file.path()).expect("open temp db");
+        conn.execute(
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path)
+             VALUES ('cache-invalidate-test', 'document', '/tmp/source')",
+            [],
+        )
+        .expect("insert slug");
+
+        let system_prompt = "system prompt";
+        let user_prompt = "user prompt";
+        let prompt_hash = compute_prompt_hash("template body");
+        let inputs_hash = compute_inputs_hash(system_prompt, user_prompt);
+        let model_id = "test/model";
+        let cache_key = compute_cache_key(&inputs_hash, &prompt_hash, model_id);
+        let entry = super::super::step_context::CacheEntry {
+            slug: "cache-invalidate-test".to_string(),
+            build_id: "build-1".to_string(),
+            step_name: "source_extract".to_string(),
+            chunk_index: -1,
+            depth: 0,
+            cache_key: cache_key.clone(),
+            inputs_hash,
+            prompt_hash: prompt_hash.clone(),
+            model_id: model_id.to_string(),
+            output_json: serde_json::json!({
+                "content": "```json\n{\"headline\":\"bad\"\n```",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })
+            .to_string(),
+            token_usage_json: None,
+            cost_usd: None,
+            latency_ms: Some(1),
+            force_fresh: false,
+            supersedes_cache_id: None,
+            note: None,
+        };
+        super::super::db::store_cache(&conn, &entry).expect("store cache");
+
+        let step_ctx = CacheStepContext::new(
+            "cache-invalidate-test",
+            "build-1",
+            "source_extract",
+            "chain_llm",
+            0,
+            None,
+            db_file.path().to_string_lossy().to_string(),
+        )
+        .with_model_resolution("extractor", model_id)
+        .with_prompt_hash(prompt_hash);
+
+        invalidate_cached_llm_response(
+            Some(&step_ctx),
+            system_prompt,
+            user_prompt,
+            "test_parse_failure",
+        );
+
+        let remaining = super::super::db::check_cache(&conn, "cache-invalidate-test", &cache_key)
+            .expect("check cache");
+        assert!(remaining.is_none(), "bad cache row should be deleted");
     }
 
     #[test]
@@ -6206,11 +6654,21 @@ mod tests {
             on_error: "retry(2)".into(),
         };
         let config = LlmConfig::default();
-        assert_eq!(resolve_model(&step, &defaults, &config), "custom/model");
+        assert_eq!(
+            resolve_model(&step, &defaults, &config, None),
+            "custom/model"
+        );
     }
 
     #[test]
-    fn test_resolve_model_tier_mapping() {
+    fn test_resolve_model_tier_mapping_aliases() {
+        // W3c: legacy hardcoded `primary_model` / `fallback_model_{1,2}`
+        // fallbacks were deleted. The resolver consults:
+        //   1. `reqs.model` / step.model (direct override)
+        //   2. Decision (unit test has none)
+        //   3. provider_registry (unit test has none)
+        //   4. `config.model_aliases` (we seed these for the test)
+        //   5. `<unknown>` sentinel — tested in the sibling test below.
         let make_step = |tier: &str| ChainStep {
             name: "test".into(),
             primitive: "compress".into(),
@@ -6224,24 +6682,58 @@ mod tests {
             temperature: 0.3,
             on_error: "retry(2)".into(),
         };
-        let config = LlmConfig::default();
+        let mut config = LlmConfig::default();
+        config
+            .model_aliases
+            .insert("low".into(), "alias/low".into());
+        config
+            .model_aliases
+            .insert("mid".into(), "alias/mid".into());
+        config
+            .model_aliases
+            .insert("high".into(), "alias/high".into());
+        config
+            .model_aliases
+            .insert("max".into(), "alias/max".into());
 
         assert_eq!(
-            resolve_model(&make_step("low"), &defaults, &config),
-            config.primary_model
+            resolve_model(&make_step("low"), &defaults, &config, None),
+            "alias/low"
         );
         assert_eq!(
-            resolve_model(&make_step("mid"), &defaults, &config),
-            config.primary_model
+            resolve_model(&make_step("mid"), &defaults, &config, None),
+            "alias/mid"
         );
         assert_eq!(
-            resolve_model(&make_step("high"), &defaults, &config),
-            config.fallback_model_1
+            resolve_model(&make_step("high"), &defaults, &config, None),
+            "alias/high"
         );
         assert_eq!(
-            resolve_model(&make_step("max"), &defaults, &config),
-            config.fallback_model_2
+            resolve_model(&make_step("max"), &defaults, &config, None),
+            "alias/max"
         );
+    }
+
+    #[test]
+    fn test_resolve_model_no_decision_no_alias_returns_unknown_sentinel() {
+        // W3c: when neither Decision, registry, nor alias covers the tier,
+        // the resolver stamps `<unknown>`. `call_model_unified` turns that
+        // into a RouteSkipped at dispatch time.
+        let step = ChainStep {
+            name: "test".into(),
+            primitive: "compress".into(),
+            model_tier: Some("mid".into()),
+            instruction: Some("x".into()),
+            ..Default::default()
+        };
+        let defaults = ChainDefaults {
+            model_tier: "mid".into(),
+            model: None,
+            temperature: 0.3,
+            on_error: "retry(2)".into(),
+        };
+        let config = LlmConfig::default();
+        assert_eq!(resolve_model(&step, &defaults, &config, None), "<unknown>");
     }
 
     // ── IR dispatch tests ───────────────────────────────────────────────────
@@ -6286,12 +6778,25 @@ mod tests {
         };
         let config = LlmConfig::default();
         // Direct model override wins over tier
-        assert_eq!(resolve_ir_model(&reqs, &config), "custom/my-model");
+        assert_eq!(resolve_ir_model(&reqs, &config, None), "custom/my-model");
     }
 
     #[test]
-    fn test_resolve_ir_model_tier_mapping() {
-        let config = LlmConfig::default();
+    fn test_resolve_ir_model_tier_mapping_aliases() {
+        // W3c: aliases are the last escape hatch after Decision/registry.
+        let mut config = LlmConfig::default();
+        config
+            .model_aliases
+            .insert("low".into(), "alias/low".into());
+        config
+            .model_aliases
+            .insert("mid".into(), "alias/mid".into());
+        config
+            .model_aliases
+            .insert("high".into(), "alias/high".into());
+        config
+            .model_aliases
+            .insert("max".into(), "alias/max".into());
 
         let make_reqs = |tier: &str| ModelRequirements {
             tier: Some(tier.into()),
@@ -6300,41 +6805,42 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_ir_model(&make_reqs("low"), &config),
-            config.primary_model
+            resolve_ir_model(&make_reqs("low"), &config, None),
+            "alias/low"
         );
         assert_eq!(
-            resolve_ir_model(&make_reqs("mid"), &config),
-            config.primary_model
+            resolve_ir_model(&make_reqs("mid"), &config, None),
+            "alias/mid"
         );
         assert_eq!(
-            resolve_ir_model(&make_reqs("high"), &config),
-            config.fallback_model_1
+            resolve_ir_model(&make_reqs("high"), &config, None),
+            "alias/high"
         );
         assert_eq!(
-            resolve_ir_model(&make_reqs("max"), &config),
-            config.fallback_model_2
+            resolve_ir_model(&make_reqs("max"), &config, None),
+            "alias/max"
         );
     }
 
     #[test]
-    fn test_resolve_ir_model_default_tier() {
-        // When tier is None, defaults to "mid" → primary_model
+    fn test_resolve_ir_model_default_tier_no_decision_returns_unknown() {
+        // W3c: without Decision/registry/alias, default-tier "mid" resolves
+        // to `<unknown>` — dispatch surfaces RouteSkipped.
         let reqs = ModelRequirements::default();
         let config = LlmConfig::default();
-        assert_eq!(resolve_ir_model(&reqs, &config), config.primary_model);
+        assert_eq!(resolve_ir_model(&reqs, &config, None), "<unknown>");
     }
 
     #[test]
-    fn test_resolve_ir_model_unknown_tier() {
+    fn test_resolve_ir_model_unknown_tier_returns_unknown() {
+        // W3c: arbitrary tier without any resolver match → `<unknown>`.
         let reqs = ModelRequirements {
             tier: Some("ultra".into()),
             model: None,
             temperature: None,
         };
         let config = LlmConfig::default();
-        // Unknown tier falls back to primary
-        assert_eq!(resolve_ir_model(&reqs, &config), config.primary_model);
+        assert_eq!(resolve_ir_model(&reqs, &config, None), "<unknown>");
     }
 
     #[test]
@@ -6642,5 +7148,148 @@ mod tests {
             .unwrap();
         assert_eq!(result["_mechanical"], "extract_mechanical_metadata");
         assert!(llm_resp.is_none()); // mechanical steps don't produce LlmResponse
+    }
+
+    // ── Walker v3 W1b: outer-step DispatchDecision build + attach ───────
+    //
+    // `build_step_dispatch_decision` is the one place chain_executor wires
+    // the step's DispatchDecision. These unit tests exercise the
+    // happy-path (empty DB → SYSTEM_DEFAULTS Decision) and the
+    // permissive-on-failure path (uninitialized DB → None, fall-through).
+
+    fn make_w1b_seedable_ctx(conn: Connection) -> ChainDispatchContext {
+        ChainDispatchContext {
+            db_reader: Arc::new(Mutex::new(conn)),
+            db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            slug: "w1b-test".into(),
+            config: LlmConfig::default(),
+            tier1: Tier1Config::default(),
+            ops: OperationalConfig::default(),
+            audit: None,
+            cache_base: None,
+            concurrency_cap: None,
+            // Phase 6b: sub-chain recursion + starter-runner extensions.
+            // Unit tests don't invoke call_starter_chain so None is safe.
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
+        }
+    }
+
+    fn make_pyramid_config_contributions_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pyramid_config_contributions (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 contribution_id TEXT NOT NULL UNIQUE,
+                 slug TEXT,
+                 schema_type TEXT NOT NULL,
+                 yaml_content TEXT NOT NULL,
+                 wire_native_metadata_json TEXT NOT NULL DEFAULT '{}',
+                 wire_publication_state_json TEXT NOT NULL DEFAULT '{}',
+                 supersedes_id TEXT,
+                 superseded_by_id TEXT,
+                 triggering_note TEXT,
+                 status TEXT NOT NULL DEFAULT 'active',
+                 source TEXT NOT NULL DEFAULT 'local',
+                 wire_contribution_id TEXT,
+                 created_by TEXT,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 accepted_at TEXT
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[tokio::test]
+    async fn test_w1b_build_step_dispatch_decision_empty_db_returns_some_default() {
+        // Acquire the global node-state lock so MarketReadiness's
+        // `network_failure_backoff_threshold` check reads stable state
+        // while other parallel tests mutate the walker_market_probe
+        // node_state cell. Without this, intermittent failures fire
+        // when the concurrent market tests trip the failure counter.
+        let _guard = crate::pyramid::walker_market_probe::node_state_test_lock()
+            .lock()
+            .unwrap();
+        crate::pyramid::walker_market_probe::clear_node_state_for_tests();
+
+        test_capture::enable();
+        test_capture::clear();
+        let conn = make_pyramid_config_contributions_db();
+        let ctx = make_w1b_seedable_ctx(conn);
+        let d = build_step_dispatch_decision(&ctx, "mid").await;
+        assert!(
+            d.is_some(),
+            "W1b: empty pyramid_config_contributions table means \
+             SYSTEM_DEFAULTS — Decision must build successfully"
+        );
+        let decision = d.unwrap();
+        assert_eq!(decision.slot, "mid");
+        assert!(!decision.synthetic, "runtime path is not synthetic");
+        // test_capture observed it
+        let snap = test_capture::snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].slot, "mid");
+        assert!(Arc::ptr_eq(&snap[0].decision, &decision));
+    }
+
+    #[tokio::test]
+    async fn test_w1b_build_step_dispatch_decision_missing_table_is_permissive() {
+        // No pyramid_config_contributions table exists. `build` must error
+        // (DB read fails) and our helper must log + return None so the
+        // legacy dispatch path continues.
+        test_capture::enable();
+        test_capture::clear();
+        let conn = Connection::open_in_memory().unwrap();
+        let ctx = make_w1b_seedable_ctx(conn);
+        let d = build_step_dispatch_decision(&ctx, "mid").await;
+        assert!(
+            d.is_none(),
+            "W1b: DB read failure must be permissive (None + log)"
+        );
+        // Capture hook must NOT have fired on a failed build.
+        assert!(test_capture::snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_w1b_decision_reflects_seeded_walker_provider_openrouter() {
+        // Seed walker_provider_openrouter.overrides.model_list[mid] =
+        // ["test-model-id"]. After build, per_provider[OpenRouter].model_list
+        // must surface that value.
+        test_capture::enable();
+        test_capture::clear();
+        let conn = make_pyramid_config_contributions_db();
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions (
+                 contribution_id, slug, schema_type, yaml_content, status, source
+             ) VALUES (?1, NULL, 'walker_provider_openrouter', ?2, 'active', 'bundled')",
+            rusqlite::params![
+                "w1b-or-ml",
+                r#"
+schema_type: walker_provider_openrouter
+version: 1
+overrides:
+  model_list:
+    mid: ["test-model-id"]
+"#
+            ],
+        )
+        .unwrap();
+        let ctx = make_w1b_seedable_ctx(conn);
+        let d = build_step_dispatch_decision(&ctx, "mid").await;
+        assert!(d.is_some());
+        let decision = d.unwrap();
+        use crate::pyramid::walker_resolver::ProviderType;
+        let or = decision
+            .per_provider
+            .get(&ProviderType::OpenRouter)
+            .expect("OpenRouter must be in effective call order");
+        assert_eq!(
+            or.model_list.as_deref(),
+            Some(&["test-model-id".to_string()][..]),
+            "W1b: seeded model_list must reach the Decision"
+        );
     }
 }

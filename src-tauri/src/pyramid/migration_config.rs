@@ -52,7 +52,7 @@ use crate::pyramid::event_bus::{BuildEventBus, TaggedBuildEvent, TaggedKind};
 use crate::pyramid::llm::{call_model_unified_with_options_and_ctx, LlmCallOptions, LlmConfig};
 use crate::pyramid::provider::ProviderRegistry;
 use crate::pyramid::schema_registry::SchemaRegistry;
-use crate::pyramid::step_context::{compute_prompt_hash, StepContext};
+use crate::pyramid::step_context::make_step_ctx_from_llm_config;
 use crate::pyramid::wire_native_metadata::{default_wire_native_metadata, WireMaturity};
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -568,33 +568,45 @@ pub async fn run_migration_llm_call(
     let (model_id, provider_id) = match resolved {
         Some(entry) => (entry.tier.model_id.clone(), entry.provider.id.clone()),
         None => {
-            warn!(
+            // W3c: legacy `llm_config.primary_model` fallback removed.
+            // Migration LLM calls must resolve via the provider registry
+            // / walker_provider_openrouter — no implicit default.
+            return Err(anyhow!(
+                "run_migration_llm_call: tier '{}' not resolved via provider registry \
+                 and walker-v3 W3c removed the legacy primary_model fallback. \
+                 Configure a walker_provider_openrouter contribution with a \
+                 '{}' slot.",
                 tier,
-                "run_migration_llm_call: tier not resolved via registry; falling back to llm_config.primary_model"
-            );
-            (llm_config.primary_model.clone(), "openrouter".to_string())
+                tier,
+            ));
         }
     };
 
+    // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
     let build_id = format!("migrate-{}", uuid::Uuid::new_v4());
-    let prompt_hash = compute_prompt_hash(&inputs.skill_body);
-    let ctx = StepContext::new(
+    let scoped_config = llm_config.clone_with_cache_access(
         inputs
             .flagged_contribution
             .slug
             .as_deref()
-            .unwrap_or("global"),
+            .unwrap_or("global")
+            .to_string(),
         build_id.clone(),
+        std::sync::Arc::<str>::from(db_path.to_string()),
+        Some(bus.clone()),
+    );
+    let ctx = make_step_ctx_from_llm_config(
+        &scoped_config,
         "migrate_config",
         "config_migration",
         0,
         None,
-        db_path,
+        &inputs.skill_body,
+        tier,
+        Some(&model_id),
+        Some(&provider_id),
     )
-    .with_model_resolution(tier, model_id)
-    .with_provider(provider_id)
-    .with_prompt_hash(prompt_hash)
-    .with_bus(bus.clone());
+    .await;
 
     debug!(
         contribution_id = %inputs.flagged_contribution.contribution_id,
@@ -604,8 +616,8 @@ pub async fn run_migration_llm_call(
     );
 
     let response = call_model_unified_with_options_and_ctx(
-        llm_config,
-        Some(&ctx),
+        &scoped_config,
+        ctx.as_ref(),
         "You are a configuration migrator for Wire Node.",
         &prompt_body,
         0.2,
@@ -642,15 +654,12 @@ pub fn persist_migration_proposal(
     let _: serde_yaml::Value = serde_yaml::from_str(&new_yaml)
         .map_err(|e| anyhow!("migrated YAML is not parseable: {e}; body: {new_yaml}"))?;
 
-    let triggering_note = inputs
-        .user_note
-        .clone()
-        .unwrap_or_else(|| {
-            format!(
-                "LLM-assisted migration of {} from prior schema",
-                inputs.flagged_contribution.schema_type
-            )
-        });
+    let triggering_note = inputs.user_note.clone().unwrap_or_else(|| {
+        format!(
+            "LLM-assisted migration of {} from prior schema",
+            inputs.flagged_contribution.schema_type
+        )
+    });
 
     if triggering_note.trim().is_empty() {
         return Err(anyhow!("triggering_note must not be empty"));
@@ -659,16 +668,15 @@ pub fn persist_migration_proposal(
     // Carry forward the flagged contribution's canonical metadata with
     // maturity reset to Draft. Falls back to the schema-type default if
     // the prior metadata is missing or unparseable.
-    let mut new_metadata =
-        crate::pyramid::wire_native_metadata::WireNativeMetadata::from_json(
-            &inputs.flagged_contribution.wire_native_metadata_json,
+    let mut new_metadata = crate::pyramid::wire_native_metadata::WireNativeMetadata::from_json(
+        &inputs.flagged_contribution.wire_native_metadata_json,
+    )
+    .unwrap_or_else(|_| {
+        default_wire_native_metadata(
+            &inputs.flagged_contribution.schema_type,
+            inputs.flagged_contribution.slug.as_deref(),
         )
-        .unwrap_or_else(|_| {
-            default_wire_native_metadata(
-                &inputs.flagged_contribution.schema_type,
-                inputs.flagged_contribution.slug.as_deref(),
-            )
-        });
+    });
     new_metadata.maturity = WireMaturity::Draft;
 
     let metadata_json = new_metadata
@@ -735,11 +743,7 @@ pub fn persist_migration_proposal(
 
     // Emit a ConfigMigrationProposed event for the DADBEAR Oversight
     // page and any UI listening. Phase 18d adds the variant.
-    let envelope_slug = inputs
-        .flagged_contribution
-        .slug
-        .clone()
-        .unwrap_or_default();
+    let envelope_slug = inputs.flagged_contribution.slug.clone().unwrap_or_default();
     let _ = bus.tx.send(TaggedBuildEvent {
         slug: envelope_slug,
         kind: TaggedKind::ConfigMigrationProposed {
@@ -817,10 +821,9 @@ pub fn accept_config_migration(
         ));
     }
 
-    let prior_id = draft
-        .supersedes_id
-        .clone()
-        .ok_or_else(|| anyhow!("migration draft {draft_id} has no supersedes_id (corrupt draft)"))?;
+    let prior_id = draft.supersedes_id.clone().ok_or_else(|| {
+        anyhow!("migration draft {draft_id} has no supersedes_id (corrupt draft)")
+    })?;
 
     // Resolve the note now so we can fail-fast on empty notes before
     // opening the transaction.
@@ -909,19 +912,22 @@ pub fn accept_config_migration(
     let promoted = load_contribution_by_id(conn, draft_id)?
         .ok_or_else(|| anyhow!("migration draft {draft_id} disappeared after promotion"))?;
 
-    let sync_succeeded =
-        match sync_config_to_operational_with_registry(conn, bus, &promoted, Some(schema_registry))
-        {
-            Ok(()) => true,
-            Err(e) => {
-                warn!(
-                    contribution_id = draft_id,
-                    error = %e,
-                    "accept_config_migration: sync_config_to_operational_with_registry failed; the contribution is active in the contribution table but the operational sink may be out of date"
-                );
-                false
-            }
-        };
+    let sync_succeeded = match sync_config_to_operational_with_registry(
+        conn,
+        bus,
+        &promoted,
+        Some(schema_registry),
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(
+                contribution_id = draft_id,
+                error = %e,
+                "accept_config_migration: sync_config_to_operational_with_registry failed; the contribution is active in the contribution table but the operational sink may be out of date"
+            );
+            false
+        }
+    };
 
     // Emit a ConfigMigrationAccepted event for the oversight page.
     let envelope_slug = draft.slug.clone().unwrap_or_default();
@@ -979,10 +985,9 @@ pub fn reject_config_migration(
         ));
     }
 
-    let original_id = draft
-        .supersedes_id
-        .clone()
-        .ok_or_else(|| anyhow!("migration draft {draft_id} has no supersedes_id (corrupt draft)"))?;
+    let original_id = draft.supersedes_id.clone().ok_or_else(|| {
+        anyhow!("migration draft {draft_id} has no supersedes_id (corrupt draft)")
+    })?;
 
     conn.execute(
         "DELETE FROM pyramid_config_contributions WHERE contribution_id = ?1",
@@ -991,8 +996,7 @@ pub fn reject_config_migration(
 
     info!(
         draft_id,
-        original_id,
-        "reject_config_migration: draft deleted, original left untouched"
+        original_id, "reject_config_migration: draft deleted, original left untouched"
     );
 
     Ok(RejectMigrationOutcome {
@@ -1021,11 +1025,10 @@ mod tests {
     }
 
     fn seed_user_evidence_policy(conn: &Connection) -> String {
-        let mut metadata =
-            crate::pyramid::wire_native_metadata::default_wire_native_metadata(
-                "evidence_policy",
-                Some("test-pyramid"),
-            );
+        let mut metadata = crate::pyramid::wire_native_metadata::default_wire_native_metadata(
+            "evidence_policy",
+            Some("test-pyramid"),
+        );
         metadata.maturity = WireMaturity::Canon;
         create_config_contribution_with_metadata(
             conn,
@@ -1067,7 +1070,8 @@ mod tests {
             )
             .unwrap();
 
-        let mut metadata = default_wire_native_metadata("schema_definition", Some(target_schema_type));
+        let mut metadata =
+            default_wire_native_metadata("schema_definition", Some(target_schema_type));
         metadata.maturity = WireMaturity::Canon;
 
         // Sleep a single millisecond so the new row's `created_at`
@@ -1089,19 +1093,18 @@ mod tests {
         )
         .unwrap();
 
-        let new_id =
-            create_config_contribution_with_metadata(
-                conn,
-                "schema_definition",
-                Some(target_schema_type),
-                new_body,
-                Some("test supersession"),
-                "local",
-                Some("test"),
-                "active",
-                &metadata,
-            )
-            .unwrap();
+        let new_id = create_config_contribution_with_metadata(
+            conn,
+            "schema_definition",
+            Some(target_schema_type),
+            new_body,
+            Some("test supersession"),
+            "local",
+            Some("test"),
+            "active",
+            &metadata,
+        )
+        .unwrap();
 
         conn.execute(
             "UPDATE pyramid_config_contributions
@@ -1135,9 +1138,7 @@ mod tests {
         // user-seeded row, in newest-first order.
         let entries = list_configs_needing_migration(&conn).unwrap();
         assert!(entries.len() >= 2);
-        assert!(entries
-            .iter()
-            .all(|e| e.schema_type == "evidence_policy"));
+        assert!(entries.iter().all(|e| e.schema_type == "evidence_policy"));
     }
 
     #[test]
@@ -1193,8 +1194,10 @@ mod tests {
         // LLM round-trip).
         let inputs = load_migration_inputs(&conn, &user_id, Some("just a test")).unwrap();
         assert_eq!(inputs.flagged_contribution.contribution_id, user_id);
-        assert!(inputs.old_schema_body.is_some(),
-            "chain walk should find the bundled (now-superseded) schema");
+        assert!(
+            inputs.old_schema_body.is_some(),
+            "chain walk should find the bundled (now-superseded) schema"
+        );
         assert!(!inputs.new_schema_body.is_empty());
         assert!(inputs.skill_body.contains("migrating"));
 
@@ -1332,15 +1335,14 @@ mod tests {
         let conn = mem_conn();
         // Use the bundled evidence_policy default as a real parent so
         // the FK constraint is satisfied.
-        let parent_id =
-            crate::pyramid::config_contributions::load_active_config_contribution(
-                &conn,
-                "evidence_policy",
-                None,
-            )
-            .unwrap()
-            .unwrap()
-            .contribution_id;
+        let parent_id = crate::pyramid::config_contributions::load_active_config_contribution(
+            &conn,
+            "evidence_policy",
+            None,
+        )
+        .unwrap()
+        .unwrap()
+        .contribution_id;
 
         // A draft row with source = local should be refused.
         conn.execute(
@@ -1379,9 +1381,8 @@ mod tests {
         );
 
         let user_row = load_contribution_by_id(&conn, &user_id).unwrap().unwrap();
-        let prior =
-            find_prior_schema_definition_id(&conn, "evidence_policy", &user_row.created_at)
-                .unwrap();
+        let prior = find_prior_schema_definition_id(&conn, "evidence_policy", &user_row.created_at)
+            .unwrap();
         assert!(
             prior.is_some(),
             "chain walk should find the original bundled schema_definition"
@@ -1400,9 +1401,8 @@ mod tests {
         // Intentionally do NOT supersede the schema — the bundled default
         // is still active, so there is no superseded row to find.
         let user_row = load_contribution_by_id(&conn, &user_id).unwrap().unwrap();
-        let prior =
-            find_prior_schema_definition_id(&conn, "evidence_policy", &user_row.created_at)
-                .unwrap();
+        let prior = find_prior_schema_definition_id(&conn, "evidence_policy", &user_row.created_at)
+            .unwrap();
         assert!(
             prior.is_none(),
             "chain walk must return None when no superseded schema predates the config"
@@ -1451,10 +1451,10 @@ mod tests {
         // care which — only that it resolves without erroring and
         // returns a value stable across runs (SQLite's id ordering is
         // deterministic for a given dataset).
-        let first = find_prior_schema_definition_id(&conn, "evidence_policy", &colliding_ts)
-            .unwrap();
-        let second = find_prior_schema_definition_id(&conn, "evidence_policy", &colliding_ts)
-            .unwrap();
+        let first =
+            find_prior_schema_definition_id(&conn, "evidence_policy", &colliding_ts).unwrap();
+        let second =
+            find_prior_schema_definition_id(&conn, "evidence_policy", &colliding_ts).unwrap();
         assert!(first.is_some(), "walk must succeed under collision");
         assert_eq!(first, second, "walk must be deterministic");
     }
@@ -1483,8 +1483,7 @@ mod tests {
         // A second propose for the same flagged contribution (simulating
         // "Re-propose with guidance") should DELETE the prior draft and
         // insert a new one.
-        let inputs_second =
-            load_migration_inputs(&conn, &user_id, Some("refined note")).unwrap();
+        let inputs_second = load_migration_inputs(&conn, &user_id, Some("refined note")).unwrap();
         let second_proposal = persist_migration_proposal(
             &mut conn,
             &inputs_second,
@@ -1493,8 +1492,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_ne!(first_proposal.draft_id, second_proposal.draft_id,
-            "each propose must mint a fresh draft_id");
+        assert_ne!(
+            first_proposal.draft_id, second_proposal.draft_id,
+            "each propose must mint a fresh draft_id"
+        );
 
         // Only ONE draft row for this flagged contribution should remain
         // after the second propose, and it must be the second one.
@@ -1515,8 +1516,10 @@ mod tests {
 
         // The first draft row should be gone.
         let first_exists = load_contribution_by_id(&conn, &first_proposal.draft_id).unwrap();
-        assert!(first_exists.is_none(),
-            "first propose draft must be deleted by the second");
+        assert!(
+            first_exists.is_none(),
+            "first propose draft must be deleted by the second"
+        );
     }
 
     #[test]
@@ -1532,13 +1535,8 @@ mod tests {
     #[test]
     fn test_substitute_migration_prompt_with_note() {
         let template = "OLD: {old_schema}\nNEW: {new_schema}\nYAML: {old_yaml}\n{if user_note}NOTE: {user_note}{end}";
-        let out = substitute_migration_prompt(
-            template,
-            "old-s",
-            "new-s",
-            "y: 1",
-            Some("preserve x"),
-        );
+        let out =
+            substitute_migration_prompt(template, "old-s", "new-s", "y: 1", Some("preserve x"));
         assert!(out.contains("OLD: old-s"));
         assert!(out.contains("NEW: new-s"));
         assert!(out.contains("YAML: y: 1"));

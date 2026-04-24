@@ -103,6 +103,43 @@ impl Drop for SelfChainSlugMarker {
     }
 }
 
+// ── SQLite writer-lock retry helpers ────────────────────────────────────────
+//
+// The answered-node / failed-question-gap save path in the main build loop
+// uses a shared writer connection that can contend with concurrent audit /
+// chronicle writes, especially now that successful long (6+ minute) gemma
+// inferences are common. A DEFERRED `BEGIN` would lazily upgrade to a
+// writer lock at the first INSERT, which can fail with SQLITE_BUSY /
+// "database is locked" past the 10s busy_timeout. The save callers use
+// `BEGIN IMMEDIATE` (matching db.rs:5719 / db.rs:10908) and wrap each
+// transaction in `retry_on_sqlite_busy` so transient contention doesn't
+// abort the whole build.
+const SAVE_MAX_RETRIES: u32 = 3;
+const SAVE_BACKOFF_MS: [u64; 3] = [100, 500, 2000];
+
+/// Returns true iff the error is a SQLite BUSY / "database is locked"
+/// error. Prefers typed downcast to `rusqlite::Error::SqliteFailure` with
+/// `ErrorCode::DatabaseBusy`, and falls back to a substring check on the
+/// error chain so wrapped `anyhow!("...: {e}")` errors are still caught.
+fn is_sqlite_busy(err: &anyhow::Error) -> bool {
+    // Typed check: walk the cause chain for rusqlite::Error::SqliteFailure.
+    for cause in err.chain() {
+        if let Some(rusqlite::Error::SqliteFailure(ffi, _)) =
+            cause.downcast_ref::<rusqlite::Error>()
+        {
+            if ffi.code == rusqlite::ErrorCode::DatabaseBusy
+                || ffi.code == rusqlite::ErrorCode::DatabaseLocked
+            {
+                return true;
+            }
+        }
+    }
+    // Fallback: textual match on the flattened error chain. Covers cases
+    // where a `rusqlite::Error` has been stringified into an `anyhow!`.
+    let msg = format!("{:#}", err).to_ascii_lowercase();
+    msg.contains("database is locked") || msg.contains("database table is locked")
+}
+
 // ── WS-AUDIENCE-CONTRACT helpers ────────────────────────────────────────────
 
 /// Coerce an `audience` JSON value (either the canonical `Audience` Object or
@@ -188,6 +225,92 @@ fn dispatch_build_id(dispatch_ctx: &chain_dispatch::ChainDispatchContext) -> Str
         .as_ref()
         .map(|cb| cb.build_id.clone())
         .unwrap_or_else(|| format!("{}-no-cache", dispatch_ctx.slug))
+}
+
+// ── Walker v3 W3b: save-step provenance model resolver ──────────────────────
+//
+// Compute the model-id string stamped on `pyramid_step` / `pyramid_cluster`
+// provenance rows written from within a chain step. Save sites sit AFTER
+// `dispatch_with_retry` returns a bare `serde_json::Value` — the
+// `DispatchDecision` built inside `dispatch_llm` at outer-step entry is
+// not propagated back to the save path, and the dispatcher doesn't
+// currently return an `LlmResponse` with an `actual_model_id` field.
+//
+// The resolver therefore mirrors `chain_dispatch::resolve_model`'s
+// priority chain:
+//   1. `step.model` override (highest precedence — explicit per-step pin)
+//   2. `defaults.model` override (when the step has no tier)
+//   3. `DispatchDecision::per_provider[OpenRouter].model_list[0]` (Pattern A —
+//      built on demand; matches "what the LLM would try first")
+//   4. `walker_resolver::first_openrouter_model_from_db` (Pattern D — DB
+//      fallback)
+//   5. `dispatch_ctx.config.primary_model.clone()` (legacy fallback — W3c
+//      sweeps this after the field deletion)
+//
+// Priority 3 requires an async DB read via `build_step_dispatch_decision`,
+// so callers pre-resolve ONCE per outer executor function and reuse the
+// resulting `String` at every save site. This keeps the save path cheap
+// AND matches W1b's "build once per outer step" semantics.
+//
+// Until W3c deletes `LlmConfig.primary_model`, the legacy-fallback arm on
+// line 5 stays. Cargo-check in W3c will surface every site carrying that
+// fallback and W3c removes them together with the field.
+async fn compute_save_step_provenance_model(
+    step: &ChainStep,
+    defaults: &super::chain_engine::ChainDefaults,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
+) -> String {
+    // Priority 1: explicit per-step model override.
+    if let Some(ref model) = step.model {
+        return model.clone();
+    }
+    // Priority 2: defaults.model override, but only when the step doesn't
+    // specify a tier (mirrors `resolve_model`).
+    if let Some(ref model) = defaults.model {
+        if step.model_tier.is_none() {
+            return model.clone();
+        }
+    }
+
+    let slot = step
+        .model_tier
+        .clone()
+        .unwrap_or_else(|| defaults.model_tier.clone());
+
+    // Priority 3: pull from the step's DispatchDecision (Pattern A).
+    if let Some(decision) = chain_dispatch::build_step_dispatch_decision(dispatch_ctx, &slot).await
+    {
+        if let Some(model) = decision
+            .per_provider
+            .get(&super::walker_resolver::ProviderType::OpenRouter)
+            .and_then(|p| p.model_list.as_ref())
+            .and_then(|ml| ml.first().cloned())
+        {
+            return model;
+        }
+    }
+
+    // Priority 4: read directly from the walker provider-scope DB cascade
+    // (Pattern D). A best-effort provenance tag when the Decision build
+    // failed and we have no better signal.
+    {
+        let conn = dispatch_ctx.db_reader.lock().await;
+        if let Some(model) = super::walker_resolver::first_openrouter_model_from_db(&conn) {
+            return model;
+        }
+    }
+
+    // W3c: legacy `config.primary_model` fallback deleted. When neither
+    // Decision nor DB walker_provider_openrouter covers the slot,
+    // provenance rows stamp `<unknown>` with a loud warn — provenance
+    // strings are not dispatch-load-bearing.
+    tracing::warn!(
+        event = "save_step_provenance_model_unknown",
+        step = %step.name,
+        slot = %slot,
+        "walker-v3: no Decision / DB model available for save-step provenance; stamping '<unknown>'"
+    );
+    "<unknown>".to_string()
 }
 
 // ── Error strategy ──────────────────────────────────────────────────────────
@@ -358,10 +481,7 @@ impl ChunkProvider {
         )
         .expect("test schema");
         for (i, item) in items.iter().enumerate() {
-            let content = item
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let content = item.get("content").and_then(|v| v.as_str()).unwrap_or("");
             conn.execute(
                 "INSERT INTO pyramid_chunks (slug, chunk_index, content) VALUES ('test', ?1, ?2)",
                 rusqlite::params![i as i64, content],
@@ -1248,7 +1368,10 @@ fn build_system_prompt(
                 return Ok(base_prompt);
             }
         }
-        warn!("instruction_from '{}' could not be resolved, falling through", instr_from);
+        warn!(
+            "instruction_from '{}' could not be resolved, falling through",
+            instr_from
+        );
     }
 
     let instruction = resolve_instruction(step, resolved_input);
@@ -1888,11 +2011,7 @@ fn build_webbing_node_payload(
 }
 
 /// Wrap pre-built node payloads in the `{depth, node_count, nodes: [...]}` envelope.
-fn wrap_webbing_envelope(
-    node_payloads: Vec<Value>,
-    depth: i64,
-    resolved_input: &Value,
-) -> Value {
+fn wrap_webbing_envelope(node_payloads: Vec<Value>, depth: i64, resolved_input: &Value) -> Value {
     let node_count = node_payloads.len();
     let mut payload = serde_json::Map::new();
     payload.insert(
@@ -2175,11 +2294,20 @@ async fn enrich_for_each_step_input(
             arr.iter()
                 .filter_map(|v| {
                     if let Some(name) = v.as_str() {
-                        Some(ZipEntry { step_name: name.to_string(), reverse: false })
+                        Some(ZipEntry {
+                            step_name: name.to_string(),
+                            reverse: false,
+                        })
                     } else if let Some(obj) = v.as_object() {
                         let name = obj.get("step").and_then(|s| s.as_str())?;
-                        let reverse = obj.get("reverse").and_then(|r| r.as_bool()).unwrap_or(false);
-                        Some(ZipEntry { step_name: name.to_string(), reverse })
+                        let reverse = obj
+                            .get("reverse")
+                            .and_then(|r| r.as_bool())
+                            .unwrap_or(false);
+                        Some(ZipEntry {
+                            step_name: name.to_string(),
+                            reverse,
+                        })
                     } else {
                         None
                     }
@@ -2224,7 +2352,6 @@ async fn enrich_for_each_step_input(
         }
     }
 
-
     // ── 11-E: Declarative enrichment check with backward compat fallback ─
     let has_enrichment = |name: &str| {
         step.enrichments.contains(&name.to_string())
@@ -2241,7 +2368,6 @@ async fn enrich_for_each_step_input(
 
     Ok(resolved_input)
 }
-
 
 async fn enrich_group_extra_input(
     step: &ChainStep,
@@ -2601,7 +2727,11 @@ fn spawn_write_drain(
                         ref parent_id,
                     } => db::update_parent(&conn, slug, node_id, parent_id),
                     WriteOp::UpdateStats { ref slug } => db::update_slug_stats(&conn, slug),
-                    WriteOp::UpdateFileHash { ref slug, ref file_path, ref node_id } => {
+                    WriteOp::UpdateFileHash {
+                        ref slug,
+                        ref file_path,
+                        ref node_id,
+                    } => {
                         // Append node_id to existing file_hash entry, or create new one
                         db::append_node_id_to_file_hash(&conn, slug, file_path, node_id)
                     }
@@ -2646,7 +2776,9 @@ fn estimate_tokens(text: &str) -> usize {
 /// - `"topics.name"` → for each element in `topics` array, extract only `name`
 /// - `"topics.name,entities"` → extract `name` and `entities` from each topics element
 fn project_item(item: &Value, fields: &[String]) -> Value {
-    let Some(obj) = item.as_object() else { return item.clone() };
+    let Some(obj) = item.as_object() else {
+        return item.clone();
+    };
     let mut projected = serde_json::Map::new();
     for field in fields {
         if field.contains('.') {
@@ -2667,9 +2799,11 @@ fn project_item(item: &Value, fields: &[String]) -> Value {
 /// Project nested fields from a value. If the value is an array, project each element.
 fn project_nested(val: &Value, sub_fields: &[&str]) -> Value {
     match val {
-        Value::Array(arr) => {
-            Value::Array(arr.iter().map(|elem| project_nested(elem, sub_fields)).collect())
-        }
+        Value::Array(arr) => Value::Array(
+            arr.iter()
+                .map(|elem| project_nested(elem, sub_fields))
+                .collect(),
+        ),
         Value::Object(obj) => {
             let mut projected = serde_json::Map::new();
             for &field in sub_fields {
@@ -2743,7 +2877,8 @@ pub fn batch_items_by_tokens(
             }
         }
 
-        let would_exceed_tokens = current_tokens + item_tokens > max_tokens && !current_batch.is_empty();
+        let would_exceed_tokens =
+            current_tokens + item_tokens > max_tokens && !current_batch.is_empty();
         let would_exceed_items = max_items.map_or(false, |max| current_batch.len() >= max);
 
         if would_exceed_tokens || would_exceed_items {
@@ -2857,7 +2992,8 @@ fn split_by_sections(content: &str, max_tokens: usize, overlap_tokens: usize) ->
                 let trim_start = overlap_prefix.len().saturating_sub(budget_bytes);
                 // Snap to char boundary
                 let trim_start = if trim_start < overlap_prefix.len() {
-                    overlap_prefix.char_indices()
+                    overlap_prefix
+                        .char_indices()
                         .map(|(i, _)| i)
                         .find(|&i| i >= trim_start)
                         .unwrap_or(overlap_prefix.len())
@@ -2922,7 +3058,8 @@ fn split_by_lines(content: &str, max_tokens: usize, overlap_tokens: usize) -> Ve
         // overhead and don't push models to their context limit.
         if end == start + 1 && estimate_tokens(lines[start]) > max_tokens {
             let sub_budget = (max_tokens * 3) / 5;
-            let line_sub_chunks = split_by_tokens(lines[start], sub_budget.max(1000), overlap_tokens);
+            let line_sub_chunks =
+                split_by_tokens(lines[start], sub_budget.max(1000), overlap_tokens);
             chunks.extend(line_sub_chunks);
             start = end; // advance past the oversized line
             continue;
@@ -3271,7 +3408,10 @@ fn evaluate_when(when: Option<&str>, ctx: &ChainContext) -> bool {
     match super::expression::evaluate_expression(expr, &env) {
         Ok(val) => super::expression::value_is_truthy(&val),
         Err(e) => {
-            warn!("when expression '{}' evaluation failed: {}, skipping step (defaulting to false)", expr, e);
+            warn!(
+                "when expression '{}' evaluation failed: {}, skipping step (defaulting to false)",
+                expr, e
+            );
             false
         }
     }
@@ -3297,13 +3437,19 @@ fn build_legacy_expression_env(ctx: &ChainContext) -> Value {
     }
 
     // Special context variables
-    map.insert("has_prior_build".to_string(), Value::Bool(ctx.has_prior_build));
+    map.insert(
+        "has_prior_build".to_string(),
+        Value::Bool(ctx.has_prior_build),
+    );
 
     if let Some(ref item) = ctx.current_item {
         map.insert("item".to_string(), item.clone());
     }
     if let Some(idx) = ctx.current_index {
-        map.insert("index".to_string(), Value::Number(serde_json::Number::from(idx as u64)));
+        map.insert(
+            "index".to_string(),
+            Value::Number(serde_json::Number::from(idx as u64)),
+        );
     }
 
     Value::Object(map)
@@ -3331,7 +3477,10 @@ async fn execute_container_step(
     layer_tx: &Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(Vec<Value>, i32)> {
     let inner_steps = step.steps.as_ref().ok_or_else(|| {
-        anyhow!("execute_container_step called on step '{}' without inner steps", step.name)
+        anyhow!(
+            "execute_container_step called on step '{}' without inner steps",
+            step.name
+        )
     })?;
 
     let saves_node = step.save_as.as_deref() == Some("node");
@@ -3345,13 +3494,16 @@ async fn execute_container_step(
             Ok(other) => {
                 return Err(anyhow!(
                     "Container step '{}' forEach ref '{}' resolved to {}, expected array",
-                    step.name, for_each_ref, other
+                    step.name,
+                    for_each_ref,
+                    other
                 ));
             }
             Err(e) => {
                 return Err(anyhow!(
                     "Container step '{}' could not resolve forEach ref '{}': {e}",
-                    step.name, for_each_ref
+                    step.name,
+                    for_each_ref
                 ));
             }
         };
@@ -3365,7 +3517,10 @@ async fn execute_container_step(
 
         for (index, item) in items.iter().enumerate() {
             if cancel.is_cancelled() {
-                info!("Container step '{}' cancelled at iteration {index}", step.name);
+                info!(
+                    "Container step '{}' cancelled at iteration {index}",
+                    step.name
+                );
                 break;
             }
 
@@ -3378,9 +3533,21 @@ async fn execute_container_step(
             child_ctx.break_loop = false;
 
             match execute_inner_steps(
-                inner_steps, &mut child_ctx, dispatch_ctx, defaults, error_strategy,
-                writer_tx, reader, cancel, progress_tx, done, total, layer_tx,
-            ).await {
+                inner_steps,
+                &mut child_ctx,
+                dispatch_ctx,
+                defaults,
+                error_strategy,
+                writer_tx,
+                reader,
+                cancel,
+                progress_tx,
+                done,
+                total,
+                layer_tx,
+            )
+            .await
+            {
                 Ok(last_output) => {
                     let node_id = if let Some(ref pattern) = step.node_id_pattern {
                         generate_node_id(pattern, index, Some(depth))
@@ -3389,36 +3556,63 @@ async fn execute_container_step(
                     };
 
                     if saves_node {
-                        let chunk_index = item.get("index").and_then(|v| v.as_i64()).unwrap_or(index as i64);
-                        if let Ok(node) = build_node_from_output(&last_output, &node_id, &ctx.slug, depth, Some(chunk_index)) {
-                            emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
-                                slug: ctx.slug.clone(),
-                                build_id: dispatch_build_id(dispatch_ctx),
-                                step_name: step.name.clone(),
-                                node_id: node.id.clone(),
-                                headline: node.headline.clone(),
-                                depth: node.depth,
-                            });
+                        let chunk_index = item
+                            .get("index")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(index as i64);
+                        if let Ok(node) = build_node_from_output(
+                            &last_output,
+                            &node_id,
+                            &ctx.slug,
+                            depth,
+                            Some(chunk_index),
+                        ) {
+                            emit_chain_event(
+                                dispatch_ctx,
+                                crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                                    slug: ctx.slug.clone(),
+                                    build_id: dispatch_build_id(dispatch_ctx),
+                                    step_name: step.name.clone(),
+                                    node_id: node.id.clone(),
+                                    headline: node.headline.clone(),
+                                    depth: node.depth,
+                                },
+                            );
                             let topics_json = serde_json::to_string(
-                                last_output.get("topics").unwrap_or(&serde_json::json!([]))
+                                last_output.get("topics").unwrap_or(&serde_json::json!([])),
                             )?;
                             send_save_node(writer_tx, node, Some(topics_json)).await;
                             *done += 1;
                             send_progress(progress_tx, *done, *total).await;
-                            let label = last_output.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
-                            try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
-                                depth, step_name: step.name.clone(), node_id: node_id.clone(), label,
-                            });
+                            let label = last_output
+                                .get("headline")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            try_send_layer_event(
+                                layer_tx,
+                                LayerEvent::NodeCompleted {
+                                    depth,
+                                    step_name: step.name.clone(),
+                                    node_id: node_id.clone(),
+                                    label,
+                                },
+                            );
                         }
                     }
 
                     outputs[index] = decorate_step_output(last_output, &node_id, index as i64);
                 }
                 Err(e) => {
-                    warn!("[CHAIN] Container step '{}' iteration {index} failed: {e}", step.name);
+                    warn!(
+                        "[CHAIN] Container step '{}' iteration {index} failed: {e}",
+                        step.name
+                    );
                     failures += 1;
                     if *error_strategy == ErrorStrategy::Abort {
-                        return Err(anyhow!("Container step '{}' aborted at iteration {index}: {e}", step.name));
+                        return Err(anyhow!(
+                            "Container step '{}' aborted at iteration {index}: {e}",
+                            step.name
+                        ));
                     }
                 }
             }
@@ -3431,9 +3625,20 @@ async fn execute_container_step(
         child_ctx.break_loop = false;
 
         let last_output = execute_inner_steps(
-            inner_steps, &mut child_ctx, dispatch_ctx, defaults, error_strategy,
-            writer_tx, reader, cancel, progress_tx, done, total, layer_tx,
-        ).await?;
+            inner_steps,
+            &mut child_ctx,
+            dispatch_ctx,
+            defaults,
+            error_strategy,
+            writer_tx,
+            reader,
+            cancel,
+            progress_tx,
+            done,
+            total,
+            layer_tx,
+        )
+        .await?;
 
         // Propagate inner step outputs back to the parent context
         for (k, v) in child_ctx.step_outputs.iter() {
@@ -3484,14 +3689,20 @@ fn execute_inner_steps<'a>(
 
             // Check `when` condition
             if !evaluate_when(inner_step.when.as_deref(), ctx) {
-                info!("  Inner step '{}' skipped (when condition false)", inner_step.name);
+                info!(
+                    "  Inner step '{}' skipped (when condition false)",
+                    inner_step.name
+                );
                 continue;
             }
 
             let inner_error_strategy = resolve_error_strategy(inner_step, defaults);
             let inner_saves_node = inner_step.save_as.as_deref() == Some("node");
 
-            info!("[CHAIN] inner step '{}' started (primitive: {})", inner_step.name, inner_step.primitive);
+            info!(
+                "[CHAIN] inner step '{}' started (primitive: {})",
+                inner_step.name, inner_step.primitive
+            );
 
             let step_output = if inner_step.primitive == "gate" {
                 // ── Gate primitive: evaluate condition, optionally break loop ──
@@ -3507,32 +3718,75 @@ fn execute_inner_steps<'a>(
             } else if inner_step.primitive == "loop" {
                 // ── Loop primitive: repeat inner steps until condition ──
                 let (loop_outputs, loop_failures) = execute_loop_step(
-                    inner_step, ctx, dispatch_ctx, defaults, error_strategy,
-                    writer_tx, reader, cancel, progress_tx, done, total, layer_tx,
-                ).await?;
+                    inner_step,
+                    ctx,
+                    dispatch_ctx,
+                    defaults,
+                    error_strategy,
+                    writer_tx,
+                    reader,
+                    cancel,
+                    progress_tx,
+                    done,
+                    total,
+                    layer_tx,
+                )
+                .await?;
                 if loop_failures > 0 {
-                    warn!("[CHAIN] loop '{}' had {loop_failures} failures", inner_step.name);
+                    warn!(
+                        "[CHAIN] loop '{}' had {loop_failures} failures",
+                        inner_step.name
+                    );
                 }
                 // Loop output is the last iteration's result
                 Ok(loop_outputs.last().cloned().unwrap_or(Value::Null))
             } else if inner_step.steps.is_some() {
                 // ── Nested container step ──
                 let (container_outputs, container_failures) = execute_container_step(
-                    inner_step, ctx, dispatch_ctx, defaults, &inner_error_strategy,
-                    writer_tx, reader, cancel, progress_tx, done, total, layer_tx,
-                ).await?;
+                    inner_step,
+                    ctx,
+                    dispatch_ctx,
+                    defaults,
+                    &inner_error_strategy,
+                    writer_tx,
+                    reader,
+                    cancel,
+                    progress_tx,
+                    done,
+                    total,
+                    layer_tx,
+                )
+                .await?;
                 if container_failures > 0 {
-                    warn!("[CHAIN] nested container '{}' had {container_failures} failures", inner_step.name);
+                    warn!(
+                        "[CHAIN] nested container '{}' had {container_failures} failures",
+                        inner_step.name
+                    );
                 }
                 Ok(Value::Array(container_outputs))
             } else if inner_step.for_each.is_some() {
                 // ── Inner for_each: delegate to existing execute_for_each ──
                 let (for_each_outputs, for_each_failures) = execute_for_each(
-                    inner_step, ctx, dispatch_ctx, defaults, &inner_error_strategy,
-                    inner_saves_node, writer_tx, reader, cancel, progress_tx, done, *total, layer_tx,
-                ).await?;
+                    inner_step,
+                    ctx,
+                    dispatch_ctx,
+                    defaults,
+                    &inner_error_strategy,
+                    inner_saves_node,
+                    writer_tx,
+                    reader,
+                    cancel,
+                    progress_tx,
+                    done,
+                    *total,
+                    layer_tx,
+                )
+                .await?;
                 if for_each_failures > 0 {
-                    warn!("[CHAIN] inner for_each '{}' had {for_each_failures} failures", inner_step.name);
+                    warn!(
+                        "[CHAIN] inner for_each '{}' had {for_each_failures} failures",
+                        inner_step.name
+                    );
                 }
                 Ok(Value::Array(for_each_outputs))
             } else if inner_step.mechanical {
@@ -3541,32 +3795,49 @@ fn execute_inner_steps<'a>(
             } else {
                 // ── Standard LLM dispatch (single step) ──
                 execute_single(
-                    inner_step, ctx, dispatch_ctx, defaults, &inner_error_strategy,
-                    inner_saves_node, writer_tx, reader, cancel, progress_tx, done, *total, layer_tx,
-                ).await
+                    inner_step,
+                    ctx,
+                    dispatch_ctx,
+                    defaults,
+                    &inner_error_strategy,
+                    inner_saves_node,
+                    writer_tx,
+                    reader,
+                    cancel,
+                    progress_tx,
+                    done,
+                    *total,
+                    layer_tx,
+                )
+                .await
             };
 
             match step_output {
                 Ok(output) => {
                     info!("[CHAIN] inner step '{}' complete", inner_step.name);
                     if !output.is_null() {
-                        Arc::make_mut(&mut ctx.step_outputs).insert(inner_step.name.clone(), output.clone());
+                        Arc::make_mut(&mut ctx.step_outputs)
+                            .insert(inner_step.name.clone(), output.clone());
                         last_output = output;
                     }
                 }
-                Err(e) => {
-                    match inner_error_strategy {
-                        ErrorStrategy::Abort | ErrorStrategy::Retry(_) => {
-                            return Err(anyhow!("Inner step '{}' failed (abort): {e}", inner_step.name));
-                        }
-                        ErrorStrategy::Skip => {
-                            warn!("[CHAIN] inner step '{}' FAILED (skip): {e}", inner_step.name);
-                        }
-                        _ => {
-                            warn!("[CHAIN] inner step '{}' FAILED: {e}", inner_step.name);
-                        }
+                Err(e) => match inner_error_strategy {
+                    ErrorStrategy::Abort | ErrorStrategy::Retry(_) => {
+                        return Err(anyhow!(
+                            "Inner step '{}' failed (abort): {e}",
+                            inner_step.name
+                        ));
                     }
-                }
+                    ErrorStrategy::Skip => {
+                        warn!(
+                            "[CHAIN] inner step '{}' FAILED (skip): {e}",
+                            inner_step.name
+                        );
+                    }
+                    _ => {
+                        warn!("[CHAIN] inner step '{}' FAILED: {e}", inner_step.name);
+                    }
+                },
             }
         }
 
@@ -3585,10 +3856,16 @@ fn execute_split_step(step: &ChainStep, ctx: &mut ChainContext) -> Result<Value>
     } else if let Some(ref item) = ctx.current_item {
         item.clone()
     } else {
-        return Err(anyhow!("split step '{}' has no input and no current_item", step.name));
+        return Err(anyhow!(
+            "split step '{}' has no input and no current_item",
+            step.name
+        ));
     };
 
-    let max_tokens = step.max_input_tokens.or(step.batch_max_tokens).unwrap_or(60000);
+    let max_tokens = step
+        .max_input_tokens
+        .or(step.batch_max_tokens)
+        .unwrap_or(60000);
     let strategy = step.split_strategy.as_deref().unwrap_or("sections");
     let overlap = step.split_overlap_tokens.unwrap_or(500);
 
@@ -3602,7 +3879,10 @@ fn execute_split_step(step: &ChainStep, ctx: &mut ChainContext) -> Result<Value>
 
     info!(
         "[CHAIN] split '{}': produced {} chunks (strategy={}, max_tokens={})",
-        step.name, chunks.len(), strategy, max_tokens
+        step.name,
+        chunks.len(),
+        strategy,
+        max_tokens
     );
 
     let result = Value::Array(chunks);
@@ -3634,9 +3914,10 @@ async fn execute_loop_step(
     total: &mut i64,
     layer_tx: &Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(Vec<Value>, i32)> {
-    let inner_steps = step.steps.as_ref().ok_or_else(|| {
-        anyhow!("loop step '{}' has no inner steps", step.name)
-    })?;
+    let inner_steps = step
+        .steps
+        .as_ref()
+        .ok_or_else(|| anyhow!("loop step '{}' has no inner steps", step.name))?;
 
     let until_condition = step.until.as_deref();
     let max_iterations: usize = 100;
@@ -3669,7 +3950,10 @@ async fn execute_loop_step(
             };
 
             if until_met {
-                info!("[CHAIN] loop '{}' until condition met at iteration {iteration}", step.name);
+                info!(
+                    "[CHAIN] loop '{}' until condition met at iteration {iteration}",
+                    step.name
+                );
                 break;
             }
         }
@@ -3677,24 +3961,45 @@ async fn execute_loop_step(
         info!("[CHAIN] loop '{}' iteration {iteration}", step.name);
 
         match execute_inner_steps(
-            inner_steps, &mut loop_ctx, dispatch_ctx, defaults, error_strategy,
-            writer_tx, reader, cancel, progress_tx, done, total, layer_tx,
-        ).await {
+            inner_steps,
+            &mut loop_ctx,
+            dispatch_ctx,
+            defaults,
+            error_strategy,
+            writer_tx,
+            reader,
+            cancel,
+            progress_tx,
+            done,
+            total,
+            layer_tx,
+        )
+        .await
+        {
             Ok(last_output) => {
                 outputs.push(last_output);
             }
             Err(e) => {
-                warn!("[CHAIN] loop '{}' iteration {iteration} failed: {e}", step.name);
+                warn!(
+                    "[CHAIN] loop '{}' iteration {iteration} failed: {e}",
+                    step.name
+                );
                 total_failures += 1;
                 if *error_strategy == ErrorStrategy::Abort {
-                    return Err(anyhow!("Loop '{}' aborted at iteration {iteration}: {e}", step.name));
+                    return Err(anyhow!(
+                        "Loop '{}' aborted at iteration {iteration}: {e}",
+                        step.name
+                    ));
                 }
             }
         }
 
         // Check break_loop signal (set by a gate step within the inner steps)
         if loop_ctx.break_loop {
-            info!("[CHAIN] loop '{}' break signal at iteration {iteration}", step.name);
+            info!(
+                "[CHAIN] loop '{}' break signal at iteration {iteration}",
+                step.name
+            );
             break;
         }
     }
@@ -3756,7 +4061,12 @@ async fn dispatch_with_retry(
                             (h.finish() % (base_delay_ms / 2)).max(100)
                         };
                         let delay = std::time::Duration::from_millis(base_delay_ms + hash_jitter);
-                        info!("  Retrying {fallback_key} after {}ms (attempt {}/{})", delay.as_millis(), attempt + 1, max_attempts);
+                        info!(
+                            "  Retrying {fallback_key} after {}ms (attempt {}/{})",
+                            delay.as_millis(),
+                            attempt + 1,
+                            max_attempts
+                        );
                         tokio::time::sleep(delay).await;
                     }
                 }
@@ -3779,7 +4089,12 @@ async fn dispatch_with_retry(
                         (h.finish() % (base_delay_ms / 2)).max(100)
                     };
                     let delay = std::time::Duration::from_millis(base_delay_ms + jitter_ms);
-                    info!("  Retrying {fallback_key} after {}ms (attempt {}/{})", delay.as_millis(), attempt + 1, max_attempts);
+                    info!(
+                        "  Retrying {fallback_key} after {}ms (attempt {}/{})",
+                        delay.as_millis(),
+                        attempt + 1,
+                        max_attempts
+                    );
                     tokio::time::sleep(delay).await;
                 }
             }
@@ -3862,9 +4177,7 @@ fn classify_error_kind(msg: &str) -> String {
         || lower.contains("too many requests")
     {
         "rate_limit".into()
-    } else if lower.contains("parse")
-        || lower.contains("expected value")
-        || lower.contains("json")
+    } else if lower.contains("parse") || lower.contains("expected value") || lower.contains("json")
     {
         "parse_error".into()
     } else if lower.contains("schema")
@@ -3986,7 +4299,19 @@ pub async fn execute_chain(
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
     layer_tx: Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
-    execute_chain_from(state, chain, slug, 0, None, None, cancel, progress_tx, layer_tx, None).await
+    execute_chain_from(
+        state,
+        chain,
+        slug,
+        0,
+        None,
+        None,
+        cancel,
+        progress_tx,
+        layer_tx,
+        None,
+    )
+    .await
 }
 
 /// Execute a chain from a specific depth, reusing nodes below that depth.
@@ -4010,8 +4335,16 @@ pub async fn execute_chain_from(
     // and every Phase 12 retrofit that reads it was dead code.
     let chain_build_id = format!(
         "chain-{}",
-        uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0")
+        uuid::Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("0")
     );
+    // Phase 5 §G: RAII guard — on any exit (success, error, panic)
+    // this drops every per-build breaker cell for chain_build_id so
+    // the map doesn't leak across builds.
+    let _breaker_guard = super::walker_breaker::BuildBreakerGuard::new(chain_build_id.clone());
     let llm_config = state.llm_config_with_cache(slug, &chain_build_id).await;
 
     // Count chunks
@@ -4067,7 +4400,8 @@ pub async fn execute_chain_from(
         if !step_names.contains(&sa) {
             return Err(anyhow!(
                 "stop_after step '{}' not found in chain. Valid steps: {:?}",
-                sa, step_names
+                sa,
+                step_names
             ));
         }
     }
@@ -4075,7 +4409,8 @@ pub async fn execute_chain_from(
         if !step_names.contains(&ff) {
             return Err(anyhow!(
                 "force_from step '{}' not found in chain. Valid steps: {:?}",
-                ff, step_names
+                ff,
+                step_names
             ));
         }
     }
@@ -4094,19 +4429,22 @@ pub async fn execute_chain_from(
         let slug_owned2 = slug.to_string();
         let writer = state.writer.clone();
         let conn = writer.lock().await;
-        conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| anyhow!("force_from transaction: {e}"))?;
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| anyhow!("force_from transaction: {e}"))?;
         let result = (|| -> Result<()> {
             for step_name in &invalidated_steps {
                 conn.execute(
                     "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1 AND step_type = ?2",
                     rusqlite::params![slug_owned2, step_name],
-                ).map_err(|e| anyhow!("force_from: failed to delete step '{}': {}", step_name, e))?;
+                )
+                .map_err(|e| anyhow!("force_from: failed to delete step '{}': {}", step_name, e))?;
             }
             Ok(())
         })();
         match result {
             Ok(()) => {
-                conn.execute_batch("COMMIT").map_err(|e| anyhow!("force_from commit: {e}"))?;
+                conn.execute_batch("COMMIT")
+                    .map_err(|e| anyhow!("force_from commit: {e}"))?;
             }
             Err(err) => {
                 let _ = conn.execute_batch("ROLLBACK");
@@ -4159,11 +4497,14 @@ pub async fn execute_chain_from(
     // content-addressable cache. Requires state.data_dir to be set
     // (production path); tests with data_dir=None cleanly bypass the cache.
     let cache_base = state.data_dir.as_ref().map(|dir| {
-        Arc::new(chain_dispatch::CacheDispatchBase::new(
-            dir.join("pyramid.db").to_string_lossy().to_string(),
-            chain_build_id.clone(),
-            Some(state.build_event_bus.clone()),
-        ).with_chain_context(chain.name.clone(), chain.content_type.clone()))
+        Arc::new(
+            chain_dispatch::CacheDispatchBase::new(
+                dir.join("pyramid.db").to_string_lossy().to_string(),
+                chain_build_id.clone(),
+                Some(state.build_event_bus.clone()),
+            )
+            .with_chain_context(chain.name.clone(), chain.content_type.clone()),
+        )
     });
     // Read the build strategy concurrency cap from the operational table.
     // Local mode sets this to 1 so Ollama (single-request) isn't overwhelmed.
@@ -4187,7 +4528,10 @@ pub async fn execute_chain_from(
         if let Some(ref registry) = llm_config.provider_registry {
             let active = registry.active_provider_id();
             if active != "openrouter" {
-                info!("[CHAIN] local provider '{}' detected, defaulting concurrency cap to 1", active);
+                info!(
+                    "[CHAIN] local provider '{}' detected, defaulting concurrency cap to 1",
+                    active
+                );
                 return Some(1);
             }
         }
@@ -4239,6 +4583,19 @@ pub async fn execute_chain_from(
         // Check `when` condition
         if !evaluate_when(step.when.as_deref(), &ctx) {
             info!("  Step '{}' skipped (when condition false)", step.name);
+            let _ = state
+                .build_event_bus
+                .tx
+                .send(crate::pyramid::event_bus::TaggedBuildEvent {
+                    slug: slug.to_string(),
+                    kind: crate::pyramid::event_bus::TaggedKind::NodeSkipped {
+                        slug: slug.to_string(),
+                        build_id: chain_build_id.clone(),
+                        step_name: step.name.clone(),
+                        node_id: format!("__step__:{}", step.name),
+                        reason: "when_false".to_string(),
+                    },
+                });
             // Skipped setup steps still count toward done to keep totals balanced
             if !step_saves_node(step) {
                 done += 1;
@@ -4268,6 +4625,20 @@ pub async fn execute_chain_from(
                     "[CHAIN] step \"{}\" skipped (extract at depth {} < from_depth {})",
                     step.name, step_depth, from_depth
                 );
+                let _ =
+                    state
+                        .build_event_bus
+                        .tx
+                        .send(crate::pyramid::event_bus::TaggedBuildEvent {
+                            slug: slug.to_string(),
+                            kind: crate::pyramid::event_bus::TaggedKind::NodeSkipped {
+                                slug: slug.to_string(),
+                                build_id: chain_build_id.clone(),
+                                step_name: step.name.clone(),
+                                node_id: format!("__step__:{}", step.name),
+                                reason: format!("from_depth:{from_depth}"),
+                            },
+                        });
                 if let Some(hydrated_output) =
                     hydrate_skipped_step_output(step, &ctx, &state.reader).await?
                 {
@@ -4311,23 +4682,30 @@ pub async fn execute_chain_from(
                 let s = slug.to_string();
                 let sn = step.name.clone();
                 move |conn| db::step_exists(conn, &s, &sn, -1, -1, "__step_done__")
-            }).await.unwrap_or(false);
+            })
+            .await
+            .unwrap_or(false);
             if sentinel_exists {
-                info!("[CHAIN] step \"{}\" skipped (sentinel: already completed)", step.name);
+                info!(
+                    "[CHAIN] step \"{}\" skipped (sentinel: already completed)",
+                    step.name
+                );
 
                 // Phase 3a: emit NodeSkipped for sentinel-matched step
-                let _ = state.build_event_bus.tx.send(
-                    crate::pyramid::event_bus::TaggedBuildEvent {
-                        slug: slug.to_string(),
-                        kind: crate::pyramid::event_bus::TaggedKind::NodeSkipped {
+                let _ =
+                    state
+                        .build_event_bus
+                        .tx
+                        .send(crate::pyramid::event_bus::TaggedBuildEvent {
                             slug: slug.to_string(),
-                            build_id: chain_build_id.clone(),
-                            step_name: step.name.clone(),
-                            node_id: format!("__step__:{}", step.name),
-                            reason: "sentinel".to_string(),
-                        },
-                    },
-                );
+                            kind: crate::pyramid::event_bus::TaggedKind::NodeSkipped {
+                                slug: slug.to_string(),
+                                build_id: chain_build_id.clone(),
+                                step_name: step.name.clone(),
+                                node_id: format!("__step__:{}", step.name),
+                                reason: "sentinel".to_string(),
+                            },
+                        });
 
                 // Try to hydrate cached output so downstream steps can reference it
                 if let Some(hydrated_output) =
@@ -4366,13 +4744,20 @@ pub async fn execute_chain_from(
             done,
             total,
         );
-        try_send_layer_event(&layer_tx, LayerEvent::StepStarted { step_name: step.name.clone() });
+        try_send_layer_event(
+            &layer_tx,
+            LayerEvent::StepStarted {
+                step_name: step.name.clone(),
+            },
+        );
 
         // WS-EVENTS §15.21: ChainStepStarted — emitted after all skip/reuse/sentinel
         // paths have been ruled out, so every Started is paired with a Finished
         // (on success) or with a dead-letter enqueue (on failure).
-        let _ = state.build_event_bus.tx.send(
-            crate::pyramid::event_bus::TaggedBuildEvent {
+        let _ = state
+            .build_event_bus
+            .tx
+            .send(crate::pyramid::event_bus::TaggedBuildEvent {
                 slug: slug.to_string(),
                 kind: crate::pyramid::event_bus::TaggedKind::ChainStepStarted {
                     step_name: step.name.clone(),
@@ -4380,8 +4765,7 @@ pub async fn execute_chain_from(
                     primitive: step.primitive.clone(),
                     depth: step.depth.unwrap_or(0),
                 },
-            },
-        );
+            });
 
         let step_result = if step.mechanical {
             execute_mechanical(step, &mut ctx, &dispatch_ctx, &chain.defaults).await
@@ -4461,8 +4845,7 @@ pub async fn execute_chain_from(
             )
             .await?;
             total_failures += failures;
-            Arc::make_mut(&mut ctx.step_outputs)
-                .insert(step.name.clone(), Value::Array(outputs));
+            Arc::make_mut(&mut ctx.step_outputs).insert(step.name.clone(), Value::Array(outputs));
             Ok(Value::Null)
         } else if step.steps.is_some() && step.primitive != "loop" {
             // Container step with sub-chain (not a loop — loops handle their own steps)
@@ -4491,8 +4874,7 @@ pub async fn execute_chain_from(
             } else {
                 outputs.into_iter().last().unwrap_or(Value::Null)
             };
-            Arc::make_mut(&mut ctx.step_outputs)
-                .insert(step.name.clone(), output_value);
+            Arc::make_mut(&mut ctx.step_outputs).insert(step.name.clone(), output_value);
             Ok(Value::Null)
         } else if step.primitive == "split" {
             // Split primitive (no LLM call) — text splitting
@@ -4529,19 +4911,27 @@ pub async fn execute_chain_from(
         } else if step.primitive == "cross_build_input" {
             execute_cross_build_input(state, step, &mut ctx, slug).await
         } else if step.primitive == "recursive_decompose" {
-            execute_recursive_decompose(state, step, &mut ctx, slug, cancel).await
+            execute_recursive_decompose(state, step, &chain.defaults, &mut ctx, slug, cancel).await
         } else if step.primitive == "build_lifecycle" {
             execute_build_lifecycle(state, step, &mut ctx, slug).await
         } else if step.primitive == "evidence_loop" {
-            execute_evidence_loop(state, step, &mut ctx, slug, cancel, &progress_tx, &layer_tx, &mut done, total).await
+            execute_evidence_loop(
+                state,
+                step,
+                &mut ctx,
+                slug,
+                cancel,
+                &progress_tx,
+                &layer_tx,
+                &mut done,
+                total,
+            )
+            .await
         } else if step.primitive == "process_gaps" {
             execute_process_gaps(state, step, &mut ctx, slug, cancel).await
         } else if step.invoke_chain.is_some() {
             // WS-CHAIN-INVOKE: chain-invoking-chain primitive
-            execute_invoke_chain(
-                state, step, &mut ctx, slug, cancel, &progress_tx, &layer_tx,
-            )
-            .await
+            execute_invoke_chain(state, step, &mut ctx, slug, cancel, &progress_tx, &layer_tx).await
         } else if step.for_each.is_some() {
             let (outputs, failures) = execute_for_each(
                 step,
@@ -4570,21 +4960,23 @@ pub async fn execute_chain_from(
                         // Extract file_path from chunk header ("## FILE: path" / "## DOCUMENT: path").
                         // Uses load_header (SUBSTR 200 bytes) to avoid loading full 50KB content.
                         let file_path = match ctx.chunks.load_header(i as i64).await {
-                            Ok(Some(header)) => {
-                                header.lines().next().and_then(|first_line| {
-                                    first_line.strip_prefix("## FILE: ")
-                                        .or_else(|| first_line.strip_prefix("## DOCUMENT: "))
-                                        .map(|p| p.to_string())
-                                })
-                            }
+                            Ok(Some(header)) => header.lines().next().and_then(|first_line| {
+                                first_line
+                                    .strip_prefix("## FILE: ")
+                                    .or_else(|| first_line.strip_prefix("## DOCUMENT: "))
+                                    .map(|p| p.to_string())
+                            }),
                             _ => None,
                         };
                         if let Some(fp) = file_path {
-                            if let Err(e) = writer_tx.send(WriteOp::UpdateFileHash {
-                                slug: slug.to_string(),
-                                file_path: fp,
-                                node_id: node_id.to_string(),
-                            }).await {
+                            if let Err(e) = writer_tx
+                                .send(WriteOp::UpdateFileHash {
+                                    slug: slug.to_string(),
+                                    file_path: fp,
+                                    node_id: node_id.to_string(),
+                                })
+                                .await
+                            {
                                 warn!("writer channel closed, file hash update dropped: {e}");
                             }
                         }
@@ -4592,8 +4984,7 @@ pub async fn execute_chain_from(
                 }
             }
 
-            Arc::make_mut(&mut ctx.step_outputs)
-                .insert(step.name.clone(), Value::Array(outputs));
+            Arc::make_mut(&mut ctx.step_outputs).insert(step.name.clone(), Value::Array(outputs));
             Ok(Value::Null)
         } else {
             execute_single(
@@ -4637,10 +5028,24 @@ pub async fn execute_chain_from(
                     let elapsed = step_start.elapsed().as_secs_f64();
                     let _ = tokio::task::spawn_blocking(move || {
                         let c = writer.blocking_lock();
-                        if let Err(e) = db::save_step(&c, &slug_s, &step_name, -1, -1, "__step_done__", "", "", elapsed) {
-                            warn!("[CHAIN] failed to write step sentinel for '{}': {e}", step_name);
+                        if let Err(e) = db::save_step(
+                            &c,
+                            &slug_s,
+                            &step_name,
+                            -1,
+                            -1,
+                            "__step_done__",
+                            "",
+                            "",
+                            elapsed,
+                        ) {
+                            warn!(
+                                "[CHAIN] failed to write step sentinel for '{}': {e}",
+                                step_name
+                            );
                         }
-                    }).await;
+                    })
+                    .await;
                 }
                 // Count setup steps (non-node-saving) toward progress so the
                 // UI doesn't sit at 0/0 during the initial chain phases.
@@ -4659,17 +5064,19 @@ pub async fn execute_chain_from(
                 });
 
                 // WS-EVENTS §15.21: ChainStepFinished (success path)
-                let _ = state.build_event_bus.tx.send(
-                    crate::pyramid::event_bus::TaggedBuildEvent {
-                        slug: slug.to_string(),
-                        kind: crate::pyramid::event_bus::TaggedKind::ChainStepFinished {
-                            step_name: step.name.clone(),
-                            step_idx,
-                            status: "ran".into(),
-                            elapsed_seconds: step_elapsed,
-                        },
-                    },
-                );
+                let _ =
+                    state
+                        .build_event_bus
+                        .tx
+                        .send(crate::pyramid::event_bus::TaggedBuildEvent {
+                            slug: slug.to_string(),
+                            kind: crate::pyramid::event_bus::TaggedKind::ChainStepFinished {
+                                step_name: step.name.clone(),
+                                step_idx,
+                                status: "ran".into(),
+                                elapsed_seconds: step_elapsed,
+                            },
+                        });
 
                 // WS-EVENTS §15.21: SlopeChanged — depth-0/1 node-saving
                 // step mutated the leftmost slope. WS-PRIMER cache must
@@ -4689,7 +5096,10 @@ pub async fn execute_chain_from(
                 }
 
                 if stop_after == Some(step.name.as_str()) {
-                    info!("[CHAIN] stop_after reached: halting after step \"{}\"", step.name);
+                    info!(
+                        "[CHAIN] stop_after reached: halting after step \"{}\"",
+                        step.name
+                    );
                     for remaining in &chain.steps[step_idx + 1..] {
                         step_activities.push(super::types::StepActivity {
                             name: remaining.name.clone(),
@@ -4755,7 +5165,10 @@ pub async fn execute_chain_from(
         {
             Ok(id) => apex_node_id = id,
             Err(e) => {
-                warn!("[CHAIN] Failed to find apex node for '{}': {} — build itself succeeded", slug, e);
+                warn!(
+                    "[CHAIN] Failed to find apex node for '{}': {} — build itself succeeded",
+                    slug, e
+                );
             }
         }
     }
@@ -4774,14 +5187,15 @@ pub async fn execute_chain_from(
     // cache invalidates on every completed chain, even if per-step emits
     // were suppressed. Empty affected_layers = revalidate everything.
     if !cancel.is_cancelled() {
-        let _ = state.build_event_bus.tx.send(
-            crate::pyramid::event_bus::TaggedBuildEvent {
+        let _ = state
+            .build_event_bus
+            .tx
+            .send(crate::pyramid::event_bus::TaggedBuildEvent {
                 slug: slug.to_string(),
                 kind: crate::pyramid::event_bus::TaggedKind::SlopeChanged {
                     affected_layers: Vec::new(),
                 },
-            },
-        );
+            });
     }
 
     Ok((apex_node_id, total_failures, step_activities))
@@ -4881,8 +5295,8 @@ async fn execute_cross_build_input(
                             // live node for the child. For a never-built
                             // child this returns nothing and we skip the
                             // child cleanly.
-                            let all_nodes = db::get_all_live_nodes(conn, &child_slug)
-                                .unwrap_or_default();
+                            let all_nodes =
+                                db::get_all_live_nodes(conn, &child_slug).unwrap_or_default();
                             all_nodes
                                 .iter()
                                 .max_by_key(|n| n.depth)
@@ -4892,9 +5306,7 @@ async fn execute_cross_build_input(
 
                     let apex_node = apex_id
                         .as_ref()
-                        .and_then(|id| {
-                            db::get_node(conn, &child_slug, id).ok().flatten()
-                        });
+                        .and_then(|id| db::get_node(conn, &child_slug, id).ok().flatten());
 
                     // Build a compact summary payload. We intentionally
                     // keep the shape close to what the topical clustering
@@ -4955,6 +5367,7 @@ async fn execute_cross_build_input(
 async fn execute_recursive_decompose(
     state: &PyramidState,
     step: &ChainStep,
+    defaults: &super::chain_engine::ChainDefaults,
     ctx: &mut ChainContext,
     slug: &str,
     cancel: &CancellationToken,
@@ -4971,23 +5384,37 @@ async fn execute_recursive_decompose(
     // Try step.input first so forked chains that rename steps still work.
     // Fall back to hardcoded context refs for backward compatibility.
     let resolved_input = if let Some(ref input) = step.input {
-        ctx.resolve_value(input).unwrap_or(Value::Object(serde_json::Map::new()))
+        ctx.resolve_value(input)
+            .unwrap_or(Value::Object(serde_json::Map::new()))
     } else {
         Value::Object(serde_json::Map::new())
     };
 
-    let apex_question = resolved_input.get("apex_question")
+    let apex_question = resolved_input
+        .get("apex_question")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| ctx.resolve_ref("$apex_question").ok().and_then(|v| v.as_str().map(|s| s.to_string())))
-        .ok_or_else(|| anyhow!("recursive_decompose: apex_question not found in input or context"))?;
+        .or_else(|| {
+            ctx.resolve_ref("$apex_question")
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+        })
+        .ok_or_else(|| {
+            anyhow!("recursive_decompose: apex_question not found in input or context")
+        })?;
 
-    let granularity = resolved_input.get("granularity")
+    let granularity = resolved_input
+        .get("granularity")
         .and_then(|v| v.as_u64())
-        .or_else(|| ctx.resolve_ref("$granularity").ok().and_then(|v| v.as_u64()))
+        .or_else(|| {
+            ctx.resolve_ref("$granularity")
+                .ok()
+                .and_then(|v| v.as_u64())
+        })
         .unwrap_or(3) as u32;
 
-    let max_depth = resolved_input.get("max_depth")
+    let max_depth = resolved_input
+        .get("max_depth")
         .and_then(|v| v.as_u64())
         .or_else(|| ctx.resolve_ref("$max_depth").ok().and_then(|v| v.as_u64()))
         .unwrap_or(3) as u32;
@@ -4996,10 +5423,15 @@ async fn execute_recursive_decompose(
     let content_type = ctx.content_type.clone();
 
     // Build DecompositionConfig — characterize with l0_summary fallback
-    let decomp_context = resolved_input.get("characterize")
+    let decomp_context = resolved_input
+        .get("characterize")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| ctx.resolve_ref("$characterize").ok().and_then(|v| v.as_str().map(|s| s.to_string())))
+        .or_else(|| {
+            ctx.resolve_ref("$characterize")
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+        })
         .or_else(|| {
             ctx.resolve_ref("$load_prior_state.l0_summary")
                 .ok()
@@ -5017,6 +5449,28 @@ async fn execute_recursive_decompose(
                 .and_then(audience_value_to_legacy_string)
         });
 
+    let decompose_model_tier = step
+        .model_tier
+        .clone()
+        .unwrap_or_else(|| defaults.model_tier.clone());
+    let decompose_temperature = step
+        .temperature
+        .unwrap_or(state.operational.tier1.decomposition_temperature);
+    let audit_build_id = ctx
+        .resolve_ref("$build_id")
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| decompose_build_id.clone());
+    let audit_ctx = super::llm::AuditContext {
+        conn: state.writer.clone(),
+        slug: slug.to_string(),
+        build_id: audit_build_id,
+        node_id: None,
+        step_name: step.name.clone(),
+        call_purpose: "question_decompose".to_string(),
+        depth: step.depth,
+    };
+
     let config = super::question_decomposition::DecompositionConfig {
         apex_question: apex_question.clone(),
         content_type,
@@ -5025,6 +5479,10 @@ async fn execute_recursive_decompose(
         folder_map: Some(decomp_context),
         chains_dir: Some(state.chains_dir.clone()),
         audience,
+        model_tier: decompose_model_tier,
+        temperature: decompose_temperature,
+        max_tokens: state.operational.tier1.decomposition_max_tokens,
+        sibling_review_max_tokens: state.operational.tier1.synthesis_prompts_max_tokens,
     };
 
     // Check if this is delta or fresh decomposition
@@ -5033,14 +5491,18 @@ async fn execute_recursive_decompose(
     let tree = if is_delta {
         // Delta decomposition: needs existing tree, answers, evidence, gaps
         // Read from resolved_input first, fall back to hardcoded context refs
-        let existing_tree_val = resolved_input.get("existing_tree")
+        let existing_tree_val = resolved_input
+            .get("existing_tree")
             .cloned()
             .or_else(|| ctx.resolve_ref("$load_prior_state.question_tree").ok())
-            .ok_or_else(|| anyhow!("recursive_decompose delta: existing tree not found in input or context"))?;
+            .ok_or_else(|| {
+                anyhow!("recursive_decompose delta: existing tree not found in input or context")
+            })?;
         let existing_tree: super::question_decomposition::QuestionTree =
             serde_json::from_value(existing_tree_val)?;
 
-        let existing_answers_val = resolved_input.get("existing_answers")
+        let existing_answers_val = resolved_input
+            .get("existing_answers")
             .cloned()
             .or_else(|| ctx.resolve_ref("$load_prior_state.overlay_answers").ok())
             .unwrap_or(Value::Array(vec![]));
@@ -5048,45 +5510,45 @@ async fn execute_recursive_decompose(
             serde_json::from_value(existing_answers_val)?;
 
         // Build evidence and gap context strings
-        let evidence_sets_val = resolved_input.get("evidence_sets")
+        let evidence_sets_val = resolved_input
+            .get("evidence_sets")
             .cloned()
             .or_else(|| ctx.resolve_ref("$load_prior_state.evidence_sets").ok());
-        let evidence_set_ctx = evidence_sets_val
-            .and_then(|v| {
-                let sets: Vec<super::types::EvidenceSet> = serde_json::from_value(v).ok()?;
-                if sets.is_empty() {
-                    return None;
-                }
-                Some(
-                    sets.iter()
-                        .map(|s| {
-                            let headline = s.index_headline.as_deref().unwrap_or("(no headline)");
-                            format!(
-                                "- {} ({} nodes): {}",
-                                s.self_prompt, s.member_count, headline
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                )
-            });
+        let evidence_set_ctx = evidence_sets_val.and_then(|v| {
+            let sets: Vec<super::types::EvidenceSet> = serde_json::from_value(v).ok()?;
+            if sets.is_empty() {
+                return None;
+            }
+            Some(
+                sets.iter()
+                    .map(|s| {
+                        let headline = s.index_headline.as_deref().unwrap_or("(no headline)");
+                        format!(
+                            "- {} ({} nodes): {}",
+                            s.self_prompt, s.member_count, headline
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        });
 
-        let gaps_val = resolved_input.get("gaps")
+        let gaps_val = resolved_input
+            .get("gaps")
             .cloned()
             .or_else(|| ctx.resolve_ref("$load_prior_state.unresolved_gaps").ok());
-        let gap_ctx = gaps_val
-            .and_then(|v| {
-                let gaps: Vec<super::types::GapReport> = serde_json::from_value(v).ok()?;
-                if gaps.is_empty() {
-                    return None;
-                }
-                Some(
-                    gaps.iter()
-                        .map(|g| format!("- {}", g.description))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                )
-            });
+        let gap_ctx = gaps_val.and_then(|v| {
+            let gaps: Vec<super::types::GapReport> = serde_json::from_value(v).ok()?;
+            if gaps.is_empty() {
+                return None;
+            }
+            Some(
+                gaps.iter()
+                    .map(|g| format!("- {}", g.description))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        });
 
         let delta_result = super::question_decomposition::decompose_question_delta(
             &config,
@@ -5096,6 +5558,7 @@ async fn execute_recursive_decompose(
             Some(&state.chains_dir),
             evidence_set_ctx.as_deref(),
             gap_ctx.as_deref(),
+            Some(&audit_ctx),
         )
         .await?;
 
@@ -5115,6 +5578,7 @@ async fn execute_recursive_decompose(
             slug,
             &state.operational.tier1,
             &state.operational.tier2,
+            Some(&audit_ctx),
         )
         .await?
     };
@@ -5152,29 +5616,40 @@ async fn execute_build_lifecycle(
     ctx: &mut ChainContext,
     slug: &str,
 ) -> Result<Value> {
-    let resolved_input = ctx.resolve_value(
-        step.input.as_ref().unwrap_or(&serde_json::json!({})),
-    )?;
+    let resolved_input =
+        ctx.resolve_value(step.input.as_ref().unwrap_or(&serde_json::json!({})))?;
 
-    let load_prior_state_val = resolved_input.get("load_prior_state")
+    let load_prior_state_val = resolved_input
+        .get("load_prior_state")
         .cloned()
         .or_else(|| ctx.resolve_ref("$load_prior_state").ok())
         .unwrap_or(serde_json::json!({}));
 
-    let build_id = resolved_input.get("build_id")
+    let build_id = resolved_input
+        .get("build_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| ctx.resolve_ref("$build_id").ok().and_then(|v| v.as_str().map(|s| s.to_string())))
+        .or_else(|| {
+            ctx.resolve_ref("$build_id")
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+        })
         .unwrap_or_else(|| "unknown".to_string());
 
-    let has_overlay = load_prior_state_val.get("has_overlay")
+    let has_overlay = load_prior_state_val
+        .get("has_overlay")
         .and_then(|v| v.as_bool())
-        .or_else(|| ctx.resolve_ref("$load_prior_state.has_overlay").ok().and_then(|v| v.as_bool()))
+        .or_else(|| {
+            ctx.resolve_ref("$load_prior_state.has_overlay")
+                .ok()
+                .and_then(|v| v.as_bool())
+        })
         .unwrap_or(false);
 
     if has_overlay {
         // Delta path: supersede existing overlay apex nodes
-        let existing_answers_val = load_prior_state_val.get("overlay_answers")
+        let existing_answers_val = load_prior_state_val
+            .get("overlay_answers")
             .cloned()
             .or_else(|| ctx.resolve_ref("$load_prior_state.overlay_answers").ok())
             .unwrap_or(Value::Array(vec![]));
@@ -5211,7 +5686,10 @@ async fn execute_build_lifecycle(
         })
         .await
         .map_err(|e| anyhow!("Overlay cleanup panicked: {e}"))??;
-        info!(slug, "build_lifecycle: fresh path — all prior L1+ nodes superseded");
+        info!(
+            slug,
+            "build_lifecycle: fresh path — all prior L1+ nodes superseded"
+        );
     }
 
     Ok(serde_json::json!({
@@ -5244,13 +5722,15 @@ async fn execute_evidence_loop(
 
     // ── Resolve step.input (Pillar 28: forkable wiring) ────────────────
     let resolved_input = if let Some(ref input) = step.input {
-        ctx.resolve_value(input).unwrap_or(Value::Object(serde_json::Map::new()))
+        ctx.resolve_value(input)
+            .unwrap_or(Value::Object(serde_json::Map::new()))
     } else {
         Value::Object(serde_json::Map::new())
     };
 
     // Resolve the nested load_prior_state object from input (or fall back to context)
-    let load_prior_state_val = resolved_input.get("load_prior_state")
+    let load_prior_state_val = resolved_input
+        .get("load_prior_state")
         .cloned()
         .or_else(|| ctx.resolve_ref("$load_prior_state").ok())
         .unwrap_or(Value::Object(serde_json::Map::new()));
@@ -5265,8 +5745,7 @@ async fn execute_evidence_loop(
         .or_else(|| ctx.resolve_ref("$decompose").ok())
         .or_else(|| ctx.resolve_ref("$decompose_delta").ok())
         .ok_or_else(|| anyhow!("evidence_loop: no question_tree in input or $decompose/$decompose_delta in context"))?;
-    let mut tree: super::question_decomposition::QuestionTree =
-        serde_json::from_value(tree_val)?;
+    let mut tree: super::question_decomposition::QuestionTree = serde_json::from_value(tree_val)?;
 
     // Attach audience from initial params or characterize step.
     // WS-AUDIENCE-CONTRACT: `$audience` may now resolve to a structured
@@ -5284,21 +5763,36 @@ async fn execute_evidence_loop(
     let max_layer = layer_questions.keys().copied().max().unwrap_or(0);
 
     // Get reused question IDs (from delta decomposition, empty for fresh)
-    let reused_question_ids: Vec<String> = resolved_input.get("reused_question_ids")
+    let reused_question_ids: Vec<String> = resolved_input
+        .get("reused_question_ids")
         .cloned()
         .and_then(|v| serde_json::from_value(v).ok())
-        .or_else(|| ctx.resolve_ref("$reused_question_ids").ok().and_then(|v| serde_json::from_value(v).ok()))
+        .or_else(|| {
+            ctx.resolve_ref("$reused_question_ids")
+                .ok()
+                .and_then(|v| serde_json::from_value(v).ok())
+        })
         .unwrap_or_default();
 
     // Get cross-slug info from load_prior_state
-    let is_cross_slug = load_prior_state_val.get("is_cross_slug")
+    let is_cross_slug = load_prior_state_val
+        .get("is_cross_slug")
         .and_then(|v| v.as_bool())
-        .or_else(|| ctx.resolve_ref("$load_prior_state.is_cross_slug").ok().and_then(|v| v.as_bool()))
+        .or_else(|| {
+            ctx.resolve_ref("$load_prior_state.is_cross_slug")
+                .ok()
+                .and_then(|v| v.as_bool())
+        })
         .unwrap_or(false);
-    let referenced_slugs: Vec<String> = load_prior_state_val.get("referenced_slugs")
+    let referenced_slugs: Vec<String> = load_prior_state_val
+        .get("referenced_slugs")
         .cloned()
         .and_then(|v| serde_json::from_value(v).ok())
-        .or_else(|| ctx.resolve_ref("$load_prior_state.referenced_slugs").ok().and_then(|v| serde_json::from_value(v).ok()))
+        .or_else(|| {
+            ctx.resolve_ref("$load_prior_state.referenced_slugs")
+                .ok()
+                .and_then(|v| serde_json::from_value(v).ok())
+        })
         .unwrap_or_default();
 
     // Get source_content_type for cross-slug builds
@@ -5320,20 +5814,27 @@ async fn execute_evidence_loop(
     };
 
     // ── 2. Generate build_id and record build start ─────────────────────
-    let input_build_id = resolved_input.get("build_id")
+    let input_build_id = resolved_input
+        .get("build_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let external_build_tracking = input_build_id.is_some() || ctx.resolve_ref("$build_id").is_ok();
     let build_id = input_build_id
-        .or_else(|| ctx.resolve_ref("$build_id").ok().and_then(|v| v.as_str().map(|s| s.to_string())))
-        .unwrap_or_else(|| format!(
-            "qb-{}",
-            uuid::Uuid::new_v4()
-                .to_string()
-                .split('-')
-                .next()
-                .unwrap_or("0000")
-        ));
+        .or_else(|| {
+            ctx.resolve_ref("$build_id")
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "qb-{}",
+                uuid::Uuid::new_v4()
+                    .to_string()
+                    .split('-')
+                    .next()
+                    .unwrap_or("0000")
+            )
+        });
 
     // Record build start (skip if caller is tracking externally)
     if !external_build_tracking {
@@ -5359,9 +5860,14 @@ async fn execute_evidence_loop(
     // ── 3. Overlay cleanup: now handled by build_lifecycle primitive ────
     // (runs unconditionally before evidence_loop in the chain YAML)
     // Read has_overlay flag (still needed for delta vs fresh logic in evidence answering)
-    let has_overlay = load_prior_state_val.get("has_overlay")
+    let has_overlay = load_prior_state_val
+        .get("has_overlay")
         .and_then(|v| v.as_bool())
-        .or_else(|| ctx.resolve_ref("$load_prior_state.has_overlay").ok().and_then(|v| v.as_bool()))
+        .or_else(|| {
+            ctx.resolve_ref("$load_prior_state.has_overlay")
+                .ok()
+                .and_then(|v| v.as_bool())
+        })
         .unwrap_or(false);
 
     // ── 4. Load L0 nodes ────────────────────────────────────────────────
@@ -5375,8 +5881,7 @@ async fn execute_evidence_loop(
                         all_nodes.extend(db::get_all_live_nodes(&conn_guard, ref_slug)?);
                     }
                     _ => {
-                        all_nodes
-                            .extend(db::get_nodes_at_depth(&conn_guard, ref_slug, 0)?);
+                        all_nodes.extend(db::get_nodes_at_depth(&conn_guard, ref_slug, 0)?);
                     }
                 }
             }
@@ -5391,33 +5896,25 @@ async fn execute_evidence_loop(
         .await?
     };
 
-    let l0_summary =
-        super::evidence_answering::build_l0_summary(&l0_nodes, &state.operational);
+    let l0_summary = super::evidence_answering::build_l0_summary(&l0_nodes, &state.operational);
 
     // ── 5. Generate synthesis prompts ───────────────────────────────────
-    let ext_schema_val = resolved_input.get("extraction_schema")
+    let ext_schema_val = resolved_input
+        .get("extraction_schema")
         .cloned()
         .filter(|v| !v.is_null())
         .or_else(|| ctx.resolve_ref("$extraction_schema").ok())
         .unwrap_or(Value::Null);
-    let ext_schema: super::types::ExtractionSchema =
-        serde_json::from_value(ext_schema_val).unwrap_or_else(|_| {
-            super::types::ExtractionSchema {
-                extraction_prompt: String::new(),
-                topic_schema: vec![],
-                orientation_guidance: String::new(),
-            }
+    let ext_schema: super::types::ExtractionSchema = serde_json::from_value(ext_schema_val)
+        .unwrap_or_else(|_| super::types::ExtractionSchema {
+            extraction_prompt: String::new(),
+            topic_schema: vec![],
+            orientation_guidance: String::new(),
         });
 
     if cancel.is_cancelled() {
         warn!(slug, "build cancelled before synthesis prompt generation");
-        return Ok(serde_json::json!({
-            "build_id": build_id,
-            "error": "Cancelled before synthesis",
-            "total_nodes": 0,
-            "layers_completed": 0,
-            "max_layer": max_layer,
-        }));
+        return Err(anyhow!("evidence_loop cancelled before synthesis"));
     }
 
     let synth_prompts = super::extraction_schema::generate_synthesis_prompts(
@@ -5547,14 +6044,26 @@ async fn execute_evidence_loop(
             Ok(map) => map,
             Err(e) => {
                 warn!(slug, layer, error = %e, "pre-mapping failed");
-                build_error =
-                    Some(format!("Pre-mapping failed at layer {}: {}", layer, e));
+                build_error = Some(format!("Pre-mapping failed at layer {}: {}", layer, e));
                 break;
             }
         };
 
         // Step b: Answer questions (with per-question progress ticks)
         let (answer_tick_tx, mut answer_tick_rx) = mpsc::channel::<()>(64);
+        let evidence_answer_concurrency = step.concurrency.max(1);
+        let mut evidence_ops = (*state.operational).clone();
+        evidence_ops.tier1.answer_concurrency = evidence_ops
+            .tier1
+            .answer_concurrency
+            .min(evidence_answer_concurrency)
+            .max(1);
+        info!(
+            slug,
+            layer,
+            answer_concurrency = evidence_ops.tier1.answer_concurrency,
+            "evidence_loop answer concurrency resolved"
+        );
 
         // Spawn progress drain: fires send_progress for each answered question
         let progress_tx_clone = progress_tx.clone();
@@ -5580,7 +6089,7 @@ async fn execute_evidence_loop(
             slug, // answer_slug
             Some(&state.chains_dir),
             source_content_type.as_deref(),
-            &state.operational,
+            &evidence_ops,
             Some(&audit_ctx),
             Some(&answer_tick_tx),
         )
@@ -5589,8 +6098,7 @@ async fn execute_evidence_loop(
             Ok(a) => a,
             Err(e) => {
                 warn!(slug, layer, error = %e, "answer_questions failed");
-                build_error =
-                    Some(format!("Answer failed at layer {}: {}", layer, e));
+                build_error = Some(format!("Answer failed at layer {}: {}", layer, e));
                 drop(answer_tick_tx);
                 let _ = tick_drain.await;
                 break;
@@ -5607,12 +6115,13 @@ async fn execute_evidence_loop(
         // Stamp build_id
         for a in &mut answered {
             a.node.build_id = Some(build_id.clone());
+            for link in &mut a.evidence {
+                link.build_id = Some(build_id.clone());
+            }
         }
 
-        let answered_ids: Vec<String> =
-            answered.iter().map(|a| a.node.id.clone()).collect();
-        let lower_ids: Vec<String> =
-            lower_nodes.iter().map(|n| n.id.clone()).collect();
+        let answered_ids: Vec<String> = answered.iter().map(|a| a.node.id.clone()).collect();
+        let lower_ids: Vec<String> = lower_nodes.iter().map(|n| n.id.clone()).collect();
         let layer_node_count = answered.len() as i32;
 
         // Step c: Persist answered nodes + evidence links + gaps
@@ -5621,62 +6130,242 @@ async fn execute_evidence_loop(
         {
             let conn = state.writer.clone();
             let slug_owned = slug.to_string();
+            let build_id_owned = build_id.clone();
             let bid_for_gaps = build_id.clone();
             let answered_owned = answered;
             let failed_owned = failed;
             tokio::task::spawn_blocking(move || {
                 let c = conn.blocking_lock();
                 for a in &answered_owned {
-                    c.execute_batch("BEGIN")?;
-                    let result = (|| -> anyhow::Result<()> {
-                        db::save_node(&c, &a.node, None)?;
-                        for child_id in &a.node.children {
-                            if child_id.contains('/') {
+                    // First commit the expensive answer result to a tiny
+                    // outbox row. The canonical graph drain below can fail
+                    // loudly without throwing away the LLM work.
+                    for attempt in 0..=SAVE_MAX_RETRIES {
+                        let tx_result = (|| -> anyhow::Result<()> {
+                            c.execute_batch("BEGIN IMMEDIATE")?;
+                            let inner =
+                                db::save_answered_node_outbox(&c, &slug_owned, &build_id_owned, a);
+                            match inner {
+                                Ok(()) => {
+                                    if let Err(e) = c.execute_batch("COMMIT") {
+                                        let _ = c.execute_batch("ROLLBACK");
+                                        Err(e.into())
+                                    } else {
+                                        Ok(())
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = c.execute_batch("ROLLBACK");
+                                    Err(e)
+                                }
+                            }
+                        })();
+                        match tx_result {
+                            Ok(()) => break,
+                            Err(e) if is_sqlite_busy(&e) && attempt < SAVE_MAX_RETRIES => {
+                                warn!(
+                                    slug = %slug_owned,
+                                    node_id = %a.node.id,
+                                    attempt,
+                                    backoff_ms = SAVE_BACKOFF_MS[attempt as usize],
+                                    "answered-node outbox save hit database-locked, retrying"
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    SAVE_BACKOFF_MS[attempt as usize],
+                                ));
                                 continue;
                             }
-                            let _ =
-                                db::update_parent(&c, &slug_owned, child_id, &a.node.id);
+                            Err(e) => {
+                                warn!(
+                                    slug = %slug_owned,
+                                    node_id = %a.node.id,
+                                    error = %e,
+                                    "failed to persist answered-node outbox"
+                                );
+                                return Err(anyhow!(
+                                    "failed to persist answered-node outbox {}: {}",
+                                    a.node.id,
+                                    e
+                                ));
+                            }
                         }
-                        for link in &a.evidence {
-                            db::save_evidence_link(&c, link)?;
-                        }
-                        for missing_desc in &a.missing {
-                            let gap = super::types::GapReport {
-                                question_id: a.node.id.clone(),
-                                description: missing_desc.clone(),
-                                layer: a.node.depth as i64,
-                                resolved: false,
-                                resolution_confidence: 0.0,
-                            };
-                            db::save_gap(&c, &slug_owned, &gap, Some(&bid_for_gaps))?;
-                        }
-                        Ok(())
-                    })();
-                    match result {
-                        Ok(()) => { c.execute_batch("COMMIT")?; }
-                        Err(e) => {
-                            let _ = c.execute_batch("ROLLBACK");
-                            warn!(slug = %slug_owned, node_id = %a.node.id, error = %e, "failed to save answered node — continuing");
+                    }
+
+                    let durable = db::get_pending_answered_node_outbox(
+                        &c,
+                        &slug_owned,
+                        &build_id_owned,
+                        &a.node.id,
+                    )?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "answered-node outbox row missing before canonical save for {}",
+                            a.node.id
+                        )
+                    })?;
+
+                    // Retry wrapper: SQLite BUSY / "database is locked" can
+                    // bubble up when a concurrent writer on another
+                    // Connection holds the writer lock longer than
+                    // busy_timeout. `BEGIN
+                    // IMMEDIATE` acquires the writer lock up front so
+                    // busy_timeout applies to the acquisition itself, and
+                    // the exponential-backoff retry absorbs the rare case
+                    // where the lock is still held when the timer expires.
+                    // See docs/plans/walker-v3-completion-decision-attachment.md
+                    // Wave 7 follow-up (test14 failure).
+                    for attempt in 0..=SAVE_MAX_RETRIES {
+                        let tx_result = (|| -> anyhow::Result<()> {
+                            c.execute_batch("BEGIN IMMEDIATE")?;
+                            let inner = (|| -> anyhow::Result<()> {
+                                db::save_node(&c, &durable.node, None)?;
+                                for child_id in &durable.node.children {
+                                    if child_id.contains('/') {
+                                        continue;
+                                    }
+                                    let _ = db::update_parent(
+                                        &c,
+                                        &slug_owned,
+                                        child_id,
+                                        &durable.node.id,
+                                    );
+                                }
+                                for link in &durable.evidence {
+                                    db::save_evidence_link(&c, link)?;
+                                }
+                                for missing_desc in &durable.missing {
+                                    let gap = super::types::GapReport {
+                                        question_id: durable.node.id.clone(),
+                                        description: missing_desc.clone(),
+                                        layer: durable.node.depth as i64,
+                                        resolved: false,
+                                        resolution_confidence: 0.0,
+                                    };
+                                    db::save_gap(&c, &slug_owned, &gap, Some(&bid_for_gaps))?;
+                                }
+                                db::mark_answered_node_outbox_drained(
+                                    &c,
+                                    &slug_owned,
+                                    &build_id_owned,
+                                    &durable.node.id,
+                                )?;
+                                Ok(())
+                            })();
+                            match inner {
+                                Ok(()) => {
+                                    if let Err(e) = c.execute_batch("COMMIT") {
+                                        let _ = c.execute_batch("ROLLBACK");
+                                        Err(e.into())
+                                    } else {
+                                        Ok(())
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = c.execute_batch("ROLLBACK");
+                                    Err(e)
+                                }
+                            }
+                        })();
+                        match tx_result {
+                            Ok(()) => break,
+                            Err(e) if is_sqlite_busy(&e) && attempt < SAVE_MAX_RETRIES => {
+                                warn!(
+                                    slug = %slug_owned,
+                                    node_id = %a.node.id,
+                                    attempt,
+                                    backoff_ms = SAVE_BACKOFF_MS[attempt as usize],
+                                    "answered-node save hit database-locked, retrying"
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    SAVE_BACKOFF_MS[attempt as usize],
+                                ));
+                                continue;
+                            }
+                            Err(e) => {
+                                let _ = db::record_answered_node_outbox_error(
+                                    &c,
+                                    &slug_owned,
+                                    &build_id_owned,
+                                    &a.node.id,
+                                    &e.to_string(),
+                                );
+                                warn!(
+                                    slug = %slug_owned,
+                                    node_id = %a.node.id,
+                                    error = %e,
+                                    "failed to save answered node"
+                                );
+                                return Err(anyhow!(
+                                    "failed to save answered node {}: {}",
+                                    a.node.id,
+                                    e
+                                ));
+                            }
                         }
                     }
                 }
-                // Save failed questions as gaps (single transaction, low risk)
+                // Save failed questions as gaps (single transaction, low risk).
+                // Same retry wrapper as answered-node save — the writer-lock
+                // contention window is the same.
                 if !failed_owned.is_empty() {
-                    c.execute_batch("BEGIN")?;
-                    for fq in &failed_owned {
-                        let gap = super::types::GapReport {
-                            question_id: fq.question_id.clone(),
-                            description: format!(
-                                "Question failed: {}. Error: {}",
-                                fq.question_text, fq.error
-                            ),
-                            layer: fq.layer,
-                            resolved: false,
-                            resolution_confidence: 0.0,
-                        };
-                        db::save_gap(&c, &slug_owned, &gap, Some(&bid_for_gaps))?;
+                    for attempt in 0..=SAVE_MAX_RETRIES {
+                        let tx_result = (|| -> anyhow::Result<()> {
+                            c.execute_batch("BEGIN IMMEDIATE")?;
+                            let inner = (|| -> anyhow::Result<()> {
+                                for fq in &failed_owned {
+                                    let gap = super::types::GapReport {
+                                        question_id: fq.question_id.clone(),
+                                        description: format!(
+                                            "Question failed: {}. Error: {}",
+                                            fq.question_text, fq.error
+                                        ),
+                                        layer: fq.layer,
+                                        resolved: false,
+                                        resolution_confidence: 0.0,
+                                    };
+                                    db::save_gap(&c, &slug_owned, &gap, Some(&bid_for_gaps))?;
+                                }
+                                Ok(())
+                            })();
+                            match inner {
+                                Ok(()) => {
+                                    if let Err(e) = c.execute_batch("COMMIT") {
+                                        let _ = c.execute_batch("ROLLBACK");
+                                        Err(e.into())
+                                    } else {
+                                        Ok(())
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = c.execute_batch("ROLLBACK");
+                                    Err(e)
+                                }
+                            }
+                        })();
+                        match tx_result {
+                            Ok(()) => break,
+                            Err(e) if is_sqlite_busy(&e) && attempt < SAVE_MAX_RETRIES => {
+                                warn!(
+                                    slug = %slug_owned,
+                                    attempt,
+                                    backoff_ms = SAVE_BACKOFF_MS[attempt as usize],
+                                    "failed-question gap save hit database-locked, retrying"
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    SAVE_BACKOFF_MS[attempt as usize],
+                                ));
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    slug = %slug_owned,
+                                    error = %e,
+                                    "failed to save failed-question gaps"
+                                );
+                                return Err(e);
+                            }
+                        }
                     }
-                    c.execute_batch("COMMIT")?;
                 }
                 Ok::<(), anyhow::Error>(())
             })
@@ -5701,8 +6390,10 @@ async fn execute_evidence_loop(
             .map_err(|e| anyhow!("Reconciliation panicked: {e}"))??;
 
             // Phase 3a: emit ReconciliationEmitted with orphan/central counts
-            let _ = state.build_event_bus.tx.send(
-                crate::pyramid::event_bus::TaggedBuildEvent {
+            let _ = state
+                .build_event_bus
+                .tx
+                .send(crate::pyramid::event_bus::TaggedBuildEvent {
                     slug: slug.to_string(),
                     kind: crate::pyramid::event_bus::TaggedKind::ReconciliationEmitted {
                         slug: slug.to_string(),
@@ -5710,13 +6401,14 @@ async fn execute_evidence_loop(
                         orphan_count: recon_result.orphans.len(),
                         central_count: recon_result.central_nodes.len(),
                     },
-                },
-            );
+                });
 
             // S2-4: merge this layer's reconciliation into the per-build accumulator
             combined_recon.orphans.extend(recon_result.orphans);
             combined_recon.gaps.extend(recon_result.gaps);
-            combined_recon.central_nodes.extend(recon_result.central_nodes);
+            combined_recon
+                .central_nodes
+                .extend(recon_result.central_nodes);
             combined_recon.weight_map.extend(recon_result.weight_map);
         }
 
@@ -5766,6 +6458,30 @@ async fn execute_evidence_loop(
         );
     }
 
+    if let Some(error_msg) = build_error.clone() {
+        if !external_build_tracking {
+            let conn = state.writer.clone();
+            let slug_owned = slug.to_string();
+            let bid = build_id.clone();
+            let lc = layers_completed;
+            let ml = max_layer;
+            let msg = error_msg.clone();
+            tokio::task::spawn_blocking(move || {
+                let c = conn.blocking_lock();
+                super::local_store::fail_build(
+                    &c,
+                    &slug_owned,
+                    &bid,
+                    &format!("Stopped at layer {}/{}: {}", lc, ml, msg),
+                )?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .map_err(|e| anyhow!("Build failure save panicked: {e}"))??;
+        }
+        return Err(anyhow!("evidence_loop failed: {}", error_msg));
+    }
+
     // ── S2-4: Persist reconciliation summary as a contribution ─────────
     // One contribution per build, merging all per-layer reconciliation
     // results. Persisted before delta-apex and build-complete so it's
@@ -5786,8 +6502,8 @@ async fn execute_evidence_loop(
                 serde_yaml::Value::Number(serde_yaml::Number::from(layers_completed as u64)),
             );
             // Serialize the full ReconciliationResult fields via serde
-            let recon_value = serde_yaml::to_value(&combined_recon)
-                .unwrap_or_else(|_| serde_yaml::Value::Null);
+            let recon_value =
+                serde_yaml::to_value(&combined_recon).unwrap_or_else(|_| serde_yaml::Value::Null);
             if let serde_yaml::Value::Mapping(m) = recon_value {
                 for (k, v) in m {
                     doc.insert(k, v);
@@ -5836,22 +6552,29 @@ async fn execute_evidence_loop(
             let s = slug.to_string();
             let ml = max_layer;
             move |conn| db::get_nodes_at_depth(conn, &s, ml)
-        }).await?;
+        })
+        .await?;
 
         if live_at_max.is_empty() {
-            info!(slug, max_layer, "delta path: no live apex at max_layer, synthesizing replacement");
+            info!(
+                slug,
+                max_layer, "delta path: no live apex at max_layer, synthesizing replacement"
+            );
 
             // Collect nodes from one layer below to create apex summary
             let penultimate_nodes: Vec<super::types::PyramidNode> = db_read(&state.reader, {
                 let s = slug.to_string();
                 let pl = max_layer - 1;
                 move |conn| db::get_nodes_at_depth(conn, &s, pl)
-            }).await?;
+            })
+            .await?;
 
             if !penultimate_nodes.is_empty() {
                 // Build apex from penultimate layer summaries
-                let children_ids: Vec<String> = penultimate_nodes.iter().map(|n| n.id.clone()).collect();
-                let combined_distilled = penultimate_nodes.iter()
+                let children_ids: Vec<String> =
+                    penultimate_nodes.iter().map(|n| n.id.clone()).collect();
+                let combined_distilled = penultimate_nodes
+                    .iter()
                     .map(|n| format!("## {}\n{}", n.headline, n.distilled))
                     .collect::<Vec<_>>()
                     .join("\n\n");
@@ -5897,7 +6620,10 @@ async fn execute_evidence_loop(
                 total_nodes += 1;
                 info!(slug, apex_id = %apex_id, "delta apex synthesized from {} penultimate nodes", penultimate_nodes.len());
             } else {
-                warn!(slug, "delta path: no penultimate nodes to synthesize apex from");
+                warn!(
+                    slug,
+                    "delta path: no penultimate nodes to synthesize apex from"
+                );
             }
         }
     }
@@ -5972,19 +6698,22 @@ async fn execute_process_gaps(
 
     // ── Resolve step.input (Pillar 28: forkable wiring) ────────────────
     let resolved_input = if let Some(ref input) = step.input {
-        ctx.resolve_value(input).unwrap_or(Value::Object(serde_json::Map::new()))
+        ctx.resolve_value(input)
+            .unwrap_or(Value::Object(serde_json::Map::new()))
     } else {
         Value::Object(serde_json::Map::new())
     };
 
     // Resolve nested load_prior_state from input (or fall back to context)
-    let load_prior_state_val = resolved_input.get("load_prior_state")
+    let load_prior_state_val = resolved_input
+        .get("load_prior_state")
         .cloned()
         .or_else(|| ctx.resolve_ref("$load_prior_state").ok())
         .unwrap_or(Value::Object(serde_json::Map::new()));
 
     // Get build context from evidence_loop step output
-    let evidence_result = resolved_input.get("evidence_loop")
+    let evidence_result = resolved_input
+        .get("evidence_loop")
         .cloned()
         .or_else(|| ctx.resolve_ref("$evidence_loop").ok())
         .unwrap_or(Value::Null);
@@ -6002,7 +6731,10 @@ async fn execute_process_gaps(
         .get("skipped_evidence")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
-        || evidence_result.get("skipped").and_then(|v| v.as_bool()).unwrap_or(false);
+        || evidence_result
+            .get("skipped")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
     if evidence_skipped || evidence_error.is_some() || cancel.is_cancelled() {
         info!(
             slug,
@@ -6014,14 +6746,24 @@ async fn execute_process_gaps(
     }
 
     // Get cross-slug info
-    let is_cross_slug = load_prior_state_val.get("is_cross_slug")
+    let is_cross_slug = load_prior_state_val
+        .get("is_cross_slug")
         .and_then(|v| v.as_bool())
-        .or_else(|| ctx.resolve_ref("$load_prior_state.is_cross_slug").ok().and_then(|v| v.as_bool()))
+        .or_else(|| {
+            ctx.resolve_ref("$load_prior_state.is_cross_slug")
+                .ok()
+                .and_then(|v| v.as_bool())
+        })
         .unwrap_or(false);
-    let referenced_slugs: Vec<String> = load_prior_state_val.get("referenced_slugs")
+    let referenced_slugs: Vec<String> = load_prior_state_val
+        .get("referenced_slugs")
         .cloned()
         .and_then(|v| serde_json::from_value(v).ok())
-        .or_else(|| ctx.resolve_ref("$load_prior_state.referenced_slugs").ok().and_then(|v| serde_json::from_value(v).ok()))
+        .or_else(|| {
+            ctx.resolve_ref("$load_prior_state.referenced_slugs")
+                .ok()
+                .and_then(|v| serde_json::from_value(v).ok())
+        })
         .unwrap_or_default();
 
     // Get audience from tree
@@ -6030,8 +6772,10 @@ async fn execute_process_gaps(
         .or_else(|_| ctx.resolve_ref("$decompose"))
         .or_else(|_| ctx.resolve_ref("$decompose_delta"))
         .ok();
-    let audience: Option<String> = tree_val
-        .and_then(|v| v.get("audience").and_then(|a| a.as_str().map(|s| s.to_string())));
+    let audience: Option<String> = tree_val.and_then(|v| {
+        v.get("audience")
+            .and_then(|a| a.as_str().map(|s| s.to_string()))
+    });
 
     // Load unresolved gaps
     let unresolved_gaps = db_read(&state.reader, {
@@ -6055,8 +6799,10 @@ async fn execute_process_gaps(
     // Phase 13: emit GapProcessing { action: "identify" } at the start
     // of the loop. Depth is 0 for gap processing — gaps are filled by
     // re-examining L0 source files.
-    let _ = state.build_event_bus.tx.send(
-        crate::pyramid::event_bus::TaggedBuildEvent {
+    let _ = state
+        .build_event_bus
+        .tx
+        .send(crate::pyramid::event_bus::TaggedBuildEvent {
             slug: slug.to_string(),
             kind: crate::pyramid::event_bus::TaggedKind::GapProcessing {
                 slug: slug.to_string(),
@@ -6066,8 +6812,7 @@ async fn execute_process_gaps(
                 gap_count: unresolved_gaps.len() as i64,
                 action: "identify".to_string(),
             },
-        },
-    );
+        });
 
     let mut gaps_processed = 0;
     let mut gaps_with_new_evidence = 0;
@@ -6307,8 +7052,10 @@ async fn execute_process_gaps(
 
     // Phase 13: emit GapProcessing { action: "fill" } at the end so
     // the UI can flip the step row to complete with a summary count.
-    let _ = state.build_event_bus.tx.send(
-        crate::pyramid::event_bus::TaggedBuildEvent {
+    let _ = state
+        .build_event_bus
+        .tx
+        .send(crate::pyramid::event_bus::TaggedBuildEvent {
             slug: slug.to_string(),
             kind: crate::pyramid::event_bus::TaggedKind::GapProcessing {
                 slug: slug.to_string(),
@@ -6318,8 +7065,7 @@ async fn execute_process_gaps(
                 gap_count: gaps_processed as i64,
                 action: "fill".to_string(),
             },
-        },
-    );
+        });
 
     Ok(serde_json::json!({
         "gaps_processed": gaps_processed,
@@ -6437,9 +7183,9 @@ async fn execute_invoke_chain(
         state,
         &child_chain,
         slug,
-        0,                          // from_depth: child starts fresh
-        None,                       // stop_after
-        None,                       // force_from
+        0,    // from_depth: child starts fresh
+        None, // stop_after
+        None, // force_from
         cancel,
         progress_tx.clone(),
         layer_tx.clone(),
@@ -6529,56 +7275,72 @@ async fn execute_for_each(
             "[CHAIN] [{}] forEach: projecting items to fields {:?}",
             step.name, fields
         );
-        items.into_iter().map(|item| project_item(&item, fields)).collect()
+        items
+            .into_iter()
+            .map(|item| project_item(&item, fields))
+            .collect()
     } else {
         items
     };
 
     // ── Step 2: batching ─────────────────────────────────────────────────
-    let items = if let Some(max_tokens) = step.batch_max_tokens {
-        // Token-aware greedy batching (composes with batch_size as max items per batch)
-        info!(
+    let items =
+        if let Some(max_tokens) = step.batch_max_tokens {
+            // Token-aware greedy batching (composes with batch_size as max items per batch)
+            info!(
             "[CHAIN] [{}] forEach: token-aware batching {} items (max_tokens={}, max_items={:?})",
             step.name, items.len(), max_tokens, step.batch_size
         );
-        batch_items_by_tokens(items, max_tokens, step.batch_size, step.dehydrate.as_deref())
-    } else if let Some(batch_size) = step.batch_size {
-        // Proportional splitting: 127 items / batch_size=100 → [64, 63]
-        let bs = batch_size.max(1);
-        let num_batches = (items.len() + bs - 1) / bs;
-        if num_batches <= 1 {
-            info!(
-                "[CHAIN] [{}] forEach: batching {} items into 1 batch",
-                step.name, items.len()
-            );
-            vec![Value::Array(items)]
-        } else {
-            let base_size = items.len() / num_batches;
-            let remainder = items.len() % num_batches;
-            info!(
-                "[CHAIN] [{}] forEach: batching {} items into {} balanced batches (~{} each)",
-                step.name, items.len(), num_batches, base_size
-            );
-            let mut result = Vec::with_capacity(num_batches);
-            let mut offset = 0;
-            for i in 0..num_batches {
-                let size = base_size + if i < remainder { 1 } else { 0 };
-                result.push(Value::Array(items[offset..offset + size].to_vec()));
-                offset += size;
+            batch_items_by_tokens(
+                items,
+                max_tokens,
+                step.batch_size,
+                step.dehydrate.as_deref(),
+            )
+        } else if let Some(batch_size) = step.batch_size {
+            // Proportional splitting: 127 items / batch_size=100 → [64, 63]
+            let bs = batch_size.max(1);
+            let num_batches = (items.len() + bs - 1) / bs;
+            if num_batches <= 1 {
+                info!(
+                    "[CHAIN] [{}] forEach: batching {} items into 1 batch",
+                    step.name,
+                    items.len()
+                );
+                vec![Value::Array(items)]
+            } else {
+                let base_size = items.len() / num_batches;
+                let remainder = items.len() % num_batches;
+                info!(
+                    "[CHAIN] [{}] forEach: batching {} items into {} balanced batches (~{} each)",
+                    step.name,
+                    items.len(),
+                    num_batches,
+                    base_size
+                );
+                let mut result = Vec::with_capacity(num_batches);
+                let mut offset = 0;
+                for i in 0..num_batches {
+                    let size = base_size + if i < remainder { 1 } else { 0 };
+                    result.push(Value::Array(items[offset..offset + size].to_vec()));
+                    offset += size;
+                }
+                result
             }
-            result
-        }
-    } else {
-        items
-    };
+        } else {
+            items
+        };
 
     info!("[CHAIN] [{}] forEach: {} items", step.name, items.len());
     if saves_node {
-        try_send_layer_event(layer_tx, LayerEvent::Discovered {
-            depth: step.depth.unwrap_or(0),
-            step_name: step.name.clone(),
-            estimated_nodes: items.len() as i64,
-        });
+        try_send_layer_event(
+            layer_tx,
+            LayerEvent::Discovered {
+                depth: step.depth.unwrap_or(0),
+                step_name: step.name.clone(),
+                estimated_nodes: items.len() as i64,
+            },
+        );
     }
     let mut outputs: Vec<Value> = Vec::with_capacity(items.len());
     let mut failures: i32 = 0;
@@ -6626,6 +7388,10 @@ async fn execute_for_each(
         )
         .await;
     }
+
+    // Walker v3 W3b: resolve the provenance model ONCE for all save sites
+    // in this forEach. Mirrors W1b's "build once per outer step" shape.
+    let save_model = compute_save_step_provenance_model(step, defaults, dispatch_ctx).await;
 
     for (index, item) in items.iter().enumerate() {
         if cancel.is_cancelled() {
@@ -6681,7 +7447,10 @@ async fn execute_for_each(
                 )
                 .await?
                 {
-                    resume_label = prior_output.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    resume_label = prior_output
+                        .get("headline")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
                     if step.sequential {
                         update_accumulators(&mut ctx.accumulators, &prior_output, step);
                     }
@@ -6697,9 +7466,15 @@ async fn execute_for_each(
                 if saves_node {
                     *done += 1;
                     send_progress(progress_tx, *done, total).await;
-                    try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
-                        depth, step_name: step.name.clone(), node_id: node_id.clone(), label: resume_label,
-                    });
+                    try_send_layer_event(
+                        layer_tx,
+                        LayerEvent::NodeCompleted {
+                            depth,
+                            step_name: step.name.clone(),
+                            node_id: node_id.clone(),
+                            label: resume_label,
+                        },
+                    );
                 }
                 continue;
             }
@@ -6854,7 +7629,10 @@ async fn execute_for_each(
                                 "[CHAIN] [{}] {node_id}: merge failed ({e}), using first sub-result",
                                 step.name
                             );
-                            sub_results.into_iter().find(|v| !v.is_null()).unwrap_or(Value::Null)
+                            sub_results
+                                .into_iter()
+                                .find(|v| !v.is_null())
+                                .unwrap_or(Value::Null)
                         }
                     }
                 } else if sub_results.len() == 1 {
@@ -6868,7 +7646,8 @@ async fn execute_for_each(
                             continue;
                         }
                         let sub_node_id = format!("{node_id}s{sub_idx}");
-                        let decorated = decorate_step_output(sub_output.clone(), &sub_node_id, chunk_index);
+                        let decorated =
+                            decorate_step_output(sub_output.clone(), &sub_node_id, chunk_index);
                         let output_json = serde_json::to_string(&decorated)?;
                         send_save_step(
                             writer_tx,
@@ -6878,7 +7657,7 @@ async fn execute_for_each(
                             depth,
                             &sub_node_id,
                             &output_json,
-                            &dispatch_ctx.config.primary_model,
+                            &save_model,
                             merge_elapsed,
                         )
                         .await;
@@ -6891,14 +7670,17 @@ async fn execute_for_each(
                                 depth,
                                 Some(chunk_index),
                             )?;
-                            emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
-                                slug: ctx.slug.clone(),
-                                build_id: dispatch_build_id(dispatch_ctx),
-                                step_name: step.name.clone(),
-                                node_id: node.id.clone(),
-                                headline: node.headline.clone(),
-                                depth: node.depth,
-                            });
+                            emit_chain_event(
+                                dispatch_ctx,
+                                crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                                    slug: ctx.slug.clone(),
+                                    build_id: dispatch_build_id(dispatch_ctx),
+                                    step_name: step.name.clone(),
+                                    node_id: node.id.clone(),
+                                    headline: node.headline.clone(),
+                                    depth: node.depth,
+                                },
+                            );
                             let topics_json = serde_json::to_string(
                                 sub_output.get("topics").unwrap_or(&serde_json::json!([])),
                             )?;
@@ -6928,7 +7710,7 @@ async fn execute_for_each(
                     depth,
                     &node_id,
                     &output_json,
-                    &dispatch_ctx.config.primary_model,
+                    &save_model,
                     elapsed,
                 )
                 .await;
@@ -6941,14 +7723,17 @@ async fn execute_for_each(
                         depth,
                         Some(chunk_index),
                     )?;
-                    emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
-                        slug: ctx.slug.clone(),
-                        build_id: dispatch_build_id(dispatch_ctx),
-                        step_name: step.name.clone(),
-                        node_id: node.id.clone(),
-                        headline: node.headline.clone(),
-                        depth: node.depth,
-                    });
+                    emit_chain_event(
+                        dispatch_ctx,
+                        crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                            slug: ctx.slug.clone(),
+                            build_id: dispatch_build_id(dispatch_ctx),
+                            step_name: step.name.clone(),
+                            node_id: node.id.clone(),
+                            headline: node.headline.clone(),
+                            depth: node.depth,
+                        },
+                    );
                     let topics_json = serde_json::to_string(
                         analysis.get("topics").unwrap_or(&serde_json::json!([])),
                     )?;
@@ -6962,10 +7747,19 @@ async fn execute_for_each(
                 outputs.push(decorated_output);
                 info!("[CHAIN] [{}] {node_id} complete (split+merge)", step.name);
                 if saves_node {
-                    let label = analysis.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
-                        depth, step_name: step.name.clone(), node_id: node_id.clone(), label,
-                    });
+                    let label = analysis
+                        .get("headline")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    try_send_layer_event(
+                        layer_tx,
+                        LayerEvent::NodeCompleted {
+                            depth,
+                            step_name: step.name.clone(),
+                            node_id: node_id.clone(),
+                            label,
+                        },
+                    );
                     *done += 1;
                     send_progress(progress_tx, *done, total).await;
                 }
@@ -7007,7 +7801,7 @@ async fn execute_for_each(
                     depth,
                     &node_id,
                     &output_json,
-                    &dispatch_ctx.config.primary_model,
+                    &save_model,
                     elapsed,
                 )
                 .await;
@@ -7089,14 +7883,17 @@ async fn execute_for_each(
                         }
                     }
 
-                    emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
-                        slug: ctx.slug.clone(),
-                        build_id: dispatch_build_id(dispatch_ctx),
-                        step_name: step.name.clone(),
-                        node_id: node.id.clone(),
-                        headline: node.headline.clone(),
-                        depth: node.depth,
-                    });
+                    emit_chain_event(
+                        dispatch_ctx,
+                        crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                            slug: ctx.slug.clone(),
+                            build_id: dispatch_build_id(dispatch_ctx),
+                            step_name: step.name.clone(),
+                            node_id: node.id.clone(),
+                            headline: node.headline.clone(),
+                            depth: node.depth,
+                        },
+                    );
                     let topics_json = serde_json::to_string(
                         analysis.get("topics").unwrap_or(&serde_json::json!([])),
                     )?;
@@ -7116,10 +7913,19 @@ async fn execute_for_each(
                 outputs.push(decorated_output);
                 info!("[CHAIN] [{}] {node_id} complete ({elapsed:.1}s)", step.name);
                 if saves_node {
-                    let label = analysis.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
-                        depth, step_name: step.name.clone(), node_id: node_id.clone(), label,
-                    });
+                    let label = analysis
+                        .get("headline")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    try_send_layer_event(
+                        layer_tx,
+                        LayerEvent::NodeCompleted {
+                            depth,
+                            step_name: step.name.clone(),
+                            node_id: node_id.clone(),
+                            label,
+                        },
+                    );
                 }
             }
             Err(e) => match error_strategy {
@@ -7131,9 +7937,14 @@ async fn execute_for_each(
                     failures += 1;
                     outputs.push(Value::Null);
                     if saves_node {
-                        try_send_layer_event(layer_tx, LayerEvent::NodeFailed {
-                            depth, step_name: step.name.clone(), node_id: node_id.clone(),
-                        });
+                        try_send_layer_event(
+                            layer_tx,
+                            LayerEvent::NodeFailed {
+                                depth,
+                                step_name: step.name.clone(),
+                                node_id: node_id.clone(),
+                            },
+                        );
                     }
                 }
             },
@@ -7179,8 +7990,11 @@ async fn execute_for_each_concurrent(
         .map(|cap| step_concurrency.min(cap).max(1))
         .unwrap_or(step_concurrency);
     let semaphore = Arc::new(Semaphore::new(concurrency));
-    let (result_tx, mut result_rx) =
-        mpsc::channel::<ForEachTaskOutcome>(concurrency * 4);
+    let (result_tx, mut result_rx) = mpsc::channel::<ForEachTaskOutcome>(concurrency * 4);
+
+    // Walker v3 W3b: resolve the provenance model ONCE before the producer
+    // spawns. Each per-item task inherits the same String via clone below.
+    let save_model = compute_save_step_provenance_model(step, defaults, dispatch_ctx).await;
 
     // ── Capture clones for the producer task ────────────────────────────
     let step_owned = step.clone();
@@ -7193,6 +8007,7 @@ async fn execute_for_each_concurrent(
     let semaphore_producer = semaphore.clone();
     let cancel_producer = cancel.clone();
     let result_tx_producer = result_tx;
+    let save_model_producer = save_model.clone();
 
     // ── Producer task ───────────────────────────────────────────────────
     let producer_handle = tokio::spawn(async move {
@@ -7235,7 +8050,6 @@ async fn execute_for_each_concurrent(
                             node_id: node_id.clone(),
                             output: Err(e),
                             sub_failures: 0,
-
                         })
                         .await;
                     continue;
@@ -7244,7 +8058,10 @@ async fn execute_for_each_concurrent(
 
             match resume {
                 ResumeState::Complete => {
-                    info!("[CHAIN] [{}] {} -- resumed (complete)", step_owned.name, node_id);
+                    info!(
+                        "[CHAIN] [{}] {} -- resumed (complete)",
+                        step_owned.name, node_id
+                    );
 
                     let mut output_val = Value::Null;
                     match load_prior_step_output(
@@ -7273,7 +8090,6 @@ async fn execute_for_each_concurrent(
                                     node_id: node_id.clone(),
                                     output: Err(e),
                                     sub_failures: 0,
-        
                                 })
                                 .await;
                             continue;
@@ -7287,7 +8103,6 @@ async fn execute_for_each_concurrent(
                             node_id: node_id.clone(),
                             output: Ok(output_val),
                             sub_failures: 0,
-
                         })
                         .await
                         .is_err()
@@ -7326,6 +8141,7 @@ async fn execute_for_each_concurrent(
             let defaults_work = defaults_producer.clone();
             let error_strategy_work = error_strategy_producer.clone();
             let result_tx_work = result_tx_producer.clone();
+            let save_model_work = save_model_producer.clone();
             let item_owned = item.clone();
 
             let work_handle = tokio::spawn(async move {
@@ -7344,7 +8160,6 @@ async fn execute_for_each_concurrent(
                             node_id: node_id.clone(),
                             output: Err(e),
                             sub_failures: 0,
-
                         })
                         .await;
                     return;
@@ -7364,7 +8179,6 @@ async fn execute_for_each_concurrent(
                                     node_id: node_id.clone(),
                                     output: Err(e),
                                     sub_failures: 0,
-        
                                 })
                                 .await;
                             return;
@@ -7391,7 +8205,6 @@ async fn execute_for_each_concurrent(
                                 node_id: node_id.clone(),
                                 output: Err(e),
                                 sub_failures: 0,
-    
                             })
                             .await;
                         return;
@@ -7404,7 +8217,8 @@ async fn execute_for_each_concurrent(
                     if est_tokens > max_tokens {
                         let strategy = step_work.split_strategy.as_deref().unwrap_or("sections");
                         let overlap = step_work.split_overlap_tokens.unwrap_or(500);
-                        let sub_chunks = split_chunk(&resolved_input, max_tokens, strategy, overlap);
+                        let sub_chunks =
+                            split_chunk(&resolved_input, max_tokens, strategy, overlap);
                         let num_sub = sub_chunks.len();
 
                         info!(
@@ -7420,7 +8234,10 @@ async fn execute_for_each_concurrent(
                                     "This is part {} of {} from document: {}",
                                     sub_idx + 1,
                                     num_sub,
-                                    sub_item.get("_split_source").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                                    sub_item
+                                        .get("_split_source")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("unknown"),
                                 );
                                 let base = build_system_prompt(&step_work, sub_item, &item_ctx)?;
                                 Ok(format!("{base}\n\n{part_header}"))
@@ -7433,17 +8250,22 @@ async fn execute_for_each_concurrent(
                                             node_id: node_id.clone(),
                                             output: Err(e),
                                             sub_failures: sub_fail_count,
-                
                                         })
                                         .await;
                                     return;
                                 }
                             };
-                            let sub_fallback_key = format!("{}-{index}-sub{sub_idx}", step_work.name);
+                            let sub_fallback_key =
+                                format!("{}-{index}-sub{sub_idx}", step_work.name);
 
                             match dispatch_with_retry(
-                                &step_work, sub_item, &sub_system_prompt, &defaults_work,
-                                &dispatch_ctx_work, &error_strategy_work, &sub_fallback_key,
+                                &step_work,
+                                sub_item,
+                                &sub_system_prompt,
+                                &defaults_work,
+                                &dispatch_ctx_work,
+                                &error_strategy_work,
+                                &sub_fallback_key,
                             )
                             .await
                             {
@@ -7456,7 +8278,6 @@ async fn execute_for_each_concurrent(
                                                 node_id: node_id.clone(),
                                                 output: Err(anyhow!("forEach abort at index {index} sub-chunk {sub_idx}: {e}")),
                                                 sub_failures: sub_fail_count,
-                    
                                             })
                                             .await;
                                         return;
@@ -7489,19 +8310,28 @@ async fn execute_for_each_concurrent(
                                 SPLIT_MERGE_DEFAULT_PROMPT.to_string()
                             };
                             let analysis = match dispatch_with_retry(
-                                &step_work, &merge_input, &merge_prompt, &defaults_work,
-                                &dispatch_ctx_work, &error_strategy_work, &merge_fallback_key,
+                                &step_work,
+                                &merge_input,
+                                &merge_prompt,
+                                &defaults_work,
+                                &dispatch_ctx_work,
+                                &error_strategy_work,
+                                &merge_fallback_key,
                             )
                             .await
                             {
                                 Ok(merged) => merged,
                                 Err(e) => {
                                     warn!("[CHAIN] [{}] {node_id}: merge failed ({e}), using first sub-result", step_work.name);
-                                    sub_results.into_iter().find(|v| !v.is_null()).unwrap_or(Value::Null)
+                                    sub_results
+                                        .into_iter()
+                                        .find(|v| !v.is_null())
+                                        .unwrap_or(Value::Null)
                                 }
                             };
 
-                            let decorated = decorate_step_output(analysis.clone(), &node_id, chunk_index);
+                            let decorated =
+                                decorate_step_output(analysis.clone(), &node_id, chunk_index);
                             let output_json = match serde_json::to_string(&decorated) {
                                 Ok(j) => j,
                                 Err(e) => {
@@ -7511,30 +8341,52 @@ async fn execute_for_each_concurrent(
                                             node_id: node_id.clone(),
                                             output: Err(anyhow::Error::from(e)),
                                             sub_failures: sub_fail_count,
-                
                                         })
                                         .await;
                                     return;
                                 }
                             };
                             send_save_step(
-                                &writer_tx_work, &ctx_snap_work.slug, &step_work.name, chunk_index, depth, &node_id,
-                                &output_json, &dispatch_ctx_work.config.primary_model, 0.0,
-                            ).await;
+                                &writer_tx_work,
+                                &ctx_snap_work.slug,
+                                &step_work.name,
+                                chunk_index,
+                                depth,
+                                &node_id,
+                                &output_json,
+                                &save_model_work,
+                                0.0,
+                            )
+                            .await;
 
                             if saves_node {
-                                match build_node_from_output(&analysis, &node_id, &ctx_snap_work.slug, depth, Some(chunk_index)) {
+                                match build_node_from_output(
+                                    &analysis,
+                                    &node_id,
+                                    &ctx_snap_work.slug,
+                                    depth,
+                                    Some(chunk_index),
+                                ) {
                                     Ok(node) => {
-                                        emit_chain_event(&dispatch_ctx_work, crate::pyramid::event_bus::TaggedKind::NodeProduced {
-                                            slug: ctx_snap_work.slug.clone(),
-                                            build_id: dispatch_build_id(&dispatch_ctx_work),
-                                            step_name: step_work.name.clone(),
-                                            node_id: node.id.clone(),
-                                            headline: node.headline.clone(),
-                                            depth: node.depth,
-                                        });
-                                        let topics_json = serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([]))).unwrap_or_default();
-                                        send_save_node(&writer_tx_work, node, Some(topics_json)).await;
+                                        emit_chain_event(
+                                            &dispatch_ctx_work,
+                                            crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                                                slug: ctx_snap_work.slug.clone(),
+                                                build_id: dispatch_build_id(&dispatch_ctx_work),
+                                                step_name: step_work.name.clone(),
+                                                node_id: node.id.clone(),
+                                                headline: node.headline.clone(),
+                                                depth: node.depth,
+                                            },
+                                        );
+                                        let topics_json = serde_json::to_string(
+                                            analysis
+                                                .get("topics")
+                                                .unwrap_or(&serde_json::json!([])),
+                                        )
+                                        .unwrap_or_default();
+                                        send_save_node(&writer_tx_work, node, Some(topics_json))
+                                            .await;
                                     }
                                     Err(e) => {
                                         warn!("[CHAIN] [{}] {node_id}: build_node_from_output failed: {e}", step_work.name);
@@ -7559,32 +8411,55 @@ async fn execute_for_each_concurrent(
                                     continue;
                                 }
                                 let sub_node_id = format!("{node_id}s{sub_idx}");
-                                let decorated = decorate_step_output(sub_output.clone(), &sub_node_id, chunk_index);
+                                let decorated = decorate_step_output(
+                                    sub_output.clone(),
+                                    &sub_node_id,
+                                    chunk_index,
+                                );
                                 let output_json = match serde_json::to_string(&decorated) {
                                     Ok(j) => j,
                                     Err(_) => continue,
                                 };
                                 send_save_step(
-                                    &writer_tx_work, &ctx_snap_work.slug, &step_work.name, chunk_index, depth, &sub_node_id,
-                                    &output_json, &dispatch_ctx_work.config.primary_model, 0.0,
-                                ).await;
+                                    &writer_tx_work,
+                                    &ctx_snap_work.slug,
+                                    &step_work.name,
+                                    chunk_index,
+                                    depth,
+                                    &sub_node_id,
+                                    &output_json,
+                                    &save_model_work,
+                                    0.0,
+                                )
+                                .await;
 
                                 if saves_node {
                                     if let Ok(node) = build_node_from_output(
-                                        &sub_output, &sub_node_id, &ctx_snap_work.slug, depth, Some(chunk_index),
+                                        &sub_output,
+                                        &sub_node_id,
+                                        &ctx_snap_work.slug,
+                                        depth,
+                                        Some(chunk_index),
                                     ) {
-                                        emit_chain_event(&dispatch_ctx_work, crate::pyramid::event_bus::TaggedKind::NodeProduced {
-                                            slug: ctx_snap_work.slug.clone(),
-                                            build_id: dispatch_build_id(&dispatch_ctx_work),
-                                            step_name: step_work.name.clone(),
-                                            node_id: node.id.clone(),
-                                            headline: node.headline.clone(),
-                                            depth: node.depth,
-                                        });
+                                        emit_chain_event(
+                                            &dispatch_ctx_work,
+                                            crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                                                slug: ctx_snap_work.slug.clone(),
+                                                build_id: dispatch_build_id(&dispatch_ctx_work),
+                                                step_name: step_work.name.clone(),
+                                                node_id: node.id.clone(),
+                                                headline: node.headline.clone(),
+                                                depth: node.depth,
+                                            },
+                                        );
                                         let topics_json = serde_json::to_string(
-                                            sub_output.get("topics").unwrap_or(&serde_json::json!([])),
-                                        ).unwrap_or_default();
-                                        send_save_node(&writer_tx_work, node, Some(topics_json)).await;
+                                            sub_output
+                                                .get("topics")
+                                                .unwrap_or(&serde_json::json!([])),
+                                        )
+                                        .unwrap_or_default();
+                                        send_save_node(&writer_tx_work, node, Some(topics_json))
+                                            .await;
                                     }
                                 }
                                 if first_decorated.is_none() {
@@ -7602,8 +8477,12 @@ async fn execute_for_each_concurrent(
                                 .await;
                         } else {
                             // Single sub-result or empty — save as the original node
-                            let analysis = sub_results.into_iter().find(|v| !v.is_null()).unwrap_or(Value::Null);
-                            let decorated = decorate_step_output(analysis.clone(), &node_id, chunk_index);
+                            let analysis = sub_results
+                                .into_iter()
+                                .find(|v| !v.is_null())
+                                .unwrap_or(Value::Null);
+                            let decorated =
+                                decorate_step_output(analysis.clone(), &node_id, chunk_index);
                             let output_json = match serde_json::to_string(&decorated) {
                                 Ok(j) => j,
                                 Err(e) => {
@@ -7613,30 +8492,52 @@ async fn execute_for_each_concurrent(
                                             node_id: node_id.clone(),
                                             output: Err(anyhow::Error::from(e)),
                                             sub_failures: sub_fail_count,
-                
                                         })
                                         .await;
                                     return;
                                 }
                             };
                             send_save_step(
-                                &writer_tx_work, &ctx_snap_work.slug, &step_work.name, chunk_index, depth, &node_id,
-                                &output_json, &dispatch_ctx_work.config.primary_model, 0.0,
-                            ).await;
+                                &writer_tx_work,
+                                &ctx_snap_work.slug,
+                                &step_work.name,
+                                chunk_index,
+                                depth,
+                                &node_id,
+                                &output_json,
+                                &save_model_work,
+                                0.0,
+                            )
+                            .await;
 
                             if saves_node {
-                                match build_node_from_output(&analysis, &node_id, &ctx_snap_work.slug, depth, Some(chunk_index)) {
+                                match build_node_from_output(
+                                    &analysis,
+                                    &node_id,
+                                    &ctx_snap_work.slug,
+                                    depth,
+                                    Some(chunk_index),
+                                ) {
                                     Ok(node) => {
-                                        emit_chain_event(&dispatch_ctx_work, crate::pyramid::event_bus::TaggedKind::NodeProduced {
-                                            slug: ctx_snap_work.slug.clone(),
-                                            build_id: dispatch_build_id(&dispatch_ctx_work),
-                                            step_name: step_work.name.clone(),
-                                            node_id: node.id.clone(),
-                                            headline: node.headline.clone(),
-                                            depth: node.depth,
-                                        });
-                                        let topics_json = serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([]))).unwrap_or_default();
-                                        send_save_node(&writer_tx_work, node, Some(topics_json)).await;
+                                        emit_chain_event(
+                                            &dispatch_ctx_work,
+                                            crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                                                slug: ctx_snap_work.slug.clone(),
+                                                build_id: dispatch_build_id(&dispatch_ctx_work),
+                                                step_name: step_work.name.clone(),
+                                                node_id: node.id.clone(),
+                                                headline: node.headline.clone(),
+                                                depth: node.depth,
+                                            },
+                                        );
+                                        let topics_json = serde_json::to_string(
+                                            analysis
+                                                .get("topics")
+                                                .unwrap_or(&serde_json::json!([])),
+                                        )
+                                        .unwrap_or_default();
+                                        send_save_node(&writer_tx_work, node, Some(topics_json))
+                                            .await;
                                     }
                                     Err(e) => {
                                         warn!("[CHAIN] [{}] {node_id}: build_node_from_output failed: {e}", step_work.name);
@@ -7657,21 +8558,21 @@ async fn execute_for_each_concurrent(
                 }
 
                 // ── Normal (non-oversized) path ─────────────────────────────
-                let system_prompt = match build_system_prompt(&step_work, &resolved_input, &item_ctx) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let _ = result_tx_work
-                            .send(ForEachTaskOutcome {
-                                index,
-                                node_id: node_id.clone(),
-                                output: Err(e),
-                                sub_failures: 0,
-    
-                            })
-                            .await;
-                        return;
-                    }
-                };
+                let system_prompt =
+                    match build_system_prompt(&step_work, &resolved_input, &item_ctx) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let _ = result_tx_work
+                                .send(ForEachTaskOutcome {
+                                    index,
+                                    node_id: node_id.clone(),
+                                    output: Err(e),
+                                    sub_failures: 0,
+                                })
+                                .await;
+                            return;
+                        }
+                    };
 
                 let work = ForEachPendingWork {
                     index,
@@ -7748,15 +8649,21 @@ async fn execute_for_each_concurrent(
 
         match result.output {
             Ok(ref output) => {
-                let label = output.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let label = output
+                    .get("headline")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 outputs[result.index] = output.clone();
                 if saves_node {
-                    try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
-                        depth,
-                        step_name: step.name.clone(),
-                        node_id: result.node_id.clone(),
-                        label,
-                    });
+                    try_send_layer_event(
+                        layer_tx,
+                        LayerEvent::NodeCompleted {
+                            depth,
+                            step_name: step.name.clone(),
+                            node_id: result.node_id.clone(),
+                            label,
+                        },
+                    );
                 }
             }
             Err(e) => match error_strategy {
@@ -7767,7 +8674,9 @@ async fn execute_for_each_concurrent(
                     match producer_handle.await {
                         Ok(()) => {}
                         Err(e) if e.is_cancelled() => {}
-                        Err(e) => { warn!("[CHAIN] producer task error on abort: {e}"); }
+                        Err(e) => {
+                            warn!("[CHAIN] producer task error on abort: {e}");
+                        }
                     }
                     return Err(anyhow!("forEach abort at index {}: {e}", result.index));
                 }
@@ -7778,11 +8687,14 @@ async fn execute_for_each_concurrent(
                     );
                     failures += 1;
                     if saves_node {
-                        try_send_layer_event(layer_tx, LayerEvent::NodeFailed {
-                            depth,
-                            step_name: step.name.clone(),
-                            node_id: result.node_id.clone(),
-                        });
+                        try_send_layer_event(
+                            layer_tx,
+                            LayerEvent::NodeFailed {
+                                depth,
+                                step_name: step.name.clone(),
+                                node_id: result.node_id.clone(),
+                            },
+                        );
                     }
                 }
             },
@@ -7824,7 +8736,10 @@ async fn execute_for_each_work_item(
 ) -> Result<Value> {
     let fallback_key = format!("{}-{}", step.name, work.index);
     let t0 = Instant::now();
-    info!("[CHAIN] [{}] {} dispatching LLM call", step.name, work.node_id);
+    info!(
+        "[CHAIN] [{}] {} dispatching LLM call",
+        step.name, work.node_id
+    );
 
     // Propagate node_id into audit context so LLM audit records are queryable
     let dispatch_ctx_with_node = {
@@ -7849,11 +8764,20 @@ async fn execute_for_each_work_item(
     validate_step_output(step, &analysis)?;
     let elapsed = t0.elapsed().as_secs_f64();
     if elapsed > 10.0 {
-        warn!("[CHAIN] [{}] {} SLOW dispatch: {:.1}s", step.name, work.node_id, elapsed);
+        warn!(
+            "[CHAIN] [{}] {} SLOW dispatch: {:.1}s",
+            step.name, work.node_id, elapsed
+        );
     } else {
-        info!("[CHAIN] [{}] {} dispatch complete: {:.1}s", step.name, work.node_id, elapsed);
+        info!(
+            "[CHAIN] [{}] {} dispatch complete: {:.1}s",
+            step.name, work.node_id, elapsed
+        );
     }
     let decorated_output = decorate_step_output(analysis.clone(), &work.node_id, work.chunk_index);
+
+    // Walker v3 W3b: resolve the provenance model for the save-step write.
+    let save_model = compute_save_step_provenance_model(step, defaults, dispatch_ctx).await;
 
     let output_json = serde_json::to_string(&decorated_output)?;
     send_save_step(
@@ -7864,7 +8788,7 @@ async fn execute_for_each_work_item(
         work.depth,
         &work.node_id,
         &output_json,
-        &dispatch_ctx.config.primary_model,
+        &save_model,
         elapsed,
     )
     .await;
@@ -7946,14 +8870,17 @@ async fn execute_for_each_work_item(
             }
         }
 
-        emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
-            slug: ctx_snapshot.slug.clone(),
-            build_id: dispatch_build_id(dispatch_ctx),
-            step_name: step.name.clone(),
-            node_id: node.id.clone(),
-            headline: node.headline.clone(),
-            depth: node.depth,
-        });
+        emit_chain_event(
+            dispatch_ctx,
+            crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                slug: ctx_snapshot.slug.clone(),
+                build_id: dispatch_build_id(dispatch_ctx),
+                step_name: step.name.clone(),
+                node_id: node.id.clone(),
+                headline: node.headline.clone(),
+                depth: node.depth,
+            },
+        );
         let topics_json =
             serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([])))?;
         let child_ids = node.children.clone();
@@ -8066,11 +8993,14 @@ async fn execute_pair_adjacent(
     let instruction = step.instruction.as_deref().unwrap_or("");
 
     if saves_node {
-        try_send_layer_event(layer_tx, LayerEvent::Discovered {
-            depth: target_depth,
-            step_name: step.name.clone(),
-            estimated_nodes: ((source_nodes.len() + 1) / 2) as i64,
-        });
+        try_send_layer_event(
+            layer_tx,
+            LayerEvent::Discovered {
+                depth: target_depth,
+                step_name: step.name.clone(),
+                estimated_nodes: ((source_nodes.len() + 1) / 2) as i64,
+            },
+        );
     }
 
     let mut pair_idx: usize = 0;
@@ -8107,9 +9037,15 @@ async fn execute_pair_adjacent(
                 if saves_node {
                     *done += 1;
                     send_progress(progress_tx, *done, total).await;
-                    try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
-                        depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(), label: None,
-                    });
+                    try_send_layer_event(
+                        layer_tx,
+                        LayerEvent::NodeCompleted {
+                            depth: target_depth,
+                            step_name: step.name.clone(),
+                            node_id: node_id.clone(),
+                            label: None,
+                        },
+                    );
                 }
                 if let Some(prior_output) = load_prior_step_output(
                     reader,
@@ -8159,12 +9095,21 @@ async fn execute_pair_adjacent(
             .await
             {
                 Ok(analysis) => {
-                    let label = analysis.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let label = analysis
+                        .get("headline")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
                     outputs.push(analysis);
                     if saves_node {
-                        try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
-                            depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(), label,
-                        });
+                        try_send_layer_event(
+                            layer_tx,
+                            LayerEvent::NodeCompleted {
+                                depth: target_depth,
+                                step_name: step.name.clone(),
+                                node_id: node_id.clone(),
+                                label,
+                            },
+                        );
                     }
                 }
                 Err(e) => match error_strategy {
@@ -8188,9 +9133,14 @@ async fn execute_pair_adjacent(
                         failures += 1;
                         outputs.push(Value::Null);
                         if saves_node {
-                            try_send_layer_event(layer_tx, LayerEvent::NodeFailed {
-                                depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(),
-                            });
+                            try_send_layer_event(
+                                layer_tx,
+                                LayerEvent::NodeFailed {
+                                    depth: target_depth,
+                                    step_name: step.name.clone(),
+                                    node_id: node_id.clone(),
+                                },
+                            );
                         }
                     }
                     _ => {
@@ -8198,9 +9148,14 @@ async fn execute_pair_adjacent(
                         failures += 1;
                         outputs.push(Value::Null);
                         if saves_node {
-                            try_send_layer_event(layer_tx, LayerEvent::NodeFailed {
-                                depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(),
-                            });
+                            try_send_layer_event(
+                                layer_tx,
+                                LayerEvent::NodeFailed {
+                                    depth: target_depth,
+                                    step_name: step.name.clone(),
+                                    node_id: node_id.clone(),
+                                },
+                            );
                         }
                     }
                 },
@@ -8225,9 +9180,15 @@ async fn execute_pair_adjacent(
             .await;
             outputs.push(Value::Null);
             if saves_node {
-                try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
-                    depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(), label: Some(carry.headline.clone()),
-                });
+                try_send_layer_event(
+                    layer_tx,
+                    LayerEvent::NodeCompleted {
+                        depth: target_depth,
+                        step_name: step.name.clone(),
+                        node_id: node_id.clone(),
+                        label: Some(carry.headline.clone()),
+                    },
+                );
             }
             i += 1;
         }
@@ -8309,6 +9270,8 @@ async fn dispatch_pair(
     let decorated_output = decorate_step_output(analysis.clone(), node_id, -1);
 
     // Save step
+    // Walker v3 W3b: resolve the provenance model for the save-step write.
+    let save_model = compute_save_step_provenance_model(step, defaults, dispatch_ctx).await;
     let output_json = serde_json::to_string(&decorated_output)?;
     send_save_step(
         writer_tx,
@@ -8318,7 +9281,7 @@ async fn dispatch_pair(
         target_depth,
         node_id,
         &output_json,
-        &dispatch_ctx.config.primary_model,
+        &save_model,
         elapsed,
     )
     .await;
@@ -8327,14 +9290,17 @@ async fn dispatch_pair(
     if saves_node {
         let mut node = build_node_from_output(&analysis, node_id, &ctx.slug, target_depth, None)?;
         node.children = vec![left.id.clone(), right.id.clone()];
-        emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
-            slug: ctx.slug.clone(),
-            build_id: dispatch_build_id(dispatch_ctx),
-            step_name: step.name.clone(),
-            node_id: node.id.clone(),
-            headline: node.headline.clone(),
-            depth: node.depth,
-        });
+        emit_chain_event(
+            dispatch_ctx,
+            crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                slug: ctx.slug.clone(),
+                build_id: dispatch_build_id(dispatch_ctx),
+                step_name: step.name.clone(),
+                node_id: node.id.clone(),
+                headline: node.headline.clone(),
+                depth: node.depth,
+            },
+        );
         let topics_json =
             serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([])))?;
         send_save_node(writer_tx, node, Some(topics_json)).await;
@@ -8410,21 +9376,35 @@ async fn execute_recursive_pair(
             info!("[CHAIN] depth {target_depth}: {existing} nodes (already complete)");
             *done += existing;
             // Emit Discovered + immediate LayerCompleted for this already-complete layer
-            try_send_layer_event(layer_tx, LayerEvent::Discovered {
-                depth: target_depth, step_name: step.name.clone(), estimated_nodes: existing,
-            });
-            try_send_layer_event(layer_tx, LayerEvent::LayerCompleted {
-                depth: target_depth, step_name: step.name.clone(),
-            });
+            try_send_layer_event(
+                layer_tx,
+                LayerEvent::Discovered {
+                    depth: target_depth,
+                    step_name: step.name.clone(),
+                    estimated_nodes: existing,
+                },
+            );
+            try_send_layer_event(
+                layer_tx,
+                LayerEvent::LayerCompleted {
+                    depth: target_depth,
+                    step_name: step.name.clone(),
+                },
+            );
             send_progress(progress_tx, *done, *total).await;
             depth = target_depth;
             continue;
         }
 
         // Emit Discovered for this new layer
-        try_send_layer_event(layer_tx, LayerEvent::Discovered {
-            depth: target_depth, step_name: step.name.clone(), estimated_nodes: expected as i64,
-        });
+        try_send_layer_event(
+            layer_tx,
+            LayerEvent::Discovered {
+                depth: target_depth,
+                step_name: step.name.clone(),
+                estimated_nodes: expected as i64,
+            },
+        );
 
         info!(
             "=== DEPTH {target_depth}: PAIR {} -> {expected} ===",
@@ -8464,9 +9444,15 @@ async fn execute_recursive_pair(
                     if saves_node {
                         *done += 1;
                         send_progress(progress_tx, *done, *total).await;
-                        try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
-                            depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(), label: None,
-                        });
+                        try_send_layer_event(
+                            layer_tx,
+                            LayerEvent::NodeCompleted {
+                                depth: target_depth,
+                                step_name: step.name.clone(),
+                                node_id: node_id.clone(),
+                                label: None,
+                            },
+                        );
                     }
                     continue;
                 }
@@ -8554,9 +9540,15 @@ async fn execute_recursive_pair(
             if saves_node {
                 *done += 1;
                 send_progress(progress_tx, *done, *total).await;
-                try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
-                    depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(), label: None,
-                });
+                try_send_layer_event(
+                    layer_tx,
+                    LayerEvent::NodeCompleted {
+                        depth: target_depth,
+                        step_name: step.name.clone(),
+                        node_id: node_id.clone(),
+                        label: None,
+                    },
+                );
             }
         }
 
@@ -8567,13 +9559,19 @@ async fn execute_recursive_pair(
         flush_writes(writer_tx).await;
 
         // Emit LayerCompleted and re-estimate total
-        try_send_layer_event(layer_tx, LayerEvent::LayerCompleted {
-            depth: target_depth, step_name: step.name.clone(),
-        });
+        try_send_layer_event(
+            layer_tx,
+            LayerEvent::LayerCompleted {
+                depth: target_depth,
+                step_name: step.name.clone(),
+            },
+        );
         let actual_at_this_depth = db_read(reader, {
             let s = slug_owned.clone();
             move |conn| db::count_nodes_at_depth(conn, &s, target_depth)
-        }).await.unwrap_or(0);
+        })
+        .await
+        .unwrap_or(0);
         if actual_at_this_depth > 0 {
             *total = *done + estimate_recursive_pair_nodes(actual_at_this_depth);
             send_progress(progress_tx, *done, *total).await;
@@ -8713,12 +9711,21 @@ async fn execute_recursive_cluster(
                 *done += existing;
                 send_progress(progress_tx, *done, *total).await;
                 // Emit Discovered + immediate LayerCompleted for this resume layer
-                try_send_layer_event(layer_tx, LayerEvent::Discovered {
-                    depth: target_depth, step_name: step.name.clone(), estimated_nodes: existing,
-                });
-                try_send_layer_event(layer_tx, LayerEvent::LayerCompleted {
-                    depth: target_depth, step_name: step.name.clone(),
-                });
+                try_send_layer_event(
+                    layer_tx,
+                    LayerEvent::Discovered {
+                        depth: target_depth,
+                        step_name: step.name.clone(),
+                        estimated_nodes: existing,
+                    },
+                );
+                try_send_layer_event(
+                    layer_tx,
+                    LayerEvent::LayerCompleted {
+                        depth: target_depth,
+                        step_name: step.name.clone(),
+                    },
+                );
                 depth = target_depth;
                 continue;
             }
@@ -8740,24 +9747,29 @@ async fn execute_recursive_cluster(
         // YAML can set `direct_synthesis_threshold: 4` to restore the old behavior.
         if let Some(threshold) = step.direct_synthesis_threshold {
             if threshold > 0 && current_nodes.len() <= threshold {
-            info!(
-                "[CHAIN] [{}] direct synthesis: {} nodes → apex at depth {}",
-                step.name,
-                current_nodes.len(),
-                target_depth
-            );
-            // Emit Discovered for direct synthesis layer
-            try_send_layer_event(layer_tx, LayerEvent::Discovered {
-                depth: target_depth, step_name: step.name.clone(), estimated_nodes: 1,
-            });
-            let node_id = generate_node_id(
-                step.node_id_pattern
-                    .as_deref()
-                    .unwrap_or("L{depth}-{index:03}"),
-                0,
-                Some(target_depth),
-            );
-            let result = dispatch_group(
+                info!(
+                    "[CHAIN] [{}] direct synthesis: {} nodes → apex at depth {}",
+                    step.name,
+                    current_nodes.len(),
+                    target_depth
+                );
+                // Emit Discovered for direct synthesis layer
+                try_send_layer_event(
+                    layer_tx,
+                    LayerEvent::Discovered {
+                        depth: target_depth,
+                        step_name: step.name.clone(),
+                        estimated_nodes: 1,
+                    },
+                );
+                let node_id = generate_node_id(
+                    step.node_id_pattern
+                        .as_deref()
+                        .unwrap_or("L{depth}-{index:03}"),
+                    0,
+                    Some(target_depth),
+                );
+                let result = dispatch_group(
                 step,
                 ctx,
                 dispatch_ctx,
@@ -8778,42 +9790,52 @@ async fn execute_recursive_cluster(
             )
             .await;
 
-            match result {
-                Ok(_) => {
-                    if saves_node {
-                        *done += 1;
-                        send_progress(progress_tx, *done, *total).await;
-                        try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
-                            depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(), label: None,
-                        });
+                match result {
+                    Ok(_) => {
+                        if saves_node {
+                            *done += 1;
+                            send_progress(progress_tx, *done, *total).await;
+                            try_send_layer_event(
+                                layer_tx,
+                                LayerEvent::NodeCompleted {
+                                    depth: target_depth,
+                                    step_name: step.name.clone(),
+                                    node_id: node_id.clone(),
+                                    label: None,
+                                },
+                            );
+                        }
+                        try_send_layer_event(
+                            layer_tx,
+                            LayerEvent::LayerCompleted {
+                                depth: target_depth,
+                                step_name: step.name.clone(),
+                            },
+                        );
                     }
-                    try_send_layer_event(layer_tx, LayerEvent::LayerCompleted {
-                        depth: target_depth, step_name: step.name.clone(),
-                    });
-                }
-                Err(e) => {
-                    if matches!(
-                        error_strategy,
-                        ErrorStrategy::Abort | ErrorStrategy::Retry(_)
-                    ) {
-                        return Err(anyhow!(
-                            "[{}] direct synthesis FAILED at depth {}: {}",
-                            step.name,
-                            target_depth,
-                            e
-                        ));
+                    Err(e) => {
+                        if matches!(
+                            error_strategy,
+                            ErrorStrategy::Abort | ErrorStrategy::Retry(_)
+                        ) {
+                            return Err(anyhow!(
+                                "[{}] direct synthesis FAILED at depth {}: {}",
+                                step.name,
+                                target_depth,
+                                e
+                            ));
+                        }
+                        warn!("[CHAIN] [{}] direct synthesis FAILED: {e}", step.name);
+                        failures += 1;
                     }
-                    warn!("[CHAIN] [{}] direct synthesis FAILED: {e}", step.name);
-                    failures += 1;
                 }
+
+                // Flush writer
+                flush_writes(writer_tx).await;
+
+                info!("[CHAIN] === APEX: {node_id} at depth {target_depth} ===");
+                return Ok((node_id, failures));
             }
-
-            // Flush writer
-            flush_writes(writer_tx).await;
-
-            info!("[CHAIN] === APEX: {node_id} at depth {target_depth} ===");
-            return Ok((node_id, failures));
-        }
         } // end if let Some(threshold)
 
         // Step A: CLUSTER — ask LLM to group current nodes into semantic clusters
@@ -8828,35 +9850,38 @@ async fn execute_recursive_cluster(
         // ── CONVERGENCE LOOP REFACTOR: cluster_item_fields (1.5) ──
         // When set, project each node through the existing project_item() function.
         // When None, keep the hardcoded projection (current behavior preserved).
-        let cluster_input: Vec<serde_json::Value> = if let Some(ref fields) = step.cluster_item_fields {
-            current_nodes
-                .iter()
-                .map(|n| {
-                    // Build full node representation, then project down to requested fields
-                    let topic_names: Vec<String> = n.topics.iter().map(|t| t.name.clone()).collect();
-                    let full = serde_json::json!({
-                        "node_id": n.id,
-                        "headline": n.headline,
-                        "orientation": n.distilled,
-                        "topics": topic_names,
-                    });
-                    project_item(&full, fields)
-                })
-                .collect()
-        } else {
-            current_nodes
-                .iter()
-                .map(|n| {
-                    let topic_names: Vec<String> = n.topics.iter().map(|t| t.name.clone()).collect();
-                    serde_json::json!({
-                        "node_id": n.id,
-                        "headline": n.headline,
-                        "orientation": truncate_for_webbing(&n.distilled, 500),
-                        "topics": topic_names,
+        let cluster_input: Vec<serde_json::Value> =
+            if let Some(ref fields) = step.cluster_item_fields {
+                current_nodes
+                    .iter()
+                    .map(|n| {
+                        // Build full node representation, then project down to requested fields
+                        let topic_names: Vec<String> =
+                            n.topics.iter().map(|t| t.name.clone()).collect();
+                        let full = serde_json::json!({
+                            "node_id": n.id,
+                            "headline": n.headline,
+                            "orientation": n.distilled,
+                            "topics": topic_names,
+                        });
+                        project_item(&full, fields)
                     })
-                })
-                .collect()
-        };
+                    .collect()
+            } else {
+                current_nodes
+                    .iter()
+                    .map(|n| {
+                        let topic_names: Vec<String> =
+                            n.topics.iter().map(|t| t.name.clone()).collect();
+                        serde_json::json!({
+                            "node_id": n.id,
+                            "headline": n.headline,
+                            "orientation": truncate_for_webbing(&n.distilled, 500),
+                            "topics": topic_names,
+                        })
+                    })
+                    .collect()
+            };
 
         let cluster_input_value = serde_json::json!(cluster_input);
         let cluster_assignment_node_id = format!("CLUSTER-L{target_depth}");
@@ -8923,7 +9948,9 @@ async fn execute_recursive_cluster(
                     if coe == "abort" {
                         return Err(anyhow!(
                             "[{}] clustering FAILED at depth {} and cluster_on_error=abort: {}",
-                            step.name, depth, e
+                            step.name,
+                            depth,
+                            e
                         ));
                     }
                     warn!(
@@ -8943,13 +9970,18 @@ async fn execute_recursive_cluster(
                 }
             };
 
+            // Walker v3 W3b: resolve the provenance model using the
+            // clustering step's own config (it may override step.model via
+            // `cluster_model`).
+            let cluster_save_model =
+                compute_save_step_provenance_model(&cluster_step, defaults, dispatch_ctx).await;
             save_cluster_assignment_output(
                 writer_tx,
                 &ctx.slug,
                 target_depth,
                 &cluster_assignment_node_id,
                 &output,
-                &dispatch_ctx.config.primary_model,
+                &cluster_save_model,
             )
             .await?;
 
@@ -8979,12 +10011,24 @@ async fn execute_recursive_cluster(
         // ── CONVERGENCE LOOP REFACTOR: apex_ready signal (1.2) ──
         // If the LLM signals apex_ready=true, the current nodes ARE the right
         // top-level structure. Jump to direct synthesis with all current nodes.
-        if cluster_assignments.get("apex_ready").and_then(|v| v.as_bool()).unwrap_or(false) {
-            info!("[CHAIN] [{}] apex_ready signal received at depth {depth}", step.name);
+        if cluster_assignments
+            .get("apex_ready")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            info!(
+                "[CHAIN] [{}] apex_ready signal received at depth {depth}",
+                step.name
+            );
             // Jump to direct synthesis with current nodes (reuse the direct synthesis code path)
-            try_send_layer_event(layer_tx, LayerEvent::Discovered {
-                depth: target_depth, step_name: step.name.clone(), estimated_nodes: 1,
-            });
+            try_send_layer_event(
+                layer_tx,
+                LayerEvent::Discovered {
+                    depth: target_depth,
+                    step_name: step.name.clone(),
+                    estimated_nodes: 1,
+                },
+            );
             let node_id = generate_node_id(
                 step.node_id_pattern
                     .as_deref()
@@ -9018,19 +10062,34 @@ async fn execute_recursive_cluster(
                     if saves_node {
                         *done += 1;
                         send_progress(progress_tx, *done, *total).await;
-                        try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
-                            depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(), label: None,
-                        });
+                        try_send_layer_event(
+                            layer_tx,
+                            LayerEvent::NodeCompleted {
+                                depth: target_depth,
+                                step_name: step.name.clone(),
+                                node_id: node_id.clone(),
+                                label: None,
+                            },
+                        );
                     }
-                    try_send_layer_event(layer_tx, LayerEvent::LayerCompleted {
-                        depth: target_depth, step_name: step.name.clone(),
-                    });
+                    try_send_layer_event(
+                        layer_tx,
+                        LayerEvent::LayerCompleted {
+                            depth: target_depth,
+                            step_name: step.name.clone(),
+                        },
+                    );
                 }
                 Err(e) => {
-                    if matches!(error_strategy, ErrorStrategy::Abort | ErrorStrategy::Retry(_)) {
+                    if matches!(
+                        error_strategy,
+                        ErrorStrategy::Abort | ErrorStrategy::Retry(_)
+                    ) {
                         return Err(anyhow!(
                             "[{}] apex_ready synthesis FAILED at depth {}: {}",
-                            step.name, target_depth, e
+                            step.name,
+                            target_depth,
+                            e
                         ));
                     }
                     warn!("[CHAIN] [{}] apex_ready synthesis FAILED: {e}", step.name);
@@ -9137,13 +10196,23 @@ async fn execute_recursive_cluster(
                                 .and_then(|v| v.as_array())
                                 .cloned()
                                 .unwrap_or_default();
-                            if !retried_clusters.is_empty() && retried_clusters.len() < current_nodes.len() {
-                                info!("[CHAIN] [{}] convergence retry succeeded: {} clusters", step.name, retried_clusters.len());
+                            if !retried_clusters.is_empty()
+                                && retried_clusters.len() < current_nodes.len()
+                            {
+                                info!(
+                                    "[CHAIN] [{}] convergence retry succeeded: {} clusters",
+                                    step.name,
+                                    retried_clusters.len()
+                                );
                                 clusters = retried_clusters;
                             } else {
                                 warn!("[CHAIN] [{}] convergence retry still non-convergent ({} clusters), falling back to force_merge", step.name, retried_clusters.len());
                                 // Fall through to force_merge below
-                                force_merge_clusters(&mut clusters, current_nodes.len(), &step.name);
+                                force_merge_clusters(
+                                    &mut clusters,
+                                    current_nodes.len(),
+                                    &step.name,
+                                );
                             }
                         }
                         Err(e) => {
@@ -9207,9 +10276,14 @@ async fn execute_recursive_cluster(
         }
 
         // Emit Discovered now that we know cluster count
-        try_send_layer_event(layer_tx, LayerEvent::Discovered {
-            depth: target_depth, step_name: step.name.clone(), estimated_nodes: clusters.len() as i64,
-        });
+        try_send_layer_event(
+            layer_tx,
+            LayerEvent::Discovered {
+                depth: target_depth,
+                step_name: step.name.clone(),
+                estimated_nodes: clusters.len() as i64,
+            },
+        );
 
         // Step B: SYNTHESIZE — for each cluster, synthesize assigned nodes into one parent
         for (cluster_idx, cluster) in clusters.iter().enumerate() {
@@ -9271,9 +10345,15 @@ async fn execute_recursive_cluster(
                     if saves_node {
                         *done += 1;
                         send_progress(progress_tx, *done, *total).await;
-                        try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
-                            depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(), label: None,
-                        });
+                        try_send_layer_event(
+                            layer_tx,
+                            LayerEvent::NodeCompleted {
+                                depth: target_depth,
+                                step_name: step.name.clone(),
+                                node_id: node_id.clone(),
+                                label: None,
+                            },
+                        );
                     }
                     continue;
                 }
@@ -9336,9 +10416,15 @@ async fn execute_recursive_cluster(
                 Ok(_) => {
                     *done += 1;
                     send_progress(progress_tx, *done, *total).await;
-                    try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
-                        depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(), label: None,
-                    });
+                    try_send_layer_event(
+                        layer_tx,
+                        LayerEvent::NodeCompleted {
+                            depth: target_depth,
+                            step_name: step.name.clone(),
+                            node_id: node_id.clone(),
+                            label: None,
+                        },
+                    );
                 }
                 Err(e) => {
                     if matches!(
@@ -9358,9 +10444,14 @@ async fn execute_recursive_cluster(
                         step.name, cluster_name
                     );
                     failures += 1;
-                    try_send_layer_event(layer_tx, LayerEvent::NodeFailed {
-                        depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(),
-                    });
+                    try_send_layer_event(
+                        layer_tx,
+                        LayerEvent::NodeFailed {
+                            depth: target_depth,
+                            step_name: step.name.clone(),
+                            node_id: node_id.clone(),
+                        },
+                    );
                 }
             }
         }
@@ -9369,14 +10460,20 @@ async fn execute_recursive_cluster(
         flush_writes(writer_tx).await;
 
         // Emit LayerCompleted and re-estimate total
-        try_send_layer_event(layer_tx, LayerEvent::LayerCompleted {
-            depth: target_depth, step_name: step.name.clone(),
-        });
+        try_send_layer_event(
+            layer_tx,
+            LayerEvent::LayerCompleted {
+                depth: target_depth,
+                step_name: step.name.clone(),
+            },
+        );
         let slug_owned = ctx.slug.clone();
         let td = target_depth;
         let actual_at_this_depth = db_read(reader, move |conn| {
             db::count_nodes_at_depth(conn, &slug_owned, td)
-        }).await.unwrap_or(0);
+        })
+        .await
+        .unwrap_or(0);
         if actual_at_this_depth > 0 {
             *total = *done + estimate_recursive_cluster_nodes(actual_at_this_depth);
             send_progress(progress_tx, *done, *total).await;
@@ -9468,6 +10565,8 @@ async fn dispatch_group(
     let decorated_output = decorate_step_output(analysis.clone(), node_id, -1);
 
     // Save step
+    // Walker v3 W3b: resolve the provenance model for the save-step write.
+    let save_model = compute_save_step_provenance_model(step, defaults, dispatch_ctx).await;
     let output_json = serde_json::to_string(&decorated_output)?;
     send_save_step(
         writer_tx,
@@ -9477,7 +10576,7 @@ async fn dispatch_group(
         target_depth,
         node_id,
         &output_json,
-        &dispatch_ctx.config.primary_model,
+        &save_model,
         elapsed,
     )
     .await;
@@ -9486,14 +10585,17 @@ async fn dispatch_group(
     if saves_node {
         let mut node = build_node_from_output(&analysis, node_id, &ctx.slug, target_depth, None)?;
         node.children = nodes.iter().map(|n| n.id.clone()).collect();
-        emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
-            slug: ctx.slug.clone(),
-            build_id: dispatch_build_id(dispatch_ctx),
-            step_name: step.name.clone(),
-            node_id: node.id.clone(),
-            headline: node.headline.clone(),
-            depth: node.depth,
-        });
+        emit_chain_event(
+            dispatch_ctx,
+            crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                slug: ctx.slug.clone(),
+                build_id: dispatch_build_id(dispatch_ctx),
+                step_name: step.name.clone(),
+                node_id: node.id.clone(),
+                headline: node.headline.clone(),
+                depth: node.depth,
+            },
+        );
         let topics_json =
             serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([])))?;
         send_save_node(writer_tx, node, Some(topics_json)).await;
@@ -9553,8 +10655,13 @@ async fn web_nodes_batched(
         let system_prompt = build_system_prompt(step, &full_envelope, ctx)?;
         let fallback_key = format!("{}-d{depth}", step.name);
         let analysis = dispatch_with_retry(
-            step, &full_envelope, &system_prompt, defaults,
-            dispatch_ctx, error_strategy, &fallback_key,
+            step,
+            &full_envelope,
+            &system_prompt,
+            defaults,
+            dispatch_ctx,
+            error_strategy,
+            &fallback_key,
         )
         .await?;
         return Ok(parse_web_edges(&step.name, &analysis, nodes));
@@ -9563,16 +10670,15 @@ async fn web_nodes_batched(
     // ── Batch packing ───────────────────────────────────────────────────
     info!(
         "[CHAIN] [{}] webbing: {} nodes ({} tokens > {}), splitting into batches",
-        step.name, nodes.len(), est_tokens, max_tokens
+        step.name,
+        nodes.len(),
+        est_tokens,
+        max_tokens
     );
 
     let dehydrate_steps = step.dehydrate.as_deref();
-    let batches = batch_items_by_tokens(
-        node_payloads,
-        max_tokens,
-        step.batch_size,
-        dehydrate_steps,
-    );
+    let batches =
+        batch_items_by_tokens(node_payloads, max_tokens, step.batch_size, dehydrate_steps);
 
     // Pre-compute batch offsets into the original `nodes` slice.
     // Each batch is a Value::Array of node payloads — its len maps 1:1 to
@@ -9588,12 +10694,17 @@ async fn web_nodes_batched(
     let batch_count = batches.len();
     info!(
         "[CHAIN] [{}] packed into {} batches (concurrency={})",
-        step.name, batch_count, step.concurrency.max(1)
+        step.name,
+        batch_count,
+        step.concurrency.max(1)
     );
 
     if batch_count <= 1 {
         // Single batch after packing — dispatch without concurrency overhead
-        let batch_items = batches.into_iter().next().unwrap_or(Value::Array(Vec::new()));
+        let batch_items = batches
+            .into_iter()
+            .next()
+            .unwrap_or(Value::Array(Vec::new()));
         let items = match batch_items {
             Value::Array(v) => v,
             other => vec![other],
@@ -9602,8 +10713,13 @@ async fn web_nodes_batched(
         let system_prompt = build_system_prompt(step, &envelope, ctx)?;
         let fallback_key = format!("{}-d{depth}-b0", step.name);
         let analysis = dispatch_with_retry(
-            step, &envelope, &system_prompt, defaults,
-            dispatch_ctx, error_strategy, &fallback_key,
+            step,
+            &envelope,
+            &system_prompt,
+            defaults,
+            dispatch_ctx,
+            error_strategy,
+            &fallback_key,
         )
         .await?;
         return Ok(parse_web_edges(&step.name, &analysis, nodes));
@@ -9629,7 +10745,10 @@ async fn web_nodes_batched(
         let (_boff, blen) = batch_offsets[batch_idx];
         info!(
             "  [CHAIN] [{}] batch {}: {} nodes (~{} tokens)",
-            step.name, batch_idx, blen, estimate_tokens_for_item(&envelope)
+            step.name,
+            batch_idx,
+            blen,
+            estimate_tokens_for_item(&envelope)
         );
 
         let sem = semaphore.clone();
@@ -9642,8 +10761,13 @@ async fn web_nodes_batched(
         tokio::spawn(async move {
             let _permit = sem.acquire().await;
             let result = dispatch_with_retry(
-                &step_c, &envelope, &system_prompt, &defaults_c,
-                &dispatch_ctx_c, &error_strategy_c, &fallback_key,
+                &step_c,
+                &envelope,
+                &system_prompt,
+                &defaults_c,
+                &dispatch_ctx_c,
+                &error_strategy_c,
+                &fallback_key,
             )
             .await;
             let _ = tx.send((batch_idx, result)).await;
@@ -9666,7 +10790,10 @@ async fn web_nodes_batched(
             Err(e) => {
                 batch_failures += 1;
                 warn!("  [CHAIN] [{}] batch {} failed: {e}", step.name, batch_idx);
-                if matches!(error_strategy, ErrorStrategy::Abort | ErrorStrategy::Retry(_)) {
+                if matches!(
+                    error_strategy,
+                    ErrorStrategy::Abort | ErrorStrategy::Retry(_)
+                ) {
                     return Err(e);
                 }
             }
@@ -9675,7 +10802,9 @@ async fn web_nodes_batched(
 
     info!(
         "[CHAIN] [{}] intra-batch dispatch complete: {} edges, {} failures",
-        step.name, intra_edges.len(), batch_failures
+        step.name,
+        intra_edges.len(),
+        batch_failures
     );
 
     // ── Cross-batch merge pass ──────────────────────────────────────────
@@ -9692,8 +10821,15 @@ async fn web_nodes_batched(
 
         // Recursive call via Box::pin to avoid async recursion issues
         let cross_edges = Box::pin(web_nodes_batched(
-            nodes, depth, resolved_input, &merge_step, ctx, defaults,
-            dispatch_ctx, error_strategy, max_tokens,
+            nodes,
+            depth,
+            resolved_input,
+            &merge_step,
+            ctx,
+            defaults,
+            dispatch_ctx,
+            error_strategy,
+            max_tokens,
         ))
         .await;
 
@@ -9723,21 +10859,24 @@ async fn web_nodes_batched(
 
                 info!(
                     "[CHAIN] [{}] merge pass found {} new cross-batch edges",
-                    step.name, merge_edges.len()
+                    step.name,
+                    merge_edges.len()
                 );
                 intra_edges.append(&mut merge_edges);
             }
             Err(e) => {
                 warn!(
                     "[CHAIN] [{}] merge pass failed ({e}), keeping {} intra-batch edges only",
-                    step.name, intra_edges.len()
+                    step.name,
+                    intra_edges.len()
                 );
             }
         }
     } else {
         info!(
             "[CHAIN] [{}] already compact, skipping merge pass ({} intra-batch edges)",
-            step.name, intra_edges.len()
+            step.name,
+            intra_edges.len()
         );
     }
 
@@ -9817,8 +10956,15 @@ async fn execute_web_step(
     let normalized_edges = if nodes.len() >= 2 {
         let max_tokens = step.max_input_tokens.unwrap_or(80_000);
         web_nodes_batched(
-            &nodes, depth, &resolved_input, step, ctx, defaults,
-            dispatch_ctx, error_strategy, max_tokens,
+            &nodes,
+            depth,
+            &resolved_input,
+            step,
+            ctx,
+            defaults,
+            dispatch_ctx,
+            error_strategy,
+            max_tokens,
         )
         .await?
     } else {
@@ -9843,11 +10989,15 @@ async fn execute_web_step(
         "saved_edge_count": 0,
     });
 
+    // Walker v3 W3b: resolve the provenance model ONCE for both webbing
+    // save-step writes (pre-persist preview + final with edge counts).
+    let web_save_model = compute_save_step_provenance_model(step, defaults, dispatch_ctx).await;
+
     let output_json = serde_json::to_string(&output)?;
     let save_slug = ctx.slug.clone();
     let save_step_name = step.name.clone();
     let save_synthetic_id = synthetic_id.clone();
-    let save_model = dispatch_ctx.config.primary_model.clone();
+    let save_model = web_save_model.clone();
     let writer = writer.clone();
     let persist_writer = writer.clone();
     let final_writer = persist_writer.clone();
@@ -9885,8 +11035,12 @@ async fn execute_web_step(
                 source_id: edge.source_node_id.clone(),
                 target_id: edge.target_node_id.clone(),
                 depth: depth as i64,
-                source_headline: headline_map.get(edge.source_node_id.as_str()).map(|s| s.to_string()),
-                target_headline: headline_map.get(edge.target_node_id.as_str()).map(|s| s.to_string()),
+                source_headline: headline_map
+                    .get(edge.source_node_id.as_str())
+                    .map(|s| s.to_string()),
+                target_headline: headline_map
+                    .get(edge.target_node_id.as_str())
+                    .map(|s| s.to_string()),
             },
         );
     }
@@ -9901,7 +11055,7 @@ async fn execute_web_step(
     let save_slug = ctx.slug.clone();
     let save_step_name = step.name.clone();
     let save_synthetic_id = synthetic_id.clone();
-    let save_model = dispatch_ctx.config.primary_model.clone();
+    let save_model = web_save_model.clone();
     let writer = final_writer;
     tokio::task::spawn_blocking(move || -> Result<()> {
         let conn = writer.blocking_lock();
@@ -10032,6 +11186,8 @@ async fn execute_single(
     let decorated_output = decorate_step_output(analysis.clone(), &node_id, -1);
 
     // Save step
+    // Walker v3 W3b: resolve the provenance model for the save-step write.
+    let save_model = compute_save_step_provenance_model(step, defaults, dispatch_ctx).await;
     let output_json = serde_json::to_string(&decorated_output)?;
     send_save_step(
         writer_tx,
@@ -10041,7 +11197,7 @@ async fn execute_single(
         depth,
         &node_id,
         &output_json,
-        &dispatch_ctx.config.primary_model,
+        &save_model,
         elapsed,
     )
     .await;
@@ -10049,14 +11205,17 @@ async fn execute_single(
     // Save node if configured
     if saves_node {
         let node = build_node_from_output(&analysis, &node_id, &ctx.slug, depth, None)?;
-        emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
-            slug: ctx.slug.clone(),
-            build_id: dispatch_build_id(dispatch_ctx),
-            step_name: step.name.clone(),
-            node_id: node.id.clone(),
-            headline: node.headline.clone(),
-            depth: node.depth,
-        });
+        emit_chain_event(
+            dispatch_ctx,
+            crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                slug: ctx.slug.clone(),
+                build_id: dispatch_build_id(dispatch_ctx),
+                step_name: step.name.clone(),
+                node_id: node.id.clone(),
+                headline: node.headline.clone(),
+                depth: node.depth,
+            },
+        );
         let topics_json =
             serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([])))?;
         send_save_node(writer_tx, node, Some(topics_json)).await;
@@ -11251,8 +12410,15 @@ pub async fn execute_plan(
     // (via make_step_ctx_from_llm_config or inline) finds populated plumbing.
     let ir_build_id = format!(
         "ir-{}",
-        uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0")
+        uuid::Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("0")
     );
+    // Phase 5 §G: RAII guard ensures breaker cells keyed on
+    // ir_build_id are reclaimed whenever this scope unwinds.
+    let _breaker_guard = super::walker_breaker::BuildBreakerGuard::new(ir_build_id.clone());
     let llm_config = state.llm_config_with_cache(slug, &ir_build_id).await;
 
     // ── 1. Load chunks ──────────────────────────────────────────────────
@@ -11269,7 +12435,10 @@ pub async fn execute_plan(
         if ct != "question" {
             return Err(anyhow!("No chunks found for slug '{slug}'"));
         }
-        warn!(slug, "No chunks found — steps requiring $chunks will be skipped or fail");
+        warn!(
+            slug,
+            "No chunks found — steps requiring $chunks will be skipped or fail"
+        );
     }
 
     // Lazy chunk provider — loads content on-demand, not upfront.
@@ -11330,7 +12499,10 @@ pub async fn execute_plan(
         if let Some(ref registry) = llm_config.provider_registry {
             let active = registry.active_provider_id();
             if active != "openrouter" {
-                info!("[IR] local provider '{}' detected, defaulting concurrency cap to 1", active);
+                info!(
+                    "[IR] local provider '{}' detected, defaulting concurrency cap to 1",
+                    active
+                );
                 return Some(1);
             }
         }
@@ -11349,7 +12521,10 @@ pub async fn execute_plan(
             Some(state.build_event_bus.clone()),
         );
         if let Some(ref cn) = plan.source_chain_id {
-            let ct = plan.source_content_type.clone().unwrap_or_else(|| "code".to_string());
+            let ct = plan
+                .source_content_type
+                .clone()
+                .unwrap_or_else(|| "code".to_string());
             base = base.with_chain_context(cn.clone(), ct);
         }
         Arc::new(base)
@@ -11675,7 +12850,7 @@ async fn execute_ir_single(
     // grace period.
     if let Some(ref response) = llm_response {
         let model =
-            chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config);
+            chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config, None);
         let _ = exec_state
             .log_cost_synchronous(
                 step_name,
@@ -11695,7 +12870,8 @@ async fn execute_ir_single(
 
     // Save step record
     let output_json = serde_json::to_string(&output).unwrap_or_default();
-    let model = chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config);
+    let model =
+        chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config, None);
     exec_state
         .send_save_step(
             step_name,
@@ -11729,14 +12905,17 @@ async fn execute_ir_single(
         )
         .await?;
 
-        emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
-            slug: exec_state.slug.clone(),
-            build_id: dispatch_build_id(dispatch_ctx),
-            step_name: step_name.to_string(),
-            node_id: node.id.clone(),
-            headline: node.headline.clone(),
-            depth: node.depth,
-        });
+        emit_chain_event(
+            dispatch_ctx,
+            crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                slug: exec_state.slug.clone(),
+                build_id: dispatch_build_id(dispatch_ctx),
+                step_name: step_name.to_string(),
+                node_id: node.id.clone(),
+                headline: node.headline.clone(),
+                depth: node.depth,
+            },
+        );
 
         // Wire children
         let children = node.children.clone();
@@ -11885,7 +13064,7 @@ async fn execute_ir_parallel_foreach(
         let reader = exec_state.reader.clone();
         let step_name_owned = step_name.to_string();
         let model =
-            chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config);
+            chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config, None);
         let item_clone = item.clone();
         let mut ctx_snapshot = build_chain_context_from_execution_state(exec_state);
         ctx_snapshot.current_item = Some(item_clone.clone());
@@ -11932,9 +13111,13 @@ async fn execute_ir_parallel_foreach(
                             model: model.clone(),
                             elapsed,
                         })
-                        .await {
-                            warn!("[IR] writer channel closed, step save dropped for {}: {e}", node_id_clone);
-                        }
+                        .await
+                    {
+                        warn!(
+                            "[IR] writer channel closed, step save dropped for {}: {e}",
+                            node_id_clone
+                        );
+                    }
 
                     // Save node if needed
                     if saves_node {
@@ -11961,23 +13144,30 @@ async fn execute_ir_parallel_foreach(
                                     step_name_owned, node_id_clone,
                                 );
                             }
-                            emit_chain_event(&ctx_clone, crate::pyramid::event_bus::TaggedKind::NodeProduced {
-                                slug: slug.clone(),
-                                build_id: dispatch_build_id(&ctx_clone),
-                                step_name: step_name_owned.clone(),
-                                node_id: node.id.clone(),
-                                headline: node.headline.clone(),
-                                depth: node.depth,
-                            });
+                            emit_chain_event(
+                                &ctx_clone,
+                                crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                                    slug: slug.clone(),
+                                    build_id: dispatch_build_id(&ctx_clone),
+                                    step_name: step_name_owned.clone(),
+                                    node_id: node.id.clone(),
+                                    headline: node.headline.clone(),
+                                    depth: node.depth,
+                                },
+                            );
                             let children = node.children.clone();
                             if let Err(e) = writer_tx
                                 .send(IrWriteOp::SaveNode {
                                     node,
                                     topics_json: None,
                                 })
-                                .await {
-                                    warn!("[IR] writer channel closed, node save dropped for {}: {e}", node_id_clone);
-                                }
+                                .await
+                            {
+                                warn!(
+                                    "[IR] writer channel closed, node save dropped for {}: {e}",
+                                    node_id_clone
+                                );
+                            }
                             for child_id in &children {
                                 if let Err(e) = writer_tx
                                     .send(IrWriteOp::UpdateParent {
@@ -11985,9 +13175,10 @@ async fn execute_ir_parallel_foreach(
                                         node_id: child_id.clone(),
                                         parent_id: node_id_clone.clone(),
                                     })
-                                    .await {
-                                        warn!("[IR] writer channel closed, parent update dropped for {}: {e}", child_id);
-                                    }
+                                    .await
+                                {
+                                    warn!("[IR] writer channel closed, parent update dropped for {}: {e}", child_id);
+                                }
                             }
                         }
                     }
@@ -12178,6 +13369,7 @@ async fn execute_ir_sequential_foreach(
                     let model = chain_dispatch::resolve_ir_model(
                         &step.model_requirements,
                         &dispatch_ctx.config,
+                        None,
                     );
                     let _ = exec_state
                         .log_cost_synchronous(
@@ -12201,6 +13393,7 @@ async fn execute_ir_sequential_foreach(
                 let model = chain_dispatch::resolve_ir_model(
                     &step.model_requirements,
                     &dispatch_ctx.config,
+                    None,
                 );
                 exec_state
                     .send_save_step(
@@ -12234,14 +13427,17 @@ async fn execute_ir_sequential_foreach(
                         &exec_state.reader,
                     )
                     .await?;
-                    emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
-                        slug: exec_state.slug.clone(),
-                        build_id: dispatch_build_id(dispatch_ctx),
-                        step_name: step_name.to_string(),
-                        node_id: node.id.clone(),
-                        headline: node.headline.clone(),
-                        depth: node.depth,
-                    });
+                    emit_chain_event(
+                        dispatch_ctx,
+                        crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                            slug: exec_state.slug.clone(),
+                            build_id: dispatch_build_id(dispatch_ctx),
+                            step_name: step_name.to_string(),
+                            node_id: node.id.clone(),
+                            headline: node.headline.clone(),
+                            depth: node.depth,
+                        },
+                    );
                     let children = node.children.clone();
                     exec_state.send_save_node(node, None).await;
                     for child_id in &children {
@@ -12600,8 +13796,11 @@ async fn execute_ir_web_edges(
 
         // Log cost — Phase 11 synchronous path.
         if let Some(ref response) = llm_resp {
-            let model =
-                chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config);
+            let model = chain_dispatch::resolve_ir_model(
+                &step.model_requirements,
+                &dispatch_ctx.config,
+                None,
+            );
             let _ = exec_state
                 .log_cost_synchronous(
                     step_name,
@@ -12646,7 +13845,8 @@ async fn execute_ir_web_edges(
 
     // 7. Save step record (directly, not through write drain)
     let output_json = serde_json::to_string(&output)?;
-    let model = chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config);
+    let model =
+        chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config, None);
     {
         let slug = exec_state.slug.clone();
         let step_name_owned = step_name.to_string();
@@ -12734,8 +13934,12 @@ async fn execute_ir_web_edges(
                 source_id: edge.source_node_id.clone(),
                 target_id: edge.target_node_id.clone(),
                 depth: depth as i64,
-                source_headline: ir_headline_map.get(edge.source_node_id.as_str()).map(|s| s.to_string()),
-                target_headline: ir_headline_map.get(edge.target_node_id.as_str()).map(|s| s.to_string()),
+                source_headline: ir_headline_map
+                    .get(edge.source_node_id.as_str())
+                    .map(|s| s.to_string()),
+                target_headline: ir_headline_map
+                    .get(edge.target_node_id.as_str())
+                    .map(|s| s.to_string()),
             },
         );
     }
@@ -13285,12 +14489,28 @@ async fn execute_chain_for_target_inner(
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
 
-    // Build a minimal dispatch context. We do NOT mint a build_id or wire
-    // CacheDispatchBase — starter chains are short (2-5 steps) + run
-    // synchronously in one supervisor tick; the LLM step cache is not
-    // load-bearing here. Audit context is also None; the supervisor's
-    // role_bound arm records completion via work_item state transitions.
+    // Build a minimal dispatch context. We mint a synthetic build_id +
+    // CacheDispatchBase so walker-v3 Wave 5's dispatch-spine guard can
+    // construct a StepContext + attach a DispatchDecision at LLM step
+    // entry. Without this, `dispatch_llm` skips StepContext construction
+    // (cache_base is None → no ctx) and `call_model_unified` raises
+    // "walker dispatch spine missing". Starter chains are still short and
+    // synchronous; the cache isn't load-bearing but the ctx plumbing is.
+    // Audit context stays None; the supervisor's role_bound arm records
+    // completion via work_item state transitions.
     let llm_config = state.config.read().await.clone();
+    let starter_build_id = format!(
+        "starter-chain:{}:{}",
+        chain.id,
+        target_id.unwrap_or("<no-target>")
+    );
+    // Tests + in-memory DBs don't have a filesystem path; resolve to
+    // ":memory:" as a stable sentinel that cache lookups will miss harmlessly.
+    let starter_db_path = state
+        .data_dir
+        .as_ref()
+        .map(|p| p.join("pyramid.db").to_string_lossy().into_owned())
+        .unwrap_or_else(|| ":memory:".to_string());
     let dispatch_ctx = chain_dispatch::ChainDispatchContext {
         db_reader: state.reader.clone(),
         db_writer: state.writer.clone(),
@@ -13299,7 +14519,11 @@ async fn execute_chain_for_target_inner(
         tier1: state.operational.tier1.clone(),
         ops: (*state.operational).clone(),
         audit: None,
-        cache_base: None,
+        cache_base: Some(Arc::new(chain_dispatch::CacheDispatchBase::new(
+            starter_db_path,
+            starter_build_id,
+            None,
+        ))),
         concurrency_cap: None,
         // Post-build accretion v5 Phase 6b: wire the state through so
         // `call_starter_chain` (a mechanical primitive dispatched via
@@ -13931,7 +15155,10 @@ mod tests {
             "content": "abcdefghi"
         });
         let serialized = serde_json::to_string(&item).unwrap();
-        assert_eq!(estimate_tokens_for_item(&item), serialized.len().div_ceil(4));
+        assert_eq!(
+            estimate_tokens_for_item(&item),
+            serialized.len().div_ceil(4)
+        );
     }
 
     #[test]
@@ -14699,10 +15926,7 @@ mod tests {
     #[test]
     fn test_resolve_foreach_collection_chunks() {
         let mut state = make_ir_test_state();
-        state.chunks = ChunkProvider::test(vec![
-            json!({"content": "a"}),
-            json!({"content": "b"}),
-        ]);
+        state.chunks = ChunkProvider::test(vec![json!({"content": "a"}), json!({"content": "b"})]);
 
         let mut step = ir_test_step("extract");
         step.iteration = Some(IterationDirective {
@@ -16627,10 +17851,8 @@ mod tests {
         // consumed and sets ctx.invoke_depth. This is the mechanism
         // execute_invoke_chain uses to propagate depth to child chains.
         let mut ctx = ChainContext::new("test-slug", "conversation", ChunkProvider::empty());
-        ctx.initial_params.insert(
-            "__invoke_depth".to_string(),
-            serde_json::json!(3),
-        );
+        ctx.initial_params
+            .insert("__invoke_depth".to_string(), serde_json::json!(3));
 
         // Simulate what execute_chain_from does: read and consume the key
         if let Some(depth_val) = ctx.initial_params.remove("__invoke_depth") {
@@ -16640,8 +17862,10 @@ mod tests {
         }
 
         assert_eq!(ctx.invoke_depth, 3);
-        assert!(!ctx.initial_params.contains_key("__invoke_depth"),
-            "__invoke_depth should be consumed (removed) from initial_params");
+        assert!(
+            !ctx.initial_params.contains_key("__invoke_depth"),
+            "__invoke_depth should be consumed (removed) from initial_params"
+        );
     }
 
     #[test]
@@ -16691,5 +17915,58 @@ mod tests {
         assert_eq!(output["steps"].as_array().unwrap().len(), 2);
         assert_eq!(output["steps"][0]["name"], "step1");
         assert_eq!(output["steps"][0]["status"], "ran");
+    }
+
+    // ── SQLite writer-lock retry classifier ─────────────────────────────
+    //
+    // `is_sqlite_busy` drives the retry branch inside the answered-node /
+    // failed-question gap save block. A false negative (real BUSY not
+    // classified as busy) would abort the build; a false positive
+    // (non-BUSY error wrongly classified) would silently retry a hard
+    // error up to 4 times. Both matter, so we pin the classification on
+    // typed, stringified-typed, and unrelated errors.
+
+    #[test]
+    fn is_sqlite_busy_typed_database_busy() {
+        let ffi = rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY);
+        let rusqlite_err = rusqlite::Error::SqliteFailure(ffi, None);
+        let err: anyhow::Error = rusqlite_err.into();
+        assert!(
+            is_sqlite_busy(&err),
+            "typed SQLITE_BUSY must classify as busy"
+        );
+    }
+
+    #[test]
+    fn is_sqlite_busy_typed_database_locked() {
+        let ffi = rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED);
+        let rusqlite_err = rusqlite::Error::SqliteFailure(ffi, None);
+        let err: anyhow::Error = rusqlite_err.into();
+        assert!(
+            is_sqlite_busy(&err),
+            "typed SQLITE_LOCKED must classify as busy"
+        );
+    }
+
+    #[test]
+    fn is_sqlite_busy_wrapped_anyhow_text_fallback() {
+        // Simulate the real-world case where a rusqlite::Error has been
+        // stringified into an `anyhow!("failed to save answered node {}: {}",
+        // id, e)` wrapper. The cause chain no longer holds a typed
+        // rusqlite::Error, so we must fall back to textual matching.
+        let wrapped = anyhow!("failed to save answered node L1-000: database is locked");
+        assert!(
+            is_sqlite_busy(&wrapped),
+            "stringified 'database is locked' must classify as busy"
+        );
+    }
+
+    #[test]
+    fn is_sqlite_busy_unrelated_error_is_not_busy() {
+        let other = anyhow!("constraint violation: UNIQUE failed");
+        assert!(
+            !is_sqlite_busy(&other),
+            "unrelated errors must not classify as busy"
+        );
     }
 }

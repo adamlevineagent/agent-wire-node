@@ -14,10 +14,15 @@ use rusqlite::Connection;
 use tracing::{error, info, warn};
 
 use super::config_helper::estimate_cost;
-use super::llm::{call_model_unified_and_ctx, extract_json, LlmConfig};
-use super::step_context::{compute_prompt_hash, StepContext};
+use super::llm::{
+    call_model_unified_with_options_and_ctx, extract_json, LlmCallOptions, LlmConfig,
+};
 use super::naming::{clean_headline, headline_for_node};
 use super::stale_engine::batch_items;
+use super::step_context::make_step_ctx_from_llm_config;
+// StepContext + compute_prompt_hash kept for test fixtures (line ~4566).
+#[allow(unused_imports)]
+use super::step_context::{compute_prompt_hash, StepContext};
 use super::types::{
     ChangeManifest, ChildSwap, ConnectionCheckResult, ConnectionResult, ManifestValidationError,
     NodeStaleResult, PendingMutation, StaleCheckResult, Topic,
@@ -384,7 +389,9 @@ pub(crate) fn resolve_evidence_targets_for_node_ids(
                 continue;
             }
 
-            if let Some(target) = resolve_stale_target_for_node(conn, &link.slug, &link.target_node_id)? {
+            if let Some(target) =
+                resolve_stale_target_for_node(conn, &link.slug, &link.target_node_id)?
+            {
                 targets.insert(target);
             } else {
                 warn!(
@@ -592,28 +599,40 @@ pub async fn dispatch_node_stale_check(
         [{\"node_id\": \"...\", \"stale\": true, \"reason\": \"one sentence\"}]",
     );
 
-    // Call LLM via the live config (preserves Phase 3 provider_registry +
-    // credential_store) with the model overridden to the per-call slug.
-    let config = base_config.clone_with_model_override(model);
-    let ctx = StepContext::new(
-        batch[0].slug.clone(),
-        format!("stale-node-batch-{}", batch[0].slug),
-        "node_stale_check",
-        "stale_check",
-        batch[0].layer as i64,
-        None,
-        db_path.to_string(),
-    )
-    .with_model_resolution("stale_local", model.to_string())
-    .with_prompt_hash(compute_prompt_hash(system_prompt));
-    let llm_resp = call_model_unified_and_ctx(
-        &config,
-        Some(&ctx),
+    // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+    let stale_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+    let ctx = match &stale_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "node_stale_check",
+                "stale_check",
+                batch[0].layer as i64,
+                None,
+                system_prompt,
+                "stale_l0",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
+    let llm_resp = call_model_unified_with_options_and_ctx(
+        base_config,
+        ctx.as_ref(),
         system_prompt,
         &user_prompt,
         0.1,
         2048,
         None,
+        LlmCallOptions {
+            model_override: Some(model.to_string()),
+            ..Default::default()
+        },
     )
     .await?;
     let response = llm_resp.content;
@@ -923,28 +942,40 @@ pub async fn dispatch_connection_check(
             [{\"connection_id\": \"...\", \"still_valid\": true, \"reason\": \"one sentence\"}]",
         );
 
-        // Call LLM via the live config (preserves Phase 3 provider_registry +
-        // credential_store) with the model overridden to the per-call slug.
-        let config = base_config.clone_with_model_override(model);
-        let ctx = StepContext::new(
-            slug.to_string(),
-            format!("stale-connection-check-{}", slug),
-            "connection_stale_check",
-            "stale_check",
-            old_depth as i64,
-            None,
-            db_path.to_string(),
-        )
-        .with_model_resolution("stale_local", model.to_string())
-        .with_prompt_hash(compute_prompt_hash(system_prompt));
-        let llm_resp = call_model_unified_and_ctx(
-            &config,
-            Some(&ctx),
+        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+        let stale_resolved = base_config
+            .provider_registry
+            .as_ref()
+            .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+        let ctx = match &stale_resolved {
+            Some(resolved) => {
+                make_step_ctx_from_llm_config(
+                    base_config,
+                    "connection_stale_check",
+                    "stale_check",
+                    old_depth as i64,
+                    None,
+                    system_prompt,
+                    "stale_l0",
+                    Some(model),
+                    Some(&resolved.provider.id),
+                )
+                .await
+            }
+            None => None,
+        };
+        let llm_resp = call_model_unified_with_options_and_ctx(
+            base_config,
+            ctx.as_ref(),
             system_prompt,
             &user_prompt,
             0.1,
             2048,
             None,
+            LlmCallOptions {
+                model_override: Some(model.to_string()),
+                ..Default::default()
+            },
         )
         .await?;
         let response = llm_resp.content;
@@ -1047,7 +1078,6 @@ pub async fn dispatch_connection_check(
                         ],
                     )?;
                 }
-
             }
 
             Ok(())
@@ -1269,28 +1299,40 @@ pub async fn dispatch_edge_stale_check(
             truncate_str(&edge_data.new_content, 500),
         );
 
-        // Call LLM via the live config (preserves Phase 3 provider_registry +
-        // credential_store) with the model overridden to the per-call slug.
-        let config = base_config.clone_with_model_override(model);
-        let ctx = StepContext::new(
-            mutation.slug.clone(),
-            format!("stale-edge-check-{}", mutation.slug),
-            "edge_stale_check",
-            "stale_check",
-            mutation.layer as i64,
-            None,
-            db_path.to_string(),
-        )
-        .with_model_resolution("stale_local", model.to_string())
-        .with_prompt_hash(compute_prompt_hash(system_prompt));
-        let llm_resp = call_model_unified_and_ctx(
-            &config,
-            Some(&ctx),
+        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+        let stale_resolved = base_config
+            .provider_registry
+            .as_ref()
+            .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+        let ctx = match &stale_resolved {
+            Some(resolved) => {
+                make_step_ctx_from_llm_config(
+                    base_config,
+                    "edge_stale_check",
+                    "stale_check",
+                    mutation.layer as i64,
+                    None,
+                    system_prompt,
+                    "stale_l0",
+                    Some(model),
+                    Some(&resolved.provider.id),
+                )
+                .await
+            }
+            None => None,
+        };
+        let llm_resp = call_model_unified_with_options_and_ctx(
+            base_config,
+            ctx.as_ref(),
             system_prompt,
             &user_prompt,
             0.1,
             1024,
             None,
+            LlmCallOptions {
+                model_override: Some(model.to_string()),
+                ..Default::default()
+            },
         )
         .await?;
         let response = llm_resp.content;
@@ -1342,25 +1384,40 @@ pub async fn dispatch_edge_stale_check(
                 truncate_str(&edge_data.new_content, 300),
             );
 
-            let re_eval_ctx = StepContext::new(
-                mutation.slug.clone(),
-                format!("stale-edge-reeval-{}", mutation.slug),
-                "edge_stale_reeval",
-                "stale_check",
-                mutation.layer as i64,
-                None,
-                db_path.to_string(),
-            )
-            .with_model_resolution("stale_local", model.to_string())
-            .with_prompt_hash(compute_prompt_hash(system_prompt));
-            let re_eval_llm_resp = call_model_unified_and_ctx(
-                &config,
-                Some(&re_eval_ctx),
+            // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+            let re_eval_resolved = base_config
+                .provider_registry
+                .as_ref()
+                .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+            let re_eval_ctx = match &re_eval_resolved {
+                Some(resolved) => {
+                    make_step_ctx_from_llm_config(
+                        base_config,
+                        "edge_stale_reeval",
+                        "stale_check",
+                        mutation.layer as i64,
+                        None,
+                        system_prompt,
+                        "stale_l0",
+                        Some(model),
+                        Some(&resolved.provider.id),
+                    )
+                    .await
+                }
+                None => None,
+            };
+            let re_eval_llm_resp = call_model_unified_with_options_and_ctx(
+                base_config,
+                re_eval_ctx.as_ref(),
                 system_prompt,
                 &re_eval_prompt,
                 0.3,
                 512,
                 None,
+                LlmCallOptions {
+                    model_override: Some(model.to_string()),
+                    ..Default::default()
+                },
             )
             .await?;
             let re_eval_response = re_eval_llm_resp.content;
@@ -1648,7 +1705,9 @@ pub async fn generate_change_manifest(
 
     user_prompt.push_str("\n---\n\nCHANGED CHILDREN:\n");
     if input.changed_children.is_empty() {
-        user_prompt.push_str("(no child deltas — likely a forced reroll; produce a minimal no-op manifest)\n");
+        user_prompt.push_str(
+            "(no child deltas — likely a forced reroll; produce a minimal no-op manifest)\n",
+        );
     } else {
         for (i, cc) in input.changed_children.iter().enumerate() {
             let formatted_id = match &cc.slug_prefix {
@@ -1656,14 +1715,8 @@ pub async fn generate_change_manifest(
                 None => cc.child_id.clone(),
             };
             user_prompt.push_str(&format!("\n{}. CHILD {}\n", i + 1, formatted_id));
-            user_prompt.push_str(&format!(
-                "   OLD: {}\n",
-                truncate_str(&cc.old_summary, 800)
-            ));
-            user_prompt.push_str(&format!(
-                "   NEW: {}\n",
-                truncate_str(&cc.new_summary, 800)
-            ));
+            user_prompt.push_str(&format!("   OLD: {}\n", truncate_str(&cc.old_summary, 800)));
+            user_prompt.push_str(&format!("   NEW: {}\n", truncate_str(&cc.new_summary, 800)));
         }
     }
 
@@ -1748,16 +1801,20 @@ pub async fn generate_change_manifest(
     // with the provided StepContext. The ctx carries the cache plumbing;
     // if it is None (or not cache-ready) this function behaves exactly
     // like the pre-Phase-6 path.
-    let config = base_config.clone_with_model_override(model);
+    // W3c: legacy clone_with_model_override removed; model threads via
+    // LlmCallOptions.model_override.
     let llm_response = super::llm::call_model_unified_with_options_and_ctx(
-        &config,
+        base_config,
         ctx,
         system_prompt,
         &user_prompt,
         0.2,
         4096,
         None,
-        super::llm::LlmCallOptions::default(),
+        super::llm::LlmCallOptions {
+            model_override: Some(model.to_string()),
+            ..Default::default()
+        },
     )
     .await?;
     let response = llm_response.content;
@@ -1838,7 +1895,11 @@ pub fn validate_change_manifest(
         row.ok_or(ManifestValidationError::TargetNotFound)?;
 
     // 2. children_swapped references exist in the evidence graph.
-    for ChildSwap { old: old_id, new: new_id } in &manifest.children_swapped {
+    for ChildSwap {
+        old: old_id,
+        new: new_id,
+    } in &manifest.children_swapped
+    {
         // KEEP evidence link old_child -> node_id must exist.
         let keep_exists: bool = conn
             .query_row(
@@ -2351,8 +2412,7 @@ pub async fn execute_supersession(
     // appear in recent deltas. For depth==0 nodes this is a synthesized
     // entry carrying the source file content (see
     // build_changed_children_from_deltas).
-    let changed_children =
-        build_changed_children_from_deltas(&node_ctx, &resolved_node_id);
+    let changed_children = build_changed_children_from_deltas(&node_ctx, &resolved_node_id);
 
     let expected_build_version = node_ctx.current_build_version + 1;
 
@@ -2360,17 +2420,13 @@ pub async fn execute_supersession(
     // reason should reflect that so the prompt context is accurate.
     let stale_check_reason = if node_ctx.depth == 0 {
         match node_ctx.source_file_path.as_deref() {
-            Some(path) => format!(
-                "Automated stale check: source file {path} changed on disk"
-            ),
+            Some(path) => format!("Automated stale check: source file {path} changed on disk"),
             None => format!(
                 "Automated stale check: L0 file-change mutation for node {resolved_node_id}"
             ),
         }
     } else {
-        format!(
-            "Automated stale check: delta(s) detected on children of node {resolved_node_id}"
-        )
+        format!("Automated stale check: delta(s) detected on children of node {resolved_node_id}")
     };
 
     let reason_tag = if node_ctx.depth == 0 {
@@ -2407,24 +2463,42 @@ pub async fn execute_supersession(
     // single node, not a chunk. `primitive: "manifest_generation"`
     // distinguishes it from extract/synthesis steps in the cache's
     // lookup indices.
+    // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+    // slot="stale_upper" (Rust rename of "stale_remote"; first-class walker
+    // tier → xiaomi/mimo-v2.5-pro 1M-context per bundled seed). Change-
+    // manifest generation can be large (upper-layer context), which is why
+    // mimo-v2.5-pro's 1M window is the right pick.
     let cache_build_id = format!(
         "stale-{}-{}",
-        resolved_node_id,
-        node_ctx.current_build_version
+        resolved_node_id, node_ctx.current_build_version
     );
-    let prompt_hash =
-        super::step_context::compute_prompt_hash(&load_change_manifest_prompt_body());
-    let cache_ctx = super::step_context::StepContext::new(
+    let scoped_config = base_config.clone_with_cache_access(
         slug.to_string(),
         cache_build_id,
-        "change_manifest",
-        "manifest_generation",
-        node_ctx.depth,
+        std::sync::Arc::<str>::from(db_path.to_string()),
         None,
-        db_path.to_string(),
-    )
-    .with_model_resolution("stale_remote", model)
-    .with_prompt_hash(prompt_hash);
+    );
+    let stale_resolved = scoped_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("stale_upper", None, None, None).ok());
+    let cache_ctx = match &stale_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                &scoped_config,
+                "change_manifest",
+                "manifest_generation",
+                node_ctx.depth,
+                None,
+                &load_change_manifest_prompt_body(),
+                "stale_upper",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
 
     // Ask the LLM for a targeted change manifest. On LLM failure the spec's
     // "Manifest Validation → Failure handling" section is unambiguous:
@@ -2442,7 +2516,7 @@ pub async fn execute_supersession(
         base_config,
         model,
         reason_tag,
-        Some(&cache_ctx),
+        cache_ctx.as_ref(),
     )
     .await
     {
@@ -2596,15 +2670,17 @@ async fn apply_supersession_manifest(
         let slug_owned = slug.to_string();
         let node_owned = resolved_node_id.to_string();
         let manifest_owned = manifest.clone();
-        tokio::task::spawn_blocking(move || -> Result<std::result::Result<(), ManifestValidationError>> {
-            let conn = super::db::open_pyramid_connection(Path::new(&db))?;
-            Ok(validate_change_manifest(
-                &conn,
-                &slug_owned,
-                &node_owned,
-                &manifest_owned,
-            ))
-        })
+        tokio::task::spawn_blocking(
+            move || -> Result<std::result::Result<(), ManifestValidationError>> {
+                let conn = super::db::open_pyramid_connection(Path::new(&db))?;
+                Ok(validate_change_manifest(
+                    &conn,
+                    &slug_owned,
+                    &node_owned,
+                    &manifest_owned,
+                ))
+            },
+        )
         .await??
     };
 
@@ -2868,7 +2944,17 @@ fn load_supersession_node_context(
         dead_ends_json,
         parent_id,
         current_build_version,
-    ): (String, String, i64, String, String, String, String, Option<String>, i64) = conn
+    ): (
+        String,
+        String,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        i64,
+    ) = conn
         .query_row(
             "SELECT headline, distilled, depth,
                     COALESCE(topics, '[]'),
@@ -2893,9 +2979,7 @@ fn load_supersession_node_context(
                 ))
             },
         )
-        .map_err(|e| {
-            anyhow::anyhow!("load_supersession_node_context: {slug}/{node_id}: {e}")
-        })?;
+        .map_err(|e| anyhow::anyhow!("load_supersession_node_context: {slug}/{node_id}: {e}"))?;
 
     let topics: Vec<Topic> = serde_json::from_str(&topics_json).unwrap_or_default();
 
@@ -2913,8 +2997,7 @@ fn load_supersession_node_context(
              WHERE slug = ?1 AND thread_id = ?2
              ORDER BY sequence DESC LIMIT 5",
         )?;
-        let rows = stmt
-            .query_map(rusqlite::params![slug, tid], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(rusqlite::params![slug, tid], |row| row.get::<_, String>(0))?;
         for row in rows {
             if let Ok(content) = row {
                 recent_deltas.push(content);
@@ -3854,28 +3937,40 @@ async fn execute_supersession_identity_change(
         )
     };
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let config = base_config.clone_with_model_override(model);
-    let supersession_ctx = StepContext::new(
-        slug.to_string(),
-        format!("supersession-apply-{}", slug),
-        "supersession_apply",
-        "supersession",
-        node_data.depth,
-        None,
-        db_path.to_string(),
-    )
-    .with_model_resolution("stale_local", model.to_string())
-    .with_prompt_hash(compute_prompt_hash(system_prompt));
-    let supersession_llm_resp = call_model_unified_and_ctx(
-        &config,
-        Some(&supersession_ctx),
+    // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+    let supersession_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+    let supersession_ctx = match &supersession_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "supersession_apply",
+                "supersession",
+                node_data.depth,
+                None,
+                system_prompt,
+                "stale_l0",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
+    let supersession_llm_resp = call_model_unified_with_options_and_ctx(
+        base_config,
+        supersession_ctx.as_ref(),
         system_prompt,
         &user_prompt,
         0.2,
         4096,
         None,
+        LlmCallOptions {
+            model_override: Some(model.to_string()),
+            ..Default::default()
+        },
     )
     .await?;
     let supersession_response = supersession_llm_resp.content;
@@ -4386,10 +4481,7 @@ mod tests {
             dead_ends: None,
         };
 
-        let children_swapped = vec![(
-            "L2-child-old".to_string(),
-            "L2-child-new".to_string(),
-        )];
+        let children_swapped = vec![("L2-child-old".to_string(), "L2-child-new".to_string())];
 
         let new_bv = update_node_in_place(
             &conn,
@@ -4459,7 +4551,10 @@ mod tests {
                 |_| Ok(true),
             )
             .unwrap_or(false);
-        assert!(new_evidence_exists, "evidence link should point at new child");
+        assert!(
+            new_evidence_exists,
+            "evidence link should point at new child"
+        );
 
         // And the old evidence row is gone (rewritten, not duplicated)
         let old_evidence_exists: bool = conn
@@ -4472,7 +4567,10 @@ mod tests {
                 |_| Ok(true),
             )
             .unwrap_or(false);
-        assert!(!old_evidence_exists, "old evidence link should be rewritten away");
+        assert!(
+            !old_evidence_exists,
+            "old evidence link should be rewritten away"
+        );
     }
 
     #[test]
@@ -4547,7 +4645,8 @@ mod tests {
     #[test]
     fn test_validate_change_manifest_all_errors() {
         let (_file, conn) = setup_test_db();
-        let topics_json = r#"[{"name":"existing","current":"x","entities":[],"corrections":[],"decisions":[]}]"#;
+        let topics_json =
+            r#"[{"name":"existing","current":"x","entities":[],"corrections":[],"decisions":[]}]"#;
         insert_upper_node(&conn, "L2-node", 2, topics_json, &["L1-child"]);
         insert_node(&conn, "L1-child", None);
         insert_evidence_link(&conn, "L1-child", "L2-node", "build-1", "KEEP");
@@ -4580,7 +4679,9 @@ mod tests {
         );
         assert_eq!(
             validate_change_manifest(&conn, "test-slug", "L2-node", &m),
-            Err(ManifestValidationError::MissingOldChild("L1-nope".to_string()))
+            Err(ManifestValidationError::MissingOldChild(
+                "L1-nope".to_string()
+            ))
         );
 
         // --- MissingNewChild ---
@@ -4597,18 +4698,13 @@ mod tests {
         );
         assert_eq!(
             validate_change_manifest(&conn, "test-slug", "L2-node", &m),
-            Err(ManifestValidationError::MissingNewChild("L1-ghost".to_string()))
+            Err(ManifestValidationError::MissingNewChild(
+                "L1-ghost".to_string()
+            ))
         );
 
         // --- IdentityChangedWithoutRewrite ---
-        let m = build_manifest(
-            "L2-node",
-            2,
-            ContentUpdates::default(),
-            vec![],
-            true,
-            "r",
-        );
+        let m = build_manifest("L2-node", 2, ContentUpdates::default(), vec![], true, "r");
         assert_eq!(
             validate_change_manifest(&conn, "test-slug", "L2-node", &m),
             Err(ManifestValidationError::IdentityChangedWithoutRewrite)
@@ -4707,14 +4803,7 @@ mod tests {
         );
 
         // --- NonContiguousVersion (expected 2, got 5) ---
-        let m = build_manifest(
-            "L2-node",
-            5,
-            ContentUpdates::default(),
-            vec![],
-            false,
-            "r",
-        );
+        let m = build_manifest("L2-node", 5, ContentUpdates::default(), vec![], false, "r");
         assert_eq!(
             validate_change_manifest(&conn, "test-slug", "L2-node", &m),
             Err(ManifestValidationError::NonContiguousVersion {
@@ -4818,9 +4907,9 @@ mod tests {
         assert_eq!(latest.build_version, 3);
 
         // No manifests for a different node
-        assert!(
-            get_latest_manifest_for_node(&conn, "test-slug", "L2-other").unwrap().is_none()
-        );
+        assert!(get_latest_manifest_for_node(&conn, "test-slug", "L2-other")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -4830,8 +4919,7 @@ mod tests {
         // survives with the same id. This is the closest non-LLM simulation
         // of the execute_supersession happy path.
         let (_file, conn) = setup_test_db();
-        let topics_json =
-            r#"[{"name":"focus","current":"initial","entities":[],"corrections":[],"decisions":[]}]"#;
+        let topics_json = r#"[{"name":"focus","current":"initial","entities":[],"corrections":[],"decisions":[]}]"#;
         insert_upper_node(&conn, "L2-stable", 2, topics_json, &["L1-a"]);
         insert_node(&conn, "L1-a", None);
         insert_node(&conn, "L1-b", None);
@@ -5037,8 +5125,8 @@ mod tests {
         // load_supersession_node_context pulls the source file for L0
         // nodes — the fix for Issue 1.
         let conn_for_ctx = open_pyramid_db(db_file.path()).expect("reopen db");
-        let ctx = load_supersession_node_context(&conn_for_ctx, slug, node_id)
-            .expect("load context");
+        let ctx =
+            load_supersession_node_context(&conn_for_ctx, slug, node_id).expect("load context");
         drop(conn_for_ctx);
 
         assert_eq!(ctx.depth, 0, "fixture is a depth=0 node");
@@ -5047,7 +5135,10 @@ mod tests {
             Some(file_path_str.as_str()),
             "L0 context should carry source_file_path"
         );
-        let snap = ctx.source_snapshot.clone().expect("L0 context must carry source_snapshot");
+        let snap = ctx
+            .source_snapshot
+            .clone()
+            .expect("L0 context must carry source_snapshot");
         assert!(
             snap.contains("NEW rewritten content"),
             "snapshot should contain post-edit file bytes, got: {snap}"
@@ -5186,7 +5277,11 @@ mod tests {
         // Drive the failure path directly.
         let synth_err = anyhow::anyhow!("simulated LLM 500 (network blip)");
         let result = rt().block_on(handle_manifest_generation_failure(
-            &db_path, "test-slug", "L2-node", 1, synth_err,
+            &db_path,
+            "test-slug",
+            "L2-node",
+            1,
+            synth_err,
         ));
         assert!(result.is_err(), "failure path must return Err");
         let err_msg = format!("{}", result.unwrap_err());
@@ -5238,8 +5333,8 @@ mod tests {
         );
 
         // Failed manifest persisted with the spec-aligned note prefix.
-        let manifests = get_change_manifests_for_node(&conn, "test-slug", "L2-node")
-            .expect("load manifests");
+        let manifests =
+            get_change_manifests_for_node(&conn, "test-slug", "L2-node").expect("load manifests");
         assert_eq!(manifests.len(), 1, "exactly one failed-manifest row");
         let note = manifests[0].note.as_deref().unwrap_or_default();
         assert!(
@@ -5313,8 +5408,7 @@ mod tests {
         );
 
         // Confirm nothing was persisted — validate is side-effect free.
-        let manifests =
-            get_change_manifests_for_node(&conn, "test-slug", "L2-rare").unwrap();
+        let manifests = get_change_manifests_for_node(&conn, "test-slug", "L2-rare").unwrap();
         assert!(manifests.is_empty(), "validate should not persist rows");
     }
 
@@ -5328,8 +5422,8 @@ mod tests {
     /// fail to compile this test.
     #[test]
     fn test_generate_change_manifest_with_step_context_compiles() {
-        use crate::pyramid::step_context::{compute_prompt_hash, StepContext};
         use super::ChangedChild;
+        use crate::pyramid::step_context::{compute_prompt_hash, StepContext};
 
         let ctx = StepContext::new(
             "test-slug",
@@ -5450,7 +5544,11 @@ mod tests {
                 .expect("receiver should see the event")
         });
         match event.kind {
-            TaggedKind::ManifestGenerated { manifest_id, node_id, .. } => {
+            TaggedKind::ManifestGenerated {
+                manifest_id,
+                node_id,
+                ..
+            } => {
                 assert!(manifest_id > 0);
                 assert_eq!(node_id, "L1-test-001");
             }

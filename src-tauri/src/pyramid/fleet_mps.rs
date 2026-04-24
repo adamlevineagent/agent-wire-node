@@ -40,9 +40,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::pyramid::dispatch_policy::DispatchPolicy;
-use crate::pyramid::local_mode::{
-    ComputeParticipationMode, ComputeParticipationPolicy,
-};
+use crate::pyramid::local_mode::{ComputeParticipationMode, ComputeParticipationPolicy};
 use crate::pyramid::tunnel_url::TunnelUrl;
 
 /// Current on-wire protocol version for ServiceDescriptor + related
@@ -368,8 +366,8 @@ mod tests {
     use super::*;
 
     use crate::pyramid::dispatch_policy::{
-        BuildCoordinationConfig, DispatchPolicy, EscalationConfig, MatchConfig,
-        RouteEntry, RoutingRule,
+        BuildCoordinationConfig, DispatchPolicy, EscalationConfig, MatchConfig, RouteEntry,
+        RoutingRule,
     };
     use crate::pyramid::local_mode::ComputeParticipationPolicy;
     use std::collections::BTreeMap;
@@ -561,18 +559,10 @@ mod tests {
         let models = vec!["gemma3:27b".to_string()];
 
         let d1 = derive_service_descriptor(&policy, &dispatch_policy, &models, 0);
-        let d2 = derive_service_descriptor(
-            &policy,
-            &dispatch_policy,
-            &models,
-            d1.descriptor_version,
-        );
-        let d3 = derive_service_descriptor(
-            &policy,
-            &dispatch_policy,
-            &models,
-            d2.descriptor_version,
-        );
+        let d2 =
+            derive_service_descriptor(&policy, &dispatch_policy, &models, d1.descriptor_version);
+        let d3 =
+            derive_service_descriptor(&policy, &dispatch_policy, &models, d2.descriptor_version);
         assert_eq!(d1.descriptor_version, 1);
         assert_eq!(d2.descriptor_version, 2);
         assert_eq!(d3.descriptor_version, 3);
@@ -670,7 +660,10 @@ mod tests {
         assert_eq!(s.health_status, HealthStatus::Degraded);
         assert!(s.degraded);
         // degraded is a convenience mirror — must match health_status.
-        assert_eq!(s.degraded, matches!(s.health_status, HealthStatus::Degraded));
+        assert_eq!(
+            s.degraded,
+            matches!(s.health_status, HealthStatus::Degraded)
+        );
     }
 
     #[test]
@@ -682,8 +675,10 @@ mod tests {
         let s = derive_availability_snapshot(&depths, false, true, 0);
         assert_eq!(s.health_status, HealthStatus::Healthy);
         assert_eq!(s.tunnel_status, TunnelStatus::Unhealthy);
-        assert!(!s.degraded,
-            "degraded mirrors health_status, not tunnel_status");
+        assert!(
+            !s.degraded,
+            "degraded mirrors health_status, not tunnel_status"
+        );
     }
 
     #[test]
@@ -739,12 +734,8 @@ mod tests {
     fn service_descriptor_yaml_roundtrips() {
         let policy = hybrid_with_markets_off();
         let dispatch_policy = minimal_dispatch_policy();
-        let d1 = derive_service_descriptor(
-            &policy,
-            &dispatch_policy,
-            &["gemma3:27b".to_string()],
-            0,
-        );
+        let d1 =
+            derive_service_descriptor(&policy, &dispatch_policy, &["gemma3:27b".to_string()], 0);
         let yaml = serde_yaml::to_string(&d1).unwrap();
         let d2: ServiceDescriptor = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(d1, d2);
@@ -763,12 +754,8 @@ mod tests {
     #[test]
     fn peer_knowledge_state_json_roundtrips() {
         let tunnel = TunnelUrl::parse("https://example.com/v1").unwrap();
-        let p1 = PeerKnowledgeState::unknown(
-            "peer-x".to_string(),
-            "PeerX".to_string(),
-            tunnel,
-            None,
-        );
+        let p1 =
+            PeerKnowledgeState::unknown("peer-x".to_string(), "PeerX".to_string(), tunnel, None);
         let json = serde_json::to_string(&p1).unwrap();
         let p2: PeerKnowledgeState = serde_json::from_str(&json).unwrap();
         assert_eq!(p1, p2);

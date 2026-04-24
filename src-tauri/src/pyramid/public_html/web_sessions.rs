@@ -10,7 +10,7 @@
 //! Pillar 13 note: `supabase_user_id` is a Supabase id, NEVER a Wire
 //! `operator_id`. Do not pass it into anything that expects an operator_id.
 
-use rusqlite::{Connection, OptionalExtension, Result as SqlResult, params};
+use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult};
 use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Clone)]
@@ -72,10 +72,7 @@ pub fn lookup(conn: &Connection, token: &str) -> SqlResult<Option<WebSession>> {
 
 /// Delete a single session (logout). Returns rows affected.
 pub fn delete(conn: &Connection, token: &str) -> SqlResult<usize> {
-    conn.execute(
-        "DELETE FROM web_sessions WHERE token = ?1",
-        params![token],
-    )
+    conn.execute("DELETE FROM web_sessions WHERE token = ?1", params![token])
 }
 
 /// Delete all expired sessions (sweeper).

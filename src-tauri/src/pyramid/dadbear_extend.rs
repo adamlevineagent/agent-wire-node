@@ -408,7 +408,10 @@ pub async fn run_tick_for_config(
                 updated_at: String::new(),
             };
             if let Err(e) = db::save_ingest_record(&conn, &record) {
-                warn!("DADBEAR: failed to save ingest record for {}: {}", sf.path, e);
+                warn!(
+                    "DADBEAR: failed to save ingest record for {}: {}",
+                    sf.path, e
+                );
             }
         }
 
@@ -470,7 +473,8 @@ pub async fn run_tick_for_config(
                 let resolved = crate::pyramid::config_contributions::resolve_dadbear_norms(
                     &conn,
                     Some(&slug_compile),
-                ).unwrap_or_default();
+                )
+                .unwrap_or_default();
                 let yaml_str = serde_yaml::to_string(&resolved).unwrap_or_default();
                 use std::hash::{Hash, Hasher};
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -544,11 +548,8 @@ async fn check_session_timeouts(
         // Get current mtime of the source file
         let file_mtime = match std::fs::metadata(&session.source_path) {
             Ok(meta) => {
-                let mtime: chrono::DateTime<Utc> = meta
-                    .modified()
-                    .ok()
-                    .map(|t| t.into())
-                    .unwrap_or(now);
+                let mtime: chrono::DateTime<Utc> =
+                    meta.modified().ok().map(|t| t.into()).unwrap_or(now);
                 mtime
             }
             Err(_) => continue, // file gone — skip
@@ -649,10 +650,7 @@ async fn dispatch_pending_ingests(
 
     // Respect batch_size as a CLAIM cap — we'll fire a single chain build for
     // the whole claimed batch, not batch_size sequential builds.
-    let claimed: Vec<IngestRecord> = pending
-        .into_iter()
-        .take(batch_size.max(1))
-        .collect();
+    let claimed: Vec<IngestRecord> = pending.into_iter().take(batch_size.max(1)).collect();
 
     if claimed.is_empty() {
         return Ok(());
@@ -963,11 +961,8 @@ pub async fn fire_ingest_chain(
     // Progress channel — tee'd onto the build_event_bus so Pipeline B builds
     // become visible in build viz alongside normal builds.
     let (progress_tx, raw_progress_rx) = mpsc::channel::<BuildProgress>(64);
-    let mut progress_rx = super::event_bus::tee_build_progress_to_bus(
-        event_bus,
-        slug.to_string(),
-        raw_progress_rx,
-    );
+    let mut progress_rx =
+        super::event_bus::tee_build_progress_to_bus(event_bus, slug.to_string(), raw_progress_rx);
     let progress_handle = tokio::spawn(async move {
         // Drain the teed progress so the upstream sender doesn't block.
         while progress_rx.recv().await.is_some() {}
@@ -976,9 +971,7 @@ pub async fn fire_ingest_chain(
     // Layer event channel — drained locally. Phase 13 will expand build viz
     // to surface Pipeline B layer events the same way normal builds do.
     let (layer_tx, mut layer_rx) = mpsc::channel::<LayerEvent>(256);
-    let layer_handle = tokio::spawn(async move {
-        while layer_rx.recv().await.is_some() {}
-    });
+    let layer_handle = tokio::spawn(async move { while layer_rx.recv().await.is_some() {} });
 
     // Fresh cancellation token per dispatch. Pipeline B dispatch is not
     // externally cancellable today; a future phase can add that.
@@ -1361,7 +1354,9 @@ mod tests {
         let _count = db::promote_session(&conn, session_id, build_id, None).unwrap();
 
         // The session should now be promoted
-        let session = db::get_provisional_session(&conn, session_id).unwrap().unwrap();
+        let session = db::get_provisional_session(&conn, session_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(session.status, "promoted");
         assert_eq!(session.canonical_build_id.as_deref(), Some(build_id));
 
@@ -1384,17 +1379,23 @@ mod tests {
 
         // update_session_mtime
         db::update_session_mtime(&conn, session_id, "2026-04-08T12:00:00Z").unwrap();
-        let session = db::get_provisional_session(&conn, session_id).unwrap().unwrap();
+        let session = db::get_provisional_session(&conn, session_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(session.file_mtime.as_deref(), Some("2026-04-08T12:00:00Z"));
 
         // update_session_chunk_progress
         db::update_session_chunk_progress(&conn, session_id, 5).unwrap();
-        let session2 = db::get_provisional_session(&conn, session_id).unwrap().unwrap();
+        let session2 = db::get_provisional_session(&conn, session_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(session2.last_chunk_processed, 5);
 
         // Update again
         db::update_session_chunk_progress(&conn, session_id, 10).unwrap();
-        let session3 = db::get_provisional_session(&conn, session_id).unwrap().unwrap();
+        let session3 = db::get_provisional_session(&conn, session_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(session3.last_chunk_processed, 10);
     }
 
@@ -1436,9 +1437,7 @@ mod tests {
             operational: Arc::new(crate::pyramid::OperationalConfig::default()),
             chains_dir: data_dir.join("chains"),
             remote_query_rate_limiter: Arc::new(TokioMutex::new(HashMap::new())),
-            absorption_gate: Arc::new(TokioMutex::new(
-                crate::pyramid::AbsorptionGate::new(),
-            )),
+            absorption_gate: Arc::new(TokioMutex::new(crate::pyramid::AbsorptionGate::new())),
             build_event_bus: Arc::new(BuildEventBus::new()),
             supabase_url: None,
             supabase_anon_key: None,
@@ -1458,9 +1457,7 @@ mod tests {
             credential_store: Arc::new(
                 crate::pyramid::credentials::CredentialStore::load(&data_dir).unwrap(),
             ),
-            schema_registry: Arc::new(
-                crate::pyramid::schema_registry::SchemaRegistry::new(),
-            ),
+            schema_registry: Arc::new(crate::pyramid::schema_registry::SchemaRegistry::new()),
             cross_pyramid_router: Arc::new(
                 crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
             ),
@@ -1477,8 +1474,7 @@ mod tests {
         let (state, _data_dir) = make_test_state();
         let bus = state.build_event_bus.clone();
 
-        let result =
-            fire_ingest_chain(&state, "test-slug", "conversation", &[], &bus).await;
+        let result = fire_ingest_chain(&state, "test-slug", "conversation", &[], &bus).await;
 
         assert!(result.is_err(), "expected error for empty source_paths");
         let err = result.unwrap_err().to_string();
@@ -1571,10 +1567,7 @@ mod tests {
         )
         .await;
 
-        assert!(
-            result.is_err(),
-            "expected error for unknown content type"
-        );
+        assert!(result.is_err(), "expected error for unknown content type");
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("Unknown content type"),
@@ -1976,12 +1969,7 @@ mod tests {
         // dispatch_end is always <= dispatch_start (the last one may be
         // aborted mid-sleep), and iters == starts (because the skip branch
         // is unreachable, every iteration calls dispatch_start).
-        assert!(
-            ends <= starts,
-            "ends={} must be <= starts={}",
-            ends,
-            starts
-        );
+        assert!(ends <= starts, "ends={} must be <= starts={}", ends, starts);
         assert_eq!(
             iters, starts,
             "outer iterations should equal dispatch_starts; every iteration \
@@ -2059,7 +2047,9 @@ mod tests {
         }
 
         let db_path = data_dir.join("pyramid.db").to_string_lossy().to_string();
-        let result = trigger_for_slug(&state, &db_path, slug, &bus).await.unwrap();
+        let result = trigger_for_slug(&state, &db_path, slug, &bus)
+            .await
+            .unwrap();
 
         // The trigger should report a skipped entry for this config.
         let skipped = result.get("skipped").and_then(|v| v.as_array()).unwrap();

@@ -377,9 +377,16 @@ const VALID_CONTENT_TYPES: &[&str] = &["conversation", "code", "document", "ques
 // aliases used by the LLM-profile system (extractor/synth_heavy/web).
 // See docs/semantic_aliasing_audit_results.md for the rationale.
 const VALID_MODEL_TIERS: &[&str] = &[
-    "low", "mid", "high", "max",
-    "extractor", "synth_heavy", "web",
-    "fast_extract", "stale_remote", "stale_local",
+    "low",
+    "mid",
+    "high",
+    "max",
+    "extractor",
+    "synth_heavy",
+    "web",
+    "fast_extract",
+    "stale_remote",
+    "stale_local",
 ];
 
 /// Validate a chain definition, returning errors and warnings.
@@ -460,17 +467,33 @@ pub fn validate_chain(def: &ChainDefinition) -> ValidationResult {
         );
         let recipe = matches!(
             step.primitive.as_str(),
-            "build_lifecycle" | "cross_build_input" | "evidence_loop" | "process_gaps" | "recursive_decompose"
+            "build_lifecycle"
+                | "cross_build_input"
+                | "evidence_loop"
+                | "process_gaps"
+                | "recursive_decompose"
         );
         let is_invoke = step.invoke_chain.is_some();
-        if !step.mechanical && !orchestration && !recipe && !is_invoke && step.instruction.is_none() && step.instruction_from.is_none() {
-            errors.push(format!("{}: LLM step must specify instruction or instruction_from", prefix));
+        if !step.mechanical
+            && !orchestration
+            && !recipe
+            && !is_invoke
+            && step.instruction.is_none()
+            && step.instruction_from.is_none()
+        {
+            errors.push(format!(
+                "{}: LLM step must specify instruction or instruction_from",
+                prefix
+            ));
         }
 
         // WS-CHAIN-INVOKE: validate invoke_chain step
         if let Some(ref chain_id) = step.invoke_chain {
             if chain_id.is_empty() {
-                errors.push(format!("{}: invoke_chain must be a non-empty chain ID", prefix));
+                errors.push(format!(
+                    "{}: invoke_chain must be a non-empty chain ID",
+                    prefix
+                ));
             }
             // invoke_context must be an object (if present)
             if let Some(ref ctx_val) = step.invoke_context {
@@ -536,7 +559,10 @@ pub fn validate_chain(def: &ChainDefinition) -> ValidationResult {
             errors.push(format!("{}: concurrency must be >= 1", prefix));
         }
         if step.concurrency > 1 && step.for_each.is_none() && step.primitive != "web" {
-            errors.push(format!("{}: concurrency > 1 requires for_each (or web primitive)", prefix));
+            errors.push(format!(
+                "{}: concurrency > 1 requires for_each (or web primitive)",
+                prefix
+            ));
         }
         if step.sequential && step.concurrency > 1 {
             errors.push(format!(
@@ -827,7 +853,10 @@ steps:
         chain.steps[0].invoke_chain = Some(String::new());
         let result = validate_chain(&chain);
         assert!(!result.valid);
-        assert!(result.errors.iter().any(|e| e.contains("invoke_chain must be a non-empty chain ID")));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("invoke_chain must be a non-empty chain ID")));
     }
 
     #[test]
@@ -838,7 +867,10 @@ steps:
         chain.steps[0].invoke_context = Some(serde_json::json!("not an object"));
         let result = validate_chain(&chain);
         assert!(!result.valid);
-        assert!(result.errors.iter().any(|e| e.contains("invoke_context must be a JSON object")));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("invoke_context must be a JSON object")));
     }
 
     #[test]
@@ -863,13 +895,31 @@ steps:
 
         // Verify key steps exist
         let step_names: Vec<&str> = def.steps.iter().map(|s| s.name.as_str()).collect();
-        assert!(step_names.contains(&"forward_pass"), "missing forward_pass step");
-        assert!(step_names.contains(&"reverse_pass"), "missing reverse_pass step");
-        assert!(step_names.contains(&"combine_l0"), "missing combine_l0 step");
-        assert!(step_names.contains(&"l0_webbing"), "missing l0_webbing step");
+        assert!(
+            step_names.contains(&"forward_pass"),
+            "missing forward_pass step"
+        );
+        assert!(
+            step_names.contains(&"reverse_pass"),
+            "missing reverse_pass step"
+        );
+        assert!(
+            step_names.contains(&"combine_l0"),
+            "missing combine_l0 step"
+        );
+        assert!(
+            step_names.contains(&"l0_webbing"),
+            "missing l0_webbing step"
+        );
         assert!(step_names.contains(&"decompose"), "missing decompose step");
-        assert!(step_names.contains(&"evidence_loop"), "missing evidence_loop step");
-        assert!(step_names.contains(&"recursive_synthesis"), "missing recursive_synthesis step");
+        assert!(
+            step_names.contains(&"evidence_loop"),
+            "missing evidence_loop step"
+        );
+        assert!(
+            step_names.contains(&"recursive_synthesis"),
+            "missing recursive_synthesis step"
+        );
     }
 
     #[test]
@@ -877,11 +927,21 @@ steps:
         let yaml = include_str!("../../../chains/defaults/conversation-episodic.yaml");
         let def: ChainDefinition = serde_yaml::from_str(yaml).unwrap();
 
-        let synth_step = def.steps.iter().find(|s| s.name == "recursive_synthesis")
+        let synth_step = def
+            .steps
+            .iter()
+            .find(|s| s.name == "recursive_synthesis")
             .expect("recursive_synthesis step should exist");
 
-        assert!(synth_step.recursive_pair, "recursive_synthesis should have recursive_pair: true");
-        assert_eq!(synth_step.depth, Some(1), "recursive_synthesis should start at depth 1");
+        assert!(
+            synth_step.recursive_pair,
+            "recursive_synthesis should have recursive_pair: true"
+        );
+        assert_eq!(
+            synth_step.depth,
+            Some(1),
+            "recursive_synthesis should start at depth 1"
+        );
         assert_eq!(synth_step.save_as.as_deref(), Some("node"));
     }
 
@@ -894,20 +954,34 @@ steps:
         crate::pyramid::db::init_pyramid_db(&conn).unwrap();
 
         assert_eq!(
-            super::super::chain_registry::resolve_chain_for_slug(&conn, "test", "conversation", "deep").unwrap(),
+            super::super::chain_registry::resolve_chain_for_slug(
+                &conn,
+                "test",
+                "conversation",
+                "deep"
+            )
+            .unwrap(),
             "conversation-episodic"
         );
         assert_eq!(
-            super::super::chain_registry::resolve_chain_for_slug(&conn, "test", "conversation", "fast").unwrap(),
+            super::super::chain_registry::resolve_chain_for_slug(
+                &conn,
+                "test",
+                "conversation",
+                "fast"
+            )
+            .unwrap(),
             "conversation-episodic-fast"
         );
         // Other content types still get question-pipeline
         assert_eq!(
-            super::super::chain_registry::resolve_chain_for_slug(&conn, "test", "code", "deep").unwrap(),
+            super::super::chain_registry::resolve_chain_for_slug(&conn, "test", "code", "deep")
+                .unwrap(),
             "question-pipeline"
         );
         assert_eq!(
-            super::super::chain_registry::resolve_chain_for_slug(&conn, "test", "document", "deep").unwrap(),
+            super::super::chain_registry::resolve_chain_for_slug(&conn, "test", "document", "deep")
+                .unwrap(),
             "question-pipeline"
         );
     }
@@ -915,22 +989,43 @@ steps:
     #[test]
     fn episodic_prompt_files_exist_and_contain_required_sections() {
         // synthesize_recursive.md is the load-bearing prompt
-        let synth = include_str!("../../../chains/prompts/conversation-episodic/synthesize_recursive.md");
-        assert!(synth.contains("episodic memory pyramid"), "synthesize_recursive must reference episodic memory");
-        assert!(synth.contains("successor"), "synthesize_recursive must reference successor agent");
-        assert!(synth.contains("zoom") || synth.contains("ZOOM"), "synthesize_recursive must reference zoom level");
-        assert!(synth.contains("speaker_role"), "synthesize_recursive must reference speaker_role for quote asymmetry");
-        assert!(synth.contains("human") && synth.contains("agent"), "synthesize_recursive must reference both human and agent roles");
-        assert!(synth.contains("dehydrat"), "synthesize_recursive must be dehydration-aware");
+        let synth =
+            include_str!("../../../chains/prompts/conversation-episodic/synthesize_recursive.md");
+        assert!(
+            synth.contains("episodic memory pyramid"),
+            "synthesize_recursive must reference episodic memory"
+        );
+        assert!(
+            synth.contains("successor"),
+            "synthesize_recursive must reference successor agent"
+        );
+        assert!(
+            synth.contains("zoom") || synth.contains("ZOOM"),
+            "synthesize_recursive must reference zoom level"
+        );
+        assert!(
+            synth.contains("speaker_role"),
+            "synthesize_recursive must reference speaker_role for quote asymmetry"
+        );
+        assert!(
+            synth.contains("human") && synth.contains("agent"),
+            "synthesize_recursive must reference both human and agent roles"
+        );
+        assert!(
+            synth.contains("dehydrat"),
+            "synthesize_recursive must be dehydration-aware"
+        );
         // The prompt should not instruct the model to produce content AT specific
         // layer numbers (e.g., "your L1 output should..."). It may mention them
         // in negative instructions ("do not reference L0 or L1 in your output").
         // Check that L0/L1/L2 don't appear outside of negative instructions.
-        let lines_with_layer_refs: Vec<&str> = synth.lines()
+        let lines_with_layer_refs: Vec<&str> = synth
+            .lines()
             .filter(|line| line.contains("L0") || line.contains("L1") || line.contains("L2"))
             .filter(|line| {
                 // Allow lines that are negative instructions (telling model NOT to use layer refs)
-                !line.to_lowercase().contains("do not") && !line.to_lowercase().contains("not reference")
+                !line.to_lowercase().contains("do not")
+                    && !line.to_lowercase().contains("not reference")
             })
             .collect();
         assert!(
@@ -941,15 +1036,31 @@ steps:
 
         // combine_l0.md
         let combine = include_str!("../../../chains/prompts/conversation-episodic/combine_l0.md");
-        assert!(combine.contains("episodic memory"), "combine_l0 must reference episodic memory");
-        assert!(combine.contains("speaker_role"), "combine_l0 must include speaker_role");
-        assert!(combine.contains("stance"), "combine_l0 must include stance vocabulary");
+        assert!(
+            combine.contains("episodic memory"),
+            "combine_l0 must reference episodic memory"
+        );
+        assert!(
+            combine.contains("speaker_role"),
+            "combine_l0 must include speaker_role"
+        );
+        assert!(
+            combine.contains("stance"),
+            "combine_l0 must include stance vocabulary"
+        );
 
         // chronological_decompose.md
-        let decompose = include_str!("../../../chains/prompts/conversation-episodic/chronological_decompose.md");
-        assert!(decompose.contains("phase"), "chronological_decompose must reference phases");
-        assert!(decompose.contains("Topic shift") || decompose.contains("topic shift"),
-            "chronological_decompose must reference topic shift signal");
+        let decompose = include_str!(
+            "../../../chains/prompts/conversation-episodic/chronological_decompose.md"
+        );
+        assert!(
+            decompose.contains("phase"),
+            "chronological_decompose must reference phases"
+        );
+        assert!(
+            decompose.contains("Topic shift") || decompose.contains("topic shift"),
+            "chronological_decompose must reference topic shift signal"
+        );
 
         // forward.md and reverse.md exist
         let _forward = include_str!("../../../chains/prompts/conversation-episodic/forward.md");

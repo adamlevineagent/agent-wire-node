@@ -264,19 +264,32 @@ Output JSON only:
         delta_contents = delta_contents,
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let cfg = base_config.clone_with_model_override(model);
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &cfg,
-        "webbing_collapse_edge",
-        "webbing",
-        -1,
-        None,
-        system_prompt,
-    );
-    let raw = llm::call_model_and_ctx(
-        &cfg,
+    // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+    // slot="web" (existing bundled walker tier → xiaomi/mimo-v2.5-pro).
+    let web_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("web", None, None, None).ok());
+    let cache_ctx = match &web_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "webbing_collapse_edge",
+                "webbing",
+                -1,
+                None,
+                system_prompt,
+                "web",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
+    let raw = llm::call_model_with_override_and_ctx(
+        base_config,
+        model,
         cache_ctx.as_ref(),
         system_prompt,
         &user_prompt,

@@ -351,13 +351,17 @@ mod tests {
         let cache = PromptCache::new();
         assert_eq!(cache.len(), 0);
 
-        let body = cache.get(&conn, "$prompts/conversation/forward.md").unwrap();
+        let body = cache
+            .get(&conn, "$prompts/conversation/forward.md")
+            .unwrap();
         assert_eq!(body, "body v1");
         assert_eq!(cache.len(), 1);
         assert!(cache.contains("conversation/forward.md"));
 
         // Second read is a cache hit.
-        let body2 = cache.get(&conn, "$prompts/conversation/forward.md").unwrap();
+        let body2 = cache
+            .get(&conn, "$prompts/conversation/forward.md")
+            .unwrap();
         assert_eq!(body2, "body v1");
         assert_eq!(cache.len(), 1);
     }
@@ -381,19 +385,25 @@ mod tests {
         insert_skill(&conn, "conversation/forward.md", "body v1");
 
         let cache = PromptCache::new();
-        let v1 = cache.get(&conn, "$prompts/conversation/forward.md").unwrap();
+        let v1 = cache
+            .get(&conn, "$prompts/conversation/forward.md")
+            .unwrap();
         assert_eq!(v1, "body v1");
 
         // Supersede the skill.
         supersede_skill(&mut conn, "conversation/forward.md", "body v2");
 
         // Without invalidation, the stale cache entry still wins.
-        let stale = cache.get(&conn, "$prompts/conversation/forward.md").unwrap();
+        let stale = cache
+            .get(&conn, "$prompts/conversation/forward.md")
+            .unwrap();
         assert_eq!(stale, "body v1");
 
         // Invalidate → next read reflects the supersession.
         cache.invalidate_all().unwrap();
-        let fresh = cache.get(&conn, "$prompts/conversation/forward.md").unwrap();
+        let fresh = cache
+            .get(&conn, "$prompts/conversation/forward.md")
+            .unwrap();
         assert_eq!(fresh, "body v2");
     }
 
@@ -421,8 +431,12 @@ mod tests {
         insert_skill(&conn, "conversation/reverse.md", "conv reverse");
 
         let cache = PromptCache::new();
-        let fwd = cache.get(&conn, "$prompts/conversation/forward.md").unwrap();
-        let rev = cache.get(&conn, "$prompts/conversation/reverse.md").unwrap();
+        let fwd = cache
+            .get(&conn, "$prompts/conversation/forward.md")
+            .unwrap();
+        let rev = cache
+            .get(&conn, "$prompts/conversation/reverse.md")
+            .unwrap();
         assert_eq!(fwd, "conv forward");
         assert_eq!(rev, "conv reverse");
         assert_eq!(cache.len(), 2);

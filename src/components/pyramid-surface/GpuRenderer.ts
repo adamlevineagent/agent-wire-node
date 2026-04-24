@@ -1,5 +1,5 @@
 import type { PyramidRenderer } from './PyramidRenderer';
-import type { SurfaceNode, SurfaceEdge, NodeEncoding, OverlayState, HitTestResult, VizPrimitive, BuildVizState } from './types';
+import type { SurfaceNode, SurfaceEdge, NodeEncoding, OverlayState, HitTestResult, VizStepConfig, BuildVizState } from './types';
 import { NodeVisualState, EdgeCategory } from './types';
 
 // ── Node color map (RGBA float arrays for GPU upload) ──────────────
@@ -399,7 +399,7 @@ export class GpuRenderer implements PyramidRenderer {
     private height = 0;
     private dpr = 1;
     private encodings = new Map<string, NodeEncoding>();
-    private activeVizPrimitive: VizPrimitive | null = null;
+    private activeVizConfig: VizStepConfig | null = null;
     private buildVizState: BuildVizState | null = null;
     private linkIntensities = new Map<string, number>();
     private densityLabelThreshold = 0;
@@ -604,8 +604,8 @@ export class GpuRenderer implements PyramidRenderer {
         this.encodings = new Map(encodings);
     }
 
-    setActiveVizPrimitive(primitive: VizPrimitive | null): void {
-        this.activeVizPrimitive = primitive;
+    setActiveVizConfig(config: VizStepConfig | null): void {
+        this.activeVizConfig = config;
     }
 
     setBuildVizState(state: BuildVizState): void {
@@ -890,7 +890,7 @@ export class GpuRenderer implements PyramidRenderer {
         if (apexNodes.length !== 1) return;
 
         const apex = apexNodes[0];
-        const title = apex.selfPrompt?.trim() || apex.headline?.trim() || apex.id;
+        const title = apex.question?.trim() || apex.selfPrompt?.trim() || apex.headline?.trim() || apex.id;
         const label = title.length > 34 ? title.slice(0, 34) + '...' : title;
 
         ctx.font = '11px Inter, sans-serif';
@@ -910,7 +910,7 @@ export class GpuRenderer implements PyramidRenderer {
             if (node.radius < this.densityLabelThreshold) continue;
             if (node.depth < 0) continue; // skip bedrock
 
-            const title = node.selfPrompt?.trim() || node.headline?.trim() || node.id;
+            const title = node.question?.trim() || node.selfPrompt?.trim() || node.headline?.trim() || node.id;
             const label = title.length > 28 ? title.slice(0, 26) + '..' : title;
 
             const fontSize = Math.max(9, Math.min(14, node.radius * 0.6));
@@ -1162,19 +1162,64 @@ export class GpuRenderer implements PyramidRenderer {
         gl: WebGL2RenderingContext,
         nodes: SurfaceNode[],
     ): void {
-        if (!this.activeVizPrimitive || !this.buildVizState) return;
+        const activeVizPrimitive = this.activeVizConfig?.type;
+        if (!activeVizPrimitive || !this.buildVizState) return;
 
-        if (this.activeVizPrimitive === 'node_fill' || this.activeVizPrimitive === 'progress_only') {
+        if (activeVizPrimitive === 'node_fill') {
             return;
         }
 
-        if (this.activeVizPrimitive === 'edge_draw') {
+        if (activeVizPrimitive === 'progress_only') {
+            this.drawProgressOnlyOverlay(gl, nodes);
+        } else if (activeVizPrimitive === 'edge_draw') {
             this.drawEdgeDrawOverlay(gl, nodes);
-        } else if (this.activeVizPrimitive === 'verdict_mark') {
+        } else if (activeVizPrimitive === 'verdict_mark') {
             this.drawVerdictMarkOverlay(gl, nodes);
-        } else if (this.activeVizPrimitive === 'cluster_form') {
+        } else if (activeVizPrimitive === 'cluster_form') {
             this.drawClusterFormOverlay(gl, nodes);
         }
+    }
+
+    /** Draw a non-structural pulse while a YAML step is active but has no committed nodes yet. */
+    private drawProgressOnlyOverlay(
+        gl: WebGL2RenderingContext,
+        nodes: SurfaceNode[],
+    ): void {
+        if (nodes.length === 0) return;
+
+        const pulse = 0.5 + 0.5 * Math.sin(this.pulsePhase);
+        const fillAlpha = 0.015 + 0.025 * pulse;
+        const borderThickness = 0.15 + 0.20 * pulse;
+        const radiusPad = 3 + 2 * pulse;
+        const ringData = new Float32Array(nodes.length * NODE_INSTANCE_FLOATS);
+
+        for (let i = 0; i < nodes.length; i++) {
+            const node = nodes[i];
+            const base = i * NODE_INSTANCE_FLOATS;
+            ringData[base + 0] = node.x;
+            ringData[base + 1] = node.y;
+            ringData[base + 2] = node.radius + radiusPad;
+            ringData[base + 3] = 0;
+            ringData[base + 4] = 1;
+            ringData[base + 5] = 1;
+            ringData[base + 6] = fillAlpha;
+            ringData[base + 7] = 1;
+            ringData[base + 8] = 1;
+            ringData[base + 9] = borderThickness;
+            ringData[base + 10] = 0;
+        }
+
+        gl.useProgram(this.nodeProgram);
+        gl.uniform2f(this.nodeUniforms.resolution, this.width, this.height);
+        gl.uniform1f(this.nodeUniforms.pulsePhase, this.pulsePhase);
+
+        gl.bindVertexArray(this.nodeVAO);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.nodeInstanceVBO);
+        gl.bufferData(gl.ARRAY_BUFFER, ringData, gl.DYNAMIC_DRAW);
+        this.lastNodeInstanceCount = 0;
+
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, nodes.length);
+        gl.bindVertexArray(null);
     }
 
     /** Draw animated new edges as cyan lines via the edge shader. */
@@ -1235,8 +1280,11 @@ export class GpuRenderer implements PyramidRenderer {
         gl: WebGL2RenderingContext,
         nodes: SurfaceNode[],
     ): void {
-        const verdicts = this.buildVizState?.verdictsByNode;
-        if (!verdicts || verdicts.size === 0) return;
+        const verdicts = new Map(this.buildVizState?.verdictsBySource ?? []);
+        for (const [nodeId, verdict] of this.buildVizState?.verdictsByNode ?? []) {
+            verdicts.set(nodeId, verdict);
+        }
+        if (verdicts.size === 0) return;
 
         // Build ring instances — one per verdict node
         const ringData = new Float32Array(verdicts.size * NODE_INSTANCE_FLOATS);

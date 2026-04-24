@@ -106,8 +106,8 @@ pub fn apply_accepted_proposal(proposal: &ChainProposal, chains_dir: &str) -> Re
     }
 
     // Write the modified YAML back
-    let new_yaml = serde_yaml::to_string(&chain_value)
-        .context("failed to serialize patched chain YAML")?;
+    let new_yaml =
+        serde_yaml::to_string(&chain_value).context("failed to serialize patched chain YAML")?;
     std::fs::write(&chain_file, &new_yaml)
         .with_context(|| format!("failed to write patched chain: {}", chain_file.display()))?;
 
@@ -124,12 +124,8 @@ pub fn apply_accepted_proposal(proposal: &ChainProposal, chains_dir: &str) -> Re
 // ── Internal helpers ────────────────────────────────────────────────────────
 
 /// Find a chain YAML file by chain_id. Searches defaults/ then variants/.
-fn find_chain_file(
-    chains_dir: &std::path::Path,
-    chain_id: &str,
-) -> Result<std::path::PathBuf> {
-    let chains = discover_chains(chains_dir)
-        .context("failed to discover chains")?;
+fn find_chain_file(chains_dir: &std::path::Path, chain_id: &str) -> Result<std::path::PathBuf> {
+    let chains = discover_chains(chains_dir).context("failed to discover chains")?;
 
     for meta in &chains {
         if meta.id == chain_id {
@@ -242,8 +238,7 @@ mod tests {
         .unwrap();
 
         // Accept the proposal
-        db::accept_chain_proposal(&conn, &proposal_id, Some("Looks good, merging"))
-            .unwrap();
+        db::accept_chain_proposal(&conn, &proposal_id, Some("Looks good, merging")).unwrap();
 
         let accepted = db::get_chain_proposal(&conn, &proposal_id)
             .unwrap()
@@ -251,7 +246,10 @@ mod tests {
 
         assert_eq!(accepted.status, "accepted");
         assert!(accepted.reviewed_at.is_some(), "reviewed_at should be set");
-        assert_eq!(accepted.operator_notes.as_deref(), Some("Looks good, merging"));
+        assert_eq!(
+            accepted.operator_notes.as_deref(),
+            Some("Looks good, merging")
+        );
     }
 
     #[test]
@@ -304,11 +302,20 @@ mod tests {
 
         // List chain-a only
         let chain_a_all = db::list_chain_proposals(&conn, Some("chain-a"), None).unwrap();
-        assert_eq!(chain_a_all.len(), 2, "chain-a should have 2 proposals total");
+        assert_eq!(
+            chain_a_all.len(),
+            2,
+            "chain-a should have 2 proposals total"
+        );
 
         // List chain-a pending only
-        let chain_a_pending = db::list_chain_proposals(&conn, Some("chain-a"), Some("pending")).unwrap();
-        assert_eq!(chain_a_pending.len(), 1, "chain-a should have 1 pending proposal");
+        let chain_a_pending =
+            db::list_chain_proposals(&conn, Some("chain-a"), Some("pending")).unwrap();
+        assert_eq!(
+            chain_a_pending.len(),
+            1,
+            "chain-a should have 1 pending proposal"
+        );
     }
 
     #[test]
@@ -328,8 +335,7 @@ mod tests {
         .unwrap();
 
         // Reject once
-        db::reject_chain_proposal(&conn, &proposal_id, Some("Not relevant"))
-            .unwrap();
+        db::reject_chain_proposal(&conn, &proposal_id, Some("Not relevant")).unwrap();
 
         let rejected = db::get_chain_proposal(&conn, &proposal_id)
             .unwrap()
@@ -338,8 +344,7 @@ mod tests {
         let first_reviewed_at = rejected.reviewed_at.clone();
 
         // Reject again — should succeed (idempotent)
-        db::reject_chain_proposal(&conn, &proposal_id, Some("Still not relevant"))
-            .unwrap();
+        db::reject_chain_proposal(&conn, &proposal_id, Some("Still not relevant")).unwrap();
 
         let re_rejected = db::get_chain_proposal(&conn, &proposal_id)
             .unwrap()

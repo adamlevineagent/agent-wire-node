@@ -102,19 +102,32 @@ Output JSON:
 {{"match": "thread-id" | "NEW", "thread_name": "name for new thread if NEW"}}"#
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let cfg = base_config.clone_with_model_override(model);
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &cfg,
-        "delta_thread_match",
-        "delta",
-        -1,
-        None,
-        system_prompt,
-    );
-    let raw = llm::call_model_and_ctx(
-        &cfg,
+    // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+    // slot="mid" for delta work (fast focused decision).
+    let delta_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+    let cache_ctx = match &delta_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "delta_thread_match",
+                "delta",
+                -1,
+                None,
+                system_prompt,
+                "mid",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
+    let raw = llm::call_model_with_override_and_ctx(
+        base_config,
+        model,
         cache_ctx.as_ref(),
         system_prompt,
         &user_prompt,
@@ -291,19 +304,31 @@ Output JSON only:
         n = recent_deltas.len(),
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let cfg = base_config.clone_with_model_override(model);
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &cfg,
-        "delta_describe_change",
-        "delta",
-        -1,
-        None,
-        system_prompt,
-    );
-    let raw = llm::call_model_and_ctx(
-        &cfg,
+    // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+    let delta_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+    let cache_ctx = match &delta_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "delta_describe_change",
+                "delta",
+                -1,
+                None,
+                system_prompt,
+                "mid",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
+    let raw = llm::call_model_with_override_and_ctx(
+        base_config,
+        model,
         cache_ctx.as_ref(),
         system_prompt,
         &user_prompt,
@@ -385,9 +410,17 @@ Output JSON only:
     );
 
     // 7. Rewrite distillation
-    let web_edge_notes =
-        rewrite_distillation(reader, writer, slug, thread_id, &delta, base_config, model, ops)
-            .await?;
+    let web_edge_notes = rewrite_distillation(
+        reader,
+        writer,
+        slug,
+        thread_id,
+        &delta,
+        base_config,
+        model,
+        ops,
+    )
+    .await?;
 
     // 7b. Process web edge notes (cross-thread connections)
     if let Some(notes) = web_edge_notes {
@@ -528,19 +561,31 @@ Output JSON only:
         budget = ops.tier2.distillation_token_budget,
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let cfg = base_config.clone_with_model_override(model);
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &cfg,
-        "delta_rewrite_distillation",
-        "delta",
-        -1,
-        None,
-        system_prompt,
-    );
-    let raw = llm::call_model_and_ctx(
-        &cfg,
+    // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+    let delta_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+    let cache_ctx = match &delta_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "delta_rewrite_distillation",
+                "delta",
+                -1,
+                None,
+                system_prompt,
+                "mid",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
+    let raw = llm::call_model_with_override_and_ctx(
+        base_config,
+        model,
         cache_ctx.as_ref(),
         system_prompt,
         &user_prompt,
@@ -730,19 +775,31 @@ Output valid JSON matching this schema:
         deltas = deltas_text,
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let cfg = base_config.clone_with_model_override(collapse_model);
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &cfg,
-        "delta_collapse_deltas",
-        "delta",
-        -1,
-        None,
-        system_prompt,
-    );
-    let raw = llm::call_model_and_ctx(
-        &cfg,
+    // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+    let delta_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+    let cache_ctx = match &delta_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "delta_collapse_deltas",
+                "delta",
+                -1,
+                None,
+                system_prompt,
+                "mid",
+                Some(collapse_model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
+    let raw = llm::call_model_with_override_and_ctx(
+        base_config,
+        collapse_model,
         cache_ctx.as_ref(),
         system_prompt,
         &user_prompt,

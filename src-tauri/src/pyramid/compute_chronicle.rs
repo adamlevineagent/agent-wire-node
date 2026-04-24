@@ -233,6 +233,32 @@ pub const EVENT_NETWORK_AUTH_EXPIRED: &str = "network_auth_expired";
 #[allow(dead_code)]
 pub const EVENT_MARKET_BACKOFF_WAITING: &str = "market_backoff_waiting";
 
+/// Walker v3 Phase 3: /quote pre-gate skipped an offer. Emitted when
+/// `typical_serve_ms_p50_7d × peer_queue_depth` exceeds the usable
+/// dispatch deadline (`dispatch_deadline - dispatch_deadline_grace_secs`).
+/// Walker advances to the next market entry instead of paying a
+/// reservation fee on an offer that can't meet the deadline.
+///
+/// Payload fields:
+///   - offer_id
+///   - typical_serve_ms_p50_7d (per-offer or model-level fallback)
+///   - peer_queue_depth (current_queue_depth + execution_concurrency)
+///   - estimated_serve_ms (product above)
+///   - usable_deadline_ms (dispatch_deadline − grace)
+///   - branch: "market"
+#[allow(dead_code)]
+pub const EVENT_OFFER_SKIPPED_PRE_GATE_DEADLINE: &str = "offer_skipped_pre_gate_deadline";
+
+/// Walker v3 Phase 3: /quote pre-gate skipped an offer because the
+/// quote would exceed the per-dispatch `max_budget_credits` cap. Rare
+/// — the static max_budget is also passed to Wire's /quote and surfaces
+/// as `network_rate_above_budget` when Wire 409s — but Phase 3's
+/// resolver-driven `max_budget_credits` comes from per-provider config
+/// (not RouteEntry), so a pre-gate check avoids the HTTP round-trip
+/// when the resolver is stricter than the RouteEntry default.
+#[allow(dead_code)]
+pub const EVENT_OFFER_SKIPPED_OVER_BUDGET: &str = "offer_skipped_over_budget";
+
 #[allow(dead_code)]
 pub const EVENT_DISPATCH_POLICY_SUPERSEDED: &str = "dispatch_policy_superseded";
 
@@ -397,7 +423,11 @@ impl ChronicleEventContext {
         self
     }
 
-    pub fn with_work_item(mut self, work_item_id: Option<String>, attempt_id: Option<String>) -> Self {
+    pub fn with_work_item(
+        mut self,
+        work_item_id: Option<String>,
+        attempt_id: Option<String>,
+    ) -> Self {
         self.work_item_id = work_item_id;
         self.attempt_id = attempt_id;
         self
@@ -410,7 +440,12 @@ impl ChronicleEventContext {
 /// For DADBEAR work: uses entry.work_item_id (already a semantic path).
 /// For non-DADBEAR work: derives from StepContext or queue entry metadata.
 /// NO UUIDs — paths are human-readable and LLM-parseable.
-pub fn generate_job_path(ctx: Option<&StepContext>, work_item_id: Option<&str>, model_id: &str, source: &str) -> String {
+pub fn generate_job_path(
+    ctx: Option<&StepContext>,
+    work_item_id: Option<&str>,
+    model_id: &str,
+    source: &str,
+) -> String {
     // DADBEAR already set a semantic path
     if let Some(wid) = work_item_id {
         if !wid.is_empty() {
@@ -458,7 +493,12 @@ pub fn generate_job_path(ctx: Option<&StepContext>, work_item_id: Option<&str>, 
 
 /// Generate a job_path from a QueueEntry (convenience wrapper).
 pub fn generate_job_path_from_entry(ctx: Option<&StepContext>, entry: &QueueEntry) -> String {
-    generate_job_path(ctx, entry.work_item_id.as_deref(), &entry.model_id, &entry.source)
+    generate_job_path(
+        ctx,
+        entry.work_item_id.as_deref(),
+        &entry.model_id,
+        &entry.source,
+    )
 }
 
 // ── Record (append-only write) ────────────────────────────────────────────
@@ -766,12 +806,24 @@ pub fn query_timeline(
         let market_count: i64 = r.get("market_count")?;
         let market_received_count: i64 = r.get("market_received_count")?;
 
-        if local_count > 0 { by_source.insert("local".to_string(), local_count); }
-        if fleet_count > 0 { by_source.insert("fleet".to_string(), fleet_count); }
-        if cloud_count > 0 { by_source.insert("cloud".to_string(), cloud_count); }
-        if fleet_received_count > 0 { by_source.insert("fleet_received".to_string(), fleet_received_count); }
-        if market_count > 0 { by_source.insert("market".to_string(), market_count); }
-        if market_received_count > 0 { by_source.insert("market_received".to_string(), market_received_count); }
+        if local_count > 0 {
+            by_source.insert("local".to_string(), local_count);
+        }
+        if fleet_count > 0 {
+            by_source.insert("fleet".to_string(), fleet_count);
+        }
+        if cloud_count > 0 {
+            by_source.insert("cloud".to_string(), cloud_count);
+        }
+        if fleet_received_count > 0 {
+            by_source.insert("fleet_received".to_string(), fleet_received_count);
+        }
+        if market_count > 0 {
+            by_source.insert("market".to_string(), market_count);
+        }
+        if market_received_count > 0 {
+            by_source.insert("market_received".to_string(), market_received_count);
+        }
 
         Ok(TimelineBucket {
             bucket_start: r.get("bucket_start")?,
@@ -904,12 +956,7 @@ mod tests {
         // id and `generate_job_path` returns it verbatim regardless
         // of source. This is the branch `handle_market_dispatch` hits
         // after it creates the `market/{job_id}` work item.
-        let path = generate_job_path(
-            None,
-            Some("market/abc-123"),
-            "llama-3",
-            "market_received",
-        );
+        let path = generate_job_path(None, Some("market/abc-123"), "llama-3", "market_received");
         assert_eq!(path, "market/abc-123");
     }
 

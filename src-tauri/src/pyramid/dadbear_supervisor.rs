@@ -39,9 +39,7 @@ use tracing::{debug, error, info, warn};
 use crate::compute_queue::{ComputeQueueHandle, QueueEntry};
 use crate::pyramid::auto_update_ops;
 use crate::pyramid::dadbear_compiler;
-use crate::pyramid::dadbear_preview::{
-    self, BudgetDecision,
-};
+use crate::pyramid::dadbear_preview::{self, BudgetDecision};
 use crate::pyramid::dispatch_policy::DispatchPolicy;
 use crate::pyramid::event_bus::{BuildEventBus, TaggedBuildEvent, TaggedKind};
 use crate::pyramid::llm::{DispatchOrigin, LlmCallOptions, LlmConfig, LlmResponse};
@@ -186,12 +184,7 @@ pub fn start_dadbear_supervisor(
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
 
-    let supervisor = DadbearSupervisor::new(
-        pyramid_state,
-        compute_queue,
-        db_path,
-        event_bus,
-    );
+    let supervisor = DadbearSupervisor::new(pyramid_state, compute_queue, db_path, event_bus);
 
     let handle = tokio::spawn(async move {
         info!("DADBEAR supervisor starting");
@@ -264,8 +257,8 @@ impl DadbearSupervisor {
     async fn recover_in_flight_items(&self) -> Result<()> {
         let db_path = self.db_path.clone();
         let in_flight = tokio::task::spawn_blocking(move || -> Result<Vec<InFlightItem>> {
-            let conn = Connection::open(&db_path)
-                .context("Failed to open DB for crash recovery")?;
+            let conn =
+                Connection::open(&db_path).context("Failed to open DB for crash recovery")?;
             find_in_flight_items(&conn)
         })
         .await
@@ -326,13 +319,14 @@ impl DadbearSupervisor {
         let event_bus = self.event_bus.clone();
 
         // Gather dispatchable work per slug.
-        let slug_work = tokio::task::spawn_blocking(move || -> Result<HashMap<String, Vec<WorkItem>>> {
-            let conn = Connection::open(&db_path)
-                .context("Failed to open DB for supervisor tick")?;
-            gather_dispatchable_items(&conn, &event_bus)
-        })
-        .await
-        .context("spawn_blocking join error")??;
+        let slug_work =
+            tokio::task::spawn_blocking(move || -> Result<HashMap<String, Vec<WorkItem>>> {
+                let conn =
+                    Connection::open(&db_path).context("Failed to open DB for supervisor tick")?;
+                gather_dispatchable_items(&conn, &event_bus)
+            })
+            .await
+            .context("spawn_blocking join error")??;
 
         if slug_work.is_empty() {
             return Ok(());
@@ -556,9 +550,10 @@ impl DadbearSupervisor {
         // single-source-of-truth rationale.
         let queue_config = config.prepare_for_replay(crate::pyramid::llm::DispatchOrigin::Local);
 
-        let response_format = item.response_format_json.as_ref().and_then(|json_str| {
-            serde_json::from_str::<serde_json::Value>(json_str).ok()
-        });
+        let response_format = item
+            .response_format_json
+            .as_ref()
+            .and_then(|json_str| serde_json::from_str::<serde_json::Value>(json_str).ok());
 
         let model_id = item
             .resolved_model_id
@@ -581,6 +576,10 @@ impl DadbearSupervisor {
                 skip_fleet_dispatch: false,
                 chronicle_job_path: None,
                 dispatch_origin: Default::default(),
+                // W3c: explicit per-call model override. DADBEAR enqueues
+                // with the slug pinned at the outer dispatch site; this
+                // keeps the queue consumer dispatching the same model.
+                model_override: Some(model_id.clone()),
             },
             step_ctx: Some(step_ctx),
             model_id: model_id.clone(),
@@ -620,7 +619,9 @@ impl DadbearSupervisor {
         let attempt_id_for_task = attempt_id.clone();
         join_set.spawn(async move {
             let result = result_rx.await.unwrap_or_else(|_| {
-                Err(anyhow::anyhow!("Oneshot channel dropped — GPU loop may have crashed"))
+                Err(anyhow::anyhow!(
+                    "Oneshot channel dropped — GPU loop may have crashed"
+                ))
             });
             CompletedItem {
                 work_item_id: wi_id_for_task,
@@ -673,11 +674,8 @@ impl DadbearSupervisor {
                     batch_id: Some(item.batch_id.clone()),
                 };
 
-                crate::pyramid::stale_helpers::dispatch_new_file_ingest(
-                    vec![mutation],
-                    &db_path,
-                )
-                .await?;
+                crate::pyramid::stale_helpers::dispatch_new_file_ingest(vec![mutation], &db_path)
+                    .await?;
             }
             "tombstone" => {
                 use crate::pyramid::types::PendingMutation;
@@ -694,11 +692,7 @@ impl DadbearSupervisor {
                     batch_id: Some(item.batch_id.clone()),
                 };
 
-                crate::pyramid::stale_helpers::dispatch_tombstone(
-                    vec![mutation],
-                    &db_path,
-                )
-                .await?;
+                crate::pyramid::stale_helpers::dispatch_tombstone(vec![mutation], &db_path).await?;
             }
             // Post-build accretion v5 Phase 3 (WS3-C): log-only primitive.
             // Observability events (binding_unresolved, cascade_handler_invoked)
@@ -1037,7 +1031,13 @@ impl DadbearSupervisor {
                  WHERE id = ?2 AND state = 'previewed'",
                 params![now, wi_id_cas],
             )?;
-            emit_state_changed(&event_bus_cas, &slug_cas, &wi_id_cas, "previewed", "applied");
+            emit_state_changed(
+                &event_bus_cas,
+                &slug_cas,
+                &wi_id_cas,
+                "previewed",
+                "applied",
+            );
 
             // Write result_applications row.
             conn.execute(
@@ -1155,7 +1155,13 @@ impl DadbearSupervisor {
                     tokio::task::spawn_blocking(move || -> Result<()> {
                         let conn = Connection::open(&db_path)?;
                         complete_work_item(
-                            &conn, &wi_id, &result_json, cost, t_in, t_out, latency_ms,
+                            &conn,
+                            &wi_id,
+                            &result_json,
+                            cost,
+                            t_in,
+                            t_out,
+                            latency_ms,
                         )?;
                         // Read slug for event emission.
                         let slug: String = conn
@@ -1306,7 +1312,9 @@ impl DadbearSupervisor {
                         );
 
                         let config = self.pyramid_state.config.read().await.clone();
-                        let model = item.resolved_model_id.as_deref()
+                        let model = item
+                            .resolved_model_id
+                            .as_deref()
                             .unwrap_or(&item.model_tier);
 
                         // Stale-check path: annotations (if any) live on
@@ -1481,13 +1489,7 @@ impl DadbearSupervisor {
                 "INSERT OR IGNORE INTO dadbear_result_applications
                  (work_item_id, slug, target_id, action, applied_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    wi_id,
-                    slug_for_obs,
-                    target_id_obs,
-                    action_obs,
-                    now,
-                ],
+                params![wi_id, slug_for_obs, target_id_obs, action_obs, now,],
             )?;
 
             info!(
@@ -1539,22 +1541,21 @@ fn find_in_flight_items(conn: &Connection) -> Result<Vec<InFlightItem>> {
            AND NOT EXISTS (
                SELECT 1 FROM dadbear_work_attempts a
                WHERE a.work_item_id = wi.id AND a.status IN ('completed', 'failed')
-           )"
+           )",
     )?;
 
     let items: Vec<InFlightItem> = stmt
         .query_map([], |row| {
             let state_changed_at: String = row.get(21)?;
             // Parse the dispatched_at to compute elapsed time.
-            let elapsed_secs = chrono::NaiveDateTime::parse_from_str(
-                &state_changed_at,
-                "%Y-%m-%d %H:%M:%S",
-            )
-            .map(|dt| {
-                let dispatched = chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
-                (now - dispatched).num_seconds()
-            })
-            .unwrap_or(SLA_TIMEOUT_SECS + 1); // Default to timed out if parse fails.
+            let elapsed_secs =
+                chrono::NaiveDateTime::parse_from_str(&state_changed_at, "%Y-%m-%d %H:%M:%S")
+                    .map(|dt| {
+                        let dispatched =
+                            chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
+                        (now - dispatched).num_seconds()
+                    })
+                    .unwrap_or(SLA_TIMEOUT_SECS + 1); // Default to timed out if parse fails.
 
             // Count existing attempts.
             // (We'll compute this separately to avoid nested queries in the row mapper.)
@@ -1630,19 +1631,25 @@ fn timeout_stale_attempt(conn: &Connection, work_item_id: &str, _attempt_count: 
     // limbo where the item is in 'previewed' but no query picks it up
     // because the preview's TTL has passed. Matches the pattern in
     // unblock_cleared_items() which does the same validity check.
-    let preview_valid = conn.query_row(
-        "SELECT EXISTS(
+    let preview_valid = conn
+        .query_row(
+            "SELECT EXISTS(
             SELECT 1 FROM dadbear_dispatch_previews p
             JOIN dadbear_work_items wi ON wi.preview_id = p.id
             WHERE wi.id = ?1
               AND p.committed_at IS NOT NULL
               AND p.expires_at > ?2
         )",
-        params![work_item_id, now],
-        |row| row.get::<_, bool>(0),
-    ).unwrap_or(false);
+            params![work_item_id, now],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
 
-    let target_state = if preview_valid { "previewed" } else { "compiled" };
+    let target_state = if preview_valid {
+        "previewed"
+    } else {
+        "compiled"
+    };
 
     conn.execute(
         "UPDATE dadbear_work_items
@@ -1680,9 +1687,10 @@ fn gather_dispatchable_items(
     let slugs: Vec<String> = {
         let mut stmt = conn.prepare(
             "SELECT DISTINCT slug FROM dadbear_work_items
-             WHERE state IN ('compiled', 'previewed')"
+             WHERE state IN ('compiled', 'previewed')",
         )?;
-        let mapped: Vec<String> = stmt.query_map([], |row| row.get(0))?
+        let mapped: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
             .filter_map(|r| r.ok())
             .collect();
         mapped
@@ -1716,17 +1724,13 @@ fn gather_dispatchable_items(
 }
 
 /// Block compiled/previewed items for a held slug.
-fn block_held_items(
-    conn: &Connection,
-    slug: &str,
-    event_bus: &Arc<BuildEventBus>,
-) -> Result<()> {
+fn block_held_items(conn: &Connection, slug: &str, event_bus: &Arc<BuildEventBus>) -> Result<()> {
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     // Block compiled items.
     let mut stmt = conn.prepare(
         "SELECT id FROM dadbear_work_items
-         WHERE slug = ?1 AND state IN ('compiled', 'previewed')"
+         WHERE slug = ?1 AND state IN ('compiled', 'previewed')",
     )?;
     let ids: Vec<String> = stmt
         .query_map(params![slug], |row| row.get(0))?
@@ -1779,7 +1783,7 @@ fn unblock_cleared_items(
     // Find blocked items for this slug.
     let mut stmt = conn.prepare(
         "SELECT id, blocked_from, preview_id FROM dadbear_work_items
-         WHERE slug = ?1 AND state = 'blocked'"
+         WHERE slug = ?1 AND state = 'blocked'",
     )?;
 
     let blocked: Vec<(String, Option<String>, Option<String>)> = stmt
@@ -1845,7 +1849,7 @@ fn preview_ready_items(
                SELECT 1 FROM dadbear_work_item_deps d
                JOIN dadbear_work_items dep ON d.depends_on_id = dep.id
                WHERE d.work_item_id = wi.id AND dep.state != 'applied'
-           )"
+           )",
     )?;
 
     let item_ids: Vec<String> = stmt
@@ -1900,7 +1904,12 @@ fn preview_ready_items(
                 .unwrap_or(0.0);
 
             match dadbear_preview::enforce_budget_and_commit(
-                conn, event_bus, slug, &preview_id, preview_cost, &policy,
+                conn,
+                event_bus,
+                slug,
+                &preview_id,
+                preview_cost,
+                &policy,
             ) {
                 Ok(BudgetDecision::AutoCommit) => {
                     debug!(
@@ -1975,7 +1984,7 @@ fn find_committed_previewed_items(conn: &Connection, slug: &str) -> Result<Vec<W
                SELECT 1 FROM dadbear_work_item_deps d
                JOIN dadbear_work_items dep ON d.depends_on_id = dep.id
                WHERE d.work_item_id = wi.id AND dep.state != 'applied'
-           )"
+           )",
     )?;
 
     let items: Vec<WorkItem> = stmt
@@ -2005,7 +2014,7 @@ fn find_committed_previewed_items(conn: &Connection, slug: &str) -> Result<Vec<W
                 state_changed_at: row.get(21)?,
                 preview_id: row.get(22)?,
                 observation_event_ids: row.get(23)?,
-                    result_json: row.get(24)?,
+                result_json: row.get(24)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -2074,7 +2083,14 @@ fn create_work_attempt(
         "INSERT INTO dadbear_work_attempts
          (id, work_item_id, attempt_number, dispatched_at, model_id, routing, status)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
-        params![attempt_id, work_item_id, attempt_number, now, model_id, routing],
+        params![
+            attempt_id,
+            work_item_id,
+            attempt_number,
+            now,
+            model_id,
+            routing
+        ],
     )?;
 
     Ok(attempt_id)
@@ -2163,7 +2179,15 @@ fn complete_work_item(
              result_latency_ms = ?6,
              completed_at = ?1
          WHERE id = ?7 AND state = 'dispatched'",
-        params![now, result_json, cost_usd, tokens_in, tokens_out, latency_ms, work_item_id],
+        params![
+            now,
+            result_json,
+            cost_usd,
+            tokens_in,
+            tokens_out,
+            latency_ms,
+            work_item_id
+        ],
     )?;
 
     if changed == 0 {
@@ -2255,7 +2279,10 @@ fn reconstruct_step_context(
 ) -> StepContext {
     StepContext {
         slug: item.slug.clone(),
-        build_id: item.build_id.clone().unwrap_or_else(|| item.batch_id.clone()),
+        build_id: item
+            .build_id
+            .clone()
+            .unwrap_or_else(|| item.batch_id.clone()),
         step_name: item.step_name.clone(),
         primitive: item.primitive.clone(),
         depth: item.layer,
@@ -2272,6 +2299,7 @@ fn reconstruct_step_context(
         content_type: String::new(),
         task_label: format!("dadbear:{}", item.primitive),
         balance_exhausted_emitted: std::sync::OnceLock::new(),
+        dispatch_decision: None,
     }
 }
 
@@ -2840,10 +2868,7 @@ fn parse_stale_check_result(content: &str, target_id: &str) -> bool {
         .or_else(|| entries.first());
 
     match matching {
-        Some(entry) => entry
-            .get("stale")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true), // Default to stale when uncertain.
+        Some(entry) => entry.get("stale").and_then(|v| v.as_bool()).unwrap_or(true), // Default to stale when uncertain.
         None => true,
     }
 }
@@ -2901,8 +2926,14 @@ fn extract_rename_paths(
                         |row| row.get::<_, Option<String>>(0),
                     ) {
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&meta) {
-                            let old = parsed.get("old_path").and_then(|v| v.as_str()).map(String::from);
-                            let new = parsed.get("new_path").and_then(|v| v.as_str()).map(String::from);
+                            let old = parsed
+                                .get("old_path")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            let new = parsed
+                                .get("new_path")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
                             if let (Some(o), Some(n)) = (old, new) {
                                 return Some((o, n));
                             }
@@ -2928,7 +2959,15 @@ fn parse_rename_target_id(target_id: &str) -> Option<(String, String)> {
     // Both paths are absolute on macOS/Linux (start with `/`).
     // The boundary between old and new is where a `/` is followed by another
     // absolute path root. We scan for known root prefixes.
-    let roots = ["/Users/", "/home/", "/tmp/", "/var/", "/opt/", "/etc/", "/private/"];
+    let roots = [
+        "/Users/",
+        "/home/",
+        "/tmp/",
+        "/var/",
+        "/opt/",
+        "/etc/",
+        "/private/",
+    ];
 
     // Skip the first character (the leading `/` of old_path) and look for the
     // start of the second absolute path.

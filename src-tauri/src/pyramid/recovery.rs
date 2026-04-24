@@ -125,8 +125,8 @@ pub async fn recovery_rerun_build(
     // Verify slug exists
     {
         let conn = state.reader.lock().await;
-        let slug_info = db::get_slug(&conn, slug)?
-            .ok_or_else(|| anyhow!("Slug '{}' not found", slug))?;
+        let slug_info =
+            db::get_slug(&conn, slug)?.ok_or_else(|| anyhow!("Slug '{}' not found", slug))?;
 
         // Vine builds use a different code path
         if slug_info.content_type == super::types::ContentType::Vine {
@@ -168,8 +168,8 @@ pub async fn recovery_reingest(
     let conn = state.writer.lock().await;
 
     // Verify slug exists
-    let slug_info = db::get_slug(&conn, slug)?
-        .ok_or_else(|| anyhow!("Slug '{}' not found", slug))?;
+    let slug_info =
+        db::get_slug(&conn, slug)?.ok_or_else(|| anyhow!("Slug '{}' not found", slug))?;
 
     // 1. Mark existing ingest records as stale
     db::mark_ingest_stale(&conn, slug, source_path)?;
@@ -181,7 +181,10 @@ pub async fn recovery_reingest(
     );
 
     // 2. Create a new pending ingest record
-    let new_sig = format!("recovery-reingest-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"));
+    let new_sig = format!(
+        "recovery-reingest-{}",
+        chrono::Utc::now().format("%Y%m%d%H%M%S")
+    );
     let record = super::types::IngestRecord {
         id: 0,
         slug: slug.to_string(),
@@ -216,11 +219,7 @@ pub async fn recovery_reingest(
 /// for each vine that includes this bedrock.
 ///
 /// Returns error if the composition doesn't exist or bedrock has no apex.
-pub fn recovery_force_delta(
-    conn: &Connection,
-    vine_slug: &str,
-    bedrock_slug: &str,
-) -> Result<()> {
+pub fn recovery_force_delta(conn: &Connection, vine_slug: &str, bedrock_slug: &str) -> Result<()> {
     // Verify the composition exists
     let compositions = db::get_vine_bedrocks(conn, vine_slug)?;
     let comp = compositions
@@ -272,11 +271,7 @@ pub fn recovery_force_delta(
 /// 3. Resetting the node's current_version to 1
 ///
 /// Returns the new version number (always 1 after collapse).
-pub fn recovery_collapse_delta_chain(
-    conn: &Connection,
-    slug: &str,
-    node_id: &str,
-) -> Result<i32> {
+pub fn recovery_collapse_delta_chain(conn: &Connection, slug: &str, node_id: &str) -> Result<i32> {
     // Verify the node exists
     let node = db::get_node(conn, slug, node_id)?
         .ok_or_else(|| anyhow!("Node '{}' not found in slug '{}'", node_id, slug))?;
@@ -384,7 +379,10 @@ pub fn recovery_promote_provisional(
     }
 
     // Generate a canonical build_id for the promotion
-    let canonical_build_id = format!("recovery-promote-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"));
+    let canonical_build_id = format!(
+        "recovery-promote-{}",
+        chrono::Utc::now().format("%Y%m%d%H%M%S")
+    );
 
     info!(
         slug = slug,
@@ -602,7 +600,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version_count, 4, "Should have 4 version history entries before collapse");
+        assert_eq!(
+            version_count, 4,
+            "Should have 4 version history entries before collapse"
+        );
 
         // Collapse
         let new_version = recovery_collapse_delta_chain(&conn, "test-collapse", "n-1").unwrap();
@@ -616,7 +617,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version_count_after, 0, "All version history should be deleted after collapse");
+        assert_eq!(
+            version_count_after, 0,
+            "All version history should be deleted after collapse"
+        );
 
         // Verify: live row is at version 1
         let live_version: i64 = conn
@@ -626,7 +630,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(live_version, 1, "Live row should be at version 1 after collapse");
+        assert_eq!(
+            live_version, 1,
+            "Live row should be at version 1 after collapse"
+        );
     }
 
     // ── Test 2: recovery_status returns correct counts ──
@@ -686,10 +693,22 @@ mod tests {
 
         let status = recovery_status(&conn, "status-test").unwrap();
 
-        assert_eq!(status.dead_letter_count, 2, "Should count only open dead letter entries");
-        assert_eq!(status.pending_ingest_count, 3, "Should count pending + stale ingest records");
-        assert_eq!(status.active_provisional_sessions, 1, "Should count active provisional sessions");
-        assert_eq!(status.pending_demand_gen_jobs, 1, "Should count queued demand-gen jobs");
+        assert_eq!(
+            status.dead_letter_count, 2,
+            "Should count only open dead letter entries"
+        );
+        assert_eq!(
+            status.pending_ingest_count, 3,
+            "Should count pending + stale ingest records"
+        );
+        assert_eq!(
+            status.active_provisional_sessions, 1,
+            "Should count active provisional sessions"
+        );
+        assert_eq!(
+            status.pending_demand_gen_jobs, 1,
+            "Should count queued demand-gen jobs"
+        );
     }
 
     // ── Test 3: recovery_promote_provisional wraps promote_session correctly ──
@@ -700,7 +719,8 @@ mod tests {
         create_slug(&conn, "prom-test", "code");
 
         // Create a provisional session with some nodes
-        db::create_provisional_session(&conn, "prom-test", "/path/test.rs", "sess-promote").unwrap();
+        db::create_provisional_session(&conn, "prom-test", "/path/test.rs", "sess-promote")
+            .unwrap();
 
         // Insert provisional nodes and track them in the session
         for i in 0..3 {
@@ -719,8 +739,13 @@ mod tests {
         assert_eq!(count, 3, "Should promote all 3 provisional nodes");
 
         // Verify session is now promoted
-        let session = db::get_provisional_session(&conn, "sess-promote").unwrap().unwrap();
-        assert_eq!(session.status, "promoted", "Session status should be 'promoted'");
+        let session = db::get_provisional_session(&conn, "sess-promote")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.status, "promoted",
+            "Session status should be 'promoted'"
+        );
 
         // Verify idempotency — calling again returns 0
         let count2 = recovery_promote_provisional(&conn, "prom-test", "sess-promote").unwrap();

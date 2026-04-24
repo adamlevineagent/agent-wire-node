@@ -15,7 +15,7 @@
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use tracing::{info, warn};
 
 use super::llm::{self, LlmConfig};
@@ -128,6 +128,9 @@ The extraction prompt you produce will be used to describe source files. Those d
     let temperature = tier1.extraction_schema_temperature;
     let max_tokens = tier1.extraction_schema_max_tokens;
 
+    let (resolved_model_id, resolved_provider_id) =
+        resolve_max_tier(llm_config, "extraction_schema")?;
+
     for attempt in 0..2u32 {
         let temp = if attempt == 0 { temperature } else { 0.1 };
 
@@ -138,7 +141,11 @@ The extraction prompt you produce will be used to describe source files. Those d
             0,
             None,
             &system_prompt,
-        );
+            "max",
+            Some(&resolved_model_id),
+            resolved_provider_id.as_deref(),
+        )
+        .await;
         let response = llm::call_model_unified_and_ctx(
             llm_config,
             cache_ctx.as_ref(),
@@ -175,6 +182,30 @@ The extraction prompt you produce will be used to describe source files. Those d
     }
 
     anyhow::bail!("extraction schema generation failed after 2 attempts")
+}
+
+/// Resolve the "max" tier through the provider registry. Fails loudly if
+/// the registry has no "max" routing — walker-v3 W3c removed the legacy
+/// `LlmConfig.primary_model` fallback, so there is no downstream recovery.
+/// Both `generate_extraction_schema` and `generate_synthesis_prompts` are
+/// top-level entry points with no outer Decision; the registry is the
+/// only source of truth for which model to dispatch.
+fn resolve_max_tier(llm_config: &LlmConfig, caller: &str) -> Result<(String, Option<String>)> {
+    let resolved = llm_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("max", None, None, None).ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "{caller}: provider registry has no 'max' tier routing. \
+                 Configure a walker_provider_openrouter contribution with \
+                 a 'max' slot model_list entry."
+            )
+        })?;
+    Ok((
+        resolved.tier.model_id.clone(),
+        Some(resolved.provider.id.clone()),
+    ))
 }
 
 /// Generate per-layer synthesis prompts AFTER L0 extraction completes.
@@ -276,6 +307,9 @@ Design synthesis prompts that will combine this extracted evidence into answers 
     let temperature = tier1.extraction_schema_temperature;
     let max_tokens = tier1.synthesis_prompts_max_tokens;
 
+    let (resolved_model_id, resolved_provider_id) =
+        resolve_max_tier(llm_config, "synthesis_prompts")?;
+
     for attempt in 0..2u32 {
         let temp = if attempt == 0 { temperature } else { 0.1 };
 
@@ -286,7 +320,11 @@ Design synthesis prompts that will combine this extracted evidence into answers 
             0,
             None,
             &system_prompt,
-        );
+            "max",
+            Some(&resolved_model_id),
+            resolved_provider_id.as_deref(),
+        )
+        .await;
         let response = llm::call_model_unified_and_ctx(
             llm_config,
             cache_ctx.as_ref(),

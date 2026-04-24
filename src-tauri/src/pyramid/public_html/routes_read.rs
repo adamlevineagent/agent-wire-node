@@ -13,13 +13,13 @@
 
 use crate::pyramid::db;
 use crate::pyramid::public_html::auth::{
-    csrf_nonce, enforce_public_tier, issue_anon_session_cookie, read_cookie, ANON_SESSION_COOKIE,
-    PublicAuthSource, WIRE_SESSION_COOKIE,
+    csrf_nonce, enforce_public_tier, issue_anon_session_cookie, read_cookie, PublicAuthSource,
+    ANON_SESSION_COOKIE, WIRE_SESSION_COOKIE,
 };
-use crate::pyramid::public_html::rate_limit;
 use crate::pyramid::public_html::etag::{
     etag_for_node, etag_for_pyramid, matches_inm, not_modified,
 };
+use crate::pyramid::public_html::rate_limit;
 use crate::pyramid::public_html::render::{
     details_section, esc, node_state_class, page, page_with_etag, prov_footer, status_page,
     truncate_chars,
@@ -118,10 +118,8 @@ fn rate_limited_page(retry_after: u64) -> warp::reply::Response {
         s = retry_after
     );
     let mut resp = status_page(429, "Rate limited — Wire Node", &body);
-    resp.headers_mut().insert(
-        "retry-after",
-        warp::http::HeaderValue::from(retry_after),
-    );
+    resp.headers_mut()
+        .insert("retry-after", warp::http::HeaderValue::from(retry_after));
     resp
 }
 
@@ -206,24 +204,25 @@ pub fn read_routes(
 
     let state_tree = state.clone();
     let jwt_tree = jwt_public_key.clone();
-    let tree = warp::path("p")
-        .and(warp::path::param::<String>())
-        .and(warp::path("tree"))
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(warp::filters::addr::remote())
-        .and(warp::header::headers_cloned())
-        .and_then(
-            move |slug: String,
-                  peer: Option<std::net::SocketAddr>,
-                  headers: warp::http::HeaderMap| {
-                let state = state_tree.clone();
-                let jwt_pk = jwt_tree.clone();
-                async move {
-                    Ok::<_, Rejection>(handle_tree(state, jwt_pk, slug, peer, headers).await)
-                }
-            },
-        );
+    let tree =
+        warp::path("p")
+            .and(warp::path::param::<String>())
+            .and(warp::path("tree"))
+            .and(warp::path::end())
+            .and(warp::get())
+            .and(warp::filters::addr::remote())
+            .and(warp::header::headers_cloned())
+            .and_then(
+                move |slug: String,
+                      peer: Option<std::net::SocketAddr>,
+                      headers: warp::http::HeaderMap| {
+                    let state = state_tree.clone();
+                    let jwt_pk = jwt_tree.clone();
+                    async move {
+                        Ok::<_, Rejection>(handle_tree(state, jwt_pk, slug, peer, headers).await)
+                    }
+                },
+            );
 
     let state_glossary = state.clone();
     let jwt_glossary = jwt_public_key.clone();
@@ -364,17 +363,14 @@ pub fn read_routes(
         .and(warp::header::headers_cloned())
         .and_then(move |headers: warp::http::HeaderMap| {
             let state = state_help.clone();
-            async move {
-                Ok::<_, Rejection>(handle_help(state, headers).await)
-            }
+            async move { Ok::<_, Rejection>(handle_help(state, headers).await) }
         });
 
     // Literal sub-paths (search/tree/glossary/folio/question) MUST be
     // ordered before the `{slug}/{node_id}` catchall so they win the
     // match. The question.fragment route MUST precede question_view (more
     // specific path).
-    help
-        .or(index)
+    help.or(index)
         .unify()
         .or(pyramid_home)
         .unify()
@@ -491,7 +487,9 @@ async fn handle_help(
         "https"
     };
     let tunnel_url: Option<String> = Some(format!("{}://{}", scheme, host));
-    let tunnel_display = tunnel_url.clone().unwrap_or_else(|| "(tunnel not running — talk to the operator)".to_string());
+    let tunnel_display = tunnel_url
+        .clone()
+        .unwrap_or_else(|| "(tunnel not running — talk to the operator)".to_string());
 
     // Live pyramid catalog (public-tier only).
     let conn = state.reader.lock().await;
@@ -518,7 +516,10 @@ async fn handle_help(
         catalog.push_str("(no public pyramids on this node yet)\n");
     } else {
         for (slug, ct, nc, md) in &public_pyramids {
-            catalog.push_str(&format!("- {} ({}, {} nodes, depth {})\n", slug, ct, nc, md));
+            catalog.push_str(&format!(
+                "- {} ({}, {} nodes, depth {})\n",
+                slug, ct, nc, md
+            ));
         }
     }
 
@@ -801,7 +802,11 @@ async fn handle_index(state: Arc<PyramidState>) -> warp::reply::Response {
         )
     };
 
-    page("Wire Node — Public Pyramids", &body, "no-cache, must-revalidate")
+    page(
+        "Wire Node — Public Pyramids",
+        &body,
+        "no-cache, must-revalidate",
+    )
 }
 
 /// Renders the "For AI agents" details section that goes on the /p/ index.
@@ -910,7 +915,11 @@ async fn handle_pyramid_home(
     let apex = apex_candidates.first().cloned().cloned();
 
     // Children of apex (depth_max-1 layer) form the table of contents.
-    let depth_minus_one = if true_max_depth > 0 { true_max_depth - 1 } else { 0 };
+    let depth_minus_one = if true_max_depth > 0 {
+        true_max_depth - 1
+    } else {
+        0
+    };
     let toc_nodes: Vec<PyramidNode> = if let Some(ref a) = apex {
         // Prefer apex.children for ordering; fall back to depth scan.
         let mut found: Vec<PyramidNode> = Vec::new();
@@ -989,7 +998,9 @@ async fn handle_pyramid_home(
         let ann_total = db::get_all_annotations(&conn2, &slug)
             .map(|v| v.len())
             .unwrap_or(0);
-        (all_nodes, gloss, entities, faq, threads, web_edges, questions, refs, ann_total)
+        (
+            all_nodes, gloss, entities, faq, threads, web_edges, questions, refs, ann_total,
+        )
     };
 
     let mut body = String::new();
@@ -1025,10 +1036,7 @@ async fn handle_pyramid_home(
         // Layers between apex and L1 (exclusive on both ends already, since
         // apex is at true_max_depth and L0 gets its own section).
         for d in (1..true_max_depth).rev() {
-            let nodes_at: Vec<&PyramidNode> = all_live
-                .iter()
-                .filter(|n| n.depth == d)
-                .collect();
+            let nodes_at: Vec<&PyramidNode> = all_live.iter().filter(|n| n.depth == d).collect();
             if nodes_at.is_empty() {
                 continue;
             }
@@ -1142,11 +1150,7 @@ async fn handle_pyramid_home(
     {
         let mut inner = String::from("<dl class=\"glossary\">\n");
         for (term, def) in &glossary_terms {
-            inner.push_str(&format!(
-                "<dt>{}</dt><dd>{}</dd>\n",
-                esc(term),
-                esc(def),
-            ));
+            inner.push_str(&format!("<dt>{}</dt><dd>{}</dd>\n", esc(term), esc(def),));
         }
         inner.push_str(&format!(
             "</dl>\n<p class=\"sub\"><a href=\"/p/{}/glossary\">full glossary &rarr;</a></p>",
@@ -1196,7 +1200,12 @@ async fn handle_pyramid_home(
                 updated = esc(&f.updated_at),
             ));
         }
-        body.push_str(&details_section("FAQ entries", faq_nodes.len(), false, &inner));
+        body.push_str(&details_section(
+            "FAQ entries",
+            faq_nodes.len(),
+            false,
+            &inner,
+        ));
     }
 
     // ── Threads ────────────────────────────────────────────────────────
@@ -1214,7 +1223,12 @@ async fn handle_pyramid_home(
             ));
         }
         inner.push_str("</ul>");
-        body.push_str(&details_section("Threads", threads_list.len(), false, &inner));
+        body.push_str(&details_section(
+            "Threads",
+            threads_list.len(),
+            false,
+            &inner,
+        ));
     }
 
     // ── Web edges (thread relationships) ───────────────────────────────
@@ -1353,7 +1367,8 @@ async fn handle_pyramid_home(
     );
     if let Some(cookie) = set_anon_cookie {
         if let Ok(hv) = warp::http::HeaderValue::from_str(&cookie) {
-            resp.headers_mut().append(warp::http::header::SET_COOKIE, hv);
+            resp.headers_mut()
+                .append(warp::http::header::SET_COOKIE, hv);
         }
     }
     resp
@@ -1456,10 +1471,7 @@ async fn handle_single_node(
                     if i > 0 {
                         inner.push_str(", ");
                     }
-                    inner.push_str(&format!(
-                        "<span class=\"term-pill\">{}</span>",
-                        esc(e)
-                    ));
+                    inner.push_str(&format!("<span class=\"term-pill\">{}</span>", esc(e)));
                 }
                 inner.push_str("</span>");
             }
@@ -1492,7 +1504,12 @@ async fn handle_single_node(
             ));
         }
         inner.push_str("</ul>");
-        body.push_str(&details_section("Children", child_nodes.len(), false, &inner));
+        body.push_str(&details_section(
+            "Children",
+            child_nodes.len(),
+            false,
+            &inner,
+        ));
     }
 
     // ── Parent path ────────────────────────────────────────────────────
@@ -1513,7 +1530,12 @@ async fn handle_single_node(
             ));
         }
         inner.push_str("</ul>");
-        body.push_str(&details_section("Parent path", parents.len(), false, &inner));
+        body.push_str(&details_section(
+            "Parent path",
+            parents.len(),
+            false,
+            &inner,
+        ));
     }
 
     // ── Terms ──────────────────────────────────────────────────────────
@@ -1661,8 +1683,13 @@ async fn validate_question_pair(
     source_slug: &str,
     question_slug: &str,
     auth: &PublicAuthSource,
-) -> Result<(crate::pyramid::types::SlugInfo, crate::pyramid::types::SlugInfo), warp::reply::Response>
-{
+) -> Result<
+    (
+        crate::pyramid::types::SlugInfo,
+        crate::pyramid::types::SlugInfo,
+    ),
+    warp::reply::Response,
+> {
     if !is_safe_slug(source_slug) || !is_safe_slug(question_slug) {
         return Err(not_found_page());
     }
@@ -1808,12 +1835,14 @@ async fn handle_question_view(
         let (tree_json, build_id) = {
             let conn = state.reader.lock().await;
             let tj = db::get_question_tree(&conn, &question_slug).ok().flatten();
-            let bid = db::get_current_build_id(&conn, &question_slug).ok().flatten();
+            let bid = db::get_current_build_id(&conn, &question_slug)
+                .ok()
+                .flatten();
             (tj, bid)
         };
         if let Some(json) = tree_json.as_ref() {
-            let pretty = serde_json::to_string_pretty(json)
-                .unwrap_or_else(|_| "(invalid tree)".to_string());
+            let pretty =
+                serde_json::to_string_pretty(json).unwrap_or_else(|_| "(invalid tree)".to_string());
             let inner = format!("<pre class=\"tree-json\">{}</pre>", esc(&pretty));
             body.push_str(&details_section(
                 "Question decomposition tree",
@@ -1848,7 +1877,12 @@ async fn handle_question_view(
             esc(&question_info.created_at),
             esc(&question_text),
         );
-        body.push_str(&details_section("This question's metadata", 1, false, &meta));
+        body.push_str(&details_section(
+            "This question's metadata",
+            1,
+            false,
+            &meta,
+        ));
     }
 
     // Inline the answer fragment if the apex is actually synthesized.
@@ -1866,9 +1900,7 @@ async fn handle_question_view(
 
     // Non-JS fallback: meta refresh every 3s while the build is running.
     if is_building {
-        body.push_str(
-            "<noscript><meta http-equiv=\"refresh\" content=\"3\"></noscript>\n",
-        );
+        body.push_str("<noscript><meta http-equiv=\"refresh\" content=\"3\"></noscript>\n");
     }
 
     body.push_str(&format!(
@@ -1936,8 +1968,7 @@ async fn render_question_answer_fragment(
 
     // Cited source nodes: scan the apex distilled text for any node IDs
     // from the source pyramid that appear verbatim.
-    let source_nodes =
-        db::get_all_live_nodes(&conn, source_slug).unwrap_or_default();
+    let source_nodes = db::get_all_live_nodes(&conn, source_slug).unwrap_or_default();
     let mut cited: Vec<(String, String)> = Vec::new();
     for sn in &source_nodes {
         if !sn.id.is_empty() && apex.distilled.contains(&sn.id) {
@@ -2075,8 +2106,16 @@ async fn render_question_answer_fragment(
                  </details>\n",
                 open = open_attr,
                 id = esc(&n.id),
-                headline = if hl.is_empty() { esc("(no headline)") } else { esc(hl) },
-                distilled = if ds.is_empty() { esc("(no content)") } else { esc(ds) },
+                headline = if hl.is_empty() {
+                    esc("(no headline)")
+                } else {
+                    esc(hl)
+                },
+                distilled = if ds.is_empty() {
+                    esc("(no content)")
+                } else {
+                    esc(ds)
+                },
                 extras = extras,
                 qslug = esc(question_slug),
                 depth = n.depth,
@@ -2224,10 +2263,7 @@ async fn handle_search(
     let total = hits.len();
     let shown: Vec<_> = hits.iter().take(SEARCH_RESULT_CAP).cloned().collect();
 
-    body.push_str(&format!(
-        "<h1>results for <q>{qe}</q></h1>\n",
-        qe = esc(&q),
-    ));
+    body.push_str(&format!("<h1>results for <q>{qe}</q></h1>\n", qe = esc(&q),));
 
     // Tokenize the query the same way the search does (very rough — for
     // display only) so the visitor sees what was actually matched.
@@ -2516,9 +2552,9 @@ async fn handle_glossary(
             if lower.is_empty() {
                 continue;
             }
-            let entry = by_lower.entry(lower).or_insert_with(|| {
-                (t.term.clone(), t.definition.clone(), Vec::new())
-            });
+            let entry = by_lower
+                .entry(lower)
+                .or_insert_with(|| (t.term.clone(), t.definition.clone(), Vec::new()));
             entry.0 = t.term.clone();
             entry.1 = t.definition.clone();
             if !entry.2.contains(&n.id) {
@@ -2913,11 +2949,7 @@ fn mark_tokens(text: &str, tokens: &[String]) -> String {
 
 /// Best-effort apex headline lookup for the index card. Returns None when
 /// the pyramid has no nodes yet.
-fn apex_headline_for(
-    conn: &rusqlite::Connection,
-    slug: &str,
-    max_depth: i64,
-) -> Option<String> {
+fn apex_headline_for(conn: &rusqlite::Connection, slug: &str, max_depth: i64) -> Option<String> {
     let nodes = db::get_nodes_at_depth(conn, slug, max_depth).ok()?;
     nodes.into_iter().next().map(|n| n.headline)
 }
@@ -2987,11 +3019,7 @@ mod tests {
         let rendered = format!("<input value=\"{}\">", esc(payload));
         // The only literal `"` chars remaining must be the two that wrap value.
         let quote_count = rendered.matches('"').count();
-        assert_eq!(
-            quote_count, 2,
-            "attribute breakout possible: {}",
-            rendered
-        );
+        assert_eq!(quote_count, 2, "attribute breakout possible: {}", rendered);
         assert!(rendered.contains("&quot;"));
         // The literal `onfocus=` survives as inert text inside the escaped
         // attribute value — what matters is that the `"` boundary holds and

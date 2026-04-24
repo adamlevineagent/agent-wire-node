@@ -675,8 +675,7 @@ mod tests {
             sleep(Duration::from_millis(15)).await; // reader(s) already inside
             let _g = mgr_w.write("race05-vocab").await;
             // At this point no readers must be active.
-            *writer_started_after_w.lock().unwrap() =
-                Some(reader_overlap_w.load(Ordering::SeqCst));
+            *writer_started_after_w.lock().unwrap() = Some(reader_overlap_w.load(Ordering::SeqCst));
         });
 
         r1.await.unwrap();
@@ -784,9 +783,9 @@ mod tests {
         {
             let _g = mgr.write("drop-test").await;
         } // dropped here
-        // Second acquire must succeed immediately.
-        let acquired = tokio::time::timeout(Duration::from_millis(50), mgr.write("drop-test"))
-            .await;
+          // Second acquire must succeed immediately.
+        let acquired =
+            tokio::time::timeout(Duration::from_millis(50), mgr.write("drop-test")).await;
         assert!(acquired.is_ok(), "guard did not release on drop");
     }
 

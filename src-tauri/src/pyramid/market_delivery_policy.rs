@@ -181,9 +181,7 @@ pub fn ensure_table(conn: &Connection) -> SqlResult<()> {
 /// Read the active market delivery policy. Returns `Ok(None)` if no row
 /// is present OR the stored YAML is empty. Callers should fall back to
 /// `MarketDeliveryPolicy::default()` in that case (bootstrap sentinel).
-pub fn read_market_delivery_policy(
-    conn: &Connection,
-) -> SqlResult<Option<MarketDeliveryPolicy>> {
+pub fn read_market_delivery_policy(conn: &Connection) -> SqlResult<Option<MarketDeliveryPolicy>> {
     let row: Option<String> = conn
         .query_row(
             "SELECT yaml_content FROM pyramid_market_delivery_policy WHERE id = 1",
@@ -241,8 +239,7 @@ pub fn upsert_market_delivery_policy_yaml(
 mod tests {
     use super::*;
 
-    const SEED_YAML: &str =
-        include_str!("../../../docs/seeds/market_delivery_policy.yaml");
+    const SEED_YAML: &str = include_str!("../../../docs/seeds/market_delivery_policy.yaml");
 
     #[test]
     fn default_matches_seed_yaml() {
@@ -252,15 +249,13 @@ mod tests {
         // are bugs — the comment contract in the module doc is that
         // they coincide.
         let from_default = MarketDeliveryPolicy::default();
-        let from_seed = MarketDeliveryPolicy::from_yaml(SEED_YAML)
-            .expect("seed YAML must parse");
+        let from_seed = MarketDeliveryPolicy::from_yaml(SEED_YAML).expect("seed YAML must parse");
         assert_eq!(from_default, from_seed);
     }
 
     #[test]
     fn seed_yaml_parses_cleanly() {
-        let policy = MarketDeliveryPolicy::from_yaml(SEED_YAML)
-            .expect("seed YAML must parse");
+        let policy = MarketDeliveryPolicy::from_yaml(SEED_YAML).expect("seed YAML must parse");
         assert_eq!(policy.version, 1);
         assert_eq!(policy.callback_post_timeout_secs, 30);
         assert_eq!(policy.max_inflight_jobs, 32);
@@ -295,12 +290,10 @@ max_error_message_chars: 1024
 # The typo below is what deny_unknown_fields catches.
 bogus_field_that_does_not_exist: 42
 "#;
-        let err = MarketDeliveryPolicy::from_yaml(yaml)
-            .expect_err("unknown field must reject");
+        let err = MarketDeliveryPolicy::from_yaml(yaml).expect_err("unknown field must reject");
         let msg = err.to_string();
         assert!(
-            msg.contains("bogus_field_that_does_not_exist")
-                || msg.contains("unknown field"),
+            msg.contains("bogus_field_that_does_not_exist") || msg.contains("unknown field"),
             "error should name the offending field, got: {msg}"
         );
     }
@@ -325,11 +318,9 @@ bogus_field_that_does_not_exist: 42
         let conn = Connection::open_in_memory().expect("open in-memory");
         ensure_table(&conn).expect("create table");
 
-        assert!(
-            read_market_delivery_policy(&conn)
-                .expect("read empty")
-                .is_none()
-        );
+        assert!(read_market_delivery_policy(&conn)
+            .expect("read empty")
+            .is_none());
 
         let mut policy = MarketDeliveryPolicy::default();
         policy.callback_post_timeout_secs = 42;

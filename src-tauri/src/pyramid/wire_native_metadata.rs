@@ -338,11 +338,7 @@ pub struct WireEntity {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireRef {
     /// Handle-path for contributions (e.g. `"nightingale/77/3"`).
-    #[serde(
-        rename = "ref",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
     pub ref_: Option<String>,
     /// Local file path for corpus docs (e.g. `"wire-actions.md"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -363,10 +359,14 @@ impl WireRef {
     /// Validate that exactly one of `ref_`/`doc`/`corpus` is set.
     /// Returns a descriptive error string if the invariant is broken.
     pub fn validate(&self) -> Result<(), String> {
-        let count = [self.ref_.is_some(), self.doc.is_some(), self.corpus.is_some()]
-            .iter()
-            .filter(|x| **x)
-            .count();
+        let count = [
+            self.ref_.is_some(),
+            self.doc.is_some(),
+            self.corpus.is_some(),
+        ]
+        .iter()
+        .filter(|x| **x)
+        .count();
         match count {
             0 => Err("derived_from entry must set exactly one of ref / doc / corpus".to_string()),
             1 => Ok(()),
@@ -408,11 +408,7 @@ impl WireRef {
 /// `WireRef`, plus a `rel` label instead of a weight/justification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireRelatedRef {
-    #[serde(
-        rename = "ref",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
     pub ref_: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
@@ -601,7 +597,7 @@ impl WireNativeMetadata {
             WireDestination::Corpus | WireDestination::Both => {
                 if self.corpus.as_deref().map(str::is_empty).unwrap_or(true) {
                     return Err(
-                        "destination includes corpus but `corpus` field is empty".to_string(),
+                        "destination includes corpus but `corpus` field is empty".to_string()
                     );
                 }
             }
@@ -652,9 +648,7 @@ impl WireNativeMetadata {
         // Claims: trackable claims require end_date.
         for (i, claim) in self.claims.iter().enumerate() {
             if claim.trackable && claim.end_date.as_deref().unwrap_or("").is_empty() {
-                return Err(format!(
-                    "claims[{i}] is trackable but has no end_date"
-                ));
+                return Err(format!("claims[{i}] is trackable but has no end_date"));
             }
         }
 
@@ -678,15 +672,11 @@ impl WireNativeMetadata {
                     ));
                 }
                 if entry.justification.trim().is_empty() {
-                    return Err(format!(
-                        "creator_split[{i}] requires a justification"
-                    ));
+                    return Err(format!("creator_split[{i}] requires a justification"));
                 }
             }
         } else if !self.creator_split.is_empty() {
-            return Err(
-                "creator_split is only valid for circle-scoped contributions".to_string(),
-            );
+            return Err("creator_split is only valid for circle-scoped contributions".to_string());
         }
 
         Ok(())
@@ -999,10 +989,7 @@ pub fn resolve_wire_type(schema_type: &str) -> Result<(WireContributionType, Vec
 /// `slug` (if present) is added to the topic list so the contribution
 /// is discoverable by the pyramid it scopes to. `None` slugs produce
 /// global-config metadata (no per-slug topic).
-pub fn default_wire_native_metadata(
-    schema_type: &str,
-    slug: Option<&str>,
-) -> WireNativeMetadata {
+pub fn default_wire_native_metadata(schema_type: &str, slug: Option<&str>) -> WireNativeMetadata {
     // Resolve type + default tags. Unknown types fall back to the
     // generic "template" shape so the dispatcher never rejects a
     // creation path on an unrecognized schema — but the mapping table
@@ -1260,7 +1247,10 @@ wire:
 "#;
         let meta = WireNativeMetadata::from_canonical_yaml(yaml).unwrap();
         assert_eq!(meta.derived_from.len(), 2);
-        assert_eq!(meta.derived_from[0].ref_.as_deref(), Some("nightingale/77/3"));
+        assert_eq!(
+            meta.derived_from[0].ref_.as_deref(),
+            Some("nightingale/77/3")
+        );
         assert!(meta.derived_from[0].doc.is_none());
         assert_eq!(meta.derived_from[0].weight, 0.3);
         assert_eq!(meta.derived_from[1].doc.as_deref(), Some("wire-actions.md"));
@@ -1330,10 +1320,12 @@ wire:
 "###;
 
         let meta = WireNativeMetadata::from_canonical_yaml(yaml).unwrap_or_else(|e| {
-            panic!("canonical YAML parse failed: {e}\n\n\
+            panic!(
+                "canonical YAML parse failed: {e}\n\n\
                  This means a field in WireNativeMetadata does NOT \
                  match wire-native-documents.md byte-for-byte. Check \
-                 the field names against the canonical schema.");
+                 the field names against the canonical schema."
+            );
         });
 
         // Routing
@@ -1358,10 +1350,16 @@ wire:
 
         // Relationships
         assert_eq!(meta.derived_from.len(), 3);
-        assert_eq!(meta.derived_from[0].ref_.as_deref(), Some("nightingale/77/3"));
+        assert_eq!(
+            meta.derived_from[0].ref_.as_deref(),
+            Some("nightingale/77/3")
+        );
         assert_eq!(meta.derived_from[0].weight, 0.3);
         assert_eq!(meta.derived_from[1].doc.as_deref(), Some("wire-actions.md"));
-        assert_eq!(meta.derived_from[2].doc.as_deref(), Some("synthesis-primitives.md"));
+        assert_eq!(
+            meta.derived_from[2].doc.as_deref(),
+            Some("synthesis-primitives.md")
+        );
         for entry in &meta.derived_from {
             entry.validate().unwrap();
         }
@@ -1394,7 +1392,10 @@ wire:
         // Circle splits (must sum to 48 per canonical protocol rule)
         assert_eq!(meta.creator_split.len(), 2);
         let slot_sum: u32 = meta.creator_split.iter().map(|e| e.slots).sum();
-        assert_eq!(slot_sum, 48, "canonical example's creator_split must sum to 48");
+        assert_eq!(
+            slot_sum, 48,
+            "canonical example's creator_split must sum to 48"
+        );
         assert_eq!(meta.creator_split[0].operator, "playful-universe");
         assert_eq!(meta.creator_split[0].slots, 30);
         assert_eq!(meta.creator_split[1].operator, "partner-agent");
@@ -1407,7 +1408,10 @@ wire:
         // Decomposition
         assert_eq!(meta.sections.len(), 1);
         let section = meta.sections.get("## Economics").unwrap();
-        assert_eq!(section.contribution_type, Some(WireContributionType::Extraction));
+        assert_eq!(
+            section.contribution_type,
+            Some(WireContributionType::Extraction)
+        );
         assert_eq!(section.topics.as_ref().map(|t| t.len()), Some(2));
         assert_eq!(section.price, Some(3));
     }
@@ -1526,12 +1530,18 @@ wire:
             ("tier_routing", WireContributionType::Template),
             ("step_overrides", WireContributionType::Template),
             ("custom_prompts", WireContributionType::Template),
-            ("folder_ingestion_heuristics", WireContributionType::Template),
+            (
+                "folder_ingestion_heuristics",
+                WireContributionType::Template,
+            ),
             ("custom_chains", WireContributionType::Action),
             ("custom_chain", WireContributionType::Action),
             ("wire_discovery_weights", WireContributionType::Template),
             ("wire_auto_update_settings", WireContributionType::Template),
-            ("compute_participation_policy", WireContributionType::Template),
+            (
+                "compute_participation_policy",
+                WireContributionType::Template,
+            ),
             ("auto_update_policy", WireContributionType::Template),
             ("dispatch_policy", WireContributionType::Template),
             ("wire_update_polling", WireContributionType::Template),

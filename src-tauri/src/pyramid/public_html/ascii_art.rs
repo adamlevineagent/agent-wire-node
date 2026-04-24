@@ -82,9 +82,8 @@ pub async fn generate_banner_for_slug(
         let slug_info = crate::pyramid::db::get_slug(&conn, slug)
             .map_err(|e| format!("get_slug: {e}"))?
             .ok_or_else(|| format!("slug not found: {slug}"))?;
-        let nodes =
-            crate::pyramid::db::get_nodes_at_depth(&conn, slug, slug_info.max_depth)
-                .map_err(|e| format!("get_nodes_at_depth: {e}"))?;
+        let nodes = crate::pyramid::db::get_nodes_at_depth(&conn, slug, slug_info.max_depth)
+            .map_err(|e| format!("get_nodes_at_depth: {e}"))?;
         nodes
             .into_iter()
             .next()
@@ -112,8 +111,8 @@ pub async fn generate_banner_for_slug(
     // 4. hit check
     {
         let conn = state.reader.lock().await;
-        if let Some(existing) = lookup_head(&conn, slug, "banner")
-            .map_err(|e| format!("lookup_head: {e}"))?
+        if let Some(existing) =
+            lookup_head(&conn, slug, "banner").map_err(|e| format!("lookup_head: {e}"))?
         {
             if existing.source_hash == source_hash {
                 return Ok(existing.art_text);
@@ -137,16 +136,29 @@ pub async fn generate_banner_for_slug(
         safe_headline
     );
 
-    // 6. call via resolved model (from step 2b)
+    // walker-v3-completion Wave 7 hotfix: canonical dispatch via the unified
+    // path + model_override. Previously `call_model_direct` bypassed the
+    // walker entirely (direct HTTP POST) — silent skip of walker routing.
+    // Now goes through call_model_unified_with_options_and_ctx with
+    // ctx=None + model_override=resolved_model so the Wave 5 guard passes
+    // and the caller gets the same "pin this exact slug, no cascade"
+    // semantic via OpenRouter branch at line 3617's entry_model_override.
     let config = state.config.read().await.clone();
-    let raw = crate::pyramid::llm::call_model_direct(
+    let raw = crate::pyramid::llm::call_model_unified_with_options_and_ctx(
         &config,
-        &resolved_model,
+        None, // ephemeral one-shot banner gen; no cache
         system_prompt,
         &user_prompt,
+        0.7,
         800,
+        None,
+        crate::pyramid::llm::LlmCallOptions {
+            model_override: Some(resolved_model.clone()),
+            ..Default::default()
+        },
     )
     .await
+    .map(|resp| resp.content)
     .map_err(|e| format!("LLM call failed: {e}"))?;
 
     // 7. validate (post-hoc)
@@ -232,11 +244,7 @@ pub struct AsciiArtRow {
 }
 
 /// Return the current (unsuperseded) head row for `(slug, kind)`, if any.
-pub fn lookup_head(
-    conn: &Connection,
-    slug: &str,
-    kind: &str,
-) -> SqlResult<Option<AsciiArtRow>> {
+pub fn lookup_head(conn: &Connection, slug: &str, kind: &str) -> SqlResult<Option<AsciiArtRow>> {
     conn.query_row(
         "SELECT id, source_hash, art_text, model
            FROM pyramid_ascii_art
@@ -372,8 +380,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_too_tall() {
-        let tall: String =
-            (0..31).map(|_| "abc".to_string()).collect::<Vec<_>>().join("\n");
+        let tall: String = (0..31)
+            .map(|_| "abc".to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(validate_ascii(&tall).is_err());
     }
 

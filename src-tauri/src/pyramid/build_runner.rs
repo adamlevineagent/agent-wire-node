@@ -26,8 +26,7 @@ use super::question_decomposition::{
 };
 use super::slug;
 use super::types::{
-    BuildProgress, CharacterizationResult, ContentType, HandlePath, LayerEvent,
-    RemoteWebEdge,
+    BuildProgress, CharacterizationResult, ContentType, HandlePath, LayerEvent, RemoteWebEdge,
 };
 use super::vine_composition;
 use super::wire_import::RemotePyramidClient;
@@ -85,7 +84,10 @@ pub async fn check_absorption_rate_limit(
         let now = std::time::Instant::now();
 
         // --- Per-operator hourly rate limit ---
-        let hourly_entry = gate.hourly.entry(operator_id.to_string()).or_insert((0, now));
+        let hourly_entry = gate
+            .hourly
+            .entry(operator_id.to_string())
+            .or_insert((0, now));
         let hourly_elapsed = now.duration_since(hourly_entry.1);
 
         let (new_hourly_count, new_hourly_start) =
@@ -128,7 +130,10 @@ pub async fn check_absorption_rate_limit(
             };
 
         // Both checks passed — commit both increments atomically
-        gate.hourly.insert(operator_id.to_string(), (new_hourly_count, new_hourly_start));
+        gate.hourly.insert(
+            operator_id.to_string(),
+            (new_hourly_count, new_hourly_start),
+        );
         gate.daily = (new_daily_spend, new_daily_start);
     }
 
@@ -164,7 +169,18 @@ pub async fn run_build(
     write_tx: &mpsc::Sender<WriteOp>,
     layer_tx: Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
-    run_build_from(state, slug_name, 0, None, None, cancel, progress_tx, write_tx, layer_tx).await
+    run_build_from(
+        state,
+        slug_name,
+        0,
+        None,
+        None,
+        cancel,
+        progress_tx,
+        write_tx,
+        layer_tx,
+    )
+    .await
 }
 
 /// Run a build from a specific depth, reusing nodes below that depth.
@@ -181,9 +197,18 @@ pub async fn run_build_from(
     layer_tx: Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
     run_build_from_with_evidence_mode(
-        state, slug_name, from_depth, stop_after, force_from,
-        "deep", cancel, progress_tx, write_tx, layer_tx,
-    ).await
+        state,
+        slug_name,
+        from_depth,
+        stop_after,
+        force_from,
+        "deep",
+        cancel,
+        progress_tx,
+        write_tx,
+        layer_tx,
+    )
+    .await
 }
 
 /// Run a build from a specific depth with explicit evidence_mode control.
@@ -198,7 +223,12 @@ pub async fn run_build_from_with_evidence_mode(
     evidence_mode: &str,
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
-    write_tx: &mpsc::Sender<WriteOp>,
+    // walker-v3 W3a: `write_tx` was consumed by the retired
+    // `run_legacy_build` only — chain engine manages its own writer
+    // drain. Kept in the signature to preserve the public surface until
+    // downstream callers (parity.rs, dadbear_extend.rs, routes.rs,
+    // main.rs) can be updated in a separate pass.
+    _write_tx: &mpsc::Sender<WriteOp>,
     layer_tx: Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
     // ── 0. WS-CONCURRENCY (§15.16 races 1/3/7): serialize builds on the
@@ -293,9 +323,10 @@ pub async fn run_build_from_with_evidence_mode(
                     (
                         "What happened during this conversation? What was discussed, \
                          what decisions were made, how did the discussion evolve, \
-                         and what are the key takeaways?".to_string(),
-                        3u32,  // balanced granularity
-                        3u32,  // reasonable depth for conversations
+                         and what are the key takeaways?"
+                            .to_string(),
+                        3u32, // balanced granularity
+                        3u32, // reasonable depth for conversations
                     )
                 }
             }
@@ -324,8 +355,20 @@ pub async fn run_build_from_with_evidence_mode(
     }
 
     // ── 2. Check feature flags ───────────────────────────────────────────
+    //
+    // walker-v3 W3a: the `use_chain_engine: false` branch retired. The
+    // chain engine is the only supported dispatch path per plan §5.6.3;
+    // from_depth is now universally supported. `use_ir_executor` still
+    // toggles between the IR executor (ExecutionPlan compile → execute)
+    // and the chain executor. Configs that load as `use_chain_engine:
+    // false` are handled by the boot-time intervention modal (Phase 0a-2
+    // onboarding_state.chain_engine_enable_ack flow), not here.
+    // TODO(walker-v3 W3c): decide the fate of the use_chain_engine
+    // field on PyramidConfig — either (a) keep it for backward-compat
+    // serde and always treat it as true at runtime, or (b) delete the
+    // field entirely. W3c's field-deletion commit picks.
+    let _ = state.use_chain_engine.load(Ordering::Relaxed); // read-only; value ignored
     let use_ir = state.use_ir_executor.load(Ordering::Relaxed);
-    let use_chain = state.use_chain_engine.load(Ordering::Relaxed);
 
     let result = if use_ir {
         // IR executor path: compile chain to ExecutionPlan, execute via execute_plan
@@ -339,7 +382,7 @@ pub async fn run_build_from_with_evidence_mode(
         )
         .await
         .map(|(apex, failures)| (apex, failures, vec![]))
-    } else if use_chain {
+    } else {
         run_chain_build(
             state,
             slug_name,
@@ -352,22 +395,6 @@ pub async fn run_build_from_with_evidence_mode(
             layer_tx,
         )
         .await
-    } else {
-        if from_depth > 0 {
-            return Err(anyhow!(
-                "from_depth is only supported with the chain engine (set use_chain_engine: true)"
-            ));
-        }
-        run_legacy_build(
-            state,
-            slug_name,
-            &content_type,
-            cancel,
-            progress_tx,
-            write_tx,
-        )
-        .await
-        .map(|(apex, failures)| (apex, failures, vec![]))
     };
 
     run_post_build_hooks(state, slug_name, &result).await;
@@ -414,7 +441,8 @@ async fn run_post_build_hooks(
                 let detail = serde_json::json!({
                     "reason": "base_slug_rebuilt",
                     "source_slug": slug_owned,
-                }).to_string();
+                })
+                .to_string();
                 let mut notified = 0usize;
                 for referrer in &referrers {
                     // Canonical write: observation event (old WAL INSERT removed)
@@ -552,9 +580,15 @@ async fn run_post_build_hooks(
             // executions) not network_fell_back_local attempts, per the
             // plan §4.7 metadata semantics (total_llm_calls = network +
             // local + openrouter).
-            let (network_calls, distinct_providers, avg_latency_ms,
-                 total_credits_spent, local_calls, openrouter_calls,
-                 total_llm_calls) = match &resolved_build_id {
+            let (
+                network_calls,
+                distinct_providers,
+                avg_latency_ms,
+                total_credits_spent,
+                local_calls,
+                openrouter_calls,
+                total_llm_calls,
+            ) = match &resolved_build_id {
                 Some(bid) => {
                     let sql = "
                         SELECT
@@ -577,15 +611,17 @@ async fn run_post_build_hooks(
                         FROM pyramid_compute_events
                         WHERE slug = ?1 AND build_id = ?2
                     ";
-                    match conn.query_row(
-                        sql,
-                        rusqlite::params![slug_owned, bid],
-                        |r| Ok((
-                            r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?,
-                            r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?,
+                    match conn.query_row(sql, rusqlite::params![slug_owned, bid], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, f64>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, i64>(4)?,
+                            r.get::<_, i64>(5)?,
                             r.get::<_, i64>(6)?,
-                        )),
-                    ) {
+                        ))
+                    }) {
                         Ok(t) => t,
                         Err(e) => {
                             tracing::warn!(
@@ -608,7 +644,8 @@ async fn run_post_build_hooks(
                 .unwrap_or_else(|| format!("{}-no-events", slug_owned));
             let job_path = format!(
                 "{}:{}",
-                super::compute_chronicle::SOURCE_NETWORK, build_id_for_event
+                super::compute_chronicle::SOURCE_NETWORK,
+                build_id_for_event
             );
             let chronicle_ctx = super::compute_chronicle::ChronicleEventContext::minimal(
                 &job_path,
@@ -797,8 +834,19 @@ async fn run_chain_build(
         "starting chain engine build"
     );
 
-    chain_executor::execute_chain_from(state, &chain, slug_name, from_depth, stop_after, force_from, cancel, progress_tx, layer_tx, None)
-        .await
+    chain_executor::execute_chain_from(
+        state,
+        &chain,
+        slug_name,
+        from_depth,
+        stop_after,
+        force_from,
+        cancel,
+        progress_tx,
+        layer_tx,
+        None,
+    )
+    .await
 }
 
 /// IR executor path: load chain YAML, compile to ExecutionPlan, execute via execute_plan.
@@ -851,92 +899,16 @@ async fn run_ir_build(
     chain_executor::execute_plan(state, &plan, slug_name, from_depth, cancel, progress_tx).await
 }
 
-/// Legacy path: dispatch to the old build_conversation/build_code/build_docs.
-async fn run_legacy_build(
-    state: &PyramidState,
-    slug_name: &str,
-    content_type: &ContentType,
-    cancel: &CancellationToken,
-    progress_tx: Option<mpsc::Sender<BuildProgress>>,
-    write_tx: &mpsc::Sender<WriteOp>,
-) -> Result<(String, i32)> {
-    // Phase 12 verifier fix: attach cache_access so build.rs retrofit
-    // sites reach the step cache.
-    let llm_config = state
-        .llm_config_with_cache(slug_name, &format!("legacy-build-{}", slug_name))
-        .await;
-
-    // The legacy build functions require a progress_tx reference; create a
-    // dummy one if the caller didn't supply one.
-    let owned_tx;
-    let ptx: &mpsc::Sender<BuildProgress> = match progress_tx {
-        Some(ref tx) => tx,
-        None => {
-            let (tx, mut rx) = mpsc::channel::<BuildProgress>(16);
-            // Spawn a drain so the channel doesn't block
-            tokio::spawn(async move { while rx.recv().await.is_some() {} });
-            owned_tx = tx;
-            &owned_tx
-        }
-    };
-
-    let failures = match content_type {
-        ContentType::Conversation => {
-            build::build_conversation(
-                state.reader.clone(),
-                write_tx,
-                &llm_config,
-                slug_name,
-                cancel,
-                ptx,
-            )
-            .await?
-        }
-        ContentType::Code => {
-            build::build_code(
-                state.reader.clone(),
-                write_tx,
-                &llm_config,
-                slug_name,
-                cancel,
-                ptx,
-            )
-            .await?
-        }
-        ContentType::Document => {
-            build::build_docs(
-                state.reader.clone(),
-                write_tx,
-                &llm_config,
-                slug_name,
-                cancel,
-                ptx,
-            )
-            .await?
-        }
-        ContentType::Vine => {
-            // Phase 16: the legacy path has no standalone vine builder.
-            // Vines are always dispatched through the chain engine via the
-            // topical-vine chain, regardless of the legacy/IR/chain flags.
-            // Delegate to `build::build_topical_vine`, which loads the
-            // topical-vine chain YAML and runs it through
-            // `chain_executor::execute_chain_from` — exactly the behaviour
-            // `run_chain_build` uses for the non-legacy path, but packaged
-            // behind a stable entry point so future callers (including the
-            // `vine.rs::run_build_pipeline` fallback arm) can share one
-            // implementation.
-            let failures = build::build_topical_vine(state, slug_name, cancel, ptx).await?;
-            return Ok(("topical-vine".to_string(), failures));
-        }
-        ContentType::Question => {
-            return Err(anyhow!(
-                "Question builds use the question-driven build endpoint"
-            ));
-        }
-    };
-
-    Ok(("legacy".to_string(), failures))
-}
+// walker-v3 W3a: `run_legacy_build` retired. The chain engine is the
+// only supported dispatch path per plan §5.6.3; the `use_chain_engine:
+// false` branch in `run_build_from_with_evidence_mode` no longer exists
+// and this function had no other callers. Legacy content-type
+// dispatchers (`build_conversation` / `build_code` / `build_docs`) and
+// their helpers (`build_l1_pairing`, `build_threads_layer`,
+// `build_upper_layers`, `flatten_analysis`, `extract_import_graph`,
+// `cluster_by_imports`, `truncate_text`, `get_resume_state`) were
+// deleted with it; vines still route through `build::build_topical_vine`
+// which is a chain-engine entry point.
 
 /// Decomposed question build path: decompose apex question → question tree →
 /// QuestionSet → IR → execute.
@@ -1023,8 +995,8 @@ pub async fn run_decomposed_build(
             // For question pyramids, use the base pyramid's L0 nodes
             let l0_fallback = {
                 let conn = state.reader.lock().await;
-                let existing_l0 = db::get_nodes_at_depth(&conn, &effective_l0_slug, 0)
-                    .unwrap_or_default();
+                let existing_l0 =
+                    db::get_nodes_at_depth(&conn, &effective_l0_slug, 0).unwrap_or_default();
                 if existing_l0.is_empty() {
                     None
                 } else {
@@ -1086,21 +1058,39 @@ pub async fn run_decomposed_build(
     // These params become accessible as $apex_question, $granularity, etc.
     // in chain steps via ChainContext.initial_params
     let mut initial_context: HashMap<String, serde_json::Value> = HashMap::new();
-    initial_context.insert("apex_question".to_string(), serde_json::json!(apex_question));
+    initial_context.insert(
+        "apex_question".to_string(),
+        serde_json::json!(apex_question),
+    );
     initial_context.insert("granularity".to_string(), serde_json::json!(granularity));
     initial_context.insert("max_depth".to_string(), serde_json::json!(max_depth));
     initial_context.insert("from_depth".to_string(), serde_json::json!(from_depth));
     initial_context.insert("content_type".to_string(), serde_json::json!(ct_str));
-    initial_context.insert("audience".to_string(), serde_json::json!(characterization_result.audience));
-    initial_context.insert("characterize".to_string(), serde_json::json!(format!(
-        "Material Profile: {}\nAudience: {}\nTone: {}",
-        characterization_result.material_profile,
-        characterization_result.audience,
-        characterization_result.tone
-    )));
-    initial_context.insert("is_cross_slug".to_string(), serde_json::json!(is_cross_slug));
-    initial_context.insert("referenced_slugs".to_string(), serde_json::json!(referenced_slugs));
-    initial_context.insert("evidence_mode".to_string(), serde_json::json!(evidence_mode));
+    initial_context.insert(
+        "audience".to_string(),
+        serde_json::json!(characterization_result.audience),
+    );
+    initial_context.insert(
+        "characterize".to_string(),
+        serde_json::json!(format!(
+            "Material Profile: {}\nAudience: {}\nTone: {}",
+            characterization_result.material_profile,
+            characterization_result.audience,
+            characterization_result.tone
+        )),
+    );
+    initial_context.insert(
+        "is_cross_slug".to_string(),
+        serde_json::json!(is_cross_slug),
+    );
+    initial_context.insert(
+        "referenced_slugs".to_string(),
+        serde_json::json!(referenced_slugs),
+    );
+    initial_context.insert(
+        "evidence_mode".to_string(),
+        serde_json::json!(evidence_mode),
+    );
 
     // ── 6. Generate build_id and record build start ─────────────────
     // Create a build_id up front so that if the chain fails BEFORE
@@ -1139,8 +1129,8 @@ pub async fn run_decomposed_build(
         &chain,
         slug_name,
         from_depth,
-        None,  // stop_after
-        None,  // force_from
+        None, // stop_after
+        None, // force_from
         cancel,
         progress_tx,
         layer_tx,
@@ -1262,6 +1252,10 @@ pub async fn preview_decomposed_build(
         folder_map: decomp_context,
         chains_dir: Some(state.chains_dir.clone()),
         audience: None,
+        model_tier: "max".to_string(),
+        temperature: state.operational.tier1.decomposition_temperature,
+        max_tokens: state.operational.tier1.decomposition_max_tokens,
+        sibling_review_max_tokens: state.operational.tier1.synthesis_prompts_max_tokens,
     };
 
     // Phase 12 verifier fix: attach cache_access so question_decomposition
@@ -1274,6 +1268,7 @@ pub async fn preview_decomposed_build(
         &llm_config,
         &state.operational.tier1,
         &state.operational.tier2,
+        None,
     )
     .await?;
 

@@ -337,7 +337,10 @@ fn rule_to_decision(
             TriageDecision::Answer { model_tier }
         }
         "defer" => TriageDecision::Defer {
-            check_interval: rule.check_interval.clone().unwrap_or_else(|| "30d".to_string()),
+            check_interval: rule
+                .check_interval
+                .clone()
+                .unwrap_or_else(|| "30d".to_string()),
             triage_reason: format!("matched rule: {}", rule.condition),
         },
         "skip" => TriageDecision::Skip {
@@ -380,11 +383,7 @@ mod tests {
         }
     }
 
-    fn facts(
-        is_first: bool,
-        is_stale: bool,
-        has_signals: bool,
-    ) -> TriageFacts<'static> {
+    fn facts(is_first: bool, is_stale: bool, has_signals: bool) -> TriageFacts<'static> {
         // Leak for simpler test construction. In production the
         // facts hold real borrows from the caller's stack.
         let q: &'static LayerQuestion = Box::leak(Box::new(sample_question()));
@@ -424,11 +423,7 @@ mod tests {
         let f = facts(true, false, true);
         // (first_build AND has_demand_signals) OR stale_check
         assert!(
-            evaluate_condition(
-                "(first_build AND has_demand_signals) OR stale_check",
-                &f
-            )
-            .unwrap()
+            evaluate_condition("(first_build AND has_demand_signals) OR stale_check", &f).unwrap()
         );
         // first_build AND NOT stale_check
         assert!(evaluate_condition("first_build AND NOT stale_check", &f).unwrap());
@@ -442,9 +437,7 @@ mod tests {
         // f.question.layer is 1 → target_node_depth = 1
         assert!(evaluate_condition("depth == 1", &f).unwrap());
         assert!(!evaluate_condition("depth == 0", &f).unwrap());
-        assert!(
-            evaluate_condition("stale_check AND depth == 1", &f).unwrap()
-        );
+        assert!(evaluate_condition("stale_check AND depth == 1", &f).unwrap());
     }
 
     #[test]

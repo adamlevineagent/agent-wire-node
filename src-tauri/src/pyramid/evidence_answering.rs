@@ -27,7 +27,7 @@ use rusqlite;
 use super::db;
 use super::llm::{self, AuditContext, LlmConfig};
 use super::question_decomposition::render_prompt_template;
-use super::step_context::{compute_prompt_hash, StepContext};
+use super::step_context::make_step_ctx_from_llm_config;
 use super::types::{
     AnswerBatchResult, AnsweredNode, CandidateMap, EvidenceLink, EvidenceSet, EvidenceVerdict,
     FailedQuestion, LayerQuestion, PyramidNode,
@@ -142,9 +142,15 @@ pub async fn pre_map_layer(
     // adaptively dehydrating oversized items (drop topics.current → distilled → topics).
     // Small items keep full content. Only outliers get stripped.
     let dehydrate_cascade = vec![
-        super::chain_engine::DehydrateStep { drop: "topics.current".to_string() },
-        super::chain_engine::DehydrateStep { drop: "distilled".to_string() },
-        super::chain_engine::DehydrateStep { drop: "topics".to_string() },
+        super::chain_engine::DehydrateStep {
+            drop: "topics.current".to_string(),
+        },
+        super::chain_engine::DehydrateStep {
+            drop: "distilled".to_string(),
+        },
+        super::chain_engine::DehydrateStep {
+            drop: "topics".to_string(),
+        },
     ];
 
     let budget = ops.tier2.pre_map_prompt_budget;
@@ -241,22 +247,28 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
                 }
                 if let Some(topics) = n.get("topics").and_then(|v| v.as_array()) {
                     if !topics.is_empty() {
-                        let topic_strs: Vec<String> = topics.iter().map(|t| {
-                            let mut s = format!("      name: \"{}\"", t["name"].as_str().unwrap_or(""));
-                            if let Some(summary) = t.get("summary").and_then(|v| v.as_str()) {
-                                s.push_str(&format!(", summary: \"{}\"", summary));
-                            }
-                            if let Some(current) = t.get("current").and_then(|v| v.as_str()) {
-                                s.push_str(&format!(", current: \"{}\"", current));
-                            }
-                            if let Some(entities) = t.get("entities").and_then(|v| v.as_array()) {
-                                let ents: Vec<&str> = entities.iter().filter_map(|e| e.as_str()).collect();
-                                if !ents.is_empty() {
-                                    s.push_str(&format!(", entities: [{}]", ents.join(", ")));
+                        let topic_strs: Vec<String> = topics
+                            .iter()
+                            .map(|t| {
+                                let mut s =
+                                    format!("      name: \"{}\"", t["name"].as_str().unwrap_or(""));
+                                if let Some(summary) = t.get("summary").and_then(|v| v.as_str()) {
+                                    s.push_str(&format!(", summary: \"{}\"", summary));
                                 }
-                            }
-                            s
-                        }).collect();
+                                if let Some(current) = t.get("current").and_then(|v| v.as_str()) {
+                                    s.push_str(&format!(", current: \"{}\"", current));
+                                }
+                                if let Some(entities) = t.get("entities").and_then(|v| v.as_array())
+                                {
+                                    let ents: Vec<&str> =
+                                        entities.iter().filter_map(|e| e.as_str()).collect();
+                                    if !ents.is_empty() {
+                                        s.push_str(&format!(", entities: [{}]", ents.join(", ")));
+                                    }
+                                }
+                                s
+                            })
+                            .collect();
                         parts.push(format!("    topics:\n{}", topic_strs.join("\n")));
                     }
                 }
@@ -266,7 +278,12 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
             .join("\n");
 
         let batch_label = if num_batches > 1 {
-            format!(" (batch {} of {}, {} nodes)", batch_idx + 1, num_batches, batch_items.len())
+            format!(
+                " (batch {} of {}, {} nodes)",
+                batch_idx + 1,
+                num_batches,
+                batch_items.len()
+            )
         } else {
             String::new()
         };
@@ -276,30 +293,33 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
             questions_text, nodes_text
         );
 
-        // Phase 18b: build a cache-usable StepContext from llm_config's
-        // cache_access (when available) and thread it together with the
-        // optional AuditContext through the unified entry point. This
-        // collapses the previous "audit branch (no cache) vs non-audit
-        // branch (with cache)" split into a single call where audited
-        // builds also benefit from the Phase 6 content-addressable
-        // cache. Matches the Phase 18b L8 retrofit pattern.
-        let pre_map_ctx = llm_config.cache_access.as_ref().map(|ca| {
-            let mut c = StepContext::new(
-                ca.slug.clone(),
-                ca.build_id.clone(),
-                format!("evidence_pre_map_{}", batch_idx),
-                "evidence_pre_map",
-                0,
-                Some(batch_idx as i64),
-                ca.db_path.to_string(),
-            )
-            .with_model_resolution("fast_extract", llm_config.primary_model.clone())
-            .with_prompt_hash(compute_prompt_hash(&system_prompt));
-            if let Some(bus) = &ca.bus {
-                c = c.with_bus(bus.clone());
+        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+        // Previously: manual StepContext::new + with_model_resolution("fast_extract")
+        // without with_dispatch_decision_if_available → Decision=None → walker
+        // skipped every provider silently. Now: canonical helper with slot=
+        // "evidence_loop" (Rust rename of "fast_extract"; first-class walker
+        // tier per bundled walker_provider_openrouter → xiaomi/mimo-v2.5-pro).
+        let pre_map_resolved = llm_config
+            .provider_registry
+            .as_ref()
+            .and_then(|reg| reg.resolve_tier("evidence_loop", None, None, None).ok());
+        let pre_map_ctx = match &pre_map_resolved {
+            Some(resolved) => {
+                make_step_ctx_from_llm_config(
+                    llm_config,
+                    &format!("evidence_pre_map_{}", batch_idx),
+                    "evidence_pre_map",
+                    0,
+                    Some(batch_idx as i64),
+                    &system_prompt,
+                    "evidence_loop",
+                    Some(&resolved.tier.model_id),
+                    Some(&resolved.provider.id),
+                )
+                .await
             }
-            c
-        });
+            None => None,
+        };
         let pre_map_audit_ctx = audit.map(|ctx| AuditContext {
             call_purpose: format!("pre_map_batch_{}", batch_idx),
             step_name: "evidence_pre_map".to_string(),
@@ -333,10 +353,16 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
                     merged_mappings.entry(q_id).or_default().extend(candidates);
                 }
             } else {
-                warn!(batch = batch_idx, "Failed to parse pre-mapping batch response");
+                warn!(
+                    batch = batch_idx,
+                    "Failed to parse pre-mapping batch response"
+                );
             }
         } else {
-            warn!(batch = batch_idx, "Failed to extract JSON from pre-mapping batch response");
+            warn!(
+                batch = batch_idx,
+                "Failed to extract JSON from pre-mapping batch response"
+            );
         }
     }
 
@@ -366,7 +392,9 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
         "pre-mapping complete"
     );
 
-    Ok(CandidateMap { mappings: merged_mappings })
+    Ok(CandidateMap {
+        mappings: merged_mappings,
+    })
 }
 
 /// Internal deserialization target for the pre-mapping LLM response.
@@ -454,7 +482,7 @@ pub async fn answer_questions(
                 step_name: step_name_for_events.clone(),
                 question_count: questions.len() as i64,
                 action: "triage".to_string(),
-                model_tier: "fast_extract".to_string(),
+                model_tier: "evidence_loop".to_string(),
             },
         });
     }
@@ -762,7 +790,8 @@ async fn answer_single_question(
                 depth: question.layer,
                 chunk_index: None,
                 headline: question.question_text.clone(),
-                distilled: "Awaiting evidence — no candidates mapped during pre-mapping.".to_string(),
+                distilled: "Awaiting evidence — no candidates mapped during pre-mapping."
+                    .to_string(),
                 topics: vec![],
                 corrections: vec![],
                 decisions: vec![],
@@ -880,7 +909,11 @@ Respond with ONLY a JSON object:
     // Estimate total evidence tokens
     let total_evidence_tokens: usize = candidate_payloads
         .iter()
-        .map(|p| serde_json::to_string(p).map(|s| s.len().div_ceil(4)).unwrap_or(0))
+        .map(|p| {
+            serde_json::to_string(p)
+                .map(|s| s.len().div_ceil(4))
+                .unwrap_or(0)
+        })
         .sum();
 
     let answer_budget = ops.tier2.answer_prompt_budget;
@@ -901,9 +934,15 @@ Respond with ONLY a JSON object:
 
     // ── Dehydrate cascade for oversized individual candidates ───────────
     let dehydrate_cascade = vec![
-        super::chain_engine::DehydrateStep { drop: "topics.current".to_string() },
-        super::chain_engine::DehydrateStep { drop: "distilled".to_string() },
-        super::chain_engine::DehydrateStep { drop: "topics".to_string() },
+        super::chain_engine::DehydrateStep {
+            drop: "topics.current".to_string(),
+        },
+        super::chain_engine::DehydrateStep {
+            drop: "distilled".to_string(),
+        },
+        super::chain_engine::DehydrateStep {
+            drop: "topics".to_string(),
+        },
     ];
 
     let batches = if needs_batching {
@@ -944,14 +983,18 @@ Respond with ONLY a JSON object:
                 }
                 if let Some(topics) = n.get("topics").and_then(|v| v.as_array()) {
                     if !topics.is_empty() {
-                        let topic_str: String = topics.iter().map(|t| {
-                            let name = t["name"].as_str().unwrap_or("");
-                            if let Some(current) = t.get("current").and_then(|v| v.as_str()) {
-                                format!("{}: {}", name, current)
-                            } else {
-                                name.to_string()
-                            }
-                        }).collect::<Vec<_>>().join("; ");
+                        let topic_str: String = topics
+                            .iter()
+                            .map(|t| {
+                                let name = t["name"].as_str().unwrap_or("");
+                                if let Some(current) = t.get("current").and_then(|v| v.as_str()) {
+                                    format!("{}: {}", name, current)
+                                } else {
+                                    name.to_string()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ");
                         parts.push_str(&format!("Topics: {}\n", topic_str));
                     }
                 }
@@ -961,7 +1004,12 @@ Respond with ONLY a JSON object:
             .join("\n");
 
         let batch_label = if num_batches > 1 {
-            format!(" (batch {} of {}, {} candidates)", batch_idx + 1, num_batches, batch_items.len())
+            format!(
+                " (batch {} of {}, {} candidates)",
+                batch_idx + 1,
+                num_batches,
+                batch_items.len()
+            )
         } else {
             String::new()
         };
@@ -984,25 +1032,35 @@ Respond with ONLY a JSON object:
         // builds also benefit from the Phase 6 content-addressable
         // cache. Audited cache hits write a `cache_hit = 1` audit row
         // so the audit trail stays contiguous.
-        let answer_ctx = llm_config.cache_access.as_ref().map(|ca| {
-            let mut c = StepContext::new(
-                ca.slug.clone(),
-                ca.build_id.clone(),
-                format!("evidence_answer_batch_{}", batch_idx),
-                "evidence_answer",
-                question.layer as i64,
-                Some(batch_idx as i64),
-                ca.db_path.to_string(),
-            )
-            .with_model_resolution("fast_extract", llm_config.primary_model.clone())
-            .with_prompt_hash(compute_prompt_hash(&system_prompt));
-            if let Some(bus) = &ca.bus {
-                c = c.with_bus(bus.clone());
+        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+        let answer_resolved = llm_config
+            .provider_registry
+            .as_ref()
+            .and_then(|reg| reg.resolve_tier("evidence_loop", None, None, None).ok());
+        let answer_ctx = match &answer_resolved {
+            Some(resolved) => {
+                make_step_ctx_from_llm_config(
+                    llm_config,
+                    &format!("evidence_answer_batch_{}", batch_idx),
+                    "evidence_answer",
+                    question.layer as i64,
+                    Some(batch_idx as i64),
+                    &system_prompt,
+                    "evidence_loop",
+                    Some(&resolved.tier.model_id),
+                    Some(&resolved.provider.id),
+                )
+                .await
             }
-            c
+            None => None,
+        };
+        let answer_audit_ctx = audit.map(|ctx| {
+            ctx.for_node(
+                &node_id,
+                &format!("answer_batch_{}", batch_idx),
+                question.layer as i64,
+            )
         });
-        let answer_audit_ctx = audit
-            .map(|ctx| ctx.for_node(&node_id, &format!("answer_batch_{}", batch_idx), question.layer as i64));
         let response = llm::call_model_unified_with_audit_and_ctx(
             llm_config,
             answer_ctx.as_ref(),
@@ -1051,11 +1109,20 @@ Respond with ONLY a JSON object:
             num_batches
         );
         merge_answer_batches(
-            question, &batch_results, &audience_block,
-            synthesis_guidance, &content_type_block,
-            llm_config, answer_temperature, answer_max_tokens,
-            chains_dir, audit, &node_id, ops,
-        ).await?
+            question,
+            &batch_results,
+            &audience_block,
+            synthesis_guidance,
+            &content_type_block,
+            llm_config,
+            answer_temperature,
+            answer_max_tokens,
+            chains_dir,
+            audit,
+            &node_id,
+            ops,
+        )
+        .await?
     };
 
     // ── Build PyramidNode ───────────────────────────────────────────────
@@ -1174,6 +1241,7 @@ Respond with ONLY a JSON object:
         terms,
         dead_ends: raw.dead_ends.unwrap_or_default(),
         self_prompt: question.question_text.clone(),
+        source_question_id: Some(question.question_id.clone()),
         children,
         parent_id: None,
         superseded_by: None,
@@ -1294,11 +1362,21 @@ async fn merge_answer_batches(
     // sees node IDs and verdict labels even after dehydration so it can
     // reconcile by reference.
     let dehydrate_cascade = vec![
-        super::chain_engine::DehydrateStep { drop: "verdicts.reason".to_string() },
-        super::chain_engine::DehydrateStep { drop: "topics.current".to_string() },
-        super::chain_engine::DehydrateStep { drop: "verdicts".to_string() },
-        super::chain_engine::DehydrateStep { drop: "topics".to_string() },
-        super::chain_engine::DehydrateStep { drop: "distilled".to_string() },
+        super::chain_engine::DehydrateStep {
+            drop: "verdicts.reason".to_string(),
+        },
+        super::chain_engine::DehydrateStep {
+            drop: "topics.current".to_string(),
+        },
+        super::chain_engine::DehydrateStep {
+            drop: "verdicts".to_string(),
+        },
+        super::chain_engine::DehydrateStep {
+            drop: "topics".to_string(),
+        },
+        super::chain_engine::DehydrateStep {
+            drop: "distilled".to_string(),
+        },
     ];
 
     // Overhead: question text + system prompt + JSON syntax slack
@@ -1318,7 +1396,11 @@ async fn merge_answer_batches(
     if packed.len() == 1 {
         let items_in_batch = match packed.into_iter().next() {
             Some(Value::Array(items)) => items,
-            _ => return Err(anyhow!("merge: batch_items_by_tokens returned malformed batch")),
+            _ => {
+                return Err(anyhow!(
+                    "merge: batch_items_by_tokens returned malformed batch"
+                ))
+            }
         };
         return single_merge_call(
             question,
@@ -1453,26 +1535,30 @@ Respond with ONLY a JSON object:
         serde_json::to_string_pretty(items).unwrap_or_default(),
     );
 
-    // Phase 18b L8 retrofit: cache + audit unified path. See pre_map
-    // and answer_batch sites above for the rationale.
-    let merge_ctx = llm_config.cache_access.as_ref().map(|ca| {
-        let mut c = StepContext::new(
-            ca.slug.clone(),
-            ca.build_id.clone(),
-            "evidence_answer_merge",
-            "evidence_answer_merge",
-            question.layer as i64,
-            None,
-            ca.db_path.to_string(),
-        )
-        .with_model_resolution("fast_extract", llm_config.primary_model.clone())
-        .with_prompt_hash(compute_prompt_hash(&merge_system));
-        if let Some(bus) = &ca.bus {
-            c = c.with_bus(bus.clone());
+    // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+    let merge_resolved = llm_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("evidence_loop", None, None, None).ok());
+    let merge_ctx = match &merge_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                llm_config,
+                "evidence_answer_merge",
+                "evidence_answer_merge",
+                question.layer as i64,
+                None,
+                &merge_system,
+                "evidence_loop",
+                Some(&resolved.tier.model_id),
+                Some(&resolved.provider.id),
+            )
+            .await
         }
-        c
-    });
-    let merge_audit_ctx = audit.map(|ctx| ctx.for_node(node_id, "answer_merge", question.layer as i64));
+        None => None,
+    };
+    let merge_audit_ctx =
+        audit.map(|ctx| ctx.for_node(node_id, "answer_merge", question.layer as i64));
     let response = llm::call_model_unified_with_audit_and_ctx(
         llm_config,
         merge_ctx.as_ref(),
@@ -1663,31 +1749,30 @@ Respond with ONLY a JSON object:
     let mut all_nodes = Vec::new();
 
     for (file_path, content) in source_candidates {
-        let user_prompt = format!(
-            "SOURCE FILE: {}\n\n{}",
-            file_path,
-            content
-        );
+        let user_prompt = format!("SOURCE FILE: {}\n\n{}", file_path, content);
 
-        // Phase 18b L8 retrofit: cache + audit unified path. See pre_map
-        // and answer_batch sites above for the rationale.
-        let target_ctx = llm_config.cache_access.as_ref().map(|ca| {
-            let mut c = StepContext::new(
-                ca.slug.clone(),
-                ca.build_id.clone(),
-                "targeted_reexamination",
-                "evidence_answer",
-                0,
-                None,
-                ca.db_path.to_string(),
-            )
-            .with_model_resolution("fast_extract", llm_config.primary_model.clone())
-            .with_prompt_hash(compute_prompt_hash(&system_prompt));
-            if let Some(bus) = &ca.bus {
-                c = c.with_bus(bus.clone());
+        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+        let target_resolved = llm_config
+            .provider_registry
+            .as_ref()
+            .and_then(|reg| reg.resolve_tier("evidence_loop", None, None, None).ok());
+        let target_ctx = match &target_resolved {
+            Some(resolved) => {
+                make_step_ctx_from_llm_config(
+                    llm_config,
+                    "targeted_reexamination",
+                    "evidence_answer",
+                    0,
+                    None,
+                    &system_prompt,
+                    "evidence_loop",
+                    Some(&resolved.tier.model_id),
+                    Some(&resolved.provider.id),
+                )
+                .await
             }
-            c
-        });
+            None => None,
+        };
         let target_audit_ctx = audit.map(|ctx| AuditContext {
             call_purpose: "gap_answer".to_string(),
             step_name: "targeted_reexamination".to_string(),
@@ -1853,12 +1938,18 @@ pub fn resolve_files_for_gap(
 
         // ── 3. Score each by keyword overlap (headline + distilled + topics) ──
         for node in &canonical {
-            let topics_text = node.topics.iter()
+            let topics_text = node
+                .topics
+                .iter()
                 .map(|t| format!("{} {}", t.name, t.current))
                 .collect::<Vec<_>>()
                 .join(" ");
-            let text = format!("{} {} {}", node.headline, node.distilled, topics_text).to_lowercase();
-            let score = keywords.iter().filter(|kw| text.contains(kw.as_str())).count();
+            let text =
+                format!("{} {} {}", node.headline, node.distilled, topics_text).to_lowercase();
+            let score = keywords
+                .iter()
+                .filter(|kw| text.contains(kw.as_str()))
+                .count();
             if score > 0 {
                 scored_nodes.push((base_slug.clone(), node.id.clone(), score));
             }
@@ -2141,8 +2232,7 @@ pub fn run_triage_gate(
     // q-hash → node-id map is added.
     let slug_has_demand_signals = policy.demand_signals.iter().any(|rule| {
         let window = normalize_window(&rule.window);
-        let sum =
-            db::sum_slug_demand_weight(&conn, slug, &rule.r#type, &window).unwrap_or(0.0);
+        let sum = db::sum_slug_demand_weight(&conn, slug, &rule.r#type, &window).unwrap_or(0.0);
         sum >= rule.threshold
     });
 
@@ -2169,7 +2259,7 @@ pub fn run_triage_gate(
                     "triage DSL evaluation failed; defaulting to Answer"
                 );
                 TriageDecision::Answer {
-                    model_tier: "fast_extract".to_string(),
+                    model_tier: "evidence_loop".to_string(),
                 }
             }
         };
@@ -2254,9 +2344,7 @@ fn normalize_window(window: &str) -> String {
         return w.to_string();
     }
     // Short form: "7d" → "-7 days"; "14d" → "-14 days"; "1h" → "-1 hours".
-    let (num_part, unit_part): (String, String) = w
-        .chars()
-        .partition(|c| c.is_ascii_digit());
+    let (num_part, unit_part): (String, String) = w.chars().partition(|c| c.is_ascii_digit());
     let n: i64 = num_part.parse().unwrap_or(14);
     let unit = match unit_part.as_str() {
         "d" => "days",

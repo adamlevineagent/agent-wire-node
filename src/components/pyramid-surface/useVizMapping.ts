@@ -7,9 +7,9 @@
  * uses to decide how to visualize each build step.
  */
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import type { VizPrimitive } from './types';
+import type { VizPrimitive, VizStepConfig } from './types';
 
 /** Default primitive inference from chain step primitive type.
  *
@@ -44,10 +44,7 @@ interface ChainStep {
     name: string;
     primitive?: string;
     mode?: string;
-    viz?: {
-        type?: VizPrimitive;
-        [key: string]: unknown;
-    };
+    viz?: Partial<VizStepConfig>;
 }
 
 interface ChainResponse {
@@ -62,6 +59,8 @@ interface ChainResponse {
 }
 
 export interface VizMapping {
+    /** Look up the full YAML viz metadata for a given step name */
+    getVizConfig(stepName: string): VizStepConfig;
     /** Look up the viz primitive for a given step name */
     getVizPrimitive(stepName: string): VizPrimitive;
     /** Whether the chain has been loaded */
@@ -84,31 +83,36 @@ export function useVizMapping(slug: string, _isBuilding?: boolean): VizMapping {
 
     // Build the step→viz mapping
     const stepMap = useMemo(() => {
-        const map = new Map<string, VizPrimitive>();
+        const map = new Map<string, VizStepConfig>();
         if (!chainData?.chain?.steps) return map;
 
         for (const step of chainData.chain.steps) {
             // Explicit viz override in chain YAML takes precedence
             if (step.viz?.type) {
-                map.set(step.name, step.viz.type);
+                map.set(step.name, { ...step.viz, type: step.viz.type });
                 continue;
             }
             // Infer from primitive type
             const primitive = step.primitive ?? step.mode;
             if (primitive && PRIMITIVE_TO_VIZ[primitive]) {
-                map.set(step.name, PRIMITIVE_TO_VIZ[primitive]);
+                map.set(step.name, { type: PRIMITIVE_TO_VIZ[primitive] });
             } else {
-                map.set(step.name, 'progress_only');
+                map.set(step.name, { type: 'progress_only' });
             }
         }
         return map;
     }, [chainData]);
 
-    const getVizPrimitive = (stepName: string): VizPrimitive => {
-        return stepMap.get(stepName) ?? 'progress_only';
-    };
+    const getVizConfig = useCallback((stepName: string): VizStepConfig => {
+        return stepMap.get(stepName) ?? { type: 'progress_only' };
+    }, [stepMap]);
+
+    const getVizPrimitive = useCallback((stepName: string): VizPrimitive => {
+        return getVizConfig(stepName).type;
+    }, [getVizConfig]);
 
     return {
+        getVizConfig,
         getVizPrimitive,
         loaded: chainData !== null,
         expectedMaxDepth: chainData?.max_depth ?? null,

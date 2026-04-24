@@ -59,21 +59,39 @@ Output the timeline as plain text (not JSON). Be concise but capture the arc."#,
         thread_summaries.join("\n\n")
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let cfg = base_config.clone_with_model_override(model);
+    // W3c: the legacy clone_with_model_override helper was deleted along
+    // with LlmConfig.primary_model. The resolved model now threads into
+    // dispatch via LlmCallOptions.model_override (call_model_with_override_and_ctx)
+    // and into the cache row via the canonical make_step_ctx_from_llm_config's
+    // explicit `model` arg (walker-v3-completion Wave 4).
     let system_prompt =
         "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &cfg,
-        "meta_timeline_forward",
-        "meta",
-        -1,
-        None,
-        system_prompt,
-    );
-    let result = llm::call_model_and_ctx(
-        &cfg,
+    // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+    // slot="mid" for meta-analysis work.
+    let meta_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+    let cache_ctx = match &meta_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "meta_timeline_forward",
+                "meta",
+                -1,
+                None,
+                system_prompt,
+                "mid",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
+    let result = llm::call_model_with_override_and_ctx(
+        base_config,
+        model,
         cache_ctx.as_ref(),
         system_prompt,
         &prompt,
@@ -117,21 +135,38 @@ Output the reverse analysis as plain text. Be concise."#,
         forward_timeline
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let cfg = base_config.clone_with_model_override(model);
+    // W3c: the legacy clone_with_model_override helper was deleted along
+    // with LlmConfig.primary_model. The resolved model now threads into
+    // dispatch via LlmCallOptions.model_override (call_model_with_override_and_ctx)
+    // and into the cache row via the canonical make_step_ctx_from_llm_config's
+    // explicit `model` arg (walker-v3-completion Wave 4).
     let system_prompt =
         "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &cfg,
-        "meta_timeline_backward",
-        "meta",
-        -1,
-        None,
-        system_prompt,
-    );
-    let result = llm::call_model_and_ctx(
-        &cfg,
+    // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+    let meta_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+    let cache_ctx = match &meta_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "meta_timeline_backward",
+                "meta",
+                -1,
+                None,
+                system_prompt,
+                "mid",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
+    let result = llm::call_model_with_override_and_ctx(
+        base_config,
+        model,
         cache_ctx.as_ref(),
         system_prompt,
         &prompt,
@@ -177,21 +212,38 @@ Output the narrative as plain text. This should read like a story, not a report.
         forward_timeline, backward_timeline
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let cfg = base_config.clone_with_model_override(model);
+    // W3c: the legacy clone_with_model_override helper was deleted along
+    // with LlmConfig.primary_model. The resolved model now threads into
+    // dispatch via LlmCallOptions.model_override (call_model_with_override_and_ctx)
+    // and into the cache row via the canonical make_step_ctx_from_llm_config's
+    // explicit `model` arg (walker-v3-completion Wave 4).
     let system_prompt =
         "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &cfg,
-        "meta_narrative",
-        "meta",
-        -1,
-        None,
-        system_prompt,
-    );
-    let result = llm::call_model_and_ctx(
-        &cfg,
+    // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+    let meta_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+    let cache_ctx = match &meta_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "meta_narrative",
+                "meta",
+                -1,
+                None,
+                system_prompt,
+                "mid",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
+    let result = llm::call_model_with_override_and_ctx(
+        base_config,
+        model,
         cache_ctx.as_ref(),
         system_prompt,
         &prompt,
@@ -259,21 +311,38 @@ Produce the quickstart (target: under 1500 tokens). The reader should have the s
         narrative_text, context
     );
 
-    // Phase 3 fix pass: clone the live config (preserves provider_registry +
-    // credential_store) instead of building a fresh `config_for_model`.
-    let cfg = base_config.clone_with_model_override(model);
+    // W3c: the legacy clone_with_model_override helper was deleted along
+    // with LlmConfig.primary_model. The resolved model now threads into
+    // dispatch via LlmCallOptions.model_override (call_model_with_override_and_ctx)
+    // and into the cache row via the canonical make_step_ctx_from_llm_config's
+    // explicit `model` arg (walker-v3-completion Wave 4).
     let system_prompt =
         "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
-    let cache_ctx = make_step_ctx_from_llm_config(
-        &cfg,
-        "meta_quickstart",
-        "meta",
-        -1,
-        None,
-        system_prompt,
-    );
-    let result = llm::call_model_and_ctx(
-        &cfg,
+    // walker-v3-completion Wave 4: canonical dispatch via Decision spine.
+    let meta_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+    let cache_ctx = match &meta_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "meta_quickstart",
+                "meta",
+                -1,
+                None,
+                system_prompt,
+                "mid",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
+    let result = llm::call_model_with_override_and_ctx(
+        base_config,
+        model,
         cache_ctx.as_ref(),
         system_prompt,
         &prompt,
@@ -302,7 +371,16 @@ pub async fn run_all_meta_passes(
     let backward = timeline_backward(reader, writer, slug, &forward, base_config, model).await?;
 
     info!("[meta] Running narrative for '{}'", slug);
-    let narr = narrative(reader, writer, slug, &forward, &backward, base_config, model).await?;
+    let narr = narrative(
+        reader,
+        writer,
+        slug,
+        &forward,
+        &backward,
+        base_config,
+        model,
+    )
+    .await?;
 
     info!("[meta] Running quickstart for '{}'", slug);
     let qs = quickstart(reader, writer, slug, &narr, base_config, model).await?;

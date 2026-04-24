@@ -12,10 +12,7 @@
 use std::sync::Arc;
 use warp::Filter;
 
-use super::{
-    list_sessions, load_session, BrainState, PartnerState,
-    BUFFER_HARD_LIMIT,
-};
+use super::{list_sessions, load_session, BrainState, PartnerState, BUFFER_HARD_LIMIT};
 use crate::http_utils::{ct_eq, json_error, json_ok, Unauthorized};
 
 // ── Auth middleware ──────────────────────────────────────────────────
@@ -150,7 +147,6 @@ pub fn partner_routes(
 }
 
 // ── Route handlers ──────────────────────────────────────────────────
-
 
 async fn handle_get_session(
     session_id: String,

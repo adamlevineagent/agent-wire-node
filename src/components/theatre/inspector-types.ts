@@ -17,6 +17,7 @@ export interface PyramidNodeFull {
     self_prompt: string;
     children: string[];
     parent_id: string | null;
+    parent_ids?: string[];
     superseded_by: string | null;
     build_id: string | null;
     created_at: string;
@@ -30,6 +31,15 @@ export interface PyramidNodeFull {
     transitions: Transitions;
     current_version: number;
     current_version_chain_phase: string | null;
+    node_kind?: string | null;
+    question?: string | null;
+    question_about?: string | null;
+    question_creates?: string | null;
+    question_prompt_hint?: string | null;
+    answer_node_id?: string | null;
+    answer_headline?: string | null;
+    answer_distilled?: string | null;
+    answered?: boolean | null;
 }
 
 export interface Topic {
@@ -104,6 +114,34 @@ export interface DrillResultFull {
     evidence: EvidenceLink[];
     gaps: GapReport[];
     question_context: QuestionContext | null;
+    question_node?: QuestionNodeDetail | null;
+    linked_answer?: PyramidNodeFull | null;
+    node_kind?: string | null;
+    question?: string | null;
+    question_about?: string | null;
+    question_creates?: string | null;
+    question_prompt_hint?: string | null;
+    answer_node_id?: string | null;
+    answer_headline?: string | null;
+    answer_distilled?: string | null;
+    answered?: boolean | null;
+}
+
+export interface QuestionNodeDetail {
+    question_id: string;
+    parent_id: string | null;
+    parent_ids?: string[];
+    depth: number;
+    visual_depth: number;
+    question: string;
+    about: string;
+    creates: string;
+    prompt_hint: string;
+    is_leaf: boolean;
+    children: string[];
+    build_id?: string | null;
+    answer_node_id?: string | null;
+    answered: boolean;
 }
 
 export interface ConnectedWebEdge {

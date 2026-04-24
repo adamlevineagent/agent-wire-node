@@ -58,6 +58,14 @@ pub struct FleetPeer {
     /// New nodes prefer this over node_id for provenance and display.
     #[serde(default)]
     pub handle_path: Option<String>,
+    /// Walker v3 §5.4.2: peer's announce_protocol_version at last seen.
+    /// `0` = absent (pre-v3 peer, field wasn't in their announce body),
+    /// `1` = v2.1.1 explicit, `2` = v3. Walker's fleet readiness refuses
+    /// dispatch to any peer with `announce_protocol_version < 2`
+    /// (§5.5.2 strict mode). Default 0 preserves backward-compat for
+    /// serialized FleetRosters persisted before Phase 4 added the field.
+    #[serde(default)]
+    pub announce_protocol_version: u8,
 }
 
 /// Fleet roster — all known same-operator peers.
@@ -111,6 +119,11 @@ impl FleetRoster {
                     total_queue_depth: 0,
                     last_seen: now,
                     handle_path: None,
+                    // Heartbeat-only discovery doesn't carry an announce
+                    // protocol version; default to `0` so the peer is
+                    // flagged as v1 until a direct announce lands with
+                    // an explicit version (§5.4.2).
+                    announce_protocol_version: 0,
                 });
             // Heartbeat provides tunnel_url and name. Models + serving_rules
             // come from direct announcement (preferred) or queue state mirror.
@@ -148,6 +161,7 @@ impl FleetRoster {
                 total_queue_depth: 0,
                 last_seen: now,
                 handle_path: None,
+                announce_protocol_version: announcement.announce_protocol_version,
             });
         peer.tunnel_url = announcement.tunnel_url;
         peer.models_loaded = announcement.models_loaded;
@@ -155,6 +169,9 @@ impl FleetRoster {
         peer.queue_depths = announcement.queue_depths;
         peer.total_queue_depth = announcement.total_queue_depth;
         peer.last_seen = now;
+        // Walker v3 §5.4.2: latest announce wins. A peer that upgrades
+        // in place flips from v1 → v2 without needing a roster reset.
+        peer.announce_protocol_version = announcement.announce_protocol_version;
         if let Some(name) = announcement.name {
             peer.name = name;
         }
@@ -174,13 +191,8 @@ impl FleetRoster {
     ///
     /// `staleness_secs` comes from `FleetDeliveryPolicy::peer_staleness_secs`.
     /// Peers whose `last_seen` is older than that window are excluded.
-    pub fn find_peer_for_rule(
-        &self,
-        rule_name: &str,
-        staleness_secs: u64,
-    ) -> Option<&FleetPeer> {
-        let staleness_limit =
-            chrono::Utc::now() - chrono::Duration::seconds(staleness_secs as i64);
+    pub fn find_peer_for_rule(&self, rule_name: &str, staleness_secs: u64) -> Option<&FleetPeer> {
+        let staleness_limit = chrono::Utc::now() - chrono::Duration::seconds(staleness_secs as i64);
         self.peers
             .values()
             .filter(|p| p.last_seen > staleness_limit)
@@ -242,7 +254,35 @@ pub struct FleetAnnouncement {
     #[serde(default)]
     pub total_queue_depth: usize,
     pub operator_id: String,
+    /// Walker v3 §5.4.2 / B-I1: explicit announce-protocol version so
+    /// walker requesters can strict-refuse dispatch to pre-v3 peers that
+    /// populate `models_loaded` with observability-only semantics
+    /// (§5.5.2 — readiness returns `PeerIsV1Announcer`).
+    ///
+    /// Version mapping:
+    ///   `0` — pre-v3 peer (field absent in their announce body).
+    ///   `1` — v2.1.1 with explicit versioning.
+    ///   `2` — v3 (current).
+    ///
+    /// `serde(default)` returns `0` so a pre-v3 peer's existing announce
+    /// body deserializes cleanly; walker flags those as v1 announcers.
+    #[serde(default = "announce_protocol_version_default")]
+    pub announce_protocol_version: u8,
 }
+
+/// Default for `FleetAnnouncement.announce_protocol_version` when the
+/// field is absent in the deserialized body (pre-v3 peer). See
+/// §5.4.2 / B-F7.
+#[allow(dead_code)]
+pub fn announce_protocol_version_default() -> u8 {
+    0
+}
+
+/// Walker v3 current announce-protocol version. Emitted by this node
+/// when sending a `FleetAnnouncement`. Bumped when the announce wire
+/// format gains gating-impacting semantics.
+#[allow(dead_code)]
+pub const ANNOUNCE_PROTOCOL_VERSION: u8 = 2;
 
 // ── Fleet dispatch request / response types (async protocol) ──────────────
 
@@ -349,7 +389,11 @@ pub enum FleetDispatchErrorKind {
 
 impl std::fmt::Display for FleetDispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Fleet dispatch to {} failed ({:?}): {}", self.peer_id, self.kind, self.message)
+        write!(
+            f,
+            "Fleet dispatch to {} failed ({:?}): {}",
+            self.peer_id, self.kind, self.message
+        )
     }
 }
 
@@ -392,12 +436,11 @@ impl std::fmt::Display for FleetDeliveryError {
             FleetDeliveryError::JwtExpired => {
                 write!(f, "fleet result delivery: fleet JWT is expired")
             }
-            FleetDeliveryError::HttpStatus { status_code, message } => {
-                write!(
-                    f,
-                    "fleet result delivery HTTP {}: {}",
-                    status_code, message
-                )
+            FleetDeliveryError::HttpStatus {
+                status_code,
+                message,
+            } => {
+                write!(f, "fleet result delivery HTTP {}: {}", status_code, message)
             }
             FleetDeliveryError::ResponseParse(e) => {
                 write!(f, "fleet result delivery response parse error: {}", e)
@@ -437,9 +480,7 @@ pub fn is_jwt_expired(token: &str) -> bool {
         _ => return true, // malformed → treat as expired
     };
 
-    let payload_bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64)
-    {
+    let payload_bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64) {
         Ok(b) => b,
         Err(_) => return true,
     };
@@ -456,9 +497,7 @@ pub fn is_jwt_expired(token: &str) -> bool {
         None => return true, // no exp claim → treat as expired
     };
 
-    let now = match std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-    {
+    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_secs(),
         // Clock before UNIX epoch — treat as expired. Impossible in
         // practice; hedging is correct.
@@ -581,7 +620,9 @@ pub async fn fleet_dispatch_by_rule(
 /// exhaustive switch across the whole callback surface, but the
 /// implementation is deferred.
 pub enum CallbackKind<'a> {
-    Fleet { dispatcher_nid: &'a str },
+    Fleet {
+        dispatcher_nid: &'a str,
+    },
     /// Reserved — compute market Phase 3.
     MarketStandard,
     /// Reserved — compute market Phase 3.
@@ -808,9 +849,7 @@ impl PendingFleetJobs {
             let jobs = self.jobs.lock().expect("PendingFleetJobs mutex poisoned");
             for (job_id, entry) in jobs.iter() {
                 // Total eviction window = expected_timeout * clamped.
-                let window = entry
-                    .expected_timeout
-                    .saturating_mul(clamped as u32);
+                let window = entry.expected_timeout.saturating_mul(clamped as u32);
                 if entry.dispatched_at.elapsed() > window {
                     expired.push(job_id.clone());
                 }
@@ -973,10 +1012,7 @@ pub async fn deliver_fleet_result(
 /// Never exits under normal operation. Under Tauri async_runtime the
 /// task is cancelled when the app shuts down; there is no per-iteration
 /// shutdown channel because the sweep has no mid-flight state to flush.
-pub async fn pending_jobs_sweep_loop(
-    ctx: Arc<FleetDispatchContext>,
-    db_path: Option<PathBuf>,
-) {
+pub async fn pending_jobs_sweep_loop(ctx: Arc<FleetDispatchContext>, db_path: Option<PathBuf>) {
     loop {
         let (interval, multiplier) = {
             let p = ctx.policy.read().await;
@@ -1002,15 +1038,16 @@ pub async fn pending_jobs_sweep_loop(
                 let job_id_clone = job_id.clone();
                 tokio::task::spawn_blocking(move || {
                     if let Ok(conn) = rusqlite::Connection::open(&dbp_clone) {
-                        let ctx_ev = crate::pyramid::compute_chronicle::ChronicleEventContext::minimal(
-                            &format!("fleet-dispatch:{}", job_id_clone),
-                            crate::pyramid::compute_chronicle::EVENT_FLEET_PENDING_ORPHANED,
-                            crate::pyramid::compute_chronicle::SOURCE_FLEET,
-                        )
-                        .with_metadata(serde_json::json!({
-                            "job_id": job_id_clone,
-                            "reason": "dispatcher_sweep_evicted",
-                        }));
+                        let ctx_ev =
+                            crate::pyramid::compute_chronicle::ChronicleEventContext::minimal(
+                                &format!("fleet-dispatch:{}", job_id_clone),
+                                crate::pyramid::compute_chronicle::EVENT_FLEET_PENDING_ORPHANED,
+                                crate::pyramid::compute_chronicle::SOURCE_FLEET,
+                            )
+                            .with_metadata(serde_json::json!({
+                                "job_id": job_id_clone,
+                                "reason": "dispatcher_sweep_evicted",
+                            }));
                         let _ = crate::pyramid::compute_chronicle::record_event(&conn, &ctx_ev);
                     }
                 });
@@ -1127,6 +1164,7 @@ mod tests {
             total_queue_depth: 0,
             last_seen: chrono::Utc::now(),
             handle_path: None,
+            announce_protocol_version: ANNOUNCE_PROTOCOL_VERSION,
         }
     }
 
@@ -1328,7 +1366,11 @@ mod tests {
             &CallbackKind::MarketStandard,
             &roster,
         );
-        assert!(r.is_ok(), "valid https URL must pass for MarketStandard: {:?}", r);
+        assert!(
+            r.is_ok(),
+            "valid https URL must pass for MarketStandard: {:?}",
+            r
+        );
     }
 
     #[test]
@@ -1379,12 +1421,20 @@ mod tests {
         // `'Fleet'`. If a variant name changes or the string mapping drifts,
         // the sweep loop would silently stop picking up rows. This test
         // fails loudly before that can happen.
-        let f = CallbackKind::Fleet { dispatcher_nid: "nid-x" };
+        let f = CallbackKind::Fleet {
+            dispatcher_nid: "nid-x",
+        };
         assert_eq!(callback_kind_str(&f), "Fleet");
-        assert_eq!(callback_kind_str(&CallbackKind::MarketStandard), "MarketStandard");
+        assert_eq!(
+            callback_kind_str(&CallbackKind::MarketStandard),
+            "MarketStandard"
+        );
         assert_eq!(callback_kind_str(&CallbackKind::Relay), "Relay");
 
-        assert_eq!(callback_kind_from_str("Fleet"), Some(CallbackKindColumn::Fleet));
+        assert_eq!(
+            callback_kind_from_str("Fleet"),
+            Some(CallbackKindColumn::Fleet)
+        );
         assert_eq!(
             callback_kind_from_str("MarketStandard"),
             Some(CallbackKindColumn::MarketStandard)
@@ -1416,10 +1466,7 @@ mod tests {
                 expected_timeout: std::time::Duration::from_secs(60),
             },
         );
-        assert_eq!(
-            pending.peek_matches("job-1", "peer-x"),
-            PeekResult::Match
-        );
+        assert_eq!(pending.peek_matches("job-1", "peer-x"), PeekResult::Match);
         assert!(pending.remove("job-1").is_some());
         // Second remove returns None.
         assert!(pending.remove("job-1").is_none());
@@ -1486,15 +1533,9 @@ mod tests {
         let evicted = pending.sweep_expired(2);
         assert_eq!(evicted, vec!["old".to_string()]);
         // Fresh entry remains.
-        assert_eq!(
-            pending.peek_matches("fresh", "peer"),
-            PeekResult::Match
-        );
+        assert_eq!(pending.peek_matches("fresh", "peer"), PeekResult::Match);
         // Expired entry gone.
-        assert_eq!(
-            pending.peek_matches("old", "peer"),
-            PeekResult::NotFound
-        );
+        assert_eq!(pending.peek_matches("old", "peer"), PeekResult::NotFound);
     }
 
     // ── find_peer_for_rule staleness ────────────────────────────────────

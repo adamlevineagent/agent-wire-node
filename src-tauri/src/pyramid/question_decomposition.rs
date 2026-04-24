@@ -11,7 +11,7 @@
 //   4. question_compiler::compile_question_set() compiles to IR
 //   5. execute_plan() runs the IR through the standard executor
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -23,9 +23,58 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use super::db;
-use super::llm::{self, LlmConfig};
+use super::event_bus::{TaggedBuildEvent, TaggedKind};
+use super::llm::{self, AuditContext, LlmCallOptions, LlmConfig};
 use super::question_yaml::{Question, QuestionDefaults, QuestionSet};
 use super::step_context::make_step_ctx_from_llm_config;
+
+fn default_decomposition_model_tier() -> String {
+    "max".to_string()
+}
+
+fn default_decomposition_temperature() -> f32 {
+    0.3
+}
+
+fn default_decomposition_max_tokens() -> usize {
+    4096
+}
+
+fn default_sibling_review_max_tokens() -> usize {
+    2048
+}
+
+fn audit_for(
+    audit: Option<&AuditContext>,
+    step_name: &str,
+    depth: Option<i64>,
+) -> Option<AuditContext> {
+    audit.map(|a| AuditContext {
+        conn: Arc::clone(&a.conn),
+        slug: a.slug.clone(),
+        build_id: a.build_id.clone(),
+        node_id: None,
+        step_name: step_name.to_string(),
+        call_purpose: "question_decompose".to_string(),
+        depth,
+    })
+}
+
+fn effective_decompose_step_name<'a>(
+    audit: Option<&'a AuditContext>,
+    fallback: &'a str,
+) -> &'a str {
+    audit
+        .and_then(|a| {
+            let step_name = a.step_name.trim();
+            if step_name.is_empty() {
+                None
+            } else {
+                Some(step_name)
+            }
+        })
+        .unwrap_or(fallback)
+}
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -53,6 +102,19 @@ pub struct DecompositionConfig {
     /// WS13-A: Audience string flows into every LLM call in the pipeline.
     /// When present, decomposition prompts use the audience's vocabulary and perspective.
     pub audience: Option<String>,
+    /// Chain YAML model tier for recursive decomposition calls.
+    /// This used to be hardcoded to `max`; keep a default for legacy callers.
+    #[serde(default = "default_decomposition_model_tier")]
+    pub model_tier: String,
+    /// Chain YAML temperature for decomposition calls.
+    #[serde(default = "default_decomposition_temperature")]
+    pub temperature: f32,
+    /// Completion token cap for decomposition layer calls.
+    #[serde(default = "default_decomposition_max_tokens")]
+    pub max_tokens: usize,
+    /// Completion token cap for sibling review calls.
+    #[serde(default = "default_sibling_review_max_tokens")]
+    pub sibling_review_max_tokens: usize,
 }
 
 /// 11-Q: Replace `{{variable}}` template placeholders in a prompt string.
@@ -76,6 +138,10 @@ impl Default for DecompositionConfig {
             folder_map: None,
             chains_dir: None,
             audience: None,
+            model_tier: default_decomposition_model_tier(),
+            temperature: default_decomposition_temperature(),
+            max_tokens: default_decomposition_max_tokens(),
+            sibling_review_max_tokens: default_sibling_review_max_tokens(),
         }
     }
 }
@@ -103,7 +169,8 @@ pub struct QuestionTree {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionNode {
     /// Stable deterministic ID: `q-{sha256_hex_first_12}`.
-    /// NOT produced by the LLM — assigned after deserialization via `assign_question_ids`.
+    /// NOT produced by the LLM — assigned from normalized question text so a
+    /// shared semantic question keeps one identity across DAG parents.
     #[serde(default)]
     pub id: String,
     /// The natural language question.
@@ -143,14 +210,15 @@ pub struct DecompositionPreview {
 
 /// Assign deterministic IDs to every node in the question tree.
 ///
-/// ID format: `q-{sha256_hex_first_12}` where the hash input is
-/// `"{question}|{about}|{depth}"`. Depth is 1 for leaves (offset by 1 so layer 0
-/// is reserved for L0 extraction nodes), increasing toward the root/apex.
+/// ID format: `q-{sha256_hex_first_12}` where the hash input is the normalized
+/// question text. Visual/storage depth is deliberately excluded: a semantic
+/// question should have one canonical identity even when multiple parents or
+/// future repair passes route to it from different depths.
 ///
-/// Two passes: first compute max_depth, then assign IDs with correct depths.
+/// This is intentionally independent of final tree height: decomposition can
+/// persist a finalized subtree before sibling branches finish.
 pub fn assign_question_ids(tree: &mut QuestionTree) {
-    let max_depth = compute_max_depth(&tree.apex);
-    assign_ids_recursive(&mut tree.apex, max_depth, 0);
+    assign_ids_recursive(&mut tree.apex, 0);
 }
 
 /// Compute the max depth of the tree (number of edges from root to deepest leaf).
@@ -165,24 +233,36 @@ fn compute_max_depth(node: &QuestionNode) -> u32 {
         .unwrap_or(0)
 }
 
-/// Recursively assign IDs. `max_depth` is the tree height, `current_level` is
-/// how far from the root (0 = root). The node's depth = max_depth - current_level + 1
-/// (so leaves = 1, root = max_depth + 1). The +1 offset reserves layer 0 for L0 extraction nodes.
-fn assign_ids_recursive(node: &mut QuestionNode, max_depth: u32, current_level: u32) {
-    let depth = max_depth.saturating_sub(current_level) + 1;
-    node.id = make_question_id(&node.question, &node.about, depth);
+/// Recursively assign IDs. `tree_depth` is root-down storage depth:
+/// apex/root = 0, first-level sub-questions = 1, and so on.
+fn assign_ids_recursive(node: &mut QuestionNode, tree_depth: u32) {
+    assign_node_id(node, tree_depth);
     for child in &mut node.children {
-        assign_ids_recursive(child, max_depth, current_level + 1);
+        assign_ids_recursive(child, tree_depth + 1);
     }
 }
 
-/// Build a deterministic question ID from question text, about, and depth.
-fn make_question_id(question: &str, about: &str, depth: u32) -> String {
+fn assign_node_id(node: &mut QuestionNode, tree_depth: u32) {
+    node.id = make_question_id(&node.question, &node.about, tree_depth);
+}
+
+/// Build a deterministic question ID from semantic question text.
+fn make_question_id(question: &str, _about: &str, _tree_depth: u32) -> String {
     use sha2::{Digest, Sha256};
-    let input = format!("{}|{}|{}", question, about, depth);
+    let input = normalize_question_identity(question);
     let hash = Sha256::digest(input.as_bytes());
     let hex_str = hex::encode(hash);
     format!("q-{}", &hex_str[..12])
+}
+
+fn normalize_question_identity(question: &str) -> String {
+    question
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .trim_end_matches('?')
+        .to_lowercase()
 }
 
 // ── Layer Question Extraction ─────────────────────────────────────────────────
@@ -200,7 +280,8 @@ pub fn extract_layer_questions(
     let max_depth = compute_max_depth(&tree.apex);
     let mut result: std::collections::HashMap<i64, Vec<super::types::LayerQuestion>> =
         std::collections::HashMap::new();
-    collect_layer_questions(&tree.apex, max_depth, 0, &mut result);
+    let mut seen = HashSet::new();
+    collect_layer_questions(&tree.apex, max_depth, 0, &mut result, &mut seen);
     result
 }
 
@@ -209,22 +290,25 @@ fn collect_layer_questions(
     max_depth: u32,
     current_level: u32,
     result: &mut std::collections::HashMap<i64, Vec<super::types::LayerQuestion>>,
+    seen: &mut HashSet<String>,
 ) {
     let depth = (max_depth.saturating_sub(current_level) + 1) as i64;
 
-    result
-        .entry(depth)
-        .or_default()
-        .push(super::types::LayerQuestion {
-            question_id: node.id.clone(),
-            question_text: node.question.clone(),
-            layer: depth,
-            about: node.about.clone(),
-            creates: node.creates.clone(),
-        });
+    if seen.insert(node.id.clone()) {
+        result
+            .entry(depth)
+            .or_default()
+            .push(super::types::LayerQuestion {
+                question_id: node.id.clone(),
+                question_text: node.question.clone(),
+                layer: depth,
+                about: node.about.clone(),
+                creates: node.creates.clone(),
+            });
+    }
 
     for child in &node.children {
-        collect_layer_questions(child, max_depth, current_level + 1, result);
+        collect_layer_questions(child, max_depth, current_level + 1, result, seen);
     }
 }
 
@@ -255,6 +339,7 @@ pub async fn decompose_question_delta(
     chains_dir: Option<&std::path::Path>,
     evidence_set_context: Option<&str>,
     gap_context: Option<&str>,
+    audit: Option<&AuditContext>,
 ) -> Result<DeltaDecompositionResult> {
     if config.apex_question.trim().is_empty() {
         return Err(anyhow!("apex_question cannot be empty"));
@@ -345,22 +430,30 @@ Return ONLY the JSON object."#
             .unwrap_or("(no additional context)")
     );
 
+    let step_name = effective_decompose_step_name(audit, "question_delta_decompose");
     let cache_ctx = make_step_ctx_from_llm_config(
         llm_config,
-        "question_delta_decompose",
+        step_name,
         "question_decompose",
         0,
         None,
         &system_prompt,
-    );
-    let response = llm::call_model_unified_and_ctx(
+        &config.model_tier,
+        None,
+        None,
+    )
+    .await;
+    let audit_ctx = audit_for(audit, step_name, Some(0));
+    let response = llm::call_model_unified_with_audit_and_ctx(
         llm_config,
         cache_ctx.as_ref(),
+        audit_ctx.as_ref(),
         &system_prompt,
         &user_prompt,
-        0.3,
-        4096,
+        config.temperature,
+        config.max_tokens,
         None,
+        LlmCallOptions::default(),
     )
     .await?;
 
@@ -480,8 +573,8 @@ fn collect_existing_questions(node: &QuestionNode, out: &mut Vec<(String, String
 
 /// Decompose an apex question into a question tree via LLM calls.
 ///
-/// Uses the "High Intelligence" tier (mapped to `max` in the tier vocabulary)
-/// because decomposition is judgment work — it determines the entire pyramid topology.
+/// Uses the model tier resolved from the chain step YAML. Decomposition is
+/// topology-shaping judgment work, but the operator can route it per chain.
 ///
 /// The bounded unroll pattern limits recursion to `config.max_depth` levels.
 /// Each level is a single LLM call that decomposes ALL questions at that level
@@ -489,8 +582,9 @@ fn collect_existing_questions(node: &QuestionNode, out: &mut Vec<(String, String
 pub async fn decompose_question(
     config: &DecompositionConfig,
     llm_config: &LlmConfig,
-    tier1: &super::Tier1Config,
+    _tier1: &super::Tier1Config,
     tier2: &super::Tier2Config,
+    audit: Option<&AuditContext>,
 ) -> Result<QuestionTree> {
     if config.apex_question.trim().is_empty() {
         return Err(anyhow!("apex_question cannot be empty"));
@@ -521,7 +615,10 @@ pub async fn decompose_question(
         llm_config,
         config.chains_dir.as_deref(),
         config.audience.as_deref(),
-        tier1,
+        &config.model_tier,
+        config.temperature,
+        config.max_tokens,
+        audit,
     )
     .await?;
 
@@ -545,8 +642,12 @@ pub async fn decompose_question(
             llm_config,
             config.chains_dir.as_deref(),
             config.audience.as_deref(),
-            tier1,
+            &config.model_tier,
+            config.temperature,
+            config.max_tokens,
+            config.sibling_review_max_tokens,
             tier2,
+            audit,
         )
         .await?;
         let node_count = count_tree_nodes(&child);
@@ -585,6 +686,203 @@ pub async fn decompose_question(
 
 // ── Incremental Decomposition ────────────────────────────────────────────────
 
+#[derive(Debug, Clone)]
+struct FrontierQuestion {
+    id: String,
+    question: String,
+    prompt_hint: String,
+    tree_depth: u32,
+}
+
+#[derive(Debug, Clone)]
+struct FrontierDecomposedQuestion {
+    raw: RawDecomposedQuestion,
+    parent_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct QuestionDagDraft {
+    nodes: HashMap<String, QuestionNode>,
+    depths: HashMap<String, u32>,
+    parents_by_child: HashMap<String, Vec<String>>,
+    children_by_parent: HashMap<String, Vec<String>>,
+    apex_id: String,
+}
+
+impl QuestionDagDraft {
+    fn new(apex: QuestionNode) -> Self {
+        let apex_id = apex.id.clone();
+        let mut nodes = HashMap::new();
+        let mut depths = HashMap::new();
+        depths.insert(apex_id.clone(), 0);
+        nodes.insert(apex_id.clone(), apex);
+        Self {
+            nodes,
+            depths,
+            parents_by_child: HashMap::new(),
+            children_by_parent: HashMap::new(),
+            apex_id,
+        }
+    }
+
+    fn upsert_node(&mut self, node: QuestionNode, tree_depth: u32) {
+        self.depths.entry(node.id.clone()).or_insert(tree_depth);
+        self.nodes
+            .entry(node.id.clone())
+            .and_modify(|existing| {
+                if existing.prompt_hint.trim().is_empty() && !node.prompt_hint.trim().is_empty() {
+                    existing.prompt_hint = node.prompt_hint.clone();
+                }
+                existing.about = node.about.clone();
+                existing.creates = node.creates.clone();
+                existing.is_leaf = existing.is_leaf && node.is_leaf;
+            })
+            .or_insert(node);
+    }
+
+    fn add_edge(&mut self, parent_id: &str, child_id: &str) {
+        push_unique(
+            self.children_by_parent
+                .entry(parent_id.to_string())
+                .or_default(),
+            child_id.to_string(),
+        );
+        push_unique(
+            self.parents_by_child
+                .entry(child_id.to_string())
+                .or_default(),
+            parent_id.to_string(),
+        );
+    }
+
+    fn materialize_node(&self, node_id: &str, path: &mut HashSet<String>) -> Result<QuestionNode> {
+        if !path.insert(node_id.to_string()) {
+            return self
+                .nodes
+                .get(node_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("question DAG references missing node {node_id}"));
+        }
+        let mut node = self
+            .nodes
+            .get(node_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("question DAG references missing node {node_id}"))?;
+        node.children = self
+            .children_by_parent
+            .get(node_id)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|child_id| self.materialize_node(child_id, path).ok())
+            .collect();
+        path.remove(node_id);
+        Ok(node)
+    }
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn node_scope_for_tree_depth(tree_depth: u32, is_leaf: bool) -> (String, String) {
+    if is_leaf {
+        return ("each file individually".to_string(), "L0 nodes".to_string());
+    }
+    scope_for_depth(tree_depth + 1)
+}
+
+fn frontier_from_ids(dag: &QuestionDagDraft, ids: &[String]) -> Vec<FrontierQuestion> {
+    ids.iter()
+        .filter_map(|id| {
+            let node = dag.nodes.get(id)?;
+            Some(FrontierQuestion {
+                id: id.clone(),
+                question: node.question.clone(),
+                prompt_hint: node.prompt_hint.clone(),
+                tree_depth: *dag.depths.get(id).unwrap_or(&0),
+            })
+        })
+        .collect()
+}
+
+fn question_node_from_row(row: &db::QuestionNodeRow) -> QuestionNode {
+    QuestionNode {
+        id: row.question_id.clone(),
+        question: row.question.clone(),
+        about: row.about.clone(),
+        creates: row.creates.clone(),
+        prompt_hint: row.prompt_hint.clone(),
+        children: Vec::new(),
+        is_leaf: row.is_leaf,
+    }
+}
+
+fn question_dag_from_rows(
+    rows: Vec<db::QuestionNodeRow>,
+    edges: Vec<db::QuestionEdgeRow>,
+) -> Result<QuestionDagDraft> {
+    let apex_row = rows
+        .iter()
+        .min_by(|a, b| {
+            a.depth
+                .cmp(&b.depth)
+                .then_with(|| a.parent_id.is_some().cmp(&b.parent_id.is_some()))
+                .then_with(|| a.question_id.cmp(&b.question_id))
+        })
+        .ok_or_else(|| anyhow!("cannot reconstruct question DAG from empty rows"))?;
+
+    let mut dag = QuestionDagDraft::new(question_node_from_row(apex_row));
+    for row in &rows {
+        dag.upsert_node(question_node_from_row(row), row.depth);
+    }
+
+    let node_ids = rows
+        .iter()
+        .map(|row| row.question_id.clone())
+        .collect::<HashSet<_>>();
+    let mut edge_count = 0usize;
+    for edge in edges {
+        if node_ids.contains(&edge.parent_question_id) && node_ids.contains(&edge.child_question_id)
+        {
+            dag.add_edge(&edge.parent_question_id, &edge.child_question_id);
+            edge_count += 1;
+        }
+    }
+
+    if edge_count == 0 {
+        for row in &rows {
+            for child_id in db::question_row_child_ids(row) {
+                if node_ids.contains(&child_id) {
+                    dag.add_edge(&row.question_id, &child_id);
+                }
+            }
+        }
+    }
+
+    Ok(dag)
+}
+
+fn undecomposed_frontier_ids(dag: &QuestionDagDraft, max_depth: u32) -> Vec<String> {
+    let mut ids = dag
+        .nodes
+        .iter()
+        .filter_map(|(id, node)| {
+            let depth = *dag.depths.get(id).unwrap_or(&0);
+            let has_children = dag
+                .children_by_parent
+                .get(id)
+                .map(|children| !children.is_empty())
+                .unwrap_or(false);
+            (!node.is_leaf && depth < max_depth && !has_children).then_some((depth, id.clone()))
+        })
+        .collect::<Vec<_>>();
+    ids.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    ids.into_iter().map(|(_, id)| id).collect()
+}
+
 /// Decompose an apex question incrementally, persisting each node to the DB
 /// as it comes back from the LLM.
 ///
@@ -598,8 +896,9 @@ pub async fn decompose_question_incremental(
     llm_config: &LlmConfig,
     writer: Arc<Mutex<Connection>>,
     slug: &str,
-    tier1: &super::Tier1Config,
+    _tier1: &super::Tier1Config,
     tier2: &super::Tier2Config,
+    audit: Option<&AuditContext>,
 ) -> Result<QuestionTree> {
     if config.apex_question.trim().is_empty() {
         return Err(anyhow!("apex_question cannot be empty"));
@@ -617,186 +916,212 @@ pub async fn decompose_question_incremental(
         db::count_question_nodes(&conn, slug)?
     };
 
-    if existing_count > 0 {
-        // Resume path: check if there are undecomposed branch nodes
-        let undecomposed = {
+    let (mut dag, mut frontier_ids) = if existing_count > 0 {
+        let (rows, edges) = {
             let conn = writer.lock().await;
-            db::get_undecomposed_nodes(&conn, slug)?
+            let rows = db::load_question_nodes_as_tree(&conn, slug)?
+                .ok_or_else(|| anyhow!("no nodes found despite count > 0"))?;
+            let edges = db::load_question_edges(&conn, slug)?;
+            (rows, edges)
         };
-
-        if undecomposed.is_empty() {
-            // Tree is complete — reconstruct and return
+        let dag = question_dag_from_rows(rows, edges)?;
+        let frontier_ids = undecomposed_frontier_ids(&dag, config.max_depth);
+        if frontier_ids.is_empty() {
             info!(
                 slug = slug,
                 existing_nodes = existing_count,
-                "question tree already fully decomposed, reconstructing"
+                "question DAG already fully decomposed, reconstructing"
             );
-            let rows = {
-                let conn = writer.lock().await;
-                db::load_question_nodes_as_tree(&conn, slug)?
-                    .ok_or_else(|| anyhow!("no nodes found despite count > 0"))?
-            };
-            return db::reconstruct_question_tree(&rows, config);
+            let apex = dag.materialize_node(&dag.apex_id, &mut HashSet::new())?;
+            return Ok(QuestionTree {
+                apex,
+                content_type: config.content_type.clone(),
+                config: config.clone(),
+                audience: None,
+            });
         }
-
         info!(
             slug = slug,
             existing_nodes = existing_count,
-            undecomposed = undecomposed.len(),
-            "resuming decomposition from existing partial tree"
+            frontier = frontier_ids.len(),
+            "resuming decomposition from existing partial question DAG"
+        );
+        (dag, frontier_ids)
+    } else {
+        // Fresh decomposition — no existing nodes
+        info!(
+            apex = %config.apex_question,
+            content_type = %config.content_type,
+            granularity = granularity,
+            max_depth = config.max_depth,
+            slug = slug,
+            "starting incremental question decomposition"
         );
 
-        // Decompose each undecomposed branch node
-        for node_row in &undecomposed {
-            let raw = RawDecomposedQuestion {
-                question: node_row.question.clone(),
-                prompt_hint: node_row.prompt_hint.clone(),
-                is_leaf: false,
-            };
+        let apex_about = "all top-level nodes at once".to_string();
+        let apex_id = make_question_id(&config.apex_question, &apex_about, 0);
+        let dag = QuestionDagDraft::new(QuestionNode {
+            id: apex_id,
+            question: config.apex_question.clone(),
+            about: apex_about,
+            creates: "apex".to_string(),
+            prompt_hint:
+                "Synthesize all sub-answers into a comprehensive answer to the apex question."
+                    .to_string(),
+            children: Vec::new(),
+            is_leaf: false,
+        });
 
-            // Determine current_depth from the node's depth in the tree
-            // node_row.depth is the tree depth (root=max, leaves=0), we need
-            // the distance from root for decomposition depth
-            let current_depth = node_row.depth;
+        save_question_dag_to_db(&dag, slug, &writer, Some(llm_config), true).await?;
 
-            info!(
-                slug = slug,
-                question_id = %node_row.question_id,
-                depth = current_depth,
-                question = %node_row.question,
-                "resuming decomposition for unfinished node"
-            );
+        let frontier_ids = vec![dag.apex_id.clone()];
+        (dag, frontier_ids)
+    };
+    let mut layer_index = 0u32;
 
-            build_subtree_incremental(
-                &raw,
-                &config.content_type,
-                config.folder_map.as_deref(),
-                granularity,
-                config.max_depth,
-                current_depth,
-                llm_config,
-                writer.clone(),
-                slug,
-                Some(&node_row.question_id),
-                config.chains_dir.as_deref(),
-                config.audience.as_deref(),
-                tier1,
-                tier2,
-            )
-            .await?;
+    while !frontier_ids.is_empty() {
+        let frontier = frontier_from_ids(&dag, &frontier_ids)
+            .into_iter()
+            .filter(|parent| {
+                dag.nodes
+                    .get(&parent.id)
+                    .map(|node| !node.is_leaf && parent.tree_depth < config.max_depth)
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        if frontier.is_empty() {
+            break;
         }
 
-        // Reconstruct the full tree
-        let rows = {
-            let conn = writer.lock().await;
-            db::load_question_nodes_as_tree(&conn, slug)?
-                .ok_or_else(|| anyhow!("no nodes found after resume decomposition"))?
-        };
-        return db::reconstruct_question_tree(&rows, config);
+        let parent_depth = frontier[0].tree_depth;
+        let decomposition_depth = parent_depth + 1;
+        info!(
+            slug = slug,
+            layer = layer_index,
+            parent_count = frontier.len(),
+            parent_depth = parent_depth,
+            "decomposing question frontier"
+        );
+
+        let layer_children =
+            match call_frontier_decomposition_llm(
+                &frontier,
+                &config.content_type,
+                config.folder_map.as_deref(),
+                min_subs,
+                max_subs,
+                decomposition_depth,
+                llm_config,
+                config.chains_dir.as_deref(),
+                config.audience.as_deref(),
+                &config.model_tier,
+                config.temperature,
+                config.max_tokens,
+                audit,
+            )
+            .await
+            {
+                Ok(children) => children,
+                Err(err) => {
+                    warn!(
+                        slug = slug,
+                        layer = layer_index,
+                        error = %err,
+                        "frontier decomposition failed; falling back to per-parent decomposition"
+                    );
+                    let mut children = Vec::new();
+                    for parent in &frontier {
+                        let per_parent = call_decomposition_llm(
+                            &parent.question,
+                            &config.content_type,
+                            config.folder_map.as_deref(),
+                            min_subs,
+                            max_subs,
+                            decomposition_depth,
+                            llm_config,
+                            config.chains_dir.as_deref(),
+                            config.audience.as_deref(),
+                            &config.model_tier,
+                            config.temperature,
+                            config.max_tokens,
+                            audit,
+                        )
+                        .await?;
+                        children.extend(per_parent.into_iter().map(|raw| {
+                            FrontierDecomposedQuestion {
+                                raw,
+                                parent_ids: vec![parent.id.clone()],
+                            }
+                        }));
+                    }
+                    children
+                }
+            };
+
+        let allowed_parent_ids: HashSet<String> =
+            frontier.iter().map(|parent| parent.id.clone()).collect();
+        let child_tree_depth = parent_depth + 1;
+        let mut next_ids = Vec::new();
+        let mut parents_with_children = HashSet::new();
+
+        for child in layer_children {
+            let parent_ids = child
+                .parent_ids
+                .into_iter()
+                .filter(|parent_id| allowed_parent_ids.contains(parent_id))
+                .collect::<Vec<_>>();
+            if parent_ids.is_empty() {
+                continue;
+            }
+
+            let forced_leaf = child.raw.is_leaf || child_tree_depth + 1 >= config.max_depth;
+            let (about, creates) = node_scope_for_tree_depth(child_tree_depth, forced_leaf);
+            let node_id = make_question_id(&child.raw.question, &about, child_tree_depth);
+            let node = QuestionNode {
+                id: node_id.clone(),
+                question: child.raw.question,
+                about,
+                creates,
+                prompt_hint: child.raw.prompt_hint,
+                children: Vec::new(),
+                is_leaf: forced_leaf,
+            };
+            dag.upsert_node(node, child_tree_depth);
+            for parent_id in parent_ids {
+                dag.add_edge(&parent_id, &node_id);
+                parents_with_children.insert(parent_id);
+            }
+            if !forced_leaf {
+                push_unique(&mut next_ids, node_id);
+            }
+        }
+
+        for parent in &frontier {
+            if !parents_with_children.contains(&parent.id) {
+                if let Some(node) = dag.nodes.get_mut(&parent.id) {
+                    node.is_leaf = true;
+                    node.about = "each file individually".to_string();
+                    node.creates = "L0 nodes".to_string();
+                }
+            }
+        }
+
+        save_question_dag_to_db(&dag, slug, &writer, Some(llm_config), false).await?;
+        frontier_ids = next_ids;
+        layer_index += 1;
     }
 
-    // Fresh decomposition — no existing nodes
-    info!(
-        apex = %config.apex_question,
-        content_type = %config.content_type,
-        granularity = granularity,
-        max_depth = config.max_depth,
-        slug = slug,
-        "starting incremental question decomposition"
-    );
-
-    // First call: apex → L1 sub-questions
-    let sub_questions = call_decomposition_llm(
-        &config.apex_question,
-        &config.content_type,
-        config.folder_map.as_deref(),
-        min_subs,
-        max_subs,
-        1,
-        llm_config,
-        config.chains_dir.as_deref(),
-        config.audience.as_deref(),
-        tier1,
-    )
-    .await?;
-
-    // Build apex node (we'll save it after we know its children)
-    let mut apex_children = Vec::new();
-
-    for (i, sq) in sub_questions.iter().enumerate() {
-        info!(
-            branch = i + 1,
-            total = sub_questions.len(),
-            question = %sq.question,
-            is_leaf = sq.is_leaf,
-            slug = slug,
-            "decomposing L1 branch (incremental)"
-        );
-        let child = build_subtree_incremental(
-            sq,
-            &config.content_type,
-            config.folder_map.as_deref(),
-            granularity,
-            config.max_depth,
-            2,
-            llm_config,
-            writer.clone(),
-            slug,
-            None, // parent_id set after apex node gets its ID
-            config.chains_dir.as_deref(),
-            config.audience.as_deref(),
-            tier1,
-            tier2,
-        )
-        .await?;
-        let node_count = count_tree_nodes(&child);
-        info!(
-            branch = i + 1,
-            question = %sq.question,
-            nodes = node_count,
-            slug = slug,
-            "L1 branch complete (incremental)"
-        );
-        apex_children.push(child);
-    }
-
-    // ── Horizontal review: merge overlaps + depth-check L1 siblings ────
-    let (merged, leafed) =
-        horizontal_review_siblings(&mut apex_children, llm_config, config.chains_dir.as_deref())
-            .await?;
-    if merged > 0 || leafed > 0 {
-        info!(
-            merged = merged,
-            marked_as_leaf = leafed,
-            remaining = apex_children.len(),
-            slug = slug,
-            "horizontal review: merged overlaps and checked depth"
-        );
-    }
-
-    let apex_node = QuestionNode {
-        id: String::new(),
-        question: config.apex_question.clone(),
-        about: "all top-level nodes at once".to_string(),
-        creates: "apex".to_string(),
-        prompt_hint: "Synthesize all sub-answers into a comprehensive answer to the apex question."
-            .to_string(),
-        children: apex_children,
-        is_leaf: false,
-    };
-
-    let mut tree = QuestionTree {
-        apex: apex_node,
+    let apex = dag.materialize_node(&dag.apex_id, &mut HashSet::new())?;
+    let tree = QuestionTree {
+        apex,
         content_type: config.content_type.clone(),
         config: config.clone(),
         audience: None,
     };
 
-    // Assign stable deterministic IDs to all nodes
-    assign_question_ids(&mut tree);
-
-    // Now persist ALL nodes to the DB with correct IDs
-    save_tree_nodes_to_db(&tree.apex, None, 0, slug, &writer).await?;
+    // Persist the final DAG and refresh the legacy parent_id/children_json
+    // projection in the same pass.
+    save_question_dag_to_db(&dag, slug, &writer, Some(llm_config), true).await?;
 
     let total_nodes = {
         let conn = writer.lock().await;
@@ -811,60 +1136,95 @@ pub async fn decompose_question_incremental(
     Ok(tree)
 }
 
-/// Collect all nodes from the tree into a flat vec of (node_clone, parent_id, depth).
-fn collect_tree_nodes(
-    node: &QuestionNode,
-    parent_id: Option<String>,
-    depth: u32,
-    out: &mut Vec<(QuestionNode, Option<String>, u32)>,
-) {
-    out.push((node.clone(), parent_id, depth));
-    for child in &node.children {
-        collect_tree_nodes(child, Some(node.id.clone()), depth + 1, out);
-    }
-}
-
 /// Save all nodes in a tree to the DB in a single blocking transaction.
 /// Collects all nodes in-memory first, then acquires the lock once and writes
 /// them all inside a transaction — avoids per-node async lock round-trips that
 /// caused backpressure hangs.
-async fn save_tree_nodes_to_db(
-    node: &QuestionNode,
-    parent_id: Option<&str>,
-    depth: u32,
+async fn save_question_dag_to_db(
+    dag: &QuestionDagDraft,
     slug: &str,
     writer: &Arc<Mutex<Connection>>,
+    llm_config: Option<&LlmConfig>,
+    clear_existing: bool,
 ) -> Result<()> {
-    let mut all_nodes = Vec::new();
-    collect_tree_nodes(
-        node,
-        parent_id.map(|s| s.to_string()),
-        depth,
-        &mut all_nodes,
-    );
+    let mut ids = dag.nodes.keys().cloned().collect::<Vec<_>>();
+    ids.sort_by(|a, b| {
+        dag.depths
+            .get(a)
+            .unwrap_or(&0)
+            .cmp(dag.depths.get(b).unwrap_or(&0))
+            .then_with(|| a.cmp(b))
+    });
 
+    let mut all_nodes = Vec::new();
+    for id in ids {
+        let Some(base_node) = dag.nodes.get(&id) else {
+            continue;
+        };
+        let mut node = base_node.clone();
+        node.children = dag
+            .children_by_parent
+            .get(&id)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|child_id| dag.nodes.get(child_id).cloned())
+            .collect();
+        let parent_id = dag
+            .parents_by_child
+            .get(&id)
+            .and_then(|parents| parents.first())
+            .cloned();
+        let depth = *dag.depths.get(&id).unwrap_or(&0);
+        all_nodes.push((node, parent_id, depth));
+    }
+
+    let children_by_parent = dag.children_by_parent.clone();
     let node_count = all_nodes.len();
     info!(
         nodes = node_count,
         slug = slug,
-        "save_tree_nodes_to_db: batching all nodes in single transaction"
+        "save_question_dag_to_db: batching DAG nodes and canonical edges"
     );
 
     let conn = writer.clone();
     let slug_owned = slug.to_string();
-    tokio::task::spawn_blocking(move || {
+    let produced_events = tokio::task::spawn_blocking(move || {
         let c = conn.blocking_lock();
-        c.execute_batch("BEGIN")?;
-        let result = (|| -> anyhow::Result<()> {
+        c.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> anyhow::Result<Vec<(String, String, i64)>> {
+            let mut produced_events = Vec::new();
+            for (ref n, _, d) in &all_nodes {
+                let existed = match c.query_row(
+                    "SELECT 1 FROM pyramid_question_nodes WHERE slug = ?1 AND question_id = ?2",
+                    rusqlite::params![slug_owned, n.id],
+                    |_| Ok(true),
+                ) {
+                    Ok(existed) => existed,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => false,
+                    Err(e) => return Err(e.into()),
+                };
+                if !existed {
+                    produced_events.push((n.id.clone(), n.question.clone(), *d as i64));
+                }
+            }
+            if clear_existing {
+                db::clear_question_nodes(&c, &slug_owned, None)?;
+                db::clear_question_edges(&c, &slug_owned, None)?;
+            }
             for (ref n, ref pid, d) in &all_nodes {
                 db::save_question_node(&c, &slug_owned, n, pid.as_deref(), *d)?;
             }
-            Ok(())
+            for (ref n, _, _) in &all_nodes {
+                let child_ids = children_by_parent.get(&n.id).cloned().unwrap_or_default();
+                db::save_question_edges_for_parent(&c, &slug_owned, None, &n.id, &child_ids)?;
+            }
+            Ok(produced_events)
         })();
         match result {
-            Ok(()) => {
+            Ok(produced_events) => {
                 c.execute_batch("COMMIT")?;
-                Ok(())
+                Ok(produced_events)
             }
             Err(e) => {
                 let _ = c.execute_batch("ROLLBACK");
@@ -873,151 +1233,46 @@ async fn save_tree_nodes_to_db(
         }
     })
     .await
-    .map_err(|e| anyhow!("save_tree_nodes_to_db panicked: {e}"))??;
+    .map_err(|e| anyhow!("save_question_dag_to_db panicked: {e}"))??;
+
+    emit_question_node_events(slug, llm_config, produced_events);
 
     Ok(())
 }
 
-/// Incrementally build a subtree, persisting each node as it's created.
-///
-/// Similar to `build_subtree` but saves nodes to DB after each LLM call.
-/// For resumed builds, `existing_parent_id` lets us update the parent's
-/// children_json once we know the child IDs.
-async fn build_subtree_incremental(
-    raw: &RawDecomposedQuestion,
-    content_type: &str,
-    folder_map: Option<&str>,
-    granularity: u32,
-    max_depth: u32,
-    current_depth: u32,
-    llm_config: &LlmConfig,
-    writer: Arc<Mutex<Connection>>,
+fn emit_question_node_events(
     slug: &str,
-    _existing_parent_id: Option<&str>,
-    chains_dir: Option<&std::path::Path>,
-    audience: Option<&str>,
-    tier1: &super::Tier1Config,
-    tier2: &super::Tier2Config,
-) -> Result<QuestionNode> {
-    // Terminal conditions: marked as leaf, or depth exceeded
-    if raw.is_leaf || current_depth >= max_depth {
-        let node = QuestionNode {
-            id: String::new(), // Will be assigned later by assign_question_ids
-            question: raw.question.clone(),
-            about: "each file individually".to_string(),
-            creates: "L0 nodes".to_string(),
-            prompt_hint: raw.prompt_hint.clone(),
-            children: vec![],
-            is_leaf: true,
-        };
-        return Ok(node);
-    }
-
-    // The LLM decides whether to decompose further — it can return an empty
-    // array if the question is already specific enough. No forced minimums.
-
-    let (min_subs, max_subs) = granularity_to_range(granularity, tier2);
-
-    info!(
-        depth = current_depth,
-        question = %raw.question,
-        slug = slug,
-        "decomposing sub-question (incremental)"
-    );
-    let sub_questions = call_decomposition_llm(
-        &raw.question,
-        content_type,
-        folder_map,
-        min_subs,
-        max_subs,
-        current_depth,
-        llm_config,
-        chains_dir,
-        audience,
-        tier1,
-    )
-    .await?;
-
-    info!(
-        depth = current_depth,
-        question = %raw.question,
-        sub_count = sub_questions.len(),
-        slug = slug,
-        "sub-questions returned (incremental)"
-    );
-
-    if sub_questions.is_empty() {
-        let node = QuestionNode {
-            id: String::new(),
-            question: raw.question.clone(),
-            about: "each file individually".to_string(),
-            creates: "L0 nodes".to_string(),
-            prompt_hint: raw.prompt_hint.clone(),
-            children: vec![],
-            is_leaf: true,
-        };
-        return Ok(node);
-    }
-
-    let mut children = Vec::new();
-    for sq in sub_questions {
-        let child = Box::pin(build_subtree_incremental(
-            &sq,
-            content_type,
-            folder_map,
-            granularity,
-            max_depth,
-            current_depth + 1,
-            llm_config,
-            writer.clone(),
-            slug,
-            None,
-            chains_dir,
-            audience,
-            tier1,
-            tier2,
-        ))
-        .await?;
-        children.push(child);
-    }
-
-    // Horizontal review: deduplicate siblings at every depth, not just depth 1
-    if children.len() > 1 {
-        let (merged, leafed) =
-            horizontal_review_siblings(&mut children, llm_config, chains_dir).await?;
-        if merged > 0 || leafed > 0 {
-            info!(
-                depth = current_depth,
-                merged,
-                marked_as_leaf = leafed,
-                remaining = children.len(),
-                "horizontal review (incremental) at depth {}",
-                current_depth
-            );
-        }
-    }
-
-    let (about, creates) = scope_for_depth(current_depth);
-
-    let node = QuestionNode {
-        id: String::new(),
-        question: raw.question.clone(),
-        about,
-        creates,
-        prompt_hint: raw.prompt_hint.clone(),
-        children,
-        is_leaf: false,
+    llm_config: Option<&LlmConfig>,
+    nodes: Vec<(String, String, i64)>,
+) {
+    let Some(cache) = llm_config.and_then(|cfg| cfg.cache_access.as_ref()) else {
+        return;
+    };
+    let Some(bus) = cache.bus.as_ref() else {
+        return;
     };
 
-    info!(
-        slug = slug,
-        depth = current_depth,
-        children_count = node.children.len(),
-        question = %raw.question,
-        "decomposed question node (incremental)"
-    );
+    let build_prefix = format!("decompose-{slug}-");
+    let step_name = cache
+        .build_id
+        .strip_prefix(&build_prefix)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("question_decompose")
+        .to_string();
 
-    Ok(node)
+    for (node_id, headline, depth) in nodes {
+        let _ = bus.tx.send(TaggedBuildEvent {
+            slug: slug.to_string(),
+            kind: TaggedKind::NodeProduced {
+                slug: slug.to_string(),
+                build_id: cache.build_id.clone(),
+                step_name: step_name.clone(),
+                node_id,
+                headline,
+                depth,
+            },
+        });
+    }
 }
 
 /// Recursively build a subtree for a decomposed question.
@@ -1034,8 +1289,12 @@ async fn build_subtree(
     llm_config: &LlmConfig,
     chains_dir: Option<&std::path::Path>,
     audience: Option<&str>,
-    tier1: &super::Tier1Config,
+    model_tier: &str,
+    temperature: f32,
+    max_tokens: usize,
+    sibling_review_max_tokens: usize,
     tier2: &super::Tier2Config,
+    audit: Option<&AuditContext>,
 ) -> Result<QuestionNode> {
     // Terminal conditions: marked as leaf, or depth exceeded
     if raw.is_leaf || current_depth >= max_depth {
@@ -1080,7 +1339,10 @@ async fn build_subtree(
         llm_config,
         chains_dir,
         audience,
-        tier1,
+        model_tier,
+        temperature,
+        max_tokens,
+        audit,
     )
     .await?;
     info!(
@@ -1115,8 +1377,12 @@ async fn build_subtree(
             llm_config,
             chains_dir,
             audience,
-            tier1,
+            model_tier,
+            temperature,
+            max_tokens,
+            sibling_review_max_tokens,
             tier2,
+            audit,
         ))
         .await?;
         children.push(child);
@@ -1124,8 +1390,15 @@ async fn build_subtree(
 
     // Horizontal review: deduplicate siblings at every depth, not just depth 1
     if children.len() > 1 {
-        let (merged, leafed) =
-            horizontal_review_siblings(&mut children, llm_config, chains_dir).await?;
+        let (merged, leafed) = horizontal_review_siblings(
+            &mut children,
+            llm_config,
+            chains_dir,
+            model_tier,
+            sibling_review_max_tokens,
+            audit,
+        )
+        .await?;
         if merged > 0 || leafed > 0 {
             info!(
                 depth = current_depth,
@@ -1164,20 +1437,23 @@ struct RawDecomposedQuestion {
 
 /// Call the LLM to decompose a question into sub-questions.
 ///
-/// Uses the "max" tier (High Intelligence) because decomposition is judgment work.
+/// Uses the chain-resolved model tier because decomposition routing is YAML-driven.
 /// 11-G: Loads system prompt from chains/prompts/question/decompose.md when chains_dir is set.
 /// 11-Q: Uses {{variable}} template substitution for content_type and depth.
 async fn call_decomposition_llm(
     parent_question: &str,
     content_type: &str,
     folder_map: Option<&str>,
-    _min_subs: u32,
-    _max_subs: u32,
+    min_subs: u32,
+    max_subs: u32,
     depth: u32,
     llm_config: &LlmConfig,
     chains_dir: Option<&std::path::Path>,
     audience: Option<&str>,
-    tier1: &super::Tier1Config,
+    model_tier: &str,
+    temperature: f32,
+    max_tokens: usize,
+    audit: Option<&AuditContext>,
 ) -> Result<Vec<RawDecomposedQuestion>> {
     let folder_context = folder_map.unwrap_or("(no folder map provided)");
 
@@ -1197,6 +1473,8 @@ async fn call_decomposition_llm(
             &[
                 ("content_type", content_type),
                 ("depth", &depth_str),
+                ("min_subs", &min_subs.to_string()),
+                ("max_subs", &max_subs.to_string()),
                 ("audience_block", &audience_block),
             ],
         ),
@@ -1255,29 +1533,34 @@ What are the genuinely distinct sub-questions needed to answer this? Only create
     // Model selection is controlled by YAML chain definitions, not Rust overrides.
     // See Inviolable #4: "YAML is the single source of truth for model selection."
 
-    let temperature = tier1.decomposition_temperature;
-    let max_tokens = tier1.decomposition_max_tokens;
-
     // Try up to 2 times on parse failure
     for attempt in 0..2u32 {
         let temp = if attempt == 0 { temperature } else { 0.1 };
 
+        let step_name = effective_decompose_step_name(audit, "question_decompose_layer");
         let cache_ctx = make_step_ctx_from_llm_config(
             llm_config,
-            "question_decompose_layer",
+            step_name,
             "question_decompose",
             depth as i64,
             None,
             &system_prompt,
-        );
-        let response = llm::call_model_unified_and_ctx(
+            model_tier,
+            None,
+            None,
+        )
+        .await;
+        let audit_ctx = audit_for(audit, step_name, Some(depth as i64));
+        let response = llm::call_model_unified_with_audit_and_ctx(
             llm_config,
             cache_ctx.as_ref(),
+            audit_ctx.as_ref(),
             &system_prompt,
             &user_prompt,
             temp,
             max_tokens,
             None,
+            LlmCallOptions::default(),
         )
         .await?;
 
@@ -1315,6 +1598,177 @@ What are the genuinely distinct sub-questions needed to answer this? Only create
     Err(anyhow!(
         "failed to get valid decomposition after retries for question: {}",
         parent_question
+    ))
+}
+
+async fn call_frontier_decomposition_llm(
+    frontier: &[FrontierQuestion],
+    content_type: &str,
+    folder_map: Option<&str>,
+    min_subs: u32,
+    max_subs: u32,
+    depth: u32,
+    llm_config: &LlmConfig,
+    chains_dir: Option<&std::path::Path>,
+    audience: Option<&str>,
+    model_tier: &str,
+    temperature: f32,
+    max_tokens: usize,
+    audit: Option<&AuditContext>,
+) -> Result<Vec<FrontierDecomposedQuestion>> {
+    if frontier.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let folder_context = folder_map.unwrap_or("(no folder map provided)");
+    let depth_str = depth.to_string();
+    let audience_str = audience.unwrap_or("");
+    let audience_block = if audience_str.is_empty() {
+        String::new()
+    } else {
+        format!("AUDIENCE: The person asking this question is {audience_str}. Use their vocabulary and perspective.")
+    };
+
+    let system_prompt = match chains_dir
+        .map(|d| d.join("prompts/question/decompose_frontier.md"))
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+    {
+        Some(template) => render_prompt_template(
+            &template,
+            &[
+                ("content_type", content_type),
+                ("depth", &depth_str),
+                ("min_subs", &min_subs.to_string()),
+                ("max_subs", &max_subs.to_string()),
+                ("audience_block", &audience_block),
+            ],
+        ),
+        None => {
+            warn!("decompose_frontier.md not found — using inline fallback");
+            format!(
+                r#"You are building a question DAG for a knowledge pyramid.
+
+You will receive a whole frontier layer of parent questions. Produce the canonical next layer of child questions for the entire frontier at once.
+
+Rules:
+- A child question must be listed once even if it helps answer multiple parents.
+- Use parent_ids to attach that canonical child to every parent it supports.
+- Keep siblings across the whole layer non-overlapping.
+- Prefer the minimum set of focused questions needed to answer the parent frontier.
+- If a child can be answered directly from source material, set is_leaf true.
+- If it needs another synthesis layer, set is_leaf false.
+- Suggested breadth is {min_subs}-{max_subs} children per parent, but do not pad.
+
+You are at decomposition depth {depth} for "{content_type}" source material.
+{audience_block}
+
+Respond with JSON only:
+[
+  {{
+    "question": "canonical child question",
+    "prompt_hint": "what answering should focus on",
+    "is_leaf": true,
+    "parent_ids": ["parent question id", "..."]
+  }}
+]"#
+            )
+        }
+    };
+
+    let parent_lines = frontier
+        .iter()
+        .enumerate()
+        .map(|(idx, parent)| {
+            format!(
+                "[{idx}] id={} depth={} question=\"{}\" hint=\"{}\"",
+                parent.id, parent.tree_depth, parent.question, parent.prompt_hint
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let user_prompt = format!(
+        r#"Parent frontier:
+{parent_lines}
+
+Source material:
+{folder_context}
+
+Create the next canonical child-question layer for this whole frontier. When one child question supports multiple parents, include all of those parent_ids on the one child object."#
+    );
+
+    let allowed_parent_ids: HashSet<String> = frontier.iter().map(|p| p.id.clone()).collect();
+    let parent_index_to_id: HashMap<usize, String> = frontier
+        .iter()
+        .enumerate()
+        .map(|(idx, p)| (idx, p.id.clone()))
+        .collect();
+
+    for attempt in 0..2u32 {
+        let temp = if attempt == 0 { temperature } else { 0.1 };
+        let step_name = effective_decompose_step_name(audit, "question_decompose_frontier");
+        let cache_ctx = make_step_ctx_from_llm_config(
+            llm_config,
+            step_name,
+            "question_decompose",
+            depth as i64,
+            None,
+            &system_prompt,
+            model_tier,
+            None,
+            None,
+        )
+        .await;
+        let audit_ctx = audit_for(audit, step_name, Some(depth as i64));
+        let response = llm::call_model_unified_with_audit_and_ctx(
+            llm_config,
+            cache_ctx.as_ref(),
+            audit_ctx.as_ref(),
+            &system_prompt,
+            &user_prompt,
+            temp,
+            max_tokens,
+            None,
+            LlmCallOptions::default(),
+        )
+        .await?;
+
+        info!(
+            depth = depth,
+            parents = frontier.len(),
+            attempt = attempt,
+            tokens_in = response.usage.prompt_tokens,
+            tokens_out = response.usage.completion_tokens,
+            "frontier decomposition LLM call complete"
+        );
+
+        match parse_frontier_decomposition_response(
+            &response.content,
+            &allowed_parent_ids,
+            &parent_index_to_id,
+        ) {
+            Ok(children) if !children.is_empty() => return Ok(children),
+            Ok(_) => {
+                warn!(
+                    depth = depth,
+                    attempt = attempt,
+                    "frontier decomposition response had no valid children, retrying"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    depth = depth,
+                    attempt = attempt,
+                    error = %e,
+                    "failed to parse frontier decomposition response, retrying"
+                );
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "failed to get valid frontier decomposition after retries at depth {}",
+        depth
     ))
 }
 
@@ -1374,6 +1828,172 @@ fn parse_decomposition_response(content: &str) -> Result<Vec<RawDecomposedQuesti
     }
 
     Ok(questions)
+}
+
+fn parse_frontier_decomposition_response(
+    content: &str,
+    allowed_parent_ids: &HashSet<String>,
+    parent_index_to_id: &HashMap<usize, String>,
+) -> Result<Vec<FrontierDecomposedQuestion>> {
+    let json_str = extract_json_payload(content);
+    let parsed: Value = serde_json::from_str(json_str)
+        .map_err(|e| anyhow!("failed to parse frontier decomposition JSON: {}", e))?;
+    let items = if let Some(arr) = parsed.as_array() {
+        arr.clone()
+    } else if let Some(arr) = parsed.get("children").and_then(Value::as_array) {
+        arr.clone()
+    } else if let Some(arr) = parsed.get("questions").and_then(Value::as_array) {
+        arr.clone()
+    } else {
+        return Err(anyhow!(
+            "frontier decomposition output must be an array or object.children"
+        ));
+    };
+
+    let mut out = Vec::new();
+    for item in items {
+        let question = item
+            .get("question")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing 'question' field in frontier decomposition output"))?
+            .to_string();
+        let prompt_hint = item
+            .get("prompt_hint")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let is_leaf = item.get("is_leaf").and_then(Value::as_bool).unwrap_or(true);
+        let mut parent_ids = Vec::new();
+
+        collect_parent_refs_from_value(
+            item.get("parent_id"),
+            allowed_parent_ids,
+            parent_index_to_id,
+            &mut parent_ids,
+        );
+        collect_parent_refs_from_value(
+            item.get("parent_ids"),
+            allowed_parent_ids,
+            parent_index_to_id,
+            &mut parent_ids,
+        );
+        collect_parent_refs_from_value(
+            item.get("parents"),
+            allowed_parent_ids,
+            parent_index_to_id,
+            &mut parent_ids,
+        );
+        collect_parent_refs_from_value(
+            item.get("parent_indices"),
+            allowed_parent_ids,
+            parent_index_to_id,
+            &mut parent_ids,
+        );
+
+        if parent_ids.is_empty() && allowed_parent_ids.len() == 1 {
+            if let Some(parent_id) = allowed_parent_ids.iter().next() {
+                parent_ids.push(parent_id.clone());
+            }
+        }
+
+        if parent_ids.is_empty() {
+            return Err(anyhow!(
+                "frontier child '{}' did not reference any valid parent_ids",
+                question
+            ));
+        }
+
+        out.push(FrontierDecomposedQuestion {
+            raw: RawDecomposedQuestion {
+                question,
+                prompt_hint,
+                is_leaf,
+            },
+            parent_ids,
+        });
+    }
+
+    Ok(out)
+}
+
+fn collect_parent_refs_from_value(
+    value: Option<&Value>,
+    allowed_parent_ids: &HashSet<String>,
+    parent_index_to_id: &HashMap<usize, String>,
+    out: &mut Vec<String>,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    match value {
+        Value::Array(arr) => {
+            for item in arr {
+                collect_parent_refs_from_value(
+                    Some(item),
+                    allowed_parent_ids,
+                    parent_index_to_id,
+                    out,
+                );
+            }
+        }
+        Value::String(s) => {
+            if allowed_parent_ids.contains(s) {
+                push_unique(out, s.clone());
+            } else if let Some(stripped) = s.strip_prefix('P') {
+                if let Ok(idx) = stripped.parse::<usize>() {
+                    if let Some(parent_id) = parent_index_to_id.get(&idx) {
+                        push_unique(out, parent_id.clone());
+                    }
+                }
+            } else if let Ok(idx) = s.parse::<usize>() {
+                if let Some(parent_id) = parent_index_to_id.get(&idx) {
+                    push_unique(out, parent_id.clone());
+                }
+            }
+        }
+        Value::Number(n) => {
+            if let Some(idx) = n.as_u64().and_then(|n| usize::try_from(n).ok()) {
+                if let Some(parent_id) = parent_index_to_id.get(&idx) {
+                    push_unique(out, parent_id.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_json_payload(content: &str) -> &str {
+    let trimmed = content.trim();
+    let json_str = if trimmed.starts_with("```") {
+        let inner = trimmed
+            .strip_prefix("```json")
+            .or_else(|| trimmed.strip_prefix("```"))
+            .unwrap_or(trimmed);
+        inner.strip_suffix("```").unwrap_or(inner).trim()
+    } else {
+        trimmed
+    };
+
+    if json_str.starts_with('[') || json_str.starts_with('{') {
+        return json_str;
+    }
+    let array_start = json_str.find('[');
+    let object_start = json_str.find('{');
+    match (array_start, object_start) {
+        (Some(a), Some(o)) if a < o => json_str
+            .rfind(']')
+            .map(|end| &json_str[a..=end])
+            .unwrap_or(json_str),
+        (Some(a), None) => json_str
+            .rfind(']')
+            .map(|end| &json_str[a..=end])
+            .unwrap_or(json_str),
+        (_, Some(o)) => json_str
+            .rfind('}')
+            .map(|end| &json_str[o..=end])
+            .unwrap_or(json_str),
+        _ => json_str,
+    }
 }
 
 // ── Tree → QuestionSet conversion ─────────────────────────────────────────────
@@ -1795,12 +2415,24 @@ fn load_prompt_candidates(chains_dir: &Path, candidates: &[&str]) -> Option<Stri
 
 /// Collect all leaf nodes from a question tree.
 fn collect_leaves(node: &QuestionNode) -> Vec<&QuestionNode> {
+    let mut seen = HashSet::new();
+    collect_leaves_deduped(node, &mut seen)
+}
+
+fn collect_leaves_deduped<'a>(
+    node: &'a QuestionNode,
+    seen: &mut HashSet<String>,
+) -> Vec<&'a QuestionNode> {
     if node.is_leaf {
-        return vec![node];
+        return if seen.insert(node.id.clone()) {
+            vec![node]
+        } else {
+            Vec::new()
+        };
     }
     let mut leaves = Vec::new();
     for child in &node.children {
-        leaves.extend(collect_leaves(child));
+        leaves.extend(collect_leaves_deduped(child, seen));
     }
     leaves
 }
@@ -1914,6 +2546,9 @@ async fn horizontal_review_siblings(
     siblings: &mut Vec<QuestionNode>,
     llm_config: &LlmConfig,
     chains_dir: Option<&std::path::Path>,
+    model_tier: &str,
+    max_tokens: usize,
+    audit: Option<&AuditContext>,
 ) -> Result<(usize, usize)> {
     if siblings.len() <= 1 {
         return Ok((0, 0));
@@ -1971,15 +2606,22 @@ The merges array can be empty if no questions overlap. Return ONLY the JSON obje
         0,
         None,
         &system_prompt,
-    );
-    let response = llm::call_model_unified_and_ctx(
+        model_tier,
+        None,
+        None,
+    )
+    .await;
+    let audit_ctx = audit_for(audit, "question_sibling_review", Some(0));
+    let response = llm::call_model_unified_with_audit_and_ctx(
         llm_config,
         cache_ctx.as_ref(),
+        audit_ctx.as_ref(),
         &system_prompt,
         &user_prompt,
         0.1,
-        2048,
+        max_tokens,
         None,
+        LlmCallOptions::default(),
     )
     .await?;
 
@@ -2259,6 +2901,10 @@ mod tests {
                 folder_map: None,
                 chains_dir: None,
                 audience: None,
+                model_tier: default_decomposition_model_tier(),
+                temperature: default_decomposition_temperature(),
+                max_tokens: default_decomposition_max_tokens(),
+                sibling_review_max_tokens: default_sibling_review_max_tokens(),
             },
             audience: None,
         }
@@ -2372,6 +3018,40 @@ That should cover it."#;
     }
 
     #[test]
+    fn parse_frontier_response_preserves_multiple_parent_ids() {
+        let allowed = HashSet::from(["q-parent-a".to_string(), "q-parent-b".to_string()]);
+        let index_map = HashMap::from([
+            (0usize, "q-parent-a".to_string()),
+            (1usize, "q-parent-b".to_string()),
+        ]);
+        let response = r#"{
+            "children": [
+                {
+                    "question": "What shared constraint affects both branches?",
+                    "prompt_hint": "Find the common constraint.",
+                    "is_leaf": true,
+                    "parent_ids": ["q-parent-a", "q-parent-b"]
+                },
+                {
+                    "question": "What is parent B's distinct risk?",
+                    "prompt_hint": "Focus on branch B.",
+                    "is_leaf": false,
+                    "parent_indices": [1]
+                }
+            ]
+        }"#;
+
+        let parsed = parse_frontier_decomposition_response(response, &allowed, &index_map).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0].parent_ids,
+            vec!["q-parent-a".to_string(), "q-parent-b".to_string()]
+        );
+        assert_eq!(parsed[1].parent_ids, vec!["q-parent-b".to_string()]);
+        assert!(!parsed[1].raw.is_leaf);
+    }
+
+    #[test]
     fn parse_invalid_json_fails() {
         let response = "This is not JSON at all";
         assert!(parse_decomposition_response(response).is_err());
@@ -2413,6 +3093,25 @@ That should cover it."#;
         let (total, leaves) = count_nodes(&tree.apex);
         assert_eq!(total, 8); // apex + 2 branches + 5 leaves
         assert_eq!(leaves, 5);
+    }
+
+    #[test]
+    fn extract_layer_questions_dedupes_shared_dag_nodes() {
+        let shared = make_leaf("Which evidence matters to both branches?");
+        let mut tree = make_tree(vec![
+            make_branch("Branch A", vec![shared.clone()]),
+            make_branch("Branch B", vec![shared]),
+        ]);
+        assign_question_ids(&mut tree);
+
+        let layers = extract_layer_questions(&tree);
+        let all_question_ids = layers
+            .values()
+            .flat_map(|questions| questions.iter().map(|q| q.question_id.clone()))
+            .collect::<Vec<_>>();
+        let unique_question_ids = all_question_ids.iter().collect::<HashSet<_>>();
+
+        assert_eq!(all_question_ids.len(), unique_question_ids.len());
     }
 
     // ── Tree depth tests ──────────────────────────────────────────────────
@@ -2631,6 +3330,95 @@ That should cover it."#;
         );
     }
 
+    fn question_row(
+        id: &str,
+        depth: u32,
+        is_leaf: bool,
+        children: Option<Vec<&str>>,
+    ) -> db::QuestionNodeRow {
+        db::QuestionNodeRow {
+            question_id: id.to_string(),
+            parent_id: None,
+            depth,
+            question: format!("Question {id}"),
+            about: if is_leaf {
+                "each file individually".to_string()
+            } else {
+                "all top-level nodes at once".to_string()
+            },
+            creates: if is_leaf {
+                "L0 nodes".to_string()
+            } else {
+                "L1 nodes".to_string()
+            },
+            prompt_hint: format!("Hint {id}"),
+            is_leaf,
+            children_json: children.map(|ids| {
+                serde_json::to_string(
+                    &ids.into_iter()
+                        .map(|child| child.to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap()
+            }),
+            build_id: None,
+            created_at: None,
+        }
+    }
+
+    fn question_edge(parent: &str, child: &str, ordinal: i64) -> db::QuestionEdgeRow {
+        db::QuestionEdgeRow {
+            parent_question_id: parent.to_string(),
+            child_question_id: child.to_string(),
+            ordinal,
+            edge_kind: "decomposes".to_string(),
+            build_id: None,
+        }
+    }
+
+    #[test]
+    fn question_dag_resume_frontier_uses_canonical_edges() {
+        let rows = vec![
+            question_row("q-apex", 0, false, None),
+            question_row("q-a", 1, false, None),
+            question_row("q-b", 1, false, None),
+        ];
+        let edges = vec![
+            question_edge("q-apex", "q-a", 0),
+            question_edge("q-apex", "q-b", 1),
+        ];
+        let dag = question_dag_from_rows(rows, edges).unwrap();
+
+        assert_eq!(dag.apex_id, "q-apex");
+        assert_eq!(
+            undecomposed_frontier_ids(&dag, 3),
+            vec!["q-a".to_string(), "q-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn question_dag_from_rows_preserves_multi_parent_child() {
+        let rows = vec![
+            question_row("q-apex", 0, false, None),
+            question_row("q-a", 1, false, None),
+            question_row("q-b", 1, false, None),
+            question_row("q-shared", 2, true, None),
+        ];
+        let edges = vec![
+            question_edge("q-apex", "q-a", 0),
+            question_edge("q-apex", "q-b", 1),
+            question_edge("q-a", "q-shared", 0),
+            question_edge("q-b", "q-shared", 0),
+        ];
+        let dag = question_dag_from_rows(rows, edges).unwrap();
+
+        assert_eq!(
+            dag.parents_by_child.get("q-shared").cloned().unwrap(),
+            vec!["q-a".to_string(), "q-b".to_string()]
+        );
+        assert!(undecomposed_frontier_ids(&dag, 3).is_empty());
+    }
+
     // ── Granularity tests ─────────────────────────────────────────────────
 
     #[test]
@@ -2655,6 +3443,10 @@ That should cover it."#;
             folder_map: None,
             chains_dir: None,
             audience: None,
+            model_tier: default_decomposition_model_tier(),
+            temperature: default_decomposition_temperature(),
+            max_tokens: default_decomposition_max_tokens(),
+            sibling_review_max_tokens: default_sibling_review_max_tokens(),
         };
         // Can't test the async decompose directly without LLM, but we can test
         // that build_subtree respects depth limits via the terminal condition.
@@ -2680,8 +3472,12 @@ That should cover it."#;
             &llm_config,
             None,
             None,
-            &tier1,
+            "max",
+            tier1.decomposition_temperature,
+            tier1.decomposition_max_tokens,
+            tier1.synthesis_prompts_max_tokens,
             &tier2,
+            None,
         ));
         let node = result.unwrap();
         assert!(node.is_leaf);

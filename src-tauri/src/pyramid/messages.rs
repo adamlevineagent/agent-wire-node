@@ -59,16 +59,25 @@ impl std::fmt::Display for MessagesError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MessagesError::InvalidShape => {
-                write!(f, "messages: malformed shape (expected array of {{role, content}} objects)")
+                write!(
+                    f,
+                    "messages: malformed shape (expected array of {{role, content}} objects)"
+                )
             }
             MessagesError::UnknownRole(r) => {
-                write!(f, "messages: unknown role '{r}' (only 'system' and 'user' accepted)")
+                write!(
+                    f,
+                    "messages: unknown role '{r}' (only 'system' and 'user' accepted)"
+                )
             }
             MessagesError::NoUserMessages => {
                 write!(f, "messages: no user messages present")
             }
             MessagesError::AssistantTurns => {
-                write!(f, "messages: assistant turns rejected in Phase 2 (single-turn only)")
+                write!(
+                    f,
+                    "messages: assistant turns rejected in Phase 2 (single-turn only)"
+                )
             }
         }
     }
@@ -348,15 +357,21 @@ mod tests {
         // Handler response body shape: `{ "kind": "...", "detail": "..." }`.
         let e = MessagesError::UnknownRole("tool".to_string());
         let json_str = serde_json::to_string(&e).unwrap();
-        assert!(json_str.contains("\"kind\":\"unknown_role\""),
-            "serialized form: {json_str}");
-        assert!(json_str.contains("\"detail\":\"tool\""),
-            "serialized form: {json_str}");
+        assert!(
+            json_str.contains("\"kind\":\"unknown_role\""),
+            "serialized form: {json_str}"
+        );
+        assert!(
+            json_str.contains("\"detail\":\"tool\""),
+            "serialized form: {json_str}"
+        );
 
         let e = MessagesError::NoUserMessages;
         let json_str = serde_json::to_string(&e).unwrap();
         // Unit variants carry no detail.
-        assert!(json_str.contains("\"kind\":\"no_user_messages\""),
-            "serialized form: {json_str}");
+        assert!(
+            json_str.contains("\"kind\":\"no_user_messages\""),
+            "serialized form: {json_str}"
+        );
     }
 }

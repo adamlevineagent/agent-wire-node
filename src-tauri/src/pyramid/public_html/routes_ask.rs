@@ -32,15 +32,15 @@ use warp::http::StatusCode;
 use warp::{Filter, Rejection};
 
 use crate::http_utils::ct_eq;
-use crate::pyramid::types::ContentType;
-use crate::pyramid::PyramidState;
 use crate::pyramid::public_html::auth::{
-    ANON_SESSION_COOKIE, PublicAuthSource, WIRE_SESSION_COOKIE, csrf_nonce, enforce_public_tier,
-    read_cookie, verify_csrf,
+    csrf_nonce, enforce_public_tier, read_cookie, verify_csrf, PublicAuthSource,
+    ANON_SESSION_COOKIE, WIRE_SESSION_COOKIE,
 };
 use crate::pyramid::public_html::rate_limit;
 use crate::pyramid::public_html::render::{esc, page, status_page};
 use crate::pyramid::public_html::web_sessions;
+use crate::pyramid::types::ContentType;
+use crate::pyramid::PyramidState;
 
 const FORM_BODY_LIMIT: u64 = 8 * 1024;
 const QUESTION_MAX_LEN: usize = 2048;
@@ -131,12 +131,7 @@ fn commit_token_at(
 /// Mint a `commit_token` binding the operator identity + slug + exact
 /// question text + current 5-minute window. Consumed by the second POST to
 /// prove the caller actually saw the preview page.
-pub fn make_commit_token(
-    secret: &[u8; 32],
-    user_id: &str,
-    slug: &str,
-    question: &str,
-) -> String {
+pub fn make_commit_token(secret: &[u8; 32], user_id: &str, slug: &str, question: &str) -> String {
     commit_token_at(secret, user_id, slug, question, epoch_minute_div5())
 }
 
@@ -211,9 +206,7 @@ async fn resolve_auth(
             if token.matches('.').count() == 2 {
                 let pk_str = jwt_public_key.read().await;
                 if !pk_str.is_empty() {
-                    if let Ok(claims) =
-                        crate::server::verify_pyramid_query_jwt(token, &pk_str)
-                    {
+                    if let Ok(claims) = crate::server::verify_pyramid_query_jwt(token, &pk_str) {
                         let operator_id = claims.operator_id.unwrap_or_default();
                         let circle_id = claims.circle_id;
                         return PublicAuthSource::WireOperator {
@@ -330,8 +323,10 @@ fn render_preview_page(
 ) -> warp::reply::Response {
     let mut cand_html = String::new();
     if candidates.is_empty() {
-        cand_html.push_str("<p class=\"empty\">No matching nodes were found yet — \
-             committing will still run a synthesis pass.</p>\n");
+        cand_html.push_str(
+            "<p class=\"empty\">No matching nodes were found yet — \
+             committing will still run a synthesis pass.</p>\n",
+        );
     } else {
         cand_html.push_str("<ul class=\"candidates\">\n");
         for c in candidates {
@@ -375,148 +370,16 @@ fn render_preview_page(
     page("Preview — Wire Node", &body, "no-store")
 }
 
-#[allow(dead_code)]
-fn render_answer_page(
-    slug: &str,
-    question: &str,
-    answer: &str,
-    cited_nodes: &[String],
-) -> warp::reply::Response {
-    let mut cites_html = String::new();
-    if !cited_nodes.is_empty() {
-        cites_html.push_str("<h2>Cited nodes</h2>\n<ul>\n");
-        for nid in cited_nodes {
-            cites_html.push_str(&format!(
-                "<li><a href=\"/p/{slug}/{nid}\">{nid}</a></li>\n",
-                slug = esc(slug),
-                nid = esc(nid),
-            ));
-        }
-        cites_html.push_str("</ul>\n");
-    }
-    let body = format!(
-        "<h1>Answer</h1>\n\
-         <blockquote class=\"question\">{q}</blockquote>\n\
-         <article class=\"answer\"><pre>{a}</pre></article>\n\
-         {cites}\n\
-         <p><a href=\"/p/{slug}\">Back to pyramid</a></p>\n",
-        q = esc(question),
-        a = esc(answer),
-        cites = cites_html,
-        slug = esc(slug),
-    );
-    page("Answer — Wire Node", &body, "no-store")
-}
-
-#[allow(dead_code)]
-fn render_no_results_page(slug: &str, question: &str) -> warp::reply::Response {
-    let body = format!(
-        "<h1>No relevant nodes</h1>\n\
-         <blockquote class=\"question\">{q}</blockquote>\n\
-         <p class=\"empty\">No relevant nodes found for this question.</p>\n\
-         <p><a href=\"/p/{slug}\">Back to pyramid</a></p>\n",
-        q = esc(question),
-        slug = esc(slug),
-    );
-    page("No results — Wire Node", &body, "no-store")
-}
-
 // ── Core synthesis (legacy — kept for reference; question-pyramid path
 //    bypasses inline synthesis entirely). ───────────────────────────────
-
-#[allow(dead_code)]
-struct SynthesisOutput {
-    answer: String,
-    cited_nodes: Vec<String>,
-    is_empty: bool,
-}
-
-#[allow(dead_code)]
-async fn run_synthesis(
-    state: &PyramidState,
-    slug: &str,
-    question: &str,
-) -> Result<SynthesisOutput, String> {
-    let llm_config = {
-        let config = state.config.read().await;
-        if config.api_key.is_empty() {
-            return Err("LLM not configured on this Wire Node.".to_string());
-        }
-        config.clone()
-    };
-
-    let search_results = {
-        let conn = state.reader.lock().await;
-        match crate::pyramid::query::search(&conn, slug, question) {
-            Ok(r) => r,
-            Err(e) => return Err(format!("search failed: {}", e)),
-        }
-    };
-
-    if search_results.is_empty() {
-        return Ok(SynthesisOutput {
-            answer: String::new(),
-            cited_nodes: Vec::new(),
-            is_empty: true,
-        });
-    }
-
-    let top: Vec<_> = search_results.iter().take(TOP_K).collect();
-    let mut node_contents: Vec<(String, String)> = Vec::new();
-    {
-        let conn = state.reader.lock().await;
-        for hit in &top {
-            if let Ok(Some(node)) = crate::pyramid::db::get_node(&conn, slug, &hit.node_id) {
-                let mut distilled = node.distilled.clone();
-                if distilled.len() > 800 {
-                    let mut end = 800;
-                    while end < distilled.len() && !distilled.is_char_boundary(end) {
-                        end += 1;
-                    }
-                    distilled.truncate(end);
-                }
-                let content = format!("Node {}: {}\n{}", node.id, node.headline, distilled);
-                node_contents.push((node.id.clone(), content));
-            }
-        }
-    }
-
-    if node_contents.is_empty() {
-        return Ok(SynthesisOutput {
-            answer: String::new(),
-            cited_nodes: Vec::new(),
-            is_empty: true,
-        });
-    }
-
-    let system = "You answer questions using knowledge pyramid nodes. Cite the node ID (e.g. L1-xxx) that supports each claim. Be concise and direct. If the nodes don't contain enough information to fully answer, say what you can and note what's missing.";
-    let user = format!(
-        "Question: {}\n\nKnowledge nodes:\n{}",
-        question,
-        node_contents
-            .iter()
-            .map(|(_, c)| c.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n---\n\n")
-    );
-
-    match crate::pyramid::llm::call_model_unified(&llm_config, system, &user, 0.2, 600, None).await
-    {
-        Ok(response) => {
-            let cited: Vec<String> = node_contents
-                .iter()
-                .filter(|(id, _)| response.content.contains(id))
-                .map(|(id, _)| id.clone())
-                .collect();
-            Ok(SynthesisOutput {
-                answer: response.content,
-                cited_nodes: cited,
-                is_empty: false,
-            })
-        }
-        Err(e) => Err(format!("LLM call failed: {}", e)),
-    }
-}
+//
+// DELETED (walker-v3-completion Wave 2): render_answer_page,
+// render_no_results_page, SynthesisOutput, run_synthesis,
+// synthesize_and_render — all were #[allow(dead_code)] with zero live
+// callers. The live ask flow uses `create_question_pyramid_and_redirect`
+// at line ~842 which does not call these. Deleting removes a
+// Category-A walker-v3-completion bypass site (ctx=None LLM call at
+// former line 498) without needing migration.
 
 async fn load_preview_candidates(
     state: &PyramidState,
@@ -642,12 +505,9 @@ async fn create_question_pyramid_and_redirect(
     let question_slug = mint_question_slug(&writer, question);
 
     // Step 2: create the slug row.
-    if let Err(e) = crate::pyramid::db::create_slug(
-        &writer,
-        &question_slug,
-        &ContentType::Question,
-        "",
-    ) {
+    if let Err(e) =
+        crate::pyramid::db::create_slug(&writer, &question_slug, &ContentType::Question, "")
+    {
         let body = format!(
             "<h1>Failed to create question pyramid</h1>\n<p class=\"err\">{}</p>\n",
             esc(&e.to_string())
@@ -738,7 +598,9 @@ async fn handle_ask_post(
     // CSRF (bound to wire_session | anon_session | empty + slug).
     let sess_tok = csrf_session_token(&headers);
     if !verify_csrf(&state.csrf_secret, &csrf, &sess_tok, &slug) {
-        return Ok(bad_request_page("Session expired — please reload the pyramid page."));
+        return Ok(bad_request_page(
+            "Session expired — please reload the pyramid page.",
+        ));
     }
 
     // Tier gate: Anonymous/WebSession on a non-public pyramid → 404.
@@ -848,25 +710,6 @@ async fn handle_ask_post(
     Ok(create_question_pyramid_and_redirect(&state, &slug, &question).await)
 }
 
-#[allow(dead_code)]
-async fn synthesize_and_render(
-    state: &PyramidState,
-    slug: &str,
-    question: &str,
-) -> warp::reply::Response {
-    match run_synthesis(state, slug, question).await {
-        Ok(out) if out.is_empty => render_no_results_page(slug, question),
-        Ok(out) => render_answer_page(slug, question, &out.answer, &out.cited_nodes),
-        Err(msg) => {
-            let body = format!(
-                "<h1>Synthesis failed</h1>\n<p class=\"err\">{}</p>\n",
-                esc(&msg)
-            );
-            status_page(500, "Error — Wire Node", &body)
-        }
-    }
-}
-
 // ── Filter assembly ─────────────────────────────────────────────────────
 
 fn with_state(
@@ -916,7 +759,11 @@ mod tests {
         let secret = [7u8; 32];
         let t = make_commit_token(&secret, "op-1", "slug-a", "question A");
         assert!(!verify_commit_token(
-            &secret, &t, "op-1", "slug-a", "question B"
+            &secret,
+            &t,
+            "op-1",
+            "slug-a",
+            "question B"
         ));
     }
 
