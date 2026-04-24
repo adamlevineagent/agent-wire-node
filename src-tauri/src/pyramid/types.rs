@@ -2264,6 +2264,14 @@ pub struct ChildSwap {
     pub new: String,
 }
 
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// The full change manifest produced by the LLM for a single stale-check
 /// (or user-initiated reroll) against a single upper-layer node. Serializes
 /// to / from the JSON shape documented in
@@ -2278,9 +2286,11 @@ pub struct ChangeManifest {
     pub identity_changed: bool,
     /// Wholesale + per-field updates to apply to the target node.
     #[serde(default)]
+    #[serde(deserialize_with = "deserialize_null_default")]
     pub content_updates: ContentUpdates,
     /// Which child references were replaced, for evidence-link rewriting.
     #[serde(default)]
+    #[serde(deserialize_with = "deserialize_null_default")]
     pub children_swapped: Vec<ChildSwap>,
     /// LLM-authored reason: one sentence explaining what changed and why.
     pub reason: String,

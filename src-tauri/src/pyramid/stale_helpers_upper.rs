@@ -1842,20 +1842,95 @@ pub async fn generate_change_manifest(
     }
 
     let json = extract_json(&response)?;
+    let manifest =
+        parse_generated_change_manifest(json, &input.node_id, input.expected_build_version)?;
+
+    Ok(manifest)
+}
+
+fn parse_generated_change_manifest(
+    json: serde_json::Value,
+    node_id: &str,
+    expected_build_version: i64,
+) -> Result<ChangeManifest> {
     let mut manifest: ChangeManifest = serde_json::from_value(json.clone()).with_context(|| {
         format!(
             "change-manifest JSON missing or malformed for node {}: {}",
-            input.node_id,
+            node_id,
             serde_json::to_string(&json).unwrap_or_default()
         )
     })?;
 
-    // Normalize the echoed node_id to the one we asked about — the LLM
-    // sometimes drops the slug prefix or otherwise mangles it. Downstream
-    // validation operates on the node_id we know is live.
-    manifest.node_id = input.node_id.clone();
-
+    // Treat echoed identifiers and versions as runtime-owned bookkeeping. The
+    // model may mangle the target id or invent a non-contiguous build_version;
+    // validation should operate on the live node we actually requested.
+    manifest.node_id = node_id.to_string();
+    manifest.build_version = expected_build_version;
     Ok(manifest)
+}
+
+fn rewrite_identity_change_evidence_links(
+    conn: &Connection,
+    slug: &str,
+    old_node_id: &str,
+    new_node_id: &str,
+) -> Result<usize> {
+    let source_rows: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT build_id, target_node_id
+             FROM pyramid_evidence
+             WHERE slug = ?1 AND source_node_id = ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![slug, old_node_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    let mut rewritten = 0usize;
+    for (build_id, target_node_id) in source_rows {
+        conn.execute(
+            "DELETE FROM pyramid_evidence
+             WHERE slug = ?1 AND build_id = ?2 AND source_node_id = ?3 AND target_node_id = ?4",
+            rusqlite::params![slug, build_id, new_node_id, target_node_id],
+        )?;
+        rewritten += conn.execute(
+            "UPDATE pyramid_evidence
+             SET source_node_id = ?1
+             WHERE slug = ?2 AND build_id = ?3 AND source_node_id = ?4 AND target_node_id = ?5",
+            rusqlite::params![new_node_id, slug, build_id, old_node_id, target_node_id],
+        )?;
+    }
+
+    let target_rows: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT build_id, source_node_id
+             FROM pyramid_evidence
+             WHERE slug = ?1 AND target_node_id = ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![slug, old_node_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    for (build_id, source_node_id) in target_rows {
+        conn.execute(
+            "DELETE FROM pyramid_evidence
+             WHERE slug = ?1 AND build_id = ?2 AND source_node_id = ?3 AND target_node_id = ?4",
+            rusqlite::params![slug, build_id, source_node_id, new_node_id],
+        )?;
+        rewritten += conn.execute(
+            "UPDATE pyramid_evidence
+             SET target_node_id = ?1
+             WHERE slug = ?2 AND build_id = ?3 AND source_node_id = ?4 AND target_node_id = ?5",
+            rusqlite::params![new_node_id, slug, build_id, source_node_id, old_node_id],
+        )?;
+    }
+
+    Ok(rewritten)
 }
 
 /// Synchronous structural validation of a change manifest against the live
@@ -4047,6 +4122,7 @@ async fn execute_supersession_identity_change(
         let conn = super::db::open_pyramid_connection(Path::new(&db))
             .context("Failed to open DB for identity-change supersession write")?;
         let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
 
         conn.execute(
             "INSERT INTO pyramid_nodes
@@ -4202,6 +4278,18 @@ async fn execute_supersession_identity_change(
             );
         }
 
+        let evidence_rewrites =
+            rewrite_identity_change_evidence_links(&conn, &s, &nid, &new_nid)?;
+        if evidence_rewrites > 0 {
+            info!(
+                slug = %s,
+                old_node_id = %nid,
+                new_node_id = %new_nid,
+                evidence_rewrites,
+                "rewrote pyramid_evidence links for identity-change supersession"
+            );
+        }
+
         if let Some(ref tid) = nd.self_thread_id {
             let mut stmt = conn.prepare(
                 "SELECT id FROM pyramid_web_edges
@@ -4230,6 +4318,7 @@ async fn execute_supersession_identity_change(
             }
         }
 
+        conn.execute_batch("COMMIT;")?;
         Ok(())
     })
     .await??;
@@ -4266,7 +4355,8 @@ mod tests {
         apply_supersession_manifest, build_changed_children_from_deltas,
         handle_manifest_generation_failure, load_supersession_node_context,
         lookup_source_file_path_for_node, resolve_live_canonical_node_id,
-        rewrite_file_hash_node_reference, validate_change_manifest,
+        rewrite_file_hash_node_reference, rewrite_identity_change_evidence_links,
+        validate_change_manifest,
     };
     use crate::pyramid::db::{
         get_change_manifests_for_node, get_latest_manifest_for_node, open_pyramid_db,
@@ -5482,6 +5572,107 @@ mod tests {
         assert_eq!(ctx.primitive, "manifest_generation");
         assert_eq!(ctx.depth, 2);
         assert_eq!(ctx.chunk_index, None);
+    }
+
+    #[test]
+    fn test_parse_generated_manifest_tolerates_llm_nulls_and_normalizes_bookkeeping() {
+        let raw = serde_json::json!({
+            "node_id": "wrong-node-id",
+            "identity_changed": false,
+            "content_updates": {
+                "distilled": null,
+                "headline": null,
+                "topics": null,
+                "terms": null,
+                "decisions": null,
+                "dead_ends": null
+            },
+            "children_swapped": null,
+            "reason": "No substantive update needed.",
+            "build_version": 99
+        });
+
+        let manifest =
+            super::parse_generated_change_manifest(raw, "L2-real", 2).expect("manifest parses");
+
+        assert_eq!(manifest.node_id, "L2-real");
+        assert_eq!(manifest.build_version, 2);
+        assert!(manifest.children_swapped.is_empty());
+        assert_eq!(manifest.content_updates, ContentUpdates::default());
+        assert_eq!(manifest.reason, "No substantive update needed.");
+    }
+
+    #[test]
+    fn test_identity_change_evidence_rewrite_preserves_tree_links() {
+        let (_tmp, conn) = setup_test_db();
+        insert_upper_node(&conn, "L0-child", 0, "[]", &[]);
+        insert_upper_node(&conn, "L1-old", 1, "[]", &["L0-child"]);
+        insert_upper_node(&conn, "L1-new", 1, "[]", &["L0-child"]);
+        insert_upper_node(&conn, "L2-parent", 2, "[]", &["L1-old"]);
+
+        conn.execute(
+            "UPDATE pyramid_nodes SET superseded_by = 'L1-new'
+              WHERE slug = 'test-slug' AND id = 'L1-old'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_evidence
+             (slug, build_id, source_node_id, target_node_id, verdict, weight, reason)
+             VALUES
+             ('test-slug', 'b1', 'L0-child', 'L1-old', 'KEEP', 1.0, 'child to old'),
+             ('test-slug', 'b1', 'L1-old', 'L2-parent', 'KEEP', 1.0, 'old to parent'),
+             ('test-slug', 'b1', 'L1-new', 'L2-parent', 'KEEP', 0.5, 'pre-existing conflict')",
+            [],
+        )
+        .unwrap();
+
+        let rewritten =
+            rewrite_identity_change_evidence_links(&conn, "test-slug", "L1-old", "L1-new").unwrap();
+
+        assert_eq!(rewritten, 2);
+        let old_refs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_evidence
+                  WHERE slug = 'test-slug'
+                    AND (source_node_id = 'L1-old' OR target_node_id = 'L1-old')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_refs, 0);
+
+        let child_to_new: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_evidence
+                  WHERE slug = 'test-slug'
+                    AND source_node_id = 'L0-child'
+                    AND target_node_id = 'L1-new'
+                    AND verdict = 'KEEP'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_to_new, 1);
+
+        let new_to_parent: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_evidence
+                  WHERE slug = 'test-slug'
+                    AND source_node_id = 'L1-new'
+                    AND target_node_id = 'L2-parent'
+                    AND verdict = 'KEEP'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_to_parent, 1);
+
+        let tree = crate::pyramid::query::get_tree(&conn, "test-slug").unwrap();
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].id, "L2-parent");
+        assert_eq!(tree[0].children[0].id, "L1-new");
+        assert_eq!(tree[0].children[0].children[0].id, "L0-child");
     }
 
     /// Phase 13 verifier fix: the bus-variant of `persist_change_manifest`
