@@ -16,6 +16,8 @@
 //!     dropped
 //!   * insufficient credit (balance < max_budget_credits) →
 //!     InsufficientCredit, dropped
+//!   * cold per-model cache with declared model → Market remains
+//!     available, because `/quote` is authoritative
 //!
 //! The integration test bypasses the background market-probe task
 //! (which requires a live tokio runtime + a populated MarketSurfaceCache).
@@ -197,6 +199,31 @@ fn phase3_decision_includes_market_when_offers_have_headroom() {
     assert!(
         d.effective_call_order.contains(&ProviderType::Market),
         "Market MUST be in effective_call_order; got {:?}",
+        d.effective_call_order
+    );
+    let m = d
+        .per_provider
+        .get(&ProviderType::Market)
+        .expect("Market params must be present");
+    assert_eq!(m.model_list.as_deref(), Some(&[slug.to_string()][..]));
+    invalidate_cached_model(slug);
+}
+
+#[test]
+fn phase3_decision_includes_market_when_probe_cache_is_cold() {
+    let _g = market_it_lock().lock().unwrap_or_else(|p| p.into_inner());
+    clear_model_cache_for_tests();
+    clear_node_state_for_tests();
+    let (_dir, conn) = make_it_db();
+    let _ = seed_local_ready(&conn, "cold-cache");
+    let slug = "phase3-market-readiness/cold-cache";
+    invalidate_cached_model(slug);
+    seed_walker_provider_market(&conn, "c-wpm-cold", "max", &[slug], None);
+
+    let d = DispatchDecision::build("max", &conn).expect("Decision must build with cold cache");
+    assert!(
+        d.effective_call_order.contains(&ProviderType::Market),
+        "Market MUST stay in effective_call_order while probe cache is cold; got {:?}",
         d.effective_call_order
     );
     let m = d

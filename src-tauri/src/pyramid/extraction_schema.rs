@@ -128,7 +128,8 @@ The extraction prompt you produce will be used to describe source files. Those d
     let temperature = tier1.extraction_schema_temperature;
     let max_tokens = tier1.extraction_schema_max_tokens;
 
-    let (resolved_model_id, resolved_provider_id) = resolve_max_tier(llm_config, "extraction_schema")?;
+    let (resolved_model_id, resolved_provider_id) =
+        resolve_max_tier(llm_config, "extraction_schema")?;
 
     for attempt in 0..2u32 {
         let temp = if attempt == 0 { temperature } else { 0.1 };
@@ -189,10 +190,7 @@ The extraction prompt you produce will be used to describe source files. Those d
 /// Both `generate_extraction_schema` and `generate_synthesis_prompts` are
 /// top-level entry points with no outer Decision; the registry is the
 /// only source of truth for which model to dispatch.
-fn resolve_max_tier(
-    llm_config: &LlmConfig,
-    caller: &str,
-) -> Result<(String, Option<String>)> {
+fn resolve_max_tier(llm_config: &LlmConfig, caller: &str) -> Result<(String, Option<String>)> {
     let resolved = llm_config
         .provider_registry
         .as_ref()
@@ -204,7 +202,10 @@ fn resolve_max_tier(
                  a 'max' slot model_list entry."
             )
         })?;
-    Ok((resolved.tier.model_id.clone(), Some(resolved.provider.id.clone())))
+    Ok((
+        resolved.tier.model_id.clone(),
+        Some(resolved.provider.id.clone()),
+    ))
 }
 
 /// Generate per-layer synthesis prompts AFTER L0 extraction completes.
@@ -306,7 +307,8 @@ Design synthesis prompts that will combine this extracted evidence into answers 
     let temperature = tier1.extraction_schema_temperature;
     let max_tokens = tier1.synthesis_prompts_max_tokens;
 
-    let (resolved_model_id, resolved_provider_id) = resolve_max_tier(llm_config, "synthesis_prompts")?;
+    let (resolved_model_id, resolved_provider_id) =
+        resolve_max_tier(llm_config, "synthesis_prompts")?;
 
     for attempt in 0..2u32 {
         let temp = if attempt == 0 { temperature } else { 0.1 };

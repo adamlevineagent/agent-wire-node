@@ -137,6 +137,17 @@ function mapEvent(event: TaggedKind): ChronicleEntry | null {
                 stepName: known.step_name,
             };
         }
+        case 'cache_miss': {
+            return {
+                id: nextId(),
+                timestamp: ts,
+                kind: 'mechanical',
+                category: 'cache',
+                headline: `Cache miss: ${known.step_name}`,
+                detail: `Cache key ${known.cache_key} was not available. Step: ${known.step_name}`,
+                stepName: known.step_name,
+            };
+        }
         case 'chain_step_started': {
             return {
                 id: nextId(),
@@ -204,6 +215,28 @@ function mapEvent(event: TaggedKind): ChronicleEntry | null {
                 stepName: known.step_name,
             };
         }
+        case 'step_retry': {
+            return {
+                id: nextId(),
+                timestamp: ts,
+                kind: 'decision',
+                category: 'retry',
+                headline: `Retry: ${known.step_name} ${known.attempt}/${known.max_attempts}`,
+                detail: `${known.error}. Backoff: ${known.backoff_ms}ms`,
+                stepName: known.step_name,
+            };
+        }
+        case 'step_error': {
+            return {
+                id: nextId(),
+                timestamp: ts,
+                kind: 'decision',
+                category: 'error',
+                headline: `Error: ${known.step_name}`,
+                detail: known.error,
+                stepName: known.step_name,
+            };
+        }
         case 'cost_update': {
             return {
                 id: nextId(),
@@ -213,11 +246,22 @@ function mapEvent(event: TaggedKind): ChronicleEntry | null {
                 headline: `Cost: $${known.cost_so_far_usd.toFixed(4)}`,
             };
         }
+        case 'llm_call_started': {
+            return {
+                id: nextId(),
+                timestamp: ts,
+                kind: 'decision',
+                category: 'llm',
+                headline: `LLM started: ${known.model_id} [${known.step_name}]`,
+                detail: `Model: ${known.model_id}, Tier: ${known.model_tier}, Step: ${known.step_name}, Primitive: ${known.primitive}`,
+                stepName: known.step_name,
+            };
+        }
         case 'llm_call_completed': {
             return {
                 id: nextId(),
                 timestamp: ts,
-                kind: 'mechanical',
+                kind: 'decision',
                 category: 'llm',
                 headline: `LLM: ${known.model_id} ${known.tokens_prompt + known.tokens_completion}tok ${known.latency_ms}ms`,
                 detail: `Model: ${known.model_id}, Step: ${known.step_name}, Prompt: ${known.tokens_prompt}tok, Completion: ${known.tokens_completion}tok, Latency: ${known.latency_ms}ms`,

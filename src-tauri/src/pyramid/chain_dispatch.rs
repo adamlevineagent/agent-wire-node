@@ -20,7 +20,9 @@ use super::execution_plan::{ModelRequirements, Step, StepOperation};
 use super::expression::ValueEnv;
 use super::llm::{self, AuditContext, LlmConfig, LlmResponse};
 use super::naming::headline_from_analysis;
-use super::step_context::{compute_prompt_hash, StepContext as CacheStepContext};
+use super::step_context::{
+    compute_cache_key, compute_inputs_hash, compute_prompt_hash, StepContext as CacheStepContext,
+};
 use super::transform_runtime;
 use super::types::{Correction, Decision, PyramidNode, Term, Topic};
 use super::walker_decision::DispatchDecision;
@@ -48,6 +50,43 @@ fn first_openrouter_model_from_decision(
         .and_then(|d| d.per_provider.get(&WalkerProviderType::OpenRouter))
         .and_then(|p| p.model_list.as_ref())
         .and_then(|ml| ml.first().cloned())
+}
+
+fn invalidate_cached_llm_response(
+    step_ctx: Option<&CacheStepContext>,
+    system_prompt: &str,
+    user_prompt: &str,
+    reason: &str,
+) {
+    let Some(sc) = step_ctx.filter(|sc| sc.cache_is_usable()) else {
+        return;
+    };
+    let Some(resolved_model) = sc
+        .resolved_model_id
+        .as_deref()
+        .filter(|model| !model.is_empty())
+    else {
+        return;
+    };
+
+    let inputs_hash = compute_inputs_hash(system_prompt, user_prompt);
+    let cache_key = compute_cache_key(&inputs_hash, &sc.prompt_hash, resolved_model);
+    let delete_result = super::db::open_pyramid_connection(std::path::Path::new(&sc.db_path))
+        .and_then(|conn| super::db::delete_cache_entry(&conn, &sc.slug, &cache_key));
+
+    match delete_result {
+        Ok(()) => warn!(
+            "[CHAIN] invalidated cached LLM response after parse failure slug={} step={} key={} reason={}",
+            sc.slug,
+            sc.step_name,
+            &cache_key[..cache_key.len().min(16)],
+            reason
+        ),
+        Err(e) => warn!(
+            "[CHAIN] failed to invalidate cached LLM response slug={} step={} reason={}: {}",
+            sc.slug, sc.step_name, reason, e
+        ),
+    }
 }
 
 // ── Step context ────────────────────────────────────────────────────────────
@@ -532,6 +571,12 @@ async fn dispatch_llm(
         match llm::extract_json(&response) {
             Ok(json) => return Ok(json),
             Err(e) => {
+                invalidate_cached_llm_response(
+                    struct_ctx.as_ref(),
+                    system_prompt,
+                    &user_prompt,
+                    "structured_primary_json_parse_failed",
+                );
                 info!(
                     "[CHAIN] step '{}' parse failed, on_parse_error={:?}",
                     step.name, step.on_parse_error
@@ -587,13 +632,22 @@ async fn dispatch_llm(
                         max_tokens,
                     )
                     .await?;
-                    return llm::extract_json(&retry_resp).map_err(|he| {
-                        anyhow!(
-                            "Step '{}': JSON parse failed after self-healing: {}",
-                            step.name,
-                            he
-                        )
-                    });
+                    return match llm::extract_json(&retry_resp) {
+                        Ok(json) => Ok(json),
+                        Err(he) => {
+                            invalidate_cached_llm_response(
+                                heal_ctx.as_ref(),
+                                &heal_sys,
+                                &heal_user,
+                                "structured_heal_json_parse_failed",
+                            );
+                            Err(anyhow!(
+                                "Step '{}': JSON parse failed after self-healing: {}",
+                                step.name,
+                                he
+                            ))
+                        }
+                    };
                 } else {
                     return Err(anyhow!(
                         "Step '{}': structured output JSON parse failed: {}",
@@ -672,6 +726,12 @@ async fn dispatch_llm(
             Ok(json)
         }
         Err(_first_err) => {
+            invalidate_cached_llm_response(
+                dispatch_cache_ctx.as_ref(),
+                system_prompt,
+                &user_prompt,
+                "primary_json_parse_failed",
+            );
             info!(
                 "[CHAIN] step '{}' parse failed, on_parse_error={:?}",
                 step.name, step.on_parse_error
@@ -721,13 +781,22 @@ async fn dispatch_llm(
                     max_tokens,
                 )
                 .await?;
-                return llm::extract_json(&retry_resp).map_err(|he| {
-                    anyhow!(
-                        "Step '{}': JSON parse failed after self-healing: {}",
-                        step.name,
-                        he
-                    )
-                });
+                return match llm::extract_json(&retry_resp) {
+                    Ok(json) => Ok(json),
+                    Err(he) => {
+                        invalidate_cached_llm_response(
+                            heal_ctx.as_ref(),
+                            &heal_sys,
+                            &heal_user,
+                            "heal_json_parse_failed",
+                        );
+                        Err(anyhow!(
+                            "Step '{}': JSON parse failed after self-healing: {}",
+                            step.name,
+                            he
+                        ))
+                    }
+                };
             } else {
                 // JSON-retry guarantee: retry at temperature 0.1
                 info!(
@@ -777,13 +846,22 @@ async fn dispatch_llm(
                 )
                 .await?;
 
-                llm::extract_json(&retry_response).map_err(|e| {
-                    anyhow!(
-                        "Step '{}': JSON parse failed after retry at temp 0.1: {}",
-                        step.name,
-                        e
-                    )
-                })
+                match llm::extract_json(&retry_response) {
+                    Ok(json) => Ok(json),
+                    Err(e) => {
+                        invalidate_cached_llm_response(
+                            retry_ctx.as_ref(),
+                            system_prompt,
+                            &user_prompt,
+                            "retry_json_parse_failed",
+                        );
+                        Err(anyhow!(
+                            "Step '{}': JSON parse failed after retry at temp 0.1: {}",
+                            step.name,
+                            e
+                        ))
+                    }
+                }
             }
         }
     }
@@ -1621,13 +1699,22 @@ pub async fn dispatch_ir_llm(
             llm_options,
         )
         .await?;
-        let parsed = llm::extract_json(&response.content).map_err(|e| {
-            anyhow!(
-                "IR step '{}': structured output JSON parse failed: {}",
-                step.id,
-                e
-            )
-        })?;
+        let parsed = match llm::extract_json(&response.content) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                invalidate_cached_llm_response(
+                    cache_ctx.as_ref(),
+                    system_prompt,
+                    &user_prompt,
+                    "ir_structured_json_parse_failed",
+                );
+                return Err(anyhow!(
+                    "IR step '{}': structured output JSON parse failed: {}",
+                    step.id,
+                    e
+                ));
+            }
+        };
         return Ok((parsed, response));
     }
 
@@ -1672,6 +1759,12 @@ pub async fn dispatch_ir_llm(
             Ok((json, response))
         }
         Err(_first_err) => {
+            invalidate_cached_llm_response(
+                cache_ctx.as_ref(),
+                system_prompt,
+                &user_prompt,
+                "ir_primary_json_parse_failed",
+            );
             // JSON-retry guarantee: retry at temperature 0.1
             info!(
                 "[IR] step '{}' → JSON parse failed, retrying at temp 0.1",
@@ -1689,13 +1782,22 @@ pub async fn dispatch_ir_llm(
             )
             .await?;
 
-            let parsed = llm::extract_json(&retry_response.content).map_err(|e| {
-                anyhow!(
-                    "IR step '{}': JSON parse failed after retry at temp 0.1: {}",
-                    step.id,
-                    e
-                )
-            })?;
+            let parsed = match llm::extract_json(&retry_response.content) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    invalidate_cached_llm_response(
+                        cache_ctx.as_ref(),
+                        system_prompt,
+                        &user_prompt,
+                        "ir_retry_json_parse_failed",
+                    );
+                    return Err(anyhow!(
+                        "IR step '{}': JSON parse failed after retry at temp 0.1: {}",
+                        step.id,
+                        e
+                    ));
+                }
+            };
             Ok((parsed, retry_response))
         }
     }
@@ -1864,6 +1966,71 @@ mod tests {
     #[test]
     fn test_generate_node_id_four_digit_pad() {
         assert_eq!(generate_node_id("N{index:04}", 3, None), "N0003");
+    }
+
+    #[test]
+    fn test_invalidate_cached_llm_response_deletes_exact_cache_row() {
+        let db_file = tempfile::NamedTempFile::new().expect("temp db file");
+        let conn = super::super::db::open_pyramid_db(db_file.path()).expect("open temp db");
+        conn.execute(
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path)
+             VALUES ('cache-invalidate-test', 'document', '/tmp/source')",
+            [],
+        )
+        .expect("insert slug");
+
+        let system_prompt = "system prompt";
+        let user_prompt = "user prompt";
+        let prompt_hash = compute_prompt_hash("template body");
+        let inputs_hash = compute_inputs_hash(system_prompt, user_prompt);
+        let model_id = "test/model";
+        let cache_key = compute_cache_key(&inputs_hash, &prompt_hash, model_id);
+        let entry = super::super::step_context::CacheEntry {
+            slug: "cache-invalidate-test".to_string(),
+            build_id: "build-1".to_string(),
+            step_name: "source_extract".to_string(),
+            chunk_index: -1,
+            depth: 0,
+            cache_key: cache_key.clone(),
+            inputs_hash,
+            prompt_hash: prompt_hash.clone(),
+            model_id: model_id.to_string(),
+            output_json: serde_json::json!({
+                "content": "```json\n{\"headline\":\"bad\"\n```",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })
+            .to_string(),
+            token_usage_json: None,
+            cost_usd: None,
+            latency_ms: Some(1),
+            force_fresh: false,
+            supersedes_cache_id: None,
+            note: None,
+        };
+        super::super::db::store_cache(&conn, &entry).expect("store cache");
+
+        let step_ctx = CacheStepContext::new(
+            "cache-invalidate-test",
+            "build-1",
+            "source_extract",
+            "chain_llm",
+            0,
+            None,
+            db_file.path().to_string_lossy().to_string(),
+        )
+        .with_model_resolution("extractor", model_id)
+        .with_prompt_hash(prompt_hash);
+
+        invalidate_cached_llm_response(
+            Some(&step_ctx),
+            system_prompt,
+            user_prompt,
+            "test_parse_failure",
+        );
+
+        let remaining = super::super::db::check_cache(&conn, "cache-invalidate-test", &cache_key)
+            .expect("check cache");
+        assert!(remaining.is_none(), "bad cache row should be deleted");
     }
 
     #[test]

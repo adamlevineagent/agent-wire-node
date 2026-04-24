@@ -5,10 +5,21 @@ export interface SurfaceNode {
     depth: number;
     headline: string;
     distilled: string;
+    /** Generic object kind from the read model. Question nodes are first-class surface nodes. */
+    nodeKind?: 'knowledge' | 'question' | 'source' | string | null;
+    question?: string | null;
+    questionAbout?: string | null;
+    questionCreates?: string | null;
+    questionPromptHint?: string | null;
+    answerNodeId?: string | null;
+    answerHeadline?: string | null;
+    answerDistilled?: string | null;
+    answered?: boolean | null;
     selfPrompt?: string | null;
     threadId?: string | null;
     sourcePath?: string | null;
     parentId: string | null;
+    parentIds: string[];
     childIds: string[];
     /** Layout-computed position */
     x: number;
@@ -100,12 +111,25 @@ export type VizPrimitive =
     | 'edge_draw'       // Lines forming between existing nodes
     | 'cluster_form'    // Nodes visually grouping, parent appearing
     | 'verdict_mark'    // KEEP/DISCONNECT/MISSING indicators on nodes
-    | 'progress_only';  // Status text, no structural change
+    | 'progress_only';  // Non-structural activity pulse
+
+/** Full YAML step viz metadata. `type` selects the primitive; the rest is runtime data. */
+export interface VizStepConfig {
+    type: VizPrimitive;
+    source?: string;
+    node_kind?: string;
+    nodeKind?: string;
+    [key: string]: unknown;
+}
+
+export type EvidenceVerdict = 'KEEP' | 'DISCONNECT' | 'MISSING';
 
 /** Build-time viz state accumulated from events during a build */
 export interface BuildVizState {
-    /** Per-node verdict from VerdictProduced events */
-    verdictsByNode: Map<string, 'KEEP' | 'DISCONNECT' | 'MISSING'>;
+    /** Per-target-node verdict from VerdictProduced events */
+    verdictsByNode: Map<string, EvidenceVerdict>;
+    /** Per-source-node verdict from VerdictProduced events, used while targets are provisional */
+    verdictsBySource: Map<string, EvidenceVerdict>;
     /** Cluster membership from ClusterAssignment events: cluster_id → node_ids */
     clusterMembers: Map<string, string[]>;
     /** New edges from EdgeCreated events (source_id, target_id) */

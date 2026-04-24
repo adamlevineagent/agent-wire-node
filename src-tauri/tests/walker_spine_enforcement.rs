@@ -93,7 +93,10 @@ const STEP_CONTEXT_NEW_ALLOWLIST: &[(&str, &str)] = &[
     // the intentional cache bypass. reroll.rs instead calls
     // with_dispatch_decision_if_available(ctx).await explicitly after
     // StepContext::new — see plan §6 Wave 3d and reroll.rs:~155.
-    ("pyramid/reroll.rs", "intentional cache bypass; Decision attached explicitly"),
+    (
+        "pyramid/reroll.rs",
+        "intentional cache bypass; Decision attached explicitly",
+    ),
     // step_context.rs is where StepContext::new is defined.
     ("pyramid/step_context.rs", "definition site"),
 ];

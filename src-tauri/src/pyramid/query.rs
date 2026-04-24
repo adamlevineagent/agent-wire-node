@@ -122,6 +122,7 @@ pub fn get_node_version(
             self_prompt: row
                 .get::<_, Option<String>>("self_prompt")?
                 .unwrap_or_default(),
+            source_question_id: None,
             children: serde_json::from_str(&children_json).unwrap_or_default(),
             parent_id: row.get::<_, Option<String>>("parent_id")?,
             superseded_by: None,
@@ -384,6 +385,187 @@ pub fn get_apex_with_edges(conn: &Connection, slug: &str) -> Result<Option<NodeW
     Ok(Some(NodeWithWebEdges { node, web_edges }))
 }
 
+fn question_node_detail(
+    row: &db::QuestionNodeRow,
+    max_question_depth: u32,
+    linked_answer: Option<&PyramidNode>,
+    parent_ids: Vec<String>,
+    children: Vec<String>,
+) -> QuestionNodeDetail {
+    QuestionNodeDetail {
+        question_id: row.question_id.clone(),
+        parent_id: parent_ids
+            .first()
+            .cloned()
+            .or_else(|| row.parent_id.clone()),
+        parent_ids,
+        depth: row.depth as i64,
+        visual_depth: db::question_visual_depth(max_question_depth, row.depth),
+        question: row.question.clone(),
+        about: row.about.clone(),
+        creates: row.creates.clone(),
+        prompt_hint: row.prompt_hint.clone(),
+        is_leaf: row.is_leaf,
+        children,
+        build_id: row.build_id.clone(),
+        answer_node_id: linked_answer.map(|answer| answer.id.clone()),
+        answered: linked_answer.is_some(),
+    }
+}
+
+fn synthetic_question_node(
+    slug: &str,
+    row: &db::QuestionNodeRow,
+    visual_depth: i64,
+    parent_ids: Vec<String>,
+    children: Vec<String>,
+    linked_answer: Option<&PyramidNode>,
+) -> PyramidNode {
+    PyramidNode {
+        id: row.question_id.clone(),
+        slug: slug.to_string(),
+        depth: visual_depth,
+        headline: row.question.clone(),
+        distilled: linked_answer
+            .map(|answer| answer.distilled.clone())
+            .unwrap_or_default(),
+        self_prompt: row.question.clone(),
+        source_question_id: None,
+        children,
+        parent_id: parent_ids
+            .first()
+            .cloned()
+            .or_else(|| row.parent_id.clone()),
+        build_id: row.build_id.clone(),
+        created_at: row.created_at.clone().unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
+fn question_tree_projection_node(
+    conn: &Connection,
+    slug: &str,
+    row: &db::QuestionNodeRow,
+    row_map: &HashMap<String, &db::QuestionNodeRow>,
+    children_by_parent: &HashMap<String, Vec<String>>,
+    parents_by_child: &HashMap<String, Vec<String>>,
+    max_question_depth: u32,
+    path: &mut HashSet<String>,
+) -> Result<TreeNode> {
+    if !path.insert(row.question_id.clone()) {
+        return Ok(TreeNode {
+            id: row.question_id.clone(),
+            depth: db::question_visual_depth(max_question_depth, row.depth),
+            headline: row.question.clone(),
+            distilled: String::new(),
+            node_kind: Some("question".to_string()),
+            parent_ids: db::question_parent_ids_for_row(row, parents_by_child),
+            self_prompt: Some(row.question.clone()),
+            thread_id: None,
+            source_path: None,
+            source_slug: None,
+            question: Some(row.question.clone()),
+            question_about: Some(row.about.clone()),
+            question_creates: Some(row.creates.clone()),
+            question_prompt_hint: Some(row.prompt_hint.clone()),
+            answer_node_id: None,
+            answer_headline: None,
+            answer_distilled: None,
+            answered: Some(false),
+            children: Vec::new(),
+        });
+    }
+
+    let mut children = Vec::new();
+    for child_id in db::question_child_ids_for_row(row, children_by_parent) {
+        if let Some(child_row) = row_map.get(&child_id) {
+            children.push(question_tree_projection_node(
+                conn,
+                slug,
+                child_row,
+                row_map,
+                children_by_parent,
+                parents_by_child,
+                max_question_depth,
+                path,
+            )?);
+        }
+    }
+    path.remove(&row.question_id);
+
+    let visual_depth = db::question_visual_depth(max_question_depth, row.depth);
+    let parent_ids = db::question_parent_ids_for_row(row, parents_by_child);
+    let linked_answer = db::get_answer_node_for_question(
+        conn,
+        slug,
+        &row.question_id,
+        &row.question,
+        visual_depth,
+    )?;
+
+    Ok(TreeNode {
+        id: row.question_id.clone(),
+        depth: visual_depth,
+        headline: row.question.clone(),
+        distilled: linked_answer
+            .as_ref()
+            .map(|answer| answer.distilled.clone())
+            .unwrap_or_default(),
+        node_kind: Some("question".to_string()),
+        parent_ids,
+        self_prompt: Some(row.question.clone()),
+        thread_id: None,
+        source_path: None,
+        source_slug: None,
+        question: Some(row.question.clone()),
+        question_about: Some(row.about.clone()),
+        question_creates: Some(row.creates.clone()),
+        question_prompt_hint: Some(row.prompt_hint.clone()),
+        answer_node_id: linked_answer.as_ref().map(|answer| answer.id.clone()),
+        answer_headline: linked_answer.as_ref().map(|answer| answer.headline.clone()),
+        answer_distilled: linked_answer
+            .as_ref()
+            .map(|answer| answer.distilled.clone()),
+        answered: Some(linked_answer.is_some()),
+        children,
+    })
+}
+
+fn question_tree_projections(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
+    let Some(rows) = db::load_question_nodes_as_tree(conn, slug)? else {
+        return Ok(Vec::new());
+    };
+    let question_edges = db::load_question_edges(conn, slug)?;
+    let children_by_parent = db::question_edges_by_parent(&question_edges);
+    let parents_by_child = db::question_edges_by_child(&question_edges);
+    let max_question_depth = rows.iter().map(|row| row.depth).max().unwrap_or(0);
+    let row_map: HashMap<String, &db::QuestionNodeRow> = rows
+        .iter()
+        .map(|row| (row.question_id.clone(), row))
+        .collect();
+
+    let mut roots = Vec::new();
+    for row in rows.iter().filter(|row| {
+        let parent_ids = db::question_parent_ids_for_row(row, &parents_by_child);
+        parent_ids
+            .iter()
+            .all(|parent_id| !row_map.contains_key(parent_id))
+    }) {
+        let mut path = HashSet::new();
+        roots.push(question_tree_projection_node(
+            conn,
+            slug,
+            row,
+            &row_map,
+            &children_by_parent,
+            &parents_by_child,
+            max_question_depth,
+            &mut path,
+        )?);
+    }
+    Ok(roots)
+}
+
 /// Get the full tree structure from the apex down.
 ///
 /// Loads all nodes for the slug into memory, finds the apex (highest depth),
@@ -402,8 +584,10 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
         })
         .collect();
 
+    let question_trees = question_tree_projections(conn, slug)?;
+
     if nodes.is_empty() {
-        return Ok(Vec::new());
+        return Ok(question_trees);
     }
 
     let mut source_path_by_node_id: HashMap<String, String> = HashMap::new();
@@ -504,10 +688,20 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
                                 depth: s.depth,
                                 headline: s.headline.clone(),
                                 distilled: s.distilled.clone(),
+                                node_kind: None,
+                                parent_ids: Vec::new(),
                                 self_prompt: None,
                                 thread_id: None,
                                 source_path: None,
                                 source_slug: Some(ref_slug.to_string()),
+                                question: None,
+                                question_about: None,
+                                question_creates: None,
+                                question_prompt_hint: None,
+                                answer_node_id: None,
+                                answer_headline: None,
+                                answer_distilled: None,
+                                answered: None,
                                 children: vec![],
                             }),
                             _ => None,
@@ -533,6 +727,8 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
                 depth: node.depth,
                 headline: node.headline.clone(),
                 distilled: node.distilled.clone(),
+                node_kind: None,
+                parent_ids: Vec::new(),
                 self_prompt: if node.self_prompt.is_empty() {
                     None
                 } else {
@@ -541,11 +737,19 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
                 thread_id: thread_id_by_canonical_id.get(&node.id).cloned(),
                 source_path: source_path_by_node_id.get(&node.id).cloned(),
                 source_slug: None,
+                question: None,
+                question_about: None,
+                question_creates: None,
+                question_prompt_hint: None,
+                answer_node_id: None,
+                answer_headline: None,
+                answer_distilled: None,
+                answered: None,
                 children,
             }
         }
 
-        let result: Vec<TreeNode> = apex_nodes
+        let mut result: Vec<TreeNode> = apex_nodes
             .iter()
             .map(|apex| {
                 build_question_tree_node(
@@ -558,6 +762,7 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
                 )
             })
             .collect();
+        result.extend(question_trees);
         return Ok(result);
     }
 
@@ -581,10 +786,20 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
                             depth: child_node.depth,
                             headline: child_node.headline.clone(),
                             distilled: child_node.distilled.clone(),
+                            node_kind: None,
+                            parent_ids: Vec::new(),
                             self_prompt: None,
                             thread_id: None,
                             source_path: None,
                             source_slug: Some(ref_slug.to_string()),
+                            question: None,
+                            question_about: None,
+                            question_creates: None,
+                            question_prompt_hint: None,
+                            answer_node_id: None,
+                            answer_headline: None,
+                            answer_distilled: None,
+                            answered: None,
                             children: vec![], // Don't recurse into foreign slugs
                         }),
                         _ => None,
@@ -610,15 +825,25 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
             depth: node.depth,
             headline: node.headline.clone(),
             distilled: node.distilled.clone(),
+            node_kind: None,
+            parent_ids: Vec::new(),
             self_prompt: None,
             thread_id: thread_id_by_canonical_id.get(&node.id).cloned(),
             source_path: source_path_by_node_id.get(&node.id).cloned(),
             source_slug: source_slug,
+            question: None,
+            question_about: None,
+            question_creates: None,
+            question_prompt_hint: None,
+            answer_node_id: None,
+            answer_headline: None,
+            answer_distilled: None,
+            answered: None,
             children,
         }
     }
 
-    let trees = apex_nodes
+    let mut trees: Vec<TreeNode> = apex_nodes
         .into_iter()
         .map(|apex| {
             build_tree_node(
@@ -631,8 +856,114 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
             )
         })
         .collect();
+    trees.extend(question_trees);
 
     Ok(trees)
+}
+
+fn drill_question_node(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Option<DrillResult>> {
+    let Some(rows) = db::load_question_nodes_as_tree(conn, slug)? else {
+        return Ok(None);
+    };
+    let max_question_depth = rows.iter().map(|row| row.depth).max().unwrap_or(0);
+    let row_map: HashMap<String, &db::QuestionNodeRow> = rows
+        .iter()
+        .map(|row| (row.question_id.clone(), row))
+        .collect();
+    let question_edges = db::load_question_edges(conn, slug)?;
+    let children_by_parent = db::question_edges_by_parent(&question_edges);
+    let parents_by_child = db::question_edges_by_child(&question_edges);
+    let Some(row) = row_map.get(node_id).copied() else {
+        return Ok(None);
+    };
+
+    let visual_depth = db::question_visual_depth(max_question_depth, row.depth);
+    let linked_answer = db::get_answer_node_for_question(
+        conn,
+        slug,
+        &row.question_id,
+        &row.question,
+        visual_depth,
+    )?;
+    let parent_ids = db::question_parent_ids_for_row(row, &parents_by_child);
+    let question_children = db::question_child_ids_for_row(row, &children_by_parent);
+    let mut children = Vec::new();
+    for child_id in &question_children {
+        let Some(child_row) = row_map.get(child_id).copied() else {
+            continue;
+        };
+        let child_visual_depth = db::question_visual_depth(max_question_depth, child_row.depth);
+        let child_linked_answer = db::get_answer_node_for_question(
+            conn,
+            slug,
+            &child_row.question_id,
+            &child_row.question,
+            child_visual_depth,
+        )?;
+        children.push(synthetic_question_node(
+            slug,
+            child_row,
+            child_visual_depth,
+            db::question_parent_ids_for_row(child_row, &parents_by_child),
+            db::question_child_ids_for_row(child_row, &children_by_parent),
+            child_linked_answer.as_ref(),
+        ));
+    }
+
+    let question_context = parent_ids.first().and_then(|parent_id| {
+        let parent = row_map.get(parent_id).copied()?;
+        let sibling_questions = db::question_child_ids_for_row(parent, &children_by_parent)
+            .into_iter()
+            .filter(|child_id| child_id != node_id)
+            .filter_map(|child_id| {
+                row_map
+                    .get(&child_id)
+                    .map(|sibling| sibling.question.clone())
+            })
+            .collect();
+        Some(QuestionContext {
+            parent_question: Some(parent.question.clone()),
+            sibling_questions,
+        })
+    });
+
+    let evidence = match &linked_answer {
+        Some(answer) => db::get_evidence_for_target_cross(conn, slug, &answer.id)?,
+        None => Vec::new(),
+    };
+    let edge_node_id = linked_answer
+        .as_ref()
+        .map(|answer| answer.id.as_str())
+        .unwrap_or(node_id);
+
+    Ok(Some(DrillResult {
+        node: synthetic_question_node(
+            slug,
+            row,
+            visual_depth,
+            parent_ids.clone(),
+            question_children,
+            linked_answer.as_ref(),
+        ),
+        children,
+        web_edges: load_connected_web_edges(conn, slug, edge_node_id)?,
+        remote_web_edges: load_remote_web_edges(conn, slug, edge_node_id),
+        evidence,
+        gaps: db::get_gaps_for_question(conn, slug, node_id)?,
+        question_context,
+        question_node: Some(question_node_detail(
+            row,
+            max_question_depth,
+            linked_answer.as_ref(),
+            parent_ids,
+            db::question_child_ids_for_row(row, &children_by_parent),
+        )),
+        linked_answer,
+    }))
 }
 
 /// Drill into a node — returns the node plus its direct children,
@@ -641,6 +972,10 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
 /// Cross-slug support: children that are handle-paths (e.g. "other-slug/0/node-id")
 /// are loaded from the referenced slug via `db::get_node_summary`.
 pub fn drill(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<DrillResult>> {
+    if let Some(result) = drill_question_node(conn, slug, node_id)? {
+        return Ok(Some(result));
+    }
+
     let parent = match db::get_live_node(conn, slug, node_id)? {
         Some(n) => n,
         None => return Ok(None),
@@ -714,6 +1049,8 @@ pub fn drill(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<Dril
         evidence,
         gaps,
         question_context,
+        question_node: None,
+        linked_answer: None,
     }))
 }
 

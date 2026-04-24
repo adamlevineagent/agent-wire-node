@@ -13,6 +13,9 @@ use super::types::*;
 
 // ── Database Opening ─────────────────────────────────────────────────────────
 
+pub const PYRAMID_DEFAULT_BUSY_TIMEOUT_MS: u64 = 10_000;
+pub const PYRAMID_WRITER_BUSY_TIMEOUT_MS: u64 = 30_000;
+
 /// Open (or create) the pyramid SQLite database at the given path, initialize
 /// tables and pragmas, and return the connection.
 pub fn open_pyramid_db(path: &std::path::Path) -> Result<Connection> {
@@ -30,10 +33,22 @@ pub fn open_pyramid_db(path: &std::path::Path) -> Result<Connection> {
 pub fn open_pyramid_connection(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)
         .with_context(|| format!("Failed to open pyramid connection at {}", path.display()))?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=10000;",
-    )?;
+    conn.execute_batch(&format!(
+        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout={};",
+        PYRAMID_DEFAULT_BUSY_TIMEOUT_MS
+    ))?;
     Ok(conn)
+}
+
+/// Tune the long-lived build writer connection. Other subsystems open their
+/// own SQLite connections for audit/chronicle/market writes, so the canonical
+/// build writer needs a longer patience window when acquiring writer locks.
+pub fn configure_pyramid_writer_connection(conn: &Connection) -> Result<()> {
+    conn.execute_batch(&format!(
+        "PRAGMA busy_timeout={};",
+        PYRAMID_WRITER_BUSY_TIMEOUT_MS
+    ))?;
+    Ok(())
 }
 
 // ── Schema Initialization ────────────────────────────────────────────────────
@@ -43,9 +58,10 @@ pub fn open_pyramid_connection(path: &std::path::Path) -> Result<Connection> {
 /// Enables WAL mode and foreign keys, then creates all five tables with
 /// proper constraints and indices.
 pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=10000;",
-    )?;
+    conn.execute_batch(&format!(
+        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout={};",
+        PYRAMID_DEFAULT_BUSY_TIMEOUT_MS
+    ))?;
 
     // 11-R: CASCADE DELETEs on FK constraints below only fire when a slug row is
     // physically DELETEd, which only happens via admin-only `purge_slug`.
@@ -88,6 +104,7 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             terms TEXT,
             dead_ends TEXT,
             self_prompt TEXT,
+            source_question_id TEXT,
             children TEXT,
             parent_id TEXT,
             build_version INTEGER NOT NULL DEFAULT 1,
@@ -524,6 +541,10 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         [],
     );
     let _ = conn.execute(
+        "ALTER TABLE pyramid_nodes ADD COLUMN source_question_id TEXT DEFAULT NULL",
+        [],
+    );
+    let _ = conn.execute(
         "ALTER TABLE pyramid_threads ADD COLUMN build_id TEXT DEFAULT NULL",
         [],
     );
@@ -613,6 +634,11 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pyramid_nodes_time_range \
              ON pyramid_nodes(slug, time_range_start)",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pyramid_nodes_source_question \
+             ON pyramid_nodes(slug, source_question_id)",
         [],
     );
 
@@ -792,6 +818,29 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_evidence_source ON pyramid_evidence(slug, source_node_id);
         -- NOTE: idx_evidence_build is created by migrate_evidence_pk AFTER build_id column exists
 
+        -- Durable answered-node material produced by the evidence loop before
+        -- it is drained into canonical graph tables. This is an internal
+        -- outbox/WAL, not a user-facing data model.
+        CREATE TABLE IF NOT EXISTS pyramid_answered_node_outbox (
+            slug TEXT NOT NULL,
+            build_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            layer INTEGER NOT NULL,
+            source_question_id TEXT,
+            answered_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending', 'drained', 'failed')),
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY(slug, build_id, node_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_answered_outbox_pending
+            ON pyramid_answered_node_outbox(slug, build_id, status, layer, node_id);
+        CREATE INDEX IF NOT EXISTS idx_answered_outbox_question
+            ON pyramid_answered_node_outbox(slug, source_question_id);
+
         -- Question decomposition tree per slug (stored as JSON blob)
         CREATE TABLE IF NOT EXISTS pyramid_question_tree (
             slug TEXT NOT NULL,
@@ -814,11 +863,30 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             prompt_hint TEXT NOT NULL DEFAULT '',
             is_leaf INTEGER NOT NULL DEFAULT 0,
             children_json TEXT,
+            build_id TEXT DEFAULT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY(slug, question_id)
         );
         CREATE INDEX IF NOT EXISTS idx_question_nodes_parent ON pyramid_question_nodes(slug, parent_id);
         CREATE INDEX IF NOT EXISTS idx_question_nodes_depth ON pyramid_question_nodes(slug, depth);
+
+        -- Canonical question DAG adjacency. `pyramid_question_nodes.parent_id`
+        -- and `children_json` are compatibility projections; this edge table
+        -- is the source of truth for shared subquestions with multiple parents.
+        CREATE TABLE IF NOT EXISTS pyramid_question_edges (
+            slug TEXT NOT NULL,
+            build_id TEXT NOT NULL DEFAULT '',
+            parent_question_id TEXT NOT NULL,
+            child_question_id TEXT NOT NULL,
+            edge_kind TEXT NOT NULL DEFAULT 'decomposes',
+            ordinal INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY(slug, build_id, parent_question_id, child_question_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_question_edges_parent
+            ON pyramid_question_edges(slug, parent_question_id, ordinal);
+        CREATE INDEX IF NOT EXISTS idx_question_edges_child
+            ON pyramid_question_edges(slug, child_question_id);
 
         -- Missing evidence gap reports
         CREATE TABLE IF NOT EXISTS pyramid_gaps (
@@ -5137,6 +5205,10 @@ pub fn node_from_row(row: &rusqlite::Row) -> rusqlite::Result<PyramidNode> {
         terms: parse_json_vec(&terms_json),
         dead_ends: parse_json_vec(&dead_ends_json),
         self_prompt: row.get::<_, String>("self_prompt").unwrap_or_default(),
+        source_question_id: row
+            .get::<_, Option<String>>("source_question_id")
+            .ok()
+            .flatten(),
         children: parse_json_vec(&children_json),
         parent_id: row.get("parent_id").ok().and_then(
             |v: String| {
@@ -5223,7 +5295,7 @@ pub fn node_from_row(row: &rusqlite::Row) -> rusqlite::Result<PyramidNode> {
 
 const NODE_SELECT_COLS: &str =
     "id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions, \
-     terms, dead_ends, self_prompt, children, parent_id, superseded_by, build_id, created_at, \
+     terms, dead_ends, self_prompt, source_question_id, children, parent_id, superseded_by, build_id, created_at, \
      time_range_start, time_range_end, weight, provisional, promoted_from, \
      narrative_json, entities_json, key_quotes_json, transitions_json, \
      current_version, current_version_chain_phase";
@@ -5301,12 +5373,12 @@ pub fn save_node(conn: &Connection, node: &PyramidNode, topics_json: Option<&str
     conn.execute(
         "INSERT INTO pyramid_nodes
             (id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions,
-             terms, dead_ends, self_prompt, children, parent_id, superseded_by, build_id,
+             terms, dead_ends, self_prompt, source_question_id, children, parent_id, superseded_by, build_id,
              time_range_start, time_range_end, weight, provisional, promoted_from,
              narrative_json, entities_json, key_quotes_json, transitions_json,
              current_version, current_version_chain_phase)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
         rusqlite::params![
             node.id,
             node.slug,
@@ -5320,6 +5392,7 @@ pub fn save_node(conn: &Connection, node: &PyramidNode, topics_json: Option<&str
             terms,
             dead_ends,
             node.self_prompt,
+            node.source_question_id,
             children,
             node.parent_id,
             node.superseded_by,
@@ -5461,19 +5534,20 @@ pub fn apply_supersession(
                 terms = ?10,
                 dead_ends = ?11,
                 self_prompt = ?12,
-                children = ?13,
-                parent_id = ?14,
-                build_id = COALESCE(?15, build_id),
-                time_range_start = ?16,
-                time_range_end = ?17,
-                weight = ?18,
-                promoted_from = COALESCE(?19, promoted_from),
-                narrative_json = ?20,
-                entities_json = ?21,
-                key_quotes_json = ?22,
-                transitions_json = ?23,
+                source_question_id = ?13,
+                children = ?14,
+                parent_id = ?15,
+                build_id = COALESCE(?16, build_id),
+                time_range_start = ?17,
+                time_range_end = ?18,
+                weight = ?19,
+                promoted_from = COALESCE(?20, promoted_from),
+                narrative_json = ?21,
+                entities_json = ?22,
+                key_quotes_json = ?23,
+                transitions_json = ?24,
                 current_version = COALESCE(current_version, 1) + 1,
-                current_version_chain_phase = ?24,
+                current_version_chain_phase = ?25,
                 superseded_by = NULL,
                 build_version = build_version + 1
              WHERE slug = ?1 AND id = ?2",
@@ -5490,6 +5564,7 @@ pub fn apply_supersession(
                 terms,
                 dead_ends,
                 new_node.self_prompt,
+                new_node.source_question_id,
                 children,
                 new_node.parent_id,
                 new_node.build_id,
@@ -5580,15 +5655,16 @@ pub fn mutate_provisional_node(
             terms = ?10,
             dead_ends = ?11,
             self_prompt = ?12,
-            children = ?13,
-            parent_id = ?14,
-            time_range_start = ?15,
-            time_range_end = ?16,
-            weight = ?17,
-            narrative_json = ?18,
-            entities_json = ?19,
-            key_quotes_json = ?20,
-            transitions_json = ?21
+            source_question_id = ?13,
+            children = ?14,
+            parent_id = ?15,
+            time_range_start = ?16,
+            time_range_end = ?17,
+            weight = ?18,
+            narrative_json = ?19,
+            entities_json = ?20,
+            key_quotes_json = ?21,
+            transitions_json = ?22
          WHERE slug = ?1 AND id = ?2 AND provisional = 1",
         rusqlite::params![
             slug,
@@ -5603,6 +5679,7 @@ pub fn mutate_provisional_node(
             terms,
             dead_ends,
             new_node.self_prompt,
+            new_node.source_question_id,
             children,
             new_node.parent_id,
             time_range_start,
@@ -6280,7 +6357,7 @@ pub fn get_node_summary(
 ) -> Result<Option<PyramidNode>> {
     let sql = "SELECT id, slug, depth, chunk_index, headline, distilled, \
                '[]' as topics, '[]' as corrections, '[]' as decisions, \
-               '[]' as terms, '[]' as dead_ends, self_prompt, children, parent_id, superseded_by, build_id, created_at \
+               '[]' as terms, '[]' as dead_ends, self_prompt, source_question_id, children, parent_id, superseded_by, build_id, created_at \
                FROM pyramid_nodes WHERE slug = ?1 AND id = ?2";
     let mut stmt = conn.prepare(sql)?;
     let result = stmt.query_row(rusqlite::params![slug, node_id], node_from_row);
@@ -8124,6 +8201,18 @@ pub fn complete_llm_audit(
     Ok(())
 }
 
+/// Update the audit row's model after the walker learns the actual
+/// serving model. Pending rows are inserted before dispatch, so market /
+/// fleet / cascaded calls may only know the requested tier model at
+/// insert time.
+pub fn update_llm_audit_model(conn: &Connection, audit_id: i64, actual_model: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_llm_audit SET model = ?1 WHERE id = ?2",
+        rusqlite::params![actual_model, audit_id],
+    )?;
+    Ok(())
+}
+
 /// Mark an audit row as failed (LLM error).
 ///
 /// Walker Re-Plan Wire 2.1 Wave 1 task 11: `provider_id` carries the
@@ -8148,8 +8237,10 @@ pub fn fail_llm_audit(
 /// Phase 18b: insert a fully-formed audit row stamped as a cache hit in
 /// a single statement. Cache hits don't go through the pending → complete
 /// dance because there is no LLM call to "fail mid-flight" — the cached
-/// result is read in microseconds. The row carries `parsed_ok = true`
-/// (the cached output already parsed once when it was stored) and
+/// result is read in microseconds. The row carries the caller-supplied
+/// `parsed_ok` value because cache validity only proves the wrapper
+/// parsed; chain callers still need to record whether `content` parsed as
+/// step JSON. The row carries
 /// `cache_hit = 1` so the audit trail can distinguish it from wire calls.
 ///
 /// Returns the inserted audit row id.
@@ -8166,6 +8257,7 @@ pub fn insert_llm_audit_cache_hit(
     system_prompt: &str,
     user_prompt: &str,
     raw_response: &str,
+    parsed_ok: bool,
     prompt_tokens: i64,
     completion_tokens: i64,
     latency_ms: i64,
@@ -8186,8 +8278,8 @@ pub fn insert_llm_audit_cache_hit(
           system_prompt, user_prompt, raw_response, parsed_ok,
           prompt_tokens, completion_tokens, latency_ms, generation_id,
           status, completed_at, cache_hit)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1,
-                 ?11, ?12, ?13, ?14, 'complete', datetime('now'), 1)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                 ?12, ?13, ?14, ?15, 'complete', datetime('now'), 1)",
         rusqlite::params![
             slug,
             build_id,
@@ -8199,6 +8291,7 @@ pub fn insert_llm_audit_cache_hit(
             sys_ref,
             user_prompt,
             raw_response,
+            parsed_ok as i32,
             prompt_tokens,
             completion_tokens,
             latency_ms,
@@ -8266,7 +8359,7 @@ pub fn get_build_live_nodes(
          WHERE n.slug = ?1 AND n.build_version > 0
          ORDER BY n.depth ASC, n.id ASC",
     )?;
-    let rows = stmt
+    let mut rows: Vec<LiveNodeInfo> = stmt
         .query_map(rusqlite::params![slug], |row| {
             let children_json: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
             let children: Vec<String> = serde_json::from_str(&children_json).unwrap_or_default();
@@ -8275,12 +8368,66 @@ pub fn get_build_live_nodes(
                 depth: row.get(1)?,
                 headline: row.get(2)?,
                 parent_id: row.get::<_, Option<String>>(3)?,
+                parent_ids: Vec::new(),
                 children,
+                node_kind: None,
+                question: None,
+                question_about: None,
+                question_creates: None,
+                question_prompt_hint: None,
+                answer_node_id: None,
+                answered: None,
                 status: row.get(5)?,
             })
         })?
         .filter_map(|r| r.ok())
         .collect();
+
+    if let Some(question_rows) = load_question_nodes_as_tree(conn, slug)? {
+        let question_edges = load_question_edges(conn, slug)?;
+        let children_by_parent = question_edges_by_parent(&question_edges);
+        let parents_by_child = question_edges_by_child(&question_edges);
+        let max_question_depth = question_rows.iter().map(|row| row.depth).max().unwrap_or(0);
+
+        for row in question_rows {
+            let visual_depth = question_visual_depth(max_question_depth, row.depth);
+            let parent_ids = question_parent_ids_for_row(&row, &parents_by_child);
+            let parent_id = parent_ids
+                .first()
+                .cloned()
+                .or_else(|| row.parent_id.clone());
+            let children = question_child_ids_for_row(&row, &children_by_parent);
+            let linked_answer = get_answer_node_for_question(
+                conn,
+                slug,
+                &row.question_id,
+                &row.question,
+                visual_depth,
+            )?;
+            let answered = linked_answer.is_some();
+            rows.push(LiveNodeInfo {
+                node_id: row.question_id.clone(),
+                depth: visual_depth,
+                headline: row.question.clone(),
+                parent_id,
+                parent_ids,
+                children,
+                node_kind: Some("question".to_string()),
+                question: Some(row.question.clone()),
+                question_about: Some(row.about.clone()),
+                question_creates: Some(row.creates.clone()),
+                question_prompt_hint: Some(row.prompt_hint.clone()),
+                answer_node_id: linked_answer.as_ref().map(|answer| answer.id.clone()),
+                answered: Some(answered),
+                status: if answered {
+                    "complete".to_string()
+                } else {
+                    "pending".to_string()
+                },
+            });
+        }
+    }
+
     Ok(rows)
 }
 
@@ -9309,6 +9456,100 @@ pub fn save_evidence_link(conn: &Connection, link: &EvidenceLink) -> Result<()> 
     Ok(())
 }
 
+/// Persist answered-node material before draining it into canonical graph
+/// tables. This makes expensive LLM answer work durable even if the later
+/// `pyramid_nodes` / evidence / gap transaction is delayed or fails.
+pub fn save_answered_node_outbox(
+    conn: &Connection,
+    slug: &str,
+    build_id: &str,
+    answered: &AnsweredNode,
+) -> Result<()> {
+    let answered_json = serde_json::to_string(answered)?;
+    conn.execute(
+        "INSERT INTO pyramid_answered_node_outbox
+            (slug, build_id, node_id, layer, source_question_id, answered_json, status, last_error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL)
+         ON CONFLICT(slug, build_id, node_id) DO UPDATE SET
+            layer = excluded.layer,
+            source_question_id = excluded.source_question_id,
+            answered_json = excluded.answered_json,
+            status = 'pending',
+            last_error = NULL,
+            updated_at = datetime('now')",
+        rusqlite::params![
+            slug,
+            build_id,
+            answered.node.id.as_str(),
+            answered.node.depth,
+            answered.node.source_question_id.as_deref(),
+            answered_json,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Load pending answered-node material from the outbox for canonical drain.
+pub fn get_pending_answered_node_outbox(
+    conn: &Connection,
+    slug: &str,
+    build_id: &str,
+    node_id: &str,
+) -> Result<Option<AnsweredNode>> {
+    let row: Option<String> = conn
+        .query_row(
+            "SELECT answered_json
+             FROM pyramid_answered_node_outbox
+             WHERE slug = ?1 AND build_id = ?2 AND node_id = ?3 AND status = 'pending'",
+            rusqlite::params![slug, build_id, node_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    row.map(|json| {
+        serde_json::from_str::<AnsweredNode>(&json).with_context(|| {
+            format!(
+                "failed to deserialize answered-node outbox row for {slug}/{build_id}/{node_id}"
+            )
+        })
+    })
+    .transpose()
+}
+
+pub fn mark_answered_node_outbox_drained(
+    conn: &Connection,
+    slug: &str,
+    build_id: &str,
+    node_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_answered_node_outbox
+         SET status = 'drained', last_error = NULL, updated_at = datetime('now')
+         WHERE slug = ?1 AND build_id = ?2 AND node_id = ?3",
+        rusqlite::params![slug, build_id, node_id],
+    )?;
+    Ok(())
+}
+
+pub fn record_answered_node_outbox_error(
+    conn: &Connection,
+    slug: &str,
+    build_id: &str,
+    node_id: &str,
+    error: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_answered_node_outbox
+         SET status = 'pending',
+             retry_count = retry_count + 1,
+             last_error = ?4,
+             updated_at = datetime('now')
+         WHERE slug = ?1 AND build_id = ?2 AND node_id = ?3",
+        rusqlite::params![slug, build_id, node_id, error],
+    )?;
+    Ok(())
+}
+
 #[deprecated(note = "Use get_evidence_for_target_cross for handle-path support")]
 /// Get all evidence links pointing at a target node (i.e. its supporting evidence).
 pub fn get_evidence_for_target(
@@ -9609,7 +9850,7 @@ pub fn load_question_nodes_as_tree(
     slug: &str,
 ) -> Result<Option<Vec<QuestionNodeRow>>> {
     let mut stmt = conn.prepare(
-        "SELECT question_id, parent_id, depth, question, about, creates, prompt_hint, is_leaf, children_json
+        "SELECT question_id, parent_id, depth, question, about, creates, prompt_hint, is_leaf, children_json, build_id, created_at
          FROM pyramid_question_nodes
          WHERE slug = ?1
          ORDER BY depth ASC",
@@ -9626,6 +9867,8 @@ pub fn load_question_nodes_as_tree(
                 prompt_hint: row.get(6)?,
                 is_leaf: row.get::<_, i32>(7)? != 0,
                 children_json: row.get(8)?,
+                build_id: row.get(9)?,
+                created_at: row.get(10)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -9649,13 +9892,241 @@ pub struct QuestionNodeRow {
     pub prompt_hint: String,
     pub is_leaf: bool,
     pub children_json: Option<String>,
+    pub build_id: Option<String>,
+    pub created_at: Option<String>,
+}
+
+/// Canonical question DAG edge row.
+#[derive(Debug, Clone)]
+pub struct QuestionEdgeRow {
+    pub parent_question_id: String,
+    pub child_question_id: String,
+    pub ordinal: i64,
+    pub edge_kind: String,
+    pub build_id: Option<String>,
+}
+
+pub fn question_row_child_ids(row: &QuestionNodeRow) -> Vec<String> {
+    row.children_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
+        .unwrap_or_default()
+}
+
+pub fn question_visual_depth(max_question_depth: u32, row_depth: u32) -> i64 {
+    max_question_depth.saturating_sub(row_depth) as i64 + 1
+}
+
+fn edge_build_id(build_id: Option<&str>) -> &str {
+    build_id.unwrap_or("")
+}
+
+/// Replace all canonical child edges for one question parent.
+pub fn save_question_edges_for_parent(
+    conn: &Connection,
+    slug: &str,
+    build_id: Option<&str>,
+    parent_question_id: &str,
+    child_question_ids: &[String],
+) -> Result<()> {
+    let bid = edge_build_id(build_id);
+    conn.execute(
+        "DELETE FROM pyramid_question_edges
+         WHERE slug = ?1 AND build_id = ?2 AND parent_question_id = ?3",
+        rusqlite::params![slug, bid, parent_question_id],
+    )?;
+    for (ordinal, child_id) in child_question_ids.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO pyramid_question_edges
+                (slug, build_id, parent_question_id, child_question_id, edge_kind, ordinal)
+             VALUES (?1, ?2, ?3, ?4, 'decomposes', ?5)
+             ON CONFLICT(slug, build_id, parent_question_id, child_question_id) DO UPDATE SET
+                edge_kind = excluded.edge_kind,
+                ordinal = excluded.ordinal",
+            rusqlite::params![slug, bid, parent_question_id, child_id, ordinal as i64],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn clear_question_edges(conn: &Connection, slug: &str, build_id: Option<&str>) -> Result<i64> {
+    let deleted = match build_id {
+        Some(bid) => conn.execute(
+            "DELETE FROM pyramid_question_edges WHERE slug = ?1 AND build_id = ?2",
+            rusqlite::params![slug, bid],
+        )?,
+        None => conn.execute(
+            "DELETE FROM pyramid_question_edges WHERE slug = ?1 AND build_id = ''",
+            rusqlite::params![slug],
+        )?,
+    };
+    Ok(deleted as i64)
+}
+
+pub fn load_question_edges(conn: &Connection, slug: &str) -> Result<Vec<QuestionEdgeRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT parent_question_id, child_question_id, ordinal, edge_kind, build_id
+         FROM pyramid_question_edges
+         WHERE slug = ?1
+         ORDER BY parent_question_id ASC, ordinal ASC, child_question_id ASC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![slug], |row| {
+            Ok(QuestionEdgeRow {
+                parent_question_id: row.get(0)?,
+                child_question_id: row.get(1)?,
+                ordinal: row.get(2)?,
+                edge_kind: row.get(3)?,
+                build_id: row.get::<_, Option<String>>(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn question_edges_by_parent(edges: &[QuestionEdgeRow]) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    for edge in edges {
+        map.entry(edge.parent_question_id.clone())
+            .or_default()
+            .push((edge.ordinal, edge.child_question_id.clone()));
+    }
+    map.into_iter()
+        .map(|(parent, mut children)| {
+            children.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let mut seen = std::collections::HashSet::new();
+            let ids = children
+                .into_iter()
+                .filter_map(|(_, child)| seen.insert(child.clone()).then_some(child))
+                .collect();
+            (parent, ids)
+        })
+        .collect()
+}
+
+pub fn question_edges_by_child(edges: &[QuestionEdgeRow]) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    for edge in edges {
+        map.entry(edge.child_question_id.clone())
+            .or_default()
+            .push((edge.ordinal, edge.parent_question_id.clone()));
+    }
+    map.into_iter()
+        .map(|(child, mut parents)| {
+            parents.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let mut seen = std::collections::HashSet::new();
+            let ids = parents
+                .into_iter()
+                .filter_map(|(_, parent)| seen.insert(parent.clone()).then_some(parent))
+                .collect();
+            (child, ids)
+        })
+        .collect()
+}
+
+pub fn question_child_ids_for_row(
+    row: &QuestionNodeRow,
+    children_by_parent: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    children_by_parent
+        .get(&row.question_id)
+        .cloned()
+        .unwrap_or_else(|| question_row_child_ids(row))
+}
+
+pub fn question_parent_ids_for_row(
+    row: &QuestionNodeRow,
+    parents_by_child: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    parents_by_child
+        .get(&row.question_id)
+        .cloned()
+        .unwrap_or_else(|| row.parent_id.clone().into_iter().collect())
+}
+
+pub fn get_question_node(
+    conn: &Connection,
+    slug: &str,
+    question_id: &str,
+) -> Result<Option<QuestionNodeRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT question_id, parent_id, depth, question, about, creates, prompt_hint, is_leaf, children_json, build_id, created_at
+         FROM pyramid_question_nodes
+         WHERE slug = ?1 AND question_id = ?2",
+    )?;
+    let result = stmt.query_row(rusqlite::params![slug, question_id], |row| {
+        Ok(QuestionNodeRow {
+            question_id: row.get(0)?,
+            parent_id: row.get(1)?,
+            depth: row.get(2)?,
+            question: row.get(3)?,
+            about: row.get(4)?,
+            creates: row.get(5)?,
+            prompt_hint: row.get(6)?,
+            is_leaf: row.get::<_, i32>(7)? != 0,
+            children_json: row.get(8)?,
+            build_id: row.get(9)?,
+            created_at: row.get(10)?,
+        })
+    });
+    match result {
+        Ok(row) => Ok(Some(row)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Resolve a question row to its current materialized answer.
+///
+/// New answer rows carry `source_question_id`, which is the durable bridge.
+/// The text/depth bridge remains as a legacy fallback for already-built rows.
+pub fn get_answer_node_for_question(
+    conn: &Connection,
+    slug: &str,
+    question_id: &str,
+    question: &str,
+    visual_depth: i64,
+) -> Result<Option<PyramidNode>> {
+    let sql = format!(
+        "SELECT {NODE_SELECT_COLS} FROM live_pyramid_nodes
+         WHERE slug = ?1 AND depth = ?2 AND source_question_id = ?3
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let result = stmt.query_row(
+        rusqlite::params![slug, visual_depth, question_id],
+        node_from_row,
+    );
+    match result {
+        Ok(node) => return Ok(Some(node)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    let fallback_sql = format!(
+        "SELECT {NODE_SELECT_COLS} FROM live_pyramid_nodes
+         WHERE slug = ?1 AND depth = ?2 AND self_prompt = ?3
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1"
+    );
+    let mut fallback_stmt = conn.prepare(&fallback_sql)?;
+    let fallback = fallback_stmt.query_row(
+        rusqlite::params![slug, visual_depth, question],
+        node_from_row,
+    );
+    match fallback {
+        Ok(node) => Ok(Some(node)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Get nodes that are branch nodes (is_leaf = 0) but haven't been decomposed yet
 /// (children_json IS NULL). These are the nodes that need further LLM decomposition.
 pub fn get_undecomposed_nodes(conn: &Connection, slug: &str) -> Result<Vec<QuestionNodeRow>> {
     let mut stmt = conn.prepare(
-        "SELECT question_id, parent_id, depth, question, about, creates, prompt_hint, is_leaf, children_json
+        "SELECT question_id, parent_id, depth, question, about, creates, prompt_hint, is_leaf, children_json, build_id, created_at
          FROM pyramid_question_nodes
          WHERE slug = ?1 AND is_leaf = 0 AND children_json IS NULL
          ORDER BY depth ASC",
@@ -9672,6 +10143,8 @@ pub fn get_undecomposed_nodes(conn: &Connection, slug: &str) -> Result<Vec<Quest
                 prompt_hint: row.get(6)?,
                 is_leaf: row.get::<_, i32>(7)? != 0,
                 children_json: row.get(8)?,
+                build_id: row.get(9)?,
+                created_at: row.get(10)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -11967,6 +12440,76 @@ mod tests {
         assert_eq!(handle_link.weight, Some(0.9));
     }
 
+    #[test]
+    fn test_answered_node_outbox_roundtrip_error_and_drain() {
+        let conn = test_conn();
+        create_slug(&conn, "qslug", &ContentType::Question, "").unwrap();
+
+        let answered = AnsweredNode {
+            node: PyramidNode {
+                id: "L1-000".to_string(),
+                slug: "qslug".to_string(),
+                depth: 1,
+                headline: "Answered question".to_string(),
+                distilled: "The durable answer body".to_string(),
+                self_prompt: "What happened?".to_string(),
+                source_question_id: Some("q-source".to_string()),
+                build_id: Some("build-1".to_string()),
+                created_at: "2026-04-23T00:00:00Z".to_string(),
+                ..Default::default()
+            },
+            evidence: vec![EvidenceLink {
+                slug: "qslug".to_string(),
+                source_node_id: "Q-L0-000".to_string(),
+                target_node_id: "L1-000".to_string(),
+                verdict: EvidenceVerdict::Keep,
+                weight: Some(0.9),
+                reason: Some("supports answer".to_string()),
+                build_id: Some("build-1".to_string()),
+                live: Some(true),
+            }],
+            missing: vec!["missing corroboration".to_string()],
+        };
+
+        save_answered_node_outbox(&conn, "qslug", "build-1", &answered).unwrap();
+        let loaded = get_pending_answered_node_outbox(&conn, "qslug", "build-1", "L1-000")
+            .unwrap()
+            .expect("pending outbox row should round-trip");
+
+        assert_eq!(loaded.node.id, "L1-000");
+        assert_eq!(loaded.node.source_question_id.as_deref(), Some("q-source"));
+        assert_eq!(loaded.evidence.len(), 1);
+        assert_eq!(loaded.missing, vec!["missing corroboration".to_string()]);
+
+        record_answered_node_outbox_error(
+            &conn,
+            "qslug",
+            "build-1",
+            "L1-000",
+            "database is locked",
+        )
+        .unwrap();
+        let (status, retry_count, last_error): (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT status, retry_count, last_error
+                 FROM pyramid_answered_node_outbox
+                 WHERE slug = 'qslug' AND build_id = 'build-1' AND node_id = 'L1-000'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
+        assert_eq!(retry_count, 1);
+        assert_eq!(last_error.as_deref(), Some("database is locked"));
+
+        mark_answered_node_outbox_drained(&conn, "qslug", "build-1", "L1-000").unwrap();
+        assert!(
+            get_pending_answered_node_outbox(&conn, "qslug", "build-1", "L1-000")
+                .unwrap()
+                .is_none()
+        );
+    }
+
     // ── WS-SCHEMA-V2 integration test ───────────────────────────────────
     #[test]
     fn ws_schema_v2_versioning_round_trip() {
@@ -12706,6 +13249,48 @@ mod tests {
         assert_eq!(rec.model, "anthropic/claude-3.5-sonnet");
         let rec_fail = get_llm_audit_by_id(&conn, id_fail).unwrap().unwrap();
         assert_eq!(rec_fail.provider_id.as_deref(), Some("market"));
+    }
+
+    #[test]
+    fn test_update_llm_audit_model_records_actual_serving_model() {
+        let conn = test_conn();
+        let id = insert_llm_audit_pending(
+            &conn,
+            "s",
+            "b1",
+            Some("n1"),
+            "source_extract",
+            "chain_dispatch",
+            Some(0),
+            "inception/mercury-2",
+            "sys",
+            "user",
+        )
+        .unwrap();
+
+        complete_llm_audit(
+            &conn,
+            id,
+            "{\"ok\":true}",
+            true,
+            100,
+            50,
+            1234,
+            None,
+            Some("market"),
+        )
+        .unwrap();
+        update_llm_audit_model(&conn, id, "gemma4:26b").unwrap();
+
+        let (model, provider_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT model, provider_id FROM pyramid_llm_audit WHERE id = ?1",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(model, "gemma4:26b");
+        assert_eq!(provider_id.as_deref(), Some("market"));
     }
 
     /// Migration idempotency: calling `init_pyramid_db` a second time on the

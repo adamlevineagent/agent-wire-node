@@ -6069,12 +6069,8 @@ async fn execute_evidence_loop(
                     for attempt in 0..=SAVE_MAX_RETRIES {
                         let tx_result = (|| -> anyhow::Result<()> {
                             c.execute_batch("BEGIN IMMEDIATE")?;
-                            let inner = db::save_answered_node_outbox(
-                                &c,
-                                &slug_owned,
-                                &build_id_owned,
-                                a,
-                            );
+                            let inner =
+                                db::save_answered_node_outbox(&c, &slug_owned, &build_id_owned, a);
                             match inner {
                                 Ok(()) => {
                                     if let Err(e) = c.execute_batch("COMMIT") {
@@ -6092,9 +6088,7 @@ async fn execute_evidence_loop(
                         })();
                         match tx_result {
                             Ok(()) => break,
-                            Err(e)
-                                if is_sqlite_busy(&e) && attempt < SAVE_MAX_RETRIES =>
-                            {
+                            Err(e) if is_sqlite_busy(&e) && attempt < SAVE_MAX_RETRIES => {
                                 warn!(
                                     slug = %slug_owned,
                                     node_id = %a.node.id,
@@ -6139,7 +6133,7 @@ async fn execute_evidence_loop(
                     // Retry wrapper: SQLite BUSY / "database is locked" can
                     // bubble up when a concurrent writer on another
                     // Connection holds the writer lock longer than
-                    // busy_timeout (10s, set at db.rs:34,47). `BEGIN
+                    // busy_timeout. `BEGIN
                     // IMMEDIATE` acquires the writer lock up front so
                     // busy_timeout applies to the acquisition itself, and
                     // the exponential-backoff retry absorbs the rare case
@@ -6173,12 +6167,7 @@ async fn execute_evidence_loop(
                                         resolved: false,
                                         resolution_confidence: 0.0,
                                     };
-                                    db::save_gap(
-                                        &c,
-                                        &slug_owned,
-                                        &gap,
-                                        Some(&bid_for_gaps),
-                                    )?;
+                                    db::save_gap(&c, &slug_owned, &gap, Some(&bid_for_gaps))?;
                                 }
                                 db::mark_answered_node_outbox_drained(
                                     &c,
@@ -6205,9 +6194,7 @@ async fn execute_evidence_loop(
                         })();
                         match tx_result {
                             Ok(()) => break,
-                            Err(e)
-                                if is_sqlite_busy(&e) && attempt < SAVE_MAX_RETRIES =>
-                            {
+                            Err(e) if is_sqlite_busy(&e) && attempt < SAVE_MAX_RETRIES => {
                                 warn!(
                                     slug = %slug_owned,
                                     node_id = %a.node.id,
@@ -6262,19 +6249,18 @@ async fn execute_evidence_loop(
                                         resolved: false,
                                         resolution_confidence: 0.0,
                                     };
-                                    db::save_gap(
-                                        &c,
-                                        &slug_owned,
-                                        &gap,
-                                        Some(&bid_for_gaps),
-                                    )?;
+                                    db::save_gap(&c, &slug_owned, &gap, Some(&bid_for_gaps))?;
                                 }
                                 Ok(())
                             })();
                             match inner {
                                 Ok(()) => {
-                                    c.execute_batch("COMMIT")?;
-                                    Ok(())
+                                    if let Err(e) = c.execute_batch("COMMIT") {
+                                        let _ = c.execute_batch("ROLLBACK");
+                                        Err(e.into())
+                                    } else {
+                                        Ok(())
+                                    }
                                 }
                                 Err(e) => {
                                     let _ = c.execute_batch("ROLLBACK");
@@ -6284,9 +6270,7 @@ async fn execute_evidence_loop(
                         })();
                         match tx_result {
                             Ok(()) => break,
-                            Err(e)
-                                if is_sqlite_busy(&e) && attempt < SAVE_MAX_RETRIES =>
-                            {
+                            Err(e) if is_sqlite_busy(&e) && attempt < SAVE_MAX_RETRIES => {
                                 warn!(
                                     slug = %slug_owned,
                                     attempt,
@@ -17103,7 +17087,10 @@ mod tests {
         let ffi = rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY);
         let rusqlite_err = rusqlite::Error::SqliteFailure(ffi, None);
         let err: anyhow::Error = rusqlite_err.into();
-        assert!(is_sqlite_busy(&err), "typed SQLITE_BUSY must classify as busy");
+        assert!(
+            is_sqlite_busy(&err),
+            "typed SQLITE_BUSY must classify as busy"
+        );
     }
 
     #[test]
@@ -17111,7 +17098,10 @@ mod tests {
         let ffi = rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED);
         let rusqlite_err = rusqlite::Error::SqliteFailure(ffi, None);
         let err: anyhow::Error = rusqlite_err.into();
-        assert!(is_sqlite_busy(&err), "typed SQLITE_LOCKED must classify as busy");
+        assert!(
+            is_sqlite_busy(&err),
+            "typed SQLITE_LOCKED must classify as busy"
+        );
     }
 
     #[test]
@@ -17120,9 +17110,7 @@ mod tests {
         // stringified into an `anyhow!("failed to save answered node {}: {}",
         // id, e)` wrapper. The cause chain no longer holds a typed
         // rusqlite::Error, so we must fall back to textual matching.
-        let wrapped = anyhow!(
-            "failed to save answered node L1-000: database is locked"
-        );
+        let wrapped = anyhow!("failed to save answered node L1-000: database is locked");
         assert!(
             is_sqlite_busy(&wrapped),
             "stringified 'database is locked' must classify as busy"

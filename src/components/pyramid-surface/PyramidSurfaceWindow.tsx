@@ -25,7 +25,9 @@ export function PyramidSurfaceWindow({ slug: initialSlug }: PyramidSurfaceWindow
     const [allNodes, setAllNodes] = useState<LiveNodeInfo[]>([]);
     const { config } = useVizConfig(currentSlug);
 
-    // Load node data for the inspector panel whenever slug changes
+    // Load node data for the inspector panel whenever slug changes or a node is opened.
+    // The live-node read model now includes question nodes when available, so this keeps
+    // q-* navigation in sync without making the surface modal depend on renderer internals.
     useEffect(() => {
         if (!currentSlug) {
             setAllNodes([]);
@@ -34,7 +36,7 @@ export function PyramidSurfaceWindow({ slug: initialSlug }: PyramidSurfaceWindow
         invoke<LiveNodeInfo[]>('pyramid_build_live_nodes', { slug: currentSlug })
             .then(setAllNodes)
             .catch(() => setAllNodes([]));
-    }, [currentSlug]);
+    }, [currentSlug, inspectedNodeId]);
 
     // Show the window once React is ready
     useEffect(() => {

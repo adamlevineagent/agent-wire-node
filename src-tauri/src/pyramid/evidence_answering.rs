@@ -1241,6 +1241,7 @@ Respond with ONLY a JSON object:
         terms,
         dead_ends: raw.dead_ends.unwrap_or_default(),
         self_prompt: question.question_text.clone(),
+        source_question_id: Some(question.question_id.clone()),
         children,
         parent_id: None,
         superseded_by: None,

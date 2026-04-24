@@ -1252,6 +1252,10 @@ pub async fn preview_decomposed_build(
         folder_map: decomp_context,
         chains_dir: Some(state.chains_dir.clone()),
         audience: None,
+        model_tier: "max".to_string(),
+        temperature: state.operational.tier1.decomposition_temperature,
+        max_tokens: state.operational.tier1.decomposition_max_tokens,
+        sibling_review_max_tokens: state.operational.tier1.synthesis_prompts_max_tokens,
     };
 
     // Phase 12 verifier fix: attach cache_access so question_decomposition
@@ -1264,6 +1268,7 @@ pub async fn preview_decomposed_build(
         &llm_config,
         &state.operational.tier1,
         &state.operational.tier2,
+        None,
     )
     .await?;
 

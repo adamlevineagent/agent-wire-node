@@ -62,7 +62,7 @@ export function PyramidSurface({
     // ── Viz-from-YAML: chain mapping loaded eagerly for expectedMaxDepth ──
     // Must be called before usePyramidData so expectedMaxDepth is available
     // for layout computation during early build phases (Fix A).
-    const { getVizPrimitive, expectedMaxDepth } = useVizMapping(slug);
+    const { getVizConfig, expectedMaxDepth } = useVizMapping(slug);
 
     // ── Unified data: static tree + build progress + event bus ───────
     const {
@@ -73,22 +73,22 @@ export function PyramidSurface({
         buildProgress: buildProg,
         buildVizState,
         loading,
-    } = usePyramidData(slug, containerSize.width, containerSize.height, staleLog, expectedMaxDepth);
+    } = usePyramidData(slug, containerSize.width, containerSize.height, staleLog, expectedMaxDepth, getVizConfig);
 
     // ── Chronicle event stream (Phase 4, S2-5 history) ──────────────
     const { entries: chronicleEntries, generation: chronicleGen, clear: _clearChronicle } = useChronicleStream(slug, isBuilding);
     const [chronicleOpen, setChronicleOpen] = useState(false);
-    const activeVizPrimitive = isBuilding && currentStep
-        ? getVizPrimitive(currentStep)
+    const activeVizConfig = isBuilding && currentStep
+        ? getVizConfig(currentStep)
         : null;
 
-    // Apply viz primitive + build viz state to renderer
+    // Apply full YAML viz metadata + build viz state to renderer
     useEffect(() => {
         if (rendererRef.current) {
-            rendererRef.current.setActiveVizPrimitive(activeVizPrimitive);
+            rendererRef.current.setActiveVizConfig(activeVizConfig);
             rendererRef.current.setBuildVizState(buildVizState);
         }
-    }, [activeVizPrimitive, buildVizState]);
+    }, [activeVizConfig, buildVizState]);
 
     // ── Visual encoding (three-axis: brightness, saturation, border) ──
     const { encodings: visualEncodings, linkIntensities } = useVisualEncoding(
@@ -443,6 +443,9 @@ export function PyramidSurface({
                     if (ttTop + tooltipH > containerSize.height) ttTop = node.y - tooltipH;
                     ttLeft = Math.max(0, ttLeft);
                     ttTop = Math.max(0, ttTop);
+                    const isQuestion = node.nodeKind === 'question' || node.id.startsWith('q-');
+                    const tooltipTitle = node.question || node.headline;
+                    const tooltipBody = node.answerDistilled || node.distilled;
                     return (
                         <div
                             className="ps-tooltip"
@@ -451,14 +454,20 @@ export function PyramidSurface({
                                 top: ttTop,
                             }}
                         >
-                            <div className="ps-tooltip-headline">{node.headline}</div>
+                            <div className="ps-tooltip-headline">{tooltipTitle}</div>
                             <div className="ps-tooltip-meta">
-                                L{node.depth} · {node.id}
+                                L{node.depth} · {isQuestion ? 'Question' : 'Node'} · {node.id}
+                                {isQuestion && node.answered != null ? ` · ${node.answered ? 'Answered' : 'Open'}` : ''}
                             </div>
-                            {node.distilled && (
+                            {isQuestion && node.answerHeadline && (
+                                <div className="ps-tooltip-meta">
+                                    Answer: {node.answerHeadline}
+                                </div>
+                            )}
+                            {tooltipBody && (
                                 <div className="ps-tooltip-distilled">
-                                    {node.distilled.slice(0, 120)}
-                                    {node.distilled.length > 120 ? '...' : ''}
+                                    {tooltipBody.slice(0, 120)}
+                                    {tooltipBody.length > 120 ? '...' : ''}
                                 </div>
                             )}
                         </div>
@@ -484,6 +493,7 @@ export function PyramidSurface({
                     generation={chronicleGen}
                     onArtifactClick={onNodeClick}
                     onClose={toggleChronicle}
+                    isBuilding={isBuilding}
                     showMechanicalOps={config.chronicle.show_mechanical_ops}
                     autoExpandDecisions={config.chronicle.auto_expand_decisions}
                 />

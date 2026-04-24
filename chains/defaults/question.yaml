@@ -29,7 +29,7 @@ steps:
     for_each: "$chunks"
     when: "$load_prior_state.l0_count < $load_prior_state.source_count"
     dispatch_order: "largest_first"
-    concurrency: 10
+    concurrency: 1
     node_id_pattern: "Q-L0-{index:03}"
     depth: 0
     save_as: node
@@ -105,16 +105,25 @@ steps:
 
   - name: enhance_question
     primitive: extract
+    viz:
+      type: progress_only
     instruction: "$prompts/question/enhance_question.md"
     input:
       apex_question: "$apex_question"
       corpus_context: "$refresh_state.l0_summary"
       characterization: "$characterize"
     max_input_tokens: 80000
+    model_tier: mid
+    temperature: 0.2
+    on_error: "retry(1)"
     save_as: step_only
 
   - name: decompose
     primitive: recursive_decompose
+    viz:
+      type: node_fill
+      source: question_nodes
+      node_kind: question
     instruction: "$prompts/question/decompose.md"
     when: "$load_prior_state.has_overlay == false"
     input:
@@ -125,10 +134,17 @@ steps:
       audience: "$audience"
       l0_summary: "$refresh_state.l0_summary"
     max_input_tokens: 80000
+    model_tier: mid
+    temperature: 0.2
+    on_error: "retry(1)"
     save_as: step_only
 
   - name: decompose_delta
     primitive: recursive_decompose
+    viz:
+      type: node_fill
+      source: question_nodes
+      node_kind: question
     mode: delta
     instruction: "$prompts/question/decompose_delta.md"
     when: "$load_prior_state.has_overlay == true"
@@ -148,6 +164,9 @@ steps:
       - drop: evidence_sets
       - drop: gaps
       - drop: existing_answers
+    model_tier: mid
+    temperature: 0.2
+    on_error: "retry(1)"
     save_as: step_only
 
   # Both decompose and decompose_delta write to $decomposed_tree (canonical alias).
@@ -155,12 +174,17 @@ steps:
 
   - name: extraction_schema
     primitive: extract
+    viz:
+      type: progress_only
     instruction: "$prompts/question/extraction_schema.md"
     input:
       question_tree: "$decomposed_tree"
       characterize: "$characterize"
       audience: "$audience"
     max_input_tokens: 80000
+    model_tier: mid
+    temperature: 0.1
+    on_error: "retry(1)"
     save_as: step_only
 
   # ── Phase 4b: Build lifecycle (overlay cleanup) ─────────────────────
@@ -175,6 +199,9 @@ steps:
   # Skipped when evidence_mode != "deep".
   - name: evidence_loop
     primitive: evidence_loop
+    viz:
+      type: verdict_mark
+    concurrency: 1
     input:
       question_tree: "$decomposed_tree"
       extraction_schema: "$extraction_schema"

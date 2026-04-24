@@ -48,8 +48,8 @@ pub enum NotReadyReason {
         consecutive_failures: u32,
         last_success_at: Option<SystemTime>,
     },
-    /// Market: MarketSurfaceCache shows 0 offers matching any slug in the
-    /// resolved model_list.
+    /// Market: no model is declared for this slot, or cached positive
+    /// market-surface evidence shows 0 offers for every declared model.
     NoMarketOffersForSlot,
     /// Market: at least one offer exists for the model_list, but every
     /// offer's queue is full (current_queue_depth >= max_queue_depth).
@@ -334,13 +334,15 @@ impl ProviderReadiness for FleetReadiness {
 //   3. Wire unreachable (consecutive failures
 //      >= network_failure_backoff_threshold)   → WireUnreachable
 //   4. credit balance < max_budget_credits     → InsufficientCredit
-//   5. every model in model_list has cache
+//   5. any declared model is absent from the
+//      sync probe cache                       → Ready (/quote is authoritative)
+//   6. every model in model_list has cache
 //      entry with active_offers == 0           → NoMarketOffersForSlot
-//   6. every model's cache entry flags
-//      only_self_offers == true                → SelfDealing
 //   7. every model's cache entry flags
+//      only_self_offers == true                → SelfDealing
+//   8. every model's cache entry flags
 //      all_offers_saturated == true            → AllOffersSaturatedForModel
-//   8. otherwise                               → Ready
+//   9. otherwise                               → Ready
 //
 // The market-surface + balance + Wire-reachability caches are the sync-
 // read shared state populated by the boot-spawned background task.
@@ -351,12 +353,10 @@ impl ProviderReadiness for FleetReadiness {
 // operator whose balance zeroed out sees `InsufficientCredit` regardless
 // of whether a given slug is saturated or missing offers.
 //
-// `AllOffersSaturatedForModel` is strictly weaker than the slot-level
-// short-circuit from NoMarketOffersForSlot — we only report saturation
-// when offers exist for every model, so "mixed-saturation" (some slugs
-// cold, others saturated) still yields NoMarketOffersForSlot for the
-// cold ones. The strictest per-model verdict wins: if any declared
-// model has headroom, MarketReadiness returns Ready.
+// Missing per-model cache entries are "unknown", not "no offers". The
+// probe cache is advisory and can be cold at app boot; `/quote` is the
+// authoritative market viability check. Only positive cached evidence
+// may remove Market from the decision.
 #[allow(dead_code)]
 pub struct MarketReadiness;
 
@@ -426,6 +426,7 @@ impl ProviderReadiness for MarketReadiness {
         let mut every_self_dealing = true;
         let mut every_all_saturated = true;
         let mut any_has_cache = false;
+        let mut any_cache_miss = false;
 
         for model_id in model_list {
             match read_cached_model(model_id) {
@@ -452,10 +453,11 @@ impl ProviderReadiness for MarketReadiness {
                     any_headroom = true;
                 }
                 None => {
-                    // Cache miss for this slug → no offer data. Treat as
-                    // "no offers" for the aggregate verdict but DON'T
-                    // early-fail: another model in the list may have
-                    // headroom.
+                    // Cache miss for this slug → unknown, not no offers.
+                    // The first build step can race ahead of the async
+                    // market-surface poller/projector; keep Market in the
+                    // decision so the dispatch path can ask `/quote`.
+                    any_cache_miss = true;
                     every_self_dealing = false;
                     every_all_saturated = false;
                 }
@@ -466,10 +468,14 @@ impl ProviderReadiness for MarketReadiness {
             return ReadinessResult::Ready;
         }
 
+        if any_cache_miss {
+            return ReadinessResult::Ready;
+        }
+
         // No headroom anywhere. Pick the most specific reason.
         // Precedence: SelfDealing > AllOffersSaturated > NoOffers.
-        // Only report SelfDealing / AllSaturated if we actually saw
-        // cache entries — otherwise it's cold-cache → NoOffers.
+        // Cache-miss cases already returned Ready above; at this point
+        // the remaining verdicts are backed by positive cached evidence.
         if any_has_cache && every_self_dealing {
             return ReadinessResult::NotReady {
                 reason: NotReadyReason::SelfDealing,
@@ -942,6 +948,21 @@ mod tests {
                 reason: NotReadyReason::NoMarketOffersForSlot,
             } => {}
             other => panic!("expected NoMarketOffersForSlot, got {:?}", other),
+        }
+        invalidate_cached_model(slug);
+    }
+
+    #[test]
+    fn test_market_readiness_cold_model_cache_is_ready() {
+        let _g = market_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_model_cache_for_tests();
+        clear_node_state_for_tests();
+        let slug = "market-readiness-cold-cache";
+        invalidate_cached_model(slug);
+        let p = params_for_market(true, Some(vec![slug.into()]), None);
+        match MarketReadiness::new().can_dispatch_now(&p) {
+            ReadinessResult::Ready => {}
+            other => panic!("expected Ready for cold market cache, got {:?}", other),
         }
         invalidate_cached_model(slug);
     }

@@ -8400,7 +8400,8 @@ async fn handle_navigate(
     // attach early-returned → walker saw no cascade. Now: attach ephemeral
     // cache_access, resolve "max" tier (judgment work), canonical helper.
     let navigate_build_id = format!("navigate-{}-{}", slug_name, chrono::Utc::now().timestamp());
-    let navigate_llm_config = state.attach_cache_access(llm_config.clone(), &slug_name, &navigate_build_id);
+    let navigate_llm_config =
+        state.attach_cache_access(llm_config.clone(), &slug_name, &navigate_build_id);
     let resolved_opt = navigate_llm_config
         .provider_registry
         .as_ref()

@@ -77,6 +77,23 @@ fn first_openrouter_model_from_decision(step_ctx: Option<&StepContext>) -> Optio
     first_provider_model_from_decision(step_ctx, WalkerProviderType::OpenRouter)
 }
 
+fn audit_response_parsed_ok(
+    audit: Option<&AuditContext>,
+    response_format: Option<&serde_json::Value>,
+    content: &str,
+) -> bool {
+    let expects_json = response_format.is_some()
+        || audit
+            .map(|a| matches!(a.call_purpose.as_str(), "chain_dispatch" | "ir_dispatch"))
+            .unwrap_or(false);
+
+    if expects_json {
+        extract_json(content).is_ok()
+    } else {
+        true
+    }
+}
+
 /// Clone the full OpenRouter `model_list` from the current
 /// `DispatchDecision`. Used by sites that need the whole cascade
 /// (context-exceeded model promotion / context-limit lookup).
@@ -727,14 +744,12 @@ struct MarketDispatchArgs<'a> {
     market_ctx: &'a crate::pyramid::compute_market_ctx::ComputeMarketRequesterContext,
     model_id: String,
     max_budget: i64,
-    /// Safety-rail timeout for the /fill await when Wire's
-    /// `dispatch_deadline_at` can't be parsed (should never happen in
-    /// practice; defensive fallback only). Canonical path uses
-    /// `purchase_resp.dispatch_deadline_at + small grace` — see
-    /// [compute-market-saturation-decisions-2026-04-21.md D3]: the
-    /// deadline is a load-bearing economic contract, not a node-local
-    /// timer.
+    /// Configured post-fill wait budget for a purchased market job.
+    /// This is user-tunable via `compute_participation_policy.
+    /// market_dispatch_max_wait_ms`; fallbacks must wait this long
+    /// before treating an accepted market job as dead.
     max_wait_ms: u64,
+    retry_http_count: u32,
     /// Wall-clock patience budget per chunk for the saturation-retry
     /// loop. Walker v3 Phase 3 sources this from the DispatchDecision's
     /// per_provider[Market].patience_secs (SYSTEM_DEFAULT 3600), falling
@@ -757,11 +772,6 @@ struct MarketDispatchArgs<'a> {
     /// for chronicle visibility and to keep the plumbing consistent
     /// with §3's "Decision carries all params" contract.
     patience_clock_resets_per_model: bool,
-    /// Walker v3 Phase 3: grace window subtracted from Wire's
-    /// `dispatch_deadline_at` when computing the /quote pre-gate's
-    /// usable deadline. SYSTEM_DEFAULT 10s. Same value drives the
-    /// /fill-await safety rail.
-    dispatch_deadline_grace_secs: u64,
     /// Walker v3 Phase 3 consumer: the resolver-supplied breaker_reset
     /// variant. Phase 3 only THREADS this through — Phase 5 owns the
     /// per-build circuit breaker state machine; when that lands it
@@ -787,11 +797,6 @@ struct MarketDispatchArgs<'a> {
 /// that a fresh-offer cohort drains within a few retries, long enough
 /// not to hammer Wire."
 const SATURATION_BACKOFF_FALLBACK_MS: u64 = 15_000;
-
-/// Grace appended to Wire's `dispatch_deadline_at` when computing
-/// walker's /fill-await tokio timeout. Covers clock skew + callback
-/// transit latency between provider → Wire → requester tunnel.
-const DISPATCH_DEADLINE_GRACE_SECS: u64 = 10;
 
 /// If `err` is `all_offers_saturated_for_model` (per body.error slug),
 /// return Some(Duration) to back off before re-quoting. Walker should
@@ -874,20 +879,37 @@ async fn apply_saturation_backoff(
     true
 }
 
-/// Parse Wire's `dispatch_deadline_at` (RFC 3339 UTC) into a Duration
-/// from now. Returns None on parse failure or if the deadline is
-/// already in the past; caller falls back to the safety-rail
-/// max_wait_ms.
-fn duration_until_deadline(dispatch_deadline_at: &str) -> Option<std::time::Duration> {
-    let deadline = chrono::DateTime::parse_from_rfc3339(dispatch_deadline_at).ok()?;
-    let now = chrono::Utc::now();
-    let delta = deadline
-        .with_timezone(&chrono::Utc)
-        .signed_duration_since(now);
-    if delta.num_milliseconds() <= 0 {
-        return None;
+fn market_result_wait_timeout(max_wait_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(max_wait_ms.max(1))
+}
+
+fn market_response_model_id(response: &LlmResponse) -> Option<&str> {
+    response
+        .provider_id
+        .as_deref()
+        .and_then(|provider_id| provider_id.strip_prefix("market:"))
+        .filter(|model_id| !model_id.is_empty())
+}
+
+fn is_quote_expired_slug(slug: &str) -> bool {
+    matches!(slug, "quote_jwt_expired" | "quote_expired")
+}
+
+fn fill_error_may_have_accepted_job(api_err: &crate::http_utils::ApiErrorWithHints) -> bool {
+    if api_err.status == 0 {
+        return true;
     }
-    delta.to_std().ok()
+
+    if !(500..=599).contains(&api_err.status) {
+        return false;
+    }
+
+    let slug = api_err
+        .body
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    slug.is_empty() || slug.trim_start().starts_with('<')
 }
 
 async fn dispatch_market_entry(
@@ -902,9 +924,9 @@ async fn dispatch_market_entry(
         model_id,
         max_budget,
         max_wait_ms,
+        retry_http_count,
         market_saturation_patience_secs,
         patience_clock_resets_per_model: _patience_clock_resets_per_model,
-        dispatch_deadline_grace_secs: _dispatch_deadline_grace_secs,
         breaker_reset: _breaker_reset,
         max_tokens,
         temperature,
@@ -924,6 +946,7 @@ async fn dispatch_market_entry(
     let patience_deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(market_saturation_patience_secs);
     let mut saturation_attempt: u32 = 0;
+    let mut quote_expiry_attempt: u32 = 0;
 
     // Snapshot node_id from AuthState — canonical runtime identity,
     // populated at registration and kept live via heartbeat/session.
@@ -960,7 +983,7 @@ async fn dispatch_market_entry(
     // and re-enters the loop. /fill and onward are post-loop — once
     // we've successfully /purchased, the job is reserved and
     // execution proceeds.
-    let (quote_resp, purchase_resp) = loop {
+    let (_quote_resp, purchase_resp) = loop {
         // ── /quote ────────────────────────────────────────────────────
         let quote_body = cqf::ComputeQuoteBody {
             model_id: model_id.clone(),
@@ -977,6 +1000,30 @@ async fn dispatch_market_entry(
         let quote_resp = match cqf::quote(&market_ctx.auth, &market_ctx.config, quote_body).await {
             Ok(r) => r,
             Err(api_err) => {
+                let slug = api_err
+                    .body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if is_quote_expired_slug(slug) && quote_expiry_attempt < retry_http_count {
+                    quote_expiry_attempt += 1;
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_NETWORK_QUOTE_EXPIRED,
+                        walker_source_label,
+                        entry_provider_id,
+                        serde_json::json!({
+                            "reason": slug,
+                            "branch": "market",
+                            "classification": "retry_same_market",
+                            "attempt": quote_expiry_attempt,
+                            "max_attempts": retry_http_count,
+                            "model_id": model_id.as_str(),
+                        }),
+                    );
+                    continue;
+                }
                 if let Some(backoff) = saturation_backoff_from_api_err(&api_err) {
                     saturation_attempt += 1;
                     let min_drain_ms = api_err
@@ -1021,7 +1068,7 @@ async fn dispatch_market_entry(
                 "reservation_fee": quote_resp.price_breakdown.reservation_fee,
                 "estimated_total": quote_resp.price_breakdown.estimated_total,
                 "queue_position": quote_resp.price_breakdown.queue_position,
-                "model_id": model_id,
+                "model_id": model_id.as_str(),
             }),
         );
 
@@ -1057,6 +1104,30 @@ async fn dispatch_market_entry(
         {
             Ok(r) => r,
             Err(api_err) => {
+                let slug = api_err
+                    .body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if is_quote_expired_slug(slug) && quote_expiry_attempt < retry_http_count {
+                    quote_expiry_attempt += 1;
+                    emit_walker_chronicle(
+                        ctx,
+                        config,
+                        super::compute_chronicle::EVENT_NETWORK_QUOTE_EXPIRED,
+                        walker_source_label,
+                        entry_provider_id,
+                        serde_json::json!({
+                            "reason": slug,
+                            "branch": "market",
+                            "classification": "retry_same_market",
+                            "attempt": quote_expiry_attempt,
+                            "max_attempts": retry_http_count,
+                            "model_id": model_id.as_str(),
+                        }),
+                    );
+                    continue;
+                }
                 if let Some(backoff) = saturation_backoff_from_api_err(&api_err) {
                     saturation_attempt += 1;
                     let min_drain_ms = api_err
@@ -1101,7 +1172,7 @@ async fn dispatch_market_entry(
             "request_id": purchase_resp.request_id,
             "job_id": purchase_resp.job_id,
             "dispatch_deadline_at": purchase_resp.dispatch_deadline_at,
-            "model_id": model_id,
+            "model_id": model_id.as_str(),
         }),
     );
 
@@ -1139,11 +1210,28 @@ async fn dispatch_market_entry(
         idempotency_key: purchase_resp.request_id.clone(),
     };
 
-    // Fire /fill; on error the registered rx is dropped when this fn
-    // returns (we also explicitly take() below for timeouts inside
-    // await_result). If /fill errors, clean up the pending entry so a
-    // late push hits already_settled.
+    // Fire /fill. Some transport/5xx failures are ambiguous: Wire may
+    // have accepted and dispatched the job, but the response path failed
+    // on the way back to us. In that case keep the pending waiter alive
+    // and give the market result the configured budget before fallbacks
+    // are allowed to run.
     if let Err(api_err) = cqf::fill(&market_ctx.auth, &market_ctx.config, fill_request).await {
+        if fill_error_may_have_accepted_job(&api_err) {
+            tracing::warn!(
+                uuid_job_id = %purchase_resp.uuid_job_id,
+                status = api_err.status,
+                body = %api_err.body,
+                max_wait_ms,
+                "ambiguous /fill failure after purchase; waiting for possible market result",
+            );
+            return cqf::await_result(
+                rx,
+                &purchase_resp.uuid_job_id,
+                &market_ctx.pending_jobs,
+                market_result_wait_timeout(max_wait_ms),
+            )
+            .await;
+        }
         let _ = market_ctx
             .pending_jobs
             .take(&purchase_resp.uuid_job_id)
@@ -1153,26 +1241,18 @@ async fn dispatch_market_entry(
 
     // ── Await oneshot ────────────────────────────────────────────────
     //
-    // Canonical deadline (per D3): parse Wire's
-    // `purchase_resp.dispatch_deadline_at` (RFC 3339) and await until
-    // that + a small grace (DISPATCH_DEADLINE_GRACE_SECS). Wire owns
-    // the deadline; walker has no independent timer.
-    //
-    // Fallback: if the deadline string fails to parse (shouldn't
-    // happen in practice — Wire always emits RFC 3339 UTC — but we're
-    // defensive), use the legacy `max_wait_ms` safety rail so the
-    // await doesn't become unbounded. A parse failure also logs a
-    // warning so operators notice the contract drift.
-    let timeout = match duration_until_deadline(&purchase_resp.dispatch_deadline_at) {
-        Some(d) => d + std::time::Duration::from_secs(DISPATCH_DEADLINE_GRACE_SECS),
-        None => {
-            tracing::warn!(
-                dispatch_deadline_at = %purchase_resp.dispatch_deadline_at,
-                "dispatch_deadline_at parse failed or already elapsed; falling back to max_wait_ms safety rail",
-            );
-            std::time::Duration::from_millis(max_wait_ms)
-        }
-    };
+    // `/fill` returned Ok, so Wire/provider accepted the dispatch. From
+    // this point on, fallbacks must wait the operator's configured
+    // market result budget before considering the job dead. Wire's
+    // `dispatch_deadline_at` is the fill-admission/reservation deadline,
+    // not the requester-side result timeout.
+    let timeout = market_result_wait_timeout(max_wait_ms);
+    tracing::debug!(
+        uuid_job_id = %purchase_resp.uuid_job_id,
+        dispatch_deadline_at = %purchase_resp.dispatch_deadline_at,
+        max_wait_ms,
+        "awaiting accepted market job using configured market wait budget",
+    );
     cqf::await_result(
         rx,
         &purchase_resp.uuid_job_id,
@@ -2158,6 +2238,10 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     });
                 let latency_ms = probe_started.elapsed().as_millis() as i64;
                 let conn = audit_ctx.conn.lock().await;
+                let actual_model_for_row = market_response_model_id(&response)
+                    .or(response.fleet_peer_model.as_deref())
+                    .unwrap_or(model_for_row.as_str());
+                let parsed_ok = audit_response_parsed_ok(audit, response_format, &response.content);
                 let _ = super::db::insert_llm_audit_cache_hit(
                     &conn,
                     &audit_ctx.slug,
@@ -2166,10 +2250,11 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     &audit_ctx.step_name,
                     &audit_ctx.call_purpose,
                     audit_ctx.depth,
-                    &model_for_row,
+                    actual_model_for_row,
                     system_prompt,
                     user_prompt,
                     &response.content,
+                    parsed_ok,
                     response.usage.prompt_tokens,
                     response.usage.completion_tokens,
                     latency_ms,
@@ -2196,9 +2281,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
     // `StepContext::new`) bypass this unless paired with
     // `with_dispatch_decision_if_available` — see plan
     // docs/plans/walker-v3-completion-decision-attachment.md §4, §5.
-    let decision_present = ctx
-        .and_then(|c| c.dispatch_decision.as_ref())
-        .is_some();
+    let decision_present = ctx.and_then(|c| c.dispatch_decision.as_ref()).is_some();
     let override_present = options.model_override.is_some();
     if !decision_present && !override_present {
         let step_name = ctx.map(|c| c.step_name.as_str()).unwrap_or("<no_ctx>");
@@ -2458,7 +2541,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                             &entry.provider_id,
                             serde_json::json!({
                                 "reason": "no_offers_for_model",
-                                "model_id": market_model_id,
+                                "model_id": market_model_id.as_str(),
                             }),
                         );
                         skip_reasons.push(format!("{}:no_offers_for_model", entry.provider_id));
@@ -2483,10 +2566,9 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 })
                 .map(|p| {
                     // Phase 3 walker_provider_market does not yet surface
-                    // a distinct max_wait_ms param — reuse
-                    // dispatch_deadline_grace_secs + the legacy
-                    // participation-policy value below. Set a harmless
-                    // sentinel and let the policy read overwrite.
+                    // a distinct max_wait_ms param. Set a harmless
+                    // sentinel and let the participation-policy read
+                    // below supply the post-fill market wait budget.
                     let _ = p;
                     0u64
                 })
@@ -2521,18 +2603,10 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 })
                 .map(|p| p.patience_clock_resets_per_model)
                 .unwrap_or(false);
-            let market_dispatch_deadline_grace_secs = ctx
-                .and_then(|c| c.dispatch_decision.as_ref())
-                .and_then(|d| {
-                    d.per_provider
-                        .get(&crate::pyramid::walker_resolver::ProviderType::Market)
-                })
-                .map(|p| p.dispatch_deadline_grace_secs)
-                .unwrap_or(10);
-
             // Fall back to the participation-policy values for
-            // `market_max_wait_ms` (deadline safety rail) and, when the
-            // Decision doesn't supply patience, for patience_secs too.
+            // `market_max_wait_ms` (post-fill result wait budget) and,
+            // when the Decision doesn't supply patience, for
+            // patience_secs too.
             let (market_max_wait_ms, market_saturation_patience_secs): (u64, u64) = {
                 let db_path = ctx.map(|c| c.db_path.clone()).or_else(|| {
                     config
@@ -2654,7 +2728,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                                     "estimated_serve_ms": est,
                                     "usable_deadline_ms": usable,
                                     "dispatch_deadline_grace_secs": grace_secs,
-                                    "model_id": market_model_id,
+                                    "model_id": market_model_id.as_str(),
                                     "branch": "market",
                                 }),
                             );
@@ -2701,9 +2775,16 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 model_id: market_model_id.clone(),
                 max_budget,
                 max_wait_ms: market_max_wait_ms,
+                retry_http_count: ctx
+                    .and_then(|c| c.dispatch_decision.as_ref())
+                    .and_then(|d| {
+                        d.per_provider
+                            .get(&crate::pyramid::walker_resolver::ProviderType::Market)
+                    })
+                    .map(|p| p.retry_http_count)
+                    .unwrap_or(3),
                 market_saturation_patience_secs,
                 patience_clock_resets_per_model: market_patience_clock_resets_per_model,
-                dispatch_deadline_grace_secs: market_dispatch_deadline_grace_secs,
                 breaker_reset: market_breaker_reset_from_decision,
                 max_tokens: max_tokens_i64,
                 temperature,
@@ -2727,23 +2808,30 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     );
                     let latency_ms = call_started.elapsed().as_millis() as i64;
                     let walker_ms = walker_started.elapsed().as_millis() as i64;
+                    let actual_model_id = market_response_model_id(&response)
+                        .unwrap_or(market_model_id.as_str())
+                        .to_string();
+                    let provider_id = response.provider_id.as_deref().unwrap_or("market");
 
                     // Optional cache store on success.
                     try_cache_store(ctx, cache_lookup.as_ref(), &response, call_started);
 
                     if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
                         let conn = audit_ctx.conn.lock().await;
+                        let parsed_ok =
+                            audit_response_parsed_ok(audit, response_format, &response.content);
                         let _ = super::db::complete_llm_audit(
                             &conn,
                             id,
                             &response.content,
-                            true,
+                            parsed_ok,
                             response.usage.prompt_tokens,
                             response.usage.completion_tokens,
                             latency_ms,
                             response.generation_id.as_deref(),
                             Some(entry.provider_id.as_str()),
                         );
+                        let _ = super::db::update_llm_audit_model(&conn, id, &actual_model_id);
                     }
 
                     emit_walker_chronicle(
@@ -2757,6 +2845,10 @@ pub async fn call_model_unified_with_audit_and_ctx(
                             "total_walker_ms": walker_ms,
                             "attempts": entry_idx + 1,
                             "branch": "market",
+                            "model_id": actual_model_id.as_str(),
+                            "actual_model_id": actual_model_id.as_str(),
+                            "requested_model_id": market_model_id.as_str(),
+                            "provider_id": provider_id,
                         }),
                     );
 
@@ -2779,6 +2871,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                                 "reason": reason,
                                 "branch": "market",
                                 "classification": "retryable",
+                                "model_id": market_model_id.as_str(),
                             }),
                         );
                     }
@@ -2788,7 +2881,11 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         super::compute_chronicle::EVENT_NETWORK_ROUTE_RETRYABLE_FAIL,
                         &walker_source_label,
                         &entry.provider_id,
-                        serde_json::json!({ "reason": reason, "branch": "market" }),
+                        serde_json::json!({
+                            "reason": reason,
+                            "branch": "market",
+                            "model_id": market_model_id.as_str(),
+                        }),
                     );
                     // Phase 5 §F: Retryable reflects a genuine
                     // provider-side failure (HTTP 5xx, connection
@@ -2842,6 +2939,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                                 "reason": reason,
                                 "branch": "market",
                                 "classification": "route_skipped",
+                                "model_id": market_model_id.as_str(),
                             }),
                         );
                     }
@@ -2851,7 +2949,11 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         super::compute_chronicle::EVENT_NETWORK_ROUTE_SKIPPED,
                         &walker_source_label,
                         &entry.provider_id,
-                        serde_json::json!({ "reason": reason, "branch": "market" }),
+                        serde_json::json!({
+                            "reason": reason,
+                            "branch": "market",
+                            "model_id": market_model_id.as_str(),
+                        }),
                     );
                     skip_reasons.push(format!("{}:route_skipped({})", entry.provider_id, reason));
                     continue;
@@ -2880,6 +2982,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                                 "reason": reason.clone(),
                                 "branch": "market",
                                 "classification": "call_terminal",
+                                "model_id": market_model_id.as_str(),
                             }),
                         );
                     }
@@ -2889,7 +2992,11 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         super::compute_chronicle::EVENT_NETWORK_ROUTE_TERMINAL_FAIL,
                         &walker_source_label,
                         &entry.provider_id,
-                        serde_json::json!({ "reason": reason.clone(), "branch": "market" }),
+                        serde_json::json!({
+                            "reason": reason.clone(),
+                            "branch": "market",
+                            "model_id": market_model_id.as_str(),
+                        }),
                     );
                     if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
                         let conn = audit_ctx.conn.lock().await;
@@ -3105,20 +3212,45 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     );
                     let latency_ms = call_started.elapsed().as_millis() as i64;
                     let walker_ms = walker_started.elapsed().as_millis() as i64;
+                    let mut metadata = serde_json::json!({
+                        "latency_ms": latency_ms,
+                        "total_walker_ms": walker_ms,
+                        "attempts": entry_idx + 1,
+                        "branch": "fleet",
+                        "provider_id": response.provider_id.as_deref(),
+                        "fleet_peer_id": response.fleet_peer_id.as_deref(),
+                    });
+                    if let Some(model_id) = response.fleet_peer_model.as_deref() {
+                        if let Some(obj) = metadata.as_object_mut() {
+                            obj.insert(
+                                "model_id".to_string(),
+                                serde_json::Value::String(model_id.to_string()),
+                            );
+                            obj.insert(
+                                "actual_model_id".to_string(),
+                                serde_json::Value::String(model_id.to_string()),
+                            );
+                        }
+                    }
 
                     if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
                         let conn = audit_ctx.conn.lock().await;
+                        let parsed_ok =
+                            audit_response_parsed_ok(audit, response_format, &response.content);
                         let _ = super::db::complete_llm_audit(
                             &conn,
                             id,
                             &response.content,
-                            true,
+                            parsed_ok,
                             response.usage.prompt_tokens,
                             response.usage.completion_tokens,
                             latency_ms,
                             response.generation_id.as_deref(),
                             Some(entry.provider_id.as_str()),
                         );
+                        if let Some(model_id) = response.fleet_peer_model.as_deref() {
+                            let _ = super::db::update_llm_audit_model(&conn, id, model_id);
+                        }
                     }
 
                     emit_walker_chronicle(
@@ -3127,11 +3259,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         super::compute_chronicle::EVENT_WALKER_RESOLVED,
                         &walker_source_label,
                         &entry.provider_id,
-                        serde_json::json!({
-                            "latency_ms": latency_ms,
-                            "total_walker_ms": walker_ms,
-                            "attempts": entry_idx + 1,
-                        }),
+                        metadata,
                     );
 
                     return Ok(response);
@@ -3384,16 +3512,23 @@ pub async fn call_model_unified_with_audit_and_ctx(
 
                         if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
                             let conn = audit_ctx.conn.lock().await;
+                            let parsed_ok =
+                                audit_response_parsed_ok(audit, response_format, &response.content);
                             let _ = super::db::complete_llm_audit(
                                 &conn,
                                 id,
                                 &response.content,
-                                true,
+                                parsed_ok,
                                 response.usage.prompt_tokens,
                                 response.usage.completion_tokens,
                                 latency_ms,
                                 response.generation_id.as_deref(),
                                 Some(entry.provider_id.as_str()),
+                            );
+                            let _ = super::db::update_llm_audit_model(
+                                &conn,
+                                id,
+                                queue_model_id.as_str(),
                             );
                         }
 
@@ -3407,6 +3542,10 @@ pub async fn call_model_unified_with_audit_and_ctx(
                                 "latency_ms": latency_ms,
                                 "total_walker_ms": walker_ms,
                                 "attempts": entry_idx + 1,
+                                "branch": "local_queue",
+                                "model_id": queue_model_id.as_str(),
+                                "actual_model_id": queue_model_id.as_str(),
+                                "provider_id": response.provider_id.as_deref(),
                             }),
                         );
 
@@ -4197,7 +4336,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     let cloud_job_path = saved_chronicle_job_path.clone().unwrap_or_else(|| {
                         super::compute_chronicle::generate_job_path(ctx, None, &use_model, "cloud")
                     });
-                    let chronicle_ctx = if let Some(sc) = ctx {
+                    let chronicle_ctx = (if let Some(sc) = ctx {
                         super::compute_chronicle::ChronicleEventContext::from_step_ctx(
                             sc,
                             &cloud_job_path,
@@ -4210,8 +4349,8 @@ pub async fn call_model_unified_with_audit_and_ctx(
                             "cloud_returned",
                             "cloud",
                         )
-                        .with_model_id(use_model.clone())
-                    };
+                    })
+                    .with_model_id(use_model.clone());
                     let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
                         "provider_id": response.provider_id,
                         "latency_ms": latency_ms,
@@ -4265,17 +4404,20 @@ pub async fn call_model_unified_with_audit_and_ctx(
                 // Audit complete row — stamp winning entry's provider_id.
                 if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
                     let conn = audit_ctx.conn.lock().await;
+                    let parsed_ok =
+                        audit_response_parsed_ok(audit, response_format, &response.content);
                     let _ = super::db::complete_llm_audit(
                         &conn,
                         id,
                         &response.content,
-                        true,
+                        parsed_ok,
                         response.usage.prompt_tokens,
                         response.usage.completion_tokens,
                         latency_ms,
                         response.generation_id.as_deref(),
                         Some(entry.provider_id.as_str()),
                     );
+                    let _ = super::db::update_llm_audit_model(&conn, id, use_model.as_str());
                 }
 
                 // walker_resolved chronicle.
@@ -4289,6 +4431,9 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         "latency_ms": latency_ms,
                         "total_walker_ms": walker_ms,
                         "attempts": entry_idx + 1,
+                        "model_id": use_model.as_str(),
+                        "actual_model_id": use_model.as_str(),
+                        "provider_id": response.provider_id.as_deref(),
                     }),
                 );
 
@@ -4416,6 +4561,8 @@ fn serialize_response_for_cache(response: &LlmResponse) -> String {
         "generation_id": response.generation_id,
         "actual_cost_usd": response.actual_cost_usd,
         "provider_id": response.provider_id,
+        "fleet_peer_id": response.fleet_peer_id,
+        "fleet_peer_model": response.fleet_peer_model,
     })
     .to_string()
 }
@@ -6366,9 +6513,9 @@ routing_rules:
             model_id: "test-model".into(),
             max_budget: (1i64 << 53) - 1,
             max_wait_ms: 60_000,
+            retry_http_count: 3,
             market_saturation_patience_secs: 3600,
             patience_clock_resets_per_model: false,
-            dispatch_deadline_grace_secs: 10,
             breaker_reset: crate::pyramid::walker_resolver::BreakerReset::PerBuild,
             max_tokens: 0,
             temperature: 0.0,
@@ -6381,6 +6528,67 @@ routing_rules:
         };
         // Don't actually dispatch — we'd need a live Wire server. The
         // struct construction is the load-bearing assertion.
+    }
+
+    #[test]
+    fn market_result_wait_timeout_honors_configured_budget() {
+        let timeout = market_result_wait_timeout(900_000);
+        assert_eq!(timeout, std::time::Duration::from_secs(15 * 60));
+    }
+
+    #[test]
+    fn market_result_wait_timeout_never_zeroes_out() {
+        let timeout = market_result_wait_timeout(0);
+        assert_eq!(timeout, std::time::Duration::from_millis(1));
+    }
+
+    #[test]
+    fn market_response_model_id_reads_actual_provider_model() {
+        let response = LlmResponse {
+            content: "ok".into(),
+            usage: TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            },
+            generation_id: None,
+            actual_cost_usd: None,
+            provider_id: Some("market:gemma4:26b".into()),
+            fleet_peer_id: None,
+            fleet_peer_model: None,
+        };
+        assert_eq!(market_response_model_id(&response), Some("gemma4:26b"));
+    }
+
+    #[test]
+    fn ambiguous_fill_5xx_keeps_market_waiter_alive() {
+        let err = crate::http_utils::ApiErrorWithHints {
+            status: 503,
+            body: serde_json::json!({
+                "error": "<!DOCTYPE html><title>Service Unavailable</title>"
+            }),
+            hints: crate::http_utils::RetryHints::default(),
+        };
+        assert!(fill_error_may_have_accepted_job(&err));
+    }
+
+    #[test]
+    fn explicit_fill_4xx_does_not_keep_market_waiter_alive() {
+        let err = crate::http_utils::ApiErrorWithHints {
+            status: 409,
+            body: serde_json::json!({ "error": "dispatch_deadline_exceeded" }),
+            hints: crate::http_utils::RetryHints::default(),
+        };
+        assert!(!fill_error_may_have_accepted_job(&err));
+    }
+
+    #[test]
+    fn fill_transport_error_keeps_market_waiter_alive() {
+        let err = crate::http_utils::ApiErrorWithHints {
+            status: 0,
+            body: serde_json::json!({ "transport": "connection reset" }),
+            hints: crate::http_utils::RetryHints::default(),
+        };
+        assert!(fill_error_may_have_accepted_job(&err));
     }
 
     #[test]
@@ -6888,6 +7096,20 @@ routing_rules:
         }
     }
 
+    fn latest_audit_parsed_ok(db_path: &std::path::Path, slug: &str) -> bool {
+        let conn = super::super::db::open_pyramid_db(db_path).expect("reopen for audit row");
+        let parsed_ok: i64 = conn
+            .query_row(
+                "SELECT parsed_ok FROM pyramid_llm_audit
+                 WHERE slug = ?1
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .expect("latest audit row");
+        parsed_ok != 0
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_phase18b_audited_cache_hit_writes_cache_hit_audit_row() {
         // L8 acceptance: when an audited LLM call serves from cache,
@@ -6972,6 +7194,72 @@ routing_rules:
             count_audit_rows(db.path(), "p18b-l8", None),
             1,
             "exactly one audit row total"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_chain_dispatch_cache_hit_marks_malformed_content_parse_failed() {
+        let slug = "p18b-chain-cache-bad";
+        let db = temp_pyramid_db_with_slug(slug);
+        let system = "chain dispatch cache hit system";
+        let user = "chain dispatch cache hit user";
+        let model_id = "test/model-chain";
+        let prompt_hash = "phash-chain";
+
+        let inputs_hash = compute_inputs_hash(system, user);
+        let cache_key = compute_cache_key(&inputs_hash, prompt_hash, model_id);
+        pre_populate_cache(
+            db.path(),
+            slug,
+            &cache_key,
+            &inputs_hash,
+            prompt_hash,
+            model_id,
+            "```json\n{\"headline\":\"missing close\"\n```",
+        );
+
+        let ctx = StepContext::new(
+            slug,
+            "build-chain",
+            "source_extract",
+            "chain_llm",
+            0,
+            None,
+            db.path().to_string_lossy().to_string(),
+        )
+        .with_model_resolution("extractor", model_id)
+        .with_prompt_hash(prompt_hash);
+
+        let audit = AuditContext {
+            conn: audit_conn_for(db.path(), slug),
+            slug: slug.to_string(),
+            build_id: "build-chain".to_string(),
+            node_id: Some("Q-L0-003".to_string()),
+            step_name: "source_extract".to_string(),
+            call_purpose: "chain_dispatch".to_string(),
+            depth: Some(0),
+        };
+
+        let cfg = LlmConfig::default();
+        let response = call_model_unified_with_audit_and_ctx(
+            &cfg,
+            Some(&ctx),
+            Some(&audit),
+            system,
+            user,
+            0.2,
+            4096,
+            None,
+            walker_test_options(),
+        )
+        .await
+        .expect("cache hit still returns cached text to the chain parser");
+
+        assert!(response.content.contains("missing close"));
+        assert_eq!(count_audit_rows(db.path(), slug, Some(true)), 1);
+        assert!(
+            !latest_audit_parsed_ok(db.path(), slug),
+            "chain-dispatch cache-hit audit must reflect content JSON parse failure"
         );
     }
 
@@ -7325,6 +7613,14 @@ routing_rules:
             map_market_slug_to_specific_event("quote_expired"),
             Some(super::super::compute_chronicle::EVENT_NETWORK_QUOTE_EXPIRED),
         );
+    }
+
+    #[test]
+    fn quote_expired_slugs_retry_same_market() {
+        assert!(is_quote_expired_slug("quote_jwt_expired"));
+        assert!(is_quote_expired_slug("quote_expired"));
+        assert!(!is_quote_expired_slug("quote_no_longer_winning"));
+        assert!(!is_quote_expired_slug("provider_queue_full"));
     }
 
     #[test]

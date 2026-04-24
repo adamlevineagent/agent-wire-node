@@ -26,10 +26,11 @@
 //     in-memory and the ~millisecond-scale contention matters less
 //     than dragging tokio into readiness code.
 //   * Absent entry = "not yet probed". `MarketReadiness` treats this
-//     conservatively — for per-model liquidity queries a missing
-//     entry yields `NoMarketOffersForSlot`; for credit balance a
-//     missing entry yields "assume sufficient" (opt-out by design —
-//     cold cache MUST NOT block the only market path).
+//     permissively for per-model liquidity: missing data keeps Market
+//     in the decision so `/quote` can be authoritative. Credit balance
+//     follows the same cold-cache principle: missing means "assume
+//     sufficient" (opt-out by design — cold cache MUST NOT block the
+//     only market path).
 //   * The cache never stores "has the operator declared this model
 //     for this slot" — that's a ResolvedProviderParams.model_list
 //     question, resolved per-call by readiness. The cache only

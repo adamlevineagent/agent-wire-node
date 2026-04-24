@@ -11755,6 +11755,8 @@ fn main() {
         .expect("Failed to open pyramid.db writer connection");
     wire_node_lib::pyramid::db::init_pyramid_db(&pyramid_writer)
         .expect("Failed to initialize pyramid schema on writer");
+    wire_node_lib::pyramid::db::configure_pyramid_writer_connection(&pyramid_writer)
+        .expect("Failed to configure pyramid writer connection");
 
     let pyramid_reader = rusqlite::Connection::open(&pyramid_db_path)
         .expect("Failed to open pyramid.db reader connection");

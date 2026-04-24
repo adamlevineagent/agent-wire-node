@@ -78,6 +78,8 @@ pub struct PyramidNode {
     pub terms: Vec<Term>,
     pub dead_ends: Vec<String>,
     pub self_prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_question_id: Option<String>,
     pub children: Vec<String>,
     pub parent_id: Option<String>,
     pub superseded_by: Option<String>,
@@ -239,11 +241,31 @@ pub struct TreeNode {
     pub depth: i64,
     pub headline: String,
     pub distilled: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_kind: Option<String>,
+    #[serde(default)]
+    pub parent_ids: Vec<String>,
     pub self_prompt: Option<String>,
     pub thread_id: Option<String>,
     pub source_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_about: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_creates: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_prompt_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_headline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_distilled: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered: Option<bool>,
     pub children: Vec<TreeNode>,
 }
 
@@ -261,12 +283,38 @@ pub struct DrillResult {
     pub gaps: Vec<GapReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question_context: Option<QuestionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_node: Option<QuestionNodeDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_answer: Option<PyramidNode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionContext {
     pub parent_question: Option<String>,
     pub sibling_questions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestionNodeDetail {
+    pub question_id: String,
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub parent_ids: Vec<String>,
+    pub depth: i64,
+    pub visual_depth: i64,
+    pub question: String,
+    pub about: String,
+    pub creates: String,
+    pub prompt_hint: String,
+    pub is_leaf: bool,
+    pub children: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_node_id: Option<String>,
+    #[serde(default)]
+    pub answered: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -523,7 +571,23 @@ pub struct LiveNodeInfo {
     pub depth: i64,
     pub headline: String,
     pub parent_id: Option<String>,
+    #[serde(default)]
+    pub parent_ids: Vec<String>,
     pub children: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_about: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_creates: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_prompt_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered: Option<bool>,
     /// "complete" | "pending" | "superseded"
     pub status: String,
 }
