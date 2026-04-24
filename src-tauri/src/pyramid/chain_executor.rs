@@ -40,6 +40,43 @@ use super::PyramidState;
 const CODE_THREAD_SPLIT_PROMPT: &str =
     include_str!("../../../chains/prompts/code/code_thread_split.md");
 
+// ── SQLite writer-lock retry helpers ────────────────────────────────────────
+//
+// The answered-node / failed-question-gap save path in the main build loop
+// uses a shared writer connection that can contend with concurrent audit /
+// chronicle writes, especially now that successful long (6+ minute) gemma
+// inferences are common. A DEFERRED `BEGIN` would lazily upgrade to a
+// writer lock at the first INSERT, which can fail with SQLITE_BUSY /
+// "database is locked" past the 10s busy_timeout. The save callers use
+// `BEGIN IMMEDIATE` (matching db.rs:5719 / db.rs:10908) and wrap each
+// transaction in `retry_on_sqlite_busy` so transient contention doesn't
+// abort the whole build.
+const SAVE_MAX_RETRIES: u32 = 3;
+const SAVE_BACKOFF_MS: [u64; 3] = [100, 500, 2000];
+
+/// Returns true iff the error is a SQLite BUSY / "database is locked"
+/// error. Prefers typed downcast to `rusqlite::Error::SqliteFailure` with
+/// `ErrorCode::DatabaseBusy`, and falls back to a substring check on the
+/// error chain so wrapped `anyhow!("...: {e}")` errors are still caught.
+fn is_sqlite_busy(err: &anyhow::Error) -> bool {
+    // Typed check: walk the cause chain for rusqlite::Error::SqliteFailure.
+    for cause in err.chain() {
+        if let Some(rusqlite::Error::SqliteFailure(ffi, _)) =
+            cause.downcast_ref::<rusqlite::Error>()
+        {
+            if ffi.code == rusqlite::ErrorCode::DatabaseBusy
+                || ffi.code == rusqlite::ErrorCode::DatabaseLocked
+            {
+                return true;
+            }
+        }
+    }
+    // Fallback: textual match on the flattened error chain. Covers cases
+    // where a `rusqlite::Error` has been stringified into an `anyhow!`.
+    let msg = format!("{:#}", err).to_ascii_lowercase();
+    msg.contains("database is locked") || msg.contains("database table is locked")
+}
+
 // ── WS-AUDIENCE-CONTRACT helpers ────────────────────────────────────────────
 
 /// Coerce an `audience` JSON value (either the canonical `Audience` Object or
@@ -4472,6 +4509,19 @@ pub async fn execute_chain_from(
         // Check `when` condition
         if !evaluate_when(step.when.as_deref(), &ctx) {
             info!("  Step '{}' skipped (when condition false)", step.name);
+            let _ = state
+                .build_event_bus
+                .tx
+                .send(crate::pyramid::event_bus::TaggedBuildEvent {
+                    slug: slug.to_string(),
+                    kind: crate::pyramid::event_bus::TaggedKind::NodeSkipped {
+                        slug: slug.to_string(),
+                        build_id: chain_build_id.clone(),
+                        step_name: step.name.clone(),
+                        node_id: format!("__step__:{}", step.name),
+                        reason: "when_false".to_string(),
+                    },
+                });
             // Skipped setup steps still count toward done to keep totals balanced
             if !step_saves_node(step) {
                 done += 1;
@@ -4501,6 +4551,20 @@ pub async fn execute_chain_from(
                     "[CHAIN] step \"{}\" skipped (extract at depth {} < from_depth {})",
                     step.name, step_depth, from_depth
                 );
+                let _ =
+                    state
+                        .build_event_bus
+                        .tx
+                        .send(crate::pyramid::event_bus::TaggedBuildEvent {
+                            slug: slug.to_string(),
+                            kind: crate::pyramid::event_bus::TaggedKind::NodeSkipped {
+                                slug: slug.to_string(),
+                                build_id: chain_build_id.clone(),
+                                step_name: step.name.clone(),
+                                node_id: format!("__step__:{}", step.name),
+                                reason: format!("from_depth:{from_depth}"),
+                            },
+                        });
                 if let Some(hydrated_output) =
                     hydrate_skipped_step_output(step, &ctx, &state.reader).await?
                 {
@@ -4773,7 +4837,7 @@ pub async fn execute_chain_from(
         } else if step.primitive == "cross_build_input" {
             execute_cross_build_input(state, step, &mut ctx, slug).await
         } else if step.primitive == "recursive_decompose" {
-            execute_recursive_decompose(state, step, &mut ctx, slug, cancel).await
+            execute_recursive_decompose(state, step, &chain.defaults, &mut ctx, slug, cancel).await
         } else if step.primitive == "build_lifecycle" {
             execute_build_lifecycle(state, step, &mut ctx, slug).await
         } else if step.primitive == "evidence_loop" {
@@ -5229,6 +5293,7 @@ async fn execute_cross_build_input(
 async fn execute_recursive_decompose(
     state: &PyramidState,
     step: &ChainStep,
+    defaults: &super::chain_engine::ChainDefaults,
     ctx: &mut ChainContext,
     slug: &str,
     cancel: &CancellationToken,
@@ -5310,6 +5375,28 @@ async fn execute_recursive_decompose(
                 .and_then(audience_value_to_legacy_string)
         });
 
+    let decompose_model_tier = step
+        .model_tier
+        .clone()
+        .unwrap_or_else(|| defaults.model_tier.clone());
+    let decompose_temperature = step
+        .temperature
+        .unwrap_or(state.operational.tier1.decomposition_temperature);
+    let audit_build_id = ctx
+        .resolve_ref("$build_id")
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| decompose_build_id.clone());
+    let audit_ctx = super::llm::AuditContext {
+        conn: state.writer.clone(),
+        slug: slug.to_string(),
+        build_id: audit_build_id,
+        node_id: None,
+        step_name: step.name.clone(),
+        call_purpose: "question_decompose".to_string(),
+        depth: step.depth,
+    };
+
     let config = super::question_decomposition::DecompositionConfig {
         apex_question: apex_question.clone(),
         content_type,
@@ -5318,6 +5405,10 @@ async fn execute_recursive_decompose(
         folder_map: Some(decomp_context),
         chains_dir: Some(state.chains_dir.clone()),
         audience,
+        model_tier: decompose_model_tier,
+        temperature: decompose_temperature,
+        max_tokens: state.operational.tier1.decomposition_max_tokens,
+        sibling_review_max_tokens: state.operational.tier1.synthesis_prompts_max_tokens,
     };
 
     // Check if this is delta or fresh decomposition
@@ -5393,6 +5484,7 @@ async fn execute_recursive_decompose(
             Some(&state.chains_dir),
             evidence_set_ctx.as_deref(),
             gap_ctx.as_deref(),
+            Some(&audit_ctx),
         )
         .await?;
 
@@ -5412,6 +5504,7 @@ async fn execute_recursive_decompose(
             slug,
             &state.operational.tier1,
             &state.operational.tier2,
+            Some(&audit_ctx),
         )
         .await?
     };
@@ -5747,13 +5840,7 @@ async fn execute_evidence_loop(
 
     if cancel.is_cancelled() {
         warn!(slug, "build cancelled before synthesis prompt generation");
-        return Ok(serde_json::json!({
-            "build_id": build_id,
-            "error": "Cancelled before synthesis",
-            "total_nodes": 0,
-            "layers_completed": 0,
-            "max_layer": max_layer,
-        }));
+        return Err(anyhow!("evidence_loop cancelled before synthesis"));
     }
 
     let synth_prompts = super::extraction_schema::generate_synthesis_prompts(
@@ -5890,6 +5977,19 @@ async fn execute_evidence_loop(
 
         // Step b: Answer questions (with per-question progress ticks)
         let (answer_tick_tx, mut answer_tick_rx) = mpsc::channel::<()>(64);
+        let evidence_answer_concurrency = step.concurrency.max(1);
+        let mut evidence_ops = (*state.operational).clone();
+        evidence_ops.tier1.answer_concurrency = evidence_ops
+            .tier1
+            .answer_concurrency
+            .min(evidence_answer_concurrency)
+            .max(1);
+        info!(
+            slug,
+            layer,
+            answer_concurrency = evidence_ops.tier1.answer_concurrency,
+            "evidence_loop answer concurrency resolved"
+        );
 
         // Spawn progress drain: fires send_progress for each answered question
         let progress_tx_clone = progress_tx.clone();
@@ -5915,7 +6015,7 @@ async fn execute_evidence_loop(
             slug, // answer_slug
             Some(&state.chains_dir),
             source_content_type.as_deref(),
-            &state.operational,
+            &evidence_ops,
             Some(&audit_ctx),
             Some(&answer_tick_tx),
         )
@@ -5941,6 +6041,9 @@ async fn execute_evidence_loop(
         // Stamp build_id
         for a in &mut answered {
             a.node.build_id = Some(build_id.clone());
+            for link in &mut a.evidence {
+                link.build_id = Some(build_id.clone());
+            }
         }
 
         let answered_ids: Vec<String> = answered.iter().map(|a| a.node.id.clone()).collect();
@@ -5953,62 +6056,258 @@ async fn execute_evidence_loop(
         {
             let conn = state.writer.clone();
             let slug_owned = slug.to_string();
+            let build_id_owned = build_id.clone();
             let bid_for_gaps = build_id.clone();
             let answered_owned = answered;
             let failed_owned = failed;
             tokio::task::spawn_blocking(move || {
                 let c = conn.blocking_lock();
                 for a in &answered_owned {
-                    c.execute_batch("BEGIN")?;
-                    let result = (|| -> anyhow::Result<()> {
-                        db::save_node(&c, &a.node, None)?;
-                        for child_id in &a.node.children {
-                            if child_id.contains('/') {
+                    // First commit the expensive answer result to a tiny
+                    // outbox row. The canonical graph drain below can fail
+                    // loudly without throwing away the LLM work.
+                    for attempt in 0..=SAVE_MAX_RETRIES {
+                        let tx_result = (|| -> anyhow::Result<()> {
+                            c.execute_batch("BEGIN IMMEDIATE")?;
+                            let inner = db::save_answered_node_outbox(
+                                &c,
+                                &slug_owned,
+                                &build_id_owned,
+                                a,
+                            );
+                            match inner {
+                                Ok(()) => {
+                                    if let Err(e) = c.execute_batch("COMMIT") {
+                                        let _ = c.execute_batch("ROLLBACK");
+                                        Err(e.into())
+                                    } else {
+                                        Ok(())
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = c.execute_batch("ROLLBACK");
+                                    Err(e)
+                                }
+                            }
+                        })();
+                        match tx_result {
+                            Ok(()) => break,
+                            Err(e)
+                                if is_sqlite_busy(&e) && attempt < SAVE_MAX_RETRIES =>
+                            {
+                                warn!(
+                                    slug = %slug_owned,
+                                    node_id = %a.node.id,
+                                    attempt,
+                                    backoff_ms = SAVE_BACKOFF_MS[attempt as usize],
+                                    "answered-node outbox save hit database-locked, retrying"
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    SAVE_BACKOFF_MS[attempt as usize],
+                                ));
                                 continue;
                             }
-                            let _ =
-                                db::update_parent(&c, &slug_owned, child_id, &a.node.id);
+                            Err(e) => {
+                                warn!(
+                                    slug = %slug_owned,
+                                    node_id = %a.node.id,
+                                    error = %e,
+                                    "failed to persist answered-node outbox"
+                                );
+                                return Err(anyhow!(
+                                    "failed to persist answered-node outbox {}: {}",
+                                    a.node.id,
+                                    e
+                                ));
+                            }
                         }
-                        for link in &a.evidence {
-                            db::save_evidence_link(&c, link)?;
-                        }
-                        for missing_desc in &a.missing {
-                            let gap = super::types::GapReport {
-                                question_id: a.node.id.clone(),
-                                description: missing_desc.clone(),
-                                layer: a.node.depth as i64,
-                                resolved: false,
-                                resolution_confidence: 0.0,
-                            };
-                            db::save_gap(&c, &slug_owned, &gap, Some(&bid_for_gaps))?;
-                        }
-                        Ok(())
-                    })();
-                    match result {
-                        Ok(()) => { c.execute_batch("COMMIT")?; }
-                        Err(e) => {
-                            let _ = c.execute_batch("ROLLBACK");
-                            warn!(slug = %slug_owned, node_id = %a.node.id, error = %e, "failed to save answered node — continuing");
+                    }
+
+                    let durable = db::get_pending_answered_node_outbox(
+                        &c,
+                        &slug_owned,
+                        &build_id_owned,
+                        &a.node.id,
+                    )?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "answered-node outbox row missing before canonical save for {}",
+                            a.node.id
+                        )
+                    })?;
+
+                    // Retry wrapper: SQLite BUSY / "database is locked" can
+                    // bubble up when a concurrent writer on another
+                    // Connection holds the writer lock longer than
+                    // busy_timeout (10s, set at db.rs:34,47). `BEGIN
+                    // IMMEDIATE` acquires the writer lock up front so
+                    // busy_timeout applies to the acquisition itself, and
+                    // the exponential-backoff retry absorbs the rare case
+                    // where the lock is still held when the timer expires.
+                    // See docs/plans/walker-v3-completion-decision-attachment.md
+                    // Wave 7 follow-up (test14 failure).
+                    for attempt in 0..=SAVE_MAX_RETRIES {
+                        let tx_result = (|| -> anyhow::Result<()> {
+                            c.execute_batch("BEGIN IMMEDIATE")?;
+                            let inner = (|| -> anyhow::Result<()> {
+                                db::save_node(&c, &durable.node, None)?;
+                                for child_id in &durable.node.children {
+                                    if child_id.contains('/') {
+                                        continue;
+                                    }
+                                    let _ = db::update_parent(
+                                        &c,
+                                        &slug_owned,
+                                        child_id,
+                                        &durable.node.id,
+                                    );
+                                }
+                                for link in &durable.evidence {
+                                    db::save_evidence_link(&c, link)?;
+                                }
+                                for missing_desc in &durable.missing {
+                                    let gap = super::types::GapReport {
+                                        question_id: durable.node.id.clone(),
+                                        description: missing_desc.clone(),
+                                        layer: durable.node.depth as i64,
+                                        resolved: false,
+                                        resolution_confidence: 0.0,
+                                    };
+                                    db::save_gap(
+                                        &c,
+                                        &slug_owned,
+                                        &gap,
+                                        Some(&bid_for_gaps),
+                                    )?;
+                                }
+                                db::mark_answered_node_outbox_drained(
+                                    &c,
+                                    &slug_owned,
+                                    &build_id_owned,
+                                    &durable.node.id,
+                                )?;
+                                Ok(())
+                            })();
+                            match inner {
+                                Ok(()) => {
+                                    if let Err(e) = c.execute_batch("COMMIT") {
+                                        let _ = c.execute_batch("ROLLBACK");
+                                        Err(e.into())
+                                    } else {
+                                        Ok(())
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = c.execute_batch("ROLLBACK");
+                                    Err(e)
+                                }
+                            }
+                        })();
+                        match tx_result {
+                            Ok(()) => break,
+                            Err(e)
+                                if is_sqlite_busy(&e) && attempt < SAVE_MAX_RETRIES =>
+                            {
+                                warn!(
+                                    slug = %slug_owned,
+                                    node_id = %a.node.id,
+                                    attempt,
+                                    backoff_ms = SAVE_BACKOFF_MS[attempt as usize],
+                                    "answered-node save hit database-locked, retrying"
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    SAVE_BACKOFF_MS[attempt as usize],
+                                ));
+                                continue;
+                            }
+                            Err(e) => {
+                                let _ = db::record_answered_node_outbox_error(
+                                    &c,
+                                    &slug_owned,
+                                    &build_id_owned,
+                                    &a.node.id,
+                                    &e.to_string(),
+                                );
+                                warn!(
+                                    slug = %slug_owned,
+                                    node_id = %a.node.id,
+                                    error = %e,
+                                    "failed to save answered node"
+                                );
+                                return Err(anyhow!(
+                                    "failed to save answered node {}: {}",
+                                    a.node.id,
+                                    e
+                                ));
+                            }
                         }
                     }
                 }
-                // Save failed questions as gaps (single transaction, low risk)
+                // Save failed questions as gaps (single transaction, low risk).
+                // Same retry wrapper as answered-node save — the writer-lock
+                // contention window is the same.
                 if !failed_owned.is_empty() {
-                    c.execute_batch("BEGIN")?;
-                    for fq in &failed_owned {
-                        let gap = super::types::GapReport {
-                            question_id: fq.question_id.clone(),
-                            description: format!(
-                                "Question failed: {}. Error: {}",
-                                fq.question_text, fq.error
-                            ),
-                            layer: fq.layer,
-                            resolved: false,
-                            resolution_confidence: 0.0,
-                        };
-                        db::save_gap(&c, &slug_owned, &gap, Some(&bid_for_gaps))?;
+                    for attempt in 0..=SAVE_MAX_RETRIES {
+                        let tx_result = (|| -> anyhow::Result<()> {
+                            c.execute_batch("BEGIN IMMEDIATE")?;
+                            let inner = (|| -> anyhow::Result<()> {
+                                for fq in &failed_owned {
+                                    let gap = super::types::GapReport {
+                                        question_id: fq.question_id.clone(),
+                                        description: format!(
+                                            "Question failed: {}. Error: {}",
+                                            fq.question_text, fq.error
+                                        ),
+                                        layer: fq.layer,
+                                        resolved: false,
+                                        resolution_confidence: 0.0,
+                                    };
+                                    db::save_gap(
+                                        &c,
+                                        &slug_owned,
+                                        &gap,
+                                        Some(&bid_for_gaps),
+                                    )?;
+                                }
+                                Ok(())
+                            })();
+                            match inner {
+                                Ok(()) => {
+                                    c.execute_batch("COMMIT")?;
+                                    Ok(())
+                                }
+                                Err(e) => {
+                                    let _ = c.execute_batch("ROLLBACK");
+                                    Err(e)
+                                }
+                            }
+                        })();
+                        match tx_result {
+                            Ok(()) => break,
+                            Err(e)
+                                if is_sqlite_busy(&e) && attempt < SAVE_MAX_RETRIES =>
+                            {
+                                warn!(
+                                    slug = %slug_owned,
+                                    attempt,
+                                    backoff_ms = SAVE_BACKOFF_MS[attempt as usize],
+                                    "failed-question gap save hit database-locked, retrying"
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    SAVE_BACKOFF_MS[attempt as usize],
+                                ));
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    slug = %slug_owned,
+                                    error = %e,
+                                    "failed to save failed-question gaps"
+                                );
+                                return Err(e);
+                            }
+                        }
                     }
-                    c.execute_batch("COMMIT")?;
                 }
                 Ok::<(), anyhow::Error>(())
             })
@@ -6099,6 +6398,30 @@ async fn execute_evidence_loop(
             total_nodes,
             "layer complete"
         );
+    }
+
+    if let Some(error_msg) = build_error.clone() {
+        if !external_build_tracking {
+            let conn = state.writer.clone();
+            let slug_owned = slug.to_string();
+            let bid = build_id.clone();
+            let lc = layers_completed;
+            let ml = max_layer;
+            let msg = error_msg.clone();
+            tokio::task::spawn_blocking(move || {
+                let c = conn.blocking_lock();
+                super::local_store::fail_build(
+                    &c,
+                    &slug_owned,
+                    &bid,
+                    &format!("Stopped at layer {}/{}: {}", lc, ml, msg),
+                )?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .map_err(|e| anyhow!("Build failure save panicked: {e}"))??;
+        }
+        return Err(anyhow!("evidence_loop failed: {}", error_msg));
     }
 
     // ── S2-4: Persist reconciliation summary as a contribution ─────────
@@ -7897,7 +8220,6 @@ async fn execute_for_each_concurrent(
                                                 node_id: node_id.clone(),
                                                 output: Err(anyhow!("forEach abort at index {index} sub-chunk {sub_idx}: {e}")),
                                                 sub_failures: sub_fail_count,
-                    
                                             })
                                             .await;
                                         return;
@@ -16765,5 +17087,54 @@ mod tests {
         assert_eq!(output["steps"].as_array().unwrap().len(), 2);
         assert_eq!(output["steps"][0]["name"], "step1");
         assert_eq!(output["steps"][0]["status"], "ran");
+    }
+
+    // ── SQLite writer-lock retry classifier ─────────────────────────────
+    //
+    // `is_sqlite_busy` drives the retry branch inside the answered-node /
+    // failed-question gap save block. A false negative (real BUSY not
+    // classified as busy) would abort the build; a false positive
+    // (non-BUSY error wrongly classified) would silently retry a hard
+    // error up to 4 times. Both matter, so we pin the classification on
+    // typed, stringified-typed, and unrelated errors.
+
+    #[test]
+    fn is_sqlite_busy_typed_database_busy() {
+        let ffi = rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY);
+        let rusqlite_err = rusqlite::Error::SqliteFailure(ffi, None);
+        let err: anyhow::Error = rusqlite_err.into();
+        assert!(is_sqlite_busy(&err), "typed SQLITE_BUSY must classify as busy");
+    }
+
+    #[test]
+    fn is_sqlite_busy_typed_database_locked() {
+        let ffi = rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED);
+        let rusqlite_err = rusqlite::Error::SqliteFailure(ffi, None);
+        let err: anyhow::Error = rusqlite_err.into();
+        assert!(is_sqlite_busy(&err), "typed SQLITE_LOCKED must classify as busy");
+    }
+
+    #[test]
+    fn is_sqlite_busy_wrapped_anyhow_text_fallback() {
+        // Simulate the real-world case where a rusqlite::Error has been
+        // stringified into an `anyhow!("failed to save answered node {}: {}",
+        // id, e)` wrapper. The cause chain no longer holds a typed
+        // rusqlite::Error, so we must fall back to textual matching.
+        let wrapped = anyhow!(
+            "failed to save answered node L1-000: database is locked"
+        );
+        assert!(
+            is_sqlite_busy(&wrapped),
+            "stringified 'database is locked' must classify as busy"
+        );
+    }
+
+    #[test]
+    fn is_sqlite_busy_unrelated_error_is_not_busy() {
+        let other = anyhow!("constraint violation: UNIQUE failed");
+        assert!(
+            !is_sqlite_busy(&other),
+            "unrelated errors must not classify as busy"
+        );
     }
 }
