@@ -97,9 +97,8 @@ pub fn record_demand_signal(
     // for `(slug, node_id)` rows where `check_interval IN ('never',
     // 'on_demand')`". That mapping is impossible with the current
     // schema: a deferred question's `question_id` column is a
-    // `q-{sha256}` hash (`make_question_id` in
-    // question_decomposition.rs) while the drill signal's `node_id`
-    // is the answered pyramid node's `L{layer}-{seq}` id. The two
+    // question handle like `Q-L1-000` while the drill signal's
+    // `node_id` is the answered pyramid node's `L{layer}-{seq}` id. The two
     // ID spaces never overlap and the prior `list_deferred_by_question_target`
     // join returned zero rows for every real drill event — the
     // reactivation hook was dead code.
@@ -110,7 +109,7 @@ pub fn record_demand_signal(
     // triage DSL then decides which ones to reactivate. This
     // matches the spec's intent ("demand drives re-check") while
     // staying sound in the only ID space we have at both sides of
-    // the join. When the pyramid grows a persistent q-hash → L-id
+    // the join. When the pyramid grows a persistent question → answer
     // map (Phase 13+), the tighter per-node reactivation can return.
     let pending = db::list_on_demand_deferred_for_slug(conn, slug).unwrap_or_default();
     if !pending.is_empty() {
@@ -157,11 +156,11 @@ pub fn record_demand_signal(
 /// DeferredQuestion row shape.
 ///
 /// Phase 12 wanderer note: retained as a stable helper for any
-/// future caller that has a real q-hash to match against. The
+/// future caller that has a real question handle to match against. The
 /// `record_demand_signal` reactivation hook no longer uses this
 /// helper — it switched to `db::list_on_demand_deferred_for_slug`
 /// (slug-scoped) because the drill event's `node_id` can never be
-/// a `q-{sha256}` hash.
+/// a question handle.
 pub fn list_on_demand_deferred_for_node(
     conn: &Connection,
     slug: &str,
@@ -372,7 +371,7 @@ mod tests {
     /// across the entire slug regardless of which node the signal
     /// landed on. This is the helper the triage DSL's
     /// `has_demand_signals` condition now uses, because the
-    /// previous per-node path couldn't join a q-hash question_id
+    /// previous per-node path couldn't join a question handle
     /// to an L{}-{} drill node_id.
     #[test]
     fn test_sum_slug_demand_weight_aggregates_across_nodes() {
@@ -386,13 +385,13 @@ mod tests {
         record_demand_signal(&conn, "s", "L1-002", "agent_query", Some("user"), &policy).unwrap();
         record_demand_signal(&conn, "s", "L2-003", "agent_query", Some("user"), &policy).unwrap();
 
-        // Per-node lookup against a q-hash question id returns
+        // Per-node lookup against a question handle returns
         // zero (the old broken path).
         let per_node_miss =
-            db::sum_demand_weight(&conn, "s", "q-abc123456789", "agent_query", "-1 day").unwrap();
+            db::sum_demand_weight(&conn, "s", "Q-L1-000", "agent_query", "-1 day").unwrap();
         assert!(
             per_node_miss < 1e-9,
-            "per-node lookup on q-hash can never match"
+            "per-node lookup on question handle can never match answer-node demand rows"
         );
 
         // Slug-level aggregation picks up all three signals.

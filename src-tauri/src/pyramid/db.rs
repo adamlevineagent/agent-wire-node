@@ -16506,13 +16506,13 @@ pub fn sum_demand_weight(
 /// the helper the triage DSL's `has_demand_signals` condition uses —
 /// the per-node variant (`sum_demand_weight`) can't be used for
 /// deferred evidence questions because a `LayerQuestion.question_id`
-/// is a `q-{sha256}` hash, not the L{layer}-{seq} id that demand
-/// signals are recorded under. The two ID spaces never meet.
+/// is a question handle like `Q-L1-000`, not the L{layer}-{seq} id
+/// that demand signals are recorded under. The two ID spaces never meet.
 ///
 /// Aggregating per-slug matches the spec's intent ("drive re-check
 /// by demand") while staying correct in the only ID space we
 /// actually have at both sides of the join. When the pyramid grows
-/// a persistent q-hash → node-id map (Phase 13+), the per-node
+/// a persistent question-handle → answer-node map (Phase 13+), the per-node
 /// variant can be brought back for spatial precision.
 ///
 /// Returns 0.0 if no signals match (not an error).
@@ -16555,7 +16555,7 @@ pub fn list_slugs_with_deferred_questions(conn: &Connection) -> Result<Vec<Strin
 /// `check_interval IN ('never', 'on_demand')`. Used by the
 /// `record_demand_signal` on-demand reactivation hook. The previous
 /// `list_deferred_by_question_target` helper tried to join by
-/// question_id = node_id which never matches (q-hash vs L{}-{}),
+/// question_id = node_id which never matches (Q-L{}-{} vs L{}-{}),
 /// so the reactivation hook was a no-op. This helper drops the
 /// node_id filter and returns all slug-level `on_demand`/`never`
 /// rows — the demand signal handler then re-triages each with

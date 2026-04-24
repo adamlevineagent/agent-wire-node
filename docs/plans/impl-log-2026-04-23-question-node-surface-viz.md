@@ -18,6 +18,7 @@ without hardcoding `decompose` in React. YAML declares structural visualization;
 ## Progress
 
 - Created this implementation log.
+- 2026-04-24 tester regression fix: replaced opaque `q-{hash}` question IDs with user-facing layer handles (`Q-L{layer}-{index}`) in question decomposition. The allocator still de-dupes repeated semantic questions before issuing a new handle, preserving the DAG property that one child can attach to multiple parents.
 - Updated `chains/defaults/question.yaml`: `decompose` and `decompose_delta` now declare `viz.type: node_fill` with `source: question_nodes` and `node_kind: question` instead of `progress_only`.
 - Began backend read-model patch:
   - Extended `TreeNode` with optional `node_kind`, question metadata, answer linkage fields, and answered state.

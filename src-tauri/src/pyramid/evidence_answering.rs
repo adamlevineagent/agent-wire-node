@@ -2217,11 +2217,10 @@ pub fn run_triage_gate(
     // ONCE per triage pass, at slug granularity, not per-question.
     //
     // The per-node `sum_demand_weight(slug, node_id, ...)` can't be
-    // used here because `LayerQuestion.question_id` is a `q-{sha256}`
-    // hash (`make_question_id` in question_decomposition.rs), while
-    // demand signals land on `pyramid_demand_signals.node_id` under
-    // the pyramid node's `L{layer}-{seq}` id that `answer_single_question`
-    // assigns at answering time. The two ID spaces never meet, so
+    // used here because `LayerQuestion.question_id` is a question handle
+    // like `Q-L1-000`, while demand signals land on
+    // `pyramid_demand_signals.node_id` under the answered pyramid node's
+    // `L{layer}-{seq}` id. The two ID spaces never meet, so
     // the previous per-question lookup always returned 0.0 and
     // `has_demand_signals` was effectively dead.
     //
@@ -2229,7 +2228,7 @@ pub fn run_triage_gate(
     // by demand") while staying correct in the only ID space the
     // demand signals actually live in. The spatial precision the
     // spec implies will come back in Phase 13+ when a persistent
-    // q-hash → node-id map is added.
+    // question-handle → answer-node map is added.
     let slug_has_demand_signals = policy.demand_signals.iter().any(|rule| {
         let window = normalize_window(&rule.window);
         let sum = db::sum_slug_demand_weight(&conn, slug, &rule.r#type, &window).unwrap_or(0.0);

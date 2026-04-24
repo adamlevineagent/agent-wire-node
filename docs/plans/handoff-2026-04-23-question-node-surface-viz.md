@@ -23,6 +23,7 @@ Current state:
 - Empty parsed frontier responses retry instead of silently marking a whole frontier as leaves.
 - Dead recursive incremental resume helpers were removed.
 - Question DAG tests now include resume-frontier reconstruction and multi-parent child preservation.
+- 2026-04-24 tester regression fix: question DAG identities are now layer handle IDs (`Q-L3-000`, `Q-L2-000`, `Q-L1-000`) instead of opaque `q-{hash}` values. Semantic de-dupe still happens inside the allocator, so shared child questions keep one handle with multiple parents.
 
 Residuals:
 
@@ -36,7 +37,7 @@ Validation from the latest pass:
 - `cargo fmt --check`
 - `git diff --check`
 - `cargo check --bin wire-node-desktop`
-- `cargo test --lib pyramid::question_decomposition::tests -- --nocapture` passed 31/31
+- `cargo test --lib pyramid::question_decomposition::tests -- --nocapture` passed 32/32 after adding a handle-ID regression test
 - Reported DB fallout tests passed:
   - `pyramid::chain_dispatch::tests::test_w1b_build_step_dispatch_decision_empty_db_returns_some_default`
   - `pyramid::manifest::tests::test_hydrate_returns_node_content`
@@ -215,7 +216,7 @@ Do not violate this by making React say “if step name equals decompose, render
 
 - `src-tauri/src/pyramid/question_decomposition.rs`
   - `QuestionNode` has `id`, `question`, `about`, `creates`, `prompt_hint`, `children`, `is_leaf`.
-  - `assign_question_ids` creates deterministic ids like `q-{hash}`.
+  - `assign_question_ids` creates layer handle ids like `Q-L2-000`.
   - Display depth assignment: leaves are depth 1, root/apex is max depth + 1. Layer 0 is reserved for source/extraction nodes.
   - Important current gap: `build_subtree_incremental` is named incremental, but fresh decomposition currently builds an in-memory tree first, assigns ids at the end, then `save_tree_nodes_to_db` persists all nodes in a batch. That means the graph cannot show each question layer as soon as each subcall completes until this is changed or events are emitted before persistence.
 
@@ -227,10 +228,10 @@ Do not violate this by making React say “if step name equals decompose, render
 ### Backend Answer Nodes
 
 - `src-tauri/src/pyramid/evidence_answering.rs`
-  - `LayerQuestion.question_id` is a q-hash question identity.
+  - `LayerQuestion.question_id` is a question handle identity such as `Q-L1-000`.
   - Answer nodes currently get ids like `L{layer}-{seq}`.
   - Answer node `self_prompt` is set to `question.question_text`.
-  - Evidence rows target the answer node id, not the q-hash question id.
+  - Evidence rows target the answer node id, not the question handle id.
   - This means question identity and answer identity are currently separate. The UI can correlate by question text/self_prompt as a bridge, but the durable structural fix is to explicitly persist the question id on the answer or make the answer materialize onto the question id.
 
 - `src-tauri/src/pyramid/types.rs`
@@ -455,7 +456,7 @@ Given existing comments about short `L1-003` ids being easier for LLMs to reprod
 - Fresh decomposition does not currently persist question nodes until after the full in-memory tree is built and ids assigned. That means live per-layer question appearance requires either:
   - emitting provisional question-node events before final persistence, or
   - assigning deterministic ids earlier and persisting each subtree as it completes.
-- If React renders q-hash nodes but the inspector only receives answer nodes, clicking will break or show “Node not found.”
+- If React renders question nodes but the inspector only receives answer nodes, clicking will break or show “Node not found.”
 - Matching answers to questions by `self_prompt == question` is useful for a first pass but can collide if duplicate/near-duplicate questions exist.
 - Do not add a new user-facing table for this. `pyramid_question_nodes` already exists.
 - Do not make “question nodes” a frontend-only visual illusion. They are persistent data and should be inspectable.
