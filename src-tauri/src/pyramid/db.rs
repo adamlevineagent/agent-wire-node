@@ -31648,6 +31648,18 @@ mod phase7b_post_build_tests {
                 "exactly one '{event_type}' event must have landed"
             );
         }
+        let skipped_count: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE slug = 'p7bcj' AND event_type = 'meta_layer_oracle_skipped'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            skipped_count, 0,
+            "successful purpose_shifted crystallization must not also emit a skip"
+        );
 
         // CAS the oracle work item to applied to mirror the supervisor arm.
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();

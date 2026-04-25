@@ -3103,30 +3103,30 @@ async fn dispatch_mechanical(
             //   visible mark.
             //
             // Behavior:
-            //   - If the threaded input carries should_crystallize=true
-            //     AND a meta_layer_node_id (i.e. create_meta_layer_node
-            //     already ran and emitted meta_layer_crystallized), we
-            //     don't double-emit; just pass through.
+            //   - If the threaded input carries successful child-writer
+            //     output (created=true and/or meta_layer_node_id), then
+            //     create_meta_layer_node already ran and emitted
+            //     meta_layer_crystallized. We don't double-emit; just pass
+            //     through. This must not depend on should_crystallize
+            //     surviving output threading: call_starter_chain returns
+            //     the child chain's final output, not the parent oracle
+            //     envelope.
             //   - Otherwise, emit a `meta_layer_oracle_skipped` event
             //     carrying {reasoning, trigger_event_type, target_node_id,
             //     source_event_id, purpose_id} so a chronicle reader can
             //     reconstruct WHY the oracle declined.
-            let should_crystallize = input
-                .get("should_crystallize")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
             let created = input
                 .get("created")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
                 || input.get("meta_layer_node_id").is_some();
 
-            if should_crystallize && created {
+            if created {
                 // Happy path already emitted meta_layer_crystallized via
                 // create_meta_layer_node. Nothing to add; threading forwards
                 // the writer's output verbatim.
                 info!(
-                    "[mechanical] oracle_finalize slug={} crystallize=true created=true (no-op pass-through)",
+                    "[mechanical] oracle_finalize slug={} created=true (no-op pass-through)",
                     ctx.slug,
                 );
                 return Ok(input.clone());
