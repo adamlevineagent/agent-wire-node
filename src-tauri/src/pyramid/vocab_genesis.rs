@@ -160,14 +160,14 @@ pub const GENESIS_ANNOTATION_TYPES: &[(
         true,
         None,
     ),
-    // v5 Phase 7 reactives — steel_man + red_team are the Phase 7a starter
-    // debate annotations. Phase 7c adds the 4 missing v5 verbs (`gap`,
-    // `hypothesis`, `purpose_declaration`, `purpose_shift`) as pure vocab
-    // entries — no Rust enum change required post-6c-B. hypothesis shares
-    // the debate substrate and materializes as a position-like claim.
-    // 6c-B flipped the consumers to vocab lookups, so these four are picked
-    // up on the very next `init_pyramid_db` tick (and any running slug
-    // after `invalidate_cache()`).
+    // v5 Phase 7 reactives — steel_man, hypothesis, and red_team share the
+    // starter debate substrate. The remaining reactive v5 verbs (`gap`,
+    // `purpose_declaration`, `purpose_shift`) are pure vocab entries — no
+    // Rust enum change required post-6c-B. hypothesis materializes as a
+    // position-like claim; gap/purpose verbs route to their own starter
+    // handlers. 6c-B flipped the consumers to vocab lookups, so these are
+    // picked up on the very next `init_pyramid_db` tick (and any running
+    // slug after `invalidate_cache()`).
     (
         "steel_man",
         "Good-faith reconstruction of an opposing position. Triggers debate_steward.",

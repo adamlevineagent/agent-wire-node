@@ -331,7 +331,7 @@ Cross-process cache coherence (Phase 9c-3-1) kicks in on the NEXT read after a p
 
 ### Debate resurrects after collapse
 
-If a steel_man / hypothesis / red_team arrives immediately after `debate_collapse`, the append is REFUSED within `collapse_cooldown_secs` (default 10 min). The refusal raises loud in `append_annotation_to_debate_node`; the HTTP response is a 500 with the cooldown age in the body. Workaround: wait the cooldown, or POST `/pyramid/:slug/debates/:id/reopen` first — reopen emits `debate_reopened` which bypasses the cooldown for the next append (Phase 9c-3-3).
+If a steel_man / hypothesis / red_team arrives immediately after `debate_collapse`, the append is REFUSED within `collapse_cooldown_secs` (default 10 min). The refusal raises loud in `append_annotation_to_debate_node` with the concrete `annotation_type`; compiler-side cooldown skips also write `annotation_type` into `debate_steward_skipped` metadata. Workaround: wait the cooldown, or POST `/pyramid/:slug/debates/:id/reopen` first — reopen emits `debate_reopened` which bypasses the cooldown for the next append (Phase 9c-3-3).
 
 ### Scheduler ticks not firing
 

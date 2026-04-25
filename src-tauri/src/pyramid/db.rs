@@ -30015,6 +30015,103 @@ mod phase7a_post_build_tests {
         assert_eq!(metadata["annotation_id"], serde_json::json!(ann.id));
     }
 
+    #[tokio::test]
+    async fn hypothesis_annotation_on_existing_debate_appends_position() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7a1h2", &ContentType::Code, "/tmp/p7a1h2").unwrap();
+        let existing = DebateTopic {
+            concern: "Pre-existing concern".to_string(),
+            positions: vec![DebatePosition {
+                label: "main".to_string(),
+                steel_manning: "Initial position".to_string(),
+                red_teams: vec![],
+                evidence_anchors: vec![],
+                source_annotation_ids: vec![],
+            }],
+            cross_refs: vec![],
+            vote_lean: None,
+        };
+        seed_existing_debate_node(&conn, "p7a1h2", "node-hypothesis-2", &existing);
+        let ann = save_ann(
+            &conn,
+            "p7a1h2",
+            "node-hypothesis-2",
+            "hypothesis",
+            "Hypothesis: the market route skipped because fallback config was empty.",
+            "newman",
+        );
+        emit_annotation_reacted(&conn, "p7a1h2", &ann, "starter-debate-steward");
+
+        let result =
+            dadbear_compiler::run_compilation_for_slug(&conn, "p7a1h2", None, None).unwrap();
+        assert!(
+            result.items_compiled >= 1,
+            "hypothesis on existing debate must compile a steward work item"
+        );
+        let (wi_id, layer): (String, i64) = conn
+            .query_row(
+                "SELECT id, layer FROM dadbear_work_items
+                  WHERE slug = 'p7a1h2' AND step_name = 'cascade_reacted'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        let state_pyr = test_pyramid_state(conn);
+        let chain = chain_loader::load_chain_by_id(
+            "starter-debate-steward",
+            &state_pyr.chains_dir,
+        )
+        .expect("starter-debate-steward must load");
+        chain_executor::execute_chain_for_target(
+            &state_pyr,
+            &chain,
+            "p7a1h2",
+            Some("node-hypothesis-2"),
+            serde_json::json!({
+                "work_item_id": wi_id,
+                "step_name": "cascade_reacted",
+                "target_id": "node-hypothesis-2",
+                "layer": layer,
+            }),
+        )
+        .await
+        .expect("debate_steward chain must append hypothesis to existing debate");
+
+        let writer = state_pyr.writer.lock().await;
+        let view = get_node_shape(&writer, "p7a1h2", "node-hypothesis-2")
+            .unwrap()
+            .unwrap();
+        match view.payload {
+            Some(ShapePayload::Debate(d)) => {
+                assert_eq!(d.positions.len(), 2, "hypothesis appends a second position");
+                let appended = d
+                    .positions
+                    .iter()
+                    .find(|p| p.label == format!("annotation#{}", ann.id))
+                    .expect("appended hypothesis position must use annotation label");
+                assert!(
+                    appended
+                        .steel_manning
+                        .contains("fallback config was empty")
+                );
+                assert!(
+                    appended
+                        .source_annotation_ids
+                        .iter()
+                        .any(|a| a == &format!("annotation#{}", ann.id)),
+                    "existing-debate hypothesis append must retain source annotation provenance"
+                );
+                assert!(
+                    appended.red_teams.is_empty(),
+                    "hypothesis append creates a position, not a red_team"
+                );
+            }
+            other => panic!("expected Debate payload, got {other:?}"),
+        }
+    }
+
     // ── Test 3: RedTeam on existing Debate appends red_team ────────────
 
     #[tokio::test]
@@ -37995,6 +38092,121 @@ mod phase9c2_post_build_tests {
         assert!(
             skip["cooldown_until"].as_str().is_some(),
             "skip metadata must carry cooldown_until"
+        );
+    }
+
+    #[test]
+    fn compiler_skips_hypothesis_arrival_during_collapse_cooldown() {
+        use crate::pyramid::observation_events;
+        let _lock = test_lock();
+        let conn = fresh_conn();
+        create_slug(&conn, "p9c23hyp", &ContentType::Code, "/tmp/p9c23hyp").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L2-HYP', 'p9c23hyp', 2, 'hl', 'd', '', 1)",
+            [],
+        )
+        .unwrap();
+
+        let collapse_id = observation_events::emit_debate_collapsed(
+            &conn,
+            "p9c23hyp",
+            "L2-HYP",
+            Some(2),
+            "consensus reached",
+            1,
+            "operator",
+        )
+        .unwrap();
+        crate::pyramid::dadbear_compiler::run_compilation_for_slug(
+            &conn,
+            "p9c23hyp",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let ann = PyramidAnnotation {
+            id: 0,
+            slug: "p9c23hyp".to_string(),
+            node_id: "L2-HYP".to_string(),
+            annotation_type: AnnotationType::new("hypothesis"),
+            content: "Hypothesis during collapse cooldown.".to_string(),
+            question_context: None,
+            author: "newman".to_string(),
+            created_at: String::new(),
+        };
+        let saved = save_annotation(&conn, &ann).unwrap();
+        let metadata = serde_json::json!({
+            "annotation_id": saved.id,
+            "annotation_type": "hypothesis",
+            "target_node_id": "L2-HYP",
+            "handler_chain_id": "starter-debate-steward",
+            "author": "newman",
+        })
+        .to_string();
+        observation_events::write_observation_event(
+            &conn,
+            "p9c23hyp",
+            "annotation",
+            "annotation_reacted",
+            None,
+            None,
+            None,
+            None,
+            Some("L2-HYP"),
+            Some(2),
+            Some(&metadata),
+        )
+        .unwrap();
+
+        let result = crate::pyramid::dadbear_compiler::run_compilation_for_slug(
+            &conn,
+            "p9c23hyp",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            result.items_compiled, 0,
+            "hypothesis must be refused during collapse cooldown"
+        );
+        let steward_items: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_work_items
+                  WHERE slug = 'p9c23hyp'
+                    AND step_name = 'cascade_reacted'
+                    AND resolved_chain_id = 'starter-debate-steward'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            steward_items, 0,
+            "cooldown skip must not compile a hypothesis debate steward work item"
+        );
+
+        let skip_meta: String = conn
+            .query_row(
+                "SELECT metadata_json FROM dadbear_observation_events
+                  WHERE slug = 'p9c23hyp'
+                    AND event_type = 'debate_steward_skipped'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("hypothesis cooldown skip event must be logged");
+        let skip: serde_json::Value = serde_json::from_str(&skip_meta).unwrap();
+        assert_eq!(
+            skip["reason"],
+            serde_json::json!("collapse_cooldown_active")
+        );
+        assert_eq!(skip["collapse_event_id"], serde_json::json!(collapse_id));
+        assert_eq!(skip["annotation_id"], serde_json::json!(saved.id));
+        assert_eq!(skip["annotation_type"], serde_json::json!("hypothesis"));
+        assert!(
+            skip["cooldown_until"].as_str().is_some(),
+            "hypothesis skip metadata must carry cooldown_until"
         );
     }
 
