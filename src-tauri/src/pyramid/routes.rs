@@ -3855,6 +3855,7 @@ async fn handle_get_debate_state(
     let cooldown_until: Option<String> = if is_collapsed {
         let cooldown_secs = super::pyramid_scheduler::load_config(&conn).collapse_cooldown_secs;
         if cooldown_secs > 0 {
+            let cooldown_secs_i64 = i64::try_from(cooldown_secs).unwrap_or(i64::MAX);
             if let Some((_, detected_at)) = &latest_collapse {
                 // Compute detected_at + cooldown_secs vs now; return Some
                 // only if still in cooldown. SQLite strftime handles the
@@ -3862,11 +3863,12 @@ async fn handle_get_debate_state(
                 let end_time: Option<String> = conn
                     .query_row(
                         "SELECT CASE
-                            WHEN strftime('%s','now') < strftime('%s', ?1) + ?2
+                            WHEN CAST(strftime('%s','now') AS INTEGER)
+                               < CAST(strftime('%s', ?1) AS INTEGER) + ?2
                             THEN datetime(?1, '+' || ?2 || ' seconds')
                             ELSE NULL
                          END",
-                        rusqlite::params![detected_at, cooldown_secs],
+                        rusqlite::params![detected_at, cooldown_secs_i64],
                         |r| r.get::<_, Option<String>>(0),
                     )
                     .ok()

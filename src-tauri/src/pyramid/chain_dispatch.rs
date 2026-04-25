@@ -4191,6 +4191,20 @@ async fn dispatch_mechanical(
                         |r| r.get(0),
                     )
                     .ok();
+                let cooldown_secs =
+                    super::pyramid_scheduler::load_config(&conn_guard).collapse_cooldown_secs;
+                let cooldown_secs_i64 = i64::try_from(cooldown_secs).unwrap_or(i64::MAX);
+                let cooldown_until: Option<String> = if cooldown_secs > 0 {
+                    conn_guard
+                        .query_row(
+                            "SELECT datetime('now', '+' || ?1 || ' seconds')",
+                            rusqlite::params![cooldown_secs_i64],
+                            |r| r.get(0),
+                        )
+                        .ok()
+                } else {
+                    None
+                };
 
                 // Atomic: UPDATE + event emit inside a savepoint. rusqlite
                 // has no Savepoint::new_named on &Connection without &mut,
@@ -4212,6 +4226,8 @@ async fn dispatch_mechanical(
                         "final_concern": concern,
                         "final_position_labels": position_labels,
                         "final_vote_lean": vote_lean_json,
+                        "cooldown_secs": cooldown_secs,
+                        "cooldown_until": cooldown_until,
                         // v5 Phase 9c-1 verifier: full payload for audit
                         // reconstruction (steel_manning/red_teams/evidence_anchors/
                         // source_annotation_ids all preserved here since the

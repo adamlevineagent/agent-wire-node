@@ -23685,6 +23685,7 @@ mod phase3_post_build_tests {
         let chain_emitted: &[(&str, &str, &str)] = &[
             ("cascade_handler_invoked", "log_only", "cascade_invoked_log"),
             ("debate_steward_invoked", "log_only", "debate_steward_invoked_log"),
+            ("debate_steward_skipped", "log_only", "debate_steward_skipped_log"),
             ("meta_layer_oracle_invoked", "log_only", "oracle_invoked_log"),
             ("meta_layer_oracle_skipped", "log_only", "oracle_skipped_log"),
             ("synthesizer_invoked", "log_only", "synthesizer_invoked_log"),
@@ -29731,6 +29732,129 @@ mod phase7a_post_build_tests {
                         .iter()
                         .all(|a| !a.starts_with("annotation#")),
                     "evidence_anchors must hold node-id refs only, not annotation tags"
+                );
+            }
+            other => panic!("expected Debate payload, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_reactive_annotations_compile_and_execute_per_arrival() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7a2b", &ContentType::Code, "/tmp/p7a2b").unwrap();
+        let existing = DebateTopic {
+            concern: "Pre-existing concern".to_string(),
+            positions: vec![DebatePosition {
+                label: "main".to_string(),
+                steel_manning: "Initial position".to_string(),
+                red_teams: vec![],
+                evidence_anchors: vec![],
+                source_annotation_ids: vec![],
+            }],
+            cross_refs: vec![],
+            vote_lean: None,
+        };
+        seed_existing_debate_node(&conn, "p7a2b", "node-debate-2b", &existing);
+
+        let ann1 = save_ann(
+            &conn,
+            "p7a2b",
+            "node-debate-2b",
+            "red_team",
+            "First counter-argument.",
+            "bob",
+        );
+        let ann2 = save_ann(
+            &conn,
+            "p7a2b",
+            "node-debate-2b",
+            "red_team",
+            "Second counter-argument.",
+            "carol",
+        );
+        emit_annotation_reacted(&conn, "p7a2b", &ann1, "starter-debate-steward");
+        emit_annotation_reacted(&conn, "p7a2b", &ann2, "starter-debate-steward");
+
+        let result =
+            dadbear_compiler::run_compilation_for_slug(&conn, "p7a2b", None, None).unwrap();
+        assert_eq!(
+            result.items_compiled, 2,
+            "each annotation_reacted arrival must compile its own work item"
+        );
+        let wi_rows: Vec<(String, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, layer
+                       FROM dadbear_work_items
+                      WHERE slug = 'p7a2b'
+                        AND step_name = 'cascade_reacted'
+                        AND target_id = 'node-debate-2b'
+                      ORDER BY id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            wi_rows.len(),
+            2,
+            "distinct annotation arrivals must survive target dedup"
+        );
+        assert_ne!(
+            wi_rows[0].0, wi_rows[1].0,
+            "event-scoped work item IDs must differ by source event"
+        );
+
+        let state_pyr = test_pyramid_state(conn);
+        let chain = chain_loader::load_chain_by_id(
+            "starter-debate-steward",
+            &state_pyr.chains_dir,
+        )
+        .unwrap();
+        for (wi_id, layer) in wi_rows {
+            chain_executor::execute_chain_for_target(
+                &state_pyr,
+                &chain,
+                "p7a2b",
+                Some("node-debate-2b"),
+                serde_json::json!({
+                    "work_item_id": wi_id,
+                    "step_name": "cascade_reacted",
+                    "target_id": "node-debate-2b",
+                    "layer": layer,
+                }),
+            )
+            .await
+            .expect("debate_steward chain must execute for each arrival");
+        }
+
+        let writer = state_pyr.writer.lock().await;
+        let view =
+            get_node_shape(&writer, "p7a2b", "node-debate-2b").unwrap().unwrap();
+        assert_eq!(view.shape.as_str(), "debate");
+        match view.payload {
+            Some(ShapePayload::Debate(d)) => {
+                assert_eq!(d.positions.len(), 1);
+                assert_eq!(
+                    d.positions[0].red_teams.len(),
+                    2,
+                    "both red_team arrivals must be appended"
+                );
+                let arguments: Vec<&str> = d.positions[0]
+                    .red_teams
+                    .iter()
+                    .map(|entry| entry.argument.as_str())
+                    .collect();
+                assert!(
+                    arguments.contains(&"First counter-argument."),
+                    "first arrival missing from debate payload"
+                );
+                assert!(
+                    arguments.contains(&"Second counter-argument."),
+                    "second arrival missing from debate payload"
                 );
             }
             other => panic!("expected Debate payload, got {other:?}"),
@@ -36814,6 +36938,10 @@ mod phase9c1_post_build_tests {
         );
         assert_eq!(m["collapsed_by"], serde_json::json!("user"));
         assert_eq!(m["positions_remaining"], serde_json::json!(2));
+        assert!(
+            m["cooldown_until"].as_str().is_some(),
+            "debate_collapsed metadata must set cooldown_until for post-collapse guards"
+        );
         let labels = m["final_position_labels"].as_array().unwrap();
         assert_eq!(labels.len(), 2);
 
@@ -37027,8 +37155,9 @@ mod phase9c2_post_build_tests {
     use super::*;
     use super::post_build_test_support::test_lock;
     use crate::pyramid::types::{
-        parse_shape_payload, shape_handler_registry, ContentType, DebatePosition, DebateTopic,
-        GapTopic, MetaLayerTopic, MetaLayerTopicEntry, NodeShape, ShapePayload,
+        parse_shape_payload, shape_handler_registry, AnnotationType, ContentType, DebatePosition,
+        DebateTopic, GapTopic, MetaLayerTopic, MetaLayerTopicEntry, NodeShape, PyramidAnnotation,
+        ShapePayload,
         NODE_SHAPE_DEBATE, NODE_SHAPE_GAP, NODE_SHAPE_META_LAYER,
     };
     use crate::pyramid::vocab_entries::{
@@ -37366,6 +37495,121 @@ mod phase9c2_post_build_tests {
             "immediate collapse-then-check should be inside the cooldown window: \
              age={age_secs}s, cooldown={}s",
             cfg.collapse_cooldown_secs
+        );
+    }
+
+    #[test]
+    fn compiler_skips_debate_steward_arrival_during_collapse_cooldown() {
+        use crate::pyramid::observation_events;
+        let _lock = test_lock();
+        let conn = fresh_conn();
+        create_slug(&conn, "p9c23compile", &ContentType::Code, "/tmp/p9c23compile").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L2-COLD', 'p9c23compile', 2, 'hl', 'd', '', 1)",
+            [],
+        )
+        .unwrap();
+
+        let collapse_id = observation_events::emit_debate_collapsed(
+            &conn,
+            "p9c23compile",
+            "L2-COLD",
+            Some(2),
+            "consensus reached",
+            1,
+            "operator",
+        )
+        .unwrap();
+        crate::pyramid::dadbear_compiler::run_compilation_for_slug(
+            &conn,
+            "p9c23compile",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let ann = PyramidAnnotation {
+            id: 0,
+            slug: "p9c23compile".to_string(),
+            node_id: "L2-COLD".to_string(),
+            annotation_type: AnnotationType::new("red_team"),
+            content: "Late counter-argument during cooldown.".to_string(),
+            question_context: None,
+            author: "bob".to_string(),
+            created_at: String::new(),
+        };
+        let saved = save_annotation(&conn, &ann).unwrap();
+        let metadata = serde_json::json!({
+            "annotation_id": saved.id,
+            "annotation_type": "red_team",
+            "target_node_id": "L2-COLD",
+            "handler_chain_id": "starter-debate-steward",
+            "author": "bob",
+        })
+        .to_string();
+        observation_events::write_observation_event(
+            &conn,
+            "p9c23compile",
+            "annotation",
+            "annotation_reacted",
+            None,
+            None,
+            None,
+            None,
+            Some("L2-COLD"),
+            Some(2),
+            Some(&metadata),
+        )
+        .unwrap();
+
+        let result = crate::pyramid::dadbear_compiler::run_compilation_for_slug(
+            &conn,
+            "p9c23compile",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            result.items_compiled, 0,
+            "debate steward annotation_reacted must be skipped during collapse cooldown"
+        );
+        let steward_items: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_work_items
+                  WHERE slug = 'p9c23compile'
+                    AND step_name = 'cascade_reacted'
+                    AND resolved_chain_id = 'starter-debate-steward'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            steward_items, 0,
+            "cooldown skip must not compile a debate steward work item"
+        );
+
+        let skip_meta: String = conn
+            .query_row(
+                "SELECT metadata_json FROM dadbear_observation_events
+                  WHERE slug = 'p9c23compile'
+                    AND event_type = 'debate_steward_skipped'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("cooldown skip event must be logged");
+        let skip: serde_json::Value = serde_json::from_str(&skip_meta).unwrap();
+        assert_eq!(
+            skip["reason"],
+            serde_json::json!("collapse_cooldown_active")
+        );
+        assert_eq!(skip["collapse_event_id"], serde_json::json!(collapse_id));
+        assert_eq!(skip["annotation_id"], serde_json::json!(saved.id));
+        assert_eq!(skip["annotation_type"], serde_json::json!("red_team"));
+        assert!(
+            skip["cooldown_until"].as_str().is_some(),
+            "skip metadata must carry cooldown_until"
         );
     }
 
