@@ -1143,7 +1143,7 @@ pub async fn dispatch_connection_check(
         let stale_resolved = base_config
             .provider_registry
             .as_ref()
-            .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+            .and_then(|reg| reg.resolve_tier(UPPER_STALE_TIER, None, None, None).ok());
         let ctx = match &stale_resolved {
             Some(resolved) => {
                 make_step_ctx_from_llm_config(
@@ -1153,7 +1153,7 @@ pub async fn dispatch_connection_check(
                     old_depth as i64,
                     None,
                     system_prompt,
-                    "stale_l0",
+                    UPPER_STALE_TIER,
                     Some(model),
                     Some(&resolved.provider.id),
                 )
@@ -1500,7 +1500,7 @@ pub async fn dispatch_edge_stale_check(
         let stale_resolved = base_config
             .provider_registry
             .as_ref()
-            .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+            .and_then(|reg| reg.resolve_tier(UPPER_STALE_TIER, None, None, None).ok());
         let ctx = match &stale_resolved {
             Some(resolved) => {
                 make_step_ctx_from_llm_config(
@@ -1510,7 +1510,7 @@ pub async fn dispatch_edge_stale_check(
                     mutation.layer as i64,
                     None,
                     system_prompt,
-                    "stale_l0",
+                    UPPER_STALE_TIER,
                     Some(model),
                     Some(&resolved.provider.id),
                 )
@@ -1585,7 +1585,7 @@ pub async fn dispatch_edge_stale_check(
             let re_eval_resolved = base_config
                 .provider_registry
                 .as_ref()
-                .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+                .and_then(|reg| reg.resolve_tier(UPPER_STALE_TIER, None, None, None).ok());
             let re_eval_ctx = match &re_eval_resolved {
                 Some(resolved) => {
                     make_step_ctx_from_llm_config(
@@ -1595,7 +1595,7 @@ pub async fn dispatch_edge_stale_check(
                         mutation.layer as i64,
                         None,
                         system_prompt,
-                        "stale_l0",
+                        UPPER_STALE_TIER,
                         Some(model),
                         Some(&resolved.provider.id),
                     )
@@ -4213,7 +4213,7 @@ async fn execute_supersession_identity_change(
     let supersession_resolved = base_config
         .provider_registry
         .as_ref()
-        .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+        .and_then(|reg| reg.resolve_tier(UPPER_STALE_TIER, None, None, None).ok());
     let supersession_ctx = match &supersession_resolved {
         Some(resolved) => {
             make_step_ctx_from_llm_config(
@@ -4223,7 +4223,7 @@ async fn execute_supersession_identity_change(
                 node_data.depth,
                 None,
                 system_prompt,
-                "stale_l0",
+                UPPER_STALE_TIER,
                 Some(model),
                 Some(&resolved.provider.id),
             )
@@ -4554,7 +4554,7 @@ mod tests {
         lookup_source_file_path_for_node, parse_skip_adjudication_results,
         resolve_live_canonical_node_id, stale_code_from_skip_adjudication, SkipAdjudicationResult,
         rewrite_file_hash_node_reference, rewrite_identity_change_evidence_links,
-        validate_change_manifest,
+        validate_change_manifest, UPPER_STALE_TIER,
     };
     use crate::pyramid::db::{
         get_change_manifests_for_node, get_latest_manifest_for_node, open_pyramid_db,
@@ -4578,6 +4578,39 @@ mod tests {
         )
         .expect("insert slug");
         (file, conn)
+    }
+
+    #[test]
+    fn upper_helper_source_has_no_local_stale_tier_literal() {
+        let forbidden = ["stale", "_", "l0"].concat();
+
+        assert!(
+            !include_str!("stale_helpers_upper.rs").contains(&forbidden),
+            "upper-helper stale checks must resolve through UPPER_STALE_TIER"
+        );
+    }
+
+    #[test]
+    fn upper_stale_tier_resolves_from_seeded_registry() {
+        use crate::pyramid::credentials::CredentialStore;
+        use crate::pyramid::provider::ProviderRegistry;
+
+        let conn = Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(CredentialStore::load(tmp.path()).unwrap());
+        store.set("OPENROUTER_KEY", "sk-or-v1-test").unwrap();
+        std::mem::forget(tmp);
+
+        let registry = ProviderRegistry::new(store);
+        registry.load_from_db(&conn).unwrap();
+
+        let resolved = registry
+            .resolve_tier(UPPER_STALE_TIER, None, None, None)
+            .expect("UPPER_STALE_TIER must resolve from seeded registry");
+        assert_eq!(resolved.tier.tier_name, UPPER_STALE_TIER);
+        assert_eq!(resolved.provider.id, "openrouter");
     }
 
     fn insert_node(conn: &Connection, node_id: &str, parent_id: Option<&str>) {
