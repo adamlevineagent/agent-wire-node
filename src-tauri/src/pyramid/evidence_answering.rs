@@ -34,11 +34,17 @@ use super::types::{
 };
 use super::OperationalConfig;
 
-/// Check if an L0 node ID is a targeted re-examination (L0-{uuid} format).
+/// Check if an L0 node ID is a targeted re-examination.
 /// Canonical L0 nodes use patterns like C-L0-001, D-L0-042, or short sequential IDs.
-/// Targeted evidence nodes use L0-{uuid} where the UUID part is 36 chars.
+/// Targeted evidence nodes historically used L0-{uuid}; current gap filling
+/// allocates transaction-scoped L0-TNNN IDs.
 fn is_targeted_l0_id(id: &str) -> bool {
-    // Targeted: "L0-" followed by a UUID (36 chars with hyphens, e.g., L0-491a10ef-4b59-...)
+    if let Some(suffix) = id.strip_prefix("L0-T") {
+        return !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
+    }
+
+    // Targeted legacy: "L0-" followed by a UUID (36 chars with hyphens,
+    // e.g., L0-491a10ef-4b59-...).
     if let Some(suffix) = id.strip_prefix("L0-") {
         suffix.len() >= 36 && suffix.chars().nth(8) == Some('-')
     } else {
@@ -1689,7 +1695,9 @@ pub async fn targeted_reexamination(
         return Ok(Vec::new());
     }
 
-    // Counter for sequential node IDs within this batch of targeted extractions
+    // Draft IDs are intentionally not final node IDs. The DB writer allocates
+    // canonical L0-TNNN IDs inside the serialized commit so parallel/file-local
+    // calls cannot collide.
     let mut targeted_node_counter: usize = 0;
 
     // ── Build template variables ────────────────────────────────────────
@@ -1793,8 +1801,9 @@ Respond with ONLY a JSON object:
         {
             Ok(r) => r,
             Err(e) => {
-                warn!(file_path = %file_path, error = %e, "targeted extraction LLM call failed, skipping file");
-                continue;
+                return Err(anyhow!(
+                    "targeted extraction LLM call failed for {file_path}: {e}"
+                ));
             }
         };
 
@@ -1809,24 +1818,18 @@ Respond with ONLY a JSON object:
         let json_value = match llm::extract_json(&response.content) {
             Ok(v) => v,
             Err(e) => {
-                warn!(
-                    file_path = %file_path,
-                    error = %e,
-                    "targeted extraction JSON parse failed, skipping file"
-                );
-                continue;
+                return Err(anyhow!(
+                    "targeted extraction JSON parse failed for {file_path}: {e}"
+                ));
             }
         };
 
         let raw: RawTargetedExtraction = match serde_json::from_value(json_value) {
             Ok(r) => r,
             Err(e) => {
-                warn!(
-                    file_path = %file_path,
-                    error = %e,
-                    "targeted extraction deserialization failed, skipping file"
-                );
-                continue;
+                return Err(anyhow!(
+                    "targeted extraction deserialization failed for {file_path}: {e}"
+                ));
             }
         };
 
@@ -1846,7 +1849,7 @@ Respond with ONLY a JSON object:
                 .collect();
 
             let node = PyramidNode {
-                id: format!("L0-T{:03}", targeted_node_counter),
+                id: format!("__draft-targeted-{:03}", targeted_node_counter),
                 slug: target_slug.to_string(),
                 depth: 0,
                 chunk_index: None,
@@ -1916,7 +1919,8 @@ pub fn resolve_files_for_gap(
 
     // ── 2. For each base slug, get canonical L0 nodes ──
     // Canonical L0 nodes are from the original extraction (C-L0-*, D-L0-*, or short index IDs).
-    // Targeted evidence L0 nodes (from gap re-examination) use L0-{uuid} format (long UUID).
+    // Targeted evidence L0 nodes (from gap re-examination) use transaction-scoped
+    // L0-TNNN IDs (or legacy L0-{uuid} IDs on older pyramids).
     // We include ALL L0 that are NOT targeted evidence — self_prompt is NOT a reliable
     // discriminator because canonical nodes also have self_prompt populated (orientation text).
     for base_slug in base_slugs {
@@ -1980,11 +1984,9 @@ pub fn resolve_files_for_gap(
                     results.push((slug.clone(), path, content));
                 }
                 Err(e) => {
-                    warn!(
-                        file_path = %path,
-                        error = %e,
-                        "failed to read source file for gap resolution, skipping"
-                    );
+                    return Err(anyhow!(
+                        "failed to read source file for gap resolution {path}: {e}"
+                    ));
                 }
             }
         }
@@ -2057,6 +2059,74 @@ mod tests {
         let raw: PreMapResponse = serde_json::from_str(json).unwrap();
         assert_eq!(raw.mappings.len(), 2);
         assert_eq!(raw.mappings["q1"].len(), 2);
+    }
+
+    #[test]
+    fn targeted_l0_id_detector_handles_transaction_scoped_ids() {
+        assert!(is_targeted_l0_id("L0-T000"));
+        assert!(is_targeted_l0_id("L0-T042"));
+        assert!(is_targeted_l0_id("L0-491a10ef-4b59-401e-9b88-8fa1bc9d0f88"));
+        assert!(!is_targeted_l0_id("L0-000"));
+        assert!(!is_targeted_l0_id("C-L0-000"));
+        assert!(!is_targeted_l0_id("L0-TOMB000"));
+    }
+
+    #[test]
+    fn resolve_files_for_gap_surfaces_source_read_failures() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+        crate::pyramid::db::create_slug(
+            &conn,
+            "gap-io",
+            &crate::pyramid::types::ContentType::Code,
+            "/tmp/gap-io",
+        )
+        .unwrap();
+
+        let canonical = PyramidNode {
+            id: "L0-000".to_string(),
+            slug: "gap-io".to_string(),
+            depth: 0,
+            chunk_index: None,
+            headline: "missing targeted evidence".to_string(),
+            distilled: "This canonical node mentions the missing targeted evidence.".to_string(),
+            topics: Vec::new(),
+            corrections: Vec::new(),
+            decisions: Vec::new(),
+            terms: Vec::new(),
+            dead_ends: Vec::new(),
+            self_prompt: "orientation text".to_string(),
+            children: Vec::new(),
+            parent_id: None,
+            superseded_by: None,
+            build_id: Some("build-gap-io".to_string()),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            ..Default::default()
+        };
+        crate::pyramid::db::save_node(&conn, &canonical, None).unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing_path = tmp.path().join("missing-source.rs");
+        crate::pyramid::db::append_node_id_to_file_hash(
+            &conn,
+            "gap-io",
+            &missing_path.to_string_lossy(),
+            "L0-000",
+        )
+        .unwrap();
+
+        let err = resolve_files_for_gap(
+            &conn,
+            &["gap-io".to_string()],
+            "missing targeted evidence",
+            &[],
+            1,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to read source file"),
+            "expected source-read failure, got {err:#}"
+        );
     }
 
     #[test]

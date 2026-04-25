@@ -10885,6 +10885,49 @@ pub fn mark_gap_resolved_with_reason(
     resolution_reason: &str,
     resolved_by: &str,
 ) -> Result<()> {
+    mark_gap_resolved_with_reason_inner(
+        conn,
+        slug,
+        question_id,
+        description,
+        resolution_reason,
+        resolved_by,
+        false,
+    )
+}
+
+/// Strict variant for atomic writer transactions: the `gap_resolved`
+/// observation event is part of the commit contract, so event-write failure
+/// must roll the caller's transaction back instead of being logged as
+/// best-effort telemetry.
+pub fn mark_gap_resolved_with_reason_strict_observation(
+    conn: &Connection,
+    slug: &str,
+    question_id: &str,
+    description: &str,
+    resolution_reason: &str,
+    resolved_by: &str,
+) -> Result<()> {
+    mark_gap_resolved_with_reason_inner(
+        conn,
+        slug,
+        question_id,
+        description,
+        resolution_reason,
+        resolved_by,
+        true,
+    )
+}
+
+fn mark_gap_resolved_with_reason_inner(
+    conn: &Connection,
+    slug: &str,
+    question_id: &str,
+    description: &str,
+    resolution_reason: &str,
+    resolved_by: &str,
+    strict_observation: bool,
+) -> Result<()> {
     conn.execute(
         "UPDATE pyramid_gaps SET resolved = 1, resolution_confidence = 1.0
          WHERE slug = ?1 AND question_id = ?2 AND description = ?3",
@@ -10912,11 +10955,21 @@ pub fn mark_gap_resolved_with_reason(
         slug,
         "dadbear",
         "gap_resolved",
-        None, None, None, None,
+        None,
+        None,
+        None,
+        None,
         None, // target_node_id unknown — gap is question-keyed, not node-keyed
         None, // layer unknown
         Some(&metadata),
     ) {
+        if strict_observation {
+            return Err(e).with_context(|| {
+                format!(
+                    "mark_gap_resolved: failed to emit strict gap_resolved observation event for {slug}/{question_id}"
+                )
+            });
+        }
         tracing::warn!(
             slug = %slug,
             question_id = %question_id,
