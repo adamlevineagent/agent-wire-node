@@ -64,6 +64,8 @@ export interface VocabEntry {
   handler_chain_id: string | null;
   reactive: boolean;
   creates_delta: boolean;
+  include_in_cascade_prompt?: boolean;
+  event_type_on_emit?: string | null;
 }
 
 /** Response shape from `GET /vocabulary/:vocab_kind`. */
@@ -230,7 +232,7 @@ export async function validateAnnotationType(
       `Unknown annotation_type '${candidate}'. ` +
       `Valid types: ${validTypes.join(", ")}. ` +
       `To add a new type, publish a vocabulary_entry contribution ` +
-      `via the Rust API (pyramid::vocab_entries::publish_vocabulary_entry) — ` +
+      `via pyramid-cli vocab publish or POST /api/v1/pyramid/vocabulary — ` +
       `no code deploy required.`,
   };
 }
@@ -847,6 +849,28 @@ export const TOOL_CATALOG: CatalogEntry[] = [
     args: [{ name: "slug", type: "string", required: true, description: "Pyramid slug identifier" }],
     examples: ["pyramid-cli vocab my-pyramid"],
     related: ["vocab-recognize", "vocab-diff", "terms"],
+  },
+  {
+    cli: "vocab publish", mcp: "", category: "vocabulary",
+    description: "Publish a contribution-backed vocabulary_entry into the runtime registry. Prints the local contribution_id.",
+    args: [],
+    flags: [
+      { name: "kind", type: "string", description: "Vocabulary kind: annotation_type, node_shape, or role_name" },
+      { name: "name", type: "string", description: "Canonical registry name" },
+      { name: "description", type: "string", description: "Definition shown by /vocabulary/:kind" },
+      { name: "handler-chain-id", type: "string", description: "Starter chain binding for reactive entries or roles" },
+      { name: "reactive", type: "boolean", description: "Whether annotation arrival emits annotation_reacted" },
+      { name: "creates-delta", type: "boolean", description: "Whether annotation save creates a thread delta" },
+      { name: "include-in-cascade-prompt", type: "boolean", description: "Whether annotation content flows into ancestor re-distill prompts" },
+      { name: "event-type-on-emit", type: "string", description: "Observation event type override" },
+      { name: "parent", type: "string", description: "Existing parent entry to validate before publish" },
+      { name: "parent-kind", type: "string", description: "Kind for --parent, defaults to --kind" },
+    ],
+    examples: [
+      "pyramid-cli vocab publish --kind annotation_type --name my_custom --description \"Custom annotation\"",
+      "pyramid-cli vocab publish --type annotation_type --term my_custom --definition \"Custom annotation\" --reactive true --handler-chain-id starter-debate-steward",
+    ],
+    related: ["annotate"],
   },
   {
     cli: "vocab-recognize", mcp: "pyramid_vocab_recognize", category: "vocabulary",

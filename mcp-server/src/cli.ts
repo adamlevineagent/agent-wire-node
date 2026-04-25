@@ -617,14 +617,39 @@ Arguments:
 Example:
   pyramid-cli manifest my-pyramid '[{"op":"read","path":"apex"}]'`,
 
-  vocab: `vocab — Get full vocabulary
+  vocab: `vocab — Get full vocabulary or publish a vocabulary entry
 
 Usage: pyramid-cli vocab <slug>
+       pyramid-cli vocab publish --kind <kind> --name <name> --description "..."
 
 Arguments:
   <slug>      Pyramid slug
 
-Returns all recognized terms and definitions for the pyramid.`,
+Returns all recognized terms and definitions for the pyramid.
+Use the publish subcommand to add a contribution-backed registry entry.`,
+
+  "vocab publish": `vocab publish — Publish a vocabulary_entry contribution
+
+Usage: pyramid-cli vocab publish --kind <kind> --name <name> --description "..." [options]
+
+Required:
+  --kind <kind>             annotation_type | node_shape | role_name
+  --name <name>             Canonical registry name
+  --description "..."       Definition shown by /vocabulary/:kind
+
+Aliases:
+  --type <kind>             Alias for --kind
+  --term <name>             Alias for --name
+  --definition "..."        Alias for --description
+
+Options:
+  --handler-chain-id <id>   Starter chain binding for reactive entries or roles
+  --reactive true|false
+  --creates-delta true|false
+  --include-in-cascade-prompt true|false
+  --event-type-on-emit <event>
+  --parent <name>           Validate an existing parent entry before publish
+  --parent-kind <kind>      Parent kind (defaults to --kind)`,
 
   "vocab-recognize": `vocab-recognize — Check if a term is recognized
 
@@ -798,6 +823,16 @@ function enc(s: string): string {
   return encodeURIComponent(s);
 }
 
+function optionalBooleanFlag(flagName: string): boolean | undefined {
+  const raw = flags[flagName];
+  if (raw === undefined) return undefined;
+  const normalized = raw.toLowerCase();
+  if (["true", "1", "yes", "on"].includes(normalized)) return true;
+  if (["false", "0", "no", "off"].includes(normalized)) return false;
+  process.stderr.write(`Error: --${flagName} must be true or false (got '${raw}')\n`);
+  process.exit(1);
+}
+
 // ── Command Dispatch ─────────────────────────────────────────────────────────
 
 async function run(): Promise<void> {
@@ -821,6 +856,8 @@ async function run(): Promise<void> {
     const help =
       command === "annotate"
         ? renderAnnotateHelp()
+        : command === "vocab" && positional[1] === "publish"
+          ? COMMAND_HELP["vocab publish"]
         : COMMAND_HELP[command];
     if (help && help !== "__DYNAMIC_ANNOTATE_HELP__") {
       process.stderr.write(help + "\n");
@@ -1642,6 +1679,45 @@ async function run(): Promise<void> {
     }
 
     case "vocab": {
+      if (positional[1] === "publish") {
+        const vocabKind = flags.kind || flags["vocab-kind"] || flags.type;
+        const name = flags.name || flags.term;
+        const description = flags.description || flags.definition;
+        if (!vocabKind) {
+          process.stderr.write("Error: --kind <kind> is required (or --type)\n");
+          process.exit(1);
+        }
+        if (!name) {
+          process.stderr.write("Error: --name <name> is required (or --term)\n");
+          process.exit(1);
+        }
+        if (!description) {
+          process.stderr.write("Error: --description \"...\" is required (or --definition)\n");
+          process.exit(1);
+        }
+
+        const body: Record<string, unknown> = {
+          vocab_kind: vocabKind,
+          name,
+          description,
+        };
+        if (flags["handler-chain-id"]) body.handler_chain_id = flags["handler-chain-id"];
+        if (flags.parent) body.parent = flags.parent;
+        if (flags["parent-kind"]) body.parent_kind = flags["parent-kind"];
+        if (flags["event-type-on-emit"]) body.event_type_on_emit = flags["event-type-on-emit"];
+
+        const reactive = optionalBooleanFlag("reactive");
+        if (reactive !== undefined) body.reactive = reactive;
+        const createsDelta = optionalBooleanFlag("creates-delta");
+        if (createsDelta !== undefined) body.creates_delta = createsDelta;
+        const includeInCascade = optionalBooleanFlag("include-in-cascade-prompt");
+        if (includeInCascade !== undefined) {
+          body.include_in_cascade_prompt = includeInCascade;
+        }
+
+        output(await pf("/api/v1/pyramid/vocabulary", { method: "POST", body }));
+        break;
+      }
       const slug = requireArg(1, "slug");
       output(await pf(`/pyramid/${enc(slug)}/vocabulary`), slug);
       break;
@@ -2125,6 +2201,7 @@ Manifest/Runtime Commands:
 
 Vocabulary Commands:
   vocab <slug>                         Get full vocabulary
+  vocab publish --kind K --name N --description "..."  Publish a registry entry
   vocab-recognize <slug> <term>        Check if a term is recognized
   vocab-diff <slug> <since>            Vocabulary changes since a point in time
 

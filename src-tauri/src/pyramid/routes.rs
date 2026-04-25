@@ -36,6 +36,7 @@ use super::staleness_bridge;
 use super::types::CharacterizationResult;
 use super::types::*;
 use super::vine;
+use super::vocab_entries;
 use super::vocabulary;
 use super::webbing;
 use super::wire_import;
@@ -2865,7 +2866,38 @@ pub fn pyramid_routes(
         }))
         .and_then(handle_vocab_registry_list));
 
-    let top34 = top33.or(vocab_registry).unify().boxed();
+    // POST /api/v1/pyramid/vocabulary — local-only publish of a
+    // contribution-backed vocabulary_entry. This is the write sibling
+    // of the public GET /vocabulary/:vocab_kind read surface above.
+    let vocab_registry_publish_api_v1 = route!(warp::path("api")
+        .and(warp::path("v1"))
+        .and(prefix)
+        .and(warp::path("vocabulary"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::content_length_limit(1_048_576))
+        .and(warp::body::json::<vocab_entries::VocabPublishRequest>())
+        .and_then(handle_vocab_registry_publish));
+
+    // Back-compat local alias for the rest of the /pyramid CLI surface.
+    let vocab_registry_publish = route!(prefix
+        .and(warp::path("vocabulary"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::content_length_limit(1_048_576))
+        .and(warp::body::json::<vocab_entries::VocabPublishRequest>())
+        .and_then(handle_vocab_registry_publish));
+
+    let vocab_routes = vocab_registry
+        .or(vocab_registry_publish_api_v1)
+        .unify()
+        .or(vocab_registry_publish)
+        .unify()
+        .boxed();
+
+    let top34 = top33.or(vocab_routes).unify().boxed();
 
     // ── Post-build accretion v5 Phase 9b-4: authorize_question route ──
     //
@@ -3004,6 +3036,42 @@ async fn handle_vocab_registry_list(
             {
                 Ok(json_error(
                     warp::http::StatusCode::BAD_REQUEST,
+                    &e.to_string(),
+                ))
+            } else {
+                Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ))
+            }
+        }
+    }
+}
+
+/// POST /api/v1/pyramid/vocabulary — publish a contribution-backed
+/// vocabulary entry, returning its local contribution_id.
+async fn handle_vocab_registry_publish(
+    state: Arc<PyramidState>,
+    body: vocab_entries::VocabPublishRequest,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.writer.lock().await;
+    match vocab_entries::handle_publish_vocabulary(&conn, body) {
+        Ok(response) => Ok(json_ok(&response)),
+        Err(e) => {
+            if e.downcast_ref::<vocab_entries::UnknownVocabKind>()
+                .is_some()
+                || e.downcast_ref::<vocab_entries::InvalidVocabPublish>()
+                    .is_some()
+            {
+                Ok(json_error(
+                    warp::http::StatusCode::BAD_REQUEST,
+                    &e.to_string(),
+                ))
+            } else if e.downcast_ref::<vocab_entries::DuplicateVocabEntry>()
+                .is_some()
+            {
+                Ok(json_error(
+                    warp::http::StatusCode::CONFLICT,
                     &e.to_string(),
                 ))
             } else {

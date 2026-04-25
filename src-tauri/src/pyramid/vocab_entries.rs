@@ -247,6 +247,64 @@ pub struct VocabListItem {
     pub event_type_on_emit: Option<String>,
 }
 
+/// Request shape for publishing a new vocabulary entry over HTTP/CLI.
+///
+/// The canonical Rust field names are `vocab_kind`, `name`, and
+/// `description`. The route also accepts operator-friendly aliases
+/// (`type`/`kind`, `term`, `definition`) so the surface can match the
+/// vocabulary-entry language without adding a parallel schema.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VocabPublishRequest {
+    #[serde(default, alias = "kind", alias = "type")]
+    pub vocab_kind: Option<String>,
+    #[serde(default, alias = "term")]
+    pub name: Option<String>,
+    #[serde(default, alias = "definition")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub handler_chain_id: Option<String>,
+    #[serde(default)]
+    pub reactive: bool,
+    #[serde(default)]
+    pub creates_delta: bool,
+    #[serde(default = "default_include_in_cascade_prompt")]
+    pub include_in_cascade_prompt: bool,
+    #[serde(default)]
+    pub event_type_on_emit: Option<String>,
+    /// Optional parent entry guard. Vocabulary entries are global today,
+    /// so this validates the reference exists but does not persist a new
+    /// hierarchy field.
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub parent_kind: Option<String>,
+    /// Accepted for future slug-scoped clients. Current vocabulary rows
+    /// remain global (`slug = NULL`) per the existing contribution model.
+    #[serde(default)]
+    pub slug: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VocabPublishResponse {
+    pub contribution_id: String,
+    pub vocab_kind: String,
+    pub name: String,
+    pub entry: VocabListItem,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid vocabulary publish request: {message}")]
+pub struct InvalidVocabPublish {
+    pub message: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("vocabulary_entry ({vocab_kind}, {name}) already exists")]
+pub struct DuplicateVocabEntry {
+    pub vocab_kind: String,
+    pub name: String,
+}
+
 // ── Cache ───────────────────────────────────────────────────────────
 
 type CacheKey = (String, String); // (vocab_kind, name)
@@ -518,6 +576,27 @@ fn lookup_id_by_contribution_id(conn: &Connection, contribution_id: &str) -> Res
     Ok(result)
 }
 
+fn required_trimmed(value: Option<String>, field_name: &str) -> Result<String> {
+    let Some(raw) = value else {
+        return Err(anyhow::Error::new(InvalidVocabPublish {
+            message: format!("missing required field {field_name}"),
+        }));
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::Error::new(InvalidVocabPublish {
+            message: format!("{field_name} must be non-empty"),
+        }));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn optional_trimmed(value: Option<String>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Read one vocabulary row (active or superseded) and materialize a
 /// `VocabEntry`. Returns None if the row doesn't exist.
 fn load_entry_by_schema_type(
@@ -616,6 +695,98 @@ pub fn get_vocabulary_entry(
 }
 
 // ── Write API ───────────────────────────────────────────────────────
+
+/// Shared HTTP/CLI publish body. Validates the operator request, writes
+/// through the existing vocabulary contribution writer, and returns the
+/// local contribution id the caller can quote or inspect later.
+pub fn handle_publish_vocabulary(
+    conn: &Connection,
+    request: VocabPublishRequest,
+) -> Result<VocabPublishResponse> {
+    let vocab_kind = required_trimmed(request.vocab_kind, "vocab_kind")?;
+    if !is_known_vocab_kind(&vocab_kind) {
+        return Err(anyhow::Error::new(UnknownVocabKind {
+            kind: vocab_kind,
+            valid: VOCAB_KINDS,
+        }));
+    }
+
+    let name = required_trimmed(request.name, "name")?;
+    let description = required_trimmed(request.description, "description")?;
+    let handler_chain_id = optional_trimmed(request.handler_chain_id);
+    let event_type_on_emit = optional_trimmed(request.event_type_on_emit);
+    let parent = optional_trimmed(request.parent);
+    let parent_kind = optional_trimmed(request.parent_kind).unwrap_or_else(|| vocab_kind.clone());
+    let _slug_scope = optional_trimmed(request.slug);
+
+    validate_vocab_identifiers(&vocab_kind, &name)?;
+    if get_vocabulary_entry(conn, &vocab_kind, &name)?.is_some() {
+        return Err(anyhow::Error::new(DuplicateVocabEntry {
+            vocab_kind,
+            name,
+        }));
+    }
+
+    if !is_known_vocab_kind(&parent_kind) {
+        return Err(anyhow::Error::new(UnknownVocabKind {
+            kind: parent_kind,
+            valid: VOCAB_KINDS,
+        }));
+    }
+    if let Some(parent_name) = parent.as_deref() {
+        validate_vocab_identifiers(&parent_kind, parent_name)?;
+        if get_vocabulary_entry(conn, &parent_kind, parent_name)?.is_none() {
+            return Err(anyhow::Error::new(InvalidVocabPublish {
+                message: format!(
+                    "parent vocabulary_entry ({parent_kind}, {parent_name}) does not exist"
+                ),
+            }));
+        }
+    }
+
+    let requested = VocabEntry {
+        id: 0,
+        vocab_kind: vocab_kind.clone(),
+        name: name.clone(),
+        description,
+        handler_chain_id,
+        reactive: request.reactive,
+        creates_delta: request.creates_delta,
+        include_in_cascade_prompt: request.include_in_cascade_prompt,
+        event_type_on_emit,
+        created_at: String::new(),
+        superseded_by: None,
+        supersede_reason: None,
+    };
+    let saved = publish_vocabulary_entry(conn, &requested)?;
+    let contribution_id: String = conn
+        .query_row(
+            "SELECT contribution_id FROM pyramid_config_contributions WHERE id = ?1",
+            rusqlite::params![saved.id],
+            |row| row.get(0),
+        )
+        .with_context(|| {
+            format!(
+                "failed to load contribution_id for vocabulary_entry ({}, {})",
+                saved.vocab_kind, saved.name
+            )
+        })?;
+
+    Ok(VocabPublishResponse {
+        contribution_id,
+        vocab_kind: saved.vocab_kind.clone(),
+        name: saved.name.clone(),
+        entry: VocabListItem {
+            name: saved.name,
+            description: saved.description,
+            handler_chain_id: saved.handler_chain_id,
+            reactive: saved.reactive,
+            creates_delta: saved.creates_delta,
+            include_in_cascade_prompt: saved.include_in_cascade_prompt,
+            event_type_on_emit: saved.event_type_on_emit,
+        },
+    })
+}
 
 /// Publish a new vocabulary entry. Fails loud if `(vocab_kind, name)`
 /// already has an active entry — callers must use
