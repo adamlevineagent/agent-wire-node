@@ -23666,6 +23666,7 @@ mod phase2_post_build_tests {
     //! Post-build accretion v5 Phase 2 tests — new annotation verbs.
     //! See .lab/architecture/agent-wire-node-post-build-plan-v5.md
     use super::*;
+    use super::post_build_test_support::test_lock;
     use crate::pyramid::types::{AnnotationType, ContentType, PyramidAnnotation};
 
     fn mem_conn() -> Connection {
@@ -23702,6 +23703,7 @@ mod phase2_post_build_tests {
 
     #[test]
     fn save_annotation_round_trip_all_sixteen_types() {
+        let _lock = test_lock();
         // Phase 7c verifier: extended from 11 → 15 types (adds gap /
         // hypothesis / purpose_declaration / purpose_shift as pure vocab
         // entries per 6c-B flip).
@@ -23746,6 +23748,7 @@ mod phase2_post_build_tests {
 
     #[test]
     fn annotation_type_from_str_strict_rejects_unknown() {
+        let _lock = test_lock();
         // Pillar 38 absorbed bug: from_str silently defaulted to Observation.
         // Phase 6c-B: from_str_strict is now vocab-backed — unknown strings
         // raise because no vocab entry matches. Genesis seeds 11 canonical
@@ -23770,6 +23773,7 @@ mod phase2_post_build_tests {
     /// `annotation_type`.
     #[test]
     fn annotation_type_all_matches_vocab_registry() {
+        let _lock = test_lock();
         let conn = mem_conn();
         // Full list from the vocab registry.
         let vocab_active: Vec<String> = crate::pyramid::vocab_entries::list_vocabulary(

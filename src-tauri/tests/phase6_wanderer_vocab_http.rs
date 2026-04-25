@@ -419,6 +419,74 @@ async fn publish_vocab_entry_over_api_v1_http_surfaces_new_entry_and_contributio
     assert_eq!(yaml_value["reactive"].as_bool(), Some(true));
 }
 
+#[tokio::test]
+async fn publish_vocab_entry_rejects_alias_ambiguity_and_oversized_fields() {
+    let _l = cache_lock();
+    let state = Arc::new(VocabTestState {
+        reader: Arc::new(Mutex::new(seeded_conn())),
+    });
+    let addr = spawn_server(state).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{}/api/v1/pyramid/vocabulary", addr);
+
+    let alias_resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "vocab_kind": "annotation_type",
+            "type": "role_name",
+            "name": "ambiguous_type",
+            "description": "Should be rejected before publish",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(alias_resp.status(), 400);
+    let alias_body = alias_resp.text().await.unwrap();
+    assert!(
+        alias_body.contains("use only one of vocab_kind, kind, type"),
+        "alias ambiguity should be clear, got: {}",
+        alias_body
+    );
+
+    let long_name = "n".repeat(129);
+    let long_name_resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "vocab_kind": "annotation_type",
+            "name": long_name,
+            "description": "Name should be capped",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(long_name_resp.status(), 400);
+    let long_name_body = long_name_resp.text().await.unwrap();
+    assert!(
+        long_name_body.contains("name must be at most 128 characters"),
+        "name cap error should be clear, got: {}",
+        long_name_body
+    );
+
+    let long_description = "d".repeat(8193);
+    let long_description_resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "vocab_kind": "annotation_type",
+            "name": "oversized_description",
+            "description": long_description,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(long_description_resp.status(), 400);
+    let long_description_body = long_description_resp.text().await.unwrap();
+    assert!(
+        long_description_body.contains("description must be at most 8192 bytes"),
+        "description cap error should be clear, got: {}",
+        long_description_body
+    );
+}
+
 /// Cross-pyramid vocab scope check: entries are global (slug=NULL in the
 /// contribution row), so two connections pointed at the same DB should both
 /// see the same catalog via HTTP. Regression guard against a future refactor

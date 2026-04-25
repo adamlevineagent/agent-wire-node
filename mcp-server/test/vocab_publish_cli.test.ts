@@ -108,3 +108,55 @@ test('vocab_publish_cli_posts_to_api_v1_surface_and_prints_contribution_id', asy
     include_in_cascade_prompt: true,
   });
 });
+
+test('vocab_publish_cli_rejects_alias_ambiguity_before_posting', async () => {
+  const cases = [
+    {
+      args: [
+        '--kind',
+        'annotation_type',
+        '--type',
+        'role_name',
+        '--name',
+        'cli_alias_kind',
+        '--description',
+        'kind aliases should conflict',
+      ],
+      error: 'use only one of --kind, --vocab-kind, --type',
+    },
+    {
+      args: [
+        '--kind',
+        'annotation_type',
+        '--name',
+        'cli_alias_name',
+        '--term',
+        'cli_alias_term',
+        '--description',
+        'name aliases should conflict',
+      ],
+      error: 'use only one of --name, --term',
+    },
+    {
+      args: [
+        '--kind',
+        'annotation_type',
+        '--name',
+        'cli_alias_description',
+        '--description',
+        'description aliases should conflict',
+        '--definition',
+        'definition aliases should conflict',
+      ],
+      error: 'use only one of --description, --definition',
+    },
+  ];
+
+  for (const c of cases) {
+    seenBody = null;
+    const result = await runCli(['vocab', 'publish', ...c.args]);
+    assert.equal(result.code, 1, result.stderr);
+    assert.match(result.stderr, new RegExp(c.error.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.equal(seenBody, null, 'CLI should reject alias ambiguity before HTTP POST');
+  }
+});

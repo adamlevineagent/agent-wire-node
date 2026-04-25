@@ -36,7 +36,8 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{OnceLock, RwLock};
@@ -73,6 +74,9 @@ pub const VOCAB_KINDS: &[&str] = &[
     VOCAB_KIND_NODE_SHAPE,
     VOCAB_KIND_ROLE_NAME,
 ];
+
+const VOCAB_NAME_MAX_CHARS: usize = 128;
+const VOCAB_DESCRIPTION_MAX_BYTES: usize = 8 * 1024;
 
 /// Returns true if `kind` is one of the three whitelisted vocab_kinds.
 /// Used by the HTTP handler to reject unknown kinds loud (feedback_loud_deferrals)
@@ -253,35 +257,101 @@ pub struct VocabListItem {
 /// `description`. The route also accepts operator-friendly aliases
 /// (`type`/`kind`, `term`, `definition`) so the surface can match the
 /// vocabulary-entry language without adding a parallel schema.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct VocabPublishRequest {
-    #[serde(default, alias = "kind", alias = "type")]
     pub vocab_kind: Option<String>,
-    #[serde(default, alias = "term")]
     pub name: Option<String>,
-    #[serde(default, alias = "definition")]
     pub description: Option<String>,
-    #[serde(default)]
     pub handler_chain_id: Option<String>,
-    #[serde(default)]
     pub reactive: bool,
-    #[serde(default)]
     pub creates_delta: bool,
-    #[serde(default = "default_include_in_cascade_prompt")]
     pub include_in_cascade_prompt: bool,
-    #[serde(default)]
     pub event_type_on_emit: Option<String>,
     /// Optional parent entry guard. Vocabulary entries are global today,
     /// so this validates the reference exists but does not persist a new
     /// hierarchy field.
-    #[serde(default)]
     pub parent: Option<String>,
-    #[serde(default)]
     pub parent_kind: Option<String>,
     /// Accepted for future slug-scoped clients. Current vocabulary rows
     /// remain global (`slug = NULL`) per the existing contribution model.
-    #[serde(default)]
     pub slug: Option<String>,
+    parse_error: Option<String>,
+}
+
+fn parse_nullable_json_field<T>(
+    map: &serde_json::Map<String, serde_json::Value>,
+    field_name: &str,
+) -> std::result::Result<Option<T>, String>
+where
+    T: DeserializeOwned,
+{
+    let Some(value) = map.get(field_name) else {
+        return Ok(None);
+    };
+    serde_json::from_value::<Option<T>>(value.clone())
+        .map_err(|e| format!("{field_name}: {e}"))
+}
+
+fn parse_alias_string(
+    map: &serde_json::Map<String, serde_json::Value>,
+    aliases: &[&str],
+    parse_error: &mut Option<String>,
+) -> std::result::Result<Option<String>, String> {
+    let present: Vec<&str> = aliases
+        .iter()
+        .copied()
+        .filter(|field_name| map.contains_key(*field_name))
+        .collect();
+    if present.len() > 1 && parse_error.is_none() {
+        *parse_error = Some(format!("use only one of {}", aliases.join(", ")));
+    }
+    match present.first() {
+        Some(field_name) => parse_nullable_json_field::<String>(map, field_name),
+        None => Ok(None),
+    }
+}
+
+impl<'de> Deserialize<'de> for VocabPublishRequest {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let map = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("vocabulary publish body must be a JSON object"))?;
+        let mut parse_error = None;
+
+        Ok(Self {
+            vocab_kind: parse_alias_string(map, &["vocab_kind", "kind", "type"], &mut parse_error)
+                .map_err(serde::de::Error::custom)?,
+            name: parse_alias_string(map, &["name", "term"], &mut parse_error)
+                .map_err(serde::de::Error::custom)?,
+            description: parse_alias_string(map, &["description", "definition"], &mut parse_error)
+                .map_err(serde::de::Error::custom)?,
+            handler_chain_id: parse_nullable_json_field(map, "handler_chain_id")
+                .map_err(serde::de::Error::custom)?,
+            reactive: parse_nullable_json_field(map, "reactive")
+                .map_err(serde::de::Error::custom)?
+                .unwrap_or(false),
+            creates_delta: parse_nullable_json_field(map, "creates_delta")
+                .map_err(serde::de::Error::custom)?
+                .unwrap_or(false),
+            include_in_cascade_prompt: parse_nullable_json_field(
+                map,
+                "include_in_cascade_prompt",
+            )
+            .map_err(serde::de::Error::custom)?
+            .unwrap_or_else(default_include_in_cascade_prompt),
+            event_type_on_emit: parse_nullable_json_field(map, "event_type_on_emit")
+                .map_err(serde::de::Error::custom)?,
+            parent: parse_nullable_json_field(map, "parent").map_err(serde::de::Error::custom)?,
+            parent_kind: parse_nullable_json_field(map, "parent_kind")
+                .map_err(serde::de::Error::custom)?,
+            slug: parse_nullable_json_field(map, "slug").map_err(serde::de::Error::custom)?,
+            parse_error,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -703,6 +773,12 @@ pub fn handle_publish_vocabulary(
     conn: &Connection,
     request: VocabPublishRequest,
 ) -> Result<VocabPublishResponse> {
+    if let Some(message) = request.parse_error.as_deref() {
+        return Err(anyhow::Error::new(InvalidVocabPublish {
+            message: message.to_string(),
+        }));
+    }
+
     let vocab_kind = required_trimmed(request.vocab_kind, "vocab_kind")?;
     if !is_known_vocab_kind(&vocab_kind) {
         return Err(anyhow::Error::new(UnknownVocabKind {
@@ -713,6 +789,18 @@ pub fn handle_publish_vocabulary(
 
     let name = required_trimmed(request.name, "name")?;
     let description = required_trimmed(request.description, "description")?;
+    if name.chars().count() > VOCAB_NAME_MAX_CHARS {
+        return Err(anyhow::Error::new(InvalidVocabPublish {
+            message: format!("name must be at most {VOCAB_NAME_MAX_CHARS} characters"),
+        }));
+    }
+    if description.len() > VOCAB_DESCRIPTION_MAX_BYTES {
+        return Err(anyhow::Error::new(InvalidVocabPublish {
+            message: format!(
+                "description must be at most {VOCAB_DESCRIPTION_MAX_BYTES} bytes"
+            ),
+        }));
+    }
     let handler_chain_id = optional_trimmed(request.handler_chain_id);
     let event_type_on_emit = optional_trimmed(request.event_type_on_emit);
     let parent = optional_trimmed(request.parent);

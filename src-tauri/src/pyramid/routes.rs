@@ -3056,7 +3056,17 @@ async fn handle_vocab_registry_publish(
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.writer.lock().await;
     match vocab_entries::handle_publish_vocabulary(&conn, body) {
-        Ok(response) => Ok(json_ok(&response)),
+        Ok(response) => {
+            tracing::info!(
+                target: "pyramid.vocabulary",
+                operator = "local_auth",
+                vocab_kind = %response.vocab_kind,
+                name = %response.name,
+                contribution_id = %response.contribution_id,
+                "published vocabulary_entry contribution"
+            );
+            Ok(json_ok(&response))
+        }
         Err(e) => {
             if e.downcast_ref::<vocab_entries::UnknownVocabKind>()
                 .is_some()

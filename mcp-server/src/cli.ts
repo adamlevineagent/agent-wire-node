@@ -29,22 +29,32 @@ import {
 const rawArgs = process.argv.slice(2);
 
 /** Extract --flag value pairs, returning remaining positional args. */
-function parseArgs(args: string[]): { positional: string[]; flags: Record<string, string> } {
+function parseArgs(args: string[]): {
+  positional: string[];
+  flags: Record<string, string>;
+  flagCounts: Record<string, number>;
+} {
   const positional: string[] = [];
   const flags: Record<string, string> = {};
+  const flagCounts: Record<string, number> = {};
+
+  function setFlag(name: string, value: string): void {
+    flags[name] = value;
+    flagCounts[name] = (flagCounts[name] ?? 0) + 1;
+  }
 
   let i = 0;
   while (i < args.length) {
     const arg = args[i];
     if (arg === "-h") {
-      flags["help"] = "true";
+      setFlag("help", "true");
       i += 1;
     } else if (arg.startsWith("--") && i + 1 < args.length && !args[i + 1].startsWith("--")) {
-      flags[arg.slice(2)] = args[i + 1];
+      setFlag(arg.slice(2), args[i + 1]);
       i += 2;
     } else if (arg.startsWith("--")) {
       // Boolean flag (e.g. --compact, --help)
-      flags[arg.slice(2)] = "true";
+      setFlag(arg.slice(2), "true");
       i += 1;
     } else {
       positional.push(arg);
@@ -52,10 +62,10 @@ function parseArgs(args: string[]): { positional: string[]; flags: Record<string
     }
   }
 
-  return { positional, flags };
+  return { positional, flags, flagCounts };
 }
 
-const { positional, flags } = parseArgs(rawArgs);
+const { positional, flags, flagCounts } = parseArgs(rawArgs);
 const command = positional[0];
 
 // Pretty is the default; --compact turns it off
@@ -634,13 +644,19 @@ Usage: pyramid-cli vocab publish --kind <kind> --name <name> --description "..."
 
 Required:
   --kind <kind>             annotation_type | node_shape | role_name
-  --name <name>             Canonical registry name
-  --description "..."       Definition shown by /vocabulary/:kind
+  --name <name>             Canonical registry name, max 128 characters
+  --description "..."       Definition shown by /vocabulary/:kind, max 8192 bytes
 
 Aliases:
+  --vocab-kind <kind>       Alias for --kind
   --type <kind>             Alias for --kind
   --term <name>             Alias for --name
   --definition "..."        Alias for --description
+
+Use only one spelling from each alias group:
+  --kind | --vocab-kind | --type
+  --name | --term
+  --description | --definition
 
 Options:
   --handler-chain-id <id>   Starter chain binding for reactive entries or roles
@@ -831,6 +847,18 @@ function optionalBooleanFlag(flagName: string): boolean | undefined {
   if (["false", "0", "no", "off"].includes(normalized)) return false;
   process.stderr.write(`Error: --${flagName} must be true or false (got '${raw}')\n`);
   process.exit(1);
+}
+
+function oneOfFlag(names: string[]): string | undefined {
+  const provided = names.filter((name) => (flagCounts[name] ?? 0) > 0);
+  const repeated = provided.some((name) => (flagCounts[name] ?? 0) > 1);
+  if (provided.length > 1 || repeated) {
+    process.stderr.write(
+      `Error: use only one of ${names.map((name) => `--${name}`).join(", ")}\n`,
+    );
+    process.exit(1);
+  }
+  return provided.length === 0 ? undefined : flags[provided[0]];
 }
 
 // ── Command Dispatch ─────────────────────────────────────────────────────────
@@ -1680,11 +1708,11 @@ async function run(): Promise<void> {
 
     case "vocab": {
       if (positional[1] === "publish") {
-        const vocabKind = flags.kind || flags["vocab-kind"] || flags.type;
-        const name = flags.name || flags.term;
-        const description = flags.description || flags.definition;
+        const vocabKind = oneOfFlag(["kind", "vocab-kind", "type"]);
+        const name = oneOfFlag(["name", "term"]);
+        const description = oneOfFlag(["description", "definition"]);
         if (!vocabKind) {
-          process.stderr.write("Error: --kind <kind> is required (or --type)\n");
+          process.stderr.write("Error: --kind <kind> is required (or --vocab-kind/--type)\n");
           process.exit(1);
         }
         if (!name) {
