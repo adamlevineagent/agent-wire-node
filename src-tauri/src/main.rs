@@ -4477,6 +4477,7 @@ async fn pyramid_create_slug(
     content_type: String,
     source_path: String,
     referenced_slugs: Option<Vec<String>>,
+    purpose_text: Option<String>,
 ) -> Result<SlugInfo, String> {
     let ct = ContentType::from_str(&content_type).ok_or_else(|| {
         format!(
@@ -4503,6 +4504,21 @@ async fn pyramid_create_slug(
                     tracing::warn!(slug = %info.slug, error = %e, "failed to save slug references");
                 }
             }
+        }
+        if let Some(purpose_text) = purpose_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            wire_node_lib::pyramid::purpose::supersede_purpose(
+                &conn,
+                &info.slug,
+                purpose_text,
+                Some("initial-purpose-declaration"),
+                None,
+                None,
+            )
+            .map_err(|e| format!("Slug created but failed to declare purpose: {e}"))?;
         }
         drop(conn);
 

@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { BuildProgress } from './BuildProgress';
@@ -24,6 +24,9 @@ type Step =
     // Phase 17: recursive folder ingestion wizard
     | 'folder-ingest-pick'
     | 'folder-ingest-review';
+
+type EntryPoint = 'question' | 'purpose';
+type PurposeAnnotationState = 'idle' | 'posting' | 'posted' | 'failed';
 
 // Phase 17 / Phase 18e IPC shapes — must match `folder_ingestion.rs`.
 //
@@ -92,6 +95,71 @@ const DEFAULT_QUESTIONS: Record<string, string> = {
     document: "What are the key concepts, decisions, and relationships in these documents?",
     conversation: "What are the key themes, decisions, and evolution across these conversations?",
 };
+
+function purposeToBuildQuestion(purpose: string): string {
+    const trimmed = purpose.trim();
+    if (!trimmed) return '';
+    return `What evidence, concepts, decisions, and relationships should this pyramid capture to fulfill this purpose: ${trimmed}`;
+}
+
+interface TreeCandidate {
+    id: string;
+    depth: number;
+    isQuestion: boolean;
+    isForeign: boolean;
+    answerNodeId: string | null;
+}
+
+function stringField(record: Record<string, unknown>, key: string): string | null {
+    const value = record[key];
+    return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function numericDepth(value: unknown): number {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string') {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed)) return parsed;
+    }
+    return Number.NEGATIVE_INFINITY;
+}
+
+function collectTreeCandidates(value: unknown, candidates: TreeCandidate[] = []): TreeCandidate[] {
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            collectTreeCandidates(item, candidates);
+        }
+        return candidates;
+    }
+    if (typeof value !== 'object' || value === null) return candidates;
+    const record = value as Record<string, unknown>;
+    const id = stringField(record, 'id');
+    const answerNodeId = stringField(record, 'answer_node_id');
+    if (id || answerNodeId) {
+        candidates.push({
+            id: id ?? '',
+            depth: numericDepth(record.depth),
+            isQuestion: stringField(record, 'node_kind') === 'question',
+            isForeign: Boolean(stringField(record, 'source_slug')),
+            answerNodeId,
+        });
+    }
+    collectTreeCandidates(record.children, candidates);
+    return candidates;
+}
+
+function findApexTreeNodeId(value: unknown): string | null {
+    const candidates = collectTreeCandidates(value);
+    const sameSlugNodes = candidates
+        .filter(candidate => candidate.id && !candidate.isQuestion && !candidate.isForeign)
+        .sort((a, b) => b.depth - a.depth || a.id.localeCompare(b.id));
+    if (sameSlugNodes[0]) return sameSlugNodes[0].id;
+
+    const linkedAnswerNodes = candidates
+        .filter(candidate => candidate.answerNodeId && !candidate.isForeign)
+        .sort((a, b) => b.depth - a.depth || a.id.localeCompare(b.id));
+    return linkedAnswerNodes[0]?.answerNodeId ?? null;
+}
 
 const DEFAULT_IGNORES = [
     'node_modules', '.git', 'target', 'dist', 'build', '.next',
@@ -195,7 +263,9 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
     const [customIgnores, setCustomIgnores] = useState('');
     const [slug, setSlug] = useState('');
     const [creating, setCreating] = useState(false);
+    const [entryPoint, setEntryPoint] = useState<EntryPoint>('question');
     const [apexQuestion, setApexQuestion] = useState('');
+    const [purposeText, setPurposeText] = useState('');
     const [error, setError] = useState<string | null>(null);
     // Preview state
     const [previewLoading, setPreviewLoading] = useState(false);
@@ -222,6 +292,10 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
     const [profilesError, setProfilesError] = useState<string | null>(null);
     // Build fullscreen: collapse wizard chrome when build is running
     const [buildFullScreen, setBuildFullScreen] = useState(false);
+    const purposeAnnotationPostedRef = useRef(false);
+    const purposeAnnotationPendingRef = useRef(false);
+    const [purposeAnnotationState, setPurposeAnnotationState] = useState<PurposeAnnotationState>('idle');
+    const [purposeAnnotationError, setPurposeAnnotationError] = useState<string | null>(null);
 
     // Auth token for HTTP fetches
     const [authToken, setAuthToken] = useState('');
@@ -256,6 +330,87 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         // For code/document, the default chain is resolved server-side
         return 'question-pipeline';
     }, [contentType, conversationPreset]);
+
+    const questionText = apexQuestion.trim();
+    const declaredPurpose = entryPoint === 'purpose' ? purposeText.trim() : '';
+    const entryText = entryPoint === 'purpose' ? declaredPurpose : questionText;
+    const buildQuestion = useMemo(
+        () => entryPoint === 'purpose' ? purposeToBuildQuestion(declaredPurpose) : questionText,
+        [entryPoint, declaredPurpose, questionText],
+    );
+    const isPurposeBuild = entryPoint === 'purpose' && Boolean(declaredPurpose);
+
+    useEffect(() => {
+        purposeAnnotationPostedRef.current = false;
+        purposeAnnotationPendingRef.current = false;
+        setPurposeAnnotationState('idle');
+        setPurposeAnnotationError(null);
+    }, [slug, declaredPurpose]);
+
+    const postPurposeDeclaration = useCallback(async () => {
+        if (!isPurposeBuild || !slug) return;
+        if (purposeAnnotationPostedRef.current) return;
+        purposeAnnotationPostedRef.current = true;
+        purposeAnnotationPendingRef.current = true;
+        setPurposeAnnotationState('posting');
+        setPurposeAnnotationError(null);
+        setError(null);
+
+        try {
+            const treeResp = await fetch(`${PYRAMID_API_BASE}/pyramid/${slug}/tree`, {
+                headers: authHeaders,
+            });
+            if (!treeResp.ok) {
+                throw new Error(`Purpose annotation tree lookup failed (${treeResp.status})`);
+            }
+            const tree = await treeResp.json();
+            const nodeId = findApexTreeNodeId(tree);
+            if (!nodeId) {
+                throw new Error('Purpose annotation could not find the built pyramid apex');
+            }
+
+            const annotateResp = await fetch(`${PYRAMID_API_BASE}/pyramid/${slug}/annotate`, {
+                method: 'POST',
+                headers: authHeaders,
+                body: JSON.stringify({
+                    node_id: nodeId,
+                    annotation_type: 'purpose_declaration',
+                    content: declaredPurpose,
+                    author: 'workspace-wizard',
+                }),
+            });
+            if (!annotateResp.ok) {
+                const errBody = await annotateResp.text();
+                throw new Error(`Purpose annotation failed (${annotateResp.status}): ${errBody}`);
+            }
+            setPurposeAnnotationState('posted');
+            purposeAnnotationPendingRef.current = false;
+            setBuildFullScreen(false);
+        } catch (err) {
+            purposeAnnotationPostedRef.current = false;
+            purposeAnnotationPendingRef.current = false;
+            const message = String(err);
+            console.error('Purpose declaration annotation failed', { slug, error: err });
+            setPurposeAnnotationState('failed');
+            setPurposeAnnotationError(message);
+            setError(`Purpose declaration did not finish: ${message}`);
+            setBuildFullScreen(false);
+        }
+    }, [isPurposeBuild, declaredPurpose, slug, authHeaders]);
+
+    const handleBuildComplete = useCallback(async (status: { status: string }) => {
+        if (!['complete', 'complete_with_errors'].includes(status.status)) return;
+        await postPurposeDeclaration();
+    }, [postPurposeDeclaration]);
+
+    const handleBuildFullScreenRequest = useCallback((active: boolean) => {
+        if (
+            !active &&
+            isPurposeBuild &&
+            (purposeAnnotationState === 'posting' || purposeAnnotationPendingRef.current)
+        ) return;
+        setBuildFullScreen(active);
+    }, [isPurposeBuild, purposeAnnotationState]);
 
     const handlePickDirectory = useCallback(async () => {
         try {
@@ -548,6 +703,8 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
     const handleContentTypeSelect = useCallback((type: 'code' | 'document' | 'conversation' | 'vine') => {
         setContentType(type);
         setApexQuestion(DEFAULT_QUESTIONS[type] || '');
+        setPurposeText('');
+        setEntryPoint('question');
         if (type === 'vine') {
             setPaths([]);
             setSlug('');
@@ -656,6 +813,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                     slug,
                     contentType,
                     sourcePath,
+                    ...(declaredPurpose ? { purposeText: declaredPurpose } : {}),
                 });
             } catch (_e) {
                 // Slug may already exist — that's fine
@@ -686,7 +844,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         } finally {
             setPreviewLoading(false);
         }
-    }, [paths, contentType, slug, getEffectiveChainId]);
+    }, [paths, contentType, slug, getEffectiveChainId, declaredPurpose, authHeaders]);
 
     /** Commit after preview — creates DADBEAR config and starts background processing */
     const handleCommit = useCallback(async () => {
@@ -752,9 +910,10 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
             }
 
             // Start the build
+            purposeAnnotationPostedRef.current = false;
             await invoke('pyramid_question_build', {
                 slug,
-                question: apexQuestion,
+                question: buildQuestion,
                 granularity: 3,
                 maxDepth: 3,
             });
@@ -765,7 +924,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         } finally {
             setCommitting(false);
         }
-    }, [previewResult, slug, contentType, paths, getEffectiveChainId, selectedProfile, apexQuestion]);
+    }, [previewResult, slug, contentType, paths, getEffectiveChainId, selectedProfile, buildQuestion, authHeaders]);
 
     /** Legacy create flow for non-conversation types (code, document) */
     const handleCreate = useCallback(async (andBuild: boolean) => {
@@ -780,6 +939,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                 slug,
                 contentType,
                 sourcePath,
+                ...(declaredPurpose ? { purposeText: declaredPurpose } : {}),
             });
 
             await invoke('pyramid_ingest', { slug });
@@ -795,9 +955,10 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                     }
                 }
 
+                purposeAnnotationPostedRef.current = false;
                 await invoke('pyramid_question_build', {
                     slug,
-                    question: apexQuestion,
+                    question: buildQuestion,
                     granularity: 3,
                     maxDepth: 3,
                 });
@@ -810,7 +971,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         } finally {
             setCreating(false);
         }
-    }, [paths, contentType, slug, apexQuestion, selectedProfile, onComplete]);
+    }, [paths, contentType, slug, declaredPurpose, buildQuestion, selectedProfile, onComplete]);
 
     const allIgnores = [
         ...DEFAULT_IGNORES,
@@ -838,7 +999,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         'conversation-preset': 'Preset',
         'vine-dirs': 'Folders',
         'configure': 'Configure',
-        'question': 'Question',
+        'question': 'Intent',
         'preview': 'Preview',
         'confirm': 'Confirm',
         'building': 'Building',
@@ -1699,21 +1860,54 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                 </div>
             )}
 
-            {/* Step: Apex Question */}
+            {/* Step: Entry point */}
             {step === 'question' && (
                 <div className="workspace-step-content">
-                    <h2>Apex Question</h2>
+                    <h2>Entry Point</h2>
                     <p className="step-description">
-                        What should this pyramid answer? The question YAML pipeline will decompose this into sub-questions and build structured understanding.
+                        Choose whether this pyramid starts from a question to answer or a purpose to serve.
                     </p>
-                    <textarea
-                        className="input"
-                        rows={3}
-                        value={apexQuestion}
-                        onChange={(e) => setApexQuestion(e.target.value)}
-                        placeholder="e.g. What are the key systems and architecture of this codebase?"
-                        style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit' }}
-                    />
+
+                    <div className="entry-mode-toggle" role="tablist" aria-label="Pyramid entry point">
+                        <button
+                            type="button"
+                            role="tab"
+                            aria-selected={entryPoint === 'question'}
+                            className={`entry-mode-button ${entryPoint === 'question' ? 'active' : ''}`}
+                            onClick={() => setEntryPoint('question')}
+                        >
+                            Question
+                        </button>
+                        <button
+                            type="button"
+                            role="tab"
+                            aria-selected={entryPoint === 'purpose'}
+                            className={`entry-mode-button ${entryPoint === 'purpose' ? 'active' : ''}`}
+                            onClick={() => setEntryPoint('purpose')}
+                        >
+                            Purpose
+                        </button>
+                    </div>
+
+                    {entryPoint === 'question' ? (
+                        <textarea
+                            className="input"
+                            rows={3}
+                            value={apexQuestion}
+                            onChange={(e) => setApexQuestion(e.target.value)}
+                            placeholder="e.g. What are the key systems and architecture of this codebase?"
+                            style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit' }}
+                        />
+                    ) : (
+                        <textarea
+                            className="input"
+                            rows={3}
+                            value={purposeText}
+                            onChange={(e) => setPurposeText(e.target.value)}
+                            placeholder="e.g. Understand this corpus well enough to guide product architecture decisions."
+                            style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit' }}
+                        />
+                    )}
 
                     {/* Model profile selector */}
                     <div style={{ marginTop: '16px' }}>
@@ -1780,7 +1974,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                             <button
                                 className="btn btn-primary"
                                 onClick={handlePreview}
-                                disabled={!apexQuestion.trim() || !slug || previewLoading}
+                                disabled={!entryText.trim() || !slug || previewLoading}
                             >
                                 {previewLoading ? 'Scanning...' : 'Preview'}
                             </button>
@@ -1788,7 +1982,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                             <button
                                 className="btn btn-primary"
                                 onClick={() => setStep('confirm')}
-                                disabled={!apexQuestion.trim()}
+                                disabled={!entryText.trim()}
                             >
                                 Next
                             </button>
@@ -1943,8 +2137,12 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                         </div>
                         {contentType !== 'vine' && (
                             <div className="summary-row">
-                                <span className="summary-label">Question:</span>
-                                <span className="summary-value">{apexQuestion}</span>
+                                <span className="summary-label">
+                                    {entryPoint === 'purpose' ? 'Purpose:' : 'Question:'}
+                                </span>
+                                <span className="summary-value">
+                                    {entryPoint === 'purpose' ? purposeText : apexQuestion}
+                                </span>
                             </div>
                         )}
                         {contentType !== 'vine' && contentType !== 'conversation' && (
@@ -2012,12 +2210,44 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                 />
             )}
             {step === 'building' && contentType !== 'vine' && (
-                <BuildProgress
-                    slug={slug}
-                    onComplete={NOOP}
-                    onClose={onComplete}
-                    requestFullScreen={(active) => setBuildFullScreen(active)}
-                />
+                <>
+                    {isPurposeBuild && purposeAnnotationState !== 'idle' && (
+                        <div className={`purpose-annotation-status ${purposeAnnotationState}`}>
+                            {purposeAnnotationState === 'posting' && (
+                                <span>Finalizing purpose declaration...</span>
+                            )}
+                            {purposeAnnotationState === 'posted' && (
+                                <span>Purpose declaration recorded.</span>
+                            )}
+                            {purposeAnnotationState === 'failed' && (
+                                <>
+                                    <div>
+                                        Purpose declaration failed.
+                                        {purposeAnnotationError && (
+                                            <span className="purpose-annotation-error">
+                                                {' '}
+                                                {purposeAnnotationError}
+                                            </span>
+                                        )}
+                                    </div>
+                                    <button
+                                        type="button"
+                                        className="btn btn-secondary"
+                                        onClick={postPurposeDeclaration}
+                                    >
+                                        Retry
+                                    </button>
+                                </>
+                            )}
+                        </div>
+                    )}
+                    <BuildProgress
+                        slug={slug}
+                        onComplete={handleBuildComplete}
+                        onClose={onComplete}
+                        requestFullScreen={handleBuildFullScreenRequest}
+                    />
+                </>
             )}
         </div>
     );
