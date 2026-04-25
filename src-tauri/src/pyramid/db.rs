@@ -9,6 +9,9 @@ use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 
 use super::naming::{clean_headline, headline_for_node};
+use super::stale_check_decision::{
+    parse_stale_check_decision_value, StaleCheckDecisionKind,
+};
 use super::types::*;
 
 // ── Database Opening ─────────────────────────────────────────────────────────
@@ -8408,13 +8411,6 @@ pub fn get_auto_update_status(conn: &Connection, slug: &str) -> Result<Option<se
     })))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StaleLogDecision {
-    Yes,
-    No,
-    Skipped,
-}
-
 fn stale_log_json_value(result_json: &str) -> Option<serde_json::Value> {
     let trimmed = result_json.trim();
     if trimmed.is_empty() {
@@ -8466,36 +8462,9 @@ fn stale_log_matching_entry<'a>(
 fn stale_log_decision_from_result(
     result_json: &str,
     target_id: Option<&str>,
-) -> Option<StaleLogDecision> {
+) -> Option<StaleCheckDecisionKind> {
     let value = stale_log_json_value(result_json)?;
-    let entries = stale_log_entries(value);
-    let entry = stale_log_matching_entry(&entries, target_id)?;
-
-    if let Some(decision) = entry
-        .get("decision")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_ascii_lowercase().replace('-', "_"))
-    {
-        return match decision.as_str() {
-            "skip" | "skipped" => Some(StaleLogDecision::Skipped),
-            "pass" | "passed" | "current" | "not_stale" | "not stale" | "no" => {
-                Some(StaleLogDecision::No)
-            }
-            "stale" | "yes" => Some(StaleLogDecision::Yes),
-            _ => None,
-        };
-    }
-
-    entry
-        .get("stale")
-        .and_then(|v| v.as_bool())
-        .map(|is_stale| {
-            if is_stale {
-                StaleLogDecision::Yes
-            } else {
-                StaleLogDecision::No
-            }
-        })
+    parse_stale_check_decision_value(&value, target_id).map(|decision| decision.kind)
 }
 
 fn stale_log_status(
@@ -8516,9 +8485,9 @@ fn stale_log_status(
 
     if let Some(decision) = stale_log_decision_from_result(result_json, target_id) {
         return match decision {
-            StaleLogDecision::Yes => "yes",
-            StaleLogDecision::No => "no",
-            StaleLogDecision::Skipped => "skipped",
+            StaleCheckDecisionKind::Stale => "yes",
+            StaleCheckDecisionKind::Pass => "no",
+            StaleCheckDecisionKind::Skip => "skipped",
         };
     }
 
@@ -8766,6 +8735,17 @@ mod stale_log_tests {
         let skipped = get_stale_log(&conn, "stale-log", None, Some("skipped"), 10, 0).unwrap();
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0]["target_id"].as_str(), Some("L1-skip"));
+    }
+
+    #[test]
+    fn stale_log_unknown_decision_uses_shared_boolean_fallback() {
+        let result_json =
+            r#"{"content":"[{\"node_id\":\"L1-pass\",\"decision\":\"unclear\",\"stale\":false,\"reason\":\"Boolean says current.\"}]"}"#;
+
+        assert_eq!(
+            stale_log_status("applied", "", result_json, Some("L1-pass")),
+            "no"
+        );
     }
 }
 

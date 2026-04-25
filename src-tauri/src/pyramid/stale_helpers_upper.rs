@@ -29,6 +29,8 @@ use super::types::{
     NodeStaleResult, PendingMutation, StaleCheckResult, Topic,
 };
 
+const UPPER_STALE_TIER: &str = "stale_remote";
+
 #[derive(Debug, Clone)]
 struct ThreadTarget {
     thread_id: String,
@@ -599,7 +601,7 @@ pub async fn dispatch_node_stale_check(
     let stale_resolved = base_config
         .provider_registry
         .as_ref()
-        .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+        .and_then(|reg| reg.resolve_tier(UPPER_STALE_TIER, None, None, None).ok());
     let ctx = match &stale_resolved {
         Some(resolved) => {
             make_step_ctx_from_llm_config(
@@ -609,7 +611,7 @@ pub async fn dispatch_node_stale_check(
                 batch[0].layer as i64,
                 None,
                 system_prompt,
-                "stale_l0",
+                UPPER_STALE_TIER,
                 Some(model),
                 Some(&resolved.provider.id),
             )
@@ -764,7 +766,7 @@ Use decision \"pass\" when the candidate is valid and current.\n\n---\n\n",
     let stale_resolved = base_config
         .provider_registry
         .as_ref()
-        .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+        .and_then(|reg| reg.resolve_tier(UPPER_STALE_TIER, None, None, None).ok());
     let ctx = match &stale_resolved {
         Some(resolved) => {
             make_step_ctx_from_llm_config(
@@ -774,7 +776,7 @@ Use decision \"pass\" when the candidate is valid and current.\n\n---\n\n",
                 batch[0].layer as i64,
                 None,
                 system_prompt,
-                "stale_l0",
+                UPPER_STALE_TIER,
                 Some(model),
                 Some(&resolved.provider.id),
             )
@@ -821,23 +823,17 @@ Use decision \"pass\" when the candidate is valid and current.\n\n---\n\n",
         }).await;
     }
 
-    let json = extract_json(&llm_resp.content)?;
-    let parsed_results: Vec<SkipAdjudicationResult> = if json.is_array() {
-        serde_json::from_value(json)
-            .context("Failed to parse skip adjudication result array from LLM response")?
-    } else {
-        vec![serde_json::from_value(json)
-            .context("Failed to parse skip adjudication result from LLM response")?]
-    };
+    let (parsed_results, parse_error) = parse_skip_adjudication_results(&llm_resp.content);
 
     Ok(skipped_nodes
         .into_iter()
-        .map(|skipped| {
+        .enumerate()
+        .map(|(skip_index, skipped)| {
             let m = &batch[skipped.source_index];
             let matched = parsed_results
                 .iter()
                 .find(|r| r.node_id == skipped.node_id)
-                .or_else(|| parsed_results.get(skipped.source_index))
+                .or_else(|| parsed_results.get(skip_index))
                 .or_else(|| parsed_results.first());
             let (stale, reason) = matched
                 .map(|result| {
@@ -845,6 +841,11 @@ Use decision \"pass\" when the candidate is valid and current.\n\n---\n\n",
                         stale_code_from_skip_adjudication(result),
                         result.reason.clone(),
                     )
+                })
+                .or_else(|| {
+                    parse_error
+                        .as_ref()
+                        .map(|err| (1, format!("LLM adjudication failed: {err}")))
                 })
                 .unwrap_or_else(|| {
                     (
@@ -873,6 +874,36 @@ Use decision \"pass\" when the candidate is valid and current.\n\n---\n\n",
             }
         })
         .collect())
+}
+
+fn parse_skip_adjudication_results(
+    content: &str,
+) -> (Vec<SkipAdjudicationResult>, Option<String>) {
+    let json = match extract_json(content) {
+        Ok(json) => json,
+        Err(e) => return (Vec::new(), Some(e.to_string())),
+    };
+    let values = if let Some(array) = json.as_array() {
+        array.clone()
+    } else {
+        vec![json]
+    };
+
+    let mut results = Vec::new();
+    let mut errors = Vec::new();
+    for (i, value) in values.into_iter().enumerate() {
+        match serde_json::from_value::<SkipAdjudicationResult>(value) {
+            Ok(result) => results.push(result),
+            Err(e) => errors.push(format!("entry {i}: {e}")),
+        }
+    }
+
+    let error = if errors.is_empty() {
+        None
+    } else {
+        Some(errors.join("; "))
+    };
+    (results, error)
 }
 
 fn stale_code_from_skip_adjudication(result: &SkipAdjudicationResult) -> i32 {
@@ -4520,8 +4551,8 @@ mod tests {
     use super::{
         apply_supersession_manifest, build_changed_children_from_deltas,
         handle_manifest_generation_failure, load_supersession_node_context,
-        lookup_source_file_path_for_node, resolve_live_canonical_node_id,
-        stale_code_from_skip_adjudication, SkipAdjudicationResult,
+        lookup_source_file_path_for_node, parse_skip_adjudication_results,
+        resolve_live_canonical_node_id, stale_code_from_skip_adjudication, SkipAdjudicationResult,
         rewrite_file_hash_node_reference, rewrite_identity_change_evidence_links,
         validate_change_manifest,
     };
@@ -4780,6 +4811,23 @@ mod tests {
         assert_eq!(stale_code_from_skip_adjudication(&result), 5);
     }
 
+    #[test]
+    fn skip_adjudication_parser_preserves_valid_entries_when_one_entry_fails() {
+        let content = r#"[
+            {"node_id":"L1-ok","decision":"skip","stale":false,"reason":"Valid entry."},
+            {"node_id":"L1-bad","decision":"skip","stale":false}
+        ]"#;
+
+        let (parsed, error) = parse_skip_adjudication_results(content);
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].node_id, "L1-ok");
+        assert!(
+            error.as_deref().unwrap_or_default().contains("entry 1"),
+            "expected per-entry parse error, got {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn dispatch_node_stale_check_llm_adjudicates_missing_thread_skip() {
         let mut server = mockito::Server::new_async().await;
@@ -4828,6 +4876,55 @@ mod tests {
         assert_eq!(
             results[0].reason,
             "LLM confirmed the target has no live thread."
+        );
+        assert_eq!(results[0].cost_tokens, Some(7));
+    }
+
+    #[tokio::test]
+    async fn dispatch_node_stale_check_defaults_stale_when_skip_adjudication_is_unparseable() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openrouter_body("not json at all"))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let (file, _conn) = setup_test_db();
+        let config = mocked_llm_config(server.url()).await;
+        let batch = vec![crate::pyramid::types::PendingMutation {
+            id: 1,
+            slug: "test-slug".to_string(),
+            layer: 1,
+            mutation_type: "node_stale_check".to_string(),
+            target_ref: "missing-node".to_string(),
+            detail: None,
+            cascade_depth: 0,
+            detected_at: "2026-04-25 00:00:00".to_string(),
+            processed: false,
+            batch_id: Some("batch-skip".to_string()),
+        }];
+
+        let results = super::dispatch_node_stale_check(
+            batch,
+            &file.path().to_string_lossy(),
+            &config,
+            "openai/gpt-4o-mini",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].target_id, "missing-node");
+        assert_eq!(results[0].stale, 1);
+        assert!(
+            results[0]
+                .reason
+                .starts_with("LLM adjudication failed:"),
+            "expected explicit LLM parse-failure reason, got {}",
+            results[0].reason
         );
         assert_eq!(results[0].cost_tokens, Some(7));
     }

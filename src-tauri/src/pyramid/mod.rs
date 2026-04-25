@@ -111,6 +111,7 @@ pub mod routes_operator;
 pub mod schema_registry;
 pub mod slug;
 pub mod stale_engine;
+pub mod stale_check_decision;
 pub mod stale_helpers;
 pub mod stale_helpers_upper;
 pub mod staleness;

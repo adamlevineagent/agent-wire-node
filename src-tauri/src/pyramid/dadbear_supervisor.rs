@@ -45,6 +45,9 @@ use crate::pyramid::event_bus::{BuildEventBus, TaggedBuildEvent, TaggedKind};
 use crate::pyramid::llm::{DispatchOrigin, LlmCallOptions, LlmConfig, LlmResponse};
 use crate::pyramid::lock_manager::LockManager;
 use crate::pyramid::observation_events;
+use crate::pyramid::stale_check_decision::{
+    parse_stale_check_decision, StaleCheckDecisionKind,
+};
 use crate::pyramid::step_context::StepContext;
 use crate::pyramid::PyramidState;
 
@@ -2825,139 +2828,6 @@ pub(crate) async fn run_re_distill_supervisor_arm(
                 target_err, slug_err,
             )))
         }
-    }
-}
-
-// ── LLM result parsers ────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum StaleCheckDecisionKind {
-    Stale,
-    Pass,
-    Skip,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StaleCheckDecision {
-    kind: StaleCheckDecisionKind,
-    reason: String,
-}
-
-fn parse_stale_check_decision(content: &str, target_id: &str) -> StaleCheckDecision {
-    // Try to extract JSON from the response.
-    let json_val = match super::llm::extract_json(content) {
-        Ok(v) => v,
-        Err(_) => {
-            // If we can't parse JSON, check for obvious indicators.
-            let lower = content.to_lowercase();
-            if lower.contains("\"decision\": \"skip\"")
-                || lower.contains("\"decision\":\"skip\"")
-                || lower.contains("\"decision\": \"skipped\"")
-                || lower.contains("\"decision\":\"skipped\"")
-            {
-                return StaleCheckDecision {
-                    kind: StaleCheckDecisionKind::Skip,
-                    reason: content.trim().to_string(),
-                };
-            }
-            if lower.contains("\"stale\": true") || lower.contains("\"stale\":true") {
-                return StaleCheckDecision {
-                    kind: StaleCheckDecisionKind::Stale,
-                    reason: content.trim().to_string(),
-                };
-            }
-            warn!(
-                target_id = %target_id,
-                "parse_stale_check_result: could not parse LLM response as JSON, defaulting to stale"
-            );
-            return StaleCheckDecision {
-                kind: StaleCheckDecisionKind::Stale,
-                reason: "LLM stale check response was not parseable".to_string(),
-            };
-        }
-    };
-
-    // Response could be an array or a single object.
-    let entries = if json_val.is_array() {
-        json_val.as_array().cloned().unwrap_or_default()
-    } else {
-        vec![json_val]
-    };
-
-    // Find matching entry.
-    let matching = entries
-        .iter()
-        .find(|e| {
-            e.get("file_path")
-                .and_then(|v| v.as_str())
-                .map(|s| s == target_id)
-                .unwrap_or(false)
-                || e.get("node_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s == target_id)
-                    .unwrap_or(false)
-        })
-        .or_else(|| entries.first());
-
-    let Some(entry) = matching else {
-        return StaleCheckDecision {
-            kind: StaleCheckDecisionKind::Stale,
-            reason: "LLM stale check response had no decision entries".to_string(),
-        };
-    };
-
-    let reason = entry
-        .get("reason")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| format!("LLM stale check for {target_id} (reason not parseable)"));
-
-    let explicit_decision = entry
-        .get("decision")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_ascii_lowercase().replace('-', "_"));
-
-    let kind = match explicit_decision.as_deref() {
-        Some("skip") | Some("skipped") => StaleCheckDecisionKind::Skip,
-        Some("pass") | Some("passed") | Some("current") | Some("not_stale")
-        | Some("not stale") | Some("no") => StaleCheckDecisionKind::Pass,
-        Some("stale") | Some("yes") => StaleCheckDecisionKind::Stale,
-        _ => {
-            if entry.get("stale").and_then(|v| v.as_bool()).unwrap_or(true) {
-                StaleCheckDecisionKind::Stale
-            } else {
-                StaleCheckDecisionKind::Pass
-            }
-        }
-    };
-
-    StaleCheckDecision { kind, reason }
-}
-
-#[cfg(test)]
-mod stale_check_decision_tests {
-    use super::*;
-
-    #[test]
-    fn stale_check_decision_parses_llm_skip_reason_verbatim() {
-        let decision = parse_stale_check_decision(
-            r#"[{"node_id":"L1-skip","decision":"skip","stale":false,"reason":"LLM confirmed duplicate live thread."}]"#,
-            "L1-skip",
-        );
-
-        assert_eq!(decision.kind, StaleCheckDecisionKind::Skip);
-        assert_eq!(decision.reason, "LLM confirmed duplicate live thread.");
-    }
-
-    #[test]
-    fn stale_check_decision_keeps_legacy_stale_boolean() {
-        let decision = parse_stale_check_decision(
-            r#"[{"node_id":"L1-pass","stale":false,"reason":"No semantic change."}]"#,
-            "L1-pass",
-        );
-
-        assert_eq!(decision.kind, StaleCheckDecisionKind::Pass);
-        assert_eq!(decision.reason, "No semantic change.");
     }
 }
 

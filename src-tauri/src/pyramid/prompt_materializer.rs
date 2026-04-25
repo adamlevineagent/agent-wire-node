@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use similar::{ChangeTag, TextDiff};
 use tracing::warn;
 
@@ -539,13 +539,17 @@ fn get_node_distilled(conn: &Connection, slug: &str, node_id: &str) -> Result<St
 /// Look up node_ids from pyramid_file_hashes for a given file path,
 /// resolving each through the supersession chain to the live canonical id.
 fn get_file_node_ids(conn: &Connection, slug: &str, file_path: &str) -> Result<Vec<String>> {
-    let json_str: String = conn
+    let json_str: Option<String> = conn
         .query_row(
             "SELECT node_ids FROM pyramid_file_hashes WHERE slug = ?1 AND file_path = ?2",
             rusqlite::params![slug, file_path],
             |row| row.get::<_, String>(0),
         )
+        .optional()
         .with_context(|| format!("Failed to get file node_ids for {}:{}", slug, file_path))?;
+    let Some(json_str) = json_str else {
+        return Ok(Vec::new());
+    };
 
     let ids: Vec<String> = serde_json::from_str(&json_str)
         .with_context(|| format!("Failed to parse node_ids JSON: {}", json_str))?;
@@ -644,6 +648,25 @@ mod tests {
     use super::*;
     use crate::pyramid::db::init_pyramid_db;
     use rusqlite::Connection;
+    use tempfile::NamedTempFile;
+
+    fn assert_skip_adjudication_prompt(result: MaterializeResult, reason_fragment: &str) {
+        match result {
+            MaterializeResult::Prompt(prompt) => {
+                assert!(
+                    prompt.user_prompt.contains("\"decision\": \"skip\""),
+                    "skip candidates must be routed through an LLM decision prompt: {}",
+                    prompt.user_prompt
+                );
+                assert!(
+                    prompt.user_prompt.contains(reason_fragment),
+                    "prompt must carry resolver reason fragment {reason_fragment:?}: {}",
+                    prompt.user_prompt
+                );
+            }
+            other => panic!("expected LLM prompt, got {other:?}"),
+        }
+    }
 
     #[test]
     fn l0_missing_file_materializes_llm_skip_adjudication_prompt() {
@@ -657,19 +680,60 @@ mod tests {
         )
         .unwrap();
 
-        match result {
-            MaterializeResult::Prompt(prompt) => {
-                assert!(
-                    prompt.user_prompt.contains("\"decision\": \"skip\""),
-                    "skip candidates must be routed through an LLM decision prompt: {}",
-                    prompt.user_prompt
-                );
-                assert!(
-                    prompt.user_prompt.contains("Cannot read file from disk"),
-                    "prompt must carry the resolver reason"
-                );
-            }
-            other => panic!("expected LLM prompt, got {other:?}"),
-        }
+        assert_skip_adjudication_prompt(result, "Cannot read file from disk");
+    }
+
+    #[test]
+    fn stale_check_former_targetgone_sites_materialize_llm_skip_prompts() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+
+        assert_skip_adjudication_prompt(
+            materialize_l0_stale_check(
+                &conn,
+                "skip-adjudication",
+                "/tmp/definitely_missing_for_stale_skip.rs",
+            )
+            .unwrap(),
+            "Cannot read file from disk",
+        );
+
+        let readable_file = NamedTempFile::new().unwrap();
+        let readable_path = readable_file.path().to_string_lossy().to_string();
+        assert_skip_adjudication_prompt(
+            materialize_l0_stale_check(&conn, "skip-adjudication", &readable_path).unwrap(),
+            "No node_ids found in pyramid_file_hashes",
+        );
+
+        assert_skip_adjudication_prompt(
+            materialize_upper_stale_check(&conn, "skip-adjudication", "missing-node", 1).unwrap(),
+            "No live canonical node found",
+        );
+
+        conn.execute(
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path)
+             VALUES ('skip-adjudication', 'document', '/tmp/source')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+             (id, slug, depth, headline, distilled, children, build_version, created_at)
+             VALUES ('empty-node', 'skip-adjudication', 1, 'Empty', '', '[]', 1, datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_threads
+             (slug, thread_id, thread_name, current_canonical_id, depth, delta_count, created_at, updated_at)
+             VALUES ('skip-adjudication', 'empty-thread', 'Empty thread', 'empty-node', 1, 0, datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        assert_skip_adjudication_prompt(
+            materialize_upper_stale_check(&conn, "skip-adjudication", "empty-thread", 1).unwrap(),
+            "No distilled content and no deltas",
+        );
     }
 }
