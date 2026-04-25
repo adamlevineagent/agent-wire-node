@@ -11184,6 +11184,41 @@ body {
     font-size: 13px;
 }
 
+.purpose-annotation-status {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    border: 1px solid rgba(34, 211, 238, 0.25);
+    border-radius: var(--radius-sm);
+    background: rgba(34, 211, 238, 0.08);
+    color: var(--text-primary);
+    font-size: 13px;
+}
+
+.purpose-annotation-status.posting {
+    color: var(--accent-cyan);
+}
+
+.purpose-annotation-status.posted {
+    border-color: rgba(64, 208, 128, 0.25);
+    background: rgba(64, 208, 128, 0.08);
+    color: var(--accent-green);
+}
+
+.purpose-annotation-status.failed {
+    align-items: flex-start;
+    border-color: rgba(239, 68, 68, 0.35);
+    background: rgba(239, 68, 68, 0.08);
+    color: #f87171;
+}
+
+.purpose-annotation-error {
+    color: var(--text-secondary);
+}
+
 .build-progress-bar-container {
     margin-bottom: 24px;
 }

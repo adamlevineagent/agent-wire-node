@@ -4518,7 +4518,7 @@ async fn pyramid_create_slug(
                 None,
                 None,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("Slug created but failed to declare purpose: {e}"))?;
         }
         drop(conn);
 

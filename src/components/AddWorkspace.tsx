@@ -26,6 +26,7 @@ type Step =
     | 'folder-ingest-review';
 
 type EntryPoint = 'question' | 'purpose';
+type PurposeAnnotationState = 'idle' | 'posting' | 'posted' | 'failed';
 
 // Phase 17 / Phase 18e IPC shapes — must match `folder_ingestion.rs`.
 //
@@ -97,21 +98,67 @@ const DEFAULT_QUESTIONS: Record<string, string> = {
 
 function purposeToBuildQuestion(purpose: string): string {
     const trimmed = purpose.trim();
+    if (!trimmed) return '';
     return `What evidence, concepts, decisions, and relationships should this pyramid capture to fulfill this purpose: ${trimmed}`;
 }
 
-function findFirstTreeNodeId(value: unknown): string | null {
+interface TreeCandidate {
+    id: string;
+    depth: number;
+    isQuestion: boolean;
+    isForeign: boolean;
+    answerNodeId: string | null;
+}
+
+function stringField(record: Record<string, unknown>, key: string): string | null {
+    const value = record[key];
+    return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function numericDepth(value: unknown): number {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string') {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed)) return parsed;
+    }
+    return Number.NEGATIVE_INFINITY;
+}
+
+function collectTreeCandidates(value: unknown, candidates: TreeCandidate[] = []): TreeCandidate[] {
     if (Array.isArray(value)) {
         for (const item of value) {
-            const id = findFirstTreeNodeId(item);
-            if (id) return id;
+            collectTreeCandidates(item, candidates);
         }
-        return null;
+        return candidates;
     }
-    if (typeof value !== 'object' || value === null) return null;
+    if (typeof value !== 'object' || value === null) return candidates;
     const record = value as Record<string, unknown>;
-    if (typeof record.id === 'string' && record.id.trim()) return record.id;
-    return findFirstTreeNodeId(record.children);
+    const id = stringField(record, 'id');
+    const answerNodeId = stringField(record, 'answer_node_id');
+    if (id || answerNodeId) {
+        candidates.push({
+            id: id ?? '',
+            depth: numericDepth(record.depth),
+            isQuestion: stringField(record, 'node_kind') === 'question',
+            isForeign: Boolean(stringField(record, 'source_slug')),
+            answerNodeId,
+        });
+    }
+    collectTreeCandidates(record.children, candidates);
+    return candidates;
+}
+
+function findApexTreeNodeId(value: unknown): string | null {
+    const candidates = collectTreeCandidates(value);
+    const sameSlugNodes = candidates
+        .filter(candidate => candidate.id && !candidate.isQuestion && !candidate.isForeign)
+        .sort((a, b) => b.depth - a.depth || a.id.localeCompare(b.id));
+    if (sameSlugNodes[0]) return sameSlugNodes[0].id;
+
+    const linkedAnswerNodes = candidates
+        .filter(candidate => candidate.answerNodeId && !candidate.isForeign)
+        .sort((a, b) => b.depth - a.depth || a.id.localeCompare(b.id));
+    return linkedAnswerNodes[0]?.answerNodeId ?? null;
 }
 
 const DEFAULT_IGNORES = [
@@ -246,6 +293,9 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
     // Build fullscreen: collapse wizard chrome when build is running
     const [buildFullScreen, setBuildFullScreen] = useState(false);
     const purposeAnnotationPostedRef = useRef(false);
+    const purposeAnnotationPendingRef = useRef(false);
+    const [purposeAnnotationState, setPurposeAnnotationState] = useState<PurposeAnnotationState>('idle');
+    const [purposeAnnotationError, setPurposeAnnotationError] = useState<string | null>(null);
 
     // Auth token for HTTP fetches
     const [authToken, setAuthToken] = useState('');
@@ -281,22 +331,30 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         return 'question-pipeline';
     }, [contentType, conversationPreset]);
 
-    const entryText = entryPoint === 'purpose' ? purposeText : apexQuestion;
-    const buildQuestion = useMemo(
-        () => entryPoint === 'purpose' ? purposeToBuildQuestion(purposeText) : apexQuestion,
-        [entryPoint, purposeText, apexQuestion],
-    );
+    const questionText = apexQuestion.trim();
     const declaredPurpose = entryPoint === 'purpose' ? purposeText.trim() : '';
+    const entryText = entryPoint === 'purpose' ? declaredPurpose : questionText;
+    const buildQuestion = useMemo(
+        () => entryPoint === 'purpose' ? purposeToBuildQuestion(declaredPurpose) : questionText,
+        [entryPoint, declaredPurpose, questionText],
+    );
+    const isPurposeBuild = entryPoint === 'purpose' && Boolean(declaredPurpose);
 
     useEffect(() => {
         purposeAnnotationPostedRef.current = false;
+        purposeAnnotationPendingRef.current = false;
+        setPurposeAnnotationState('idle');
+        setPurposeAnnotationError(null);
     }, [slug, declaredPurpose]);
 
-    const handleBuildComplete = useCallback(async (status: { status: string }) => {
-        if (!['complete', 'complete_with_errors'].includes(status.status)) return;
-        if (entryPoint !== 'purpose' || !declaredPurpose || !slug) return;
+    const postPurposeDeclaration = useCallback(async () => {
+        if (!isPurposeBuild || !slug) return;
         if (purposeAnnotationPostedRef.current) return;
         purposeAnnotationPostedRef.current = true;
+        purposeAnnotationPendingRef.current = true;
+        setPurposeAnnotationState('posting');
+        setPurposeAnnotationError(null);
+        setError(null);
 
         try {
             const treeResp = await fetch(`${PYRAMID_API_BASE}/pyramid/${slug}/tree`, {
@@ -306,9 +364,9 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                 throw new Error(`Purpose annotation tree lookup failed (${treeResp.status})`);
             }
             const tree = await treeResp.json();
-            const nodeId = findFirstTreeNodeId(tree);
+            const nodeId = findApexTreeNodeId(tree);
             if (!nodeId) {
-                throw new Error('Purpose annotation could not find a built pyramid node');
+                throw new Error('Purpose annotation could not find the built pyramid apex');
             }
 
             const annotateResp = await fetch(`${PYRAMID_API_BASE}/pyramid/${slug}/annotate`, {
@@ -325,11 +383,34 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                 const errBody = await annotateResp.text();
                 throw new Error(`Purpose annotation failed (${annotateResp.status}): ${errBody}`);
             }
+            setPurposeAnnotationState('posted');
+            purposeAnnotationPendingRef.current = false;
+            setBuildFullScreen(false);
         } catch (err) {
             purposeAnnotationPostedRef.current = false;
-            setError(String(err));
+            purposeAnnotationPendingRef.current = false;
+            const message = String(err);
+            console.error('Purpose declaration annotation failed', { slug, error: err });
+            setPurposeAnnotationState('failed');
+            setPurposeAnnotationError(message);
+            setError(`Purpose declaration did not finish: ${message}`);
+            setBuildFullScreen(false);
         }
-    }, [entryPoint, declaredPurpose, slug, authHeaders]);
+    }, [isPurposeBuild, declaredPurpose, slug, authHeaders]);
+
+    const handleBuildComplete = useCallback(async (status: { status: string }) => {
+        if (!['complete', 'complete_with_errors'].includes(status.status)) return;
+        await postPurposeDeclaration();
+    }, [postPurposeDeclaration]);
+
+    const handleBuildFullScreenRequest = useCallback((active: boolean) => {
+        if (
+            !active &&
+            isPurposeBuild &&
+            (purposeAnnotationState === 'posting' || purposeAnnotationPendingRef.current)
+        ) return;
+        setBuildFullScreen(active);
+    }, [isPurposeBuild, purposeAnnotationState]);
 
     const handlePickDirectory = useCallback(async () => {
         try {
@@ -2129,12 +2210,44 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                 />
             )}
             {step === 'building' && contentType !== 'vine' && (
-                <BuildProgress
-                    slug={slug}
-                    onComplete={handleBuildComplete}
-                    onClose={onComplete}
-                    requestFullScreen={(active) => setBuildFullScreen(active)}
-                />
+                <>
+                    {isPurposeBuild && purposeAnnotationState !== 'idle' && (
+                        <div className={`purpose-annotation-status ${purposeAnnotationState}`}>
+                            {purposeAnnotationState === 'posting' && (
+                                <span>Finalizing purpose declaration...</span>
+                            )}
+                            {purposeAnnotationState === 'posted' && (
+                                <span>Purpose declaration recorded.</span>
+                            )}
+                            {purposeAnnotationState === 'failed' && (
+                                <>
+                                    <div>
+                                        Purpose declaration failed.
+                                        {purposeAnnotationError && (
+                                            <span className="purpose-annotation-error">
+                                                {' '}
+                                                {purposeAnnotationError}
+                                            </span>
+                                        )}
+                                    </div>
+                                    <button
+                                        type="button"
+                                        className="btn btn-secondary"
+                                        onClick={postPurposeDeclaration}
+                                    >
+                                        Retry
+                                    </button>
+                                </>
+                            )}
+                        </div>
+                    )}
+                    <BuildProgress
+                        slug={slug}
+                        onComplete={handleBuildComplete}
+                        onClose={onComplete}
+                        requestFullScreen={handleBuildFullScreenRequest}
+                    />
+                </>
             )}
         </div>
     );
