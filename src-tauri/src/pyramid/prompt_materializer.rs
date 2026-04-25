@@ -191,18 +191,26 @@ fn materialize_l0_stale_check(
     let new_content = match std::fs::read_to_string(file_path) {
         Ok(c) => c,
         Err(e) => {
-            return Ok(MaterializeResult::TargetGone {
-                reason: format!("Cannot read file from disk: {file_path}: {e}"),
-            });
+            return Ok(materialize_stale_skip_adjudication(
+                slug,
+                file_path,
+                0,
+                "file",
+                &format!("Cannot read file from disk: {file_path}: {e}"),
+            ));
         }
     };
 
     // Look up node_ids from pyramid_file_hashes.
     let node_ids = get_file_node_ids(conn, slug, file_path)?;
     if node_ids.is_empty() {
-        return Ok(MaterializeResult::TargetGone {
-            reason: format!("No node_ids found in pyramid_file_hashes for {file_path}"),
-        });
+        return Ok(materialize_stale_skip_adjudication(
+            slug,
+            file_path,
+            0,
+            "file",
+            &format!("No node_ids found in pyramid_file_hashes for {file_path}"),
+        ));
     }
 
     // Concatenate distilled content from all chunks.
@@ -275,11 +283,13 @@ fn materialize_upper_stale_check(
     let canonical_id = match canonical_id {
         Some(id) => id,
         None => {
-            return Ok(MaterializeResult::TargetGone {
-                reason: format!(
-                    "No live canonical node found for target {target_id} in slug {slug}"
-                ),
-            });
+            return Ok(materialize_stale_skip_adjudication(
+                slug,
+                target_id,
+                layer,
+                "node",
+                &format!("No live canonical node found for target {target_id} in slug {slug}"),
+            ));
         }
     };
 
@@ -324,11 +334,15 @@ fn materialize_upper_stale_check(
     }
 
     if delta_content.is_empty() && distilled.is_empty() {
-        return Ok(MaterializeResult::TargetGone {
-            reason: format!(
+        return Ok(materialize_stale_skip_adjudication(
+            slug,
+            target_id,
+            layer,
+            "node",
+            &format!(
                 "No distilled content and no deltas for node {canonical_id} (thread {effective_thread_id})"
             ),
-        });
+        ));
     }
 
     // Template 2 system prompt (replicated from stale_helpers_upper.rs).
@@ -370,6 +384,46 @@ fn materialize_upper_stale_check(
         temperature: 0.1,
         max_tokens: 2048,
     }))
+}
+
+fn materialize_stale_skip_adjudication(
+    slug: &str,
+    target_id: &str,
+    layer: i64,
+    target_kind: &str,
+    candidate_reason: &str,
+) -> MaterializeResult {
+    let id_field = if target_kind == "file" {
+        "file_path"
+    } else {
+        "node_id"
+    };
+    let system_prompt = "\
+You are adjudicating a stale-check candidate that could not be checked by the \
+normal resolver. Do not approve a skip mechanically. Decide whether the \
+candidate should be skipped, marked stale, or treated as passing. Output JSON \
+only.";
+    let user_prompt = format!(
+        "Pyramid slug: {slug}\nLayer: L{layer}\nTarget kind: {target_kind}\nTarget ID: {target_id}\n\n\
+The stale-check candidate appears skippable because:\n{candidate_reason}\n\n\
+Confirm or deny that skip. Use decision \"skip\" only when no meaningful stale \
+check can be performed for this candidate. Use decision \"stale\" when the \
+candidate should still force repair or operator attention. Use decision \
+\"pass\" when the candidate is valid and current.\n\n\
+Output JSON only. Array with one object:\n\
+[{{\"{id_field}\": \"{target_id}\", \"decision\": \"skip\", \"stale\": false, \"reason\": \"one sentence, verbatim for the Stale Check Log\"}}]"
+    );
+    let hash_source = format!("{system_prompt}\n{user_prompt}");
+
+    MaterializeResult::Prompt(MaterializedPrompt {
+        system_prompt: system_prompt.to_string(),
+        user_prompt,
+        model_tier: "stale_remote".into(),
+        resolved_model_id: None,
+        prompt_hash: compute_prompt_hash(&hash_source),
+        temperature: 0.1,
+        max_tokens: 512,
+    })
 }
 
 // ── Rename check (Template 4) ─────────────────────────────────────────────
@@ -583,4 +637,39 @@ fn parse_rename_target_id(target_id: &str) -> Option<(String, String)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pyramid::db::init_pyramid_db;
+    use rusqlite::Connection;
+
+    #[test]
+    fn l0_missing_file_materializes_llm_skip_adjudication_prompt() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+
+        let result = materialize_l0_stale_check(
+            &conn,
+            "skip-adjudication",
+            "/tmp/definitely_missing_for_stale_skip.rs",
+        )
+        .unwrap();
+
+        match result {
+            MaterializeResult::Prompt(prompt) => {
+                assert!(
+                    prompt.user_prompt.contains("\"decision\": \"skip\""),
+                    "skip candidates must be routed through an LLM decision prompt: {}",
+                    prompt.user_prompt
+                );
+                assert!(
+                    prompt.user_prompt.contains("Cannot read file from disk"),
+                    "prompt must carry the resolver reason"
+                );
+            }
+            other => panic!("expected LLM prompt, got {other:?}"),
+        }
+    }
 }

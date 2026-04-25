@@ -8408,6 +8408,185 @@ pub fn get_auto_update_status(conn: &Connection, slug: &str) -> Result<Option<se
     })))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleLogDecision {
+    Yes,
+    No,
+    Skipped,
+}
+
+fn stale_log_json_value(result_json: &str) -> Option<serde_json::Value> {
+    let trimmed = result_json.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(outer) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(content) = outer.get("content").and_then(|v| v.as_str()) {
+            return super::llm::extract_json(content)
+                .ok()
+                .or_else(|| serde_json::from_str::<serde_json::Value>(content).ok());
+        }
+        return Some(outer);
+    }
+
+    super::llm::extract_json(trimmed).ok()
+}
+
+fn stale_log_entries(value: serde_json::Value) -> Vec<serde_json::Value> {
+    if value.is_array() {
+        value.as_array().cloned().unwrap_or_default()
+    } else {
+        vec![value]
+    }
+}
+
+fn stale_log_matching_entry<'a>(
+    entries: &'a [serde_json::Value],
+    target_id: Option<&str>,
+) -> Option<&'a serde_json::Value> {
+    target_id
+        .and_then(|target| {
+            entries.iter().find(|entry| {
+                entry
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == target)
+                    .unwrap_or(false)
+                    || entry
+                        .get("node_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s == target)
+                        .unwrap_or(false)
+            })
+        })
+        .or_else(|| entries.first())
+}
+
+fn stale_log_decision_from_result(
+    result_json: &str,
+    target_id: Option<&str>,
+) -> Option<StaleLogDecision> {
+    let value = stale_log_json_value(result_json)?;
+    let entries = stale_log_entries(value);
+    let entry = stale_log_matching_entry(&entries, target_id)?;
+
+    if let Some(decision) = entry
+        .get("decision")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase().replace('-', "_"))
+    {
+        return match decision.as_str() {
+            "skip" | "skipped" => Some(StaleLogDecision::Skipped),
+            "pass" | "passed" | "current" | "not_stale" | "not stale" | "no" => {
+                Some(StaleLogDecision::No)
+            }
+            "stale" | "yes" => Some(StaleLogDecision::Yes),
+            _ => None,
+        };
+    }
+
+    entry
+        .get("stale")
+        .and_then(|v| v.as_bool())
+        .map(|is_stale| {
+            if is_stale {
+                StaleLogDecision::Yes
+            } else {
+                StaleLogDecision::No
+            }
+        })
+}
+
+fn stale_log_status(
+    state: &str,
+    action: &str,
+    result_json: &str,
+    target_id: Option<&str>,
+) -> &'static str {
+    if action == "skipped" {
+        return "skipped";
+    }
+    if action == "not_stale" {
+        return "no";
+    }
+    if action.starts_with("superseded:") || action.starts_with("supersession_failed:") {
+        return "yes";
+    }
+
+    if let Some(decision) = stale_log_decision_from_result(result_json, target_id) {
+        return match decision {
+            StaleLogDecision::Yes => "yes",
+            StaleLogDecision::No => "no",
+            StaleLogDecision::Skipped => "skipped",
+        };
+    }
+
+    match state {
+        "applied" => "yes",
+        "completed" => "no",
+        "failed" | "stale" => "skipped",
+        _ => "unknown",
+    }
+}
+
+fn stale_log_reason_from_result(result_json: &str, target_id: Option<&str>) -> Option<String> {
+    let trimmed = result_json.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(outer) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(reason) = outer.get("reason").and_then(|v| v.as_str()) {
+            return Some(reason.to_string());
+        }
+        if let Some(content) = outer.get("content").and_then(|v| v.as_str()) {
+            if let Some(value) = stale_log_json_value(content) {
+                let entries = stale_log_entries(value);
+                if let Some(reason) = stale_log_matching_entry(&entries, target_id)
+                    .and_then(|entry| entry.get("reason"))
+                    .and_then(|v| v.as_str())
+                {
+                    return Some(reason.to_string());
+                }
+            }
+            let content_trimmed = content.trim();
+            if !content_trimmed.is_empty() {
+                return Some(content_trimmed.to_string());
+            }
+        }
+
+        let entries = stale_log_entries(outer);
+        if let Some(reason) = stale_log_matching_entry(&entries, target_id)
+            .and_then(|entry| entry.get("reason"))
+            .and_then(|v| v.as_str())
+        {
+            return Some(reason.to_string());
+        }
+    }
+
+    if let Some(value) = stale_log_json_value(trimmed) {
+        let entries = stale_log_entries(value);
+        if let Some(reason) = stale_log_matching_entry(&entries, target_id)
+            .and_then(|entry| entry.get("reason"))
+            .and_then(|v| v.as_str())
+        {
+            return Some(reason.to_string());
+        }
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn stale_log_reason(result_json: &str, target_id: Option<&str>, status: &str) -> String {
+    stale_log_reason_from_result(result_json, target_id).unwrap_or_else(|| match status {
+        "skipped" => "Skipped stale check (reason unavailable from existing row)".to_string(),
+        "no" => "Stale check passed (reason unavailable from existing row)".to_string(),
+        "yes" => "Stale check marked stale (reason unavailable from existing row)".to_string(),
+        _ => String::new(),
+    })
+}
+
 /// Query stale check log entries from dadbear_work_items (canonical source).
 pub fn get_stale_log(
     conn: &Connection,
@@ -8422,10 +8601,14 @@ pub fn get_stale_log(
     let mut sql = String::from(
         "SELECT wi.id, wi.slug, wi.batch_id, wi.layer, wi.target_id,
                 wi.state, COALESCE(wi.result_json, ''),
+                COALESCE(app.action, ''),
                 wi.chunk_index, 1,
-                COALESCE(wi.completed_at, wi.compiled_at),
+                COALESCE(wi.completed_at, wi.applied_at, wi.compiled_at),
                 wi.result_tokens_in, wi.result_cost_usd
-         FROM dadbear_work_items wi WHERE wi.slug = ?1",
+         FROM dadbear_work_items wi
+         LEFT JOIN dadbear_result_applications app
+           ON app.work_item_id = wi.id
+         WHERE wi.slug = ?1",
     );
     let mut param_vals: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     param_vals.push(Box::new(slug.to_string()));
@@ -8435,14 +8618,22 @@ pub fn get_stale_log(
         sql.push_str(&format!(" AND wi.layer = ?{}", param_vals.len()));
     }
     if let Some(stale_str) = stale {
-        // Map old stale filter to work_item state filter
-        let state_filter: &str = match stale_str {
-            "yes" | "true" | "1" => "applied",
-            "no" | "false" | "0" => "completed",
-            _ => "applied",
+        let status_filter = match stale_str {
+            "yes" | "true" | "1" => {
+                " AND (app.action LIKE 'superseded:%'
+                       OR app.action LIKE 'supersession_failed:%'
+                       OR (app.action IS NULL AND wi.state = 'applied'))"
+            }
+            "no" | "false" | "0" => {
+                " AND (app.action = 'not_stale'
+                       OR (app.action IS NULL AND wi.state = 'completed'))"
+            }
+            "skipped" | "skip" | "5" => {
+                " AND (app.action = 'skipped' OR wi.state IN ('stale', 'failed'))"
+            }
+            _ => "",
         };
-        param_vals.push(Box::new(state_filter.to_string()));
-        sql.push_str(&format!(" AND wi.state = ?{}", param_vals.len()));
+        sql.push_str(status_filter);
     }
 
     param_vals.push(Box::new(limit));
@@ -8459,30 +8650,123 @@ pub fn get_stale_log(
 
     let rows: Vec<serde_json::Value> = stmt
         .query_map(param_refs.as_slice(), |row| {
+            let target_id = row.get::<_, Option<String>>(4)?;
+            let state = row.get::<_, String>(5)?;
+            let result_json = row.get::<_, String>(6)?;
+            let action = row.get::<_, String>(7)?;
+            let status =
+                stale_log_status(&state, &action, &result_json, target_id.as_deref());
+            let reason = stale_log_reason(&result_json, target_id.as_deref(), status);
+
             Ok(serde_json::json!({
                 "id": row.get::<_, String>(0)?,
                 "slug": row.get::<_, String>(1)?,
                 "batch_id": row.get::<_, String>(2)?,
                 "layer": row.get::<_, i32>(3)?,
-                "target_id": row.get::<_, Option<String>>(4)?,
-                "stale": match row.get::<_, String>(5)?.as_str() {
-                    "applied" => "yes",
-                    "completed" => "no",
-                    "failed" => "skipped",
-                    _ => "unknown",
-                },
-                "reason": row.get::<_, String>(6)?,
-                "checker_index": row.get::<_, Option<i32>>(7)?,
-                "checker_batch_size": row.get::<_, i32>(8)?,
-                "checked_at": row.get::<_, String>(9)?,
-                "cost_tokens": row.get::<_, Option<i64>>(10)?,
-                "cost_usd": row.get::<_, Option<f64>>(11)?,
+                "target_id": target_id,
+                "stale": status,
+                "reason": reason,
+                "checker_index": row.get::<_, Option<i32>>(8)?,
+                "checker_batch_size": row.get::<_, i32>(9)?,
+                "checked_at": row.get::<_, String>(10)?,
+                "cost_tokens": row.get::<_, Option<i64>>(11)?,
+                "cost_usd": row.get::<_, Option<f64>>(12)?,
             }))
         })
         .map(|iter| iter.filter_map(|r| r.ok()).collect())
         .unwrap_or_default();
 
     Ok(rows)
+}
+
+#[cfg(test)]
+mod stale_log_tests {
+    use super::*;
+    use rusqlite::params;
+
+    fn insert_work_item(
+        conn: &Connection,
+        id: &str,
+        target_id: &str,
+        result_json: &str,
+        action: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO dadbear_work_items
+                (id, slug, batch_id, epoch_id, step_name, primitive,
+                 layer, target_id, system_prompt, user_prompt, model_tier,
+                 result_json, compiled_at, state, state_changed_at,
+                 completed_at, applied_at)
+             VALUES (?1, 'stale-log', 'b1', 'e1', 'stale', 'stale_check',
+                     1, ?2, '', '', 'stale_remote',
+                     ?3, datetime('now'), 'applied', datetime('now'),
+                     datetime('now'), datetime('now'))",
+            params![id, target_id, result_json],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dadbear_result_applications
+                (work_item_id, slug, target_id, action, applied_at)
+             VALUES (?1, 'stale-log', ?2, ?3, datetime('now'))",
+            params![id, target_id, action],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stale_log_uses_llm_reason_and_application_action_for_status() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+
+        insert_work_item(
+            &conn,
+            "wi-skip",
+            "L1-skip",
+            r#"{"content":"[{\"node_id\":\"L1-skip\",\"decision\":\"skip\",\"stale\":false,\"reason\":\"LLM confirmed duplicate live thread.\"}]"}"#,
+            "skipped",
+        );
+        insert_work_item(
+            &conn,
+            "wi-pass",
+            "L1-pass",
+            r#"{"content":"[{\"node_id\":\"L1-pass\",\"stale\":false,\"reason\":\"LLM says the summary is still current.\"}]"}"#,
+            "not_stale",
+        );
+        insert_work_item(
+            &conn,
+            "wi-stale",
+            "L1-stale",
+            r#"{"content":"[{\"node_id\":\"L1-stale\",\"stale\":true,\"reason\":\"LLM found a semantic delta.\"}]"}"#,
+            "superseded:L1-stale-v2",
+        );
+
+        let rows = get_stale_log(&conn, "stale-log", None, None, 10, 0).unwrap();
+        let by_target = |target: &str| {
+            rows.iter()
+                .find(|row| row["target_id"].as_str() == Some(target))
+                .unwrap_or_else(|| panic!("missing target {target}: {rows:#?}"))
+        };
+
+        assert_eq!(by_target("L1-skip")["stale"].as_str(), Some("skipped"));
+        assert_eq!(
+            by_target("L1-skip")["reason"].as_str(),
+            Some("LLM confirmed duplicate live thread.")
+        );
+        assert_eq!(by_target("L1-pass")["stale"].as_str(), Some("no"));
+        assert_eq!(
+            by_target("L1-pass")["reason"].as_str(),
+            Some("LLM says the summary is still current.")
+        );
+        assert_eq!(by_target("L1-stale")["stale"].as_str(), Some("yes"));
+        assert_eq!(
+            by_target("L1-stale")["reason"].as_str(),
+            Some("LLM found a semantic delta.")
+        );
+
+        let skipped = get_stale_log(&conn, "stale-log", None, Some("skipped"), 10, 0).unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0]["target_id"].as_str(), Some("L1-skip"));
+    }
 }
 
 /// Insert a cost log entry with full P1.5 observatory columns.
@@ -20256,8 +20540,8 @@ mod phase13_tests {
         seed_dadbear_folder_hierarchy(&conn);
         // Freeze one slug via holds projection.
         conn.execute(
-            "INSERT INTO dadbear_holds_projection (slug, hold, source, acquired_at)
-             VALUES ('p18c-d', 'frozen', 'test', datetime('now'))",
+            "INSERT INTO dadbear_holds_projection (slug, hold, held_since, reason)
+             VALUES ('p18c-d', 'frozen', datetime('now'), 'test')",
             [],
         )
         .unwrap();
@@ -20283,8 +20567,8 @@ mod phase13_tests {
         // Freeze the /a slugs via holds projection (canonical path).
         for slug in &["p18c-a", "p18c-ab", "p18c-abc"] {
             conn.execute(
-                "INSERT INTO dadbear_holds_projection (slug, hold, source, acquired_at)
-                 VALUES (?1, 'frozen', 'test', datetime('now'))",
+                "INSERT INTO dadbear_holds_projection (slug, hold, held_since, reason)
+                 VALUES (?1, 'frozen', datetime('now'), 'test')",
                 rusqlite::params![slug],
             )
             .unwrap();

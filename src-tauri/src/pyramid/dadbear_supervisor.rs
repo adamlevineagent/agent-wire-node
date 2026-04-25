@@ -1300,9 +1300,9 @@ impl DadbearSupervisor {
             match primitive.as_str() {
                 "stale_check" | "node_stale_check" => {
                     // Parse stale check response.
-                    let is_stale = parse_stale_check_result(content, &target_id);
+                    let decision = parse_stale_check_decision(content, &target_id);
 
-                    if is_stale {
+                    if decision.kind == StaleCheckDecisionKind::Stale {
                         // Node is stale — trigger supersession.
                         info!(
                             work_item_id = %work_item_id,
@@ -1351,6 +1351,14 @@ impl DadbearSupervisor {
                                 action = format!("supersession_failed:{}", e);
                             }
                         }
+                    } else if decision.kind == StaleCheckDecisionKind::Skip {
+                        action = "skipped".to_string();
+                        info!(
+                            work_item_id = %work_item_id,
+                            target_id = %target_id,
+                            reason = %decision.reason,
+                            "DADBEAR supervisor: stale check skip confirmed by LLM"
+                        );
                     } else {
                         action = "not_stale".to_string();
                         info!(
@@ -2822,26 +2830,50 @@ pub(crate) async fn run_re_distill_supervisor_arm(
 
 // ── LLM result parsers ────────────────────────────────────────────────────
 
-/// Parse a stale check LLM response to determine if the target is stale.
-///
-/// The response is expected to be JSON: `[{"file_path"|"node_id": "...", "stale": true/false, "reason": "..."}]`
-/// We look for the first entry matching the target_id, or fall back to the first entry.
-/// Returns true if the node is stale.
-fn parse_stale_check_result(content: &str, target_id: &str) -> bool {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StaleCheckDecisionKind {
+    Stale,
+    Pass,
+    Skip,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaleCheckDecision {
+    kind: StaleCheckDecisionKind,
+    reason: String,
+}
+
+fn parse_stale_check_decision(content: &str, target_id: &str) -> StaleCheckDecision {
     // Try to extract JSON from the response.
     let json_val = match super::llm::extract_json(content) {
         Ok(v) => v,
         Err(_) => {
             // If we can't parse JSON, check for obvious indicators.
             let lower = content.to_lowercase();
+            if lower.contains("\"decision\": \"skip\"")
+                || lower.contains("\"decision\":\"skip\"")
+                || lower.contains("\"decision\": \"skipped\"")
+                || lower.contains("\"decision\":\"skipped\"")
+            {
+                return StaleCheckDecision {
+                    kind: StaleCheckDecisionKind::Skip,
+                    reason: content.trim().to_string(),
+                };
+            }
             if lower.contains("\"stale\": true") || lower.contains("\"stale\":true") {
-                return true;
+                return StaleCheckDecision {
+                    kind: StaleCheckDecisionKind::Stale,
+                    reason: content.trim().to_string(),
+                };
             }
             warn!(
                 target_id = %target_id,
                 "parse_stale_check_result: could not parse LLM response as JSON, defaulting to stale"
             );
-            return true; // Default to stale when uncertain.
+            return StaleCheckDecision {
+                kind: StaleCheckDecisionKind::Stale,
+                reason: "LLM stale check response was not parseable".to_string(),
+            };
         }
     };
 
@@ -2867,9 +2899,65 @@ fn parse_stale_check_result(content: &str, target_id: &str) -> bool {
         })
         .or_else(|| entries.first());
 
-    match matching {
-        Some(entry) => entry.get("stale").and_then(|v| v.as_bool()).unwrap_or(true), // Default to stale when uncertain.
-        None => true,
+    let Some(entry) = matching else {
+        return StaleCheckDecision {
+            kind: StaleCheckDecisionKind::Stale,
+            reason: "LLM stale check response had no decision entries".to_string(),
+        };
+    };
+
+    let reason = entry
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| format!("LLM stale check for {target_id} (reason not parseable)"));
+
+    let explicit_decision = entry
+        .get("decision")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase().replace('-', "_"));
+
+    let kind = match explicit_decision.as_deref() {
+        Some("skip") | Some("skipped") => StaleCheckDecisionKind::Skip,
+        Some("pass") | Some("passed") | Some("current") | Some("not_stale")
+        | Some("not stale") | Some("no") => StaleCheckDecisionKind::Pass,
+        Some("stale") | Some("yes") => StaleCheckDecisionKind::Stale,
+        _ => {
+            if entry.get("stale").and_then(|v| v.as_bool()).unwrap_or(true) {
+                StaleCheckDecisionKind::Stale
+            } else {
+                StaleCheckDecisionKind::Pass
+            }
+        }
+    };
+
+    StaleCheckDecision { kind, reason }
+}
+
+#[cfg(test)]
+mod stale_check_decision_tests {
+    use super::*;
+
+    #[test]
+    fn stale_check_decision_parses_llm_skip_reason_verbatim() {
+        let decision = parse_stale_check_decision(
+            r#"[{"node_id":"L1-skip","decision":"skip","stale":false,"reason":"LLM confirmed duplicate live thread."}]"#,
+            "L1-skip",
+        );
+
+        assert_eq!(decision.kind, StaleCheckDecisionKind::Skip);
+        assert_eq!(decision.reason, "LLM confirmed duplicate live thread.");
+    }
+
+    #[test]
+    fn stale_check_decision_keeps_legacy_stale_boolean() {
+        let decision = parse_stale_check_decision(
+            r#"[{"node_id":"L1-pass","stale":false,"reason":"No semantic change."}]"#,
+            "L1-pass",
+        );
+
+        assert_eq!(decision.kind, StaleCheckDecisionKind::Pass);
+        assert_eq!(decision.reason, "No semantic change.");
     }
 }
 
