@@ -27,6 +27,7 @@ use super::payment_redeemer;
 use super::preview;
 use super::primer;
 use super::publication;
+use super::purpose;
 use super::query;
 use super::reading_modes;
 use super::recovery;
@@ -487,6 +488,11 @@ struct CreateSlugBody {
     /// chain's metadata + into the approved-question annotation.
     #[serde(default)]
     author: Option<String>,
+    /// Optional initial purpose declaration. When provided, slug
+    /// creation supersedes the stock content-type purpose immediately
+    /// and emits the canonical purpose_shifted observation event.
+    #[serde(default)]
+    purpose_text: Option<String>,
 }
 
 /// Phase 9b-4: `POST /pyramid/:slug/propose_question` body.
@@ -4296,6 +4302,26 @@ async fn handle_create_slug(
                     return Ok(json_error(
                         warp::http::StatusCode::INTERNAL_SERVER_ERROR,
                         &format!("Slug created but failed to save references: {}", e),
+                    ));
+                }
+            }
+            if let Some(purpose_text) = body
+                .purpose_text
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+            {
+                if let Err(e) = purpose::supersede_purpose(
+                    &conn,
+                    &info.slug,
+                    purpose_text,
+                    Some("initial-purpose-declaration"),
+                    None,
+                    None,
+                ) {
+                    return Ok(json_error(
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("Slug created but failed to declare purpose: {e}"),
                     ));
                 }
             }

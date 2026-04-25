@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { BuildProgress } from './BuildProgress';
@@ -24,6 +24,8 @@ type Step =
     // Phase 17: recursive folder ingestion wizard
     | 'folder-ingest-pick'
     | 'folder-ingest-review';
+
+type EntryPoint = 'question' | 'purpose';
 
 // Phase 17 / Phase 18e IPC shapes — must match `folder_ingestion.rs`.
 //
@@ -92,6 +94,25 @@ const DEFAULT_QUESTIONS: Record<string, string> = {
     document: "What are the key concepts, decisions, and relationships in these documents?",
     conversation: "What are the key themes, decisions, and evolution across these conversations?",
 };
+
+function purposeToBuildQuestion(purpose: string): string {
+    const trimmed = purpose.trim();
+    return `What evidence, concepts, decisions, and relationships should this pyramid capture to fulfill this purpose: ${trimmed}`;
+}
+
+function findFirstTreeNodeId(value: unknown): string | null {
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            const id = findFirstTreeNodeId(item);
+            if (id) return id;
+        }
+        return null;
+    }
+    if (typeof value !== 'object' || value === null) return null;
+    const record = value as Record<string, unknown>;
+    if (typeof record.id === 'string' && record.id.trim()) return record.id;
+    return findFirstTreeNodeId(record.children);
+}
 
 const DEFAULT_IGNORES = [
     'node_modules', '.git', 'target', 'dist', 'build', '.next',
@@ -195,7 +216,9 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
     const [customIgnores, setCustomIgnores] = useState('');
     const [slug, setSlug] = useState('');
     const [creating, setCreating] = useState(false);
+    const [entryPoint, setEntryPoint] = useState<EntryPoint>('question');
     const [apexQuestion, setApexQuestion] = useState('');
+    const [purposeText, setPurposeText] = useState('');
     const [error, setError] = useState<string | null>(null);
     // Preview state
     const [previewLoading, setPreviewLoading] = useState(false);
@@ -222,6 +245,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
     const [profilesError, setProfilesError] = useState<string | null>(null);
     // Build fullscreen: collapse wizard chrome when build is running
     const [buildFullScreen, setBuildFullScreen] = useState(false);
+    const purposeAnnotationPostedRef = useRef(false);
 
     // Auth token for HTTP fetches
     const [authToken, setAuthToken] = useState('');
@@ -256,6 +280,56 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         // For code/document, the default chain is resolved server-side
         return 'question-pipeline';
     }, [contentType, conversationPreset]);
+
+    const entryText = entryPoint === 'purpose' ? purposeText : apexQuestion;
+    const buildQuestion = useMemo(
+        () => entryPoint === 'purpose' ? purposeToBuildQuestion(purposeText) : apexQuestion,
+        [entryPoint, purposeText, apexQuestion],
+    );
+    const declaredPurpose = entryPoint === 'purpose' ? purposeText.trim() : '';
+
+    useEffect(() => {
+        purposeAnnotationPostedRef.current = false;
+    }, [slug, declaredPurpose]);
+
+    const handleBuildComplete = useCallback(async (status: { status: string }) => {
+        if (!['complete', 'complete_with_errors'].includes(status.status)) return;
+        if (entryPoint !== 'purpose' || !declaredPurpose || !slug) return;
+        if (purposeAnnotationPostedRef.current) return;
+        purposeAnnotationPostedRef.current = true;
+
+        try {
+            const treeResp = await fetch(`${PYRAMID_API_BASE}/pyramid/${slug}/tree`, {
+                headers: authHeaders,
+            });
+            if (!treeResp.ok) {
+                throw new Error(`Purpose annotation tree lookup failed (${treeResp.status})`);
+            }
+            const tree = await treeResp.json();
+            const nodeId = findFirstTreeNodeId(tree);
+            if (!nodeId) {
+                throw new Error('Purpose annotation could not find a built pyramid node');
+            }
+
+            const annotateResp = await fetch(`${PYRAMID_API_BASE}/pyramid/${slug}/annotate`, {
+                method: 'POST',
+                headers: authHeaders,
+                body: JSON.stringify({
+                    node_id: nodeId,
+                    annotation_type: 'purpose_declaration',
+                    content: declaredPurpose,
+                    author: 'workspace-wizard',
+                }),
+            });
+            if (!annotateResp.ok) {
+                const errBody = await annotateResp.text();
+                throw new Error(`Purpose annotation failed (${annotateResp.status}): ${errBody}`);
+            }
+        } catch (err) {
+            purposeAnnotationPostedRef.current = false;
+            setError(String(err));
+        }
+    }, [entryPoint, declaredPurpose, slug, authHeaders]);
 
     const handlePickDirectory = useCallback(async () => {
         try {
@@ -548,6 +622,8 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
     const handleContentTypeSelect = useCallback((type: 'code' | 'document' | 'conversation' | 'vine') => {
         setContentType(type);
         setApexQuestion(DEFAULT_QUESTIONS[type] || '');
+        setPurposeText('');
+        setEntryPoint('question');
         if (type === 'vine') {
             setPaths([]);
             setSlug('');
@@ -656,6 +732,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                     slug,
                     contentType,
                     sourcePath,
+                    ...(declaredPurpose ? { purposeText: declaredPurpose } : {}),
                 });
             } catch (_e) {
                 // Slug may already exist — that's fine
@@ -686,7 +763,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         } finally {
             setPreviewLoading(false);
         }
-    }, [paths, contentType, slug, getEffectiveChainId]);
+    }, [paths, contentType, slug, getEffectiveChainId, declaredPurpose, authHeaders]);
 
     /** Commit after preview — creates DADBEAR config and starts background processing */
     const handleCommit = useCallback(async () => {
@@ -752,9 +829,10 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
             }
 
             // Start the build
+            purposeAnnotationPostedRef.current = false;
             await invoke('pyramid_question_build', {
                 slug,
-                question: apexQuestion,
+                question: buildQuestion,
                 granularity: 3,
                 maxDepth: 3,
             });
@@ -765,7 +843,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         } finally {
             setCommitting(false);
         }
-    }, [previewResult, slug, contentType, paths, getEffectiveChainId, selectedProfile, apexQuestion]);
+    }, [previewResult, slug, contentType, paths, getEffectiveChainId, selectedProfile, buildQuestion, authHeaders]);
 
     /** Legacy create flow for non-conversation types (code, document) */
     const handleCreate = useCallback(async (andBuild: boolean) => {
@@ -780,6 +858,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                 slug,
                 contentType,
                 sourcePath,
+                ...(declaredPurpose ? { purposeText: declaredPurpose } : {}),
             });
 
             await invoke('pyramid_ingest', { slug });
@@ -795,9 +874,10 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                     }
                 }
 
+                purposeAnnotationPostedRef.current = false;
                 await invoke('pyramid_question_build', {
                     slug,
-                    question: apexQuestion,
+                    question: buildQuestion,
                     granularity: 3,
                     maxDepth: 3,
                 });
@@ -810,7 +890,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         } finally {
             setCreating(false);
         }
-    }, [paths, contentType, slug, apexQuestion, selectedProfile, onComplete]);
+    }, [paths, contentType, slug, declaredPurpose, buildQuestion, selectedProfile, onComplete]);
 
     const allIgnores = [
         ...DEFAULT_IGNORES,
@@ -838,7 +918,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         'conversation-preset': 'Preset',
         'vine-dirs': 'Folders',
         'configure': 'Configure',
-        'question': 'Question',
+        'question': 'Intent',
         'preview': 'Preview',
         'confirm': 'Confirm',
         'building': 'Building',
@@ -1699,21 +1779,54 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                 </div>
             )}
 
-            {/* Step: Apex Question */}
+            {/* Step: Entry point */}
             {step === 'question' && (
                 <div className="workspace-step-content">
-                    <h2>Apex Question</h2>
+                    <h2>Entry Point</h2>
                     <p className="step-description">
-                        What should this pyramid answer? The question YAML pipeline will decompose this into sub-questions and build structured understanding.
+                        Choose whether this pyramid starts from a question to answer or a purpose to serve.
                     </p>
-                    <textarea
-                        className="input"
-                        rows={3}
-                        value={apexQuestion}
-                        onChange={(e) => setApexQuestion(e.target.value)}
-                        placeholder="e.g. What are the key systems and architecture of this codebase?"
-                        style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit' }}
-                    />
+
+                    <div className="entry-mode-toggle" role="tablist" aria-label="Pyramid entry point">
+                        <button
+                            type="button"
+                            role="tab"
+                            aria-selected={entryPoint === 'question'}
+                            className={`entry-mode-button ${entryPoint === 'question' ? 'active' : ''}`}
+                            onClick={() => setEntryPoint('question')}
+                        >
+                            Question
+                        </button>
+                        <button
+                            type="button"
+                            role="tab"
+                            aria-selected={entryPoint === 'purpose'}
+                            className={`entry-mode-button ${entryPoint === 'purpose' ? 'active' : ''}`}
+                            onClick={() => setEntryPoint('purpose')}
+                        >
+                            Purpose
+                        </button>
+                    </div>
+
+                    {entryPoint === 'question' ? (
+                        <textarea
+                            className="input"
+                            rows={3}
+                            value={apexQuestion}
+                            onChange={(e) => setApexQuestion(e.target.value)}
+                            placeholder="e.g. What are the key systems and architecture of this codebase?"
+                            style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit' }}
+                        />
+                    ) : (
+                        <textarea
+                            className="input"
+                            rows={3}
+                            value={purposeText}
+                            onChange={(e) => setPurposeText(e.target.value)}
+                            placeholder="e.g. Understand this corpus well enough to guide product architecture decisions."
+                            style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit' }}
+                        />
+                    )}
 
                     {/* Model profile selector */}
                     <div style={{ marginTop: '16px' }}>
@@ -1780,7 +1893,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                             <button
                                 className="btn btn-primary"
                                 onClick={handlePreview}
-                                disabled={!apexQuestion.trim() || !slug || previewLoading}
+                                disabled={!entryText.trim() || !slug || previewLoading}
                             >
                                 {previewLoading ? 'Scanning...' : 'Preview'}
                             </button>
@@ -1788,7 +1901,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                             <button
                                 className="btn btn-primary"
                                 onClick={() => setStep('confirm')}
-                                disabled={!apexQuestion.trim()}
+                                disabled={!entryText.trim()}
                             >
                                 Next
                             </button>
@@ -1943,8 +2056,12 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                         </div>
                         {contentType !== 'vine' && (
                             <div className="summary-row">
-                                <span className="summary-label">Question:</span>
-                                <span className="summary-value">{apexQuestion}</span>
+                                <span className="summary-label">
+                                    {entryPoint === 'purpose' ? 'Purpose:' : 'Question:'}
+                                </span>
+                                <span className="summary-value">
+                                    {entryPoint === 'purpose' ? purposeText : apexQuestion}
+                                </span>
                             </div>
                         )}
                         {contentType !== 'vine' && contentType !== 'conversation' && (
@@ -2014,7 +2131,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
             {step === 'building' && contentType !== 'vine' && (
                 <BuildProgress
                     slug={slug}
-                    onComplete={NOOP}
+                    onComplete={handleBuildComplete}
                     onClose={onComplete}
                     requestFullScreen={(active) => setBuildFullScreen(active)}
                 />

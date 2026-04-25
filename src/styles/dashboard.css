@@ -10847,6 +10847,39 @@ body {
     margin-bottom: 8px;
 }
 
+.entry-mode-toggle {
+    display: inline-flex;
+    gap: 4px;
+    padding: 4px;
+    margin-bottom: 16px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+}
+
+.entry-mode-button {
+    min-width: 96px;
+    padding: 7px 14px;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all var(--transition);
+}
+
+.entry-mode-button:hover {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.entry-mode-button.active {
+    color: var(--accent-cyan);
+    background: rgba(34, 211, 238, 0.12);
+}
+
 .ignore-input {
     width: 100%;
     padding: 10px 12px;
@@ -25100,4 +25133,3 @@ select.compute-input {
         margin-left: 0;
     }
 }
-
