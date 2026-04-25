@@ -29,7 +29,7 @@ steps:
     for_each: "$chunks"
     when: "$load_prior_state.l0_count < $load_prior_state.source_count"
     dispatch_order: "largest_first"
-    concurrency: 1
+    concurrency: 10
     node_id_pattern: "Q-L0-{index:03}"
     depth: 0
     save_as: node
@@ -53,7 +53,7 @@ steps:
       nodes: "$source_extract"
     max_input_tokens: 80000
     batch_size: 50
-    concurrency: 4
+    concurrency: 10
     dehydrate:
       - drop: orientation
       - drop: topics
@@ -201,7 +201,7 @@ steps:
     primitive: evidence_loop
     viz:
       type: verdict_mark
-    concurrency: 1
+    concurrency: 10
     input:
       question_tree: "$decomposed_tree"
       extraction_schema: "$extraction_schema"
@@ -226,7 +226,7 @@ steps:
     instruction: "$prompts/question/question_web.md"
     max_input_tokens: 80000
     batch_size: 50
-    concurrency: 4
+    concurrency: 10
     dehydrate:
       - drop: orientation
       - drop: topics
@@ -244,7 +244,7 @@ steps:
     instruction: "$prompts/question/question_web.md"
     max_input_tokens: 80000
     batch_size: 50
-    concurrency: 4
+    concurrency: 10
     dehydrate:
       - drop: orientation
       - drop: topics
