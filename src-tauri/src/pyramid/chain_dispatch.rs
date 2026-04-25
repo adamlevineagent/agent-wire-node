@@ -1063,12 +1063,10 @@ async fn dispatch_mechanical(
                 .get("target_node_id")
                 .or_else(|| input.get("target_id"))
                 .and_then(|v| v.as_str());
-            let reason = input
-                .get("reason")
-                .and_then(|v| v.as_str());
+            let reason = input.get("reason").and_then(|v| v.as_str());
             // Preserve any additional metadata already carried by the step's
             // input (work item id, step name, etc.) so downstream observers
-                    // have full context.
+            // have full context.
             let mut metadata = serde_json::Map::new();
             if let Some(obj) = input.as_object() {
                 for (k, v) in obj {
@@ -1122,14 +1120,13 @@ async fn dispatch_mechanical(
                 .get("target_node_id")
                 .or_else(|| input.get("target_id"))
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!(
+                .ok_or_else(|| {
+                    anyhow!(
                     "queue_re_distill_for_target: input missing target_node_id / target_id field"
-                ))?
+                )
+                })?
                 .to_string();
-            let layer: i64 = input
-                .get("layer")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(1);
+            let layer: i64 = input.get("layer").and_then(|v| v.as_i64()).unwrap_or(1);
             let reason = input
                 .get("reason")
                 .and_then(|v| v.as_str())
@@ -1157,9 +1154,7 @@ async fn dispatch_mechanical(
                 .map(String::from);
             let wi_id = format!("wi-{}", uuid::Uuid::new_v4());
             let conn_guard = ctx.db_writer.lock().await;
-            let propagated_obs_ids: String = if let Some(trig_id) =
-                triggering_wi_id.as_deref()
-            {
+            let propagated_obs_ids: String = if let Some(trig_id) = triggering_wi_id.as_deref() {
                 let obs_ids: Option<String> = conn_guard
                     .query_row(
                         "SELECT observation_event_ids FROM dadbear_work_items WHERE id = ?1",
@@ -1182,35 +1177,40 @@ async fn dispatch_mechanical(
                 "reason": reason,
                 "triggering_work_item_id": triggering_wi_id,
             });
-            conn_guard.execute(
-                "INSERT INTO dadbear_work_items
+            conn_guard
+                .execute(
+                    "INSERT INTO dadbear_work_items
                     (id, slug, batch_id, epoch_id, step_name, primitive,
                      layer, target_id, system_prompt, user_prompt, model_tier,
                      result_json, observation_event_ids, compiled_at,
                      state, state_changed_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                          ?12, ?13, ?14, ?15, ?16)",
-                rusqlite::params![
-                    wi_id,              // ?1  id
-                    ctx.slug,           // ?2  slug
-                    batch_id,           // ?3  batch_id
-                    epoch_id,           // ?4  epoch_id
-                    "cascade_re_distill", // ?5 step_name
-                    "re_distill",       // ?6  primitive
-                    layer,              // ?7  layer
-                    target_node_id,     // ?8  target_id
-                    "",                 // ?9  system_prompt
-                    "",                 // ?10 user_prompt
-                    "mid",              // ?11 model_tier
-                    metadata.to_string(), // ?12 result_json
-                    propagated_obs_ids, // ?13 observation_event_ids
-                    now,                // ?14 compiled_at
-                    "compiled",         // ?15 state
-                    now,                // ?16 state_changed_at
-                ],
-            ).map_err(|e| anyhow!(
-                "queue_re_distill_for_target: failed to insert work item: {}", e
-            ))?;
+                    rusqlite::params![
+                        wi_id,                // ?1  id
+                        ctx.slug,             // ?2  slug
+                        batch_id,             // ?3  batch_id
+                        epoch_id,             // ?4  epoch_id
+                        "cascade_re_distill", // ?5 step_name
+                        "re_distill",         // ?6  primitive
+                        layer,                // ?7  layer
+                        target_node_id,       // ?8  target_id
+                        "",                   // ?9  system_prompt
+                        "",                   // ?10 user_prompt
+                        "mid",                // ?11 model_tier
+                        metadata.to_string(), // ?12 result_json
+                        propagated_obs_ids,   // ?13 observation_event_ids
+                        now,                  // ?14 compiled_at
+                        "compiled",           // ?15 state
+                        now,                  // ?16 state_changed_at
+                    ],
+                )
+                .map_err(|e| {
+                    anyhow!(
+                        "queue_re_distill_for_target: failed to insert work item: {}",
+                        e
+                    )
+                })?;
             drop(conn_guard);
             Ok(serde_json::json!({ "queued": true, "work_item_id": wi_id }))
         }
@@ -1265,24 +1265,16 @@ async fn dispatch_mechanical(
                 .or_else(|| input.get("target_id"))
                 .and_then(|v| v.as_str());
             let annotation_id = input.get("annotation_id").and_then(|v| v.as_i64());
-            let annotation_type = input
-                .get("annotation_type")
-                .and_then(|v| v.as_str());
+            let annotation_type = input.get("annotation_type").and_then(|v| v.as_str());
             let mut meta = serde_json::Map::new();
             if let Some(tid) = target_node_id {
-                meta.insert(
-                    "target_node_id".to_string(),
-                    Value::String(tid.to_string()),
-                );
+                meta.insert("target_node_id".to_string(), Value::String(tid.to_string()));
             }
             if let Some(aid) = annotation_id {
                 meta.insert("annotation_id".to_string(), Value::from(aid));
             }
             if let Some(at) = annotation_type {
-                meta.insert(
-                    "annotation_type".to_string(),
-                    Value::String(at.to_string()),
-                );
+                meta.insert("annotation_type".to_string(), Value::String(at.to_string()));
             }
             let metadata_json = if meta.is_empty() {
                 None
@@ -1334,9 +1326,7 @@ async fn dispatch_mechanical(
                 .get("target_node_id")
                 .or_else(|| input.get("target_id"))
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!(
-                    "load_annotation_and_target: missing target_node_id"
-                ))?
+                .ok_or_else(|| anyhow!("load_annotation_and_target: missing target_node_id"))?
                 .to_string();
 
             let mut annotation_id = input.get("annotation_id").and_then(|v| v.as_i64());
@@ -1400,16 +1390,33 @@ async fn dispatch_mechanical(
             let conn_guard = ctx.db_reader.lock().await;
 
             let annotation_obj: Value = if let Some(aid) = annotation_id {
-                let row: Option<(i64, String, String, String, Option<String>, String, String, String)> = conn_guard
+                let row: Option<(
+                    i64,
+                    String,
+                    String,
+                    String,
+                    Option<String>,
+                    String,
+                    String,
+                    String,
+                )> = conn_guard
                     .query_row(
                         "SELECT id, slug, node_id, annotation_type, question_context, author,
                                 content, created_at
                          FROM pyramid_annotations WHERE id = ?1",
                         rusqlite::params![aid],
-                        |r| Ok((
-                            r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?,
-                            r.get(5)?, r.get(6)?, r.get(7)?,
-                        )),
+                        |r| {
+                            Ok((
+                                r.get(0)?,
+                                r.get(1)?,
+                                r.get(2)?,
+                                r.get(3)?,
+                                r.get(4)?,
+                                r.get(5)?,
+                                r.get(6)?,
+                                r.get(7)?,
+                            ))
+                        },
                     )
                     .ok();
                 if let Some((id, slug, node_id, aty, qctx, author, content, created_at)) = row {
@@ -1491,9 +1498,7 @@ async fn dispatch_mechanical(
             );
             out.insert(
                 "annotation_type".to_string(),
-                annotation_type
-                    .map(Value::String)
-                    .unwrap_or(Value::Null),
+                annotation_type.map(Value::String).unwrap_or(Value::Null),
             );
             out.insert("annotation".to_string(), annotation_obj);
             out.insert("target_node".to_string(), target_obj);
@@ -1519,9 +1524,7 @@ async fn dispatch_mechanical(
                 .get("target_node_id")
                 .or_else(|| input.get("target_id"))
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!(
-                    "append_annotation_to_debate_node: missing target_node_id"
-                ))?
+                .ok_or_else(|| anyhow!("append_annotation_to_debate_node: missing target_node_id"))?
                 .to_string();
             // Inputs may come as threaded context from load_annotation_and_target,
             // or may be set directly by callers.
@@ -1608,9 +1611,7 @@ async fn dispatch_mechanical(
             // Resolve annotation_type: prefer threaded input, otherwise the
             // DB-row capture above, otherwise a final direct lookup. Loud
             // raise if all three paths yield None (bad id) or an empty string.
-            let annotation_type = match annotation_type
-                .or(annotation_type_from_db)
-            {
+            let annotation_type = match annotation_type.or(annotation_type_from_db) {
                 Some(t) if !t.is_empty() => t,
                 _ => {
                     let conn_guard = ctx.db_reader.lock().await;
@@ -1653,8 +1654,7 @@ async fn dispatch_mechanical(
             // writer mutex for the whole transition so concurrent
             // annotations on the same target serialize.
             let conn_guard = ctx.db_writer.lock().await;
-            let shape_view =
-                super::db::get_node_shape(&conn_guard, &ctx.slug, &target_node_id)?;
+            let shape_view = super::db::get_node_shape(&conn_guard, &ctx.slug, &target_node_id)?;
             let current_shape = shape_view
                 .as_ref()
                 .map(|v| v.shape.clone())
@@ -1682,8 +1682,8 @@ async fn dispatch_mechanical(
             // collapse happened or a post-collapse re-open is already
             // complete).
             if current_shape.is_scaffolding() {
-                let cooldown_secs = super::pyramid_scheduler::load_config(&conn_guard)
-                    .collapse_cooldown_secs;
+                let cooldown_secs =
+                    super::pyramid_scheduler::load_config(&conn_guard).collapse_cooldown_secs;
                 if cooldown_secs > 0 {
                     // Most recent debate_collapsed for this (slug, node_id).
                     // `detected_at` is a SQLite `datetime('now')` string
@@ -1700,7 +1700,13 @@ async fn dispatch_mechanical(
                               ORDER BY id DESC
                               LIMIT 1",
                             rusqlite::params![ctx.slug, target_node_id],
-                            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+                            |r| {
+                                Ok((
+                                    r.get::<_, i64>(0)?,
+                                    r.get::<_, String>(1)?,
+                                    r.get::<_, String>(2)?,
+                                ))
+                            },
                         )
                         .optional()?;
                     if let Some((collapse_event_id, detected_at, metadata)) = recent {
@@ -1784,9 +1790,7 @@ async fn dispatch_mechanical(
                     // enough not to flood).
                     static COOLDOWN_DISABLED_WARNED: std::sync::atomic::AtomicBool =
                         std::sync::atomic::AtomicBool::new(false);
-                    if !COOLDOWN_DISABLED_WARNED
-                        .swap(true, std::sync::atomic::Ordering::Relaxed)
-                    {
+                    if !COOLDOWN_DISABLED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                         tracing::warn!(
                             slug = %ctx.slug,
                             target_node_id = %target_node_id,
@@ -1853,9 +1857,7 @@ async fn dispatch_mechanical(
                     .and_then(|t| t.get("headline"))
                     .and_then(|v| v.as_str())
                     .map(String::from)
-                    .unwrap_or_else(|| {
-                        format!("Debate on node {}", target_node_id)
-                    });
+                    .unwrap_or_else(|| format!("Debate on node {}", target_node_id));
                 let debate = DebateTopic {
                     concern: concern_line,
                     positions,
@@ -1901,7 +1903,11 @@ async fn dispatch_mechanical(
                             source_annotation_ids: vec![annotation_token],
                         });
                     }
-                    if already { "no_op" } else { "appended_position" }
+                    if already {
+                        "no_op"
+                    } else {
+                        "appended_position"
+                    }
                 } else {
                     // red_team → append to the first (or "main") position's
                     // red_teams[]. If none exist yet, seed one.
@@ -1936,7 +1942,8 @@ async fn dispatch_mechanical(
                     let annotation_token = format!("annotation#{annotation_id}");
                     let already = pos.red_teams.iter().any(|r| {
                         r.argument == ann_content
-                            && (r.source_annotation_ids
+                            && (r
+                                .source_annotation_ids
                                 .iter()
                                 .any(|a| a == &annotation_token)
                                 || r.evidence_anchors.iter().any(|a| a == &annotation_token))
@@ -1949,7 +1956,11 @@ async fn dispatch_mechanical(
                             source_annotation_ids: vec![annotation_token],
                         });
                     }
-                    if already { "no_op" } else { "appended_red_team" }
+                    if already {
+                        "no_op"
+                    } else {
+                        "appended_red_team"
+                    }
                 };
                 (action_label, debate, false)
             } else {
@@ -1968,12 +1979,7 @@ async fn dispatch_mechanical(
                 "UPDATE pyramid_nodes
                  SET node_shape = ?1, shape_payload_json = ?2
                  WHERE slug = ?3 AND id = ?4",
-                rusqlite::params![
-                    NODE_SHAPE_DEBATE,
-                    payload_json,
-                    ctx.slug,
-                    target_node_id,
-                ],
+                rusqlite::params![NODE_SHAPE_DEBATE, payload_json, ctx.slug, target_node_id,],
             )?;
 
             // Emit debate_spawned only on the shape upgrade (and only
@@ -1986,7 +1992,11 @@ async fn dispatch_mechanical(
                     .first()
                     .map(|p| p.label.clone())
                     .unwrap_or_default();
-                let initial_kind = if is_steel_man { "steel_man" } else { "red_team" };
+                let initial_kind = if is_steel_man {
+                    "steel_man"
+                } else {
+                    "red_team"
+                };
                 let meta = serde_json::json!({
                     "target_node_id": target_node_id,
                     "initial_position_label": initial_label,
@@ -2185,10 +2195,14 @@ async fn dispatch_mechanical(
             //     covered_substrate_nodes: [...] }
             //
             // Rules (Phase 7b MVP):
-            //   purpose_shifted → always crystallize. The shift is a
-            //     deliberate operator signal; covered_substrate_nodes
+            //   purpose_shifted → crystallize over current L0 substrate. The
+            //     shift is a deliberate operator signal; covered_substrate_nodes
             //     defaults to the current L0 node ids (substrate for the
             //     new meta-layer is the whole lower pyramid).
+            //   annotation_reacted + annotation_type purpose_declaration /
+            //     purpose_shift → same purpose-directed crystallization path.
+            //     Annotation reactive dispatch uses event_type=annotation_reacted;
+            //     the semantic trigger lives in metadata.annotation_type.
             //   gap_resolved    → crystallize iff the originating gap
             //     carried candidate_resolutions (there IS substrate to
             //     synthesize on). If no candidates, skip with reasoning.
@@ -2211,6 +2225,16 @@ async fn dispatch_mechanical(
             let trigger_event_type = input
                 .get("trigger_event_type")
                 .and_then(|v| v.as_str())
+                .map(String::from);
+            let annotation_type = input
+                .get("annotation_type")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    input
+                        .get("trigger_event_metadata")
+                        .and_then(|m| m.get("annotation_type"))
+                        .and_then(|v| v.as_str())
+                })
                 .map(String::from);
 
             // Load active purpose for the slug so purpose_question (the
@@ -2271,11 +2295,43 @@ async fn dispatch_mechanical(
                         (true, reason, ids)
                     }
                 }
+                Some("annotation_reacted")
+                    if matches!(
+                        annotation_type.as_deref(),
+                        Some("purpose_declaration" | "purpose_shift")
+                    ) =>
+                {
+                    // Reactive purpose annotations arrive as annotation_reacted;
+                    // the annotation_type is the semantic trigger.
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let nodes = super::db::get_nodes_at_depth(&conn_guard, &ctx.slug, 0)
+                        .unwrap_or_default();
+                    drop(conn_guard);
+                    let ids: Vec<String> = nodes.into_iter().map(|n| n.id).collect();
+                    let at = annotation_type.as_deref().unwrap_or("unknown");
+                    if ids.is_empty() {
+                        let reason = format!(
+                            "annotation_reacted carried annotation_type '{at}' but slug has no \
+                             L0 substrate to synthesize over; skipping crystallization. Add at \
+                             least one L0 node before crystallizing a purpose meta-layer."
+                        );
+                        (false, reason, vec![])
+                    } else {
+                        let reason = format!(
+                            "annotation_reacted carried purpose annotation_type '{at}'; \
+                             crystallizing a meta-layer over L0 substrate ({} node(s)).",
+                            ids.len()
+                        );
+                        (true, reason, ids)
+                    }
+                }
                 Some("gap_resolved") => {
                     // Inspect the gap node's candidate_resolutions.
                     let has_candidates = if let Some(tid) = target_node_id.as_deref() {
                         let conn_guard = ctx.db_reader.lock().await;
-                        let view = super::db::get_node_shape(&conn_guard, &ctx.slug, tid).ok().flatten();
+                        let view = super::db::get_node_shape(&conn_guard, &ctx.slug, tid)
+                            .ok()
+                            .flatten();
                         drop(conn_guard);
                         match view.and_then(|v| v.payload) {
                             Some(super::types::ShapePayload::Gap(g)) => {
@@ -2412,10 +2468,7 @@ async fn dispatch_mechanical(
                 Value::from(covered_substrate_nodes.len() as i64),
             );
             if let Some(ref p) = parent_meta_layer_id {
-                meta.insert(
-                    "parent_meta_layer_id".to_string(),
-                    Value::String(p.clone()),
-                );
+                meta.insert("parent_meta_layer_id".to_string(), Value::String(p.clone()));
             }
             let metadata_json = Some(serde_json::to_string(&Value::Object(meta))?);
 
@@ -2467,9 +2520,9 @@ async fn dispatch_mechanical(
             let purpose_question = input
                 .get("purpose_question")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!(
-                    "load_substrate_nodes: missing `purpose_question` in input"
-                ))?
+                .ok_or_else(|| {
+                    anyhow!("load_substrate_nodes: missing `purpose_question` in input")
+                })?
                 .to_string();
             let parent_meta_layer_id = input
                 .get("parent_meta_layer_id")
@@ -2591,10 +2644,7 @@ async fn dispatch_mechanical(
             // echo and the writer's loud-raise on missing purpose_id
             // would fire on every real run.
             out.insert("purpose_id".to_string(), Value::from(purpose_id));
-            out.insert(
-                "parent_meta_layer_id".to_string(),
-                parent_meta_layer_id,
-            );
+            out.insert("parent_meta_layer_id".to_string(), parent_meta_layer_id);
             out.insert("nodes".to_string(), Value::Array(nodes_out));
             out.insert(
                 "covered_substrate_nodes".to_string(),
@@ -2634,17 +2684,19 @@ async fn dispatch_mechanical(
             let headline = input
                 .get("headline")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!(
-                    "create_meta_layer_node: missing `headline` string in input — \
+                .ok_or_else(|| {
+                    anyhow!(
+                        "create_meta_layer_node: missing `headline` string in input — \
                      synthesize_meta_layer LLM step did not produce the required field."
-                ))?
+                    )
+                })?
                 .to_string();
             let distilled = input
                 .get("distilled")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!(
-                    "create_meta_layer_node: missing `distilled` string in input"
-                ))?
+                .ok_or_else(|| {
+                    anyhow!("create_meta_layer_node: missing `distilled` string in input")
+                })?
                 .to_string();
 
             // covered_substrate_node_ids comes from the LLM step (the
@@ -2655,7 +2707,11 @@ async fn dispatch_mechanical(
             let covered_substrate_nodes: Vec<String> = input
                 .get("covered_substrate_node_ids")
                 .and_then(|v| v.as_array())
-                .or_else(|| input.get("covered_substrate_nodes").and_then(|v| v.as_array()))
+                .or_else(|| {
+                    input
+                        .get("covered_substrate_nodes")
+                        .and_then(|v| v.as_array())
+                })
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|v| v.as_str().map(String::from))
@@ -2683,12 +2739,14 @@ async fn dispatch_mechanical(
                 Some(Value::Array(arr)) => arr
                     .iter()
                     .map(|entry| {
-                        serde_json::from_value::<MetaLayerTopicEntry>(entry.clone())
-                            .map_err(|e| anyhow!(
+                        serde_json::from_value::<MetaLayerTopicEntry>(entry.clone()).map_err(|e| {
+                            anyhow!(
                                 "create_meta_layer_node: topics entry {:?} did not deserialize \
                                  into MetaLayerTopicEntry: {}",
-                                entry, e,
-                            ))
+                                entry,
+                                e,
+                            )
+                        })
                     })
                     .collect::<Result<Vec<_>>>()?,
                 Some(other) => {
@@ -2762,8 +2820,9 @@ async fn dispatch_mechanical(
                 .get("purpose_question")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| anyhow!(
-                    "create_meta_layer_node: missing / empty `purpose_question` in input. \
+                .ok_or_else(|| {
+                    anyhow!(
+                        "create_meta_layer_node: missing / empty `purpose_question` in input. \
                      The synthesizer's synthesize_meta_layer LLM step is required to echo \
                      the purpose_question it was given verbatim so the writer pins \
                      provenance to the purpose that drove synthesis — not whatever is \
@@ -2771,7 +2830,8 @@ async fn dispatch_mechanical(
                      mid-chain). If you are calling create_meta_layer_node directly, pass \
                      purpose_question in the input envelope. Do NOT self-resolve from the \
                      slug's active purpose — that reintroduces the race this guard closes."
-                ))?
+                    )
+                })?
                 .to_string();
             let parent_meta_layer_id = input
                 .get("parent_meta_layer_id")
@@ -2780,11 +2840,13 @@ async fn dispatch_mechanical(
             let purpose_id = input
                 .get("purpose_id")
                 .and_then(|v| v.as_i64())
-                .ok_or_else(|| anyhow!(
-                    "create_meta_layer_node: missing `purpose_id` (integer) in input. \
+                .ok_or_else(|| {
+                    anyhow!(
+                        "create_meta_layer_node: missing `purpose_id` (integer) in input. \
                      Same echo-passthrough contract as `purpose_question`; see the \
                      field's error above for full rationale."
-                ))?;
+                    )
+                })?;
 
             // Compute the new node's depth. Meta layers sit above their
             // substrate, so depth = max(covered_substrate_depths) + 1.
@@ -2814,11 +2876,7 @@ async fn dispatch_mechanical(
             // uuid tail keeps the id human-readable in chronicle traces
             // while guaranteeing uniqueness across concurrent oracle runs
             // on the same slug.
-            let short_uuid: String = uuid::Uuid::new_v4()
-                .to_string()
-                .chars()
-                .take(8)
-                .collect();
+            let short_uuid: String = uuid::Uuid::new_v4().to_string().chars().take(8).collect();
             let node_id = format!("L{}-ML-{}", node_depth, short_uuid);
 
             let payload = MetaLayerTopic {
@@ -2843,26 +2901,32 @@ async fn dispatch_mechanical(
             // Scaffolding-default column set matches what test seeds use.
             // `topics` / `corrections` / `decisions` / `terms` / `dead_ends`
             // are NULL-safe: MetaLayer content lives in shape_payload_json.
-            conn_guard.execute(
-                "INSERT INTO pyramid_nodes
+            conn_guard
+                .execute(
+                    "INSERT INTO pyramid_nodes
                     (id, slug, depth, headline, distilled, self_prompt,
                      build_version, node_shape, shape_payload_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, '', 1, ?6, ?7)",
-                rusqlite::params![
-                    node_id,
-                    ctx.slug,
-                    node_depth,
-                    headline,
-                    distilled,
-                    NODE_SHAPE_META_LAYER,
-                    payload_json,
-                ],
-            )
-            .map_err(|e| anyhow!(
-                "create_meta_layer_node: failed to insert pyramid_nodes row \
+                    rusqlite::params![
+                        node_id,
+                        ctx.slug,
+                        node_depth,
+                        headline,
+                        distilled,
+                        NODE_SHAPE_META_LAYER,
+                        payload_json,
+                    ],
+                )
+                .map_err(|e| {
+                    anyhow!(
+                        "create_meta_layer_node: failed to insert pyramid_nodes row \
                  (slug={} id={} depth={}): {}",
-                ctx.slug, node_id, node_depth, e,
-            ))?;
+                        ctx.slug,
+                        node_id,
+                        node_depth,
+                        e,
+                    )
+                })?;
 
             // ── Phase 9b-5: resolve covered Gap-shaped substrate nodes ──
             //
@@ -2891,9 +2955,10 @@ async fn dispatch_mechanical(
             // missed gaps.
             let mut resolved_gaps: Vec<String> = Vec::new();
             for covered_id in &covered_substrate_nodes {
-                let shape_view = match super::db::get_node_shape(&conn_guard, &ctx.slug, covered_id) {
+                let shape_view = match super::db::get_node_shape(&conn_guard, &ctx.slug, covered_id)
+                {
                     Ok(Some(v)) => v,
-                    Ok(None) => continue,   // covered node missing (shouldn't happen; skip)
+                    Ok(None) => continue, // covered node missing (shouldn't happen; skip)
                     Err(e) => {
                         tracing::warn!(
                             slug = %ctx.slug,
@@ -3081,20 +3146,13 @@ async fn dispatch_mechanical(
                 .or_else(|| input.get("target_id"))
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            let source_event_id = input
-                .get("source_event_id")
-                .and_then(|v| v.as_i64());
-            let purpose_id = input
-                .get("purpose_id")
-                .and_then(|v| v.as_i64());
+            let source_event_id = input.get("source_event_id").and_then(|v| v.as_i64());
+            let purpose_id = input.get("purpose_id").and_then(|v| v.as_i64());
 
             let mut meta = serde_json::Map::new();
             meta.insert("reasoning".to_string(), Value::String(reasoning.clone()));
             if let Some(ref t) = trigger_event_type {
-                meta.insert(
-                    "trigger_event_type".to_string(),
-                    Value::String(t.clone()),
-                );
+                meta.insert("trigger_event_type".to_string(), Value::String(t.clone()));
             }
             if let Some(ref t) = target_node_id {
                 meta.insert("target_node_id".to_string(), Value::String(t.clone()));
@@ -3132,14 +3190,8 @@ async fn dispatch_mechanical(
             } else {
                 serde_json::Map::new()
             };
-            out.insert(
-                "oracle_finalized".to_string(),
-                Value::from(true),
-            );
-            out.insert(
-                "oracle_skipped_event_id".to_string(),
-                Value::from(event_id),
-            );
+            out.insert("oracle_finalized".to_string(), Value::from(true));
+            out.insert("oracle_skipped_event_id".to_string(), Value::from(event_id));
             Ok(Value::Object(out))
         }
         // ── Post-build accretion v5 Phase 7c: gap_dispatcher primitives ─────
@@ -3176,24 +3228,16 @@ async fn dispatch_mechanical(
                 .or_else(|| input.get("target_id"))
                 .and_then(|v| v.as_str());
             let annotation_id = input.get("annotation_id").and_then(|v| v.as_i64());
-            let annotation_type = input
-                .get("annotation_type")
-                .and_then(|v| v.as_str());
+            let annotation_type = input.get("annotation_type").and_then(|v| v.as_str());
             let mut meta = serde_json::Map::new();
             if let Some(tid) = target_node_id {
-                meta.insert(
-                    "target_node_id".to_string(),
-                    Value::String(tid.to_string()),
-                );
+                meta.insert("target_node_id".to_string(), Value::String(tid.to_string()));
             }
             if let Some(aid) = annotation_id {
                 meta.insert("annotation_id".to_string(), Value::from(aid));
             }
             if let Some(at) = annotation_type {
-                meta.insert(
-                    "annotation_type".to_string(),
-                    Value::String(at.to_string()),
-                );
+                meta.insert("annotation_type".to_string(), Value::String(at.to_string()));
             }
             let metadata_json = if meta.is_empty() {
                 None
@@ -3242,9 +3286,7 @@ async fn dispatch_mechanical(
                 .get("target_node_id")
                 .or_else(|| input.get("target_id"))
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!(
-                    "load_gap_context: missing target_node_id"
-                ))?
+                .ok_or_else(|| anyhow!("load_gap_context: missing target_node_id"))?
                 .to_string();
 
             let mut annotation_id = input.get("annotation_id").and_then(|v| v.as_i64());
@@ -3302,16 +3344,33 @@ async fn dispatch_mechanical(
             let conn_guard = ctx.db_reader.lock().await;
 
             let annotation_obj: Value = if let Some(aid) = annotation_id {
-                let row: Option<(i64, String, String, String, Option<String>, String, String, String)> = conn_guard
+                let row: Option<(
+                    i64,
+                    String,
+                    String,
+                    String,
+                    Option<String>,
+                    String,
+                    String,
+                    String,
+                )> = conn_guard
                     .query_row(
                         "SELECT id, slug, node_id, annotation_type, question_context, author,
                                 content, created_at
                          FROM pyramid_annotations WHERE id = ?1",
                         rusqlite::params![aid],
-                        |r| Ok((
-                            r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?,
-                            r.get(5)?, r.get(6)?, r.get(7)?,
-                        )),
+                        |r| {
+                            Ok((
+                                r.get(0)?,
+                                r.get(1)?,
+                                r.get(2)?,
+                                r.get(3)?,
+                                r.get(4)?,
+                                r.get(5)?,
+                                r.get(6)?,
+                                r.get(7)?,
+                            ))
+                        },
                     )
                     .ok();
                 if let Some((id, slug, node_id, aty, qctx, author, content, created_at)) = row {
@@ -3352,10 +3411,11 @@ async fn dispatch_mechanical(
                         .as_ref()
                         .map(|v| v.shape.as_str().to_string())
                         .unwrap_or_else(|| "scaffolding".to_string());
-                    let existing_gap_payload = match shape_view.as_ref().and_then(|v| v.payload.as_ref()) {
-                        Some(ShapePayload::Gap(g)) => serde_json::to_value(g).ok(),
-                        _ => None,
-                    };
+                    let existing_gap_payload =
+                        match shape_view.as_ref().and_then(|v| v.payload.as_ref()) {
+                            Some(ShapePayload::Gap(g)) => serde_json::to_value(g).ok(),
+                            _ => None,
+                        };
                     let current_payload = shape_view
                         .as_ref()
                         .and_then(|v| v.payload.as_ref())
@@ -3394,9 +3454,7 @@ async fn dispatch_mechanical(
             );
             out.insert(
                 "annotation_type".to_string(),
-                annotation_type
-                    .map(Value::String)
-                    .unwrap_or(Value::Null),
+                annotation_type.map(Value::String).unwrap_or(Value::Null),
             );
             out.insert("annotation".to_string(), annotation_obj);
             out.insert("target_node".to_string(), target_obj);
@@ -3424,9 +3482,7 @@ async fn dispatch_mechanical(
                 .get("target_node_id")
                 .or_else(|| input.get("target_id"))
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!(
-                    "materialize_gap_node: missing target_node_id"
-                ))?
+                .ok_or_else(|| anyhow!("materialize_gap_node: missing target_node_id"))?
                 .to_string();
             let annotation_id: Option<i64> = input.get("annotation_id").and_then(|v| v.as_i64());
             let annotation_obj = input.get("annotation").cloned().unwrap_or(Value::Null);
@@ -3543,8 +3599,7 @@ async fn dispatch_mechanical(
             // Serialize the transition under the writer mutex so
             // concurrent `gap` annotations on the same target serialize.
             let conn_guard = ctx.db_writer.lock().await;
-            let shape_view =
-                super::db::get_node_shape(&conn_guard, &ctx.slug, &target_node_id)?;
+            let shape_view = super::db::get_node_shape(&conn_guard, &ctx.slug, &target_node_id)?;
             let current_shape = shape_view
                 .as_ref()
                 .map(|v| v.shape.clone())
@@ -3677,12 +3732,7 @@ async fn dispatch_mechanical(
                 "UPDATE pyramid_nodes
                  SET node_shape = ?1, shape_payload_json = ?2
                  WHERE slug = ?3 AND id = ?4",
-                rusqlite::params![
-                    NODE_SHAPE_GAP,
-                    payload_json,
-                    ctx.slug,
-                    target_node_id,
-                ],
+                rusqlite::params![NODE_SHAPE_GAP, payload_json, ctx.slug, target_node_id,],
             )?;
 
             // Emit gap_detected only on the shape upgrade (scaffolding→gap).
@@ -3725,8 +3775,7 @@ async fn dispatch_mechanical(
                 ctx.slug, target_node_id, action, gap_detected_event_id
             );
 
-            let updated_payload_value =
-                serde_json::to_value(&updated_gap).unwrap_or(Value::Null);
+            let updated_payload_value = serde_json::to_value(&updated_gap).unwrap_or(Value::Null);
             Ok(serde_json::json!({
                 "action": action,
                 "target_node_id": target_node_id,
@@ -3760,24 +3809,16 @@ async fn dispatch_mechanical(
                 .or_else(|| input.get("target_id"))
                 .and_then(|v| v.as_str());
             let annotation_id = input.get("annotation_id").and_then(|v| v.as_i64());
-            let annotation_type = input
-                .get("annotation_type")
-                .and_then(|v| v.as_str());
+            let annotation_type = input.get("annotation_type").and_then(|v| v.as_str());
             let mut meta = serde_json::Map::new();
             if let Some(tid) = target_node_id {
-                meta.insert(
-                    "target_node_id".to_string(),
-                    Value::String(tid.to_string()),
-                );
+                meta.insert("target_node_id".to_string(), Value::String(tid.to_string()));
             }
             if let Some(aid) = annotation_id {
                 meta.insert("annotation_id".to_string(), Value::from(aid));
             }
             if let Some(at) = annotation_type {
-                meta.insert(
-                    "annotation_type".to_string(),
-                    Value::String(at.to_string()),
-                );
+                meta.insert("annotation_type".to_string(), Value::String(at.to_string()));
             }
             let metadata_json = if meta.is_empty() {
                 None
@@ -3823,9 +3864,7 @@ async fn dispatch_mechanical(
                 .get("target_node_id")
                 .or_else(|| input.get("target_id"))
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!(
-                    "load_collapse_context: missing target_node_id"
-                ))?
+                .ok_or_else(|| anyhow!("load_collapse_context: missing target_node_id"))?
                 .to_string();
 
             let mut annotation_id = input.get("annotation_id").and_then(|v| v.as_i64());
@@ -3883,16 +3922,33 @@ async fn dispatch_mechanical(
             let conn_guard = ctx.db_reader.lock().await;
 
             let annotation_obj: Value = if let Some(aid) = annotation_id {
-                let row: Option<(i64, String, String, String, Option<String>, String, String, String)> = conn_guard
+                let row: Option<(
+                    i64,
+                    String,
+                    String,
+                    String,
+                    Option<String>,
+                    String,
+                    String,
+                    String,
+                )> = conn_guard
                     .query_row(
                         "SELECT id, slug, node_id, annotation_type, question_context, author,
                                 content, created_at
                          FROM pyramid_annotations WHERE id = ?1",
                         rusqlite::params![aid],
-                        |r| Ok((
-                            r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?,
-                            r.get(5)?, r.get(6)?, r.get(7)?,
-                        )),
+                        |r| {
+                            Ok((
+                                r.get(0)?,
+                                r.get(1)?,
+                                r.get(2)?,
+                                r.get(3)?,
+                                r.get(4)?,
+                                r.get(5)?,
+                                r.get(6)?,
+                                r.get(7)?,
+                            ))
+                        },
                     )
                     .ok();
                 if let Some((id, slug, node_id, aty, qctx, author, content, created_at)) = row {
@@ -3933,7 +3989,8 @@ async fn dispatch_mechanical(
                         .as_ref()
                         .map(|v| v.shape.as_str().to_string())
                         .unwrap_or_else(|| "scaffolding".to_string());
-                    let existing_debate = match shape_view.as_ref().and_then(|v| v.payload.as_ref()) {
+                    let existing_debate = match shape_view.as_ref().and_then(|v| v.payload.as_ref())
+                    {
                         Some(ShapePayload::Debate(d)) => serde_json::to_value(d).ok(),
                         _ => None,
                     };
@@ -3975,9 +4032,7 @@ async fn dispatch_mechanical(
             );
             out.insert(
                 "annotation_type".to_string(),
-                annotation_type
-                    .map(Value::String)
-                    .unwrap_or(Value::Null),
+                annotation_type.map(Value::String).unwrap_or(Value::Null),
             );
             out.insert("annotation".to_string(), annotation_obj);
             out.insert("target_node".to_string(), target_obj);
@@ -4005,9 +4060,7 @@ async fn dispatch_mechanical(
                 .get("target_node_id")
                 .or_else(|| input.get("target_id"))
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!(
-                    "finalize_debate_node: missing target_node_id"
-                ))?
+                .ok_or_else(|| anyhow!("finalize_debate_node: missing target_node_id"))?
                 .to_string();
             let annotation_id: Option<i64> = input.get("annotation_id").and_then(|v| v.as_i64());
             let annotation_obj = input.get("annotation").cloned().unwrap_or(Value::Null);
@@ -4069,8 +4122,7 @@ async fn dispatch_mechanical(
             // Serialize the transition under the writer mutex so concurrent
             // collapse annotations on the same target don't race.
             let conn_guard = ctx.db_writer.lock().await;
-            let shape_view =
-                super::db::get_node_shape(&conn_guard, &ctx.slug, &target_node_id)?;
+            let shape_view = super::db::get_node_shape(&conn_guard, &ctx.slug, &target_node_id)?;
             let current_shape = shape_view
                 .as_ref()
                 .map(|v| v.shape.clone())
@@ -4098,9 +4150,7 @@ async fn dispatch_mechanical(
                 let position_labels: Vec<String> = debate_ref
                     .map(|d| d.positions.iter().map(|p| p.label.clone()).collect())
                     .unwrap_or_default();
-                let concern = debate_ref
-                    .map(|d| d.concern.clone())
-                    .unwrap_or_default();
+                let concern = debate_ref.map(|d| d.concern.clone()).unwrap_or_default();
                 let vote_lean_json = debate_ref
                     .and_then(|d| d.vote_lean.as_ref())
                     .and_then(|v| serde_json::to_value(v).ok())
@@ -4186,8 +4236,7 @@ async fn dispatch_mechanical(
                 })();
                 let debate_collapsed_event_id = match collapse_result {
                     Ok(eid) => {
-                        conn_guard
-                            .execute_batch("RELEASE SAVEPOINT finalize_debate_collapse")?;
+                        conn_guard.execute_batch("RELEASE SAVEPOINT finalize_debate_collapse")?;
                         eid
                     }
                     Err(e) => {
@@ -4315,10 +4364,12 @@ async fn dispatch_mechanical(
             let sub_chain_id = input
                 .get("chain_id")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!(
-                    "call_starter_chain: input missing required string field \
+                .ok_or_else(|| {
+                    anyhow!(
+                        "call_starter_chain: input missing required string field \
                      `chain_id` (e.g. \"starter-evidence-tester\")"
-                ))?
+                    )
+                })?
                 .to_string();
 
             // Pull the sub-chain's input envelope. `input.input` is what
@@ -4372,7 +4423,9 @@ async fn dispatch_mechanical(
                      MAX_SUB_CHAIN_DEPTH={} while invoking '{}' — probable chain cycle. \
                      Document the intended parent/child chain graph; break the cycle \
                      at the chain-authorship level.",
-                    current_depth, MAX_SUB_CHAIN_DEPTH, sub_chain_id,
+                    current_depth,
+                    MAX_SUB_CHAIN_DEPTH,
+                    sub_chain_id,
                 ));
             }
 
@@ -4381,28 +4434,33 @@ async fn dispatch_mechanical(
             // ctx.state = None — library-chain invocation is only available
             // from the starter runner. feedback_loud_deferrals: raise
             // instead of silently dropping.
-            let sub_state = ctx.state.as_ref().ok_or_else(|| anyhow!(
-                "call_starter_chain: no PyramidState wired into the dispatch \
+            let sub_state = ctx.state.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "call_starter_chain: no PyramidState wired into the dispatch \
                  context — library-chain invocation is only available under \
                  `chain_executor::execute_chain_for_target`. Cannot invoke \
                  sub-chain '{}' from this dispatch path.",
-                sub_chain_id,
-            ))?;
-            let chains_dir = ctx.chains_dir.as_ref().cloned().unwrap_or_else(|| {
-                sub_state.chains_dir.clone()
-            });
+                    sub_chain_id,
+                )
+            })?;
+            let chains_dir = ctx
+                .chains_dir
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| sub_state.chains_dir.clone());
 
             // Load the sub-chain via chain_loader::load_chain_by_id so the
             // same discovery semantics (defaults/ + defaults/starter/ +
             // variants/ + ambiguity detection) apply at sub-chain entry.
-            let sub_chain = super::chain_loader::load_chain_by_id(
-                &sub_chain_id,
-                chains_dir.as_path(),
-            )
-            .map_err(|e| anyhow!(
-                "call_starter_chain: failed to load sub-chain '{}': {}",
-                sub_chain_id, e,
-            ))?;
+            let sub_chain =
+                super::chain_loader::load_chain_by_id(&sub_chain_id, chains_dir.as_path())
+                    .map_err(|e| {
+                        anyhow!(
+                            "call_starter_chain: failed to load sub-chain '{}': {}",
+                            sub_chain_id,
+                            e,
+                        )
+                    })?;
 
             // Stamp the incremented depth on the sub-input so nested
             // `call_starter_chain` steps see a monotonic counter even when
@@ -4452,10 +4510,13 @@ async fn dispatch_mechanical(
                 .await
             })
             .await
-            .map_err(|e| anyhow!(
-                "call_starter_chain: sub-chain '{}' failed: {}",
-                sub_chain_id_for_err, e,
-            ))?;
+            .map_err(|e| {
+                anyhow!(
+                    "call_starter_chain: sub-chain '{}' failed: {}",
+                    sub_chain_id_for_err,
+                    e,
+                )
+            })?;
 
             // The parent chain sees the sub-chain's final output verbatim —
             // threading behavior is the same as any other mechanical step.
@@ -4485,10 +4546,7 @@ async fn dispatch_mechanical(
             }
             if let Some(c) = criteria {
                 let preview: String = c.chars().take(300).collect();
-                meta.insert(
-                    "criteria_preview".to_string(),
-                    Value::String(preview),
-                );
+                meta.insert("criteria_preview".to_string(), Value::String(preview));
             }
             let metadata_json = if meta.is_empty() {
                 None
@@ -4536,10 +4594,7 @@ async fn dispatch_mechanical(
             let mut meta = serde_json::Map::new();
             if let Some(q) = question {
                 let preview: String = q.chars().take(500).collect();
-                meta.insert(
-                    "question_preview".to_string(),
-                    Value::String(preview),
-                );
+                meta.insert("question_preview".to_string(), Value::String(preview));
             }
             if let Some(s) = slug_in {
                 meta.insert("slug".to_string(), Value::String(s.to_string()));
@@ -4598,10 +4653,7 @@ async fn dispatch_mechanical(
 
             let (purpose_text, stock_purpose_key) = {
                 let conn_guard = ctx.db_reader.lock().await;
-                match super::purpose::load_or_create_purpose(
-                    &conn_guard,
-                    &slug_for_purpose,
-                ) {
+                match super::purpose::load_or_create_purpose(&conn_guard, &slug_for_purpose) {
                     Ok(p) => (p.purpose_text, p.stock_purpose_key),
                     Err(e) => {
                         drop(conn_guard);
@@ -4630,15 +4682,10 @@ async fn dispatch_mechanical(
                 serde_json::Map::new()
             };
             out.insert("slug".to_string(), Value::String(slug_for_purpose));
-            out.insert(
-                "purpose_text".to_string(),
-                Value::String(purpose_text),
-            );
+            out.insert("purpose_text".to_string(), Value::String(purpose_text));
             out.insert(
                 "stock_purpose_key".to_string(),
-                stock_purpose_key
-                    .map(Value::String)
-                    .unwrap_or(Value::Null),
+                stock_purpose_key.map(Value::String).unwrap_or(Value::Null),
             );
             Ok(Value::Object(out))
         }
@@ -4709,8 +4756,9 @@ async fn dispatch_mechanical(
             let window_n = input
                 .get("window_n")
                 .and_then(|v| v.as_i64())
-                .ok_or_else(|| anyhow!(
-                    "load_recent_annotations_for_slug: required field \
+                .ok_or_else(|| {
+                    anyhow!(
+                        "load_recent_annotations_for_slug: required field \
                      `window_n` is missing from the input envelope. \
                      Pass it from the caller (e.g. \
                      `call_starter_chain` input: {{ window_n: N }}) or \
@@ -4718,7 +4766,8 @@ async fn dispatch_mechanical(
                      default into Rust would violate Pillar 37 \
                      (feedback_pillar37_no_hedging), since window_n \
                      shapes the LLM synthesis prompt's token budget."
-                ))?
+                    )
+                })?
                 .max(1);
             let node_id_filter = input
                 .get("node_id")
@@ -4738,14 +4787,13 @@ async fn dispatch_mechanical(
             // matches every annotation.
             let (purpose_text, annotations, total_count, accretion_cursor) = {
                 let conn_guard = ctx.db_reader.lock().await;
-                let p = super::purpose::load_or_create_purpose(
-                    &conn_guard,
-                    &slug_for_load,
-                )
-                .map_err(|e| anyhow!(
+                let p = super::purpose::load_or_create_purpose(&conn_guard, &slug_for_load)
+                    .map_err(|e| {
+                        anyhow!(
                     "load_recent_annotations_for_slug: failed to load purpose for slug '{}': {}",
                     slug_for_load, e,
-                ))?;
+                )
+                    })?;
 
                 // Read the slug's current accretion cursor (default 0).
                 let cursor: i64 = conn_guard
@@ -4862,27 +4910,13 @@ async fn dispatch_mechanical(
             } else {
                 serde_json::Map::new()
             };
-            out.insert(
-                "slug".to_string(),
-                Value::String(slug_for_load),
-            );
-            out.insert(
-                "purpose_text".to_string(),
-                Value::String(purpose_text),
-            );
-            out.insert(
-                "annotations".to_string(),
-                Value::Array(annotations),
-            );
-            out.insert(
-                "annotation_count".to_string(),
-                Value::from(total_count),
-            );
+            out.insert("slug".to_string(), Value::String(slug_for_load));
+            out.insert("purpose_text".to_string(), Value::String(purpose_text));
+            out.insert("annotations".to_string(), Value::Array(annotations));
+            out.insert("annotation_count".to_string(), Value::from(total_count));
             out.insert(
                 "max_annotation_id".to_string(),
-                max_annotation_id
-                    .map(Value::from)
-                    .unwrap_or(Value::Null),
+                max_annotation_id.map(Value::from).unwrap_or(Value::Null),
             );
             // v5 audit P10: thread the cursor value BEFORE this run so
             // emit_accretion_written can confirm it was advanced.
@@ -4906,14 +4940,16 @@ async fn dispatch_mechanical(
             let note = input
                 .get("note")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!(
-                    "emit_accretion_written: missing `note` in input — the \
+                .ok_or_else(|| {
+                    anyhow!(
+                        "emit_accretion_written: missing `note` in input — the \
                      synthesize_accretion_note LLM step must precede this \
                      primitive and return a `note` field. Threading is \
                      preserve-by-default in the chain executor; if the LLM \
                      step succeeded but `note` is missing, the schema \
                      enforcement failed upstream."
-                ))?
+                    )
+                })?
                 .to_string();
             let references = input
                 .get("references")
@@ -4938,12 +4974,8 @@ async fn dispatch_mechanical(
             // Null max_annotation_id occurs when load_recent_annotations
             // returned zero rows — in that case we should not advance
             // the cursor (nothing was processed).
-            let new_cursor: Option<i64> = input
-                .get("max_annotation_id")
-                .and_then(|v| v.as_i64());
-            let accretion_cursor_value = new_cursor
-                .map(Value::from)
-                .unwrap_or(Value::Null);
+            let new_cursor: Option<i64> = input.get("max_annotation_id").and_then(|v| v.as_i64());
+            let accretion_cursor_value = new_cursor.map(Value::from).unwrap_or(Value::Null);
 
             let meta = serde_json::json!({
                 "note": note,
@@ -5003,9 +5035,7 @@ async fn dispatch_mechanical(
         }
         "emit_sweep_invoked" => {
             // Chronicle-only trace: a sweep has begun against this slug.
-            let stale_days = input
-                .get("stale_days")
-                .and_then(|v| v.as_i64());
+            let stale_days = input.get("stale_days").and_then(|v| v.as_i64());
             let mut meta = serde_json::Map::new();
             if let Some(d) = stale_days {
                 meta.insert("stale_days".to_string(), Value::from(d));
@@ -5082,14 +5112,16 @@ async fn dispatch_mechanical(
             let stale_days = input
                 .get("stale_days")
                 .and_then(|v| v.as_i64())
-                .ok_or_else(|| anyhow!(
-                    "count_stale_failed_work_items: required field \
+                .ok_or_else(|| {
+                    anyhow!(
+                        "count_stale_failed_work_items: required field \
                      `stale_days` is missing from the input envelope. \
                      Pass it from the caller (e.g. chain-level \
                      initial input or a `call_starter_chain` input \
                      envelope with {{ stale_days: N }}). Operators \
                      define `stale' — the dispatch code does not."
-                ))?
+                    )
+                })?
                 .max(0);
             let slug_for_count = input
                 .get("slug")
@@ -5151,10 +5183,7 @@ async fn dispatch_mechanical(
             };
             out.insert("slug".to_string(), Value::String(slug_for_count));
             out.insert("stale_days".to_string(), Value::from(stale_days));
-            out.insert(
-                "stale_failed_count".to_string(),
-                Value::from(count),
-            );
+            out.insert("stale_failed_count".to_string(), Value::from(count));
             Ok(Value::Object(out))
         }
         "reindex_vocab_cache" => {
@@ -5256,24 +5285,28 @@ async fn dispatch_mechanical(
             let stale_days = input
                 .get("stale_days")
                 .and_then(|v| v.as_i64())
-                .ok_or_else(|| anyhow!(
-                    "archive_stale_failed_work_items: required field \
+                .ok_or_else(|| {
+                    anyhow!(
+                        "archive_stale_failed_work_items: required field \
                      `stale_days` is missing from the input envelope. \
                      The sweep chain caller owns this policy knob \
                      (scheduler_parameters.sweep_stale_days today)."
-                ))?
+                    )
+                })?
                 .max(0);
             let retention_days = input
                 .get("retention_days")
                 .and_then(|v| v.as_i64())
-                .ok_or_else(|| anyhow!(
-                    "archive_stale_failed_work_items: required field \
+                .ok_or_else(|| {
+                    anyhow!(
+                        "archive_stale_failed_work_items: required field \
                      `retention_days` is missing from the input \
                      envelope. Operators define the recovery window \
                      after `stale_days` before archival; the dispatch \
                      code does not hardcode it \
                      (scheduler_parameters.sweep_retention_days today)."
-                ))?
+                    )
+                })?
                 .max(0);
             let slug_for_archive = input
                 .get("slug")
@@ -5296,10 +5329,13 @@ async fn dispatch_mechanical(
                             AND state_changed_at < datetime('now', ?3)",
                         rusqlite::params![now, slug_for_archive, threshold_modifier],
                     )
-                    .map_err(|e| anyhow!(
-                        "archive_stale_failed_work_items: UPDATE failed for slug={}: {}",
-                        slug_for_archive, e,
-                    ))?;
+                    .map_err(|e| {
+                        anyhow!(
+                            "archive_stale_failed_work_items: UPDATE failed for slug={}: {}",
+                            slug_for_archive,
+                            e,
+                        )
+                    })?;
                 rows as i64
             };
 
@@ -5321,7 +5357,12 @@ async fn dispatch_mechanical(
                 &slug_for_archive,
                 "chain",
                 "sweep_archived_failed_work_items",
-                None, None, None, None, None, None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
                 Some(&metadata_json),
             )?;
             drop(conn_guard);
@@ -5356,12 +5397,14 @@ async fn dispatch_mechanical(
             let retention_days = input
                 .get("contribution_retention_days")
                 .and_then(|v| v.as_i64())
-                .ok_or_else(|| anyhow!(
-                    "retire_superseded_contributions_past_retention: required \
+                .ok_or_else(|| {
+                    anyhow!(
+                        "retire_superseded_contributions_past_retention: required \
                      field `contribution_retention_days` is missing from the \
                      input envelope. Operators define supersession retention; \
                      the dispatch code does not hardcode it."
-                ))?;
+                    )
+                })?;
             if retention_days <= 0 {
                 return Err(anyhow!(
                     "retire_superseded_contributions_past_retention: \
@@ -5416,7 +5459,12 @@ async fn dispatch_mechanical(
                 &slug_for_retire,
                 "chain",
                 "sweep_retired_superseded_contributions",
-                None, None, None, None, None, None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
                 Some(&metadata_json),
             )?;
             drop(conn_guard);
@@ -6597,7 +6645,9 @@ mod tests {
             sub_chain_depth: None,
         };
         let input = serde_json::json!({"files": ["main.rs"]});
-        let result = dispatch_mechanical("extract_import_graph", &input, &ctx).await.unwrap();
+        let result = dispatch_mechanical("extract_import_graph", &input, &ctx)
+            .await
+            .unwrap();
         assert_eq!(result["_mechanical"], "extract_import_graph");
         assert_eq!(result["_status"], "placeholder");
         assert_eq!(result["slug"], "test-slug");

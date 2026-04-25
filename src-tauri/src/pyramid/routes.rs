@@ -6300,14 +6300,11 @@ async fn process_annotation_hook(
     // controls it — an operator publishing a new annotation type that
     // should also spawn deltas just sets the flag; zero code change.
     if vocab_entry.creates_delta {
-        let threads = {
+        let target_thread_id = {
             let conn = reader.lock().await;
-            db::get_threads(&conn, slug)?
+            db::resolve_annotation_delta_thread(&conn, slug, &annotation.node_id)?
         };
-        let target_thread = threads
-            .iter()
-            .find(|t| t.current_canonical_id == annotation.node_id);
-        if let Some(thread) = target_thread {
+        if let Some(thread_id) = target_thread_id {
             let delta_content = format!(
                 "{} (from annotation #{}): {}",
                 type_str.to_uppercase(),
@@ -6318,7 +6315,7 @@ async fn process_annotation_hook(
                 reader,
                 writer,
                 slug,
-                &thread.thread_id,
+                &thread_id,
                 &delta_content,
                 Some(&annotation.node_id),
                 base_config,
@@ -6330,11 +6327,38 @@ async fn process_annotation_hook(
                 "[annotation] {} annotation #{} created delta on thread '{}' (creates_delta=true)",
                 type_str,
                 annotation.id,
-                thread.thread_id
+                thread_id
             );
         } else {
-            tracing::info!(
-                "[annotation] {} annotation #{} on node '{}' — creates_delta=true but no matching thread, skipping delta",
+            let metadata_json = serde_json::json!({
+                "annotation_id": annotation.id,
+                "annotation_type": annotation.annotation_type.as_str(),
+                "target_node_id": annotation.node_id,
+                "reason": "no_ancestor_thread",
+            })
+            .to_string();
+            let conn = writer.lock().await;
+            if let Err(e) = super::observation_events::write_observation_event(
+                &conn,
+                slug,
+                "annotation",
+                "correction_delta_deferred_no_ancestor_thread",
+                None,
+                None,
+                None,
+                None,
+                Some(&annotation.node_id),
+                None,
+                Some(&metadata_json),
+            ) {
+                tracing::warn!(
+                    "[annotation] failed to emit correction_delta_deferred_no_ancestor_thread for annotation #{}: {}",
+                    annotation.id,
+                    e
+                );
+            }
+            tracing::warn!(
+                "[annotation] {} annotation #{} on node '{}' — creates_delta=true but no exact or ancestor thread, deferred delta",
                 type_str,
                 annotation.id,
                 annotation.node_id

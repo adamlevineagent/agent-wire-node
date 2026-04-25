@@ -274,6 +274,14 @@ pub(crate) fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, 
         "node_re_distilled" => {
             Some(("log_only", "node_redistilled_log", "stale_remote"))
         }
+        // D1 path C: a creates_delta annotation can be valid but have no
+        // exact or ancestor thread. The annotation hook emits this loud
+        // deferral instead of silently returning Ok. It is chronicle-only;
+        // without a log_only mapping the compiler's unknown-event hold
+        // would pin the slug cursor on an intentional diagnostic event.
+        "correction_delta_deferred_no_ancestor_thread" => {
+            Some(("log_only", "correction_delta_deferred_log", "stale_remote"))
+        }
         // Phase 9b-1: pyramid_scheduler tick events. Each is role_bound
         // so the slug's configured role binding (default: accretion_handler
         // → starter-accretion-handler, sweep → starter-sweep) dispatches.

@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::naming::{clean_headline, headline_for_node};
 use super::types::*;
@@ -7119,6 +7119,90 @@ pub fn get_thread(conn: &Connection, slug: &str, thread_id: &str) -> Result<Opti
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+fn thread_id_for_current_canonical_id(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT thread_id
+         FROM pyramid_threads
+         WHERE slug = ?1 AND current_canonical_id = ?2
+         ORDER BY thread_name ASC, thread_id ASC
+         LIMIT 1",
+        rusqlite::params![slug, node_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Resolve the thread that should receive a delta created from an annotation.
+///
+/// Direct annotations on L1+ nodes preserve the existing behavior: the node's
+/// exact `current_canonical_id` match wins. Leaf/L0 annotations fall back to
+/// the nearest live ancestor that owns a thread. Returning `None` means there
+/// is no live ancestor thread, so the caller must defer loudly.
+pub fn resolve_annotation_delta_thread(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Option<String>> {
+    if let Some(thread_id) = thread_id_for_current_canonical_id(conn, slug, node_id)? {
+        return Ok(Some(thread_id));
+    }
+
+    let mut cursor = node_id.to_string();
+    let mut visited = HashSet::new();
+
+    while visited.insert(cursor.clone()) {
+        let parent_id = conn
+            .query_row(
+                "SELECT parent_id
+                 FROM pyramid_nodes
+                 WHERE slug = ?1
+                   AND id = ?2
+                   AND build_version > 0
+                   AND superseded_by IS NULL",
+                rusqlite::params![slug, cursor],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .filter(|parent| !parent.trim().is_empty());
+
+        let Some(parent_id) = parent_id else {
+            return Ok(None);
+        };
+
+        let parent_is_live = conn
+            .query_row(
+                "SELECT 1
+                 FROM pyramid_nodes
+                 WHERE slug = ?1
+                   AND id = ?2
+                   AND build_version > 0
+                   AND superseded_by IS NULL
+                 LIMIT 1",
+                rusqlite::params![slug, parent_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !parent_is_live {
+            return Ok(None);
+        }
+
+        if let Some(thread_id) = thread_id_for_current_canonical_id(conn, slug, &parent_id)? {
+            return Ok(Some(thread_id));
+        }
+
+        cursor = parent_id;
+    }
+
+    Ok(None)
 }
 
 /// Save (upsert) a thread.
@@ -28112,11 +28196,38 @@ mod phase6c_b_post_build_tests {
     }
 
     fn seed_target_node(conn: &Connection, slug: &str, node_id: &str) {
+        seed_node(conn, slug, node_id, 0, None);
+    }
+
+    fn seed_node(
+        conn: &Connection,
+        slug: &str,
+        node_id: &str,
+        depth: i64,
+        parent_id: Option<&str>,
+    ) {
         conn.execute(
             "INSERT INTO pyramid_nodes
-                (id, slug, depth, headline, distilled, self_prompt, build_version)
-             VALUES (?1, ?2, 0, '', '', '', 1)",
-            rusqlite::params![node_id, slug],
+                (id, slug, depth, headline, distilled, self_prompt, parent_id, build_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, 1)",
+            rusqlite::params![
+                node_id,
+                slug,
+                depth,
+                format!("headline for {node_id}"),
+                format!("distilled body for {node_id}"),
+                parent_id
+            ],
+        )
+        .unwrap();
+    }
+
+    fn seed_thread(conn: &Connection, slug: &str, thread_id: &str, node_id: &str, depth: i64) {
+        conn.execute(
+            "INSERT INTO pyramid_threads
+                (slug, thread_id, thread_name, current_canonical_id, depth, delta_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            rusqlite::params![slug, thread_id, format!("thread for {node_id}"), node_id, depth],
         )
         .unwrap();
     }
@@ -28218,6 +28329,55 @@ mod phase6c_b_post_build_tests {
         }
     }
 
+    #[test]
+    fn resolve_annotation_delta_thread_prefers_exact_thread_match() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+        let slug = "rh-delta-resolve-exact";
+        create_slug(&conn, slug, &ContentType::Code, "/tmp/x").unwrap();
+        seed_node(&conn, slug, "node-l1", 1, None);
+        seed_thread(&conn, slug, "thread-l1", "node-l1", 1);
+
+        let resolved = resolve_annotation_delta_thread(&conn, slug, "node-l1").unwrap();
+
+        assert_eq!(resolved.as_deref(), Some("thread-l1"));
+    }
+
+    #[test]
+    fn resolve_annotation_delta_thread_walks_to_nearest_ancestor_thread() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+        let slug = "rh-delta-resolve-ancestor";
+        create_slug(&conn, slug, &ContentType::Code, "/tmp/x").unwrap();
+        seed_node(&conn, slug, "node-l2", 2, None);
+        seed_node(&conn, slug, "node-l1", 1, Some("node-l2"));
+        seed_node(&conn, slug, "leaf-l0", 0, Some("node-l1"));
+        seed_thread(&conn, slug, "thread-l2", "node-l2", 2);
+        seed_thread(&conn, slug, "thread-l1", "node-l1", 1);
+
+        let resolved = resolve_annotation_delta_thread(&conn, slug, "leaf-l0").unwrap();
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some("thread-l1"),
+            "leaf correction should route to nearest ancestor thread"
+        );
+    }
+
+    #[test]
+    fn resolve_annotation_delta_thread_returns_none_without_ancestor_thread() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+        let slug = "rh-delta-resolve-none";
+        create_slug(&conn, slug, &ContentType::Code, "/tmp/x").unwrap();
+        seed_node(&conn, slug, "node-l1", 1, None);
+        seed_node(&conn, slug, "leaf-l0", 0, Some("node-l1"));
+
+        let resolved = resolve_annotation_delta_thread(&conn, slug, "leaf-l0").unwrap();
+
+        assert_eq!(resolved, None);
+    }
+
     // ── Test 4 ─────────────────────────────────────────────────────────
     // When the vocab entry has `reactive: true`, `process_annotation_hook`
     // emits an `annotation_reacted` observation event. This is the
@@ -28313,20 +28473,12 @@ mod phase6c_b_post_build_tests {
     }
 
     // ── Test 6 ─────────────────────────────────────────────────────────
-    // When the vocab entry has `creates_delta: true` and a matching
-    // thread exists, a delta row is created. Uses a contrived inline
-    // delta bypass: we don't run the full LLM-powered create_delta —
-    // instead we assert the hook enters the delta branch (no thread
-    // matches → logs and skips, so deltas table stays empty but the
-    // code path was exercised). We supplement with a flag-level
-    // assertion: correction has creates_delta=true in vocab, observation
-    // has false. The flag IS what drives dispatch.
-    //
-    // This test explicitly asserts "correction enters creates_delta
-    // branch" via the hook path: we verify it doesn't panic + that for
-    // NO-matching-thread, the hook still completes Ok.
+    // A creates_delta annotation with no exact or ancestor thread is a
+    // loud deferral, not the old silent Ok branch. The hook still returns
+    // Ok so annotation save does not fail after the fact, but operators
+    // get an observation event plus warn! log.
     #[tokio::test]
-    async fn process_annotation_hook_handles_creates_delta_true_without_matching_thread() {
+    async fn process_annotation_hook_defers_loudly_without_matching_or_ancestor_thread() {
         let _lock = test_lock();
         let (reader, writer) = hook_setup_readers_and_writers();
         let slug = "rh-delta-no-thread";
@@ -28335,7 +28487,6 @@ mod phase6c_b_post_build_tests {
             create_slug(&conn, slug, &ContentType::Code, "/tmp/x").unwrap();
             seed_target_node(&conn, slug, "node-1");
         }
-        // correction is genesis creates_delta=true.
         let ann = {
             let conn = writer.lock().await;
             save_annotation(
@@ -28344,28 +28495,126 @@ mod phase6c_b_post_build_tests {
             )
             .unwrap()
         };
-        // No thread has current_canonical_id = "node-1", so delta creation
-        // is skipped with an info log — but the hook MUST have entered the
-        // creates_delta=true branch, not gone down a per-type match arm
-        // that no longer exists.
+
         run_hook(&reader, &writer, slug, &ann).await;
 
-        // Sanity: the annotation_superseded event was emitted on ancestors
-        // (correction has special event_type in emit_annotation_observation_events).
-        // Since node-1 has no parent in our setup, no event is emitted — that's OK.
-        // The real assertion here is that the hook completed without error,
-        // proving the dispatch path handles creates_delta=true uniformly.
         let conn = writer.lock().await;
-        // No annotation_reacted (correction.reactive=false).
-        let reacted_count: i64 = conn
+        let (deferred_count, metadata_json): (i64, Option<String>) = conn
             .query_row(
-                "SELECT COUNT(*) FROM dadbear_observation_events
-                  WHERE slug = ?1 AND event_type = 'annotation_reacted'",
+                "SELECT COUNT(*), MAX(metadata_json)
+                 FROM dadbear_observation_events
+                 WHERE slug = ?1
+                   AND event_type = 'correction_delta_deferred_no_ancestor_thread'
+                   AND target_node_id = 'node-1'",
+                rusqlite::params![slug],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            deferred_count, 1,
+            "missing exact/ancestor thread must emit a loud deferral event"
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_str(&metadata_json.unwrap()).unwrap();
+        assert_eq!(metadata["annotation_type"], "correction");
+        assert_eq!(metadata["target_node_id"], "node-1");
+        assert_eq!(metadata["reason"], "no_ancestor_thread");
+
+        let delta_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_deltas WHERE slug = ?1",
                 rusqlite::params![slug],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(reacted_count, 0, "correction is not reactive, no reacted event");
+        assert_eq!(delta_count, 0, "deferral must not write an orphan delta");
+    }
+
+    #[tokio::test]
+    async fn process_annotation_hook_routes_leaf_correction_delta_to_parent_thread() {
+        let _lock = test_lock();
+
+        let mut server = mockito::Server::new_async().await;
+        let mock_content = serde_json::json!({
+            "content": "mocked correction delta from leaf",
+            "relevance": "high",
+            "flag": null,
+            "distillation": "mocked cumulative distillation after correction",
+            "web_edge_notes": [],
+            "drift_detected": false
+        })
+        .to_string();
+        let llm_mock = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(super::phase6_post_build_tests::openrouter_body(&mock_content))
+            .expect(2)
+            .create_async()
+            .await;
+
+        let (reader, writer) = hook_setup_readers_and_writers();
+        let slug = "rh-delta-leaf-parent-thread";
+        {
+            let conn = writer.lock().await;
+            create_slug(&conn, slug, &ContentType::Code, "/tmp/x").unwrap();
+            seed_node(&conn, slug, "parent-l1", 1, None);
+            seed_node(&conn, slug, "leaf-l0", 0, Some("parent-l1"));
+            seed_thread(&conn, slug, "thread-parent-l1", "parent-l1", 1);
+        }
+        let ann = {
+            let conn = writer.lock().await;
+            save_annotation(
+                &conn,
+                &make_annotation(slug, "leaf-l0", AnnotationType::new("correction")),
+            )
+            .unwrap()
+        };
+
+        let config = super::phase6_post_build_tests::mocked_llm_config(server.url()).await;
+        run_hook_with_config(&reader, &writer, slug, &ann, &config, "openai/gpt-4o-mini").await;
+
+        let conn = writer.lock().await;
+        let (thread_id, source_node_id, content, relevance): (
+            String,
+            Option<String>,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT thread_id, source_node_id, content, relevance
+                 FROM pyramid_deltas
+                 WHERE slug = ?1
+                 ORDER BY id DESC
+                 LIMIT 1",
+                rusqlite::params![slug],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(thread_id, "thread-parent-l1");
+        assert_eq!(source_node_id.as_deref(), Some("leaf-l0"));
+        assert!(
+            content.contains("mocked correction delta from leaf"),
+            "delta content must come from mocked create_delta LLM response: {content}"
+        );
+        assert_eq!(relevance, "high");
+
+        let distillation: String = conn
+            .query_row(
+                "SELECT content
+                 FROM pyramid_distillations
+                 WHERE slug = ?1 AND thread_id = 'thread-parent-l1'",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            distillation,
+            "mocked cumulative distillation after correction"
+        );
+        drop(conn);
+
+        llm_mock.assert_async().await;
     }
 
     // ── Test 7 ─────────────────────────────────────────────────────────
@@ -28502,25 +28751,32 @@ mod phase6c_b_post_build_tests {
     }
 
     /// Call the real `process_annotation_hook` from `routes.rs` with a
-    /// stub LlmConfig + OperationalConfig — neither reactive nor the
-    /// no-matching-thread delta paths actually invoke an LLM. The
-    /// `model` string is only used if delta creation is attempted.
+    /// stub LlmConfig + OperationalConfig for non-LLM branches.
     async fn run_hook(
         reader: &std::sync::Arc<tokio::sync::Mutex<Connection>>,
         writer: &std::sync::Arc<tokio::sync::Mutex<Connection>>,
         slug: &str,
         annotation: &PyramidAnnotation,
     ) {
-        // Minimal stubs — the hook branches we exercise here don't dereference them.
         let base_config = crate::pyramid::llm::LlmConfig::default();
-        let model = "test-model";
+        run_hook_with_config(reader, writer, slug, annotation, &base_config, "test-model").await;
+    }
+
+    async fn run_hook_with_config(
+        reader: &std::sync::Arc<tokio::sync::Mutex<Connection>>,
+        writer: &std::sync::Arc<tokio::sync::Mutex<Connection>>,
+        slug: &str,
+        annotation: &PyramidAnnotation,
+        base_config: &crate::pyramid::llm::LlmConfig,
+        model: &str,
+    ) {
         let ops = crate::pyramid::OperationalConfig::default();
         crate::pyramid::routes::test_hooks::run_process_annotation_hook(
             reader,
             writer,
             slug,
             annotation,
-            &base_config,
+            base_config,
             model,
             &ops,
         )
@@ -30010,6 +30266,81 @@ mod phase7b_post_build_tests {
                 .unwrap_or(false),
             "covered_substrate_nodes must resolve the slug's L0 ids"
         );
+    }
+
+    #[tokio::test]
+    async fn decide_crystallization_routes_purpose_annotations_from_annotation_reacted() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7b1a", &ContentType::Code, "/tmp/p7b1a").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L0-A', 'p7b1a', 0, 'L0 A', 'L0 A distilled', '', 1)",
+            [],
+        )
+        .unwrap();
+
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7b-decide-purpose-annotation".into(),
+            name: "Phase 7b decide purpose annotation".into(),
+            description: "annotation_reacted purpose trigger test".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "phase7b-test".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".into(),
+            },
+            steps: vec![crate::pyramid::chain_engine::ChainStep {
+                name: "decide".into(),
+                primitive: "custom".into(),
+                mechanical: true,
+                rust_function: Some("decide_crystallization".into()),
+                ..Default::default()
+            }],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+
+        for annotation_type in ["purpose_declaration", "purpose_shift"] {
+            let out = chain_executor::execute_chain_for_target(
+                &state,
+                &chain,
+                "p7b1a",
+                None,
+                json!({
+                    "trigger_event_type": "annotation_reacted",
+                    "annotation_type": annotation_type,
+                }),
+            )
+            .await
+            .expect("decide chain must run");
+            assert_eq!(
+                out["should_crystallize"],
+                json!(true),
+                "{annotation_type} annotation_reacted must crystallize"
+            );
+            let reasoning = out["reasoning"].as_str().unwrap_or("");
+            assert!(
+                reasoning.contains("annotation_reacted") && reasoning.contains(annotation_type),
+                "reasoning should cite annotation_reacted + {annotation_type}, got: {reasoning}"
+            );
+            assert!(
+                out["covered_substrate_nodes"]
+                    .as_array()
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false),
+                "covered_substrate_nodes must resolve the slug's L0 ids"
+            );
+        }
     }
 
     // ── 7b-7.4: decide_crystallization — unknown event skips ───────────────
