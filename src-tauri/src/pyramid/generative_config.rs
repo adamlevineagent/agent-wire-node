@@ -2016,6 +2016,10 @@ mod tests {
         assert!(names.contains(&"build_strategy"));
         assert!(names.contains(&"dadbear_policy"));
         assert!(names.contains(&"custom_prompts"));
+        assert!(names.contains(&"walker_provider_local"));
+        assert!(names.contains(&"walker_provider_openrouter"));
+        assert!(names.contains(&"walker_provider_fleet"));
+        assert!(names.contains(&"walker_provider_market"));
         assert!(
             !names.contains(&"tier_routing"),
             "tier_routing is retired from the generative config schema picker"

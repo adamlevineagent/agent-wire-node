@@ -264,6 +264,15 @@ fn try_parse_annotation(yaml_content: &str, target_schema_type: &str) -> Option<
 }
 
 fn normalize_annotation_fields(annotation: &mut SchemaAnnotation, target_schema_type: &str) {
+    if !annotation.fields.is_empty() && !annotation.parameters.is_empty() {
+        debug!(
+            target_schema_type,
+            fields_count = annotation.fields.len(),
+            parameters_count = annotation.parameters.len(),
+            "schema_annotation has both fields and legacy parameters; keeping fields"
+        );
+    }
+
     if !annotation.fields.is_empty() || annotation.parameters.is_empty() {
         return;
     }
