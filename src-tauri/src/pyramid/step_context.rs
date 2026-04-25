@@ -641,7 +641,34 @@ pub async fn make_step_ctx_from_llm_config(
         ctx = ctx.with_chain_context(cn.clone(), ct.to_string());
     }
 
-    Some(with_dispatch_decision_if_available(ctx).await)
+    let mut ctx = with_dispatch_decision_if_available(ctx).await;
+    if ctx
+        .resolved_model_id
+        .as_deref()
+        .map(|m| m.is_empty() || m == "<unknown>")
+        .unwrap_or(true)
+    {
+        if let Some(model) = first_dispatch_decision_model(&ctx) {
+            ctx.resolved_model_id = Some(model);
+        }
+    }
+
+    Some(ctx)
+}
+
+fn first_dispatch_decision_model(ctx: &StepContext) -> Option<String> {
+    let decision = ctx.dispatch_decision.as_ref()?;
+    decision
+        .effective_call_order
+        .iter()
+        .find_map(|provider_type| {
+            decision
+                .per_provider
+                .get(provider_type)
+                .and_then(|params| params.model_list.as_ref())
+                .and_then(|models| models.first())
+                .cloned()
+        })
 }
 
 /// Attach a runtime DispatchDecision to a StepContext when the caller has
@@ -994,6 +1021,72 @@ mod tests {
         assert!(
             ctx.dispatch_decision.is_some(),
             "slot-aware helper should attach a runtime DispatchDecision when DB is available",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_make_step_ctx_uses_walker_provider_fallback_slot_model() {
+        let temp_db = NamedTempFile::new().expect("temp db");
+        let conn = rusqlite::Connection::open(temp_db.path()).expect("open temp db");
+        conn.execute_batch(
+            "CREATE TABLE pyramid_config_contributions (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 contribution_id TEXT NOT NULL UNIQUE,
+                 slug TEXT,
+                 schema_type TEXT NOT NULL,
+                 yaml_content TEXT NOT NULL,
+                 wire_native_metadata_json TEXT NOT NULL DEFAULT '{}',
+                 wire_publication_state_json TEXT NOT NULL DEFAULT '{}',
+                 supersedes_id TEXT,
+                 superseded_by_id TEXT,
+                 triggering_note TEXT,
+                 status TEXT NOT NULL DEFAULT 'active',
+                 source TEXT NOT NULL DEFAULT 'local',
+                 wire_contribution_id TEXT,
+                 created_by TEXT,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 accepted_at TEXT
+             );",
+        )
+        .expect("create contributions table");
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions
+                 (contribution_id, schema_type, yaml_content, status, accepted_at)
+             VALUES (?1, ?2, ?3, 'active', datetime('now'))",
+            rusqlite::params![
+                "fallback-openrouter",
+                "walker_provider_openrouter",
+                "schema_type: walker_provider_openrouter\nversion: 1\noverrides:\n  model_list:\n    fallback:\n      - \"fallback/test-model\"\n"
+            ],
+        )
+        .expect("insert fallback contribution");
+
+        let config = LlmConfig::default().clone_with_cache_access(
+            "slot-fallback-test",
+            "build-slot-fallback-test",
+            temp_db.path().to_string_lossy().to_string(),
+            None,
+        );
+
+        let ctx = make_step_ctx_from_llm_config(
+            &config,
+            "evidence_pre_map_0",
+            "evidence_pre_map",
+            1,
+            Some(0),
+            "system prompt",
+            "evidence_loop",
+            None,
+            None,
+        )
+        .await
+        .expect("slot fallback step ctx");
+
+        assert_eq!(ctx.model_tier, "evidence_loop");
+        assert_eq!(ctx.resolved_model_id.as_deref(), Some("fallback/test-model"));
+        assert!(
+            ctx.dispatch_decision.is_some(),
+            "fallback slot should still attach a runtime DispatchDecision",
         );
     }
 }

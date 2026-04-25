@@ -52,6 +52,8 @@ use serde::{Deserialize, Serialize};
 use crate::pyramid::config_contributions::load_active_config_contribution;
 use crate::pyramid::walker_cache::ScopeCache;
 
+const FALLBACK_SLOT: &str = "fallback";
+
 // ── ProviderType ─────────────────────────────────────────────────────────────
 //
 // §2.1 / §2.7: the four provider types are the universe for v3. Scope 3
@@ -841,47 +843,7 @@ pub fn resolve_context_limit(
     slot: &str,
     provider_type: ProviderType,
 ) -> Option<u64> {
-    // Scopes 1 + 2: flat u64 (slot is implicit in scope key).
-    if let Some(v) = chain
-        .slot_provider
-        .get(&(slot.to_string(), provider_type))
-        .and_then(|e| e.overrides.get("context_limit"))
-        .filter(|v| !v.is_null())
-        .and_then(|v| serde_json::from_value::<u64>(v.clone()).ok())
-    {
-        return Some(v);
-    }
-    if let Some(v) = chain
-        .slot
-        .get(slot)
-        .and_then(|e| e.overrides.get("context_limit"))
-        .filter(|v| !v.is_null())
-        .and_then(|v| serde_json::from_value::<u64>(v.clone()).ok())
-    {
-        return Some(v);
-    }
-    // Scopes 3 + 4: HashMap<String, u64>; index on slot.
-    if let Some(v) = chain
-        .call_order_provider
-        .get(&provider_type)
-        .and_then(|e| e.overrides.get("context_limit"))
-        .filter(|v| !v.is_null())
-        .and_then(|v| serde_json::from_value::<HashMap<String, u64>>(v.clone()).ok())
-        .and_then(|m| m.get(slot).copied())
-    {
-        return Some(v);
-    }
-    if let Some(v) = chain
-        .provider
-        .get(&provider_type)
-        .and_then(|e| e.overrides.get("context_limit"))
-        .filter(|v| !v.is_null())
-        .and_then(|v| serde_json::from_value::<HashMap<String, u64>>(v.clone()).ok())
-        .and_then(|m| m.get(slot).copied())
-    {
-        return Some(v);
-    }
-    None
+    resolve_tiered_u64(chain, "context_limit", slot, provider_type)
 }
 
 /// §3 / §5.1 `max_completion_tokens` — Option-surfacing, SHAPE-PER-SCOPE.
@@ -896,45 +858,7 @@ pub fn resolve_max_completion_tokens(
     slot: &str,
     provider_type: ProviderType,
 ) -> Option<u64> {
-    if let Some(v) = chain
-        .slot_provider
-        .get(&(slot.to_string(), provider_type))
-        .and_then(|e| e.overrides.get("max_completion_tokens"))
-        .filter(|v| !v.is_null())
-        .and_then(|v| serde_json::from_value::<u64>(v.clone()).ok())
-    {
-        return Some(v);
-    }
-    if let Some(v) = chain
-        .slot
-        .get(slot)
-        .and_then(|e| e.overrides.get("max_completion_tokens"))
-        .filter(|v| !v.is_null())
-        .and_then(|v| serde_json::from_value::<u64>(v.clone()).ok())
-    {
-        return Some(v);
-    }
-    if let Some(v) = chain
-        .call_order_provider
-        .get(&provider_type)
-        .and_then(|e| e.overrides.get("max_completion_tokens"))
-        .filter(|v| !v.is_null())
-        .and_then(|v| serde_json::from_value::<HashMap<String, u64>>(v.clone()).ok())
-        .and_then(|m| m.get(slot).copied())
-    {
-        return Some(v);
-    }
-    if let Some(v) = chain
-        .provider
-        .get(&provider_type)
-        .and_then(|e| e.overrides.get("max_completion_tokens"))
-        .filter(|v| !v.is_null())
-        .and_then(|v| serde_json::from_value::<HashMap<String, u64>>(v.clone()).ok())
-        .and_then(|m| m.get(slot).copied())
-    {
-        return Some(v);
-    }
-    None
+    resolve_tiered_u64(chain, "max_completion_tokens", slot, provider_type)
 }
 
 /// §3 / §5.1 `pricing_json` — Option-surfacing, scalar opaque Value.
@@ -1028,6 +952,20 @@ pub fn resolve_model_list(
     slot: &str,
     provider_type: ProviderType,
 ) -> Option<Vec<String>> {
+    resolve_model_list_exact(chain, slot, provider_type).or_else(|| {
+        if slot == FALLBACK_SLOT {
+            None
+        } else {
+            resolve_model_list_exact(chain, FALLBACK_SLOT, provider_type)
+        }
+    })
+}
+
+fn resolve_model_list_exact(
+    chain: &ScopeChain,
+    slot: &str,
+    provider_type: ProviderType,
+) -> Option<Vec<String>> {
     // Scopes 1 + 2: flat Vec<String>.
     if let Some(v) = chain
         .slot_provider
@@ -1035,6 +973,7 @@ pub fn resolve_model_list(
         .and_then(|e| e.overrides.get("model_list"))
         .filter(|v| !v.is_null())
         .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+        .filter(|v| !v.is_empty())
     {
         return Some(v);
     }
@@ -1044,6 +983,7 @@ pub fn resolve_model_list(
         .and_then(|e| e.overrides.get("model_list"))
         .filter(|v| !v.is_null())
         .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+        .filter(|v| !v.is_empty())
     {
         return Some(v);
     }
@@ -1055,6 +995,7 @@ pub fn resolve_model_list(
         .filter(|v| !v.is_null())
         .and_then(|v| serde_json::from_value::<HashMap<String, Vec<String>>>(v.clone()).ok())
         .and_then(|m| m.get(slot).cloned())
+        .filter(|v| !v.is_empty())
     {
         return Some(v);
     }
@@ -1065,6 +1006,71 @@ pub fn resolve_model_list(
         .filter(|v| !v.is_null())
         .and_then(|v| serde_json::from_value::<HashMap<String, Vec<String>>>(v.clone()).ok())
         .and_then(|m| m.get(slot).cloned())
+        .filter(|v| !v.is_empty())
+    {
+        return Some(v);
+    }
+    None
+}
+
+fn resolve_tiered_u64(
+    chain: &ScopeChain,
+    param: &str,
+    slot: &str,
+    provider_type: ProviderType,
+) -> Option<u64> {
+    resolve_tiered_u64_exact(chain, param, slot, provider_type).or_else(|| {
+        if slot == FALLBACK_SLOT {
+            None
+        } else {
+            resolve_tiered_u64_exact(chain, param, FALLBACK_SLOT, provider_type)
+        }
+    })
+}
+
+fn resolve_tiered_u64_exact(
+    chain: &ScopeChain,
+    param: &str,
+    slot: &str,
+    provider_type: ProviderType,
+) -> Option<u64> {
+    // Scopes 1 + 2: flat u64 (slot is implicit in scope key).
+    if let Some(v) = chain
+        .slot_provider
+        .get(&(slot.to_string(), provider_type))
+        .and_then(|e| e.overrides.get(param))
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<u64>(v.clone()).ok())
+    {
+        return Some(v);
+    }
+    if let Some(v) = chain
+        .slot
+        .get(slot)
+        .and_then(|e| e.overrides.get(param))
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<u64>(v.clone()).ok())
+    {
+        return Some(v);
+    }
+    // Scopes 3 + 4: HashMap<String, u64>; index on slot.
+    if let Some(v) = chain
+        .call_order_provider
+        .get(&provider_type)
+        .and_then(|e| e.overrides.get(param))
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<HashMap<String, u64>>(v.clone()).ok())
+        .and_then(|m| m.get(slot).copied())
+    {
+        return Some(v);
+    }
+    if let Some(v) = chain
+        .provider
+        .get(&provider_type)
+        .and_then(|e| e.overrides.get(param))
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<HashMap<String, u64>>(v.clone()).ok())
+        .and_then(|m| m.get(slot).copied())
     {
         return Some(v);
     }
@@ -1819,6 +1825,44 @@ mod tests {
     }
 
     #[test]
+    fn test_model_list_exact_then_fallback() {
+        let mut chain = ScopeChain::default();
+        chain.provider.insert(
+            ProviderType::OpenRouter,
+            entry(json!({
+                "model_list": {
+                    "mid": ["exact-mid"],
+                    "empty_slot": [],
+                    "fallback": ["fallback-model"],
+                }
+            })),
+        );
+
+        assert_eq!(
+            resolve_model_list(&chain, "mid", ProviderType::OpenRouter),
+            Some(vec!["exact-mid".to_string()])
+        );
+        assert_eq!(
+            resolve_model_list(&chain, "evidence_loop", ProviderType::OpenRouter),
+            Some(vec!["fallback-model".to_string()])
+        );
+        assert_eq!(
+            resolve_model_list(&chain, "empty_slot", ProviderType::OpenRouter),
+            Some(vec!["fallback-model".to_string()])
+        );
+        assert_eq!(
+            resolve_model_list(&chain, "fallback", ProviderType::OpenRouter),
+            Some(vec!["fallback-model".to_string()])
+        );
+
+        let no_fallback = ScopeChain::default();
+        assert_eq!(
+            resolve_model_list(&no_fallback, "evidence_loop", ProviderType::OpenRouter),
+            None
+        );
+    }
+
+    #[test]
     fn test_breaker_reset_string_shorthand_parses() {
         // FromStr round-trip.
         assert_eq!(
@@ -2235,6 +2279,41 @@ slots:
         assert_eq!(
             resolve_max_completion_tokens(&chain, "mid", ProviderType::OpenRouter),
             Some(32_768)
+        );
+    }
+
+    #[test]
+    fn test_tiered_metadata_exact_then_fallback() {
+        let mut chain = ScopeChain::default();
+        chain.provider.insert(
+            ProviderType::OpenRouter,
+            entry(json!({
+                "context_limit": {
+                    "mid": 200_000_u64,
+                    "fallback": 120_000_u64,
+                },
+                "max_completion_tokens": {
+                    "mid": 8_192_u64,
+                    "fallback": 4_096_u64,
+                }
+            })),
+        );
+
+        assert_eq!(
+            resolve_context_limit(&chain, "mid", ProviderType::OpenRouter),
+            Some(200_000)
+        );
+        assert_eq!(
+            resolve_context_limit(&chain, "evidence_loop", ProviderType::OpenRouter),
+            Some(120_000)
+        );
+        assert_eq!(
+            resolve_max_completion_tokens(&chain, "mid", ProviderType::OpenRouter),
+            Some(8_192)
+        );
+        assert_eq!(
+            resolve_max_completion_tokens(&chain, "evidence_loop", ProviderType::OpenRouter),
+            Some(4_096)
         );
     }
 
