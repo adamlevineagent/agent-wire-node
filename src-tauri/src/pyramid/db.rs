@@ -29652,12 +29652,13 @@ mod phase6c_d_post_build_tests {
 // Phase 7a (post-build accretion v5): debate_steward chain + Debate writer.
 // Tests verify:
 //   1. steel_man annotation upgrades Scaffolding target to Debate
-//   2. red_team annotation on existing Debate appends red_team entry
-//   3. starter-debate-steward chain loads via chain_loader
-//   4. debate_spawned event is emitted on Scaffolding → Debate upgrade
-//   5. debate_spawned event does not cause infinite-recursion compile
-//   6. append_annotation_to_debate_node is idempotent on replay
-//   7. compiler routes annotation_reacted via vocab's handler_chain_id
+//   2. hypothesis annotation upgrades Scaffolding target to Debate position
+//   3. red_team annotation on existing Debate appends red_team entry
+//   4. starter-debate-steward chain loads via chain_loader
+//   5. debate_spawned event is emitted on Scaffolding → Debate upgrade
+//   6. debate_spawned event does not cause infinite-recursion compile
+//   7. append_annotation_to_debate_node is idempotent on replay
+//   8. compiler routes annotation_reacted via vocab's handler_chain_id
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
@@ -29898,7 +29899,123 @@ mod phase7a_post_build_tests {
         }
     }
 
-    // ── Test 2: RedTeam on existing Debate appends red_team ────────────
+    // ── Test 2: Hypothesis annotation upgrades Scaffolding to Debate ───
+
+    #[tokio::test]
+    async fn hypothesis_annotation_upgrades_scaffolding_to_debate_position() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7a1h", &ContentType::Code, "/tmp/p7a1h").unwrap();
+        seed_scaffolding_node(&conn, "p7a1h", "node-hypothesis-1");
+        let ann = save_ann(
+            &conn,
+            "p7a1h",
+            "node-hypothesis-1",
+            "hypothesis",
+            "Hypothesis: latency failures come from stale package artifacts.",
+            "newman",
+        );
+        let event_id = emit_annotation_reacted(
+            &conn,
+            "p7a1h",
+            &ann,
+            "starter-debate-steward",
+        );
+
+        let result =
+            dadbear_compiler::run_compilation_for_slug(&conn, "p7a1h", None, None).unwrap();
+        assert!(
+            result.items_compiled >= 1,
+            "hypothesis annotation_reacted must compile a steward work item"
+        );
+        let (wi_id, primitive, step_name, resolved_chain_id, state): (
+            String, String, String, Option<String>, String,
+        ) = conn
+            .query_row(
+                "SELECT id, primitive, step_name, resolved_chain_id, state
+                   FROM dadbear_work_items
+                  WHERE slug = 'p7a1h' AND step_name = 'cascade_reacted'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("role_bound work item for hypothesis annotation_reacted must exist");
+        assert_eq!(primitive, "role_bound");
+        assert_eq!(step_name, "cascade_reacted");
+        assert_eq!(resolved_chain_id.as_deref(), Some("starter-debate-steward"));
+        assert_eq!(state, "compiled");
+        assert!(
+            wi_id.ends_with(&format!("/event/{event_id}")),
+            "work item id must stay event-scoped for annotation_reacted: {wi_id}"
+        );
+
+        let state_pyr = test_pyramid_state(conn);
+        let chain = chain_loader::load_chain_by_id(
+            "starter-debate-steward",
+            &state_pyr.chains_dir,
+        )
+        .expect("starter-debate-steward must load");
+        chain_executor::execute_chain_for_target(
+            &state_pyr,
+            &chain,
+            "p7a1h",
+            Some("node-hypothesis-1"),
+            serde_json::json!({
+                "work_item_id": wi_id,
+                "step_name": step_name,
+                "target_id": "node-hypothesis-1",
+                "layer": 1,
+            }),
+        )
+        .await
+        .expect("debate_steward chain must succeed for hypothesis");
+
+        let writer = state_pyr.writer.lock().await;
+        let view = get_node_shape(&writer, "p7a1h", "node-hypothesis-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.shape.as_str(), "debate");
+        match view.payload {
+            Some(ShapePayload::Debate(d)) => {
+                assert_eq!(d.positions.len(), 1);
+                assert!(d.positions[0]
+                    .steel_manning
+                    .contains("stale package artifacts"));
+                assert!(
+                    d.positions[0].red_teams.is_empty(),
+                    "hypothesis seeds a position, not a red_team"
+                );
+                assert!(
+                    d.positions[0]
+                        .source_annotation_ids
+                        .iter()
+                        .any(|a| a == &format!("annotation#{}", ann.id)),
+                    "hypothesis position must retain source annotation provenance"
+                );
+            }
+            other => panic!("expected Debate payload, got {other:?}"),
+        }
+
+        let (count, metadata): (i64, Option<String>) = writer
+            .query_row(
+                "SELECT COUNT(*), MAX(metadata_json)
+                   FROM dadbear_observation_events
+                  WHERE slug = 'p7a1h' AND event_type = 'debate_spawned'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "hypothesis should spawn exactly one Debate");
+        let metadata: serde_json::Value =
+            serde_json::from_str(&metadata.expect("spawn metadata required")).unwrap();
+        assert_eq!(
+            metadata["initial_position_or_red_team"],
+            serde_json::json!("hypothesis"),
+            "spawn metadata must preserve hypothesis as the triggering annotation type"
+        );
+        assert_eq!(metadata["annotation_id"], serde_json::json!(ann.id));
+    }
+
+    // ── Test 3: RedTeam on existing Debate appends red_team ────────────
 
     #[tokio::test]
     async fn red_team_annotation_on_existing_debate_appends_red_team() {
@@ -30129,7 +30246,7 @@ mod phase7a_post_build_tests {
         }
     }
 
-    // ── Test 3: debate_steward chain loads via chain_loader ─────────────
+    // ── Test 4: debate_steward chain loads via chain_loader ─────────────
 
     #[test]
     fn debate_steward_chain_loads_via_chain_loader() {
@@ -30151,7 +30268,7 @@ mod phase7a_post_build_tests {
         );
     }
 
-    // ── Test 4: debate_spawned event emitted on shape upgrade ──────────
+    // ── Test 5: debate_spawned event emitted on shape upgrade ──────────
 
     #[tokio::test]
     async fn debate_spawned_event_emitted_on_shape_upgrade() {
@@ -30193,7 +30310,7 @@ mod phase7a_post_build_tests {
         );
     }
 
-    // ── Test 5: debate_spawned does not cause infinite recursion ────────
+    // ── Test 6: debate_spawned does not cause infinite recursion ────────
     //
     // Two distinct safety properties:
     //  (a) Running the `starter-debate-steward` chain a second time
@@ -30294,7 +30411,7 @@ mod phase7a_post_build_tests {
         );
     }
 
-    // ── Test 6: append_annotation_to_debate_node is idempotent ─────────
+    // ── Test 7: append_annotation_to_debate_node is idempotent ─────────
 
     #[tokio::test]
     async fn append_annotation_to_debate_node_is_idempotent() {
@@ -30347,7 +30464,7 @@ mod phase7a_post_build_tests {
         assert_eq!(spawn_count, 1);
     }
 
-    // ── Test 7: compiler routes annotation_reacted via vocab handler ────
+    // ── Test 8: compiler routes annotation_reacted via vocab handler ────
 
     #[tokio::test]
     async fn compiler_routes_annotation_reacted_via_vocab_handler_chain_id() {
@@ -30370,7 +30487,7 @@ mod phase7a_post_build_tests {
             "annotation_reacted must be routed via vocab handler_chain_id, not role_for_event");
     }
 
-    // ── Test 8: missing handler_chain_id in metadata is a loud hold ─────
+    // ── Test 9: missing handler_chain_id in metadata is a loud hold ─────
 
     #[test]
     fn compiler_holds_cursor_when_annotation_reacted_metadata_missing_handler() {

@@ -1242,11 +1242,11 @@ async fn dispatch_mechanical(
         // ── Post-build accretion v5 Phase 7a: debate_steward primitives ─────
         //
         // The three primitives below back `starter-debate-steward.yaml`, the
-        // chain dispatched when a `steel_man` / `red_team` annotation fires
-        // `annotation_reacted`. Each accepts the starter-runner threaded
-        // input shape (target_node_id / work_item_id / slug merged by the
-        // executor) and reads what it needs. Loud-raise on missing required
-        // fields per `feedback_loud_deferrals`.
+        // chain dispatched when a `steel_man` / `hypothesis` / `red_team`
+        // annotation fires `annotation_reacted`. Each accepts the
+        // starter-runner threaded input shape (target_node_id / work_item_id /
+        // slug merged by the executor) and reads what it needs. Loud-raise
+        // on missing required fields per `feedback_loud_deferrals`.
         "emit_debate_steward_invoked" => {
             // Chronicle-only observability event. Writes one row into
             // `dadbear_observation_events` naming the target + annotation.
@@ -1505,20 +1505,21 @@ async fn dispatch_mechanical(
             Ok(Value::Object(out))
         }
         "append_annotation_to_debate_node" => {
-            // Core write. Given the target node + a steel_man / red_team
-            // annotation, either:
+            // Core write. Given the target node + a debate annotation
+            // (steel_man / hypothesis / red_team), either:
             //   (a) Upgrade a Scaffolding node to Debate, seeding the first
-            //       position (steel_man) or first red_team (red_team).
+            //       position (steel_man / hypothesis) or first red_team
+            //       (red_team).
             //   (b) Append to an existing Debate's positions[] /
             //       red_teams[] (idempotent — the same annotation_id is
             //       never added twice).
             // Emits `debate_spawned` on the Scaffolding→Debate upgrade.
             //
-            // The debate_role mapping (steel_man → position, red_team →
-            // red_team) is hardcoded in this primitive today because the
-            // vocabulary registry doesn't carry a `debate_role` field yet.
-            // Phase 7b+ should lift this to a vocab attribute so new
-            // debate-mode annotation types can be published without a
+            // The debate_role mapping (steel_man / hypothesis → position,
+            // red_team → red_team) is hardcoded in this primitive today
+            // because the vocabulary registry doesn't carry a `debate_role`
+            // field yet. Phase 7b+ should lift this to a vocab attribute so
+            // new debate-mode annotation types can be published without a
             // code deploy (feedback_generalize_not_enumerate).
             let target_node_id = input
                 .get("target_node_id")
@@ -1640,12 +1641,14 @@ async fn dispatch_mechanical(
 
             // Hardcoded debate-role mapping (future: vocab-driven).
             let is_steel_man = annotation_type == "steel_man";
+            let is_hypothesis = annotation_type == "hypothesis";
+            let is_position_like = is_steel_man || is_hypothesis;
             let is_red_team = annotation_type == "red_team";
-            if !is_steel_man && !is_red_team {
+            if !is_position_like && !is_red_team {
                 return Err(anyhow!(
                     "append_annotation_to_debate_node: unsupported annotation_type '{}' — \
-                     only steel_man / red_team carry a debate_role today. Publish a vocab \
-                     entry with a debate_role field (Phase 7b+) to extend.",
+                     only steel_man / hypothesis / red_team carry a debate_role today. Publish \
+                     a vocab entry with a debate_role field (Phase 7b+) to extend.",
                     annotation_type
                 ));
             }
@@ -1664,8 +1667,8 @@ async fn dispatch_mechanical(
             //
             // finalize_debate_node collapses a Debate → Scaffolding and
             // NULLs the shape_payload_json. Without this guard, an in-flight
-            // steel_man / red_team annotation arriving moments after the
-            // collapse would take the Scaffolding-branch below and
+            // steel_man / hypothesis / red_team annotation arriving moments
+            // after the collapse would take the Scaffolding-branch below and
             // RESURRECT the debate under a fresh DebateTopic — the lock
             // prevents DB corruption but semantic ordering is wrong.
             //
@@ -1796,7 +1799,7 @@ async fn dispatch_mechanical(
                             target_node_id = %target_node_id,
                             "append_annotation_to_debate_node: collapse_cooldown_secs=0 — \
                              post-collapse append-race guard is DISABLED by operator config; \
-                             a steel_man/red_team annotation on a just-collapsed node will \
+                             a steel_man/hypothesis/red_team annotation on a just-collapsed node will \
                              resurrect the debate. This warning fires once per process \
                              lifetime."
                         );
@@ -1804,23 +1807,25 @@ async fn dispatch_mechanical(
                 }
             }
 
-            let position_label_for_steel_man = format!("annotation#{annotation_id}");
+            let position_label_for_annotation = format!("annotation#{annotation_id}");
             let red_team_from_position = "main";
 
             let (action, updated_debate, shape_was_upgraded) = if current_shape.is_scaffolding() {
                 // Create fresh Debate.
-                let (positions, action_label) = if is_steel_man {
+                let (positions, action_label) = if is_position_like {
                     // v5 audit P6: record the annotation id under the
                     // dedicated `source_annotation_ids` channel. The
                     // position-LABEL also carries `annotation#{id}` today
-                    // because a steel-manning position from an external
+                    // because a position-like external annotation from an
                     // author has no named stance — that's a separate
                     // labeling concern. `evidence_anchors` stays empty:
-                    // genuine node-id refs only.
+                    // genuine node-id refs only. Hypothesis intentionally
+                    // seeds a claim position awaiting support, rebuttal, or
+                    // evidence.
                     let annotation_token = format!("annotation#{annotation_id}");
                     (
                         vec![DebatePosition {
-                            label: position_label_for_steel_man.clone(),
+                            label: position_label_for_annotation.clone(),
                             steel_manning: ann_content.clone(),
                             red_teams: vec![],
                             evidence_anchors: vec![],
@@ -1880,8 +1885,8 @@ async fn dispatch_mechanical(
                         ));
                     }
                 };
-                let action_label = if is_steel_man {
-                    let label = position_label_for_steel_man.clone();
+                let action_label = if is_position_like {
+                    let label = position_label_for_annotation.clone();
                     let annotation_token = format!("annotation#{annotation_id}");
                     // v5 audit P6: idempotency check widened to match the
                     // new field (catch replays regardless of which side of
@@ -1992,15 +1997,10 @@ async fn dispatch_mechanical(
                     .first()
                     .map(|p| p.label.clone())
                     .unwrap_or_default();
-                let initial_kind = if is_steel_man {
-                    "steel_man"
-                } else {
-                    "red_team"
-                };
                 let meta = serde_json::json!({
                     "target_node_id": target_node_id,
                     "initial_position_label": initial_label,
-                    "initial_position_or_red_team": initial_kind,
+                    "initial_position_or_red_team": annotation_type.as_str(),
                     "annotation_id": annotation_id,
                 })
                 .to_string();

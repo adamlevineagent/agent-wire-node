@@ -15,14 +15,13 @@
 // the contribution-driven registry that Phase 6c-A shipped.
 //
 // Shape notes:
-//   - annotation types carry a `reactive` flag. `steel_man` + `red_team`
-//     are `true` today — Phase 6c-B's `process_annotation_hook` emits
-//     `annotation_reacted` observation events on any reactive type,
-//     which Phase 7 will consume for chain dispatch. The four
-//     "next-v5" reactive verbs (`hypothesis`, `gap`,
-//     `purpose_declaration`, `purpose_shift`) are NOT in the genesis
-//     tuple below — adding them is a vocab publish (contribution
-//     write), not a code deploy, per the 6c-B flip.
+//   - annotation types carry a `reactive` flag. Phase 6c-B's
+//     `process_annotation_hook` emits `annotation_reacted` observation
+//     events on any reactive type, which Phase 7 consumes for chain
+//     dispatch. The v5 reactive starters below (`steel_man`, `red_team`,
+//     `hypothesis`, `gap`, `purpose_declaration`, `purpose_shift`) prove
+//     the registry path; future verbs should be vocab publishes
+//     (contribution writes), not code deploys, per the 6c-B flip.
 //   - annotation types also carry a `creates_delta` flag (6c-B). True
 //     for `correction` only in genesis; lifts the pre-v5 hardcoded
 //     `AnnotationType::Correction => create_delta(...)` arm into vocab.
@@ -55,9 +54,10 @@
 // section. Narrative-feedback types (observation, correction, question,
 // friction, idea, era, transition, health_check, directory, steel_man,
 // red_team, hypothesis) DO flow into the prompt — they ARE the content
-// the LLM should consider when re-distilling. steel_man + red_team carry
-// `true` despite also being handled by debate_steward because their
-// CONTENT (the argument body) IS narrative and belongs in the prompt.
+// the LLM should consider when re-distilling. steel_man, hypothesis, and
+// red_team carry `true` despite also being handled by debate_steward
+// because their CONTENT (the argument body) IS narrative and belongs in
+// the prompt.
 //
 // Phase 9 close-2 added `event_type_on_emit` — lifts the pre-close-2
 // hardcoded `emit_annotation_observation_events` branch
@@ -160,13 +160,14 @@ pub const GENESIS_ANNOTATION_TYPES: &[(
         true,
         None,
     ),
-    // v5 Phase 7 reactives — steel_man + red_team are the two Phase 7a
-    // wire to emit `annotation_reacted` observation events. Phase 7c adds
-    // the 4 missing v5 verbs (`gap`, `hypothesis`, `purpose_declaration`,
-    // `purpose_shift`) as pure vocab entries — no Rust enum change
-    // required post-6c-B. 6c-B flipped the consumers to vocab lookups, so
-    // these four are picked up on the very next `init_pyramid_db` tick
-    // (and any running slug after `invalidate_cache()`).
+    // v5 Phase 7 reactives — steel_man + red_team are the Phase 7a starter
+    // debate annotations. Phase 7c adds the 4 missing v5 verbs (`gap`,
+    // `hypothesis`, `purpose_declaration`, `purpose_shift`) as pure vocab
+    // entries — no Rust enum change required post-6c-B. hypothesis shares
+    // the debate substrate and materializes as a position-like claim.
+    // 6c-B flipped the consumers to vocab lookups, so these four are picked
+    // up on the very next `init_pyramid_db` tick (and any running slug
+    // after `invalidate_cache()`).
     (
         "steel_man",
         "Good-faith reconstruction of an opposing position. Triggers debate_steward.",
@@ -277,7 +278,7 @@ pub const GENESIS_NODE_SHAPES: &[(&str, &str)] = &[
     ),
     (
         "debate",
-        "Debate node: holds steel_man / red_team exchanges and resolution state.",
+        "Debate node: holds steel_man / hypothesis / red_team exchanges and resolution state.",
     ),
     (
         "meta_layer",
@@ -323,7 +324,7 @@ pub const GENESIS_ROLE_NAMES: &[(&str, &str, &str)] = &[
     ),
     (
         "debate_steward",
-        "Manages debate nodes: dispatches on steel_man / red_team annotations.",
+        "Manages debate nodes: dispatches on steel_man / hypothesis / red_team annotations.",
         "starter-debate-steward",
     ),
     (
