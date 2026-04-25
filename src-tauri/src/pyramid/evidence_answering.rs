@@ -299,33 +299,21 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
             questions_text, nodes_text
         );
 
-        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
-        // Previously: manual StepContext::new + with_model_resolution("fast_extract")
-        // without with_dispatch_decision_if_available → Decision=None → walker
-        // skipped every provider silently. Now: canonical helper with slot=
-        // "evidence_loop" (Rust rename of "fast_extract"; first-class walker
-        // tier per bundled walker_provider_openrouter → xiaomi/mimo-v2.5-pro).
-        let pre_map_resolved = llm_config
-            .provider_registry
-            .as_ref()
-            .and_then(|reg| reg.resolve_tier("evidence_loop", None, None, None).ok());
-        let pre_map_ctx = match &pre_map_resolved {
-            Some(resolved) => {
-                make_step_ctx_from_llm_config(
-                    llm_config,
-                    &format!("evidence_pre_map_{}", batch_idx),
-                    "evidence_pre_map",
-                    0,
-                    Some(batch_idx as i64),
-                    &system_prompt,
-                    "evidence_loop",
-                    Some(&resolved.tier.model_id),
-                    Some(&resolved.provider.id),
-                )
-                .await
-            }
-            None => None,
-        };
+        // walker-v3-completion: canonical dispatch via Decision spine.
+        // Do not pre-gate on legacy pyramid_tier_routing; evidence_loop
+        // lives in walker_provider_* and may resolve through fallback.
+        let pre_map_ctx = make_step_ctx_from_llm_config(
+            llm_config,
+            &format!("evidence_pre_map_{}", batch_idx),
+            "evidence_pre_map",
+            0,
+            Some(batch_idx as i64),
+            &system_prompt,
+            "evidence_loop",
+            None,
+            None,
+        )
+        .await;
         let pre_map_audit_ctx = audit.map(|ctx| AuditContext {
             call_purpose: format!("pre_map_batch_{}", batch_idx),
             step_name: "evidence_pre_map".to_string(),
@@ -1038,28 +1026,19 @@ Respond with ONLY a JSON object:
         // builds also benefit from the Phase 6 content-addressable
         // cache. Audited cache hits write a `cache_hit = 1` audit row
         // so the audit trail stays contiguous.
-        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
-        let answer_resolved = llm_config
-            .provider_registry
-            .as_ref()
-            .and_then(|reg| reg.resolve_tier("evidence_loop", None, None, None).ok());
-        let answer_ctx = match &answer_resolved {
-            Some(resolved) => {
-                make_step_ctx_from_llm_config(
-                    llm_config,
-                    &format!("evidence_answer_batch_{}", batch_idx),
-                    "evidence_answer",
-                    question.layer as i64,
-                    Some(batch_idx as i64),
-                    &system_prompt,
-                    "evidence_loop",
-                    Some(&resolved.tier.model_id),
-                    Some(&resolved.provider.id),
-                )
-                .await
-            }
-            None => None,
-        };
+        // walker-v3-completion: canonical dispatch via Decision spine.
+        let answer_ctx = make_step_ctx_from_llm_config(
+            llm_config,
+            &format!("evidence_answer_batch_{}", batch_idx),
+            "evidence_answer",
+            question.layer as i64,
+            Some(batch_idx as i64),
+            &system_prompt,
+            "evidence_loop",
+            None,
+            None,
+        )
+        .await;
         let answer_audit_ctx = audit.map(|ctx| {
             ctx.for_node(
                 &node_id,
@@ -1541,28 +1520,19 @@ Respond with ONLY a JSON object:
         serde_json::to_string_pretty(items).unwrap_or_default(),
     );
 
-    // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
-    let merge_resolved = llm_config
-        .provider_registry
-        .as_ref()
-        .and_then(|reg| reg.resolve_tier("evidence_loop", None, None, None).ok());
-    let merge_ctx = match &merge_resolved {
-        Some(resolved) => {
-            make_step_ctx_from_llm_config(
-                llm_config,
-                "evidence_answer_merge",
-                "evidence_answer_merge",
-                question.layer as i64,
-                None,
-                &merge_system,
-                "evidence_loop",
-                Some(&resolved.tier.model_id),
-                Some(&resolved.provider.id),
-            )
-            .await
-        }
-        None => None,
-    };
+    // walker-v3-completion: canonical dispatch via Decision spine.
+    let merge_ctx = make_step_ctx_from_llm_config(
+        llm_config,
+        "evidence_answer_merge",
+        "evidence_answer_merge",
+        question.layer as i64,
+        None,
+        &merge_system,
+        "evidence_loop",
+        None,
+        None,
+    )
+    .await;
     let merge_audit_ctx =
         audit.map(|ctx| ctx.for_node(node_id, "answer_merge", question.layer as i64));
     let response = llm::call_model_unified_with_audit_and_ctx(
@@ -1759,28 +1729,19 @@ Respond with ONLY a JSON object:
     for (file_path, content) in source_candidates {
         let user_prompt = format!("SOURCE FILE: {}\n\n{}", file_path, content);
 
-        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
-        let target_resolved = llm_config
-            .provider_registry
-            .as_ref()
-            .and_then(|reg| reg.resolve_tier("evidence_loop", None, None, None).ok());
-        let target_ctx = match &target_resolved {
-            Some(resolved) => {
-                make_step_ctx_from_llm_config(
-                    llm_config,
-                    "targeted_reexamination",
-                    "evidence_answer",
-                    0,
-                    None,
-                    &system_prompt,
-                    "evidence_loop",
-                    Some(&resolved.tier.model_id),
-                    Some(&resolved.provider.id),
-                )
-                .await
-            }
-            None => None,
-        };
+        // walker-v3-completion: canonical dispatch via Decision spine.
+        let target_ctx = make_step_ctx_from_llm_config(
+            llm_config,
+            "targeted_reexamination",
+            "evidence_answer",
+            0,
+            None,
+            &system_prompt,
+            "evidence_loop",
+            None,
+            None,
+        )
+        .await;
         let target_audit_ctx = audit.map(|ctx| AuditContext {
             call_purpose: "gap_answer".to_string(),
             step_name: "targeted_reexamination".to_string(),
@@ -2126,6 +2087,72 @@ mod tests {
         assert!(
             format!("{err:#}").contains("failed to read source file"),
             "expected source-read failure, got {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_pre_map_ctx_uses_walker_fallback_without_legacy_tier() {
+        let temp_db = tempfile::NamedTempFile::new().expect("temp db");
+        let conn = rusqlite::Connection::open(temp_db.path()).expect("open temp db");
+        conn.execute_batch(
+            "CREATE TABLE pyramid_config_contributions (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 contribution_id TEXT NOT NULL UNIQUE,
+                 slug TEXT,
+                 schema_type TEXT NOT NULL,
+                 yaml_content TEXT NOT NULL,
+                 wire_native_metadata_json TEXT NOT NULL DEFAULT '{}',
+                 wire_publication_state_json TEXT NOT NULL DEFAULT '{}',
+                 supersedes_id TEXT,
+                 superseded_by_id TEXT,
+                 triggering_note TEXT,
+                 status TEXT NOT NULL DEFAULT 'active',
+                 source TEXT NOT NULL DEFAULT 'local',
+                 wire_contribution_id TEXT,
+                 created_by TEXT,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 accepted_at TEXT
+             );",
+        )
+        .expect("create contributions table");
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions
+                 (contribution_id, schema_type, yaml_content, status, accepted_at)
+             VALUES (?1, ?2, ?3, 'active', datetime('now'))",
+            rusqlite::params![
+                "fallback-only-openrouter",
+                "walker_provider_openrouter",
+                "schema_type: walker_provider_openrouter\nversion: 1\noverrides:\n  model_list:\n    fallback:\n      - \"fallback/evidence-model\"\n"
+            ],
+        )
+        .expect("insert fallback provider");
+
+        let config = crate::pyramid::llm::LlmConfig::default().clone_with_cache_access(
+            "evidence-pre-map-fallback",
+            "build-evidence-pre-map-fallback",
+            temp_db.path().to_string_lossy().to_string(),
+            None,
+        );
+
+        let ctx = make_step_ctx_from_llm_config(
+            &config,
+            "evidence_pre_map_0",
+            "evidence_pre_map",
+            0,
+            Some(0),
+            "system prompt",
+            "evidence_loop",
+            None,
+            None,
+        )
+        .await
+        .expect("evidence pre-map ctx");
+
+        assert_eq!(ctx.model_tier, "evidence_loop");
+        assert_eq!(ctx.resolved_model_id.as_deref(), Some("fallback/evidence-model"));
+        assert!(
+            ctx.dispatch_decision.is_some(),
+            "evidence pre-map should not require legacy pyramid_tier_routing"
         );
     }
 

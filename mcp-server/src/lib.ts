@@ -29,8 +29,8 @@ export const REQUEST_TIMEOUT_MS = 10_000;
  * text, TOOL_CATALOG render — without a code deploy.
  *
  * The fallback below is genesis parity for the failure-mode case: if the
- * Wire node is down at MCP startup we keep the 11 known-good types so
- * the MCP server doesn't hard-fail. Any drift here silently divergens
+ * Wire node is down at MCP startup we keep the genesis known-good types so
+ * the MCP server doesn't hard-fail. Any drift here silently diverges
  * from the genesis seed; keep the list exactly in lock-step with
  * `src-tauri/src/pyramid/vocab_genesis.rs::GENESIS_ANNOTATION_TYPES`.
  *
@@ -54,6 +54,11 @@ export const FALLBACK_ANNOTATION_TYPES: readonly string[] = [
   "directory",
   "steel_man",
   "red_team",
+  "gap",
+  "hypothesis",
+  "purpose_declaration",
+  "purpose_shift",
+  "debate_collapse",
 ];
 
 /** One `VocabEntry` entry as returned by `GET /vocabulary/:vocab_kind`.
@@ -152,8 +157,8 @@ export async function refreshVocabulary(
     console.error(
       `[pyramid] WARNING: vocabulary fetch for '${vocabKind}' failed; ` +
         `cache is serving a ${fallbackNames.length}-entry fallback. ` +
-        `Validation will still run against the fallback — newly-published ` +
-        `operator vocab entries will be rejected until the next successful fetch.`
+        `Unknown annotation types will be sent to the Wire node for ` +
+        `server-side validation until the next successful fetch.`
     );
   }
   return slot;
@@ -222,6 +227,9 @@ export async function validateAnnotationType(
     slot = await refreshVocabulary("annotation_type");
   }
   if (slot.names.has(candidate)) {
+    return { ok: true, name: candidate };
+  }
+  if (slot.isFallback) {
     return { ok: true, name: candidate };
   }
   const validTypes = Array.from(slot.names).sort();

@@ -79,7 +79,9 @@ const pretty = flags.compact !== "true";
 // If the Wire node is unreachable, `refreshAnnotationTypes` installs the
 // hardcoded genesis fallback and the CLI proceeds in graceful-degraded
 // mode — the user still gets working help text + validation of the genesis
-// set, just not of any newly-published operator types.
+// set. Unknown types are passed through to the Rust API for final
+// server-side validation so a stale client fallback cannot veto a live
+// registry entry.
 //
 // Single source of truth: the Wire node's `GET /vocabulary/annotation_type`
 // endpoint (6c-A). Eliminates the old triple-duplication (Rust enum +

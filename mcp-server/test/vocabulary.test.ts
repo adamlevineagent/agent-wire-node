@@ -7,6 +7,7 @@
  *   3. zod_validation_rejects_unknown_type_with_helpful_message
  *   4. fallback_to_hardcoded_on_fetch_failure_preserves_genesis_types
  *   5. help_text_renders_current_vocab (via getAnnotationTypesSync + renderVocabTypeList)
+ *   6. fallback cache-misses trust server-side annotation validation
  *
  * Runs against a local HTTP stub on port 8765 that mirrors the Wire node's
  * `GET /vocabulary/:vocab_kind` contract. Silences the fallback warning via
@@ -184,7 +185,7 @@ test('zod_validation_rejects_unknown_type_with_helpful_message', async () => {
 test('fallback_to_hardcoded_on_fetch_failure_preserves_genesis_types', async () => {
     setBehavior({ kind: 'status', status: 500 });
     const names = await refreshAnnotationTypes();
-    // All 11 genesis entries survive the failure-mode fallback.
+    // All genesis entries survive the failure-mode fallback.
     assert.equal(names.length, FALLBACK_ANNOTATION_TYPES.length);
     for (const genesis of FALLBACK_ANNOTATION_TYPES) {
         assert.ok(
@@ -196,6 +197,19 @@ test('fallback_to_hardcoded_on_fetch_failure_preserves_genesis_types', async () 
     // And validation of a genesis type still succeeds
     const ok = await validateAnnotationType('correction');
     assert.equal(ok.ok, true);
+});
+
+test('validation_trusts_server_when_vocab_fetch_failed', async () => {
+    setBehavior({ kind: 'status', status: 500 });
+    await refreshAnnotationTypes();
+
+    // Cache-miss while serving a fallback must not become a stale-client
+    // veto. The Rust annotate route remains the source of truth.
+    const ok = await validateAnnotationType('server_side_only_type');
+    assert.equal(ok.ok, true);
+    if (ok.ok) {
+        assert.equal(ok.name, 'server_side_only_type');
+    }
 });
 
 test('help_text_renders_current_vocab', async () => {
@@ -271,7 +285,7 @@ test('malformed_vocab_response_falls_back_cleanly', async () => {
     // malformed case we use a 4xx which our fetcher treats as failure.
     setBehavior({ kind: 'status', status: 400 });
     const names = await refreshAnnotationTypes();
-    // 4xx → fallback path → 11 genesis types.
+    // 4xx → fallback path → genesis types.
     assert.equal(names.length, FALLBACK_ANNOTATION_TYPES.length);
     assert.ok(names.includes('observation'));
 });
