@@ -69,7 +69,7 @@ handle_completion  →  execute_supersession (for re_distill)
 Nodes carry a `node_shape` column (default `'scaffolding'`) with a matching `shape_payload_json` when applicable. Shipped shapes:
 
 - **scaffolding** — default. `shape_payload_json IS NULL`. The canonical node carrying `distilled / topics / entities / decisions / terms`.
-- **debate** — holds `DebateTopic { concern, positions: [DebatePosition], cross_refs, vote_lean }`. Created by `append_annotation_to_debate_node` on the first `steel_man` / `red_team` arriving at a Scaffolding node.
+- **debate** — holds `DebateTopic { concern, positions: [DebatePosition], cross_refs, vote_lean }`. Created by `append_annotation_to_debate_node` on the first `steel_man` / `hypothesis` / `red_team` arriving at a Scaffolding node.
 - **meta_layer** — holds `MetaLayerTopic { purpose_question, parent_meta_layer_id, covered_substrate_nodes, topics }`. Created by `starter-synthesizer` when the oracle detects crystallizable substrate.
 - **gap** — holds `GapTopic { concern, description, demand_state, candidate_resolutions, evidence_anchors, source_annotation_ids }`. Created by `starter-gap-dispatcher` on a `gap` annotation.
 
@@ -206,7 +206,7 @@ One active row, global scope (slug=NULL). Seeded at first boot via `pyramid_sche
 | `accretion_tick_window_n` | 50 | 1+ | `window_n` stamped into `accretion_tick` metadata; accretion chain uses it as LLM context cap. |
 | `sweep_stale_days` | 7 | 1+ | Failed work items older than this are sweep candidates. |
 | `sweep_retention_days` | 30 | 1+ | Archive window for soft-archived rows. |
-| `collapse_cooldown_secs` | 600 (10 min) | 0+ | Post-collapse cooldown: steel_man / red_team arriving within this window is refused rather than resurrecting the Debate. 0 disables guard (loud warn). |
+| `collapse_cooldown_secs` | 600 (10 min) | 0+ | Post-collapse cooldown: steel_man / hypothesis / red_team arriving within this window is refused rather than resurrecting the Debate. 0 disables guard (loud warn). |
 
 ### Supersession workflow
 
@@ -331,7 +331,7 @@ Cross-process cache coherence (Phase 9c-3-1) kicks in on the NEXT read after a p
 
 ### Debate resurrects after collapse
 
-If a steel_man arrives immediately after `debate_collapse`, the append is REFUSED within `collapse_cooldown_secs` (default 10 min). The refusal raises loud in `append_annotation_to_debate_node`; the HTTP response is a 500 with the cooldown age in the body. Workaround: wait the cooldown, or POST `/pyramid/:slug/debates/:id/reopen` first — reopen emits `debate_reopened` which bypasses the cooldown for the next append (Phase 9c-3-3).
+If a steel_man / hypothesis / red_team arrives immediately after `debate_collapse`, the append is REFUSED within `collapse_cooldown_secs` (default 10 min). The refusal raises loud in `append_annotation_to_debate_node` with the concrete `annotation_type`; compiler-side cooldown skips also write `annotation_type` into `debate_steward_skipped` metadata. Workaround: wait the cooldown, or POST `/pyramid/:slug/debates/:id/reopen` first — reopen emits `debate_reopened` which bypasses the cooldown for the next append (Phase 9c-3-3).
 
 ### Scheduler ticks not firing
 

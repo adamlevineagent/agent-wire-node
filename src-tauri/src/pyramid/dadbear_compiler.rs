@@ -573,7 +573,7 @@ fn maybe_skip_debate_steward_for_cooldown(
     let annotation_type = metadata_string(event, "annotation_type");
     if !matches!(
         annotation_type.as_deref(),
-        Some("steel_man") | Some("red_team")
+        Some("steel_man") | Some("hypothesis") | Some("red_team")
     ) {
         return Ok(false);
     }

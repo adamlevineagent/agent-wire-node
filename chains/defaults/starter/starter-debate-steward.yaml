@@ -3,10 +3,10 @@ id: starter-debate-steward
 name: Debate Steward — append annotation to Debate node (Phase 7a MVP)
 description: >
   Starter binding for the debate_steward role. Fires on annotation_reacted
-  events whose vocab entry nominates this chain (steel_man / red_team
-  today). The chain either upgrades a Scaffolding target to Debate shape
-  (seeding the first position / red_team) or appends to the existing
-  Debate payload.
+  events whose vocab entry nominates this chain (steel_man / hypothesis /
+  red_team today). The chain either upgrades a Scaffolding target to
+  Debate shape (seeding the first position-like claim / red_team) or
+  appends to the existing Debate payload.
 
   Phase 7a ships mechanical-only. Phase 7b+ can add LLM judgement steps
   (concern rewording, duplicate-position detection, steel_manning
