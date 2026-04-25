@@ -14917,10 +14917,19 @@ async fn execute_chain_for_target_inner(
         // Stash the output under step.name so downstream `when:` guards can
         // reference `$step_name.decision` etc. Also thread it forward as
         // `current` for the next step's default input.
+        //
+        // Starter-chain threading is preserve-by-default for object
+        // envelopes: mechanical loaders often add fields that later LLM
+        // steps do not echo (e.g. max_annotation_id), but terminal
+        // mechanical writers still need them. Merge the prior step input
+        // with the step output, with output keys winning, so structured LLM
+        // responses can add/override fields without dropping the runtime
+        // context that the chain already earned.
+        let threaded_output = merge_starter_threaded_output(&resolved_input, output);
         if !step.name.is_empty() {
-            step_outputs.insert(step.name.clone(), output.clone());
+            step_outputs.insert(step.name.clone(), threaded_output.clone());
         }
-        current = output;
+        current = threaded_output;
     }
 
     info!(
@@ -14928,6 +14937,19 @@ async fn execute_chain_for_target_inner(
         chain.id, slug, target_id
     );
     Ok(current)
+}
+
+fn merge_starter_threaded_output(input: &Value, output: Value) -> Value {
+    match (input, output) {
+        (Value::Object(input_map), Value::Object(output_map)) => {
+            let mut merged = input_map.clone();
+            for (k, v) in output_map {
+                merged.insert(k, v);
+            }
+            Value::Object(merged)
+        }
+        (_, other) => other,
+    }
 }
 
 /// Outcome of a starter-chain `when:` evaluation.

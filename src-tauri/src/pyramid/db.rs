@@ -35940,6 +35940,7 @@ mod phase9b_post_build_tests {
     use crate::pyramid::chain_dispatch;
     use crate::pyramid::chain_engine::{ChainStep, ChainDefinition, ChainDefaults};
     use crate::pyramid::chain_executor;
+    use crate::pyramid::dadbear_compiler;
     use crate::pyramid::pyramid_scheduler;
     use crate::pyramid::types::{ContentType, NODE_SHAPE_GAP, GapTopic, NODE_SHAPE_META_LAYER};
     use crate::pyramid::vocab_entries;
@@ -36043,6 +36044,241 @@ mod phase9b_post_build_tests {
                 .unwrap();
             assert_eq!(count, 1, "accretion_tick emit for slug {slug}");
         }
+    }
+
+    #[test]
+    fn accretion_tick_compiles_to_accretion_handler_role_bound() {
+        let _g = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p9b-acc-tick", &ContentType::Code, "/tmp/p9b-acc-tick").unwrap();
+
+        // Live regression: scheduler ticks used to derive target_id="unknown".
+        // If any older role_bound row already owned the semantic id
+        // `{slug}:00000000:role_bound:0:unknown`, INSERT OR IGNORE treated
+        // the accretion tick as idempotent and advanced the cursor without
+        // ever dispatching starter-accretion-handler.
+        conn.execute(
+            "INSERT INTO dadbear_work_items
+                (id, slug, batch_id, epoch_id, step_name, primitive, layer,
+                 target_id, system_prompt, user_prompt, model_tier,
+                 compiled_at, state, state_changed_at, applied_at,
+                 resolved_chain_id)
+             VALUES ('p9b-acc-tick:00000000:role_bound:0:unknown',
+                     'p9b-acc-tick', 'old-batch', 'old-epoch',
+                     'oracle_gap_resolved', 'role_bound', 0,
+                     'unknown', '', '', 'stale_remote',
+                     datetime('now', '-1 day'), 'applied',
+                     datetime('now', '-1 day'), datetime('now', '-1 day'),
+                     'starter-meta-layer-oracle')",
+            [],
+        )
+        .unwrap();
+
+        pyramid_scheduler::emit_accretion_tick(&conn).unwrap();
+        let res = dadbear_compiler::run_compilation_for_slug(
+            &conn,
+            "p9b-acc-tick",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            res.items_compiled, 1,
+            "scheduler accretion_tick must compile into one role_bound work item"
+        );
+
+        let (step_name, primitive, target_id, state, resolved_chain_id, observation_event_ids): (
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT step_name, primitive, target_id, state, resolved_chain_id,
+                        observation_event_ids
+                   FROM dadbear_work_items
+                  WHERE slug = 'p9b-acc-tick'
+                    AND step_name = 'accretion_tick_dispatch'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .expect("accretion_tick must create a work item");
+        assert_eq!(step_name, "accretion_tick_dispatch");
+        assert_eq!(primitive, "role_bound");
+        assert_eq!(target_id.as_deref(), Some("accretion:p9b-acc-tick"));
+        assert_eq!(state, "compiled");
+        assert_eq!(resolved_chain_id.as_deref(), Some("starter-accretion-handler"));
+
+        let event_id: i64 = conn
+            .query_row(
+                "SELECT id FROM dadbear_observation_events
+                  WHERE slug = 'p9b-acc-tick' AND event_type = 'accretion_tick'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            observation_event_ids,
+            format!("[{event_id}]"),
+            "work item must point at the scheduler tick event"
+        );
+    }
+
+    #[tokio::test]
+    async fn accretion_tick_role_bound_chain_advances_cursor() {
+        let _g = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p9b-acc-e2e", &ContentType::Code, "/tmp/p9b-acc-e2e").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('node-acc', 'p9b-acc-e2e', 0, 'node', 'distilled', '', 1)",
+            [],
+        )
+        .unwrap();
+
+        let mut max_id = 0i64;
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO pyramid_annotations
+                    (slug, node_id, annotation_type, content, author)
+                 VALUES ('p9b-acc-e2e', 'node-acc', 'observation', ?1, 'test')",
+                rusqlite::params![format!("scheduler accretion annotation {i}")],
+            )
+            .unwrap();
+            max_id = conn.last_insert_rowid();
+        }
+
+        pyramid_scheduler::emit_accretion_tick(&conn).unwrap();
+        let res = dadbear_compiler::run_compilation_for_slug(
+            &conn,
+            "p9b-acc-e2e",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(res.items_compiled, 1);
+
+        let (wi_id, step_name, target_id, resolved_chain_id, observation_event_ids): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT id, step_name, target_id, resolved_chain_id,
+                        observation_event_ids
+                   FROM dadbear_work_items
+                  WHERE slug = 'p9b-acc-e2e'
+                    AND step_name = 'accretion_tick_dispatch'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("accretion_tick must compile a dispatch work item");
+        assert_eq!(target_id.as_deref(), Some("accretion:p9b-acc-e2e"));
+        assert_eq!(resolved_chain_id.as_deref(), Some("starter-accretion-handler"));
+
+        let event_ids: Vec<i64> = serde_json::from_str(&observation_event_ids).unwrap();
+        let event_id = *event_ids.first().expect("source event id");
+        let metadata_json: String = conn
+            .query_row(
+                "SELECT metadata_json FROM dadbear_observation_events WHERE id = ?1",
+                rusqlite::params![event_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let trigger_md: serde_json::Value = serde_json::from_str(&metadata_json).unwrap();
+        assert_eq!(
+            trigger_md["window_n"].as_i64(),
+            Some(pyramid_scheduler::DEFAULT_ACCRETION_TICK_WINDOW_N as i64),
+            "scheduler metadata must carry window_n for the accretion handler"
+        );
+
+        let mut server = mockito::Server::new_async().await;
+        let mock_content = format!(
+            r#"{{
+                "note":"Mocked scheduler accretion note.",
+                "references":[{max_id}]
+            }}"#
+        );
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(super::phase6_post_build_tests::openrouter_body(&mock_content))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let config = super::phase6_post_build_tests::mocked_llm_config(server.url()).await;
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(conn, config);
+        let chain = crate::pyramid::chain_loader::load_chain_by_id(
+            resolved_chain_id.as_deref().unwrap(),
+            &state.chains_dir,
+        )
+        .expect("starter-accretion-handler must load");
+
+        let mut chain_input = json!({
+            "work_item_id": wi_id,
+            "step_name": step_name,
+            "target_id": target_id.clone(),
+            "layer": 0,
+            "trigger_event_metadata": trigger_md.clone(),
+        });
+        if let Some(obj) = trigger_md.as_object() {
+            for (k, v) in obj {
+                if chain_input.get(k).is_none() {
+                    chain_input[k.as_str()] = v.clone();
+                }
+            }
+        }
+
+        let out = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p9b-acc-e2e",
+            target_id.as_deref(),
+            chain_input,
+        )
+        .await
+        .expect("scheduler-bound accretion chain must run");
+        assert_eq!(out["note"].as_str(), Some("Mocked scheduler accretion note."));
+
+        let writer = state.writer.lock().await;
+        let invoked_count: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE slug = 'p9b-acc-e2e' AND event_type = 'accretion_invoked'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(invoked_count, 1, "chain must emit accretion_invoked");
+        let written_count: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE slug = 'p9b-acc-e2e' AND event_type = 'accretion_written'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(written_count, 1, "chain must emit accretion_written");
+        let cursor: i64 = writer
+            .query_row(
+                "SELECT accretion_cursor FROM pyramid_slugs WHERE slug = 'p9b-acc-e2e'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cursor, max_id,
+            "starter-accretion-handler must atomically advance the slug cursor"
+        );
+        drop(writer);
+        mock.assert_async().await;
     }
 
     // ── 9b-1c: sweep_tick emits with policy knobs in metadata ────────────

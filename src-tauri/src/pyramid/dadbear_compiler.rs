@@ -362,6 +362,10 @@ pub(crate) fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, 
 /// For rename events, target_id uses rename/{old}/{new} composite format.
 fn derive_target_id(event: &ObservationEvent) -> String {
     match event.event_type.as_str() {
+        "accretion_tick" | "accretion_threshold_hit" => {
+            format!("accretion:{}", event.slug)
+        }
+        "sweep_tick" => format!("sweep:{}", event.slug),
         "file_created" | "file_modified" | "file_deleted" | "full_sweep" => event
             .file_path
             .clone()
