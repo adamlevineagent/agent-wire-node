@@ -39,7 +39,8 @@ struct ExecutorFlagGuard<'a> {
 impl<'a> Drop for ExecutorFlagGuard<'a> {
     fn drop(&mut self) {
         self.use_ir_executor.store(self.prev_ir, Ordering::Relaxed);
-        self.use_chain_engine.store(self.prev_chain, Ordering::Relaxed);
+        self.use_chain_engine
+            .store(self.prev_chain, Ordering::Relaxed);
     }
 }
 
@@ -2093,7 +2094,10 @@ mod tests {
 
         for (label, yaml) in [
             ("code", include_str!("../../../chains/defaults/code.yaml")),
-            ("document", include_str!("../../../chains/defaults/document.yaml")),
+            (
+                "document",
+                include_str!("../../../chains/defaults/document.yaml"),
+            ),
         ] {
             let chain: ChainDefinition = serde_yaml::from_str(yaml)
                 .unwrap_or_else(|e| panic!("{label}: failed to parse YAML: {e}"));

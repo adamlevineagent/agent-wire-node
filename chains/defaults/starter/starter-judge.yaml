@@ -1,0 +1,89 @@
+schema_version: 1
+id: starter-judge
+name: Judge (v5 library chain — Phase 7d)
+description: >
+  Generalist adjudicator library chain invoked via `call_starter_chain` by
+  any Phase 7+ consumer that needs a bounded accept/reject judgement with
+  calibrated confidence. Analogous to `starter-evidence-tester` and
+  `starter-reconciler`: callers supply a `{claim, context, criteria?}`
+  envelope; the LLM returns a single `{decision, confidence, reasoning}`
+  object so callers can gate further action on the score.
+
+  The `verify` primitive is deliberate (vs. `evaluate`): the judge returns
+  a CONSTRAINED verdict — `decision` is a three-way enum and `confidence`
+  is a bounded scalar, mirroring `starter-evidence-tester`'s
+  `{supports: bool, strength: [0,1]}` shape. `evaluate` is reserved for
+  open-ended quality scoring that doesn't lock onto a verdict shape; this
+  chain is squarely in verify territory. The structured response_schema
+  locks the shape so callers can key on
+  `decision` ∈ {accept, reject, unclear} and aggregate `confidence`
+  across multiple judge calls. 7d verifier pass aligned the primitive
+  with the existing evidence_tester / authorize_question convention.
+
+  Input envelope (supplied by the parent step's `input` block):
+
+      {
+        "claim":    "<the claim being judged>",
+        "context":  "<supporting info — string or object>",
+        "criteria": "<optional — what the judge should consider>"
+      }
+
+  Specific judges (like the Phase 6a cascade-relevance judge) inline
+  their own prompt in their own chain; THIS chain is the generalist
+  backstop for everything else, bound to the `judge` role via the
+  role_name vocab registry (see vocab_genesis.rs + role_binding.rs).
+  Operators may supersede the binding per slug to route adjudication
+  through a specialized chain.
+
+  Steps:
+    1. emit_judge_invoked — chronicle trace (source="chain",
+       event_type="judge_invoked") so callers can audit when judge
+       was consulted and on what claim.
+    2. judge_claim — LLM step with response_schema locking the
+       {decision, confidence, reasoning} shape. Confidence is a
+       calibrated scalar in [0, 1] per prompt anchors.
+    3. return_judgment — terminal log_and_complete; passes the LLM
+       step's structured output through to the caller verbatim.
+
+  Temperature, token counts, and other knobs that shape LLM output live
+  in YAML (not Rust) per feedback_pillar37_no_hedging.
+content_type: code
+version: "1.0.0"
+author: post-build-accretion-v5
+
+defaults:
+  model_tier: mid
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  - name: emit_judge_invoked
+    primitive: custom
+    mechanical: true
+    rust_function: emit_judge_invoked
+
+  - name: judge_claim
+    primitive: verify
+    instruction: $prompts/starter/judge.md
+    model_tier: mid
+    response_schema:
+      type: object
+      additionalProperties: false
+      required: [decision, confidence, reasoning]
+      properties:
+        decision:
+          type: string
+          enum: [accept, reject, unclear]
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        reasoning:
+          type: string
+
+  - name: return_judgment
+    primitive: custom
+    mechanical: true
+    rust_function: log_and_complete
+
+post_build: []

@@ -1,13 +1,12 @@
-import { useState, useCallback } from "react";
+import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
 
 interface OnboardingWizardProps {
     onComplete: () => void;
     defaultNodeName?: string;
 }
 
-type Step = "welcome" | "folder" | "mesh" | "ready";
+type Step = "welcome" | "mesh" | "ready";
 
 const STORAGE_OPTIONS = [
     { value: 10, label: "10 GB", desc: "Light contributor" },
@@ -25,43 +24,9 @@ export function OnboardingWizard({ onComplete, defaultNodeName }: OnboardingWiza
     const [saving, setSaving] = useState(false);
     const [error, setError] = useState("");
 
-    // Folder linking state
-    const [folderPath, setFolderPath] = useState("");
-    const [corpusSlug, setCorpusSlug] = useState("");
-    const [folderLinked, setFolderLinked] = useState(false);
-    const [linkError, setLinkError] = useState("");
-
     const storageValue = selectedStorage === -1
         ? (parseInt(customStorage, 10) || 40)
         : selectedStorage;
-
-    const handlePickFolder = useCallback(async () => {
-        try {
-            const dir = await open({ directory: true });
-            if (dir) {
-                setFolderPath(typeof dir === "string" ? dir : String(dir));
-            }
-        } catch (err) {
-            console.error("Folder picker failed:", err);
-        }
-    }, []);
-
-    const handleLinkFolder = useCallback(async () => {
-        if (!folderPath || !corpusSlug.trim()) {
-            setLinkError("Select a folder and enter a corpus slug");
-            return;
-        }
-        setLinkError("");
-        try {
-            await invoke("link_folder", {
-                folderPath,
-                corpusSlug: corpusSlug.trim(),
-            });
-            setFolderLinked(true);
-        } catch (err: any) {
-            setLinkError(err?.toString() || "Failed to link folder");
-        }
-    }, [folderPath, corpusSlug]);
 
     const handleFinish = async () => {
         setSaving(true);
@@ -160,88 +125,14 @@ export function OnboardingWizard({ onComplete, defaultNodeName }: OnboardingWiza
 
                         <button
                             className="login-button"
-                            onClick={() => setStep("folder")}
+                            onClick={() => setStep("mesh")}
                         >
-                            Next: Link a Folder &rarr;
+                            Next &rarr;
                         </button>
                     </div>
                 )}
 
-                {/* Step 2: Link First Folder */}
-                {step === "folder" && (
-                    <div className="onboarding-step">
-                        <h2 className="onboarding-title">Link Your First Folder</h2>
-                        <p className="onboarding-desc">
-                            Pick a project directory or document folder. Wire Node will
-                            create a corpus from its contents so you can build a knowledge
-                            pyramid from it.
-                        </p>
-
-                        <div className="folder-picker-row">
-                            <button
-                                className="pick-folder-btn"
-                                onClick={handlePickFolder}
-                                type="button"
-                            >
-                                Choose Folder...
-                            </button>
-                            <span className="selected-path">
-                                {folderPath
-                                    ? (folderPath.length > 35 ? "..." + folderPath.slice(-32) : folderPath)
-                                    : "No folder selected"}
-                            </span>
-                        </div>
-
-                        <div className="form-group">
-                            <label htmlFor="corpus-slug">Corpus Slug</label>
-                            <input
-                                id="corpus-slug"
-                                type="text"
-                                value={corpusSlug}
-                                onChange={(e) => setCorpusSlug(e.target.value)}
-                                placeholder="e.g. my-research"
-                            />
-                            <span className="form-hint">
-                                The Wire corpus this folder maps to
-                            </span>
-                        </div>
-
-                        {linkError && <div className="login-error">{linkError}</div>}
-
-                        {folderLinked && (
-                            <div className="onboarding-success">
-                                Folder linked successfully
-                            </div>
-                        )}
-
-                        {!folderLinked && (
-                            <button
-                                className="login-button secondary"
-                                onClick={handleLinkFolder}
-                                disabled={!folderPath || !corpusSlug.trim()}
-                            >
-                                Link Folder
-                            </button>
-                        )}
-
-                        <div className="onboarding-nav">
-                            <button
-                                className="back-link"
-                                onClick={() => setStep("welcome")}
-                            >
-                                &larr; Back
-                            </button>
-                            <button
-                                className="login-button"
-                                onClick={() => setStep("mesh")}
-                            >
-                                {folderLinked ? "Next" : "Skip"} &rarr;
-                            </button>
-                        </div>
-                    </div>
-                )}
-
-                {/* Step 3: Mesh Hosting Opt-in */}
+                {/* Step 2: Mesh Hosting Opt-in */}
                 {step === "mesh" && (
                     <div className="onboarding-step">
                         <h2 className="onboarding-title">Mesh Hosting</h2>
@@ -278,7 +169,7 @@ export function OnboardingWizard({ onComplete, defaultNodeName }: OnboardingWiza
                         <div className="onboarding-nav">
                             <button
                                 className="back-link"
-                                onClick={() => setStep("folder")}
+                                onClick={() => setStep("welcome")}
                             >
                                 &larr; Back
                             </button>
@@ -292,7 +183,7 @@ export function OnboardingWizard({ onComplete, defaultNodeName }: OnboardingWiza
                     </div>
                 )}
 
-                {/* Step 4: Summary + Launch */}
+                {/* Step 3: Summary + Launch */}
                 {step === "ready" && (
                     <div className="onboarding-step">
                         <div style={{ fontSize: "2rem", textAlign: "center", marginBottom: "1rem", fontFamily: "monospace" }}>W</div>
@@ -306,10 +197,6 @@ export function OnboardingWizard({ onComplete, defaultNodeName }: OnboardingWiza
                             <div className="summary-row">
                                 <span className="summary-label">Storage</span>
                                 <span className="summary-value">{storageValue} GB</span>
-                            </div>
-                            <div className="summary-row">
-                                <span className="summary-label">Folder linked</span>
-                                <span className="summary-value">{folderLinked ? `${corpusSlug}` : "None (skipped)"}</span>
                             </div>
                             <div className="summary-row">
                                 <span className="summary-label">Mesh hosting</span>

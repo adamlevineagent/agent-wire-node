@@ -27,9 +27,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::pyramid::config_contributions::load_active_config_contribution;
-use crate::pyramid::wire_publish::{
-    PyramidPublisher, WireContributionSearchResult,
-};
+use crate::pyramid::wire_publish::{PyramidPublisher, WireContributionSearchResult};
 
 // ── Ranking signals + weights ────────────────────────────────────────────────
 
@@ -168,16 +166,11 @@ impl RankingWeights {
     /// produces a complete weight set.
     pub fn from_yaml(yaml_content: &str) -> Result<Self> {
         let parsed: serde_yaml::Value = serde_yaml::from_str(yaml_content)?;
-        let map = parsed
-            .get("fields")
-            .cloned()
-            .unwrap_or(parsed);
+        let map = parsed.get("fields").cloned().unwrap_or(parsed);
 
         let default = Self::default();
         let get = |key: &str, default_val: f64| -> f64 {
-            map.get(key)
-                .and_then(|v| v.as_f64())
-                .unwrap_or(default_val)
+            map.get(key).and_then(|v| v.as_f64()).unwrap_or(default_val)
         };
 
         Ok(Self {
@@ -227,13 +220,8 @@ pub struct NormalizedSignals {
 /// in the current search result set, NOT a global historical max.
 /// Computing against the set max means a small search result with
 /// modest adoption counts still gets meaningful normalized spread.
-pub fn normalize_signals(
-    signals: &RankingSignals,
-    max_adoption_in_set: u64,
-) -> NormalizedSignals {
-    let rating = signals
-        .rating
-        .map(|r| (r as f64 / 5.0).clamp(0.0, 1.0));
+pub fn normalize_signals(signals: &RankingSignals, max_adoption_in_set: u64) -> NormalizedSignals {
+    let rating = signals.rating.map(|r| (r as f64 / 5.0).clamp(0.0, 1.0));
 
     let adoption = signals.adoption_count.map(|count| {
         // log1p prevents divide-by-zero when max_adoption_in_set == 0.
@@ -254,9 +242,7 @@ pub fn normalize_signals(
         .chain_length
         .map(|c| ((c as f64) / 10.0).clamp(0.0, 1.0));
 
-    let reputation = signals
-        .reputation
-        .map(|r| (r as f64).clamp(0.0, 1.0));
+    let reputation = signals.reputation.map(|r| (r as f64).clamp(0.0, 1.0));
 
     // Challenge combines upheld + filed. If either is missing the
     // signal drops out — we can't compute a rate.
@@ -432,9 +418,7 @@ pub fn load_ranking_weights(conn: &Connection) -> RankingWeights {
             }
         },
         Ok(None) => {
-            tracing::debug!(
-                "wire_discovery_weights contribution not found; using seed defaults"
-            );
+            tracing::debug!("wire_discovery_weights contribution not found; using seed defaults");
             RankingWeights::default()
         }
         Err(e) => {
@@ -734,9 +718,7 @@ pub fn compute_similarity(
     }
 
     // Tier routing similarity via Jaccard index (weight 0.4)
-    if !profile.tier_routing_providers.is_empty()
-        && !result.adopter_provider_ids.is_empty()
-    {
+    if !profile.tier_routing_providers.is_empty() && !result.adopter_provider_ids.is_empty() {
         let my_set: std::collections::HashSet<&String> =
             profile.tier_routing_providers.iter().collect();
         let adopter_set: std::collections::HashSet<&String> =
@@ -787,7 +769,10 @@ pub fn build_recommendation_rationale(
             result.adoption_count.max(1)
         )
     } else {
-        format!("Popular {}", result.schema_type.as_deref().unwrap_or("contribution"))
+        format!(
+            "Popular {}",
+            result.schema_type.as_deref().unwrap_or("contribution")
+        )
     }
 }
 
@@ -855,10 +840,7 @@ impl AutoUpdateSettings {
     /// flat map (`schema_type: bool`) or a nested `auto_update:` map.
     pub fn from_yaml(yaml_content: &str) -> Result<Self> {
         let parsed: serde_yaml::Value = serde_yaml::from_str(yaml_content)?;
-        let map = parsed
-            .get("auto_update")
-            .cloned()
-            .unwrap_or(parsed);
+        let map = parsed.get("auto_update").cloned().unwrap_or(parsed);
 
         let mut enabled_by_schema = std::collections::BTreeMap::new();
         if let Some(mapping) = map.as_mapping() {
@@ -898,9 +880,7 @@ impl AutoUpdateSettings {
 /// Returns default (all-false) when the contribution doesn't exist yet.
 pub fn load_auto_update_settings(conn: &Connection) -> AutoUpdateSettings {
     match load_active_config_contribution(conn, "wire_auto_update_settings", None) {
-        Ok(Some(row)) => {
-            AutoUpdateSettings::from_yaml(&row.yaml_content).unwrap_or_default()
-        }
+        Ok(Some(row)) => AutoUpdateSettings::from_yaml(&row.yaml_content).unwrap_or_default(),
         _ => AutoUpdateSettings::default(),
     }
 }
@@ -977,7 +957,10 @@ mod phase14_tests {
         assert!(norm.rating.is_none(), "rating missing → None");
         assert!(norm.reputation.is_none(), "reputation missing → None");
         assert!(norm.challenge.is_none(), "challenge missing → None");
-        assert!(norm.internalization.is_none(), "internalization missing → None");
+        assert!(
+            norm.internalization.is_none(),
+            "internalization missing → None"
+        );
         assert!(norm.adoption.is_some());
         assert!(norm.freshness.is_some());
         assert!(norm.chain.is_some());
@@ -1046,7 +1029,11 @@ mod phase14_tests {
         let normalized = normalize_signals(&signals, 200);
         let rationale = explain_ranking(&entry, &normalized).unwrap();
         assert!(rationale.contains("Highly rated") || rationale.contains("Refined"));
-        assert!(rationale.contains("200") || rationale.contains("7 versions") || rationale.contains("3d"));
+        assert!(
+            rationale.contains("200")
+                || rationale.contains("7 versions")
+                || rationale.contains("3d")
+        );
     }
 
     #[test]
@@ -1165,7 +1152,8 @@ mod phase14_tests {
 
     #[test]
     fn test_ranking_weights_from_yaml_nested() {
-        let yaml = "schema_type: wire_discovery_weights\nfields:\n  w_rating: 0.3\n  w_adoption: 0.3\n";
+        let yaml =
+            "schema_type: wire_discovery_weights\nfields:\n  w_rating: 0.3\n  w_adoption: 0.3\n";
         let weights = RankingWeights::from_yaml(yaml).unwrap();
         assert_eq!(weights.rating, 0.3);
         assert_eq!(weights.adoption, 0.3);

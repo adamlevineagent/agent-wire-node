@@ -251,9 +251,8 @@ pub async fn send_api_request_with_hints(
 
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        let body_value = serde_json::from_str::<serde_json::Value>(&text).unwrap_or_else(|_| {
-            serde_json::json!({ "error": text, "status": status.as_u16() })
-        });
+        let body_value = serde_json::from_str::<serde_json::Value>(&text)
+            .unwrap_or_else(|_| serde_json::json!({ "error": text, "status": status.as_u16() }));
         return Err(ApiErrorWithHints {
             status: status.as_u16(),
             body: body_value,

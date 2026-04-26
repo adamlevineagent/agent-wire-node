@@ -18,8 +18,8 @@ use similar::{ChangeTag, TextDiff};
 use tracing::warn;
 
 use super::llm::LlmConfig;
-use super::step_context::compute_prompt_hash;
 use super::stale_helpers_upper::resolve_live_canonical_node_id;
+use super::step_context::compute_prompt_hash;
 
 // ── Public types ──────────────────────────────────────────────────────────
 
@@ -85,6 +85,37 @@ pub fn materialize_prompt(
         ("tombstone", _) => Ok(MaterializeResult::Mechanical {
             reason: "Tombstone is a mechanical deletion — no LLM call needed".into(),
         }),
+        // Post-build accretion v5 Phase 3: role_bound + log_only are handled
+        // directly by `apply_mechanical_primitive` (role_bound dispatches
+        // the bound chain; log_only emits tracing info). Neither consults
+        // the compute queue, so the materializer returns Mechanical to keep
+        // the supervisor off the LLM dispatch path. Without this arm the
+        // fallback `_ =>` branch below routes the work item through a
+        // placeholder LLM prompt and burns compute — Phase 3 verifier fix.
+        ("role_bound", _) => Ok(MaterializeResult::Mechanical {
+            reason: "role_bound dispatches the bound chain — no LLM prompt materialization".into(),
+        }),
+        ("log_only", _) => Ok(MaterializeResult::Mechanical {
+            reason: "log_only is chronicle-only — no LLM call needed".into(),
+        }),
+        // v5 Phase 8-2: re_distill work items are queued by the cascade
+        // chain's queue_re_distill_for_target mechanical step. They flow
+        // through the supervisor's apply_mechanical_primitive re_distill
+        // arm which delegates to execute_supersession (that helper runs
+        // its own LLM call internally via generate_change_manifest). No
+        // outer prompt is needed — returning Mechanical keeps the item
+        // off the compute queue so execute_supersession can handle end-
+        // to-end supersession (change_manifest LLM call + pyramid_nodes
+        // UPDATE + build_version bump + node_re_distilled chronicle).
+        //
+        // Pre-Phase-8 this primitive fell through to the unknown-primitive
+        // placeholder arm, dispatched a garbage "[Unknown primitive
+        // 're_distill' at L{layer}...]" prompt, and the default apply
+        // arm marked it applied:re_distill without doing anything. That
+        // was THE original DADBEAR non-firing bug.
+        ("re_distill", _) => Ok(MaterializeResult::Mechanical {
+            reason: "re_distill delegates to execute_supersession — LLM call is internal".into(),
+        }),
         ("rename_candidate", _) => {
             // Look up the observation event's metadata_json to get old_path/new_path.
             let detail_json = observation_event_ids_json
@@ -110,9 +141,7 @@ pub fn materialize_prompt(
         ("faq_redistill", _) => {
             // TODO: wire up FAQ redistillation prompts
             Ok(MaterializeResult::Prompt(MaterializedPrompt {
-                system_prompt: format!(
-                    "You are re-distilling FAQ categories for pyramid {slug}."
-                ),
+                system_prompt: format!("You are re-distilling FAQ categories for pyramid {slug}."),
                 user_prompt: format!(
                     "Re-evaluate and update the FAQ category for target {target_id}."
                 ),
@@ -355,10 +384,16 @@ fn materialize_rename_check(
 ) -> Result<MaterializeResult> {
     // Try to extract old_path/new_path from metadata_json first.
     let (old_path, new_path) = if let Some(detail) = detail_json {
-        let parsed: serde_json::Value = serde_json::from_str(detail)
-            .context("Failed to parse rename detail JSON")?;
-        let old = parsed.get("old_path").and_then(|v| v.as_str()).map(String::from);
-        let new = parsed.get("new_path").and_then(|v| v.as_str()).map(String::from);
+        let parsed: serde_json::Value =
+            serde_json::from_str(detail).context("Failed to parse rename detail JSON")?;
+        let old = parsed
+            .get("old_path")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let new = parsed
+            .get("new_path")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         match (old, new) {
             (Some(o), Some(n)) => (o, n),
             _ => {
@@ -536,7 +571,11 @@ fn parse_rename_target_id(target_id: &str) -> Option<(String, String)> {
     // Actually, we can be smarter: absolute paths on macOS start with /Users/ or
     // other known roots. The boundary is where we see a `/Users/` (or similar)
     // that isn't the start of the string.
-    if let Some(boundary) = rest[1..].find("/Users/").or_else(|| rest[1..].find("/home/")).or_else(|| rest[1..].find("/tmp/")) {
+    if let Some(boundary) = rest[1..]
+        .find("/Users/")
+        .or_else(|| rest[1..].find("/home/"))
+        .or_else(|| rest[1..].find("/tmp/"))
+    {
         let old_path = &rest[..boundary + 1];
         let new_path = &rest[boundary + 1..];
         if !old_path.is_empty() && !new_path.is_empty() {

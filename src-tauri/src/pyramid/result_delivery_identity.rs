@@ -105,10 +105,9 @@ impl fmt::Display for ResultDeliveryAuthError {
                 f,
                 "result-delivery JWT decode failed (signature, aud, or exp invalid)"
             ),
-            Self::JobIdMismatch => write!(
-                f,
-                "result-delivery JWT sub does not match envelope job_id"
-            ),
+            Self::JobIdMismatch => {
+                write!(f, "result-delivery JWT sub does not match envelope job_id")
+            }
             Self::OperatorMismatch => write!(
                 f,
                 "result-delivery JWT rid does not match this node's operator_id"
@@ -265,7 +264,11 @@ impl fmt::Debug for RequesterDeliveryVerifyError {
             }
             Self::Expired => write!(f, "RequesterDeliveryVerifyError::Expired"),
             Self::WrongAud { got } => {
-                write!(f, "RequesterDeliveryVerifyError::WrongAud {{ got: {:?} }}", got)
+                write!(
+                    f,
+                    "RequesterDeliveryVerifyError::WrongAud {{ got: {:?} }}",
+                    got
+                )
             }
             Self::WrongIss => write!(f, "RequesterDeliveryVerifyError::WrongIss"),
             Self::WrongRid { got, expected } => write!(
@@ -302,10 +305,7 @@ impl fmt::Display for RequesterDeliveryVerifyError {
                 "requester-delivery JWT aud mismatch: got {:?}, expected \"requester-delivery\"",
                 got
             ),
-            Self::WrongIss => write!(
-                f,
-                "requester-delivery JWT iss mismatch: expected \"wire\""
-            ),
+            Self::WrongIss => write!(f, "requester-delivery JWT iss mismatch: expected \"wire\""),
             Self::WrongRid { got, expected } => write!(
                 f,
                 "requester-delivery JWT rid mismatch: got {:?}, expected {:?}",
@@ -436,7 +436,9 @@ pub fn verify_requester_delivery_token(
     }
 
     // ── exp ─────────────────────────────────────────────────────────
-    let exp = claims.exp.ok_or(RequesterDeliveryVerifyError::MalformedClaims)?;
+    let exp = claims
+        .exp
+        .ok_or(RequesterDeliveryVerifyError::MalformedClaims)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -520,7 +522,10 @@ mod tests {
         let public_pem = verifying_key
             .to_public_key_pem(LineEnding::LF)
             .expect("public pem");
-        Keypair { private_pem, public_pem }
+        Keypair {
+            private_pem,
+            public_pem,
+        }
     }
 
     fn future_exp() -> u64 {
@@ -566,8 +571,8 @@ mod tests {
         let kp = generate_keypair();
         let claims = default_claims();
         let token = sign_token(&claims, &kp.private_pem);
-        let identity =
-            verify_result_delivery_token(&token, &kp.public_pem, OP_ID, JOB_ID).expect("should verify");
+        let identity = verify_result_delivery_token(&token, &kp.public_pem, OP_ID, JOB_ID)
+            .expect("should verify");
         assert_eq!(identity.sub_job_id(), JOB_ID);
         assert_eq!(identity.rid(), OP_ID);
     }
@@ -811,7 +816,10 @@ mod requester_delivery_tests {
         let public_pem = verifying_key
             .to_public_key_pem(LineEnding::LF)
             .expect("public pem");
-        Keypair { private_pem, public_pem }
+        Keypair {
+            private_pem,
+            public_pem,
+        }
     }
 
     fn future_exp() -> u64 {

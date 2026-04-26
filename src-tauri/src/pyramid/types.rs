@@ -6,6 +6,7 @@
 //        TreeNode, DrillResult, SearchHit, EntityEntry, BuildStatus, BuildProgress,
 //        PyramidBatch, PendingMutation, AutoUpdateConfig, StaleCheckResult, etc.
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -78,6 +79,8 @@ pub struct PyramidNode {
     pub terms: Vec<Term>,
     pub dead_ends: Vec<String>,
     pub self_prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_question_id: Option<String>,
     pub children: Vec<String>,
     pub parent_id: Option<String>,
     pub superseded_by: Option<String>,
@@ -239,11 +242,31 @@ pub struct TreeNode {
     pub depth: i64,
     pub headline: String,
     pub distilled: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_kind: Option<String>,
+    #[serde(default)]
+    pub parent_ids: Vec<String>,
     pub self_prompt: Option<String>,
     pub thread_id: Option<String>,
     pub source_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_about: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_creates: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_prompt_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_headline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_distilled: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered: Option<bool>,
     pub children: Vec<TreeNode>,
 }
 
@@ -261,12 +284,38 @@ pub struct DrillResult {
     pub gaps: Vec<GapReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question_context: Option<QuestionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_node: Option<QuestionNodeDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_answer: Option<PyramidNode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionContext {
     pub parent_question: Option<String>,
     pub sibling_questions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestionNodeDetail {
+    pub question_id: String,
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub parent_ids: Vec<String>,
+    pub depth: i64,
+    pub visual_depth: i64,
+    pub question: String,
+    pub about: String,
+    pub creates: String,
+    pub prompt_hint: String,
+    pub is_leaf: bool,
+    pub children: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_node_id: Option<String>,
+    #[serde(default)]
+    pub answered: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -523,7 +572,23 @@ pub struct LiveNodeInfo {
     pub depth: i64,
     pub headline: String,
     pub parent_id: Option<String>,
+    #[serde(default)]
+    pub parent_ids: Vec<String>,
     pub children: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_about: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_creates: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_prompt_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered: Option<bool>,
     /// "complete" | "pending" | "superseded"
     pub status: String,
 }
@@ -745,21 +810,64 @@ pub struct PyramidAnnotation {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum AnnotationType {
-    Observation,
-    Correction,
-    Question,
-    Friction,
-    Idea,
-    Era,
-    Transition,
-    #[serde(rename = "health_check")]
-    HealthCheck,
-    #[serde(rename = "directory")]
-    Directory,
-}
+/// Annotation type as a vocab-validated newtype wrapper.
+///
+/// Phase 6c-B: this was an 11-variant Rust enum until v5; the enum was the
+/// source of truth AND parsers/dispatch arms encoded type-specific behavior
+/// in match-legs. That made the registry (Phase 6c-A) dead plumbing —
+/// publishing a new vocab entry had zero runtime effect.
+///
+/// Now the newtype wraps the canonical string and the
+/// `pyramid_config_contributions` vocabulary registry is the authoritative
+/// list. `from_str_strict(conn, s)` validates against the registry so an
+/// agent who publishes a new vocab entry for `my_new_type` can POST an
+/// annotation with that type the moment the entry is active — no code
+/// deploy.
+///
+/// Serde transparent keeps wire compat: it serializes to / deserializes
+/// from the plain string. The DB column stores the same string via
+/// `as_str()`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AnnotationType(String);
+
+// ── Canonical string constants for the 11 pre-Phase-7c genesis types ─
+//
+// These are NOT an authoritative list (the vocabulary registry is) — they
+// exist so internal Rust call sites that already know a specific genesis
+// type (vine.rs writing an ERA annotation, `emit_annotation_observation_events`
+// detecting "correction") don't have to hit the vocab cache just to spell
+// the canonical string. Adding a new vocab type via contribution does NOT
+// require adding a constant here; these are convenience for the baked-in
+// names that predate the registry.
+//
+// Phase 7c intentionally did NOT add ANNOTATION_TYPE_GAP /
+// ANNOTATION_TYPE_HYPOTHESIS / ANNOTATION_TYPE_PURPOSE_DECLARATION /
+// ANNOTATION_TYPE_PURPOSE_SHIFT consts — the new verbs are pure vocab
+// additions (project_wire_canonical_vocabulary.md). Internal call sites
+// that need to name them read from vocab_entries or use string literals.
+pub const ANNOTATION_TYPE_OBSERVATION: &str = "observation";
+pub const ANNOTATION_TYPE_CORRECTION: &str = "correction";
+pub const ANNOTATION_TYPE_QUESTION: &str = "question";
+pub const ANNOTATION_TYPE_FRICTION: &str = "friction";
+pub const ANNOTATION_TYPE_IDEA: &str = "idea";
+pub const ANNOTATION_TYPE_ERA: &str = "era";
+pub const ANNOTATION_TYPE_TRANSITION: &str = "transition";
+pub const ANNOTATION_TYPE_HEALTH_CHECK: &str = "health_check";
+pub const ANNOTATION_TYPE_DIRECTORY: &str = "directory";
+pub const ANNOTATION_TYPE_STEEL_MAN: &str = "steel_man";
+pub const ANNOTATION_TYPE_RED_TEAM: &str = "red_team";
+
+/// Raised when a string does not match a known annotation type.
+/// Used by `AnnotationType::from_str_strict`. Production write paths must
+/// use the strict form so unknown types raise (Pillar 38 absorbed bug:
+/// the old lossy `from_str` silently mapped unknown → Observation). Legacy
+/// read paths use `AnnotationType::from_db_string` which wraps whatever
+/// the DB had, knowing the DB column can only contain strings that were
+/// accepted at write time.
+#[derive(Debug, thiserror::Error)]
+#[error("Unknown annotation type: '{0}'")]
+pub struct UnknownAnnotationType(pub String);
 
 // ── FAQ Types ────────────────────────────────────────────────────────────────
 
@@ -780,36 +888,88 @@ pub struct FaqNode {
 }
 
 impl AnnotationType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AnnotationType::Observation => "observation",
-            AnnotationType::Correction => "correction",
-            AnnotationType::Question => "question",
-            AnnotationType::Friction => "friction",
-            AnnotationType::Idea => "idea",
-            AnnotationType::Era => "era",
-            AnnotationType::Transition => "transition",
-            AnnotationType::HealthCheck => "health_check",
-            AnnotationType::Directory => "directory",
+    /// Raw constructor — wraps an arbitrary string. Use for internal call
+    /// sites that already know the string is a canonical genesis name
+    /// (e.g. `vine.rs` building an `era` annotation, DB read path
+    /// re-wrapping a value that was validated at write time). Write paths
+    /// that accept external input (HTTP, MCP CLI) MUST use
+    /// `from_str_strict` instead so unknown values raise.
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    /// The canonical string form. Stored in `pyramid_annotations.annotation_type`
+    /// and used as the wire-protocol string in JSON.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the wrapper and return the inner string.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
+    /// Wrap a value read from the DB. Does NOT validate against the
+    /// vocabulary — the DB column can only contain strings that were
+    /// accepted at write time (write paths use `from_str_strict`). Kept
+    /// as a named helper so the intent is clear at read call sites vs
+    /// the generic `new` constructor.
+    pub fn from_db_string(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    /// Strict parse — validates `s` against the vocabulary registry
+    /// (`pyramid_config_contributions` rows with
+    /// `schema_type LIKE 'vocabulary_entry:annotation_type:%'`). Unknown
+    /// values raise `UnknownAnnotationType`. Use in every write path
+    /// (CLI, MCP, HTTP) so agents publishing new vocab entries can
+    /// IMMEDIATELY post annotations of that type without a code deploy —
+    /// the whole point of Phase 6c-B.
+    ///
+    /// Pillar 38 absorbed bug: the pre-v5 lossy `from_str` silently
+    /// defaulted unknowns to Observation; the strict form refuses.
+    pub fn from_str_strict(
+        conn: &rusqlite::Connection,
+        s: &str,
+    ) -> std::result::Result<Self, UnknownAnnotationType> {
+        match super::vocab_entries::get_vocabulary_entry(
+            conn,
+            super::vocab_entries::VOCAB_KIND_ANNOTATION_TYPE,
+            s,
+        ) {
+            Ok(Some(_)) => Ok(Self(s.to_string())),
+            Ok(None) => Err(UnknownAnnotationType(s.to_string())),
+            Err(e) => {
+                // Vocabulary read failure should not silently-accept
+                // unknown strings. Log the DB error and refuse — the
+                // caller sees UnknownAnnotationType which surfaces in
+                // HTTP as 400, and the DB error is in the trace.
+                tracing::error!(
+                    "vocabulary lookup failed while validating annotation_type '{s}': {e}"
+                );
+                Err(UnknownAnnotationType(s.to_string()))
+            }
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "observation" => AnnotationType::Observation,
-            "correction" => AnnotationType::Correction,
-            "question" => AnnotationType::Question,
-            "friction" => AnnotationType::Friction,
-            "idea" => AnnotationType::Idea,
-            "era" => AnnotationType::Era,
-            "transition" => AnnotationType::Transition,
-            "health_check" => AnnotationType::HealthCheck,
-            "directory" => AnnotationType::Directory,
-            other => {
-                tracing::warn!("Unknown annotation type: '{other}', defaulting to Observation");
-                AnnotationType::Observation
-            }
-        }
+    /// Active set of annotation types from the vocabulary registry,
+    /// sorted by name. Replaces the pre-v5 `AnnotationType::ALL`
+    /// static slice. If vocab lookup fails, returns an empty Vec plus
+    /// an error — callers that want the bare list (e.g. error-message
+    /// rendering in HTTP 400 response) should fall back to the
+    /// genesis constants on error.
+    pub fn all(conn: &rusqlite::Connection) -> anyhow::Result<Vec<Self>> {
+        let entries = super::vocab_entries::list_vocabulary(
+            conn,
+            super::vocab_entries::VOCAB_KIND_ANNOTATION_TYPE,
+        )?;
+        Ok(entries.into_iter().map(|e| Self(e.name)).collect())
+    }
+}
+
+impl std::fmt::Display for AnnotationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -2175,27 +2335,15 @@ pub enum ManifestValidationError {
     /// provided — invalid per spec.
     IdentityChangedWithoutRewrite,
     /// A topic/term/decision op is missing a required field.
-    InvalidContentOp {
-        field: String,
-        detail: String,
-    },
+    InvalidContentOp { field: String, detail: String },
     /// A topic/term/decision op uses an unknown action string.
-    InvalidContentOpAction {
-        field: String,
-        action: String,
-    },
+    InvalidContentOpAction { field: String, action: String },
     /// A "remove" op targets an entry that does not exist on the current node.
-    RemovingNonexistentEntry {
-        field: String,
-        name: String,
-    },
+    RemovingNonexistentEntry { field: String, name: String },
     /// The LLM-authored `reason` field is empty or whitespace only.
     EmptyReason,
     /// The manifest's `build_version` is not exactly `current + 1`.
-    NonContiguousVersion {
-        expected: i64,
-        got: i64,
-    },
+    NonContiguousVersion { expected: i64, got: i64 },
 }
 
 impl std::fmt::Display for ManifestValidationError {
@@ -2233,3 +2381,592 @@ impl std::fmt::Display for ManifestValidationError {
 }
 
 impl std::error::Error for ManifestValidationError {}
+
+// ── Post-build accretion v5 types ────────────────────────────────────────────
+// See .lab/architecture/agent-wire-node-post-build-plan-v5.md
+// StepOperation intentionally NOT modified — role_bound dispatch routes via
+// string primitive "role_bound" + dadbear_work_items.resolved_chain_id column.
+
+/// Error raised when a DB row contains a `node_shape` string value that
+/// the vocabulary registry does not know about. Emitted by
+/// `NodeShape::from_db` so readers fail loud on typos / registry drift
+/// rather than silently rendering a shaped node as plain scaffolding.
+///
+/// Phase 6c-D: the enum-variant form of this error (4 hardcoded shapes)
+/// was replaced with a newtype wrapper around a vocabulary-validated
+/// string — an agent can publish a new `NodeShape` vocab entry without
+/// a code deploy. Unknown shapes at read time still raise loud because
+/// the registry is the authoritative list; a DB row whose `node_shape`
+/// string has no active vocab entry is either a forward-drift migration
+/// in progress or a data bug.
+#[derive(Debug, thiserror::Error)]
+#[error("Unknown node_shape value in DB: '{0}'")]
+pub struct UnknownNodeShape(pub String);
+
+// ── Canonical string constants for the 4 genesis node shapes ──
+//
+// Mirror of the AnnotationType convention above. Not an authoritative
+// list — the vocabulary registry is — but internal callers that already
+// know a specific genesis shape string (tests, compiler arms) can refer
+// to these constants instead of repeating the literal.
+pub const NODE_SHAPE_SCAFFOLDING: &str = "scaffolding";
+pub const NODE_SHAPE_DEBATE: &str = "debate";
+pub const NODE_SHAPE_META_LAYER: &str = "meta_layer";
+pub const NODE_SHAPE_GAP: &str = "gap";
+
+/// Error raised when a typed shape handler fails to deserialize its
+/// payload. Phase 9c-2-1 replaced the `UnknownShapePayload` loud-raise
+/// for missing handlers with a `RawJsonShape` fallback (see
+/// `ShapeHandler` / `parse_shape_payload`), so this variant is reserved
+/// for the case where a shape HAS a typed handler but the JSON body
+/// fails to match — i.e. data drift, not a missing registration.
+///
+/// Historical note (pre-9c-2-1): this struct was also raised for "no
+/// handler registered for this shape" — today that path goes through
+/// the RawJsonShape fallback and returns `ShapePayload::Raw(value)`
+/// instead. The error message below reflects the 9c-2-1 semantics.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Typed shape handler for node_shape '{0}' failed to parse its \
+payload: {1}. The vocab entry exists AND a typed handler is registered, \
+but the JSON body doesn't match the handler's schema — likely data drift \
+from a vocab supersession or a hand-edited row. Remediation: fix the \
+`shape_payload_json` column OR publish a new handler that accepts the \
+legacy body. Context (slug + node_id) is attached by the caller."
+)]
+pub struct UnknownShapePayload(pub String, pub String);
+
+/// Node shape discriminator stored in `pyramid_nodes.node_shape`.
+/// NULL / empty / "scaffolding" all normalize to the scaffolding shape.
+///
+/// Phase 6c-D: flipped from a 4-variant enum to a newtype wrapper around
+/// the canonical string — per `feedback_generalize_not_enumerate`.
+/// The vocabulary registry (`pyramid_config_contributions` rows with
+/// `schema_type LIKE 'vocabulary_entry:node_shape:%'`) is the
+/// authoritative catalog. `from_db` validates against it so an agent
+/// who publishes a new node-shape vocab entry can point rows at that
+/// shape the moment the entry is active.
+///
+/// Serde transparent keeps wire compat: serializes to / deserializes from
+/// the plain string. The `node_shape` DB column stores the same string
+/// via `to_db()` (NULL for scaffolding).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NodeShape(String);
+
+impl NodeShape {
+    /// Raw constructor — wraps an arbitrary string. Use for internal call
+    /// sites that already know the string is a canonical genesis shape
+    /// (tests, shape-writer handlers). Write paths that accept external
+    /// input (HTTP, MCP CLI) MUST use `from_db` so unknown strings raise.
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    /// The canonical string form. Stored in `pyramid_nodes.node_shape`
+    /// (NULL for scaffolding via `to_db`) and used as the wire-protocol
+    /// discriminator in JSON.
+    pub fn as_str(&self) -> &str {
+        if self.is_scaffolding() {
+            NODE_SHAPE_SCAFFOLDING
+        } else {
+            &self.0
+        }
+    }
+
+    /// True for the default scaffolding shape (empty inner string OR
+    /// literal "scaffolding"). Empty normalizes to scaffolding so
+    /// `NodeShape::new("")` and `NodeShape::from_db(None)` round-trip
+    /// to the same semantic shape.
+    pub fn is_scaffolding(&self) -> bool {
+        self.0.is_empty() || self.0 == NODE_SHAPE_SCAFFOLDING
+    }
+
+    /// Convenience: the canonical scaffolding sentinel. Equivalent to
+    /// `NodeShape::new("scaffolding")` / `NodeShape::from_db(None)`.
+    pub fn scaffolding() -> Self {
+        Self(String::new())
+    }
+
+    /// Convert to the string value stored in `pyramid_nodes.node_shape`.
+    /// Scaffolding maps to None (NULL in DB) — no row write needed for the
+    /// default case; every other shape stores its canonical string.
+    pub fn to_db(&self) -> Option<&str> {
+        if self.is_scaffolding() {
+            None
+        } else {
+            Some(&self.0)
+        }
+    }
+
+    /// Parse from the optional string stored in the DB column, validating
+    /// against the vocabulary registry.
+    ///
+    /// None / empty / "scaffolding" normalize to the scaffolding shape
+    /// WITHOUT hitting the registry (scaffolding is the default, and a
+    /// NULL column existed before the `node_shape` column was added).
+    ///
+    /// Anything else is validated against the `node_shape` vocab kind —
+    /// unknown strings raise `UnknownNodeShape`. Silent-default-to-
+    /// scaffolding would let a typo'd or forward-drift shape silently
+    /// render as plain scaffolding while still holding a payload in
+    /// `shape_payload_json`, masking a real data bug. Per
+    /// `feedback_loud_deferrals`, fail loud.
+    pub fn from_db(
+        conn: &rusqlite::Connection,
+        s: Option<&str>,
+    ) -> Result<Self, UnknownNodeShape> {
+        match s {
+            None | Some("") | Some(NODE_SHAPE_SCAFFOLDING) => Ok(Self::scaffolding()),
+            Some(other) => {
+                match super::vocab_entries::get_vocabulary_entry(
+                    conn,
+                    super::vocab_entries::VOCAB_KIND_NODE_SHAPE,
+                    other,
+                ) {
+                    Ok(Some(_)) => Ok(Self(other.to_string())),
+                    Ok(None) => Err(UnknownNodeShape(other.to_string())),
+                    Err(e) => {
+                        // Registry read failure must NOT silently-accept
+                        // unknown strings — log + refuse.
+                        tracing::error!(
+                            "vocabulary lookup failed while validating node_shape '{other}': {e}"
+                        );
+                        Err(UnknownNodeShape(other.to_string()))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Unchecked wrapper — wraps whatever the DB had without vocab
+    /// validation. Callers must only use this in read paths where the
+    /// string was validated at write time (matches the AnnotationType
+    /// `from_db_string` pattern).
+    pub fn from_db_string(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+}
+
+impl std::fmt::Display for NodeShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Purpose row — per-slug declaration of what the pyramid is for.
+/// Supersession chain via `superseded_by`. One active row per slug
+/// (enforced by partial UNIQUE index).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Purpose {
+    pub id: i64,
+    pub slug: String,
+    pub purpose_text: String,
+    pub stock_purpose_key: Option<String>,
+    pub decomposition_chain_ref: Option<String>,
+    pub created_at: String,
+    pub superseded_by: Option<i64>,
+    pub supersede_reason: Option<String>,
+}
+
+/// Role binding row — per-pyramid mapping of role name to handler chain id.
+/// Supersession chain. One active row per (slug, role_name, scope).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleBinding {
+    pub id: i64,
+    pub slug: String,
+    pub role_name: String,
+    pub handler_chain_id: String,
+    pub scope: String,
+    pub created_at: String,
+    pub superseded_by: Option<i64>,
+}
+
+// ── Node-shape-specific payload structs ────────────────────────────────
+// Stored serialized in `pyramid_nodes.shape_payload_json`. The legacy
+// `topics: Vec<Topic>` column is untouched for shape nodes so non-shape-aware
+// readers see an empty Vec rather than silently-corrupted JSON.
+
+/// Debate node payload — contested-claim structure with positions,
+/// steel-mannings, red-teams, cross-references, and vote lean.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebateTopic {
+    pub concern: String,
+    pub positions: Vec<DebatePosition>,
+    #[serde(default)]
+    pub cross_refs: Vec<String>,
+    #[serde(default)]
+    pub vote_lean: Option<VoteLean>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebatePosition {
+    pub label: String,
+    pub steel_manning: String,
+    #[serde(default)]
+    pub red_teams: Vec<RedTeamEntry>,
+    /// Node-id references to the substrate that supports this position.
+    /// Semantic channel: genuine evidence — readers expect node_ids or
+    /// cross-pyramid refs (e.g. "L1-001", "adjacent-pyramid/L2-42"), NOT
+    /// annotation-id tags. Provenance/idempotency tokens live on
+    /// `source_annotation_ids` per v5 audit P6.
+    #[serde(default)]
+    pub evidence_anchors: Vec<String>,
+    /// Annotation provenance + idempotency tokens of the form
+    /// `annotation#{id}`. Populated by writers that materialize or append
+    /// to a debate from annotations (see `append_annotation_to_debate_node`).
+    /// Kept separate from `evidence_anchors` so readers of the evidence
+    /// channel see only genuine node-id refs.
+    #[serde(default)]
+    pub source_annotation_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedTeamEntry {
+    pub from_position: String,
+    pub argument: String,
+    /// Node-id references to substrate supporting this red-team argument.
+    /// See `DebatePosition.evidence_anchors` for the semantic contract.
+    #[serde(default)]
+    pub evidence_anchors: Vec<String>,
+    /// Annotation provenance + idempotency tokens of the form
+    /// `annotation#{id}`. See `DebatePosition.source_annotation_ids`.
+    #[serde(default)]
+    pub source_annotation_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoteLean {
+    pub up_count: i64,
+    pub down_count: i64,
+    #[serde(default)]
+    pub per_position: Option<HashMap<String, (i64, i64)>>,
+}
+
+/// Meta-layer node payload — purpose-aligned synthesis referencing substrate.
+///
+/// `topics` is the audit trail: each topic names a theme the synthesizer
+/// surfaced across the substrate and lists the specific substrate node ids
+/// that anchor it. Phase 7b verifier added this field — the LLM step's
+/// `response_schema` already requires it, but the original writer dropped
+/// the array on the floor (silent data loss). See
+/// `chain_dispatch::create_meta_layer_node`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaLayerTopic {
+    pub purpose_question: String,
+    #[serde(default)]
+    pub parent_meta_layer_id: Option<String>,
+    #[serde(default)]
+    pub covered_substrate_nodes: Vec<String>,
+    #[serde(default)]
+    pub topics: Vec<MetaLayerTopicEntry>,
+}
+
+/// One theme surfaced by the meta-layer synthesizer, with anchor ids.
+///
+/// Shape mirrors the starter-synthesizer response_schema's `topics[]`
+/// entries so the LLM output deserializes directly into this struct.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaLayerTopicEntry {
+    pub topic: String,
+    #[serde(default)]
+    pub anchor_nodes: Vec<String>,
+}
+
+/// Gap node payload — explicit absence with demand state and candidate
+/// resolutions. Demand state lifecycle: open -> dispatched -> closed |
+/// tombstoned.
+///
+/// `evidence_anchors` carries node-id references to substrate that supports
+/// the existence of the gap (same semantic channel as
+/// `DebatePosition.evidence_anchors` / `RedTeamEntry.evidence_anchors`).
+///
+/// `source_annotation_ids` carries `annotation#{id}` provenance/idempotency
+/// tokens. v5 audit P6 split this off from `evidence_anchors` so readers
+/// of the evidence channel see only genuine node-id refs. Phase 7c verifier
+/// previously merged these into `evidence_anchors` to dodge
+/// `GapCandidate.resolution_type` overloading; that fix lifted the wrong
+/// end of the problem, so v5 audit completes the split.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GapTopic {
+    pub concern: String,
+    pub description: String,
+    pub demand_state: String,
+    #[serde(default)]
+    pub candidate_resolutions: Vec<GapCandidate>,
+    /// Node-id references to substrate supporting the gap (genuine evidence).
+    #[serde(default)]
+    pub evidence_anchors: Vec<String>,
+    /// Annotation provenance + idempotency tokens of the form
+    /// `annotation#{id}`.
+    #[serde(default)]
+    pub source_annotation_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GapCandidate {
+    pub resolution_type: String,
+    #[serde(default)]
+    pub cost_estimate: Option<String>,
+    #[serde(default)]
+    pub authorization_required: bool,
+}
+
+/// Tagged enum over shape-specific payloads. Serialized to
+/// `pyramid_nodes.shape_payload_json` via serde untagged with a sibling
+/// node_shape column as the discriminator.
+///
+/// Phase 9c-2-1: added `Raw(serde_json::Value)`. Core shapes (Debate /
+/// MetaLayer / Gap) still deserialize through their typed handlers; a
+/// shape published via vocab without a typed Rust handler parses into
+/// `Raw` so ingress + persistence work without a code deploy. Typed
+/// consumers that match on `Debate(_)` / `MetaLayer(_)` / `Gap(_)`
+/// silently skip a `Raw(_)` payload — the shape can hold data, but the
+/// typed consumer doesn't know the schema. Handlers can be added later
+/// without migrating data.
+///
+/// Serde `untagged` still applies, but `parse_shape_payload` does NOT
+/// dispatch via serde's try-each behavior — it routes by `shape.as_str()`
+/// through the registry, so the Raw variant will only be produced when
+/// the shape has no typed handler.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ShapePayload {
+    Debate(DebateTopic),
+    MetaLayer(MetaLayerTopic),
+    Gap(GapTopic),
+    /// Phase 9c-2-1 pass-through JSON fallback for vocab-registered
+    /// shapes without a typed Rust handler. Kept last in the untagged
+    /// enum so serde's forward-compat attempts Debate/MetaLayer/Gap
+    /// first when external deserializers are used (today there are
+    /// none — `parse_shape_payload` is the only entrypoint).
+    Raw(serde_json::Value),
+}
+
+/// Typed view of a node's shape + payload as resolved from the two
+/// parallel columns `pyramid_nodes.node_shape` and
+/// `pyramid_nodes.shape_payload_json`. Produced by `db::get_node_shape`.
+#[derive(Debug, Clone)]
+pub struct NodeShapeView {
+    pub shape: NodeShape,
+    /// `None` iff `shape == Scaffolding`. For Debate / MetaLayer / Gap this
+    /// is always Some — a node claiming a non-scaffolding shape with NULL
+    /// payload is a data bug and raises at read time.
+    pub payload: Option<ShapePayload>,
+}
+
+/// Resolve `shape_payload_json` against a declared `NodeShape` discriminator.
+///
+/// Rather than rely on serde's `#[serde(untagged)]` required-field-set
+/// guessing (brittle when DebateTopic and MetaLayerTopic overlap), this
+/// function deserializes into the concrete inner struct named by `shape`,
+/// then wraps it. Errors are loud and contextual.
+///
+/// Returns:
+/// - `Ok(None)` iff `shape == Scaffolding` and `json` is None or empty.
+/// - `Ok(Some(payload))` for Debate/MetaLayer/Gap with a matching JSON body.
+/// - `Err` when the payload is missing for a shape that requires one, or
+///   when the JSON doesn't match the shape's expected struct (misaligned).
+pub fn parse_shape_payload(
+    shape: &NodeShape,
+    json: Option<&str>,
+) -> anyhow::Result<Option<ShapePayload>> {
+    let json_str = json.and_then(|s| if s.trim().is_empty() { None } else { Some(s) });
+    let shape_str = shape.as_str();
+
+    // Scaffolding handled first — scaffolding nodes must not carry a payload.
+    if shape.is_scaffolding() {
+        return match json_str {
+            None => Ok(None),
+            Some(_) => Err(anyhow::anyhow!(
+                "pyramid_nodes.shape_payload_json is non-empty but node_shape is Scaffolding — \
+                 data bug: shape and payload columns are misaligned"
+            )),
+        };
+    }
+
+    // Non-scaffolding shapes require a payload.
+    let payload = json_str.ok_or_else(|| {
+        anyhow::anyhow!(
+            "node_shape is '{}' but shape_payload_json is NULL — \
+             non-scaffolding shapes require a payload",
+            shape_str
+        )
+    })?;
+
+    // Phase 9c-2-1: dispatch through the contribution-driven shape-handler
+    // registry. Core shapes (Debate / MetaLayer / Gap) ship typed handlers
+    // that deserialize into their Topic structs. Shapes without a typed
+    // handler flow through the RawJsonShape fallback → ShapePayload::Raw,
+    // so an agent can publish a new node-shape vocab entry AND start
+    // storing payloads under it without a code deploy. Typed consumers
+    // (match arms that read Debate/MetaLayer/Gap) will silently skip the
+    // Raw variant — adding a typed handler later lights them up with no
+    // migration.
+    //
+    // A mismatched payload (e.g. debate shape with gap-shaped JSON) still
+    // raises loud via the handler's own deserialize error path — the Raw
+    // fallback only fires for shapes with NO typed handler registered.
+    let handler = shape_handler_registry()
+        .get(shape_str)
+        .cloned();
+    match handler {
+        Some(h) => h
+            .parse_payload(payload)
+            .map(Some)
+            .with_context(|| format!("shape_handler '{}' failed to parse payload", shape_str)),
+        None => {
+            // Warn ONCE per unknown shape kind — loud enough an operator
+            // knows to wire a typed handler, quiet enough not to flood logs
+            // per read of a raw-shape node.
+            warn_unknown_shape_once(shape_str);
+            let value: serde_json::Value = serde_json::from_str(payload)
+                .with_context(|| {
+                    format!(
+                        "RawJsonShape fallback: shape_payload_json for node_shape='{}' \
+                         is not valid JSON",
+                        shape_str
+                    )
+                })?;
+            Ok(Some(ShapePayload::Raw(value)))
+        }
+    }
+}
+
+// ── Phase 9c-2-1: Contribution-driven shape-handler registry ─────────────
+//
+// Core shapes (Debate, MetaLayer, Gap) ship as typed handlers backed by
+// their respective `Topic` structs. The `Scaffolding` case is handled
+// BEFORE the registry dispatch in `parse_shape_payload` (null payload is
+// a special semantic, not a typed-vs-raw distinction) — so the registry
+// never contains `scaffolding`.
+//
+// Shapes whose vocab entry is known but which have no typed Rust handler
+// flow through the `RawJsonShape` fallback in `parse_shape_payload` →
+// `ShapePayload::Raw(value)`. Adding a new typed handler is a single
+// `ShapeHandler` impl + one line of registration in `build_registry()`.
+// Adding a new shape without a typed handler is a pure vocab publish
+// (contribution write) — no code deploy.
+//
+// Thread-safety: the registry is a `LazyLock<HashMap<..., Arc<dyn ShapeHandler>>>`.
+// It is built exactly once under the `LazyLock` mutex on first read and
+// is immutable afterward; subsequent lookups are lock-free reads. Handler
+// impls are `Send + Sync` (no interior state) so concurrent parsers
+// calling the same handler are safe.
+
+/// Trait every shape handler implements. Handlers are stateless — they
+/// encapsulate the shape name + a typed deserialize path. The `&self`
+/// receiver lets future handlers carry config (e.g. schema versions)
+/// without breaking the registry API.
+pub trait ShapeHandler: Send + Sync {
+    /// Canonical shape name (matches `pyramid_nodes.node_shape`).
+    fn shape_name(&self) -> &'static str;
+    /// Parse the `shape_payload_json` body into a typed `ShapePayload`.
+    /// Implementations return an error (NOT a Raw fallback) if the JSON
+    /// does not match the handler's schema — a handler mismatch is a
+    /// data bug, not a forward-compat scenario.
+    fn parse_payload(&self, json: &str) -> anyhow::Result<ShapePayload>;
+}
+
+/// Typed handler for `debate` shape — backs `ShapePayload::Debate`.
+struct DebateShapeHandler;
+impl ShapeHandler for DebateShapeHandler {
+    fn shape_name(&self) -> &'static str {
+        NODE_SHAPE_DEBATE
+    }
+    fn parse_payload(&self, json: &str) -> anyhow::Result<ShapePayload> {
+        let t: DebateTopic = serde_json::from_str(json).map_err(|e| {
+            anyhow::anyhow!(
+                "shape_payload_json failed to parse as DebateTopic \
+                 (node_shape='debate'): {e}"
+            )
+        })?;
+        Ok(ShapePayload::Debate(t))
+    }
+}
+
+/// Typed handler for `meta_layer` shape — backs `ShapePayload::MetaLayer`.
+struct MetaLayerShapeHandler;
+impl ShapeHandler for MetaLayerShapeHandler {
+    fn shape_name(&self) -> &'static str {
+        NODE_SHAPE_META_LAYER
+    }
+    fn parse_payload(&self, json: &str) -> anyhow::Result<ShapePayload> {
+        let t: MetaLayerTopic = serde_json::from_str(json).map_err(|e| {
+            anyhow::anyhow!(
+                "shape_payload_json failed to parse as MetaLayerTopic \
+                 (node_shape='meta_layer'): {e}"
+            )
+        })?;
+        Ok(ShapePayload::MetaLayer(t))
+    }
+}
+
+/// Typed handler for `gap` shape — backs `ShapePayload::Gap`.
+struct GapShapeHandler;
+impl ShapeHandler for GapShapeHandler {
+    fn shape_name(&self) -> &'static str {
+        NODE_SHAPE_GAP
+    }
+    fn parse_payload(&self, json: &str) -> anyhow::Result<ShapePayload> {
+        let t: GapTopic = serde_json::from_str(json).map_err(|e| {
+            anyhow::anyhow!(
+                "shape_payload_json failed to parse as GapTopic \
+                 (node_shape='gap'): {e}"
+            )
+        })?;
+        Ok(ShapePayload::Gap(t))
+    }
+}
+
+static SHAPE_HANDLER_REGISTRY: std::sync::LazyLock<
+    std::collections::HashMap<String, std::sync::Arc<dyn ShapeHandler>>,
+> = std::sync::LazyLock::new(build_shape_handler_registry);
+
+fn build_shape_handler_registry(
+) -> std::collections::HashMap<String, std::sync::Arc<dyn ShapeHandler>> {
+    let mut map: std::collections::HashMap<String, std::sync::Arc<dyn ShapeHandler>> =
+        std::collections::HashMap::new();
+    let handlers: Vec<std::sync::Arc<dyn ShapeHandler>> = vec![
+        std::sync::Arc::new(DebateShapeHandler),
+        std::sync::Arc::new(MetaLayerShapeHandler),
+        std::sync::Arc::new(GapShapeHandler),
+    ];
+    for h in handlers {
+        map.insert(h.shape_name().to_string(), h);
+    }
+    map
+}
+
+/// Lookup handle. Returns a map reference; `.get(shape_name)` yields the
+/// handler if one is registered. Exposed `pub(crate)` for tests that want
+/// to assert the genesis registration is complete.
+pub(crate) fn shape_handler_registry(
+) -> &'static std::collections::HashMap<String, std::sync::Arc<dyn ShapeHandler>> {
+    &SHAPE_HANDLER_REGISTRY
+}
+
+/// One-warn-per-unknown-shape helper. Keeps a process-wide `Mutex<HashSet<String>>`
+/// so an unknown shape encountered thousands of times (every read of the
+/// same raw-shape node) only logs a single `warn!` — loud enough to
+/// surface the gap, quiet enough not to flood. Subsequent reads return
+/// a Raw payload without emitting.
+fn warn_unknown_shape_once(shape_str: &str) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut guard = match seen.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.insert(shape_str.to_string()) {
+        tracing::warn!(
+            shape = %shape_str,
+            "parse_shape_payload: no typed ShapeHandler registered for node_shape \
+             — falling back to RawJsonShape (ShapePayload::Raw). Ingress works; \
+             typed consumers cannot read this shape until a ShapeHandler is \
+             added. Per feedback_loud_deferrals this warning fires once per \
+             shape kind."
+        );
+    }
+}

@@ -15,12 +15,10 @@ use tracing::warn;
 
 use super::chain_executor::ChunkProvider;
 
-static REF_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_.]*(?:\[[^\]]*\])*)").unwrap()
-});
-static TEMPLATE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\{\{([^}]+)\}\}").unwrap()
-});
+static REF_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_.]*(?:\[[^\]]*\])*)").unwrap());
+static TEMPLATE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\{\{([^}]+)\}\}").unwrap());
 
 // ── ChainContext ─────────────────────────────────────────────────────────
 
@@ -179,10 +177,9 @@ impl ChainContext {
         }
         // $item.<field> dot-path navigation into the current forEach item
         if path.starts_with("item.") {
-            let item = self
-                .current_item
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Unresolved reference: $item (no active forEach)"))?;
+            let item = self.current_item.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Unresolved reference: $item (no active forEach)")
+            })?;
             let field_path = &path[5..]; // strip "item."
             return navigate_json_path(item, field_path)
                 .with_context(|| format!("Unresolved reference: $item.{}", field_path));
@@ -571,11 +568,7 @@ mod tests {
 
     fn test_context() -> ChainContext {
         use super::super::chain_executor::ChunkProvider;
-        let mut ctx = ChainContext::new(
-            "my-slug",
-            "conversation",
-            ChunkProvider::with_count(3),
-        );
+        let mut ctx = ChainContext::new("my-slug", "conversation", ChunkProvider::with_count(3));
 
         // Add a step output
         Arc::make_mut(&mut ctx.step_outputs).insert(
@@ -889,7 +882,10 @@ mod tests {
     #[test]
     fn chain_context_new_defaults_invoke_depth_to_zero() {
         let ctx = test_context();
-        assert_eq!(ctx.invoke_depth, 0, "new ChainContext should have invoke_depth = 0");
+        assert_eq!(
+            ctx.invoke_depth, 0,
+            "new ChainContext should have invoke_depth = 0"
+        );
     }
 
     #[test]

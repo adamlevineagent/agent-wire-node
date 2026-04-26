@@ -4,6 +4,7 @@ import { PromptTab } from './PromptTab';
 import { ResponseTab } from './ResponseTab';
 import { DetailsTab } from './DetailsTab';
 import type { LiveNodeInfo, LlmAuditRecord } from './types';
+import type { DrillResultFull } from './inspector-types';
 
 interface NodeInspectorModalProps {
     slug: string;
@@ -19,18 +20,26 @@ export function NodeInspectorModal({ slug, nodeId, allNodes, onClose, onNavigate
     const [activeTab, setActiveTab] = useState<TabId>('details');
     const [auditRecords, setAuditRecords] = useState<LlmAuditRecord[]>([]);
     const [loading, setLoading] = useState(true);
-    const [drillData, setDrillData] = useState<any>(null);
+    const [drillData, setDrillData] = useState<DrillResultFull | null>(null);
 
     // Current node info
     const currentNode = allNodes.find(n => n.node_id === nodeId);
-    const depth = currentNode?.depth ?? 0;
+    const questionNode = drillData?.question_node ?? null;
+    const topLevelQuestion = drillData?.question ?? drillData?.node?.question ?? null;
+    const depth = currentNode?.depth ?? questionNode?.visual_depth ?? drillData?.node?.depth ?? 0;
+    const headline = currentNode?.question
+        || currentNode?.headline
+        || questionNode?.question
+        || topLevelQuestion
+        || drillData?.node?.headline
+        || nodeId;
 
     // Fetch audit records + drill data when node changes
     useEffect(() => {
         setLoading(true);
         Promise.all([
             invoke<LlmAuditRecord[]>('pyramid_node_audit', { slug, nodeId }).catch(() => []),
-            invoke<any>('pyramid_drill', { slug, nodeId }).catch(() => null),
+            invoke<DrillResultFull>('pyramid_drill', { slug, nodeId }).catch(() => null),
         ]).then(([records, drill]) => {
             setAuditRecords(records);
             setDrillData(drill);
@@ -42,12 +51,67 @@ export function NodeInspectorModal({ slug, nodeId, allNodes, onClose, onNavigate
     const latestAudit = auditRecords.length > 0 ? auditRecords[auditRecords.length - 1] : null;
 
     // ── Navigation ──────────────────────────────────────────────────────
-    const siblings = allNodes.filter(n => n.depth === depth && n.parent_id === currentNode?.parent_id);
-    const siblingIndex = siblings.findIndex(n => n.node_id === nodeId);
-    const prevSibling = siblingIndex > 0 ? siblings[siblingIndex - 1] : null;
-    const nextSibling = siblingIndex < siblings.length - 1 ? siblings[siblingIndex + 1] : null;
-    const parent = currentNode?.parent_id ? allNodes.find(n => n.node_id === currentNode.parent_id) : null;
-    const children = allNodes.filter(n => n.parent_id === nodeId);
+    const parentIds = currentNode?.parent_ids && currentNode.parent_ids.length > 0
+        ? currentNode.parent_ids
+        : questionNode?.parent_ids && questionNode.parent_ids.length > 0
+            ? questionNode.parent_ids
+            : currentNode?.parent_id
+                ? [currentNode.parent_id]
+                : questionNode?.parent_id
+                    ? [questionNode.parent_id]
+                    : [];
+    const parentId = parentIds[0] ?? null;
+    const siblingParentSet = new Set(parentIds);
+    const siblings = allNodes.filter(n => {
+        if (n.depth !== depth || n.node_id === nodeId) return false;
+        const nodeParentIds = n.parent_ids && n.parent_ids.length > 0
+            ? n.parent_ids
+            : n.parent_id ? [n.parent_id] : [];
+        return parentIds.length === 0
+            ? nodeParentIds.length === 0
+            : nodeParentIds.some(pid => siblingParentSet.has(pid));
+    });
+    const siblingsWithCurrent = [
+        ...siblings,
+        currentNode ?? (questionNode ? {
+            node_id: questionNode.question_id,
+            depth,
+            headline,
+            parent_id: parentId,
+            parent_ids: parentIds,
+            children: questionNode.children,
+            node_kind: 'question',
+            question: questionNode.question,
+            status: questionNode.answered ? 'complete' : 'pending',
+        } : null),
+    ].filter(Boolean) as LiveNodeInfo[];
+    siblingsWithCurrent.sort((a, b) => a.node_id.localeCompare(b.node_id));
+    const siblingIndex = siblingsWithCurrent.findIndex(n => n.node_id === nodeId);
+    const prevSibling = siblingIndex > 0 ? siblingsWithCurrent[siblingIndex - 1] : null;
+    const nextSibling = siblingIndex >= 0 && siblingIndex < siblingsWithCurrent.length - 1 ? siblingsWithCurrent[siblingIndex + 1] : null;
+    const parent = parentId ? allNodes.find(n => n.node_id === parentId) ?? null : null;
+    const liveChildren = allNodes.filter(n => {
+        const nodeParentIds = n.parent_ids && n.parent_ids.length > 0
+            ? n.parent_ids
+            : n.parent_id ? [n.parent_id] : [];
+        return nodeParentIds.includes(nodeId);
+    });
+    const syntheticQuestionChildren: LiveNodeInfo[] = liveChildren.length > 0
+        ? []
+        : (questionNode?.children ?? []).map((childId) => {
+            const known = allNodes.find(n => n.node_id === childId);
+            return known ?? {
+                node_id: childId,
+                depth: Math.max(depth - 1, 0),
+                headline: childId,
+                parent_id: nodeId,
+                parent_ids: [nodeId],
+                children: [],
+                node_kind: 'question',
+                status: 'pending',
+            };
+        });
+    const children = liveChildren.length > 0 ? liveChildren : syntheticQuestionChildren;
 
     // Keyboard navigation
     useEffect(() => {
@@ -95,7 +159,7 @@ export function NodeInspectorModal({ slug, nodeId, allNodes, onClose, onNavigate
                     </div>
                     <div className="inspector-title">
                         <span className="inspector-headline">
-                            {currentNode?.headline || nodeId}
+                            {headline}
                         </span>
                         <span className="inspector-depth-badge">L{depth}</span>
                     </div>

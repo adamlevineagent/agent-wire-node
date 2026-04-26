@@ -26,13 +26,9 @@ use tokio::time::sleep;
 use crate::pyramid::config_contributions::load_contribution_by_id;
 use crate::pyramid::db;
 use crate::pyramid::event_bus::{TaggedBuildEvent, TaggedKind};
-use crate::pyramid::wire_discovery::{
-    load_auto_update_settings, load_update_polling_interval,
-};
+use crate::pyramid::wire_discovery::{load_auto_update_settings, load_update_polling_interval};
 use crate::pyramid::wire_publish::{PyramidPublisher, SupersessionCheckEntry};
-use crate::pyramid::wire_pull::{
-    pull_wire_contribution, PullError, PullOptions,
-};
+use crate::pyramid::wire_pull::{pull_wire_contribution, PullError, PullOptions};
 use crate::pyramid::PyramidState;
 
 /// Handle for the running poller task. Dropping the handle stops the
@@ -214,10 +210,7 @@ fn drop_interval_log(interval: Duration) {
 ///
 /// Public so tests can drive the logic without running a background
 /// task.
-pub async fn run_once(
-    state: &Arc<PyramidState>,
-    wire_url: &str,
-) -> Result<RunOnceReport> {
+pub async fn run_once(state: &Arc<PyramidState>, wire_url: &str) -> Result<RunOnceReport> {
     // Step 1: gather the list of wire-tracked contributions.
     let tracked = {
         let reader = state.reader.lock().await;
@@ -235,9 +228,7 @@ pub async fn run_once(
     let auth_token = match read_session_token(state).await {
         Some(t) if !t.is_empty() => t,
         _ => {
-            tracing::debug!(
-                "wire update poller: no session token available; skipping cycle"
-            );
+            tracing::debug!("wire update poller: no session token available; skipping cycle");
             return Ok(RunOnceReport::default());
         }
     };
@@ -287,8 +278,8 @@ pub async fn run_once(
         let writer = state.writer.lock().await;
         let changes_summary = Some(entry.version_labels_between.join(" • "));
         let changes_summary_ref = changes_summary.as_deref();
-        let authors_json = serde_json::to_string(&entry.author_handles)
-            .unwrap_or_else(|_| "[]".to_string());
+        let authors_json =
+            serde_json::to_string(&entry.author_handles).unwrap_or_else(|_| "[]".to_string());
         if let Err(e) = db::upsert_wire_update_cache(
             &writer,
             local_id,
@@ -375,7 +366,9 @@ async fn read_session_token(state: &Arc<PyramidState>) -> Option<String> {
     if !cfg.auth_token.is_empty() {
         return Some(cfg.auth_token.clone());
     }
-    std::env::var("WIRE_AUTH_TOKEN").ok().filter(|s| !s.is_empty())
+    std::env::var("WIRE_AUTH_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// Attempt to auto-pull + activate a superseding Wire contribution.
@@ -450,9 +443,7 @@ pub struct RunOnceReport {
 #[cfg(test)]
 mod phase14_tests {
     use super::*;
-    use crate::pyramid::wire_publish::{
-        SupersessionCheckEntry, WireContributionSearchResult,
-    };
+    use crate::pyramid::wire_publish::{SupersessionCheckEntry, WireContributionSearchResult};
 
     #[test]
     fn test_supersession_no_update_filter() {
@@ -552,9 +543,8 @@ mod phase14_tests {
         std::mem::forget(dir);
 
         let llm_config = crate::pyramid::llm::LlmConfig::default();
-        let credential_store = Arc::new(
-            crate::pyramid::credentials::CredentialStore::load(&data_dir).unwrap(),
-        );
+        let credential_store =
+            Arc::new(crate::pyramid::credentials::CredentialStore::load(&data_dir).unwrap());
         let state = Arc::new(PyramidState {
             reader: Arc::new(TokioMutex::new(reader_conn)),
             writer: Arc::new(TokioMutex::new(writer_conn)),
@@ -570,9 +560,7 @@ mod phase14_tests {
             operational: Arc::new(crate::pyramid::OperationalConfig::default()),
             chains_dir: data_dir.join("chains"),
             remote_query_rate_limiter: Arc::new(TokioMutex::new(HashMap::new())),
-            absorption_gate: Arc::new(TokioMutex::new(
-                crate::pyramid::AbsorptionGate::new(),
-            )),
+            absorption_gate: Arc::new(TokioMutex::new(crate::pyramid::AbsorptionGate::new())),
             build_event_bus: Arc::new(crate::pyramid::event_bus::BuildEventBus::new()),
             supabase_url: None,
             supabase_anon_key: None,
@@ -580,13 +568,11 @@ mod phase14_tests {
             dadbear_handle: Arc::new(TokioMutex::new(None)),
             dadbear_supervisor_handle: Arc::new(TokioMutex::new(None)),
             dadbear_in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            provider_registry: Arc::new(
-                crate::pyramid::provider::ProviderRegistry::new(credential_store.clone()),
-            ),
+            provider_registry: Arc::new(crate::pyramid::provider::ProviderRegistry::new(
+                credential_store.clone(),
+            )),
             credential_store,
-            schema_registry: Arc::new(
-                crate::pyramid::schema_registry::SchemaRegistry::new(),
-            ),
+            schema_registry: Arc::new(crate::pyramid::schema_registry::SchemaRegistry::new()),
             cross_pyramid_router: Arc::new(
                 crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
             ),

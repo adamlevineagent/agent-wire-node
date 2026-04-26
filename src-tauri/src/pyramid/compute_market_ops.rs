@@ -264,7 +264,9 @@ pub async fn create_offer(
     // committed locally. Wanderer caught this 2026-04-16.
     let prior_wire_offer_id: Option<String> = {
         let ms = market_state.read().await;
-        ms.offers.get(&req.model_id).and_then(|o| o.wire_offer_id.clone())
+        ms.offers
+            .get(&req.model_id)
+            .and_then(|o| o.wire_offer_id.clone())
     };
 
     // Wire-side publish first — we only touch local state if Wire accepts.
@@ -391,8 +393,15 @@ pub async fn create_offer(
             let prior_encoded = urlencoding::encode(&prior).into_owned();
             tokio::spawn(async move {
                 let path = format!("/api/v1/compute/offers/{}", prior_encoded);
-                match send_api_request(&api_url_cleanup, "DELETE", &path, &token_cleanup, None, None)
-                    .await
+                match send_api_request(
+                    &api_url_cleanup,
+                    "DELETE",
+                    &path,
+                    &token_cleanup,
+                    None,
+                    None,
+                )
+                .await
                 {
                     Ok(_) => tracing::info!(
                         prior_offer_id = %prior,
@@ -433,7 +442,9 @@ pub async fn remove_offer(
 
     let wire_offer_id = {
         let ms = market_state.read().await;
-        ms.offers.get(model_id).and_then(|o| o.wire_offer_id.clone())
+        ms.offers
+            .get(model_id)
+            .and_then(|o| o.wire_offer_id.clone())
     };
 
     if let Some(offer_id) = wire_offer_id {
@@ -485,9 +496,7 @@ async fn do_remove_local(
 }
 
 /// List all offers this node has published. Read-only snapshot.
-pub async fn list_offers(
-    market_state: &Arc<RwLock<ComputeMarketState>>,
-) -> Vec<ComputeOffer> {
+pub async fn list_offers(market_state: &Arc<RwLock<ComputeMarketState>>) -> Vec<ComputeOffer> {
     let ms = market_state.read().await;
     ms.offers.values().cloned().collect()
 }
@@ -539,9 +548,7 @@ pub async fn set_serving(
 
 /// Read the full `ComputeMarketState` for observability. Returned by
 /// value (clone under read lock) so callers don't hold the lock.
-pub async fn get_state(
-    market_state: &Arc<RwLock<ComputeMarketState>>,
-) -> ComputeMarketState {
+pub async fn get_state(market_state: &Arc<RwLock<ComputeMarketState>>) -> ComputeMarketState {
     market_state.read().await.clone()
 }
 
@@ -676,9 +683,7 @@ mod tests {
 
     #[test]
     fn classify_send_error_wire_rejected_with_numeric_code() {
-        let e = classify_send_error(
-            "API error 409: {\"error\":\"model_not_loaded\"}".to_string(),
-        );
+        let e = classify_send_error("API error 409: {\"error\":\"model_not_loaded\"}".to_string());
         match e {
             ComputeMarketOpError::WireRejected { status, body } => {
                 assert_eq!(status, 409);

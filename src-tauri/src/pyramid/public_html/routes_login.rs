@@ -16,20 +16,20 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use warp::Filter;
 use warp::filters::BoxedFilter;
-use warp::http::{StatusCode, header};
+use warp::http::{header, StatusCode};
 use warp::reply::Response as WarpResponse;
+use warp::Filter;
 
-use crate::pyramid::PyramidState;
 use crate::pyramid::public_html::auth::{
-    ANON_SESSION_COOKIE, WIRE_SESSION_COOKIE, PublicAuthSource, clear_wire_session_cookie,
-    client_key, csrf_nonce, issue_anon_session_cookie, issue_wire_session_cookie, read_cookie,
-    verify_csrf,
+    clear_wire_session_cookie, client_key, csrf_nonce, issue_anon_session_cookie,
+    issue_wire_session_cookie, read_cookie, verify_csrf, PublicAuthSource, ANON_SESSION_COOKIE,
+    WIRE_SESSION_COOKIE,
 };
 use crate::pyramid::public_html::rate_limit;
 use crate::pyramid::public_html::render::{esc, page_with_etag};
 use crate::pyramid::public_html::web_sessions;
+use crate::pyramid::PyramidState;
 
 /// Validate that a slug only contains characters safe for both DB lookup and
 /// for redirect Location headers / HTML attribute interpolation. Reserved
@@ -125,7 +125,10 @@ fn ensure_anon_session(headers: &warp::http::HeaderMap) -> (String, Option<Strin
 }
 
 fn supabase_creds(state: &PyramidState) -> Option<(String, String)> {
-    match (state.supabase_url.as_ref(), state.supabase_anon_key.as_ref()) {
+    match (
+        state.supabase_url.as_ref(),
+        state.supabase_anon_key.as_ref(),
+    ) {
         (Some(u), Some(k)) if !u.is_empty() && !k.is_empty() => Some((u.clone(), k.clone())),
         _ => None,
     }
@@ -308,10 +311,7 @@ async fn handle_verify_post(
         }
         Err(e) => {
             tracing::warn!("verify_otp failed: {}", e);
-            Ok(error_page(
-                &slug,
-                "Code did not verify — please try again.",
-            ))
+            Ok(error_page(&slug, "Code did not verify — please try again."))
         }
     }
 }
@@ -442,7 +442,12 @@ async fn handle_owner_login(
         web_sessions::lookup(&conn, &token).ok().flatten()
     };
     let sess = match session_opt {
-        Some(s) if s.supabase_user_id.starts_with(LOCAL_OPERATOR_SENTINEL_PREFIX) => s,
+        Some(s)
+            if s.supabase_user_id
+                .starts_with(LOCAL_OPERATOR_SENTINEL_PREFIX) =>
+        {
+            s
+        }
         _ => return Ok(error_page("_owner", "invalid or expired owner token")),
     };
     let _ = sess; // sentinel-only check; cookie value is the token itself
@@ -458,9 +463,8 @@ async fn handle_owner_login(
     *resp.status_mut() = warp::http::StatusCode::FOUND;
     resp.headers_mut().insert(
         "location",
-        warp::http::HeaderValue::from_str(&target).unwrap_or_else(|_| {
-            warp::http::HeaderValue::from_static("/p/")
-        }),
+        warp::http::HeaderValue::from_str(&target)
+            .unwrap_or_else(|_| warp::http::HeaderValue::from_static("/p/")),
     );
     if let Ok(v) = warp::http::HeaderValue::from_str(&cookie) {
         resp.headers_mut().append("set-cookie", v);

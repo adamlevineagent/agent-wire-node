@@ -113,9 +113,7 @@ pub fn generate_build_preview(
                     file_path: None,
                     message: format!(
                         "{} of {} files in directory match supported extensions ({:?})",
-                        file_count,
-                        total_entries,
-                        supported_exts,
+                        file_count, total_entries, supported_exts,
                     ),
                 });
             }
@@ -244,13 +242,9 @@ fn load_chain_step_count(chain_id: &str, chains_dir: &Path) -> (usize, bool) {
     // Try to find the chain YAML by scanning defaults/ and variants/
     let candidates = [
         chains_dir.join("defaults").join(format!("{chain_id}.yaml")),
-        chains_dir
-            .join("defaults")
-            .join(format!("{chain_id}.yml")),
+        chains_dir.join("defaults").join(format!("{chain_id}.yml")),
         chains_dir.join("variants").join(format!("{chain_id}.yaml")),
-        chains_dir
-            .join("variants")
-            .join(format!("{chain_id}.yml")),
+        chains_dir.join("variants").join(format!("{chain_id}.yml")),
     ];
 
     for candidate in &candidates {
@@ -522,10 +516,7 @@ mod tests {
         let cost = estimate_build_cost(&conn, "conversation-default", 5, 2000).unwrap();
 
         // Should use the seeded data: 0.20 per conversation × 5 files = 1.00
-        assert!(
-            cost > 0.0,
-            "Cost should be positive when seed data exists"
-        );
+        assert!(cost > 0.0, "Cost should be positive when seed data exists");
         assert!(
             (cost - 1.0).abs() < 0.01,
             "Expected cost ~1.00, got {}",

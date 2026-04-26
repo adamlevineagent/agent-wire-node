@@ -32,7 +32,13 @@ use tracing::{debug, info, warn};
 ///
 /// Consumer parsing contract: `splitn(5, ':')` — field 5 is the complete
 /// target_id which may contain internal `/` separators.
-pub fn work_item_id(slug: &str, epoch_short: &str, primitive: &str, layer: i64, target_id: &str) -> String {
+pub fn work_item_id(
+    slug: &str,
+    epoch_short: &str,
+    primitive: &str,
+    layer: i64,
+    target_id: &str,
+) -> String {
     format!("{slug}:{epoch_short}:{primitive}:{layer}:{target_id}")
 }
 
@@ -121,7 +127,7 @@ pub struct CompilationResult {
 ///   annotation_superseded → re_distill (same primitive; supersession is a stronger signal
 ///     preserved in metadata_json but coalesces with additive writes so a single parent
 ///     re-distill runs even if multiple annotations fire within the dedup window)
-fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, &'static str, &'static str)> {
+pub(crate) fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, &'static str, &'static str)> {
     // Returns (primitive, step_name, model_tier)
     match event_type {
         "file_created" => Some(("extract", "l0_extract", "stale_remote")),
@@ -138,9 +144,171 @@ fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, &'static st
         "faq_category_stale" => Some(("faq_redistill", "faq_redistill", "stale_remote")),
         "full_sweep" => Some(("extract", "full_sweep_extract", "stale_remote")),
         "annotation_written" | "annotation_superseded" => {
-            Some(("re_distill", "annotation_redistill", "stale_remote"))
+            // Phase 8-1 flip: route through the `cascade_handler` role. The
+            // bound chain (starter-cascade-judge-gated for new slugs,
+            // starter-cascade-immediate-redistill for legacy slugs) runs,
+            // and its terminal mechanical `queue_re_distill_for_target`
+            // enqueues a re_distill work item against the target ancestor.
+            // The supervisor's Phase 8-2 re_distill arm (apply_mechanical)
+            // then actually re-distills the node via execute_supersession,
+            // updating pyramid_nodes.distilled/headline/topics/build_version.
+            //
+            // Pre-Phase-8 mapping was `re_distill` + `annotation_redistill`
+            // which silently no-op'd in the supervisor default arm. That
+            // was THE original DADBEAR non-firing bug.
+            Some(("role_bound", "annotation_cascade", "stale_remote"))
         }
-        _ => None,
+        // ── Post-build accretion v5 event types ─────────────────────────────
+        // Per v5 R8: per-event-type step_names so dedup in has_active_work_item
+        // (keyed on target_id + step_name + layer) doesn't collapse
+        // semantically distinct events onto the same work_item row.
+        "annotation_reacted" => Some(("role_bound", "cascade_reacted", "stale_remote")),
+        "debate_spawned" => Some(("role_bound", "debate_spawn", "stale_remote")),
+        // v5 Phase 9c-1: debate_collapsed is emitted BY starter-debate-collapse
+        // AFTER the node has been collapsed to scaffolding. Previously mapped
+        // to `role_bound` + role_for_event("debate_collapsed") → debate_steward,
+        // which meant every collapse would have re-dispatched the steward on
+        // the same target — a wasted cycle at best (steward finds the target
+        // is now scaffolding with no collapse annotation) and a re-collapse
+        // loop at worst. Post-9c-1 the collapse chain dispatches on the
+        // `debate_collapse` ANNOTATION TYPE via the vocab handler_chain_id
+        // override (6c-B / audit 7a-gen); the EMITTED `debate_collapsed`
+        // event is observability-only. log_only keeps the chronicle row,
+        // maps it to a dedicated `debate_collapsed_log` step_name so
+        // has_active_work_item dedup stays clean, and spawns no work item.
+        "debate_collapsed" => Some(("log_only", "debate_collapsed_log", "stale_remote")),
+        // v5 Phase 9c-3-3: debate_reopened is operator-driven signal that
+        // a collapsed debate should accept new annotations again. Pure
+        // observability from the compiler's perspective — the actual
+        // effect is on `append_annotation_to_debate_node`'s cooldown
+        // check (if the latest event for the node is a debate_reopened
+        // newer than the latest debate_collapsed, the cooldown is
+        // bypassed). log_only + a dedicated step_name keeps chronicle
+        // dedup clean. `role_for_event` returns None below so the
+        // emitted event does not kick off a chain — it exists to gate
+        // the NEXT annotation append.
+        "debate_reopened" => Some(("log_only", "debate_reopened_log", "stale_remote")),
+        // v5 audit P3: gap_detected is observability-only. The actual
+        // dispatch already fired via annotation_reacted → handler_chain_id
+        // (6c-B flip), so compiling a second work item for gap_detected
+        // was a wasted compile+dispatch+no_op cycle. Now log_only —
+        // chronicle entry stays, no work item.
+        "gap_detected" => Some(("log_only", "gap_detected_log", "stale_remote")),
+        "gap_resolved" => Some(("role_bound", "oracle_gap_resolved", "stale_remote")),
+        "purpose_shifted" => Some(("role_bound", "oracle_purpose_shift", "stale_remote")),
+        "meta_layer_crystallized" => Some(("role_bound", "synthesize_meta_layer", "stale_remote")),
+        // Chronicle-only events (log_only dispatches nothing; observability hook).
+        "binding_unresolved" => Some(("log_only", "binding_unresolved_log", "stale_remote")),
+        "cascade_handler_invoked" => Some(("log_only", "cascade_invoked_log", "stale_remote")),
+        // v5 Phase 7a: emitted by emit_debate_steward_invoked at the head of
+        // the debate_steward chain; pure observability, no downstream action.
+        "debate_steward_invoked" => {
+            Some(("log_only", "debate_steward_invoked_log", "stale_remote"))
+        }
+        // v5 Phase 7 wanderer fix: every Phase 7 starter chain emits a
+        // `*_invoked` / `*_skipped` / `*_written` observation event for
+        // chronicle visibility. Those events land in dadbear_observation_events
+        // and are read back by the next compile tick. Without an explicit
+        // mapping, the compiler's unknown-event loud-hold arm (feedback_loud_deferrals)
+        // pins the cursor FOREVER on the first chain execution — stalling
+        // all subsequent compilation for that slug. All of these are pure
+        // observability and carry no downstream primitive; log_only keeps
+        // the chronicle row without spawning a work item.
+        "meta_layer_oracle_invoked" => {
+            Some(("log_only", "oracle_invoked_log", "stale_remote"))
+        }
+        "meta_layer_oracle_skipped" => {
+            Some(("log_only", "oracle_skipped_log", "stale_remote"))
+        }
+        "synthesizer_invoked" => {
+            Some(("log_only", "synthesizer_invoked_log", "stale_remote"))
+        }
+        "gap_dispatcher_invoked" => {
+            Some(("log_only", "gap_dispatcher_invoked_log", "stale_remote"))
+        }
+        "gap_dispatcher_skipped" => {
+            Some(("log_only", "gap_dispatcher_skipped_log", "stale_remote"))
+        }
+        // v5 Phase 9c-1 verifier: starter-debate-collapse emits
+        // `debate_collapse_invoked` at the head of the chain and
+        // `debate_collapse_skipped` on the non-Debate target arm.
+        // Both are pure observability — the chain has already done
+        // the work (or deliberately skipped it). Without these
+        // mappings, the compiler's unknown-event loud-hold arm
+        // (see line ~514) pins the cursor on the first chain
+        // execution and stalls all subsequent compilation for the
+        // slug. Mirror the gap_dispatcher_* pattern.
+        "debate_collapse_invoked" => {
+            Some(("log_only", "debate_collapse_invoked_log", "stale_remote"))
+        }
+        "debate_collapse_skipped" => {
+            Some(("log_only", "debate_collapse_skipped_log", "stale_remote"))
+        }
+        "judge_invoked" => {
+            Some(("log_only", "judge_invoked_log", "stale_remote"))
+        }
+        "authorize_question_invoked" => {
+            Some(("log_only", "authorize_invoked_log", "stale_remote"))
+        }
+        "accretion_invoked" => {
+            Some(("log_only", "accretion_invoked_log", "stale_remote"))
+        }
+        "accretion_written" => {
+            Some(("log_only", "accretion_written_log", "stale_remote"))
+        }
+        "sweep_invoked" => {
+            Some(("log_only", "sweep_invoked_log", "stale_remote"))
+        }
+        "sweep_stale_failed_counted" => {
+            Some(("log_only", "sweep_stale_counted_log", "stale_remote"))
+        }
+        "sweep_vocab_reindexed" => {
+            Some(("log_only", "sweep_vocab_reindexed_log", "stale_remote"))
+        }
+        // v5 Phase 8-2: supervisor emits node_re_distilled after
+        // execute_supersession successfully updates pyramid_nodes for a
+        // re_distill work item. Pure observability — the mutation has
+        // already happened on the node row; the event is the chronicle
+        // breadcrumb that closes the annotation → cascade → re_distill
+        // loop for operators. No downstream work.
+        "node_re_distilled" => {
+            Some(("log_only", "node_redistilled_log", "stale_remote"))
+        }
+        // Phase 9b-1: pyramid_scheduler tick events. Each is role_bound
+        // so the slug's configured role binding (default: accretion_handler
+        // → starter-accretion-handler, sweep → starter-sweep) dispatches.
+        // Operators can swap the chain via role_binding supersession per
+        // slug without touching the scheduler.
+        "accretion_tick" => Some(("role_bound", "accretion_tick_dispatch", "stale_remote")),
+        "sweep_tick" => Some(("role_bound", "sweep_tick_dispatch", "stale_remote")),
+        // Phase 9b-2: annotation-volume threshold crossing. Immediate
+        // dispatch path — same role as `accretion_tick` but with richer
+        // metadata (annotation_id, count_since_cursor) so the handler
+        // chain can key off the trigger if desired. Distinct step_name
+        // so has_active_work_item dedup doesn't collapse a threshold-hit
+        // onto a coincident tick-initiated row.
+        "accretion_threshold_hit" => {
+            Some(("role_bound", "accretion_threshold_dispatch", "stale_remote"))
+        }
+        unknown => {
+            // Per v5 R5 loud-raise discipline: opt-in strict mode for
+            // production. Default warn-and-skip preserves backward compat
+            // for any pre-existing emitter outside the known vocabulary.
+            if std::env::var("STRICT_UNKNOWN_EVENTS").is_ok() {
+                panic!(
+                    "map_event_to_primitive: unknown event_type '{}' — \
+                     must be added to the map before emission. Unset \
+                     STRICT_UNKNOWN_EVENTS to warn-skip instead.",
+                    unknown
+                );
+            }
+            tracing::warn!(
+                event_type = %unknown,
+                "map_event_to_primitive: unknown event_type — skipping. \
+                 Set STRICT_UNKNOWN_EVENTS=1 to raise instead."
+            );
+            None
+        }
     }
 }
 
@@ -152,19 +320,22 @@ fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, &'static st
 /// For rename events, target_id uses rename/{old}/{new} composite format.
 fn derive_target_id(event: &ObservationEvent) -> String {
     match event.event_type.as_str() {
-        "file_created" | "file_modified" | "file_deleted" | "full_sweep" => {
-            event.file_path.clone().unwrap_or_else(|| "unknown".to_string())
-        }
+        "file_created" | "file_modified" | "file_deleted" | "full_sweep" => event
+            .file_path
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
         "file_renamed" => {
             // metadata_json should contain the rename pair info
             // Format: rename/{old_path}/{new_path}
             if let Some(ref meta) = event.metadata_json {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(meta) {
-                    let old = v.get("old_path")
+                    let old = v
+                        .get("old_path")
                         .and_then(|v| v.as_str())
                         .or_else(|| v.get("source_path").and_then(|v| v.as_str()))
                         .unwrap_or("unknown");
-                    let new = v.get("new_path")
+                    let new = v
+                        .get("new_path")
                         .and_then(|v| v.as_str())
                         .or_else(|| v.get("file_path").and_then(|v| v.as_str()))
                         .unwrap_or("unknown");
@@ -172,7 +343,13 @@ fn derive_target_id(event: &ObservationEvent) -> String {
                 }
             }
             // Fallback: use file_path
-            format!("rename/{}", event.file_path.clone().unwrap_or_else(|| "unknown".to_string()))
+            format!(
+                "rename/{}",
+                event
+                    .file_path
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string())
+            )
         }
         "edge_stale" => {
             // target_node_id for edge events encodes both endpoints
@@ -198,11 +375,12 @@ fn derive_target_id(event: &ObservationEvent) -> String {
             }
         }
         // cascade_stale, targeted_stale, evidence_growth, vine_stale, node_stale, faq_category_stale
-        _ => {
-            event.target_node_id.clone().unwrap_or_else(|| {
-                event.file_path.clone().unwrap_or_else(|| "unknown".to_string())
-            })
-        }
+        _ => event.target_node_id.clone().unwrap_or_else(|| {
+            event
+                .file_path
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string())
+        }),
     }
 }
 
@@ -215,9 +393,8 @@ fn derive_layer(event: &ObservationEvent) -> i64 {
     match event.event_type.as_str() {
         "file_created" | "file_modified" | "file_deleted" | "file_renamed" | "full_sweep" => 0,
         "targeted_stale" | "evidence_growth" => 0,
-        "cascade_stale" | "edge_stale" | "vine_stale" | "node_stale" | "faq_category_stale" | "connection_check" => {
-            event.layer.unwrap_or(0)
-        }
+        "cascade_stale" | "edge_stale" | "vine_stale" | "node_stale" | "faq_category_stale"
+        | "connection_check" => event.layer.unwrap_or(0),
         "annotation_written" | "annotation_superseded" => event.layer.unwrap_or(0),
         _ => event.layer.unwrap_or(0),
     }
@@ -297,7 +474,13 @@ pub fn get_or_create_epoch(
          (slug, epoch_id, recipe_contribution_id, norms_contribution_id,
           last_compiled_observation_id, epoch_start_observation_id, epoch_started_at)
          VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)",
-        params![slug, new_epoch_id, recipe_contribution_id, norms_contribution_id, now],
+        params![
+            slug,
+            new_epoch_id,
+            recipe_contribution_id,
+            norms_contribution_id,
+            now
+        ],
     )
     .with_context(|| format!("Failed to create new epoch for slug '{slug}'"))?;
 
@@ -355,14 +538,21 @@ pub fn compile_observations(
         });
     }
 
-    let new_cursor = events.iter().map(|e| e.id).max().unwrap_or(last_compiled_observation_id);
+    // v5 R4 cursor-gating fix: max of all-read events is dangerous because
+    // a failed role-binding resolution (role_bound events) can leave the
+    // event permanently skipped if cursor jumps past it. Compute cursor from
+    // successfully-processed event ids only. `max_event_id` here is used for
+    // the batch id (so retries stay deterministic across resumes); the real
+    // `new_cursor` is computed further down from `compiled_event_ids`.
+    let max_event_id = events.iter().map(|e| e.id).max().unwrap_or(last_compiled_observation_id);
     let ep_short = epoch_short(epoch_id);
-    let bid = batch_id(slug, &ep_short, new_cursor);
+    let bid = batch_id(slug, &ep_short, max_event_id);
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     let mut items_compiled = 0usize;
     let mut deps_created = 0usize;
     let mut deduped = 0usize;
+    let mut compiled_event_ids: Vec<i64> = Vec::new();
 
     // ── (b-g) Process each observation event ─────────────────────────────
     for event in &events {
@@ -370,14 +560,209 @@ pub fn compile_observations(
         let (primitive, step_name, model_tier) = match map_event_to_primitive(&event.event_type) {
             Some(mapping) => mapping,
             None => {
+                // Phase 3 verifier fix: previously this arm advanced the
+                // cursor (silent-skip-and-advance). Per feedback_loud_deferrals
+                // unknown event types are now held in the read-pool: we warn
+                // every tick until an operator either teaches the compiler
+                // the new event_type or supersedes/deletes the rogue row.
+                // Silent-advance used to lose events permanently.
+                //
+                // STRICT_UNKNOWN_EVENTS=1 still escalates to a hard panic
+                // inside map_event_to_primitive, for operators who prefer
+                // the loop die over spam logs. The default now loud-holds
+                // instead of loud-losing.
                 warn!(
                     slug = %slug,
                     event_type = %event.event_type,
                     event_id = event.id,
-                    "Unknown observation event type, skipping"
+                    "Unknown observation event type — holding cursor so event is not lost; \
+                     update map_event_to_primitive or supersede the row"
                 );
                 continue;
             }
+        };
+
+        // v5 Phase 3: for role_bound events, resolve the binding up front
+        // and capture the handler chain id. On resolution failure, we do
+        // NOT advance the cursor past this event so the next tick retries.
+        //
+        // v5 Phase 7a: annotation_reacted is routed via the TRIGGERING
+        // VOCAB ENTRY's handler_chain_id (stamped into the event's
+        // metadata_json by `process_annotation_hook` in 6c-B) rather than
+        // via role_for_event → resolve_binding.
+        //
+        // v5 audit 7a-gen: generalized — ANY role_bound event whose
+        // metadata carries a non-empty `handler_chain_id` takes the
+        // override path (the vocab-supplied handler wins over
+        // role_for_event). Before this audit the condition was hardcoded
+        // to `event.event_type == "annotation_reacted"`, which forced a
+        // code deploy every time a new role_bound event type wanted
+        // vocab-driven dispatch. Post-audit, new role_bound emitters
+        // just stamp `handler_chain_id` into their metadata and they
+        // route via the override without touching the compiler.
+        //
+        // Safety audit (per feedback_architectural_lens): grepped every
+        // `handler_chain_id` write site in observation-event metadata —
+        // (1) process_annotation_hook emits annotation_reacted
+        //     (intentional; this IS the generalized path);
+        // (2) emit_vocabulary_event_with_reason emits vocabulary_published
+        //     and vocabulary_superseded to the `__global__` slug. Those
+        //     event types are NOT in map_event_to_primitive, so they
+        //     never reach this role_bound branch regardless of their
+        //     metadata shape;
+        // (3) two test helpers in db.rs that mirror (1) for test driving.
+        // No accidental `handler_chain_id` metadata fields exist today,
+        // so the generalization is safe.
+        //
+        // Missing metadata on an event type that explicitly relies on
+        // the override path (today: annotation_reacted) is a loud raise
+        // per feedback_loud_deferrals: process_annotation_hook
+        // unconditionally stamps `handler_chain_id` on every
+        // annotation_reacted event, so an event without it is either a
+        // direct-DB write bypassing the hook or a downgrade bug. Cursor
+        // holds on the event so the operator sees the stuck row.
+        //
+        // For event types that DON'T depend on the override (e.g.
+        // debate_spawned, gap_resolved), missing handler_chain_id is
+        // expected — they fall through to role_for_event → resolve_binding.
+        let resolved_chain_id: Option<String> = if primitive == "role_bound" {
+            let meta_handler: Option<String> = event
+                .metadata_json
+                .as_deref()
+                .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                .and_then(|v| {
+                    v.get("handler_chain_id")
+                        .and_then(|h| h.as_str())
+                        .filter(|h| !h.is_empty())
+                        .map(String::from)
+                });
+
+            // Event types that MUST have handler_chain_id (vocab-driven
+            // dispatch is load-bearing): annotation_reacted today.
+            // Missing metadata on these is a loud-hold.
+            const METADATA_HANDLER_REQUIRED: &[&str] = &["annotation_reacted"];
+
+            if let Some(handler) = meta_handler {
+                Some(handler)
+            } else if METADATA_HANDLER_REQUIRED.contains(&event.event_type.as_str()) {
+                warn!(
+                    slug = %slug,
+                    event_type = %event.event_type,
+                    event_id = event.id,
+                    "{} missing handler_chain_id in metadata — \
+                     process_annotation_hook should have stamped it. Cursor held; \
+                     fix the event row or republish the annotation's vocab entry.",
+                    event.event_type,
+                );
+                // Surface once into the chronicle, same loud-hold
+                // posture the role-binding arm below uses.
+                let source_id_fragment = format!(r#""source_event_id":{}"#, event.id);
+                let already_emitted: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM dadbear_observation_events
+                             WHERE slug = ?1
+                               AND event_type = 'binding_unresolved'
+                               AND metadata_json LIKE ?2
+                         )",
+                        params![slug, format!("%{source_id_fragment}%")],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap_or(false);
+                if !already_emitted {
+                    let _ = crate::pyramid::observation_events::write_observation_event(
+                        conn,
+                        slug,
+                        "dadbear",
+                        "binding_unresolved",
+                        None, None, None, None, None, None,
+                        Some(&format!(
+                            r#"{{"reason":"{}_missing_handler_chain_id","event_type":"{}","source_event_id":{}}}"#,
+                            event.event_type, event.event_type, event.id
+                        )),
+                    );
+                }
+                // Cursor holds.
+                continue;
+            } else {
+            let role_name = match role_for_event(&event.event_type) {
+                Some(r) => r,
+                None => {
+                    warn!(
+                        slug = %slug,
+                        event_type = %event.event_type,
+                        event_id = event.id,
+                        "role_bound event has no role mapping — misconfigured event vocabulary"
+                    );
+                    // Cursor does NOT advance — retry next tick after fix.
+                    continue;
+                }
+            };
+            match crate::pyramid::role_binding::resolve_binding(conn, slug, role_name) {
+                Ok(binding) => Some(binding.handler_chain_id),
+                Err(e) => {
+                    warn!(
+                        slug = %slug,
+                        event_type = %event.event_type,
+                        role = %role_name,
+                        event_id = event.id,
+                        error = %e,
+                        "role_bound resolution failed — cursor held, retry next tick"
+                    );
+                    // Emit chronicle entry for observability — but at most
+                    // once per (source_event_id) pair. Without this guard,
+                    // a stuck cursor (operator hasn't fixed the missing
+                    // role binding) would re-emit `binding_unresolved` for
+                    // the same source event on every compile tick.
+                    //
+                    // At 5s tick interval that's 17,280 rows/day per stuck
+                    // role — retention only prunes below the min cursor,
+                    // which is itself held by the same unresolved binding,
+                    // so the rows accumulate indefinitely in
+                    // `dadbear_observation_events`. One row per unresolved
+                    // (source_event_id) is enough for an operator to see
+                    // the drift in the chronicle; subsequent ticks still
+                    // log a `warn!` line so the issue is visible in the
+                    // running logs. Wanderer fix Phase 3.
+                    let source_id_fragment =
+                        format!(r#""source_event_id":{}"#, event.id);
+                    let already_emitted: bool = conn
+                        .query_row(
+                            "SELECT EXISTS(
+                                SELECT 1 FROM dadbear_observation_events
+                                 WHERE slug = ?1
+                                   AND event_type = 'binding_unresolved'
+                                   AND metadata_json LIKE ?2
+                             )",
+                            params![slug, format!("%{source_id_fragment}%")],
+                            |row| row.get::<_, bool>(0),
+                        )
+                        .unwrap_or(false);
+                    if !already_emitted {
+                        let _ = crate::pyramid::observation_events::write_observation_event(
+                            conn,
+                            slug,
+                            "dadbear",
+                            "binding_unresolved",
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(&format!(
+                                r#"{{"role":"{}","event_type":"{}","source_event_id":{}}}"#,
+                                role_name, event.event_type, event.id
+                            )),
+                        );
+                    }
+                    // Cursor does NOT advance — retry next tick.
+                    continue;
+                }
+            }
+            }
+        } else {
+            None
         };
 
         let target_id = derive_target_id(event);
@@ -393,6 +778,9 @@ pub fn compile_observations(
                 layer = layer,
                 "Dedup: active work item already exists, skipping"
             );
+            // Dedup-skipped events should still advance the cursor —
+            // they're semantic duplicates that an earlier tick handled.
+            compiled_event_ids.push(event.id);
             continue;
         }
 
@@ -423,8 +811,8 @@ pub fn compile_observations(
         );
 
         // (f) Create work item row in 'compiled' state
-        let observation_event_ids = serde_json::to_string(&[event.id])
-            .unwrap_or_else(|_| format!("[{}]", event.id));
+        let observation_event_ids =
+            serde_json::to_string(&[event.id]).unwrap_or_else(|_| format!("[{}]", event.id));
 
         let inserted = insert_work_item(
             conn,
@@ -447,10 +835,26 @@ pub fn compile_observations(
         if !inserted {
             // Work item ID already exists (idempotent — semantic path collision)
             deduped += 1;
+            // Dedup via semantic path collision also counts as processed.
+            compiled_event_ids.push(event.id);
             continue;
         }
 
         items_compiled += 1;
+        compiled_event_ids.push(event.id);
+
+        // v5 Phase 3: for role_bound dispatch, stamp the resolved chain id
+        // onto the work_item row so the supervisor's dispatch arm can load
+        // and invoke the chain without re-resolving the binding.
+        if let Some(chain_id) = &resolved_chain_id {
+            conn.execute(
+                "UPDATE dadbear_work_items SET resolved_chain_id = ?1 WHERE id = ?2",
+                params![chain_id, &wi_id],
+            )
+            .with_context(|| format!(
+                "Failed to stamp resolved_chain_id on work_item '{wi_id}'"
+            ))?;
+        }
 
         // (g) Create dependency edges for cross-layer items.
         // The cascade observation's metadata_json may carry a triggering_work_item_id
@@ -464,14 +868,49 @@ pub fn compile_observations(
                     .and_then(|v| v.get("triggering_work_item_id")?.as_str().map(String::from))
             });
             let created = create_cross_layer_deps(
-                conn, slug, &wi_id, &target_id, layer, &ep_short,
+                conn,
+                slug,
+                &wi_id,
+                &target_id,
+                layer,
+                &ep_short,
                 trigger_id.as_deref(),
             )?;
             deps_created += created;
         }
     }
 
-    // ── Update compilation cursor ────────────────────────────────────────
+    // ── v5 R4 cursor-gating (Phase 3 verifier refinement): the cursor must
+    // advance only to the largest contiguous-prefix id. `max(compiled_ids)`
+    // alone was insufficient — it silently skipped over a held event when
+    // subsequent events still succeeded, because the held id was absent
+    // from `compiled_event_ids` while larger successful ids were present.
+    // We compute the smallest held id, then take the largest compiled id
+    // strictly less than it. Held events (and everything after them) stay
+    // in the read-pool for next-tick retry — preserving the Wave 3 R4
+    // contract that a failed resolution never loses in-flight events.
+    let compiled_set: std::collections::HashSet<i64> =
+        compiled_event_ids.iter().copied().collect();
+    let min_held_id: Option<i64> = events
+        .iter()
+        .map(|e| e.id)
+        .filter(|id| !compiled_set.contains(id))
+        .min();
+    let new_cursor = if let Some(first_held) = min_held_id {
+        compiled_event_ids
+            .iter()
+            .copied()
+            .filter(|id| *id < first_held)
+            .max()
+            .unwrap_or(last_compiled_observation_id)
+    } else {
+        compiled_event_ids
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(last_compiled_observation_id)
+    };
+
     conn.execute(
         "UPDATE dadbear_compilation_state SET last_compiled_observation_id = ?1 WHERE slug = ?2",
         params![new_cursor, slug],
@@ -486,6 +925,7 @@ pub fn compile_observations(
             deps_created = deps_created,
             deduped = deduped,
             cursor = new_cursor,
+            skipped_for_retry = events.len() - compiled_event_ids.len(),
             "Compilation pass complete"
         );
     }
@@ -496,6 +936,80 @@ pub fn compile_observations(
         deps_created,
         deduped,
     })
+}
+
+/// v5 Phase 3: map event_type to the role that handles role_bound dispatch.
+///
+/// Returns None if the event_type is not a role_bound event (caller should
+/// handle via map_event_to_primitive's primitive string instead).
+///
+/// Post-build accretion v5 audit (P3) decision on `gap_detected`:
+///   The `gap` annotation type's vocab entry (Phase 7c addition) nominates
+///   `starter-gap-dispatcher` as its handler_chain_id, so the FIRST
+///   dispatch on a `gap` annotation already routes via the
+///   annotation_reacted → handler_chain_id path (6c-B flip) — not via
+///   this map. The `gap_detected` event is emitted BY the gap_dispatcher
+///   chain AFTER the Gap node is materialized, purely as an
+///   observability/chronicle marker.
+///
+///   Earlier Phase 7c kept `gap_detected → gap_dispatcher` for
+///   "event-map symmetry". The audit found that this creates a wasted
+///   compile+dispatch+no_op cycle on every gap-shape upgrade: the second
+///   dispatch finds the target already Gap-shaped AND no annotation_id
+///   in the input, so `materialize_gap_node` emits
+///   `gap_dispatcher_skipped` and the work item CAS-completes. Result:
+///   one spurious chronicle event + one wasted dispatch per gap, and an
+///   annotation_reacted → gap_detected → gap_dispatcher cycle where the
+///   second step is entirely redundant with the first.
+///
+///   Fix: map `gap_detected` to None (log_only). The chronicle event
+///   still fires from the originating chain (audit trail preserved);
+///   the second dispatch is removed entirely. If a caller directly
+///   invokes the gap_dispatcher chain outside the annotation_reacted
+///   path, `gap_dispatcher_skipped` can still fire — but it shouldn't
+///   be the norm, and if it becomes one the loud deferral is visible.
+///   Phase 8's LLM-driven gap enrichment (should it want reentry on
+///   gap_detected) will route via a chain-level subscription, not via
+///   this event-to-role map — the map is for role_bound dispatch, not
+///   for every event that needs an effect.
+pub(crate) fn role_for_event(event_type: &str) -> Option<&'static str> {
+    match event_type {
+        // Phase 8-1: annotation_written + annotation_superseded now route
+        // via the cascade_handler role (previously mapped to `re_distill`
+        // primitive which silently no-op'd in the supervisor — the
+        // original DADBEAR non-firing bug). The bound chain runs; its
+        // terminal queue_re_distill_for_target step enqueues a real
+        // re_distill work item the Phase 8-2 supervisor arm applies.
+        "annotation_written" | "annotation_superseded" => Some("cascade_handler"),
+        "annotation_reacted" => Some("cascade_handler"),
+        // v5 Phase 9c-1: debate_collapsed is observability-only post-collapse
+        // — the dispatch already fired via annotation_reacted →
+        // handler_chain_id=starter-debate-collapse (the `debate_collapse`
+        // ANNOTATION TYPE, not the emitted event). Returning None here
+        // prevents the emitted event from triggering another collapse
+        // against a node that has already been collapsed to scaffolding.
+        "debate_spawned" => Some("debate_steward"),
+        "debate_collapsed" => None,
+        // v5 Phase 9c-3-3: debate_reopened is observability-only. The
+        // emitted event is a gate for the NEXT annotation append's
+        // cooldown check — it does not itself dispatch a chain. If an
+        // operator wants the reopened debate to re-engage the steward,
+        // they POST a fresh steel_man/red_team annotation, which fires
+        // the standard debate_steward path.
+        "debate_reopened" => None,
+        // v5 audit P3: gap_detected is observability-only — the actual
+        // dispatch already fired via annotation_reacted → handler_chain_id.
+        "gap_detected" => None,
+        "gap_resolved" | "purpose_shifted" => Some("meta_layer_oracle"),
+        "meta_layer_crystallized" => Some("synthesizer"),
+        // Phase 9b-1/9b-2: scheduler tick + volume-threshold trigger
+        // fan out to the slug's `accretion_handler` / `sweep` role
+        // bindings. The slug can supersede the binding to swap
+        // chains without touching this map.
+        "accretion_tick" | "accretion_threshold_hit" => Some("accretion_handler"),
+        "sweep_tick" => Some("sweep"),
+        _ => None,
+    }
 }
 
 // ── DB helpers ────────────────────────────────────────────────────────────────
@@ -640,11 +1154,13 @@ fn create_cross_layer_deps(
     };
 
     // Verify the triggering item exists before creating the edge
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM dadbear_work_items WHERE id = ?1)",
-        params![trigger_id],
-        |row| row.get(0),
-    ).unwrap_or(false);
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM dadbear_work_items WHERE id = ?1)",
+            params![trigger_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
 
     if !exists {
         debug!(
@@ -687,20 +1203,10 @@ pub fn run_compilation_for_slug(
     recipe_contribution_id: Option<&str>,
     norms_contribution_id: Option<&str>,
 ) -> Result<CompilationResult> {
-    let (epoch_id, last_cursor) = get_or_create_epoch(
-        conn,
-        slug,
-        recipe_contribution_id,
-        norms_contribution_id,
-    )?;
+    let (epoch_id, last_cursor) =
+        get_or_create_epoch(conn, slug, recipe_contribution_id, norms_contribution_id)?;
 
-    compile_observations(
-        conn,
-        slug,
-        &epoch_id,
-        recipe_contribution_id,
-        last_cursor,
-    )
+    compile_observations(conn, slug, &epoch_id, recipe_contribution_id, last_cursor)
 }
 
 #[cfg(test)]
@@ -742,7 +1248,10 @@ mod tests {
 
     #[test]
     fn test_contribution_short() {
-        assert_eq!(contribution_short(Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890")), "a1b2c3d4");
+        assert_eq!(
+            contribution_short(Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890")),
+            "a1b2c3d4"
+        );
         assert_eq!(contribution_short(Some("abcdef01")), "abcdef01");
         assert_eq!(contribution_short(None), "00000000");
     }
@@ -766,20 +1275,25 @@ mod tests {
     }
 
     #[test]
-    fn test_annotation_events_map_to_redistill() {
-        // annotation_written and annotation_superseded both map to the same
-        // (primitive, step_name) so they coalesce on the has_active_work_item
-        // dedup. The superseded variant is distinguishable in the event row's
-        // metadata_json, not in the work item.
+    fn test_annotation_events_route_to_cascade_handler_role() {
+        // Phase 8-1 flip: annotation_written and annotation_superseded now
+        // compile to `role_bound` so the cascade_handler chain runs instead
+        // of the legacy silent `re_distill` primitive. Both events share
+        // the same step_name so they coalesce on has_active_work_item.
         let (prim, step, tier) = map_event_to_primitive("annotation_written").unwrap();
-        assert_eq!(prim, "re_distill");
-        assert_eq!(step, "annotation_redistill");
+        assert_eq!(prim, "role_bound");
+        assert_eq!(step, "annotation_cascade");
         assert_eq!(tier, "stale_remote");
 
         let (prim2, step2, tier2) = map_event_to_primitive("annotation_superseded").unwrap();
         assert_eq!(prim2, prim);
         assert_eq!(step2, step);
         assert_eq!(tier2, tier);
+
+        // role_for_event must now hand these events to cascade_handler so
+        // the supervisor resolves the slug's binding and invokes the chain.
+        assert_eq!(role_for_event("annotation_written"), Some("cascade_handler"));
+        assert_eq!(role_for_event("annotation_superseded"), Some("cascade_handler"));
     }
 
     #[test]

@@ -25,6 +25,8 @@ const CATEGORY_LABELS: Record<string, string> = {
     skip: 'SKP',
     cost: 'CST',
     llm: 'LLM',
+    retry: 'RTY',
+    error: 'ERR',
 };
 
 // ── Relative timestamp formatting ───────────────────────────────────
@@ -48,7 +50,10 @@ interface ChronicleProps {
     onArtifactClick?: (nodeId: string) => void;
     /** Close/dismiss the chronicle overlay. */
     onClose?: () => void;
-    /** When false (default), hide mechanical ops (cache hits, step starts).
+    /** Active builds should show lifecycle/background rows, because those
+     *  rows are the only honest signal while a long step is in flight. */
+    isBuilding?: boolean;
+    /** When false (default), hide background ops (cache hits, step starts).
      *  Driven by viz config `chronicle.show_mechanical_ops`. */
     showMechanicalOps?: boolean;
     /** When true (default), decision entries start expanded.
@@ -64,6 +69,7 @@ export function Chronicle({
     generation,
     onArtifactClick,
     onClose,
+    isBuilding = false,
     showMechanicalOps = false,
     autoExpandDecisions = true,
 }: ChronicleProps) {
@@ -74,7 +80,7 @@ export function Chronicle({
     // during extraction/webbing). Filter only in post-build review mode.
     const hasAnyEntries = entries.length > 0;
     const allDecision = entries.filter((e) => e.kind === 'decision');
-    const effectiveShowMechanical = showMechanicalOps || (hasAnyEntries && allDecision.length === 0);
+    const effectiveShowMechanical = isBuilding || showMechanicalOps || (hasAnyEntries && allDecision.length === 0);
     const visibleEntries = effectiveShowMechanical
         ? entries
         : allDecision;
@@ -113,7 +119,7 @@ export function Chronicle({
                 <span className="ps-chronicle-title">Chronicle</span>
                 {hiddenCount > 0 && (
                     <span className="ps-chronicle-hidden-count">
-                        {hiddenCount} mechanical hidden
+                        {hiddenCount} background hidden
                     </span>
                 )}
                 {onClose && (
@@ -135,7 +141,7 @@ export function Chronicle({
                 )}
                 {reversedEntries.length === 0 && hiddenCount > 0 && (
                     <div className="ps-chronicle-empty">
-                        {hiddenCount} mechanical event{hiddenCount !== 1 ? 's' : ''} hidden
+                        {hiddenCount} background event{hiddenCount !== 1 ? 's' : ''} hidden
                     </div>
                 )}
                 {reversedEntries.map((entry) => {

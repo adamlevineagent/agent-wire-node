@@ -15,8 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::pyramid::config_contributions::{
-    create_config_contribution_with_metadata, load_contribution_by_id,
-    sync_config_to_operational,
+    create_config_contribution_with_metadata, load_contribution_by_id, sync_config_to_operational,
 };
 use crate::pyramid::credentials::{CredentialStore, SharedCredentialStore};
 use crate::pyramid::event_bus::BuildEventBus;
@@ -51,6 +50,16 @@ pub enum PullError {
     EmptyPayload,
     #[error("pulled contribution missing schema_type")]
     MissingSchemaType,
+    /// Phase 0a-1 commit 5: unique-index contention on
+    /// `uq_config_contrib_active` during pull commit. A concurrent
+    /// local supersession beat the pull's INSERT. Caller can retry
+    /// (re-resolve the prior active and attempt again) rather than
+    /// surface a generic error to the operator.
+    #[error("supersession conflict for schema_type={schema_type} slug={slug:?}: concurrent writer landed first")]
+    SupersessionConflict {
+        schema_type: String,
+        slug: Option<String>,
+    },
     #[error("database error: {0}")]
     DbError(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -96,7 +105,10 @@ pub fn credential_safety_gate(
 /// base, then overrides with Wire-provided fields. The maturity is
 /// reset to `Draft` so the user reviews the pulled contribution before
 /// it can be re-published.
-fn build_metadata_from_pulled(full: &WireContributionFull, slug: Option<&str>) -> WireNativeMetadata {
+fn build_metadata_from_pulled(
+    full: &WireContributionFull,
+    slug: Option<&str>,
+) -> WireNativeMetadata {
     let schema_type = full.schema_type.as_deref().unwrap_or("unknown");
     let mut metadata = default_wire_native_metadata(schema_type, slug);
     metadata.maturity = WireMaturity::Draft;
@@ -181,12 +193,20 @@ pub async fn pull_wire_contribution(
     let triggering_note = if options.activate {
         format!(
             "Pulled from Wire ({})",
-            options.latest_wire_contribution_id.chars().take(8).collect::<String>()
+            options
+                .latest_wire_contribution_id
+                .chars()
+                .take(8)
+                .collect::<String>()
         )
     } else {
         format!(
             "Pulled from Wire for review ({})",
-            options.latest_wire_contribution_id.chars().take(8).collect::<String>()
+            options
+                .latest_wire_contribution_id
+                .chars()
+                .take(8)
+                .collect::<String>()
         )
     };
 
@@ -346,7 +366,10 @@ fn commit_pulled_active(
         .to_json()
         .map_err(|e| PullError::Other(anyhow!("serialize metadata: {e}")))?;
 
-    let tx = conn.transaction()?;
+    // Phase 0a-1 commit 5 / §2.16.1: BEGIN IMMEDIATE so Wire-side
+    // pulls serialize on write intent against concurrent local
+    // supersessions.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
     // Resolve the current active row INSIDE the transaction. Same
     // predicate as `load_active_config_contribution`. Holding the
@@ -377,40 +400,59 @@ fn commit_pulled_active(
     };
 
     let new_id = uuid::Uuid::new_v4().to_string();
-    tx.execute(
-        "INSERT INTO pyramid_config_contributions (
-            contribution_id, slug, schema_type, yaml_content,
-            wire_native_metadata_json, wire_publication_state_json,
-            supersedes_id, superseded_by_id, triggering_note,
-            status, source, wire_contribution_id, created_by, accepted_at
-         ) VALUES (
-            ?1, ?2, ?3, ?4,
-            ?5, '{}',
-            ?6, NULL, ?7,
-            'active', 'wire', ?8, 'wire-pull', datetime('now')
-         )",
-        rusqlite::params![
-            new_id,
-            slug,
-            schema_type,
-            new_yaml_content,
-            metadata_json,
-            prior_active_id,
-            triggering_note,
-            wire_contribution_id,
-        ],
-    )?;
 
+    // Phase 0a-1 commit 5: flip prior to superseded BEFORE inserting
+    // the new active row so the `uq_config_contrib_active` unique
+    // index never sees two active rows for the same (schema_type,
+    // slug). The predicate includes the `status='active'` guard so
+    // a re-run from a retry path is a no-op rather than clobbering
+    // an already-superseded row.
     if let Some(prior_id) = &prior_active_id {
-        // Flip the prior to superseded. Predicate includes the
-        // `status='active'` guard so a re-run from a retry path is a
-        // no-op rather than clobbering an already-superseded row.
         tx.execute(
             "UPDATE pyramid_config_contributions
-             SET status = 'superseded', superseded_by_id = ?1
-             WHERE contribution_id = ?2
+             SET status = 'superseded'
+             WHERE contribution_id = ?1
                AND status = 'active'
                AND superseded_by_id IS NULL",
+            rusqlite::params![prior_id],
+        )?;
+    }
+
+    crate::pyramid::config_contributions::write_contribution_envelope(
+        &tx,
+        crate::pyramid::config_contributions::ContributionEnvelopeInput {
+            contribution_id: new_id.clone(),
+            slug: slug.map(|s| s.to_string()),
+            schema_type: schema_type.to_string(),
+            body: new_yaml_content.to_string(),
+            wire_native_metadata_json: Some(metadata_json),
+            supersedes_id: prior_active_id.clone(),
+            triggering_note: Some(triggering_note.to_string()),
+            status: "active".to_string(),
+            source: "wire".to_string(),
+            wire_contribution_id: Some(wire_contribution_id.to_string()),
+            created_by: Some("wire-pull".to_string()),
+            accepted_at: crate::pyramid::config_contributions::AcceptedAt::Now,
+            needs_migration: None,
+            write_mode: crate::pyramid::config_contributions::WriteMode::default(),
+        },
+        crate::pyramid::config_contributions::TransactionMode::JoinAmbient,
+    )
+    .map_err(|e| match e {
+        crate::pyramid::config_contributions::ContributionWriterError::SupersessionConflict {
+            schema_type,
+            slug,
+        } => PullError::SupersessionConflict { schema_type, slug },
+        other => PullError::Other(anyhow!("write_contribution_envelope: {other}")),
+    })?;
+
+    if let Some(prior_id) = &prior_active_id {
+        // Back-fill forward pointer after the INSERT so the
+        // `supersedes_id`/`superseded_by_id` chain is symmetric.
+        tx.execute(
+            "UPDATE pyramid_config_contributions
+             SET superseded_by_id = ?1
+             WHERE contribution_id = ?2",
             rusqlite::params![new_id, prior_id],
         )?;
     }
@@ -452,7 +494,8 @@ mod phase14_tests {
     #[test]
     fn test_credential_safety_gate_rejects_missing_credentials() {
         let (_tmp, store) = make_store_with(&[("DEFINED_VAR", "value")]);
-        let yaml = "schema_type: custom_prompts\napi_key: ${MISSING_VAR}\nanother: ${DEFINED_VAR}\n";
+        let yaml =
+            "schema_type: custom_prompts\napi_key: ${MISSING_VAR}\nanother: ${DEFINED_VAR}\n";
         let result = credential_safety_gate(yaml, &store);
         match result {
             Err(PullError::MissingCredentials(missing)) => {
@@ -505,11 +548,7 @@ mod phase14_tests {
         id
     }
 
-    fn count_active_rows(
-        conn: &Connection,
-        schema_type: &str,
-        slug: Option<&str>,
-    ) -> i64 {
+    fn count_active_rows(conn: &Connection, schema_type: &str, slug: Option<&str>) -> i64 {
         if let Some(slug_val) = slug {
             conn.query_row(
                 "SELECT COUNT(*) FROM pyramid_config_contributions
@@ -781,7 +820,10 @@ mod phase14_tests {
         // Global is still active.
         assert_eq!(count_active_rows(&conn, "custom_prompts", None), 1);
         // Slug-scoped is also active.
-        assert_eq!(count_active_rows(&conn, "custom_prompts", Some("my-slug")), 1);
+        assert_eq!(
+            count_active_rows(&conn, "custom_prompts", Some("my-slug")),
+            1
+        );
 
         // Slug row has no supersedes_id — it's a fresh insert in the
         // slug scope, not a supersession of the global row.

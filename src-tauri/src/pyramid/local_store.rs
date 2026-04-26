@@ -1,7 +1,7 @@
 //! Local storage for build metadata — tracks build progress, completion, and quality.
 
-use anyhow::Result;
-use rusqlite::Connection;
+use anyhow::{anyhow, Result};
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
 /// Metadata for a single pyramid build.
@@ -79,6 +79,43 @@ pub fn complete_build(
     build_id: &str,
     quality_score: Option<f64>,
 ) -> Result<()> {
+    complete_build_inner(conn, slug, build_id, quality_score, false)
+}
+
+/// Mark a build as successfully completed even when it intentionally
+/// processed an empty corpus. Regular callers should use `complete_build`.
+#[allow(dead_code)]
+pub fn complete_empty_build(
+    conn: &Connection,
+    slug: &str,
+    build_id: &str,
+    quality_score: Option<f64>,
+) -> Result<()> {
+    complete_build_inner(conn, slug, build_id, quality_score, true)
+}
+
+fn complete_build_inner(
+    conn: &Connection,
+    slug: &str,
+    build_id: &str,
+    quality_score: Option<f64>,
+    allow_empty: bool,
+) -> Result<()> {
+    let total_node_count = conn
+        .query_row(
+            "SELECT total_node_count FROM pyramid_builds WHERE slug = ?1 AND build_id = ?2",
+            rusqlite::params![slug, build_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("build {build_id} for slug {slug} does not exist"))?;
+
+    if !allow_empty && total_node_count <= 0 {
+        return Err(anyhow!(
+            "refusing to complete build {build_id} for slug {slug}: total_node_count is {total_node_count}; use complete_empty_build for an explicit empty corpus"
+        ));
+    }
+
     conn.execute(
         "UPDATE pyramid_builds SET
            status = 'completed',
@@ -201,6 +238,34 @@ mod tests {
         let meta = get_latest_build(&conn, "test").unwrap().unwrap();
         assert_eq!(meta.status, "failed");
         assert_eq!(meta.error_message.as_deref(), Some("LLM timeout"));
+    }
+
+    #[test]
+    fn test_complete_build_rejects_zero_node_false_success() {
+        let conn = setup_db();
+        save_build_start(&conn, "test", "b3", "Empty?", 1, None).unwrap();
+
+        let err = complete_build(&conn, "test", "b3", None).unwrap_err();
+        assert!(
+            err.to_string().contains("total_node_count is 0"),
+            "expected zero-node guard, got {err}"
+        );
+
+        let meta = get_latest_build(&conn, "test").unwrap().unwrap();
+        assert_eq!(meta.status, "running");
+        assert!(meta.completed_at.is_none());
+    }
+
+    #[test]
+    fn test_complete_empty_build_is_explicit_escape_hatch() {
+        let conn = setup_db();
+        save_build_start(&conn, "test", "b4", "Empty on purpose?", 1, None).unwrap();
+
+        complete_empty_build(&conn, "test", "b4", None).unwrap();
+
+        let meta = get_latest_build(&conn, "test").unwrap().unwrap();
+        assert_eq!(meta.status, "completed");
+        assert_eq!(meta.total_node_count, 0);
     }
 
     #[test]

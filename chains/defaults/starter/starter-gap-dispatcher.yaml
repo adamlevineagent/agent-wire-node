@@ -1,0 +1,84 @@
+schema_version: 1
+id: starter-gap-dispatcher
+name: Gap Dispatcher — materialize Gap node from annotation (Phase 7c MVP)
+description: >
+  Starter binding for the gap_dispatcher role. Fires on annotation_reacted
+  events whose vocab entry nominates this chain (`gap` annotation type
+  today — Phase 7c added as a pure vocab entry). The chain either
+  upgrades a Scaffolding target to a Gap-shaped node (seeding a fresh
+  GapTopic with demand_state="open") or merges the annotation into an
+  existing Gap payload.
+
+  Phase 7c ships mechanical-only; Phase 8+ can add LLM-driven candidate
+  generation (the `candidate_resolutions` slot is created empty and
+  filled by a downstream LLM chain).
+
+  Steps:
+    1. emit_dispatcher_invoked — chronicle trace
+       (source="chain", event_type="gap_dispatcher_invoked").
+    2. load_gap_context — reads annotation + target node's current
+       shape + existing GapTopic (if present). Returns a threaded
+       envelope for the writer.
+    3. materialize_gap_node — the writer:
+         Scaffolding target → upgrade to Gap shape, seed GapTopic,
+           emit `gap_detected` observation event.
+         Existing Gap target → merge annotation's concern/description
+           into the existing payload without re-emitting `gap_detected`
+           (dedup keyed on annotation id via evidence-anchor pattern
+           borrowed from Phase 7a's debate_steward).
+         Debate / MetaLayer target → skip loud (don't destroy typed
+           nodes). Phase 8 decides whether to create a sibling Gap.
+    4. complete — terminal no-op (log_and_complete) so the work item
+       CASes to `applied` even on no_op paths.
+
+  Notes:
+    - `gap_detected` routing (role_for_event(gap_detected) →
+      gap_dispatcher) is KEPT in Phase 7c (symmetrical event-map
+      discipline). The chain's own gap_detected emission does cause
+      a second gap_dispatcher work item to compile; the second
+      dispatch is harmless because:
+        (a) load_gap_context back-fills annotation_id from the
+            gap_detected event's metadata, AND the existing Gap
+            node already carries an `annotation#{id}` token on
+            `evidence_anchors`. The anchor-check fires, action =
+            `no_op`, no re-emit. OR
+        (b) if metadata is absent (legacy event), annotation_id
+            stays None and materialize_gap_node hits the
+            `gap_dispatcher_skipped` chronicle path with
+            reason=no_annotation_id.
+      Phase 7c verifier pass added a `gap_dispatcher_skipped`
+      observation event on both paths per
+      `feedback_loud_deferrals` so the wasted cycle surfaces in
+      the chronicle, not just tracing logs.
+    - Every step is mechanical; Phase 7c ships no LLM at this layer.
+content_type: code
+version: "1.0.0"
+author: post-build-accretion-v5
+
+defaults:
+  model_tier: mid
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  - name: emit_invoked
+    primitive: custom
+    mechanical: true
+    rust_function: emit_dispatcher_invoked
+
+  - name: load_context
+    primitive: custom
+    mechanical: true
+    rust_function: load_gap_context
+
+  - name: materialize_gap
+    primitive: custom
+    mechanical: true
+    rust_function: materialize_gap_node
+
+  - name: complete
+    primitive: custom
+    mechanical: true
+    rust_function: log_and_complete
+
+post_build: []

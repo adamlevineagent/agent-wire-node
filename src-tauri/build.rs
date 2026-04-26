@@ -17,7 +17,11 @@ fn main() {
             "assets/client.js",
             "application/javascript; charset=utf-8",
         ),
-        ("robots.txt", "assets/robots.txt", "text/plain; charset=utf-8"),
+        (
+            "robots.txt",
+            "assets/robots.txt",
+            "text/plain; charset=utf-8",
+        ),
         ("favicon.ico", "assets/favicon.ico", "image/x-icon"),
         (
             "JetBrainsMono-Regular.woff2",

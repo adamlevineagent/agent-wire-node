@@ -37,13 +37,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::fleet::{
-    deliver_fleet_result, FleetAsyncResultEnvelope, FleetDispatchContext, FleetDeliveryError,
+    deliver_fleet_result, FleetAsyncResultEnvelope, FleetDeliveryError, FleetDispatchContext,
     FleetRoster,
 };
 use crate::pyramid::compute_chronicle::{
     record_event, ChronicleEventContext, EVENT_FLEET_CALLBACK_DELIVERED,
-    EVENT_FLEET_CALLBACK_EXHAUSTED, EVENT_FLEET_CALLBACK_FAILED,
-    EVENT_FLEET_WORKER_HEARTBEAT_LOST, SOURCE_FLEET_RECEIVED,
+    EVENT_FLEET_CALLBACK_EXHAUSTED, EVENT_FLEET_CALLBACK_FAILED, EVENT_FLEET_WORKER_HEARTBEAT_LOST,
+    SOURCE_FLEET_RECEIVED,
 };
 use crate::pyramid::db::{
     fleet_outbox_bump_delivery_attempt, fleet_outbox_delete, fleet_outbox_expire_exhausted,
@@ -67,10 +67,7 @@ fn job_path_for(row: &OutboxRow) -> String {
 }
 
 /// Main sweep loop. Runs forever until the async runtime shuts down.
-pub async fn fleet_outbox_sweep_loop(
-    db_path: PathBuf,
-    ctx: Arc<FleetDispatchContext>,
-) {
+pub async fn fleet_outbox_sweep_loop(db_path: PathBuf, ctx: Arc<FleetDispatchContext>) {
     tracing::info!(
         db_path = %db_path.display(),
         "Fleet outbox sweep loop started"
@@ -99,10 +96,7 @@ pub async fn fleet_outbox_sweep_loop(
 /// Predicate A: state transitions by `expires_at`. One `spawn_blocking`
 /// pass opens a connection, runs the expiry scan, and writes chronicle
 /// events for each transition inside the same connection. No async here.
-async fn sweep_expired_once(
-    db_path: PathBuf,
-    policy: FleetDeliveryPolicy,
-) -> anyhow::Result<()> {
+async fn sweep_expired_once(db_path: PathBuf, policy: FleetDeliveryPolicy) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let conn = rusqlite::Connection::open(&db_path)?;
         let rows = fleet_outbox_sweep_expired(&conn)?;
@@ -112,9 +106,8 @@ async fn sweep_expired_once(
                     // Worker heartbeat stopped before inference finished. Synth
                     // an Error payload and promote ready — delivery goes through
                     // the normal Predicate B path.
-                    let synth = synthesize_worker_error_json(
-                        "worker heartbeat lost — sweep promoted",
-                    );
+                    let synth =
+                        synthesize_worker_error_json("worker heartbeat lost — sweep promoted");
                     match fleet_outbox_promote_ready_if_pending(
                         &conn,
                         &row.dispatcher_node_id,
@@ -180,11 +173,8 @@ async fn sweep_expired_once(
                 }
                 "delivered" | "failed" => {
                     // Final retention elapsed — clean up.
-                    if let Err(e) = fleet_outbox_delete(
-                        &conn,
-                        &row.dispatcher_node_id,
-                        &row.job_id,
-                    ) {
+                    if let Err(e) = fleet_outbox_delete(&conn, &row.dispatcher_node_id, &row.job_id)
+                    {
                         tracing::warn!(
                             err = %e,
                             job_id = %row.job_id,
@@ -289,7 +279,10 @@ fn is_eligible_for_retry(
 ) -> bool {
     let attempts = row.delivery_attempts.max(0) as u32;
     let shift = attempts.min(20);
-    let raw = policy.backoff_base_secs.checked_shl(shift).unwrap_or(u64::MAX);
+    let raw = policy
+        .backoff_base_secs
+        .checked_shl(shift)
+        .unwrap_or(u64::MAX);
     let delay_secs = raw.min(policy.backoff_cap_secs);
 
     let Some(last_str) = row.last_attempt_at.as_deref() else {
@@ -362,9 +355,14 @@ async fn retry_deliver_one(
         }
     };
 
-    let delivery_result =
-        deliver_fleet_result(&row.dispatcher_node_id, &row.callback_url, &envelope, &snapshot, policy)
-            .await;
+    let delivery_result = deliver_fleet_result(
+        &row.dispatcher_node_id,
+        &row.callback_url,
+        &envelope,
+        &snapshot,
+        policy,
+    )
+    .await;
 
     // Apply CAS or bump-attempts under spawn_blocking; chronicle event in
     // the same connection.
@@ -746,7 +744,11 @@ mod tests {
         let last = (now - chrono::Duration::seconds(5))
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
-        assert!(!is_eligible_for_retry(&row_with(1, Some(&last)), &policy, now));
+        assert!(!is_eligible_for_retry(
+            &row_with(1, Some(&last)),
+            &policy,
+            now
+        ));
     }
 
     #[test]
@@ -759,7 +761,11 @@ mod tests {
         let last = (now - chrono::Duration::seconds(60))
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
-        assert!(is_eligible_for_retry(&row_with(2, Some(&last)), &policy, now));
+        assert!(is_eligible_for_retry(
+            &row_with(2, Some(&last)),
+            &policy,
+            now
+        ));
     }
 
     #[test]
@@ -850,7 +856,9 @@ mod tests {
         drop(conn);
 
         let policy = MarketDeliveryPolicy::default();
-        sweep_expired_market_once(db_path.clone(), policy).await.unwrap();
+        sweep_expired_market_once(db_path.clone(), policy)
+            .await
+            .unwrap();
 
         // Row should now be ready with a synth Error payload.
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -864,10 +872,14 @@ mod tests {
             )
             .unwrap();
         let body = result_json.unwrap();
-        assert!(body.contains("\"kind\":\"Error\""),
-            "sweep must synth Error payload, got: {body}");
-        assert!(body.contains("worker heartbeat lost"),
-            "payload must include the heartbeat-lost reason");
+        assert!(
+            body.contains("\"kind\":\"Error\""),
+            "sweep must synth Error payload, got: {body}"
+        );
+        assert!(
+            body.contains("worker heartbeat lost"),
+            "payload must include the heartbeat-lost reason"
+        );
     }
 
     #[tokio::test]
@@ -875,8 +887,7 @@ mod tests {
         // Regression: market sweep partition. A fleet row and a market
         // row both expired — only the market row must be transitioned.
         use crate::pyramid::db::{
-            fleet_outbox_insert_or_ignore, fleet_outbox_lookup,
-            market_outbox_insert_or_ignore,
+            fleet_outbox_insert_or_ignore, fleet_outbox_lookup, market_outbox_insert_or_ignore,
         };
         use tempfile::tempdir;
 
@@ -908,15 +919,21 @@ mod tests {
         drop(conn);
 
         let policy = MarketDeliveryPolicy::default();
-        sweep_expired_market_once(db_path.clone(), policy).await.unwrap();
+        sweep_expired_market_once(db_path.clone(), policy)
+            .await
+            .unwrap();
 
         // Market row: ready. Fleet row: still pending (owned by fleet sweep).
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let mkt = fleet_outbox_lookup(&conn, "mkt-expired").unwrap().unwrap();
-        let flt = fleet_outbox_lookup(&conn, "fleet-expired").unwrap().unwrap();
+        let flt = fleet_outbox_lookup(&conn, "fleet-expired")
+            .unwrap()
+            .unwrap();
         assert_eq!(mkt.status, "ready");
-        assert_eq!(flt.status, "pending",
-            "market sweep must NOT transition fleet rows");
+        assert_eq!(
+            flt.status, "pending",
+            "market sweep must NOT transition fleet rows"
+        );
     }
 
     #[tokio::test]
@@ -972,7 +989,9 @@ mod tests {
 
         let mut policy = MarketDeliveryPolicy::default();
         policy.max_delivery_attempts = 5;
-        expire_exhausted_market_once(db_path.clone(), policy).await.unwrap();
+        expire_exhausted_market_once(db_path.clone(), policy)
+            .await
+            .unwrap();
 
         // Market row expires_at pushed into the past; fleet row unchanged.
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -997,7 +1016,9 @@ mod tests {
         // Market row was pushed to `now - 1s`; lexicographic compare
         // is fine here because the far-future fixture starts with
         // `9999-` which sorts after any realistic `now`.
-        assert_ne!(mkt_exp, far_future,
-            "market row's expires_at should have been pushed into the past");
+        assert_ne!(
+            mkt_exp, far_future,
+            "market row's expires_at should have been pushed into the past"
+        );
     }
 }

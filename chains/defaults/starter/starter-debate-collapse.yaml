@@ -1,0 +1,89 @@
+schema_version: 1
+id: starter-debate-collapse
+name: Debate Collapse — finalize a Debate node (Phase 9c-1 MVP)
+description: >
+  Starter chain for the `debate_collapse` annotation type. Fires on
+  annotation_reacted events whose vocab entry nominates this chain.
+  Separate from starter-debate-steward because semantics are opposite:
+  the steward APPENDS positions/red_teams; this chain FINALIZES the
+  debate by transitioning the node back to `scaffolding` shape with
+  a NULL shape_payload_json, and emits the canonical `debate_collapsed`
+  observation event so the chronicle records the collapse.
+
+  Design choice (dedicated chain, not a branch in debate_steward):
+  the responsibilities are disjoint and the YAML becomes noise-free —
+  each chain's steps map 1:1 to one semantic operation. A single
+  branching chain would carry two code paths in every step and muddy
+  the 1-writer/1-reader mechanical contract.
+
+  Shape transition (Debate → Scaffolding + NULL payload):
+    The debate has been resolved — the node returns to a normal
+    scaffolding node. The `debate_collapsed` observation event carries
+    the final debate state (concern, position labels, vote_lean) in
+    its metadata for audit trail. There is no in-place "collapsed"
+    marker on the DebateTopic struct because (a) the node is no
+    longer semantically a debate — it's scaffolding carrying the
+    resolved conclusion, and (b) keeping the obsolete DebateTopic
+    payload on a scaffolding node would be a shape/payload mismatch.
+
+  Non-Debate target handling:
+    If the target is not currently a Debate node, skip loud —
+    emit `debate_collapse_skipped` into the chronicle with a reason.
+    Not destructive (feedback_loud_deferrals).
+
+  Steps:
+    1. emit_debate_collapse_invoked — chronicle trace
+       (source="chain", event_type="debate_collapse_invoked").
+    2. load_collapse_context — reads annotation + target node's
+       current shape + existing DebateTopic payload (if present).
+    3. finalize_debate_node — the writer:
+         Debate target → transition node_shape to 'scaffolding',
+           NULL shape_payload_json, emit `debate_collapsed` event
+           with the final debate state in metadata.
+         Scaffolding / Gap / MetaLayer target → skip loud, emit
+           `debate_collapse_skipped` event.
+         Unknown shape → raise (feedback_loud_deferrals).
+    4. complete — terminal no-op (log_and_complete) so the work
+       item CASes to `applied` even on no_op paths.
+
+  Notes:
+    - `debate_collapsed` (the EMITTED event, not the triggering
+      annotation type) is `log_only` in `map_event_to_primitive`
+      and returns None in `role_for_event`. This prevents the
+      collapse from triggering ANOTHER collapse chain on itself
+      (feedback_no_deferral_creep: the event is the outcome,
+      not the trigger for another action).
+    - Every step is mechanical; Phase 9c-1 ships no LLM at this
+      layer — the collapse is an operator- or agent-authored
+      annotation decision, the chain just finalizes the node shape.
+content_type: code
+version: "1.0.0"
+author: post-build-accretion-v5
+
+defaults:
+  model_tier: mid
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  - name: emit_invoked
+    primitive: custom
+    mechanical: true
+    rust_function: emit_debate_collapse_invoked
+
+  - name: load_context
+    primitive: custom
+    mechanical: true
+    rust_function: load_collapse_context
+
+  - name: finalize_debate
+    primitive: custom
+    mechanical: true
+    rust_function: finalize_debate_node
+
+  - name: complete
+    primitive: custom
+    mechanical: true
+    rust_function: log_and_complete
+
+post_build: []

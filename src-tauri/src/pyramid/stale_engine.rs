@@ -23,6 +23,7 @@ use uuid::Uuid;
 use super::event_bus::BuildEventBus;
 use super::faq;
 use super::llm::LlmConfig;
+use super::lock_manager::LockManager;
 use super::stale_helpers;
 use super::stale_helpers_upper;
 use super::types::{AutoUpdateConfig, PendingMutation, StaleCheckResult};
@@ -136,7 +137,8 @@ impl PyramidStaleEngine {
         active_build: Arc<tokio::sync::RwLock<HashMap<String, crate::pyramid::BuildHandle>>>,
         defer_maintenance_during_build: bool,
     ) -> Self {
-        let defer_maintenance_during_build = Arc::new(AtomicBool::new(defer_maintenance_during_build));
+        let defer_maintenance_during_build =
+            Arc::new(AtomicBool::new(defer_maintenance_during_build));
         let debounce = Duration::from_secs((config.debounce_minutes as u64) * 60);
         let mut layers = HashMap::new();
         let max_depth = query_max_depth(db_path, slug);
@@ -364,13 +366,8 @@ impl PyramidStaleEngine {
                                 };
                                 format!("-{} {}", n, unit)
                             };
-                            super::db::sum_slug_demand_weight(
-                                &conn,
-                                &s,
-                                &rule.r#type,
-                                &window,
-                            )
-                            .unwrap_or(0.0)
+                            super::db::sum_slug_demand_weight(&conn, &s, &rule.r#type, &window)
+                                .unwrap_or(0.0)
                                 >= rule.threshold
                         });
 
@@ -400,8 +397,7 @@ impl PyramidStaleEngine {
                                     );
                                 }
                                 Ok(super::triage::TriageDecision::Defer {
-                                    check_interval,
-                                    ..
+                                    check_interval, ..
                                 }) => {
                                     let _ = super::db::update_deferred_next_check(
                                         &conn,
@@ -533,8 +529,9 @@ impl PyramidStaleEngine {
         // Update timer_fires_at
         {
             let fires_at = Utc::now()
-                + chrono::Duration::from_std(debounce)
-                    .expect("Debounce duration must be convertible to chrono::Duration — config is invalid");
+                + chrono::Duration::from_std(debounce).expect(
+                    "Debounce duration must be convertible to chrono::Duration — config is invalid",
+                );
             let mut tfa = tfa_arc.lock().unwrap();
             *tfa = Some(fires_at.to_rfc3339());
         }
@@ -591,7 +588,8 @@ impl PyramidStaleEngine {
         }
 
         if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&self.db_path)) {
-            if let Err(e) = super::auto_update_ops::trip_breaker(&conn, &self.event_bus, &self.slug) {
+            if let Err(e) = super::auto_update_ops::trip_breaker(&conn, &self.event_bus, &self.slug)
+            {
                 warn!(slug = %self.slug, "Failed to persist circuit breaker trip to DB: {e}");
             }
         }
@@ -607,7 +605,9 @@ impl PyramidStaleEngine {
         self.breaker_tripped = false;
 
         if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&self.db_path)) {
-            if let Err(e) = super::auto_update_ops::resume_breaker(&conn, &self.event_bus, &self.slug) {
+            if let Err(e) =
+                super::auto_update_ops::resume_breaker(&conn, &self.event_bus, &self.slug)
+            {
                 warn!(slug = %self.slug, "Failed to persist circuit breaker reset to DB: {e}");
             }
         }
@@ -1031,9 +1031,23 @@ pub async fn drain_and_dispatch(
                     }
 
                     for node_id in &node_ids {
-                        if let Err(e) = stale_helpers_upper::execute_supersession(
-                            node_id, &db, &s, &cfg, &mdl,
-                        ).await {
+                        // Stale-check L0 file_change: annotations (if any)
+                        // live on this target — pass None so the helper
+                        // queries annotations on target_id itself.
+                        //
+                        // Phase 9a-2: honor execute_supersession's
+                        // caller-holds-lock contract. Acquired per-node in
+                        // a tight scope so the lock is released between
+                        // nodes (this loop may touch multiple L0 nodes
+                        // from the same file, and we want concurrent
+                        // readers to make progress between them).
+                        let res = {
+                            let _guard = LockManager::global().write(&s).await;
+                            stale_helpers_upper::execute_supersession(
+                                node_id, &db, &s, &cfg, &mdl, None,
+                            ).await
+                        };
+                        if let Err(e) = res {
                             error!(slug = %s, target = %result.target_id, node_id = %node_id, error = %e, "execute_supersession (L0 file_change) failed");
                         } else {
                             result.reason = format!("{} (node {} superseded)", result.reason, node_id);
@@ -1148,7 +1162,6 @@ pub async fn drain_and_dispatch(
             };
             let _ = tokio::task::spawn_blocking(move || {
                 if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
-
                     let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
                 }
             })
@@ -1177,9 +1190,19 @@ pub async fn drain_and_dispatch(
             let mut results = results;
             for result in &mut results {
                 if result.stale == 1 {
-                    if let Err(e) = stale_helpers_upper::execute_supersession(
-                        &result.target_id, &db, &s, &cfg, &mdl,
-                    ).await {
+                    // Stale-check node-sweep: same rationale as L0
+                    // branch above — annotations, if any, live on
+                    // target; None → fall back to target_id.
+                    //
+                    // Phase 9a-2: honor execute_supersession's
+                    // caller-holds-lock contract (tight per-target scope).
+                    let res = {
+                        let _guard = LockManager::global().write(&s).await;
+                        stale_helpers_upper::execute_supersession(
+                            &result.target_id, &db, &s, &cfg, &mdl, None,
+                        ).await
+                    };
+                    if let Err(e) = res {
                         error!(slug = %s, target = %result.target_id, error = %e, "execute_supersession failed");
                     } else {
                         // Bug 4 fix: Update reason to reflect supersession so propagated
@@ -1220,7 +1243,6 @@ pub async fn drain_and_dispatch(
             };
             let _ = tokio::task::spawn_blocking(move || {
                 if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
-
                     let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
                 }
             })
@@ -1304,7 +1326,6 @@ pub async fn drain_and_dispatch(
             };
             let _ = tokio::task::spawn_blocking(move || {
                 if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
-
                     let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
                 }
             })
@@ -1322,20 +1343,17 @@ pub async fn drain_and_dispatch(
         let cfg = base_config_owned.clone();
         let mdl = model_owned.clone();
         handles.push(tokio::spawn(async move {
-            let results = match stale_helpers::dispatch_targeted_l0_stale_check(
-                batch, &db, &cfg, &mdl,
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    error!(slug = %s, error = %e, "dispatch_targeted_l0_stale_check failed");
-                    Vec::new()
-                }
-            };
+            let results =
+                match stale_helpers::dispatch_targeted_l0_stale_check(batch, &db, &cfg, &mdl).await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!(slug = %s, error = %e, "dispatch_targeted_l0_stale_check failed");
+                        Vec::new()
+                    }
+                };
             let _ = tokio::task::spawn_blocking(move || {
                 if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
-
                     let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
                 }
             })
@@ -1617,11 +1635,8 @@ fn propagate_confirmed_stales(
             let node_ids: Vec<String> = node_ids_json
                 .and_then(|j| serde_json::from_str(&j).ok())
                 .unwrap_or_default();
-            let targets = stale_helpers_upper::resolve_evidence_targets_for_node_ids(
-                conn,
-                slug,
-                &node_ids,
-            )?;
+            let targets =
+                stale_helpers_upper::resolve_evidence_targets_for_node_ids(conn, slug, &node_ids)?;
             if targets.is_empty() {
                 warn!(
                     slug = %slug,

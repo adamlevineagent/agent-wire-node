@@ -159,8 +159,7 @@ pub fn create_dispatch_preview(
 
     // Build routing summary
     let routing_summary = build_routing_summary(&estimates);
-    let routing_json = serde_json::to_string(&routing_summary)
-        .unwrap_or_else(|_| "{}".to_string());
+    let routing_json = serde_json::to_string(&routing_summary).unwrap_or_else(|_| "{}".to_string());
 
     // Determine enforcement level based on budget decision
     let budget_decision = check_budget(conn, slug, total_cost, policy)?;
@@ -191,7 +190,8 @@ pub fn create_dispatch_preview(
             expires_at,
             now_str,
         ],
-    ).context("Failed to insert dispatch preview")?;
+    )
+    .context("Failed to insert dispatch preview")?;
 
     // CAS: transition each work item from compiled -> previewed.
     // Batch atomicity: if ANY item fails CAS, roll back the entire preview.
@@ -442,21 +442,25 @@ fn estimate_batch_costs(
             )
             .ok();
 
-        let (step_name, model_tier, resolved_model_id, system_prompt, user_prompt, provider_id) = match row {
-            Some(r) => r,
-            None => {
-                warn!(work_item_id = %item_id, "Work item not found during cost estimation");
-                continue;
-            }
-        };
+        let (step_name, model_tier, resolved_model_id, system_prompt, user_prompt, provider_id) =
+            match row {
+                Some(r) => r,
+                None => {
+                    warn!(work_item_id = %item_id, "Work item not found during cost estimation");
+                    continue;
+                }
+            };
 
         // Resolve model: use resolved_model_id if populated (Phase 5 materialization),
         // otherwise resolve from model_tier via dispatch policy routing rules.
-        let model_from_policy = policy.rules.iter()
+        let model_from_policy = policy
+            .rules
+            .iter()
             .find(|r| r.name == model_tier || r.name == step_name)
             .and_then(|r| r.route_to.first())
             .and_then(|re| re.model_id.as_deref());
-        let model = resolved_model_id.as_deref()
+        let model = resolved_model_id
+            .as_deref()
             .or(model_from_policy)
             .unwrap_or("unknown");
 
@@ -477,7 +481,9 @@ fn estimate_batch_costs(
 
         // Determine routing from resolved provider, or infer from dispatch policy
         let effective_provider = provider_id.as_deref().or_else(|| {
-            policy.rules.iter()
+            policy
+                .rules
+                .iter()
                 .find(|r| r.name == model_tier || r.name == step_name)
                 .and_then(|r| r.route_to.first())
                 .map(|re| re.provider_id.as_str())
@@ -545,9 +551,7 @@ fn build_routing_summary(estimates: &[ItemCostEstimate]) -> serde_json::Value {
 
 /// Get the total committed cost for a slug today (UTC day boundary).
 fn get_daily_spend(conn: &Connection, slug: &str) -> Result<f64> {
-    let today_start = Utc::now()
-        .format("%Y-%m-%d 00:00:00")
-        .to_string();
+    let today_start = Utc::now().format("%Y-%m-%d 00:00:00").to_string();
 
     let total: f64 = conn
         .query_row(
@@ -737,7 +741,10 @@ mod tests {
             result.err(),
         );
         let id = result.unwrap();
-        assert!(id.contains("market-skip"), "sentinel preview_id must mark the skip: {id}");
+        assert!(
+            id.contains("market-skip"),
+            "sentinel preview_id must mark the skip: {id}"
+        );
     }
 
     #[test]

@@ -328,10 +328,7 @@ impl PendingMarketJobs {
     /// same `job_id` (should not happen — job_ids are Wire-generated
     /// UUIDs, unique per match).
     pub fn register(&self, job_id: String, entry: PendingMarketJob) {
-        let mut jobs = self
-            .jobs
-            .lock()
-            .expect("PendingMarketJobs mutex poisoned");
+        let mut jobs = self.jobs.lock().expect("PendingMarketJobs mutex poisoned");
         jobs.insert(job_id, entry);
     }
 
@@ -339,10 +336,7 @@ impl PendingMarketJobs {
     /// `None` if no entry registered (orphan callback, or already
     /// consumed).
     pub fn remove(&self, job_id: &str) -> Option<PendingMarketJob> {
-        let mut jobs = self
-            .jobs
-            .lock()
-            .expect("PendingMarketJobs mutex poisoned");
+        let mut jobs = self.jobs.lock().expect("PendingMarketJobs mutex poisoned");
         jobs.remove(job_id)
     }
 
@@ -356,10 +350,7 @@ impl PendingMarketJobs {
     ///       PeekResult::Match    => pending.remove(&job_id) + deliver,
     ///   }
     pub fn peek_matches(&self, job_id: &str, expected_provider_id: &str) -> PeekResult {
-        let jobs = self
-            .jobs
-            .lock()
-            .expect("PendingMarketJobs mutex poisoned");
+        let jobs = self.jobs.lock().expect("PendingMarketJobs mutex poisoned");
         match jobs.get(job_id) {
             None => PeekResult::NotFound,
             Some(entry) if entry.provider_id == expected_provider_id => PeekResult::Match,
@@ -379,10 +370,7 @@ impl PendingMarketJobs {
         let clamped = multiplier.clamp(1, 10);
         let mut expired: Vec<String> = Vec::new();
         {
-            let jobs = self
-                .jobs
-                .lock()
-                .expect("PendingMarketJobs mutex poisoned");
+            let jobs = self.jobs.lock().expect("PendingMarketJobs mutex poisoned");
             for (job_id, entry) in jobs.iter() {
                 let window = entry.expected_timeout.saturating_mul(clamped as u32);
                 if entry.dispatched_at.elapsed() > window {
@@ -391,10 +379,7 @@ impl PendingMarketJobs {
             }
         }
         {
-            let mut jobs = self
-                .jobs
-                .lock()
-                .expect("PendingMarketJobs mutex poisoned");
+            let mut jobs = self.jobs.lock().expect("PendingMarketJobs mutex poisoned");
             for job_id in &expired {
                 jobs.remove(job_id);
             }
@@ -532,13 +517,19 @@ mod tests {
         assert_eq!(back.privacy_tier, req.privacy_tier);
         assert_eq!(back.timeout_ms, req.timeout_ms);
         // Optional fields elided from wire (skip_serializing_if).
-        assert!(!json.contains("\"temperature\""),
-            "None optional must not serialize: {json}");
-        assert!(!json.contains("\"max_tokens\""),
-            "None optional must not serialize: {json}");
+        assert!(
+            !json.contains("\"temperature\""),
+            "None optional must not serialize: {json}"
+        );
+        assert!(
+            !json.contains("\"max_tokens\""),
+            "None optional must not serialize: {json}"
+        );
         // callback_auth serializes with renamed JSON key (`type`).
-        assert!(json.contains("\"type\":\"bearer\""),
-            "callback_auth.kind must serialize as `type`: {json}");
+        assert!(
+            json.contains("\"type\":\"bearer\""),
+            "callback_auth.kind must serialize as `type`: {json}"
+        );
     }
 
     #[test]
@@ -604,11 +595,16 @@ mod tests {
             "priority": "urgent"
         }"#;
         let err = serde_json::from_str::<MarketDispatchRequest>(json_with_typo);
-        assert!(err.is_err(),
-            "unknown field must be rejected; got {:?}", err);
+        assert!(
+            err.is_err(),
+            "unknown field must be rejected; got {:?}",
+            err
+        );
         let msg = err.unwrap_err().to_string();
-        assert!(msg.contains("priority") || msg.contains("unknown field"),
-            "expected error to mention the unknown field; got: {msg}");
+        assert!(
+            msg.contains("priority") || msg.contains("unknown field"),
+            "expected error to mention the unknown field; got: {msg}"
+        );
     }
 
     // Spec test 18 — `pre_rev_2_0_dispatch_missing_fields_400s`: a dispatch
@@ -632,11 +628,16 @@ mod tests {
             "timeout_ms": 5000
         }"#;
         let err = serde_json::from_str::<MarketDispatchRequest>(json_missing);
-        assert!(err.is_err(),
-            "missing requester_callback_url must be rejected by serde; got {:?}", err);
+        assert!(
+            err.is_err(),
+            "missing requester_callback_url must be rejected by serde; got {:?}",
+            err
+        );
         let msg = err.unwrap_err().to_string();
-        assert!(msg.contains("requester_callback_url") || msg.contains("missing field"),
-            "expected error to mention the missing field; got: {msg}");
+        assert!(
+            msg.contains("requester_callback_url") || msg.contains("missing field"),
+            "expected error to mention the missing field; got: {msg}"
+        );
     }
 
     // Spec test 18 corollary — same guard for the sibling required field
@@ -657,11 +658,16 @@ mod tests {
             "timeout_ms": 5000
         }"#;
         let err = serde_json::from_str::<MarketDispatchRequest>(json_missing);
-        assert!(err.is_err(),
-            "missing requester_delivery_jwt must be rejected by serde; got {:?}", err);
+        assert!(
+            err.is_err(),
+            "missing requester_delivery_jwt must be rejected by serde; got {:?}",
+            err
+        );
         let msg = err.unwrap_err().to_string();
-        assert!(msg.contains("requester_delivery_jwt") || msg.contains("missing field"),
-            "expected error to mention the missing field; got: {msg}");
+        assert!(
+            msg.contains("requester_delivery_jwt") || msg.contains("missing field"),
+            "expected error to mention the missing field; got: {msg}"
+        );
     }
 
     // Spec test 19 (serde half) — `privacy_tier_bootstrap_relay_not_rejected`:
@@ -689,10 +695,13 @@ mod tests {
             "privacy_tier": "bootstrap-relay",
             "timeout_ms": 5000
         }"#;
-        let parsed = serde_json::from_str::<MarketDispatchRequest>(json_bootstrap)
-            .expect("legacy privacy_tier='bootstrap-relay' must parse — warn-don't-reject per Q-PROTO-3");
-        assert_eq!(parsed.privacy_tier, "bootstrap-relay",
-            "legacy tier string must round-trip verbatim, not be normalized");
+        let parsed = serde_json::from_str::<MarketDispatchRequest>(json_bootstrap).expect(
+            "legacy privacy_tier='bootstrap-relay' must parse — warn-don't-reject per Q-PROTO-3",
+        );
+        assert_eq!(
+            parsed.privacy_tier, "bootstrap-relay",
+            "legacy tier string must round-trip verbatim, not be normalized"
+        );
     }
 
     #[test]
@@ -760,16 +769,26 @@ mod tests {
             extensions: std::collections::HashMap::new(),
         };
         let dbg = format!("{:?}", req);
-        assert!(!dbg.contains("super-secret-signature-material"),
-            "requester_delivery_jwt leaked through Debug: {dbg}");
-        assert!(!dbg.contains("eyJhbGciOiJFZERTQSI"),
-            "any part of the JWT leaked through Debug: {dbg}");
-        assert!(!dbg.contains("super-secret-callback-token"),
-            "callback_auth.token leaked through Debug (expected redaction via CallbackAuth): {dbg}");
-        assert!(dbg.contains("<redacted>"),
-            "Debug should show the <redacted> placeholder: {dbg}");
-        assert!(dbg.contains("job-debug"),
-            "Debug should still show non-sensitive fields: {dbg}");
+        assert!(
+            !dbg.contains("super-secret-signature-material"),
+            "requester_delivery_jwt leaked through Debug: {dbg}"
+        );
+        assert!(
+            !dbg.contains("eyJhbGciOiJFZERTQSI"),
+            "any part of the JWT leaked through Debug: {dbg}"
+        );
+        assert!(
+            !dbg.contains("super-secret-callback-token"),
+            "callback_auth.token leaked through Debug (expected redaction via CallbackAuth): {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "Debug should show the <redacted> placeholder: {dbg}"
+        );
+        assert!(
+            dbg.contains("job-debug"),
+            "Debug should still show non-sensitive fields: {dbg}"
+        );
     }
 
     #[test]
@@ -784,8 +803,10 @@ mod tests {
         });
         let json = serde_json::to_string(&result).unwrap();
         // Tagged-enum representation: {"kind":"Success","data":{...}}.
-        assert!(json.starts_with("{\"kind\":\"Success\",\"data\":{"),
-            "unexpected wire form: {json}");
+        assert!(
+            json.starts_with("{\"kind\":\"Success\",\"data\":{"),
+            "unexpected wire form: {json}"
+        );
         let back: MarketAsyncResult = serde_json::from_str(&json).unwrap();
         match back {
             MarketAsyncResult::Success(r) => {
@@ -904,8 +925,7 @@ mod tests {
             "job-short".into(),
             PendingMarketJob {
                 sender: tx,
-                dispatched_at: std::time::Instant::now()
-                    - std::time::Duration::from_millis(500),
+                dispatched_at: std::time::Instant::now() - std::time::Duration::from_millis(500),
                 provider_id: "p1".into(),
                 expected_timeout: std::time::Duration::from_millis(100),
             },
@@ -936,12 +956,11 @@ mod tests {
             },
         );
         let evicted = pending.sweep_expired(0);
-        assert!(evicted.is_empty(),
-            "multiplier=0 must clamp to 1, not evict-all");
-        assert_eq!(
-            pending.peek_matches("job-fresh", "p1"),
-            PeekResult::Match
+        assert!(
+            evicted.is_empty(),
+            "multiplier=0 must clamp to 1, not evict-all"
         );
+        assert_eq!(pending.peek_matches("job-fresh", "p1"), PeekResult::Match);
     }
 
     #[test]

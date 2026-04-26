@@ -1,7 +1,8 @@
 import type { LiveNodeInfo, LlmAuditRecord } from './types';
+import type { DrillResultFull } from './inspector-types';
 
 interface DetailsTabProps {
-    drillData: any;
+    drillData: DrillResultFull | null;
     audit: LlmAuditRecord | null;
     children: LiveNodeInfo[];
     onNavigate: (nodeId: string) => void;
@@ -13,12 +14,107 @@ export function DetailsTab({ drillData, audit, children, onNavigate }: DetailsTa
     }
 
     const node = drillData.node;
+    const questionNode = drillData.question_node ?? null;
+    const linkedAnswer = drillData.linked_answer ?? null;
+    const question = questionNode?.question ?? drillData.question ?? node?.question ?? null;
+    const questionAbout = questionNode?.about ?? drillData.question_about ?? node?.question_about ?? null;
+    const questionCreates = questionNode?.creates ?? drillData.question_creates ?? node?.question_creates ?? null;
+    const questionPromptHint = questionNode?.prompt_hint ?? drillData.question_prompt_hint ?? node?.question_prompt_hint ?? null;
+    const answerNodeId = questionNode?.answer_node_id ?? drillData.answer_node_id ?? node?.answer_node_id ?? linkedAnswer?.id ?? null;
+    const answered = questionNode?.answered ?? drillData.answered ?? node?.answered ?? Boolean(linkedAnswer);
+    const answerHeadline = drillData.answer_headline ?? node?.answer_headline ?? linkedAnswer?.headline ?? null;
+    const answerDistilled = drillData.answer_distilled ?? node?.answer_distilled ?? linkedAnswer?.distilled ?? null;
     const evidence = drillData.evidence ?? [];
     const gaps = drillData.gaps ?? [];
     const webEdges = drillData.web_edges ?? [];
+    const parentIds = questionNode?.parent_ids && questionNode.parent_ids.length > 0
+        ? questionNode.parent_ids
+        : questionNode?.parent_id
+            ? [questionNode.parent_id]
+            : node?.parent_ids && node.parent_ids.length > 0
+                ? node.parent_ids
+                : node?.parent_id ? [node.parent_id] : [];
 
     return (
         <div className="details-tab">
+            {/* Question nodes are first-class records. Show the question before any answer materialization. */}
+            {(question || questionNode) && (
+                <div className="details-section">
+                    <h4>Question</h4>
+                    {question && <div className="details-distilled">{question}</div>}
+                    <div className="details-field">
+                        <strong>Status:</strong> {answered ? 'Answered' : 'Open'}
+                    </div>
+                    {questionAbout && (
+                        <div className="details-field">
+                            <strong>About:</strong> {questionAbout}
+                        </div>
+                    )}
+                    {questionCreates && (
+                        <div className="details-field">
+                            <strong>Creates:</strong> {questionCreates}
+                        </div>
+                    )}
+                    {questionPromptHint && (
+                        <div className="details-field">
+                            <strong>Prompt Hint:</strong> {questionPromptHint}
+                        </div>
+                    )}
+                    {questionNode && (
+                        <div className="details-field">
+                            <strong>Question Node:</strong> {questionNode.question_id} · L{questionNode.visual_depth}
+                            {questionNode.is_leaf ? ' · leaf' : ''}
+                        </div>
+                    )}
+                    {parentIds.length > 0 && (
+                        <div className="details-field">
+                            <strong>Parent Questions:</strong>
+                            <ul>
+                                {parentIds.map((parentId) => (
+                                    <li key={parentId}>
+                                        <span className="clickable" onClick={() => onNavigate(parentId)}>
+                                            {parentId}
+                                        </span>
+                                    </li>
+                                ))}
+                            </ul>
+                        </div>
+                    )}
+                    {answerNodeId && (
+                        <div className="details-field">
+                            <strong>Answer Node:</strong>{' '}
+                            <span className="clickable" onClick={() => onNavigate(answerNodeId)}>
+                                {answerNodeId}
+                            </span>
+                        </div>
+                    )}
+                    {answerHeadline && (
+                        <div className="details-field">
+                            <strong>Answer Headline:</strong> {answerHeadline}
+                        </div>
+                    )}
+                    {answerDistilled && (
+                        <div className="details-field">
+                            <strong>Answer:</strong> {answerDistilled}
+                        </div>
+                    )}
+                    {questionNode?.children && questionNode.children.length > 0 && (
+                        <div className="details-field">
+                            <strong>Child Questions:</strong>
+                            <ul>
+                                {questionNode.children.map((childId) => (
+                                    <li key={childId}>
+                                        <span className="clickable" onClick={() => onNavigate(childId)}>
+                                            {childId}
+                                        </span>
+                                    </li>
+                                ))}
+                            </ul>
+                        </div>
+                    )}
+                </div>
+            )}
+
             {/* Distilled text — the main content */}
             {node?.distilled && (
                 <div className="details-section">
@@ -119,6 +215,7 @@ export function DetailsTab({ drillData, audit, children, onNavigate }: DetailsTa
                                     {e.source_node_id || e.target_node_id}
                                 </span>
                                 {e.weight !== undefined && <span className="verdict-weight">{e.weight}</span>}
+                                {e.reason && <span className="details-edge-rel">{e.reason}</span>}
                             </div>
                         ))}
                     </div>

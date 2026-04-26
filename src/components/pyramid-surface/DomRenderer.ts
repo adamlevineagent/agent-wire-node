@@ -1,5 +1,5 @@
 import type { PyramidRenderer } from './PyramidRenderer';
-import type { SurfaceNode, SurfaceEdge, NodeEncoding, OverlayState, HitTestResult, VizPrimitive, BuildVizState } from './types';
+import type { SurfaceNode, SurfaceEdge, NodeEncoding, OverlayState, HitTestResult, VizStepConfig, BuildVizState } from './types';
 import { NodeVisualState, EdgeCategory } from './types';
 
 /**
@@ -93,7 +93,7 @@ export class DomRenderer implements PyramidRenderer {
                 opacity:${node.depth < 0 ? 0.3 : 1};
             `;
 
-            el.title = `${node.headline}\nL${node.depth}`;
+            el.title = `${node.question || node.headline}\nL${node.depth}`;
         }
 
         // No edge rendering in DOM mode — edges are structural only in canvas/GPU
@@ -151,7 +151,7 @@ export class DomRenderer implements PyramidRenderer {
         this.encodings = new Map(encodings);
     }
 
-    setActiveVizPrimitive(_primitive: VizPrimitive | null): void {
+    setActiveVizConfig(_config: VizStepConfig | null): void {
         // No-op: DOM mode does not render viz overlays
     }
 

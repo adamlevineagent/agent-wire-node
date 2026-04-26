@@ -19,9 +19,7 @@ use tracing::{debug, info};
 use super::db;
 use super::demand_gen;
 use super::query;
-use super::types::{
-    DemandGenJob, QuestionRetrieveResult, SubQuestionResult,
-};
+use super::types::{DemandGenJob, QuestionRetrieveResult, SubQuestionResult};
 use super::vocabulary;
 use super::PyramidState;
 
@@ -128,7 +126,10 @@ fn answer_sub_question(
     for word in &question_words {
         if let Ok(entries) = vocabulary::vocab_recognition_query(conn, slug, word) {
             for entry in &entries {
-                if !vocab_matches.iter().any(|v: &super::types::VocabEntry| v.name == entry.name) {
+                if !vocab_matches
+                    .iter()
+                    .any(|v: &super::types::VocabEntry| v.name == entry.name)
+                {
                     vocab_matches.push(entry.clone());
                 }
             }
@@ -312,7 +313,11 @@ pub async fn question_retrieve(
     question: &str,
     allow_demand_gen: bool,
 ) -> Result<QuestionRetrieveResult> {
-    info!(slug = slug, question = question, "Starting question retrieval");
+    info!(
+        slug = slug,
+        question = question,
+        "Starting question retrieval"
+    );
 
     // 1. Mechanical decomposition
     let sub_questions = decompose_mechanically(question);
@@ -400,11 +405,7 @@ pub async fn question_retrieve(
         }
 
         // Spawn async execution
-        demand_gen::spawn_demand_gen(
-            state.clone(),
-            slug.to_string(),
-            job_id.clone(),
-        );
+        demand_gen::spawn_demand_gen(state.clone(), slug.to_string(), job_id.clone());
 
         demand_gen_job_ids.push(job_id);
 
@@ -416,10 +417,8 @@ pub async fn question_retrieve(
     }
 
     // 5. Compose answer from sub-question results
-    let answered_subs: Vec<&SubQuestionResult> = sub_results
-        .iter()
-        .filter(|r| r.answer.is_some())
-        .collect();
+    let answered_subs: Vec<&SubQuestionResult> =
+        sub_results.iter().filter(|r| r.answer.is_some()).collect();
 
     let composed_answer = if answered_subs.is_empty() {
         None
@@ -463,7 +462,14 @@ mod tests {
     }
 
     /// Insert a test pyramid node into the DB for search and retrieval testing.
-    fn insert_test_node(conn: &Connection, slug: &str, node_id: &str, depth: i64, headline: &str, distilled: &str) {
+    fn insert_test_node(
+        conn: &Connection,
+        slug: &str,
+        node_id: &str,
+        depth: i64,
+        headline: &str,
+        distilled: &str,
+    ) {
         conn.execute(
             "INSERT INTO pyramid_nodes (slug, id, depth, headline, distilled, topics, corrections, decisions, terms, dead_ends, self_prompt, children, parent_id, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, '[]', '[]', '[]', '[]', '[]', '', '[]', NULL, datetime('now'))",
@@ -486,7 +492,8 @@ mod tests {
             "INSERT OR IGNORE INTO pyramid_slugs (slug, content_type, source_path, created_at)
              VALUES (?1, 'code', '/tmp/test', datetime('now'))",
             rusqlite::params![slug],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
@@ -509,9 +516,8 @@ mod tests {
 
     #[test]
     fn test_mechanical_decomposition_question_mark_split() {
-        let result = decompose_mechanically(
-            "What is the architecture? How does the build pipeline work?"
-        );
+        let result =
+            decompose_mechanically("What is the architecture? How does the build pipeline work?");
         assert_eq!(result.len(), 2);
         assert!(result[0].contains("architecture"));
         assert!(result[1].contains("build pipeline"));
@@ -534,7 +540,14 @@ mod tests {
         insert_test_slug(&conn, slug);
         insert_test_node(&conn, slug, "L2-apex", 2, "System Overview", "The system uses a pyramid architecture for knowledge organization with chain executors and vocabulary catalogs.");
         insert_test_node(&conn, slug, "L1-arch", 1, "Architecture Details", "The architecture consists of chain executors, vocabulary recognition, and demand-gen pipelines.");
-        insert_test_node(&conn, slug, "L0-base", 0, "Base Implementation", "Implementation uses Rust with SQLite for persistence and warp for HTTP routing.");
+        insert_test_node(
+            &conn,
+            slug,
+            "L0-base",
+            0,
+            "Base Implementation",
+            "Implementation uses Rust with SQLite for persistence and warp for HTTP routing.",
+        );
 
         insert_test_vocab(&conn, slug, "chain executor", "topic");
         insert_test_vocab(&conn, slug, "vocabulary", "topic");
@@ -542,7 +555,10 @@ mod tests {
         let result = answer_sub_question(&conn, slug, "How does the chain executor work?").unwrap();
 
         // Should find evidence from vocab recognition + FTS
-        assert!(!result.evidence_nodes.is_empty(), "Should find evidence nodes");
+        assert!(
+            !result.evidence_nodes.is_empty(),
+            "Should find evidence nodes"
+        );
         assert!(result.confidence > 0.0, "Should have non-zero confidence");
     }
 
@@ -593,16 +609,18 @@ mod tests {
     #[test]
     fn test_decomposition_produces_multiple_sub_questions() {
         // Semicolons
-        let result = decompose_mechanically(
-            "What is A?; What is B?; What is C?"
+        let result = decompose_mechanically("What is A?; What is B?; What is C?");
+        assert!(
+            result.len() > 1,
+            "Should produce multiple sub-questions from semicolons"
         );
-        assert!(result.len() > 1, "Should produce multiple sub-questions from semicolons");
 
         // Question marks
-        let result2 = decompose_mechanically(
-            "What is the build system? How does deployment work?"
+        let result2 = decompose_mechanically("What is the build system? How does deployment work?");
+        assert!(
+            result2.len() > 1,
+            "Should produce multiple sub-questions from question marks"
         );
-        assert!(result2.len() > 1, "Should produce multiple sub-questions from question marks");
 
         // Single question should not split
         let result3 = decompose_mechanically("What is the build system?");

@@ -165,9 +165,7 @@ pub fn ensure_table(conn: &Connection) -> SqlResult<()> {
 /// Read the active fleet delivery policy. Returns `Ok(None)` if no row
 /// is present OR the stored YAML is empty. Callers should fall back to
 /// `FleetDeliveryPolicy::default()` in that case (bootstrap sentinel).
-pub fn read_fleet_delivery_policy(
-    conn: &Connection,
-) -> SqlResult<Option<FleetDeliveryPolicy>> {
+pub fn read_fleet_delivery_policy(conn: &Connection) -> SqlResult<Option<FleetDeliveryPolicy>> {
     let row: Option<String> = conn
         .query_row(
             "SELECT yaml_content FROM pyramid_fleet_delivery_policy WHERE id = 1",
@@ -197,9 +195,8 @@ pub fn upsert_fleet_delivery_policy(
     conn: &Connection,
     policy: &FleetDeliveryPolicy,
 ) -> SqlResult<()> {
-    let yaml = serde_yaml::to_string(policy).map_err(|e| {
-        rusqlite::Error::ToSqlConversionFailure(Box::new(e))
-    })?;
+    let yaml = serde_yaml::to_string(policy)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     upsert_fleet_delivery_policy_yaml(conn, &yaml, None)
 }
 
@@ -230,8 +227,7 @@ pub fn upsert_fleet_delivery_policy_yaml(
 mod tests {
     use super::*;
 
-    const SEED_YAML: &str =
-        include_str!("../../../docs/seeds/fleet_delivery_policy.yaml");
+    const SEED_YAML: &str = include_str!("../../../docs/seeds/fleet_delivery_policy.yaml");
 
     #[test]
     fn default_matches_seed_yaml() {
@@ -241,15 +237,13 @@ mod tests {
         // are bugs — the comment contract in the module doc is that
         // they coincide.
         let from_default = FleetDeliveryPolicy::default();
-        let from_seed = FleetDeliveryPolicy::from_yaml(SEED_YAML)
-            .expect("seed YAML must parse");
+        let from_seed = FleetDeliveryPolicy::from_yaml(SEED_YAML).expect("seed YAML must parse");
         assert_eq!(from_default, from_seed);
     }
 
     #[test]
     fn seed_yaml_parses_cleanly() {
-        let policy = FleetDeliveryPolicy::from_yaml(SEED_YAML)
-            .expect("seed YAML must parse");
+        let policy = FleetDeliveryPolicy::from_yaml(SEED_YAML).expect("seed YAML must parse");
         // Spot-check a few operational fields beyond just "parsed without
         // error", so that a seed YAML edit that changes a number is
         // caught here rather than silently propagating.
@@ -285,12 +279,10 @@ peer_staleness_secs: 120
 # The typo below is what deny_unknown_fields catches.
 bogus_field_that_does_not_exist: 42
 "#;
-        let err = FleetDeliveryPolicy::from_yaml(yaml)
-            .expect_err("unknown field must reject");
+        let err = FleetDeliveryPolicy::from_yaml(yaml).expect_err("unknown field must reject");
         let msg = err.to_string();
         assert!(
-            msg.contains("bogus_field_that_does_not_exist")
-                || msg.contains("unknown field"),
+            msg.contains("bogus_field_that_does_not_exist") || msg.contains("unknown field"),
             "error should name the offending field, got: {msg}"
         );
     }
@@ -306,8 +298,7 @@ bogus_field_that_does_not_exist: 42
     #[test]
     fn roundtrip_serialize_then_parse() {
         let original = FleetDeliveryPolicy::default();
-        let yaml = serde_yaml::to_string(&original)
-            .expect("serialize must succeed");
+        let yaml = serde_yaml::to_string(&original).expect("serialize must succeed");
         let parsed = FleetDeliveryPolicy::from_yaml(&yaml)
             .expect("parse of our own serialization must succeed");
         assert_eq!(original, parsed);
@@ -319,11 +310,9 @@ bogus_field_that_does_not_exist: 42
         ensure_table(&conn).expect("create table");
 
         // Empty DB returns None — caller falls back to default.
-        assert!(
-            read_fleet_delivery_policy(&conn)
-                .expect("read empty")
-                .is_none()
-        );
+        assert!(read_fleet_delivery_policy(&conn)
+            .expect("read empty")
+            .is_none());
 
         // Write a non-default policy so we can tell read-back worked.
         let mut policy = FleetDeliveryPolicy::default();

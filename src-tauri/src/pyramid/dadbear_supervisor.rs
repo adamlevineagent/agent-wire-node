@@ -39,9 +39,7 @@ use tracing::{debug, error, info, warn};
 use crate::compute_queue::{ComputeQueueHandle, QueueEntry};
 use crate::pyramid::auto_update_ops;
 use crate::pyramid::dadbear_compiler;
-use crate::pyramid::dadbear_preview::{
-    self, BudgetDecision,
-};
+use crate::pyramid::dadbear_preview::{self, BudgetDecision};
 use crate::pyramid::dispatch_policy::DispatchPolicy;
 use crate::pyramid::event_bus::{BuildEventBus, TaggedBuildEvent, TaggedKind};
 use crate::pyramid::llm::{DispatchOrigin, LlmCallOptions, LlmConfig, LlmResponse};
@@ -186,12 +184,7 @@ pub fn start_dadbear_supervisor(
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
 
-    let supervisor = DadbearSupervisor::new(
-        pyramid_state,
-        compute_queue,
-        db_path,
-        event_bus,
-    );
+    let supervisor = DadbearSupervisor::new(pyramid_state, compute_queue, db_path, event_bus);
 
     let handle = tokio::spawn(async move {
         info!("DADBEAR supervisor starting");
@@ -264,8 +257,8 @@ impl DadbearSupervisor {
     async fn recover_in_flight_items(&self) -> Result<()> {
         let db_path = self.db_path.clone();
         let in_flight = tokio::task::spawn_blocking(move || -> Result<Vec<InFlightItem>> {
-            let conn = Connection::open(&db_path)
-                .context("Failed to open DB for crash recovery")?;
+            let conn =
+                Connection::open(&db_path).context("Failed to open DB for crash recovery")?;
             find_in_flight_items(&conn)
         })
         .await
@@ -326,13 +319,14 @@ impl DadbearSupervisor {
         let event_bus = self.event_bus.clone();
 
         // Gather dispatchable work per slug.
-        let slug_work = tokio::task::spawn_blocking(move || -> Result<HashMap<String, Vec<WorkItem>>> {
-            let conn = Connection::open(&db_path)
-                .context("Failed to open DB for supervisor tick")?;
-            gather_dispatchable_items(&conn, &event_bus)
-        })
-        .await
-        .context("spawn_blocking join error")??;
+        let slug_work =
+            tokio::task::spawn_blocking(move || -> Result<HashMap<String, Vec<WorkItem>>> {
+                let conn =
+                    Connection::open(&db_path).context("Failed to open DB for supervisor tick")?;
+                gather_dispatchable_items(&conn, &event_bus)
+            })
+            .await
+            .context("spawn_blocking join error")??;
 
         if slug_work.is_empty() {
             return Ok(());
@@ -556,9 +550,10 @@ impl DadbearSupervisor {
         // single-source-of-truth rationale.
         let queue_config = config.prepare_for_replay(crate::pyramid::llm::DispatchOrigin::Local);
 
-        let response_format = item.response_format_json.as_ref().and_then(|json_str| {
-            serde_json::from_str::<serde_json::Value>(json_str).ok()
-        });
+        let response_format = item
+            .response_format_json
+            .as_ref()
+            .and_then(|json_str| serde_json::from_str::<serde_json::Value>(json_str).ok());
 
         let model_id = item
             .resolved_model_id
@@ -581,6 +576,10 @@ impl DadbearSupervisor {
                 skip_fleet_dispatch: false,
                 chronicle_job_path: None,
                 dispatch_origin: Default::default(),
+                // W3c: explicit per-call model override. DADBEAR enqueues
+                // with the slug pinned at the outer dispatch site; this
+                // keeps the queue consumer dispatching the same model.
+                model_override: Some(model_id.clone()),
             },
             step_ctx: Some(step_ctx),
             model_id: model_id.clone(),
@@ -620,7 +619,9 @@ impl DadbearSupervisor {
         let attempt_id_for_task = attempt_id.clone();
         join_set.spawn(async move {
             let result = result_rx.await.unwrap_or_else(|_| {
-                Err(anyhow::anyhow!("Oneshot channel dropped — GPU loop may have crashed"))
+                Err(anyhow::anyhow!(
+                    "Oneshot channel dropped — GPU loop may have crashed"
+                ))
             });
             CompletedItem {
                 work_item_id: wi_id_for_task,
@@ -673,11 +674,8 @@ impl DadbearSupervisor {
                     batch_id: Some(item.batch_id.clone()),
                 };
 
-                crate::pyramid::stale_helpers::dispatch_new_file_ingest(
-                    vec![mutation],
-                    &db_path,
-                )
-                .await?;
+                crate::pyramid::stale_helpers::dispatch_new_file_ingest(vec![mutation], &db_path)
+                    .await?;
             }
             "tombstone" => {
                 use crate::pyramid::types::PendingMutation;
@@ -694,11 +692,318 @@ impl DadbearSupervisor {
                     batch_id: Some(item.batch_id.clone()),
                 };
 
-                crate::pyramid::stale_helpers::dispatch_tombstone(
-                    vec![mutation],
+                crate::pyramid::stale_helpers::dispatch_tombstone(vec![mutation], &db_path).await?;
+            }
+            // Post-build accretion v5 Phase 3 (WS3-C): log-only primitive.
+            // Observability events (binding_unresolved, cascade_handler_invoked)
+            // produce a chronicle trail without triggering any actual work.
+            //
+            // Phase 3 verifier fix: the shared post-apply block below emits
+            // cascade_stale to parent layers unconditionally, which for
+            // log_only would create downstream observation work (defeating
+            // the "no side effects" contract and risking feedback loops —
+            // binding_unresolved itself maps to log_only, so a cascade back
+            // into the pipeline would loop). We CAS → applied directly here
+            // and early-return before the shared cascade-emitter runs.
+            "log_only" => {
+                tracing::info!(
+                    slug = %slug,
+                    work_item_id = %item.id,
+                    step_name = %item.step_name,
+                    "log_only event processed (chronicle-only, no side effects)"
+                );
+                let db_path_lo = db_path.clone();
+                let wi_id_lo = wi_id.clone();
+                let slug_lo = slug.clone();
+                let event_bus_lo = event_bus.clone();
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let conn = Connection::open(&db_path_lo)?;
+                    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                    conn.execute(
+                        "UPDATE dadbear_work_items
+                         SET state = 'applied',
+                             state_changed_at = ?1,
+                             applied_at = ?1
+                         WHERE id = ?2 AND state = 'previewed'",
+                        params![now, wi_id_lo],
+                    )?;
+                    emit_state_changed(&event_bus_lo, &slug_lo, &wi_id_lo, "previewed", "applied");
+                    Ok(())
+                })
+                .await
+                .context("spawn_blocking join error for log_only apply")??;
+                return Ok(());
+            }
+            // v5 Phase 8-2: THE original DADBEAR non-firing bug fix.
+            //
+            // Flow: annotation_written → (8-1) role_bound cascade_handler →
+            // starter-cascade-immediate-redistill OR starter-cascade-judge-gated
+            // → queue_re_distill_for_target mechanical enqueues a work item with
+            // primitive=re_distill → supervisor finds it → prompt_materializer
+            // returns Mechanical → we land here.
+            //
+            // Actually RE-DISTILL the node by delegating to execute_supersession,
+            // which loads node context (distilled + topics + children + evidence),
+            // generates a change_manifest via the LLM, validates, then UPDATEs
+            // pyramid_nodes.distilled / headline / topics / build_version in
+            // place. This is the same call path stale_check takes when the
+            // judge says "stale"; it is already battle-tested and preserves
+            // node identity (no new node id, viz DAG coherence intact).
+            //
+            // Phase 8 verifier: the arm body lives in
+            // `run_re_distill_supervisor_arm` so tests can drive the whole
+            // CAS + result_app + chronicle path end-to-end without standing up
+            // a full DadbearSupervisor. The match arm stays as thin glue so
+            // the dispatch path still reads as a primitive match.
+            //
+            // Pre-Phase-8 behavior: re_distill fell through to the supervisor
+            // default arm ("applied:re_distill") — marked complete without
+            // touching the node. Annotations landed but the pyramid never
+            // reflected them. Killing that silent no-op is the mission of
+            // this phase.
+            "re_distill" => {
+                let config = self.pyramid_state.config.read().await.clone();
+                let model = item
+                    .resolved_model_id
+                    .as_deref()
+                    .unwrap_or(&item.model_tier)
+                    .to_string();
+                // Phase 8 tail-2: thread the work item's
+                // observation_event_ids into the arm so it can resolve
+                // the annotated descendant node id set from the event
+                // metadata emitted at routes.rs:
+                // emit_annotation_observation_events.
+                let obs_ids = item.observation_event_ids.clone();
+                run_re_distill_supervisor_arm(
                     &db_path,
+                    &wi_id,
+                    &slug,
+                    &target_id,
+                    item.layer,
+                    &primitive,
+                    &config,
+                    &model,
+                    &event_bus,
+                    obs_ids.as_deref(),
                 )
                 .await?;
+                return Ok(());
+            }
+            // Post-build accretion v5 Phase 3 (WS3-C): role_bound dispatch.
+            // The compiler stamps resolved_chain_id onto the work_item when
+            // map_event_to_primitive returns "role_bound" for this event_type.
+            // Supervisor invokes the bound chain via the lightweight runner
+            // chain_executor::execute_chain_for_target.
+            //
+            // v5 Phase 1 ships execute_chain_for_target as a stub. Phase 5
+            // (first starter chain ships) and Phase 8 (cascade rebinding
+            // activates annotation_written via role_bound) are when this arm
+            // actually produces work. Until then it returns the stub's
+            // "implementation pending" error which is surfaced as a work
+            // item failure — honest about the state.
+            "role_bound" => {
+                // Re-query resolved_chain_id from the work_items row to
+                // avoid plumbing a new field through WorkItem's 3
+                // constructor sites + SELECT statement. One extra DB read
+                // per role_bound dispatch; acceptable given these dispatches
+                // are rare (judge-gated, sweep, debate-spawn, etc.).
+                let chain_id: Option<String> = {
+                    let db_path_rq = db_path.clone();
+                    let wi_id_rq = item.id.clone();
+                    tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+                        let conn = Connection::open(&db_path_rq)?;
+                        let v: Option<String> = conn
+                            .query_row(
+                                "SELECT resolved_chain_id FROM dadbear_work_items WHERE id = ?1",
+                                params![wi_id_rq],
+                                |row| row.get(0),
+                            )
+                            .ok()
+                            .flatten();
+                        Ok(v)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("join error reading resolved_chain_id: {e}"))??
+                };
+                let chain_id = match chain_id {
+                    Some(id) if !id.is_empty() => id,
+                    _ => {
+                        tracing::error!(
+                            slug = %slug,
+                            work_item_id = %item.id,
+                            "role_bound work item missing resolved_chain_id — compiler bug"
+                        );
+                        // Phase 5 wanderer fix: CAS previewed→failed before returning
+                        // Err. Without this, `find_committed_previewed_items` re-selects
+                        // this same row every tick, repeating the error log + DB read
+                        // forever until operator intervention. Matches the load-failure
+                        // + exec-failure paths below which already mark_role_bound_failed.
+                        mark_role_bound_failed(&db_path, &wi_id, &slug, &event_bus).await;
+                        return Err(anyhow::anyhow!(
+                            "role_bound work_item '{}' missing resolved_chain_id",
+                            item.id
+                        ));
+                    }
+                };
+                // Phase 3 ships the wiring; the chain_executor runner body
+                // is stubbed in Phase 1 (chain_executor::execute_chain_for_target
+                // returns "implementation pending"). Phase 5 lands the first
+                // real starter chain; this arm becomes exercisable then.
+                //
+                // Phase 3 verifier fix: on chain load/execute failure (the
+                // stub bails today), transition the work item to `failed` so
+                // the next tick's `find_committed_previewed_items` does NOT
+                // keep re-dispatching it forever. Without this CAS the item
+                // stays `previewed`, the chain bail repeats every tick, and
+                // we spam the log + waste DB reads until operator intervention.
+                //
+                // Also: the shared cascade_stale emitter at the bottom of this
+                // function assumes the primitive has mutated the target node
+                // (extract/tombstone). role_bound delegates mutation to the
+                // chain runner — cascades are the chain's responsibility, not
+                // ours. Early-return on success to skip the shared emitter.
+                let chains_dir = self.pyramid_state.chains_dir.clone();
+                let load_result = crate::pyramid::chain_loader::load_chain_by_id(
+                    &chain_id,
+                    chains_dir.as_path(),
+                );
+                let chain = match load_result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        mark_role_bound_failed(&db_path, &wi_id, &slug, &event_bus).await;
+                        return Err(e.context(format!(
+                            "role_bound: failed to load chain '{}' for slug '{}'",
+                            chain_id, slug
+                        )));
+                    }
+                };
+                // Phase 9a-1: enrich chain input with the triggering
+                // observation event's metadata_json. Some role_bound chains
+                // need source-event context to operate:
+                //
+                // - starter-synthesizer (bound on meta_layer_crystallized)
+                //   requires `purpose_question` + `covered_substrate_node_ids`
+                //   from the crystallization event — load_substrate_nodes
+                //   raises without them. Pre-9a this was "dead plumbing":
+                //   the chain would fire but its first mechanical step
+                //   would loud-raise on missing input.
+                // - future synthesizer variants + debate_steward gates may
+                //   want `purpose_id`, `parent_meta_layer_id`, etc.
+                //
+                // Strategy: pass the ENTIRE event metadata_json as
+                // `trigger_event_metadata` AND splat its top-level fields
+                // into the chain input. Chains that need a specific field
+                // can read it directly; chains that pass through can thread
+                // the whole envelope forward via
+                // `trigger_event_metadata`. This is the same generic
+                // approach Phase 8 tail-2's helper uses — one shared
+                // `load_source_event_metadata` factored above.
+                //
+                // feedback_loud_deferrals: when the event has no metadata
+                // (or the load fails), we still dispatch the chain with a
+                // bare input envelope. The chain's first mechanical step
+                // (which needs the metadata) will raise with a clear
+                // message pointing at the missing field. This is the loud
+                // failure we want — silent no-op would be worse.
+                let obs_ids_str = item.observation_event_ids.as_deref();
+                let trigger_md = load_source_event_metadata(
+                    &db_path,
+                    &slug,
+                    obs_ids_str,
+                );
+                let mut chain_input = serde_json::json!({
+                    "work_item_id": &item.id,
+                    "step_name": &item.step_name,
+                    "target_id": item.target_id,
+                    "layer": item.layer,
+                });
+                if let Some(md) = trigger_md {
+                    // Thread the full envelope under a stable key for chains
+                    // that want the whole object.
+                    chain_input["trigger_event_metadata"] = md.clone();
+                    // Splat top-level fields (non-destructive: never
+                    // overwrites work_item_id / step_name / target_id /
+                    // layer). This is what gives the synthesizer chain
+                    // `purpose_question` + `covered_substrate_node_ids`
+                    // at chain-input depth-0 where `load_substrate_nodes`
+                    // reads them.
+                    if let Some(obj) = md.as_object() {
+                        let existing = chain_input.as_object().cloned().unwrap_or_default();
+                        for (k, v) in obj {
+                            if !existing.contains_key(k) {
+                                chain_input[k.as_str()] = v.clone();
+                            }
+                        }
+                        // Name-remap: the meta_layer_crystallized event emits
+                        // `covered_substrate_node_ids` (the source of truth
+                        // is the crystallizer's output), but the synthesizer
+                        // chain's `load_substrate_nodes` step reads
+                        // `covered_substrate_nodes`. Pre-9a this field was
+                        // never reaching the chain — the mismatch was never
+                        // exercised because the arm didn't thread metadata
+                        // at all. Bridge the two names here so both readers
+                        // see the substrate id list under their expected
+                        // key. Alternative would be renaming the event
+                        // metadata, but that's a wider surface change.
+                        if !chain_input
+                            .as_object()
+                            .map(|o| o.contains_key("covered_substrate_nodes"))
+                            .unwrap_or(false)
+                        {
+                            if let Some(ids) = obj.get("covered_substrate_node_ids") {
+                                chain_input["covered_substrate_nodes"] = ids.clone();
+                            }
+                        }
+                    }
+                }
+                let run_result = crate::pyramid::chain_executor::execute_chain_for_target(
+                    &self.pyramid_state,
+                    &chain,
+                    &slug,
+                    item.target_id.as_deref(),
+                    chain_input,
+                )
+                .await;
+                match run_result {
+                    Ok(_result) => {
+                        tracing::info!(
+                            slug = %slug,
+                            work_item_id = %item.id,
+                            chain_id = %chain_id,
+                            "role_bound chain invocation complete"
+                        );
+                        // CAS previewed → applied; no shared cascade (chain
+                        // is responsible for its own downstream effects).
+                        let db_path_rb = db_path.clone();
+                        let wi_id_rb = wi_id.clone();
+                        let slug_rb = slug.clone();
+                        let event_bus_rb = event_bus.clone();
+                        tokio::task::spawn_blocking(move || -> Result<()> {
+                            let conn = Connection::open(&db_path_rb)?;
+                            let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                            conn.execute(
+                                "UPDATE dadbear_work_items
+                                 SET state = 'applied',
+                                     state_changed_at = ?1,
+                                     applied_at = ?1
+                                 WHERE id = ?2 AND state = 'previewed'",
+                                params![now, wi_id_rb],
+                            )?;
+                            emit_state_changed(&event_bus_rb, &slug_rb, &wi_id_rb, "previewed", "applied");
+                            Ok(())
+                        })
+                        .await
+                        .context("spawn_blocking join error for role_bound apply")??;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        mark_role_bound_failed(&db_path, &wi_id, &slug, &event_bus).await;
+                        return Err(e.context(format!(
+                            "role_bound: chain '{}' execution failed for slug '{}'",
+                            chain_id, slug
+                        )));
+                    }
+                }
             }
             _ => {
                 warn!(
@@ -726,7 +1031,13 @@ impl DadbearSupervisor {
                  WHERE id = ?2 AND state = 'previewed'",
                 params![now, wi_id_cas],
             )?;
-            emit_state_changed(&event_bus_cas, &slug_cas, &wi_id_cas, "previewed", "applied");
+            emit_state_changed(
+                &event_bus_cas,
+                &slug_cas,
+                &wi_id_cas,
+                "previewed",
+                "applied",
+            );
 
             // Write result_applications row.
             conn.execute(
@@ -844,7 +1155,13 @@ impl DadbearSupervisor {
                     tokio::task::spawn_blocking(move || -> Result<()> {
                         let conn = Connection::open(&db_path)?;
                         complete_work_item(
-                            &conn, &wi_id, &result_json, cost, t_in, t_out, latency_ms,
+                            &conn,
+                            &wi_id,
+                            &result_json,
+                            cost,
+                            t_in,
+                            t_out,
+                            latency_ms,
                         )?;
                         // Read slug for event emission.
                         let slug: String = conn
@@ -995,15 +1312,23 @@ impl DadbearSupervisor {
                         );
 
                         let config = self.pyramid_state.config.read().await.clone();
-                        let model = item.resolved_model_id.as_deref()
+                        let model = item
+                            .resolved_model_id
+                            .as_deref()
                             .unwrap_or(&item.model_tier);
 
+                        // Stale-check path: annotations (if any) live on
+                        // THIS target, not on a descendant, so pass None
+                        // and let load_cascade_annotations_for_target
+                        // fall back to `target_id`. This is the legacy
+                        // semantic the helper preserves.
                         match crate::pyramid::stale_helpers_upper::execute_supersession(
                             &target_id,
                             &self.db_path,
                             &slug,
                             &config,
                             model,
+                            None,
                         )
                         .await
                         {
@@ -1094,9 +1419,26 @@ impl DadbearSupervisor {
                     }
                 }
                 _ => {
-                    // Other primitives (edge_check, connection_check, faq_redistill, etc.)
-                    // — log and mark applied. TODO: wire up specific application logic.
-                    action = format!("applied:{}", primitive);
+                    // v5 Phase 8-2 — loud-deferral discipline. Historically
+                    // this arm silently marked `applied:{primitive}` without
+                    // applying anything. Per feedback_loud_deferrals, name
+                    // the no-op so operators see the deferral in the result
+                    // row instead of it blending in with genuinely-applied
+                    // rows. `re_distill` specifically used to land here
+                    // before it got its own mechanical path above — if any
+                    // legacy work item produced in a pre-Phase-8 build
+                    // reaches this arm, the action string makes that
+                    // visible to audits.
+                    tracing::warn!(
+                        work_item_id = %work_item_id,
+                        primitive = %primitive,
+                        target_id = %target_id,
+                        "DADBEAR supervisor: apply_result has no arm for primitive — \
+                         marking deferred_no_op (no mutation applied). If this is a \
+                         re_distill row, it was compiled under pre-Phase-8 code; \
+                         the Phase 8-2 arm handles fresh rows via apply_mechanical_primitive."
+                    );
+                    action = format!("deferred_no_op:{}", primitive);
                 }
             }
         }
@@ -1147,13 +1489,7 @@ impl DadbearSupervisor {
                 "INSERT OR IGNORE INTO dadbear_result_applications
                  (work_item_id, slug, target_id, action, applied_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    wi_id,
-                    slug_for_obs,
-                    target_id_obs,
-                    action_obs,
-                    now,
-                ],
+                params![wi_id, slug_for_obs, target_id_obs, action_obs, now,],
             )?;
 
             info!(
@@ -1205,22 +1541,21 @@ fn find_in_flight_items(conn: &Connection) -> Result<Vec<InFlightItem>> {
            AND NOT EXISTS (
                SELECT 1 FROM dadbear_work_attempts a
                WHERE a.work_item_id = wi.id AND a.status IN ('completed', 'failed')
-           )"
+           )",
     )?;
 
     let items: Vec<InFlightItem> = stmt
         .query_map([], |row| {
             let state_changed_at: String = row.get(21)?;
             // Parse the dispatched_at to compute elapsed time.
-            let elapsed_secs = chrono::NaiveDateTime::parse_from_str(
-                &state_changed_at,
-                "%Y-%m-%d %H:%M:%S",
-            )
-            .map(|dt| {
-                let dispatched = chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
-                (now - dispatched).num_seconds()
-            })
-            .unwrap_or(SLA_TIMEOUT_SECS + 1); // Default to timed out if parse fails.
+            let elapsed_secs =
+                chrono::NaiveDateTime::parse_from_str(&state_changed_at, "%Y-%m-%d %H:%M:%S")
+                    .map(|dt| {
+                        let dispatched =
+                            chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
+                        (now - dispatched).num_seconds()
+                    })
+                    .unwrap_or(SLA_TIMEOUT_SECS + 1); // Default to timed out if parse fails.
 
             // Count existing attempts.
             // (We'll compute this separately to avoid nested queries in the row mapper.)
@@ -1296,19 +1631,25 @@ fn timeout_stale_attempt(conn: &Connection, work_item_id: &str, _attempt_count: 
     // limbo where the item is in 'previewed' but no query picks it up
     // because the preview's TTL has passed. Matches the pattern in
     // unblock_cleared_items() which does the same validity check.
-    let preview_valid = conn.query_row(
-        "SELECT EXISTS(
+    let preview_valid = conn
+        .query_row(
+            "SELECT EXISTS(
             SELECT 1 FROM dadbear_dispatch_previews p
             JOIN dadbear_work_items wi ON wi.preview_id = p.id
             WHERE wi.id = ?1
               AND p.committed_at IS NOT NULL
               AND p.expires_at > ?2
         )",
-        params![work_item_id, now],
-        |row| row.get::<_, bool>(0),
-    ).unwrap_or(false);
+            params![work_item_id, now],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
 
-    let target_state = if preview_valid { "previewed" } else { "compiled" };
+    let target_state = if preview_valid {
+        "previewed"
+    } else {
+        "compiled"
+    };
 
     conn.execute(
         "UPDATE dadbear_work_items
@@ -1346,9 +1687,10 @@ fn gather_dispatchable_items(
     let slugs: Vec<String> = {
         let mut stmt = conn.prepare(
             "SELECT DISTINCT slug FROM dadbear_work_items
-             WHERE state IN ('compiled', 'previewed')"
+             WHERE state IN ('compiled', 'previewed')",
         )?;
-        let mapped: Vec<String> = stmt.query_map([], |row| row.get(0))?
+        let mapped: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
             .filter_map(|r| r.ok())
             .collect();
         mapped
@@ -1382,17 +1724,13 @@ fn gather_dispatchable_items(
 }
 
 /// Block compiled/previewed items for a held slug.
-fn block_held_items(
-    conn: &Connection,
-    slug: &str,
-    event_bus: &Arc<BuildEventBus>,
-) -> Result<()> {
+fn block_held_items(conn: &Connection, slug: &str, event_bus: &Arc<BuildEventBus>) -> Result<()> {
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     // Block compiled items.
     let mut stmt = conn.prepare(
         "SELECT id FROM dadbear_work_items
-         WHERE slug = ?1 AND state IN ('compiled', 'previewed')"
+         WHERE slug = ?1 AND state IN ('compiled', 'previewed')",
     )?;
     let ids: Vec<String> = stmt
         .query_map(params![slug], |row| row.get(0))?
@@ -1445,7 +1783,7 @@ fn unblock_cleared_items(
     // Find blocked items for this slug.
     let mut stmt = conn.prepare(
         "SELECT id, blocked_from, preview_id FROM dadbear_work_items
-         WHERE slug = ?1 AND state = 'blocked'"
+         WHERE slug = ?1 AND state = 'blocked'",
     )?;
 
     let blocked: Vec<(String, Option<String>, Option<String>)> = stmt
@@ -1511,7 +1849,7 @@ fn preview_ready_items(
                SELECT 1 FROM dadbear_work_item_deps d
                JOIN dadbear_work_items dep ON d.depends_on_id = dep.id
                WHERE d.work_item_id = wi.id AND dep.state != 'applied'
-           )"
+           )",
     )?;
 
     let item_ids: Vec<String> = stmt
@@ -1566,7 +1904,12 @@ fn preview_ready_items(
                 .unwrap_or(0.0);
 
             match dadbear_preview::enforce_budget_and_commit(
-                conn, event_bus, slug, &preview_id, preview_cost, &policy,
+                conn,
+                event_bus,
+                slug,
+                &preview_id,
+                preview_cost,
+                &policy,
             ) {
                 Ok(BudgetDecision::AutoCommit) => {
                     debug!(
@@ -1641,7 +1984,7 @@ fn find_committed_previewed_items(conn: &Connection, slug: &str) -> Result<Vec<W
                SELECT 1 FROM dadbear_work_item_deps d
                JOIN dadbear_work_items dep ON d.depends_on_id = dep.id
                WHERE d.work_item_id = wi.id AND dep.state != 'applied'
-           )"
+           )",
     )?;
 
     let items: Vec<WorkItem> = stmt
@@ -1671,7 +2014,7 @@ fn find_committed_previewed_items(conn: &Connection, slug: &str) -> Result<Vec<W
                 state_changed_at: row.get(21)?,
                 preview_id: row.get(22)?,
                 observation_event_ids: row.get(23)?,
-                    result_json: row.get(24)?,
+                result_json: row.get(24)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -1740,7 +2083,14 @@ fn create_work_attempt(
         "INSERT INTO dadbear_work_attempts
          (id, work_item_id, attempt_number, dispatched_at, model_id, routing, status)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
-        params![attempt_id, work_item_id, attempt_number, now, model_id, routing],
+        params![
+            attempt_id,
+            work_item_id,
+            attempt_number,
+            now,
+            model_id,
+            routing
+        ],
     )?;
 
     Ok(attempt_id)
@@ -1829,7 +2179,15 @@ fn complete_work_item(
              result_latency_ms = ?6,
              completed_at = ?1
          WHERE id = ?7 AND state = 'dispatched'",
-        params![now, result_json, cost_usd, tokens_in, tokens_out, latency_ms, work_item_id],
+        params![
+            now,
+            result_json,
+            cost_usd,
+            tokens_in,
+            tokens_out,
+            latency_ms,
+            work_item_id
+        ],
     )?;
 
     if changed == 0 {
@@ -1921,7 +2279,10 @@ fn reconstruct_step_context(
 ) -> StepContext {
     StepContext {
         slug: item.slug.clone(),
-        build_id: item.build_id.clone().unwrap_or_else(|| item.batch_id.clone()),
+        build_id: item
+            .build_id
+            .clone()
+            .unwrap_or_else(|| item.batch_id.clone()),
         step_name: item.step_name.clone(),
         primitive: item.primitive.clone(),
         depth: item.layer,
@@ -1938,6 +2299,65 @@ fn reconstruct_step_context(
         content_type: String::new(),
         task_label: format!("dadbear:{}", item.primitive),
         balance_exhausted_emitted: std::sync::OnceLock::new(),
+        dispatch_decision: None,
+    }
+}
+
+/// Phase 3 verifier helper: on role_bound chain load or execution failure,
+/// CAS the work item from `previewed` to `failed` so the supervisor's
+/// `find_committed_previewed_items` query doesn't re-select it every tick.
+/// We don't propagate this helper's own errors — the caller is already
+/// returning an Err on the original failure; a CAS blip here becomes a
+/// follow-up concern, not a cascade of nested errors.
+///
+/// Phase 5 wanderer: exposed as `pub(crate)` so the missing-resolved_chain_id
+/// regression test at phase5_post_build_tests can call this directly. The
+/// arm is inline in apply_mechanical_primitive so the test verifies the
+/// helper's CAS behavior that the inline match-arm now depends on for
+/// the resolved_chain_id==None path.
+pub(crate) async fn mark_role_bound_failed(
+    db_path: &str,
+    wi_id: &str,
+    slug: &str,
+    event_bus: &Arc<BuildEventBus>,
+) {
+    let db_path = db_path.to_string();
+    let wi_id = wi_id.to_string();
+    let slug = slug.to_string();
+    let event_bus = event_bus.clone();
+    let wi_id_for_log = wi_id.clone();
+    let join = tokio::task::spawn_blocking(move || -> Result<bool> {
+        let conn = Connection::open(&db_path)?;
+        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let changed = conn.execute(
+            "UPDATE dadbear_work_items
+             SET state = 'failed',
+                 state_changed_at = ?1
+             WHERE id = ?2 AND state = 'previewed'",
+            params![now, wi_id],
+        )?;
+        if changed > 0 {
+            emit_state_changed(&event_bus, &slug, &wi_id, "previewed", "failed");
+        }
+        Ok(changed > 0)
+    })
+    .await;
+    match join {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            warn!(
+                work_item_id = %wi_id_for_log,
+                error = %e,
+                "mark_role_bound_failed: CAS previewed→failed error"
+            );
+        }
+        Err(e) => {
+            warn!(
+                work_item_id = %wi_id_for_log,
+                error = %e,
+                "mark_role_bound_failed: spawn_blocking join error"
+            );
+        }
     }
 }
 
@@ -1958,6 +2378,446 @@ fn emit_state_changed(
             new_state: new_state.to_string(),
         },
     });
+}
+
+/// v5 Phase 8-2 (Phase 8 verifier): the supervisor's `re_distill` arm body,
+/// extracted as a free `pub(crate)` helper so a real end-to-end test can drive
+/// the whole arm — including CAS, result_applications row, and the
+/// `node_re_distilled` chronicle event — without constructing a full
+/// `DadbearSupervisor` with a compute queue + pyramid state.
+///
+/// Behavior is identical to the inline match-arm body it replaced:
+///
+/// - empty `target_id` → CAS previewed→failed, return Ok (loud warn logged).
+/// - `execute_supersession` success → CAS previewed→applied, insert
+///   `re_distilled:{new_canonical_id}` row in `dadbear_result_applications`,
+///   emit `node_re_distilled` observation event.
+/// - `execute_supersession` failure → CAS previewed→failed, return the error
+///   (caller of this helper logs the failure — `execute_supersession` already
+///   persists a failed-manifest oversight row on its side).
+///
+/// The Phase 8 crown-jewel end-to-end test invokes this helper directly after
+/// compiling an `annotation_written` event + running the cascade chain that
+/// queues the re_distill work item, proving the whole annotation → role_bound
+/// → chain → queue_re_distill → supervisor arm → execute_supersession →
+/// pyramid_nodes UPDATE path in one test.
+///
+/// Phase 8 tail — annotation content channel (closes the v6 FIXME).
+///
+/// `execute_supersession` builds `ManifestGenerationInput` with a
+/// `cascade_annotations: Vec<CascadeAnnotation>` field populated from
+/// `pyramid_annotations` WHERE node_id = target AND created_at > (last
+/// re-distill `applied_at` | node `created_at`). Every annotation type —
+/// `observation`, `hypothesis`, `steel_man`, `position`, `correction`, etc.
+/// — is surfaced to the change-manifest prompt in its own PENDING
+/// ANNOTATIONS section, so the LLM sees non-correction annotation content
+/// directly and can decide whether to update distilled / headline / topics.
+///
+/// Semantic clarity preserved (Option-3 hybrid per scope doc):
+/// - `creates_delta=true` (correction only) still routes through
+///   `pyramid_deltas` → `recent_deltas` → `changed_children`. That is the
+///   mechanical field-level edit channel.
+/// - `creates_delta=false` (everything else) flows through
+///   `cascade_annotations`. That is the narrative feedback channel.
+/// Both channels are visible to the LLM; `creates_delta` remains a
+/// truthful statement about WHICH mechanism applies, not a gate on
+/// whether the annotation reaches the prompt at all.
+///
+/// The watermark for `cascade_annotations` is the target's most recent
+/// `dadbear_result_applications.action LIKE 're_distilled:%'.applied_at`
+/// (falling back to `pyramid_nodes.created_at` on first re-distill).
+/// Failed re-distills leave the watermark where it was, so the next run
+/// re-includes the same annotations — no silent loss of annotation
+/// feedback on retry.
+/// Phase 8 tail-2 — production routing fix.
+///
+/// `observation_event_ids_json` is the work item's `observation_event_ids`
+/// column (a JSON array like `[12,13]`). Each referenced event is a
+/// `dadbear_observation_events` row whose `metadata_json.annotated_node_id`
+/// records the DESCENDANT the annotation was written on. The supervisor
+/// collects those descendant ids and passes them to `execute_supersession`
+/// as `annotated_node_ids` so `load_cascade_annotations_for_target`
+/// queries annotations on the descendants (where they live) rather than
+/// on the re-distill target (an ancestor, which holds none).
+///
+/// When a single annotation rolls up to multiple ancestors the compiler
+/// coalesces them into one work item per ancestor, each with the SAME
+/// `annotated_node_id`. When multiple annotations on multiple descendants
+/// all roll up to ONE ancestor, that ancestor's work item has multiple
+/// `observation_event_ids`, each with a different `annotated_node_id` —
+/// this helper unions them.
+///
+/// Absent metadata → loud `RAISE EXCEPTION`-style log + empty list so the
+/// routing gap is visible (feedback_loud_deferrals). `None` passes through
+/// to the helper's backward-compat fallback (annotations queried on the
+/// target itself), which is what stale-check callers want.
+
+/// Phase 9a-1: shared helper to load + union metadata_json from the set of
+/// observation events referenced by a work item's `observation_event_ids`.
+///
+/// Factors the "read each referenced event, parse metadata_json" pattern
+/// shared by:
+/// - Phase 8 tail-2 `run_re_distill_supervisor_arm` (extracts
+///   `annotated_node_id` set from annotation_written events)
+/// - Phase 9a-1 role_bound synthesizer enrichment (extracts
+///   `purpose_question` / `covered_substrate_node_ids` / `parent_meta_layer_id`
+///   from the meta_layer_crystallized event)
+/// - Any future consumer that needs the triggering event's full metadata
+///
+/// Returns the metadata_json of the FIRST event in the list (there is always
+/// exactly one for chain-emitted role_bound events — the compiler coalesces
+/// by target, not by source, for these emitters). Returns `None` when:
+/// - `observation_event_ids_json` is None or empty
+/// - The first event id does not resolve to a row
+/// - `metadata_json` is NULL on the row
+/// - `metadata_json` is not parseable as JSON
+///
+/// All failure modes log loudly at warn-level so metadata-loading bugs are
+/// visible rather than silent (feedback_loud_deferrals).
+///
+/// The "union multiple events" variant lives inside
+/// `run_re_distill_supervisor_arm` because its union semantic is specific
+/// to the `annotated_node_id` set — generalizing it here would leak that
+/// concern into the signature. When a second role_bound emitter needs
+/// union semantics, factor THAT out at the call site that needs it.
+fn load_source_event_metadata(
+    db_path: &str,
+    slug: &str,
+    observation_event_ids_json: Option<&str>,
+) -> Option<serde_json::Value> {
+    let ids_json = observation_event_ids_json?;
+    let event_ids: Vec<i64> = serde_json::from_str(ids_json).unwrap_or_default();
+    let first_id = *event_ids.first()?;
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                error = %e,
+                slug = %slug,
+                "load_source_event_metadata: failed to open DB — returning None"
+            );
+            return None;
+        }
+    };
+    let md: Option<Option<String>> = conn
+        .query_row(
+            "SELECT metadata_json FROM dadbear_observation_events
+              WHERE slug = ?1 AND id = ?2",
+            params![slug, first_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok();
+    let Some(Some(md_str)) = md else {
+        warn!(
+            slug = %slug,
+            event_id = %first_id,
+            "load_source_event_metadata: event row has no metadata_json — \
+             returning None (downstream chain input will not carry trigger metadata)"
+        );
+        return None;
+    };
+    match serde_json::from_str::<serde_json::Value>(&md_str) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!(
+                slug = %slug,
+                event_id = %first_id,
+                error = %e,
+                "load_source_event_metadata: metadata_json is not valid JSON — \
+                 returning None"
+            );
+            None
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_re_distill_supervisor_arm(
+    db_path: &str,
+    wi_id: &str,
+    slug: &str,
+    target_id: &str,
+    layer: i64,
+    primitive: &str,
+    config: &LlmConfig,
+    model: &str,
+    event_bus: &Arc<BuildEventBus>,
+    observation_event_ids_json: Option<&str>,
+) -> Result<()> {
+    // Phase 9a-2: enforce the `execute_supersession` caller-holds-lock
+    // contract. Acquired here at function entry so every branch below —
+    // target-missing fast-fail, supersession success, supersession error —
+    // runs under the slug's write lock. Dropped implicitly on return.
+    //
+    // The stale_check path (apply_result) holds its own lock at a higher
+    // scope (line ~1203) and does NOT flow through this arm — it calls
+    // execute_supersession directly. So acquiring here is correct for the
+    // re_distill arm and does not double-lock the stale_check path.
+    let _slug_write_guard = LockManager::global().write(slug).await;
+
+    if target_id.is_empty() {
+        tracing::warn!(
+            slug = %slug,
+            work_item_id = %wi_id,
+            "re_distill: missing target_id, cannot re-distill"
+        );
+        let db_path_rd = db_path.to_string();
+        let wi_id_rd = wi_id.to_string();
+        let slug_rd = slug.to_string();
+        let event_bus_rd = event_bus.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = Connection::open(&db_path_rd)?;
+            let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            conn.execute(
+                "UPDATE dadbear_work_items
+                 SET state = 'failed',
+                     state_changed_at = ?1
+                 WHERE id = ?2 AND state = 'previewed'",
+                params![now, wi_id_rd],
+            )?;
+            emit_state_changed(&event_bus_rd, &slug_rd, &wi_id_rd, "previewed", "failed");
+            Ok(())
+        })
+        .await
+        .context("spawn_blocking join error for re_distill target-missing fail")??;
+        return Ok(());
+    }
+
+    // Phase 8 tail-2 — resolve the annotated descendant id set from the
+    // work item's observation_event_ids column. Read every referenced
+    // event row, parse metadata_json, collect `annotated_node_id`, union
+    // into the set the change-manifest prompt should pull annotations
+    // from.
+    //
+    // None is returned ONLY when the work item has no observation event
+    // ids at all (e.g. hand-enqueued via the test-only stale path). In
+    // that case the helper falls back to target_id. When event ids ARE
+    // present but NONE of them carry a valid annotated_node_id we
+    // return Some(empty) and let load_cascade_annotations_for_target
+    // log loudly + fall back — this is the "loud deferral" the memory
+    // feedback wants.
+    let annotated_node_ids: Option<Vec<String>> = if let Some(ids_json) =
+        observation_event_ids_json
+    {
+        let db_path_read = db_path.to_string();
+        let slug_read = slug.to_string();
+        let ids_json_owned = ids_json.to_string();
+        let target_id_read = target_id.to_string();
+        let wi_id_read = wi_id.to_string();
+        tokio::task::spawn_blocking(move || -> Option<Vec<String>> {
+            let event_ids: Vec<i64> =
+                serde_json::from_str(&ids_json_owned).unwrap_or_default();
+            if event_ids.is_empty() {
+                // No events on this work item at all — fall through to
+                // target_id via None.
+                tracing::debug!(
+                    work_item_id = %wi_id_read,
+                    slug = %slug_read,
+                    "re_distill: no observation_event_ids on work item — \
+                     cascade_annotations will fall back to target_id"
+                );
+                return None;
+            }
+            let conn = match Connection::open(&db_path_read) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        work_item_id = %wi_id_read,
+                        "re_distill: failed to open DB for annotated_node_id lookup \
+                         — falling back to target_id"
+                    );
+                    return None;
+                }
+            };
+            let mut seen = std::collections::BTreeSet::new();
+            for ev_id in &event_ids {
+                let md: Option<Option<String>> = conn
+                    .query_row(
+                        "SELECT metadata_json FROM dadbear_observation_events
+                          WHERE slug = ?1 AND id = ?2",
+                        params![slug_read, ev_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .ok();
+                let Some(Some(md_str)) = md else {
+                    // Event not found or metadata_json null. A loud
+                    // log — this is the only signal we'll see that the
+                    // routing metadata got lost between emit + dispatch.
+                    tracing::warn!(
+                        work_item_id = %wi_id_read,
+                        event_id = %ev_id,
+                        slug = %slug_read,
+                        "re_distill: observation event has no metadata_json — \
+                         cannot extract annotated_node_id"
+                    );
+                    continue;
+                };
+                let parsed: Result<serde_json::Value, _> =
+                    serde_json::from_str(&md_str);
+                let Ok(val) = parsed else {
+                    tracing::warn!(
+                        work_item_id = %wi_id_read,
+                        event_id = %ev_id,
+                        slug = %slug_read,
+                        "re_distill: observation event metadata_json is not \
+                         valid JSON — cannot extract annotated_node_id"
+                    );
+                    continue;
+                };
+                if let Some(nid) =
+                    val.get("annotated_node_id").and_then(|v| v.as_str())
+                {
+                    let trimmed = nid.trim();
+                    if !trimmed.is_empty() {
+                        seen.insert(trimmed.to_string());
+                    }
+                }
+            }
+            if seen.is_empty() {
+                // Events exist but none carried annotated_node_id —
+                // return Some(empty) so the helper logs the loud
+                // warning + falls back. This is the "loud deferral"
+                // case, NOT the quiet "no events at all" fallback.
+                tracing::warn!(
+                    work_item_id = %wi_id_read,
+                    slug = %slug_read,
+                    target_id = %target_id_read,
+                    event_count = event_ids.len(),
+                    "re_distill: no annotated_node_id found in any observation \
+                     event metadata — cascade_annotations will fall back loudly"
+                );
+                Some(Vec::new())
+            } else {
+                Some(seen.into_iter().collect())
+            }
+        })
+        .await
+        .unwrap_or(None)
+    } else {
+        None
+    };
+
+    let supersession_result = crate::pyramid::stale_helpers_upper::execute_supersession(
+        target_id,
+        db_path,
+        slug,
+        config,
+        model,
+        annotated_node_ids,
+    )
+    .await;
+
+    match supersession_result {
+        Ok(new_canonical_id) => {
+            info!(
+                work_item_id = %wi_id,
+                target_id = %target_id,
+                new_canonical_id = %new_canonical_id,
+                slug = %slug,
+                "DADBEAR supervisor: re_distill complete via execute_supersession"
+            );
+
+            // CAS previewed → applied + emit node_re_distilled chronicle
+            // breadcrumb + result_applications row.
+            let db_path_rd = db_path.to_string();
+            let wi_id_rd = wi_id.to_string();
+            let slug_rd = slug.to_string();
+            let target_id_rd = target_id.to_string();
+            let event_bus_rd = event_bus.clone();
+            let primitive_rd = primitive.to_string();
+            let new_canonical_id_rd = new_canonical_id.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let conn = Connection::open(&db_path_rd)?;
+                let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                conn.execute(
+                    "UPDATE dadbear_work_items
+                     SET state = 'applied',
+                         state_changed_at = ?1,
+                         applied_at = ?1
+                     WHERE id = ?2 AND state = 'previewed'",
+                    params![now, wi_id_rd],
+                )?;
+                emit_state_changed(
+                    &event_bus_rd, &slug_rd, &wi_id_rd, "previewed", "applied",
+                );
+
+                conn.execute(
+                    "INSERT OR IGNORE INTO dadbear_result_applications
+                     (work_item_id, slug, target_id, action, applied_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        wi_id_rd,
+                        slug_rd,
+                        target_id_rd,
+                        format!("re_distilled:{}", new_canonical_id_rd),
+                        now,
+                    ],
+                )?;
+
+                // Chronicle breadcrumb for the original-bug fix.
+                let metadata = serde_json::json!({
+                    "triggering_work_item_id": wi_id_rd,
+                    "source_primitive": primitive_rd,
+                    "new_canonical_id": new_canonical_id_rd,
+                })
+                .to_string();
+                let _ = observation_events::write_observation_event(
+                    &conn,
+                    &slug_rd,
+                    "dadbear",
+                    "node_re_distilled",
+                    None, None, None, None,
+                    Some(&target_id_rd),
+                    Some(layer),
+                    Some(&metadata),
+                );
+                Ok(())
+            })
+            .await
+            .context("spawn_blocking join error for re_distill apply")??;
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                work_item_id = %wi_id,
+                target_id = %target_id,
+                error = %e,
+                slug = %slug,
+                "DADBEAR supervisor: re_distill via execute_supersession failed"
+            );
+            // CAS previewed → failed so we don't spin on this row every
+            // tick. execute_supersession already persists a failed-manifest
+            // oversight row when the LLM call produces unusable output.
+            let db_path_rd = db_path.to_string();
+            let wi_id_rd = wi_id.to_string();
+            let slug_rd = slug.to_string();
+            let event_bus_rd = event_bus.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let conn = Connection::open(&db_path_rd)?;
+                let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                conn.execute(
+                    "UPDATE dadbear_work_items
+                     SET state = 'failed',
+                         state_changed_at = ?1
+                     WHERE id = ?2 AND state = 'previewed'",
+                    params![now, wi_id_rd],
+                )?;
+                emit_state_changed(
+                    &event_bus_rd, &slug_rd, &wi_id_rd, "previewed", "failed",
+                );
+                Ok(())
+            })
+            .await
+            .context("spawn_blocking join error for re_distill fail")??;
+            let slug_err = slug.to_string();
+            let target_err = target_id.to_string();
+            Err(e.context(format!(
+                "re_distill via execute_supersession failed for target '{}' in slug '{}'",
+                target_err, slug_err,
+            )))
+        }
+    }
 }
 
 // ── LLM result parsers ────────────────────────────────────────────────────
@@ -2008,10 +2868,7 @@ fn parse_stale_check_result(content: &str, target_id: &str) -> bool {
         .or_else(|| entries.first());
 
     match matching {
-        Some(entry) => entry
-            .get("stale")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true), // Default to stale when uncertain.
+        Some(entry) => entry.get("stale").and_then(|v| v.as_bool()).unwrap_or(true), // Default to stale when uncertain.
         None => true,
     }
 }
@@ -2069,8 +2926,14 @@ fn extract_rename_paths(
                         |row| row.get::<_, Option<String>>(0),
                     ) {
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&meta) {
-                            let old = parsed.get("old_path").and_then(|v| v.as_str()).map(String::from);
-                            let new = parsed.get("new_path").and_then(|v| v.as_str()).map(String::from);
+                            let old = parsed
+                                .get("old_path")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            let new = parsed
+                                .get("new_path")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
                             if let (Some(o), Some(n)) = (old, new) {
                                 return Some((o, n));
                             }
@@ -2096,7 +2959,15 @@ fn parse_rename_target_id(target_id: &str) -> Option<(String, String)> {
     // Both paths are absolute on macOS/Linux (start with `/`).
     // The boundary between old and new is where a `/` is followed by another
     // absolute path root. We scan for known root prefixes.
-    let roots = ["/Users/", "/home/", "/tmp/", "/var/", "/opt/", "/etc/", "/private/"];
+    let roots = [
+        "/Users/",
+        "/home/",
+        "/tmp/",
+        "/var/",
+        "/opt/",
+        "/etc/",
+        "/private/",
+    ];
 
     // Skip the first character (the leading `/` of old_path) and look for the
     // start of the second absolute path.

@@ -86,7 +86,10 @@ impl fmt::Display for FleetAuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             FleetAuthError::InvalidToken => {
-                write!(f, "fleet JWT decode failed (signature, aud, or exp invalid)")
+                write!(
+                    f,
+                    "fleet JWT decode failed (signature, aud, or exp invalid)"
+                )
             }
             FleetAuthError::OperatorMismatch => {
                 write!(f, "fleet JWT operator does not match local operator")
@@ -95,7 +98,10 @@ impl fmt::Display for FleetAuthError {
                 write!(f, "fleet JWT missing or empty nid claim")
             }
             FleetAuthError::MissingOperator => {
-                write!(f, "local operator_id is empty; cannot verify fleet identity")
+                write!(
+                    f,
+                    "local operator_id is empty; cannot verify fleet identity"
+                )
             }
         }
     }
@@ -247,8 +253,7 @@ mod tests {
 
     fn sign_token(claims: &TestClaims, private_pem: &str) -> String {
         let header = Header::new(Algorithm::EdDSA);
-        let encoding_key =
-            EncodingKey::from_ed_pem(private_pem.as_bytes()).expect("encoding key");
+        let encoding_key = EncodingKey::from_ed_pem(private_pem.as_bytes()).expect("encoding key");
         encode(&header, claims, &encoding_key).expect("sign token")
     }
 
@@ -265,8 +270,8 @@ mod tests {
         };
         let token = sign_token(&claims, &kp.private_pem);
 
-        let identity = verify_fleet_identity(&token, &kp.public_pem, "operator-alpha")
-            .expect("should verify");
+        let identity =
+            verify_fleet_identity(&token, &kp.public_pem, "operator-alpha").expect("should verify");
 
         assert_eq!(identity.nid(), "node-abc123");
         assert_eq!(identity.op(), "operator-alpha");

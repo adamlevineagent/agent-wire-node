@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist-test/
 target/
 .signing-key*.txt
 .signing-key*.txt.pub
@@ -9,3 +10,4 @@ target/
 .env.*
 .lab/
 run.log
+.claude/worktrees/

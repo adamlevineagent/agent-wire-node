@@ -891,9 +891,8 @@ impl PyramidPublisher {
         }
 
         let (wire_type, tags) =
-            crate::pyramid::wire_native_metadata::resolve_wire_type(schema_type).map_err(|e| {
-                WirePublishError::Rejected(format!("wire type resolution: {e}"))
-            })?;
+            crate::pyramid::wire_native_metadata::resolve_wire_type(schema_type)
+                .map_err(|e| WirePublishError::Rejected(format!("wire type resolution: {e}")))?;
         let wire_type_str = format!("{wire_type:?}").to_lowercase();
 
         let canonical_yaml = metadata
@@ -934,9 +933,7 @@ impl PyramidPublisher {
         // Trackable claims need end dates.
         for (i, claim) in metadata.claims.iter().enumerate() {
             if claim.trackable && claim.end_date.as_deref().unwrap_or("").is_empty() {
-                warnings.push(format!(
-                    "claims[{i}]: trackable claim has no end_date"
-                ));
+                warnings.push(format!("claims[{i}]: trackable claim has no end_date"));
             }
         }
 
@@ -961,7 +958,10 @@ impl PyramidPublisher {
 
         // Build the cost breakdown (author-declared prices).
         let author_price = metadata.price.unwrap_or(0);
-        let deposit_credits = if matches!(wire_type, crate::pyramid::wire_native_metadata::WireContributionType::Skill) {
+        let deposit_credits = if matches!(
+            wire_type,
+            crate::pyramid::wire_native_metadata::WireContributionType::Skill
+        ) {
             // Skill deposit rule per wire-skills.md — exact amount is
             // TBD against the credit rebase; Phase 5 reports 0 and
             // flags it for the user to check.
@@ -1110,10 +1110,8 @@ fn build_contribution_publish_payload(
         .validate()
         .map_err(|e| WirePublishError::Rejected(format!("metadata validation: {e}")))?;
 
-    let (wire_type, tags) =
-        crate::pyramid::wire_native_metadata::resolve_wire_type(schema_type).map_err(|e| {
-            WirePublishError::Rejected(format!("wire type resolution: {e}"))
-        })?;
+    let (wire_type, tags) = crate::pyramid::wire_native_metadata::resolve_wire_type(schema_type)
+        .map_err(|e| WirePublishError::Rejected(format!("wire type resolution: {e}")))?;
     let wire_type_str = format!("{wire_type:?}").to_lowercase();
 
     // Resolve derived_from to integer slot allocations.
@@ -1168,9 +1166,8 @@ fn build_contribution_publish_payload(
     // with the Phase 5 shape — Phase 5 callers see no `cache_manifest_json`
     // field at all, exactly as before.
     if let Some(manifest) = cache_manifest {
-        let manifest_json = serde_json::to_value(manifest).map_err(|e| {
-            WirePublishError::Rejected(format!("cache manifest serialize: {e}"))
-        })?;
+        let manifest_json = serde_json::to_value(manifest)
+            .map_err(|e| WirePublishError::Rejected(format!("cache manifest serialize: {e}")))?;
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("cache_manifest_json".to_string(), manifest_json);
         }
@@ -1475,23 +1472,21 @@ impl PyramidPublisher {
         wire_pyramid_id: &str,
         build_id: Option<&str>,
     ) -> Result<crate::pyramid::pyramid_import::CacheManifest> {
-        use crate::pyramid::pyramid_import::{
-            CacheManifest, ImportNodeEntry, ImportedCacheEntry,
-        };
+        use crate::pyramid::pyramid_import::{CacheManifest, ImportNodeEntry, ImportedCacheEntry};
         use std::collections::HashMap;
 
         // Query every cache row for the slug (optionally filtered by
         // build_id). We collect into a vector of (row fields) so the
         // join/assembly logic stays readable.
         let mut rows: Vec<(
-            String, // step_name
-            i64,    // chunk_index
-            i64,    // depth
-            String, // cache_key
-            String, // inputs_hash
-            String, // prompt_hash
-            String, // model_id
-            String, // output_json
+            String,         // step_name
+            i64,            // chunk_index
+            i64,            // depth
+            String,         // cache_key
+            String,         // inputs_hash
+            String,         // prompt_hash
+            String,         // model_id
+            String,         // output_json
             Option<String>, // token_usage_json
             Option<f64>,    // cost_usd
             Option<i64>,    // latency_ms
@@ -1595,8 +1590,7 @@ impl PyramidPublisher {
         // keyed on `(slug, file_path)`. We want a `node_id → (path, hash,
         // size)` map — since node_ids are stored as JSON strings on
         // `pyramid_file_hashes.node_ids`, we walk them once.
-        let mut node_to_source: HashMap<String, (String, String, Option<u64>)> =
-            HashMap::new();
+        let mut node_to_source: HashMap<String, (String, String, Option<u64>)> = HashMap::new();
         {
             let mut stmt = conn.prepare(
                 "SELECT file_path, hash, node_ids
@@ -1612,13 +1606,10 @@ impl PyramidPublisher {
             })?;
             for r in iter {
                 let (file_path, hash, node_ids_json) = r?;
-                let byte_size = std::fs::metadata(&file_path)
-                    .ok()
-                    .map(|m| m.len());
+                let byte_size = std::fs::metadata(&file_path).ok().map(|m| m.len());
                 if let Ok(ids) = serde_json::from_str::<Vec<String>>(&node_ids_json) {
                     for id in ids {
-                        node_to_source
-                            .insert(id, (file_path.clone(), hash.clone(), byte_size));
+                        node_to_source.insert(id, (file_path.clone(), hash.clone(), byte_size));
                     }
                 }
             }
@@ -1640,10 +1631,7 @@ impl PyramidPublisher {
             })?;
             for r in iter {
                 let (source, target) = r?;
-                target_to_sources
-                    .entry(target)
-                    .or_default()
-                    .push(source);
+                target_to_sources.entry(target).or_default().push(source);
             }
         }
 
@@ -1917,7 +1905,9 @@ impl PyramidPublisher {
         }
         if let Some(t) = tags {
             body["tags"] = serde_json::Value::Array(
-                t.iter().map(|s| serde_json::Value::String(s.clone())).collect(),
+                t.iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
             );
         }
 
@@ -2539,10 +2529,7 @@ mod tests {
         let conn = mem_pyramid_conn();
         seed_cache_row(&conn, "exp-slug", "source_extract", 0, 0, "row-1");
 
-        let publisher = PyramidPublisher::new(
-            "https://dry-run.invalid".to_string(),
-            String::new(),
-        );
+        let publisher = PyramidPublisher::new("https://dry-run.invalid".to_string(), String::new());
 
         let result = publisher
             .export_cache_manifest(&conn, "exp-slug", "wire:exp", None, false)
@@ -2562,10 +2549,7 @@ mod tests {
         let k1 = seed_cache_row(&conn, "exp-slug", "source_extract", 0, 0, "row-1");
         let k2 = seed_cache_row(&conn, "exp-slug", "cluster_synthesize", -1, 1, "row-2");
 
-        let publisher = PyramidPublisher::new(
-            "https://dry-run.invalid".to_string(),
-            String::new(),
-        );
+        let publisher = PyramidPublisher::new("https://dry-run.invalid".to_string(), String::new());
 
         let manifest = publisher
             .export_cache_manifest(&conn, "exp-slug", "wire:exp", None, true)
@@ -2594,10 +2578,7 @@ mod tests {
         // construction" (Some with no nodes).
         let conn = mem_pyramid_conn();
 
-        let publisher = PyramidPublisher::new(
-            "https://dry-run.invalid".to_string(),
-            String::new(),
-        );
+        let publisher = PyramidPublisher::new("https://dry-run.invalid".to_string(), String::new());
 
         let manifest = publisher
             .export_cache_manifest(&conn, "exp-slug", "wire:exp", None, true)
@@ -2639,10 +2620,7 @@ mod tests {
         };
         crate::pyramid::db::store_cache(&conn, &entry).unwrap();
 
-        let publisher = PyramidPublisher::new(
-            "https://dry-run.invalid".to_string(),
-            String::new(),
-        );
+        let publisher = PyramidPublisher::new("https://dry-run.invalid".to_string(), String::new());
 
         // Filter by build_id = b1 → one entry.
         let manifest_b1 = publisher
@@ -2666,7 +2644,10 @@ mod tests {
             .iter()
             .map(|n| n.cache_entries.len())
             .sum();
-        assert_eq!(total_entries_all, 2, "no build filter should yield 2 entries");
+        assert_eq!(
+            total_entries_all, 2,
+            "no build filter should yield 2 entries"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2687,21 +2668,17 @@ mod tests {
         )
         .unwrap();
 
-        let publisher = PyramidPublisher::new(
-            "https://dry-run.invalid".to_string(),
-            String::new(),
-        );
+        let publisher = PyramidPublisher::new("https://dry-run.invalid".to_string(), String::new());
 
         let manifest = publisher
             .export_cache_manifest(&conn, "exp-slug", "wire:exp", None, true)
             .unwrap()
             .unwrap();
-        let total_entries: usize = manifest
-            .nodes
-            .iter()
-            .map(|n| n.cache_entries.len())
-            .sum();
-        assert_eq!(total_entries, 0, "archived rows should not appear in manifest");
+        let total_entries: usize = manifest.nodes.iter().map(|n| n.cache_entries.len()).sum();
+        assert_eq!(
+            total_entries, 0,
+            "archived rows should not appear in manifest"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2714,10 +2691,7 @@ mod tests {
         seed_cache_row(&conn, "exp-slug", "source_extract", 0, 0, "r1");
         seed_cache_row(&conn, "exp-slug", "cluster_synthesize", -1, 1, "r2");
 
-        let publisher = PyramidPublisher::new(
-            "https://dry-run.invalid".to_string(),
-            String::new(),
-        );
+        let publisher = PyramidPublisher::new("https://dry-run.invalid".to_string(), String::new());
 
         let manifest = publisher
             .export_cache_manifest(&conn, "exp-slug", "wire:exp", None, true)
@@ -2773,9 +2747,7 @@ mod tests {
 
     // ── Phase 18c (L4): publish payload cache-manifest opt-in ──────────────
 
-    use crate::pyramid::pyramid_import::{
-        CacheManifest, ImportNodeEntry, ImportedCacheEntry,
-    };
+    use crate::pyramid::pyramid_import::{CacheManifest, ImportNodeEntry, ImportedCacheEntry};
     use crate::pyramid::wire_native_metadata::WireNativeMetadata;
 
     /// Construct a minimal valid `WireNativeMetadata` for the publish
@@ -2940,8 +2912,7 @@ mod tests {
 
         let obj = payload.as_object().unwrap();
         let attached = obj.get("cache_manifest_json").unwrap();
-        let round_trip: CacheManifest =
-            serde_json::from_value(attached.clone()).unwrap();
+        let round_trip: CacheManifest = serde_json::from_value(attached.clone()).unwrap();
         assert_eq!(round_trip.nodes.len(), 0);
     }
 

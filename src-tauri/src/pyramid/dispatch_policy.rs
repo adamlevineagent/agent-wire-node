@@ -316,7 +316,11 @@ impl DispatchPolicy {
             rules: yaml.routing_rules.clone(),
             escalation: yaml.escalation.clone().unwrap_or_default(),
             build_coordination: yaml.build_coordination.clone().unwrap_or_default(),
-            pool_configs: yaml.provider_pools.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            pool_configs: yaml
+                .provider_pools
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
             max_batch_cost_usd: yaml.max_batch_cost_usd,
             max_daily_cost_usd: yaml.max_daily_cost_usd,
         }
@@ -709,7 +713,11 @@ routing_rules:
             defer_dadbear_during_build: false,
         });
         let out = apply_local_mode_overlay(yaml, true);
-        assert!(out.build_coordination.unwrap().defer_maintenance_during_build);
+        assert!(
+            out.build_coordination
+                .unwrap()
+                .defer_maintenance_during_build
+        );
     }
 
     #[test]

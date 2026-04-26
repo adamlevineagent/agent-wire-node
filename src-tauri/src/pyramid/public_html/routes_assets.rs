@@ -49,7 +49,13 @@ pub fn asset_routes(
         .map(|| serve_asset("favicon.ico"))
         .boxed();
 
-    assets.or(robots).unify().boxed().or(favicon).unify().boxed()
+    assets
+        .or(robots)
+        .unify()
+        .boxed()
+        .or(favicon)
+        .unify()
+        .boxed()
 }
 
 /// Serve an asset by either its hashed or unhashed basename.

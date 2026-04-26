@@ -100,10 +100,7 @@ pub fn allocate_28_slots(weights: &[f64]) -> Result<Vec<u32>, RotatorAllocError>
     let target = ROTATOR_SOURCE_SLOTS;
 
     // Step 1: compute proportional (fractional) allocations.
-    let proportional: Vec<f64> = weights
-        .iter()
-        .map(|w| (w / sum) * target as f64)
-        .collect();
+    let proportional: Vec<f64> = weights.iter().map(|w| (w / sum) * target as f64).collect();
 
     // Step 2: floor each to an integer allocation.
     let mut slots: Vec<u32> = proportional.iter().map(|p| p.floor() as u32).collect();

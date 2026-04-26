@@ -1,0 +1,117 @@
+schema_version: 1
+id: starter-accretion-handler
+name: Accretion Handler — synthesize emergent patterns from recent annotations (Phase 7d)
+description: >
+  Callable-on-demand library chain that processes recent annotations on a
+  slug into an "accretion note" — a short synthesis of emergent patterns
+  the substrate is accumulating. Analogous to how `starter-synthesizer`
+  produces meta-layers from substrate nodes, but at the annotation level:
+  the accretion_handler reads what agents/users have been saying about
+  the slug recently and distills it through the lens of the slug's
+  active purpose.
+
+  Trigger investigation (Phase 7d orientation):
+    - Grepped for anything that might fire this: no scheduled task, no
+      cron hook, no existing event emits `accretion_*`. The genesis
+      role_name vocab entry binds `accretion_handler` → this chain, but
+      `dadbear_compiler::role_for_event` has no arm routing any event
+      type to the `accretion_handler` role today.
+    - Plausible future trigger: an annotation-volume threshold on
+      `annotation_written` (e.g. every N annotations since last
+      accretion), or a scheduled sweep. Both are Phase 9 design
+      clarifications — not shipped here.
+    - Ship as CALLABLE-ON-DEMAND with the full mechanical + LLM path
+      wired. The chain runs end-to-end today if invoked via
+      `call_starter_chain` or directly via `execute_chain_for_target`;
+      it is not a stub. The MISSING piece is a natural trigger, which
+      is a Phase 9 decision.
+
+  Input envelope (supplied by the caller):
+
+      {
+        "slug":      "<pyramid slug>",
+        "node_id":   "<optional — scope to annotations on one node>",
+        "window_n":  <int — REQUIRED cap on annotations loaded;
+                      Pillar 37: the caller's YAML / invocation sets
+                      the token-budget knob, not Rust. Typical
+                      values: 20 for LLM-friendly windows, 50 for
+                      heavier-context models. The mechanical
+                      primitive loud-raises if absent.>
+      }
+
+  Steps:
+    1. emit_accretion_invoked — chronicle trace (source="chain",
+       event_type="accretion_invoked").
+    2. load_recent_annotations_for_slug — mechanical read of the last
+       N annotations for the slug (optionally filtered by node_id),
+       together with the slug's active purpose text. Returns a
+       threaded envelope `{purpose_text, annotations: [...],
+       annotation_count}` consumed by the LLM step.
+    3. synthesize_accretion_note — LLM synthesis producing a structured
+       `{note, references}` object. `note` is the emergent-pattern
+       summary; `references` is the list of annotation ids the synthesis
+       drew on.
+    4. emit_accretion_written — chronicle trace recording the accretion
+       note (source="chain", event_type="accretion_written") with the
+       note body + references + `accretion_cursor` (max annotation id
+       the load step saw) in metadata so downstream FAQ / meta-layer
+       consumers can find and cite it AND so Phase 9 wiring can
+       reconstruct a cursor from the chronicle without an extra schema
+       migration. Phase 9+ decides whether to also persist as an
+       annotation contribution on a meta-layer node vs. keep it
+       chronicle-only, AND whether to back `accretion_cursor` with a
+       dedicated pyramid_slugs column for atomic cursor updates (today
+       repeated invocations on an unchanged window WILL re-emit the
+       same accretion note — known limitation flagged by 7d verifier).
+    5. finalize — terminal log_and_complete so the chain's output is the
+       LLM step's structured note, verbatim.
+
+  Temperature, token counts, and other knobs that shape LLM output live
+  in YAML (not Rust) per feedback_pillar37_no_hedging.
+content_type: code
+version: "1.0.0"
+author: post-build-accretion-v5
+
+defaults:
+  model_tier: mid
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  - name: emit_accretion_invoked
+    primitive: custom
+    mechanical: true
+    rust_function: emit_accretion_invoked
+
+  - name: load_recent_annotations_for_slug
+    primitive: custom
+    mechanical: true
+    rust_function: load_recent_annotations_for_slug
+
+  - name: synthesize_accretion_note
+    primitive: synthesize
+    instruction: $prompts/starter/synthesize_accretion_note.md
+    model_tier: mid
+    response_schema:
+      type: object
+      additionalProperties: false
+      required: [note, references]
+      properties:
+        note:
+          type: string
+        references:
+          type: array
+          items:
+            type: integer
+
+  - name: emit_accretion_written
+    primitive: custom
+    mechanical: true
+    rust_function: emit_accretion_written
+
+  - name: finalize
+    primitive: custom
+    mechanical: true
+    rust_function: log_and_complete
+
+post_build: []

@@ -112,10 +112,7 @@ impl VocabularyRegistry {
                         cmd.name, domain.domain
                     );
                 }
-                dispatch_table.insert(
-                    cmd.name.clone(),
-                    (cmd.dispatch.clone(), cmd.params.clone()),
-                );
+                dispatch_table.insert(cmd.name.clone(), (cmd.dispatch.clone(), cmd.params.clone()));
             }
         }
         VocabularyRegistry {
@@ -136,11 +133,8 @@ impl VocabularyRegistry {
                 out.push_str(&format!("{}\n", cmd.description));
 
                 // Only show user-facing params (source: args), not context-injected ones
-                let user_params: Vec<&ParamDef> = cmd
-                    .params
-                    .iter()
-                    .filter(|p| p.source == "args")
-                    .collect();
+                let user_params: Vec<&ParamDef> =
+                    cmd.params.iter().filter(|p| p.source == "args").collect();
 
                 if !user_params.is_empty() {
                     out.push_str("Args: { ");
@@ -198,9 +192,16 @@ impl VocabularyRegistry {
                         ref headers,
                     } => {
                         self.validate_api_dispatch(
-                            &domain.domain, &cmd.name, method, path,
-                            body_map.as_ref(), query_map.as_ref(), headers.as_ref(),
-                            &cmd.params, &allowed_path_prefixes, &allowed_methods,
+                            &domain.domain,
+                            &cmd.name,
+                            method,
+                            path,
+                            body_map.as_ref(),
+                            query_map.as_ref(),
+                            headers.as_ref(),
+                            &cmd.params,
+                            &allowed_path_prefixes,
+                            &allowed_methods,
                             &mut errors,
                         );
                     }
@@ -211,9 +212,16 @@ impl VocabularyRegistry {
                         ref query_map,
                     } => {
                         self.validate_api_dispatch(
-                            &domain.domain, &cmd.name, method, path,
-                            body_map.as_ref(), query_map.as_ref(), None,
-                            &cmd.params, &allowed_path_prefixes, &allowed_methods,
+                            &domain.domain,
+                            &cmd.name,
+                            method,
+                            path,
+                            body_map.as_ref(),
+                            query_map.as_ref(),
+                            None,
+                            &cmd.params,
+                            &allowed_path_prefixes,
+                            &allowed_methods,
                             &mut errors,
                         );
                     }
@@ -410,21 +418,66 @@ pub fn load_from_directory(dir: &std::path::Path) -> Result<VocabularyRegistry, 
 /// Load bundled vocabulary compiled into the binary.
 pub fn load_bundled() -> VocabularyRegistry {
     let yaml_files: &[(&str, &str)] = &[
-        ("fleet_manage", include_str!("../../chains/vocabulary_yaml/fleet_manage.yaml")),
-        ("fleet_mesh", include_str!("../../chains/vocabulary_yaml/fleet_mesh.yaml")),
-        ("fleet_tasks", include_str!("../../chains/vocabulary_yaml/fleet_tasks.yaml")),
-        ("knowledge_docs", include_str!("../../chains/vocabulary_yaml/knowledge_docs.yaml")),
-        ("knowledge_sync", include_str!("../../chains/vocabulary_yaml/knowledge_sync.yaml")),
-        ("navigate", include_str!("../../chains/vocabulary_yaml/navigate.yaml")),
-        ("pyramid_build", include_str!("../../chains/vocabulary_yaml/pyramid_build.yaml")),
-        ("pyramid_explore", include_str!("../../chains/vocabulary_yaml/pyramid_explore.yaml")),
-        ("pyramid_manage", include_str!("../../chains/vocabulary_yaml/pyramid_manage.yaml")),
-        ("system", include_str!("../../chains/vocabulary_yaml/system.yaml")),
-        ("wire_compose", include_str!("../../chains/vocabulary_yaml/wire_compose.yaml")),
-        ("wire_economics", include_str!("../../chains/vocabulary_yaml/wire_economics.yaml")),
-        ("wire_games", include_str!("../../chains/vocabulary_yaml/wire_games.yaml")),
-        ("wire_search", include_str!("../../chains/vocabulary_yaml/wire_search.yaml")),
-        ("wire_social", include_str!("../../chains/vocabulary_yaml/wire_social.yaml")),
+        (
+            "fleet_manage",
+            include_str!("../../chains/vocabulary_yaml/fleet_manage.yaml"),
+        ),
+        (
+            "fleet_mesh",
+            include_str!("../../chains/vocabulary_yaml/fleet_mesh.yaml"),
+        ),
+        (
+            "fleet_tasks",
+            include_str!("../../chains/vocabulary_yaml/fleet_tasks.yaml"),
+        ),
+        (
+            "knowledge_docs",
+            include_str!("../../chains/vocabulary_yaml/knowledge_docs.yaml"),
+        ),
+        (
+            "knowledge_sync",
+            include_str!("../../chains/vocabulary_yaml/knowledge_sync.yaml"),
+        ),
+        (
+            "navigate",
+            include_str!("../../chains/vocabulary_yaml/navigate.yaml"),
+        ),
+        (
+            "pyramid_build",
+            include_str!("../../chains/vocabulary_yaml/pyramid_build.yaml"),
+        ),
+        (
+            "pyramid_explore",
+            include_str!("../../chains/vocabulary_yaml/pyramid_explore.yaml"),
+        ),
+        (
+            "pyramid_manage",
+            include_str!("../../chains/vocabulary_yaml/pyramid_manage.yaml"),
+        ),
+        (
+            "system",
+            include_str!("../../chains/vocabulary_yaml/system.yaml"),
+        ),
+        (
+            "wire_compose",
+            include_str!("../../chains/vocabulary_yaml/wire_compose.yaml"),
+        ),
+        (
+            "wire_economics",
+            include_str!("../../chains/vocabulary_yaml/wire_economics.yaml"),
+        ),
+        (
+            "wire_games",
+            include_str!("../../chains/vocabulary_yaml/wire_games.yaml"),
+        ),
+        (
+            "wire_search",
+            include_str!("../../chains/vocabulary_yaml/wire_search.yaml"),
+        ),
+        (
+            "wire_social",
+            include_str!("../../chains/vocabulary_yaml/wire_social.yaml"),
+        ),
     ];
 
     let mut domains = Vec::new();
@@ -462,7 +515,15 @@ mod tests {
 
         // Check prompt text
         let prompt = registry.to_prompt_text();
-        println!("\n--- PROMPT TEXT ({} chars) ---\n{}", prompt.len(), &prompt[..500.min(prompt.len())]);
-        assert!(prompt.len() > 1000, "Prompt text too short: {} chars", prompt.len());
+        println!(
+            "\n--- PROMPT TEXT ({} chars) ---\n{}",
+            prompt.len(),
+            &prompt[..500.min(prompt.len())]
+        );
+        assert!(
+            prompt.len() > 1000,
+            "Prompt text too short: {} chars",
+            prompt.len()
+        );
     }
 }

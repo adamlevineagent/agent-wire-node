@@ -94,7 +94,9 @@ impl Expr {
                         let result = match op {
                             BinaryOp::Eq => ls == rs,
                             BinaryOp::Neq => ls != rs,
-                            _ => bail!("ordered comparison (>, <, >=, <=) not supported for strings"),
+                            _ => {
+                                bail!("ordered comparison (>, <, >=, <=) not supported for strings")
+                            }
                         };
                         return Ok(Value::Bool(result));
                     }
@@ -105,7 +107,9 @@ impl Expr {
                         let result = match op {
                             BinaryOp::Eq => lb == rb,
                             BinaryOp::Neq => lb != rb,
-                            _ => bail!("ordered comparison (>, <, >=, <=) not supported for booleans"),
+                            _ => bail!(
+                                "ordered comparison (>, <, >=, <=) not supported for booleans"
+                            ),
                         };
                         return Ok(Value::Bool(result));
                     }
@@ -510,7 +514,8 @@ impl<'a> Parser<'a> {
         let quote = self.peek().unwrap();
         self.cursor += 1; // consume opening quote
         let start = self.cursor;
-        while self.cursor < self.input.len() && self.input.as_bytes()[self.cursor] as char != quote {
+        while self.cursor < self.input.len() && self.input.as_bytes()[self.cursor] as char != quote
+        {
             self.cursor += 1;
         }
         let s = self.input[start..self.cursor].to_string();

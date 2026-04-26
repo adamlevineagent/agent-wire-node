@@ -1,0 +1,56 @@
+schema_version: 1
+id: starter-cascade-judge-gated
+name: Cascade Handler — Judge-gated (v5 default for new pyramids)
+description: >
+  Starter cascade_handler binding for NEW v5 pyramids. The v5 model gates
+  cascade re-distills behind an LLM judge decision: no re-distill unless the
+  judge sees enough change to warrant it.
+
+  Phase 6 flow:
+    1. emit_cascade_handler_invoked — mechanical chronicle write.
+    2. judge_cascade_relevance — LLM classify step, structured output
+       { decision: "redistill" | "skip", reasoning: string }.
+    3. queue_redistill_if_warranted — mechanical queue_re_distill_for_target,
+       guarded by when: $judge_cascade_relevance.decision == "redistill".
+
+  When the judge says "skip" the guarded step is silently passed over and
+  the chain completes with the judge's output as its final value. When the
+  judge says "redistill" a re_distill work item is enqueued exactly as the
+  immediate-redistill variant would have done unconditionally.
+content_type: code
+version: "1.0.0"
+author: post-build-accretion-v5
+
+defaults:
+  model_tier: mid
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  - name: emit_cascade_invoked
+    primitive: custom
+    mechanical: true
+    rust_function: emit_cascade_handler_invoked
+
+  - name: judge_cascade_relevance
+    primitive: classify
+    instruction: $prompts/starter/judge_cascade_relevance.md
+    model_tier: mid
+    response_schema:
+      type: object
+      additionalProperties: false
+      required: [decision, reasoning]
+      properties:
+        decision:
+          type: string
+          enum: [redistill, skip]
+        reasoning:
+          type: string
+
+  - name: queue_redistill_if_warranted
+    primitive: custom
+    mechanical: true
+    rust_function: queue_re_distill_for_target
+    when: $judge_cascade_relevance.decision == "redistill"
+
+post_build: []

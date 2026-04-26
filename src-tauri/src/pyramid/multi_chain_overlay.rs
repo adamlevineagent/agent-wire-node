@@ -234,7 +234,14 @@ mod tests {
         let sig = ingest::ingest_signature(&ContentType::Code, &config);
 
         // Add overlay
-        add_chain_overlay(&conn, "source-pyramid", "retro-overlay", "chain-retro", &sig).unwrap();
+        add_chain_overlay(
+            &conn,
+            "source-pyramid",
+            "retro-overlay",
+            "chain-retro",
+            &sig,
+        )
+        .unwrap();
 
         // Retrieve overlays for source
         let overlays = get_overlays_for_source(&conn, "source-pyramid").unwrap();
@@ -315,7 +322,11 @@ mod tests {
 
         // Active overlays should now be empty
         let overlays = get_overlays_for_source(&conn, "source-pyramid").unwrap();
-        assert_eq!(overlays.len(), 0, "Removed overlay should not appear in active list");
+        assert_eq!(
+            overlays.len(),
+            0,
+            "Removed overlay should not appear in active list"
+        );
 
         // But the row still exists in the DB (soft delete)
         let count: i64 = conn
@@ -329,6 +340,9 @@ mod tests {
 
         // Removing again should return false (already removed)
         let removed_again = remove_chain_overlay(&conn, "source-pyramid", "to-remove").unwrap();
-        assert!(!removed_again, "Should return false when overlay already removed");
+        assert!(
+            !removed_again,
+            "Should return false when overlay already removed"
+        );
     }
 }

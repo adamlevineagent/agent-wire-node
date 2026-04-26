@@ -674,8 +674,12 @@ mod tests {
 
     /// Return the fallback_model_1 from LlmConfig defaults.
     /// All test chains use this instead of hardcoding "qwen/qwen3.5-flash-02-23".
+    ///
+    /// W3c: `fallback_model_1` field was deleted from LlmConfig. Tests
+    /// that just need *some* slug string for assertions use a fixed
+    /// sentinel here.
     fn test_fallback_model() -> String {
-        LlmConfig::default().fallback_model_1
+        "test-fallback-1".to_string()
     }
 
     fn make_defaults() -> ChainDefaults {

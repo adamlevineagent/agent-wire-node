@@ -445,9 +445,7 @@ mod tests {
     fn round_trips_well_formed_tunnel_state() {
         let original = TunnelState {
             tunnel_id: Some("tun-abc123".to_string()),
-            tunnel_url: Some(
-                TunnelUrl::parse("https://example.com").expect("valid url"),
-            ),
+            tunnel_url: Some(TunnelUrl::parse("https://example.com").expect("valid url")),
             tunnel_token: Some("secret-token".to_string()),
             status: TunnelConnectionStatus::Connected,
         };
@@ -477,7 +475,10 @@ mod tests {
             serde_json::from_str(json).expect("outer deserialize must not fail");
 
         assert_eq!(decoded.tunnel_id.as_deref(), Some("tun-xyz"));
-        assert!(decoded.tunnel_url.is_none(), "empty url must fall back to None");
+        assert!(
+            decoded.tunnel_url.is_none(),
+            "empty url must fall back to None"
+        );
         assert_eq!(decoded.tunnel_token.as_deref(), Some("tok"));
         assert_eq!(decoded.status, TunnelConnectionStatus::Connected);
     }
@@ -497,7 +498,10 @@ mod tests {
             serde_json::from_str(json).expect("outer deserialize must not fail");
 
         assert_eq!(decoded.tunnel_id.as_deref(), Some("tun-xyz"));
-        assert!(decoded.tunnel_url.is_none(), "malformed url must fall back to None");
+        assert!(
+            decoded.tunnel_url.is_none(),
+            "malformed url must fall back to None"
+        );
         assert_eq!(decoded.tunnel_token.as_deref(), Some("tok"));
         assert_eq!(decoded.status, TunnelConnectionStatus::Disconnected);
     }
@@ -558,7 +562,10 @@ mod tests {
             serde_json::from_str(json).expect("outer deserialize must not fail");
 
         assert_eq!(decoded.tunnel_id.as_deref(), Some("tun-null"));
-        assert!(decoded.tunnel_url.is_none(), "null must deserialize to None");
+        assert!(
+            decoded.tunnel_url.is_none(),
+            "null must deserialize to None"
+        );
         assert_eq!(decoded.tunnel_token.as_deref(), Some("tok"));
         assert_eq!(decoded.status, TunnelConnectionStatus::Disconnected);
     }

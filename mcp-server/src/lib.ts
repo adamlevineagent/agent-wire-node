@@ -9,8 +9,248 @@ import { homedir } from "node:os";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-export const WIRE_NODE_BASE_URL = "http://localhost:8765";
+// Base URL for the Wire node HTTP API. Read lazily from
+// `PYRAMID_MCP_BASE_URL` at call time so test harnesses that set the
+// env AFTER importing still get the override. The `WIRE_NODE_BASE_URL`
+// export stays for back-compat with existing callers that read it at
+// module scope (they get whatever was set at their first read).
+export function getWireNodeBaseUrl(): string {
+  return process.env.PYRAMID_MCP_BASE_URL ?? "http://localhost:8765";
+}
+export const WIRE_NODE_BASE_URL: string = getWireNodeBaseUrl();
 export const REQUEST_TIMEOUT_MS = 10_000;
+
+/**
+ * Annotation type vocabulary. Phase 6c-C flipped this from a hardcoded
+ * `as const` tuple to a dynamic fetch against `GET /vocabulary/annotation_type`
+ * (the zero-auth registry endpoint that 6c-A shipped). An operator that
+ * publishes a new vocab entry via a contribution write (e.g. `counter_correction`)
+ * is now accepted through every TS surface — MCP Zod validation, CLI help
+ * text, TOOL_CATALOG render — without a code deploy.
+ *
+ * The fallback below is genesis parity for the failure-mode case: if the
+ * Wire node is down at MCP startup we keep the 11 known-good types so
+ * the MCP server doesn't hard-fail. Any drift here silently divergens
+ * from the genesis seed; keep the list exactly in lock-step with
+ * `src-tauri/src/pyramid/vocab_genesis.rs::GENESIS_ANNOTATION_TYPES`.
+ *
+ * `AnnotationType` is now a plain `string` alias — the old union-of-literals
+ * made consumers reject valid operator-published types at compile time.
+ */
+export type AnnotationType = string;
+
+/** Genesis fallback. Used ONLY when the vocab fetch fails — keeps MCP
+ * alive in a graceful-degraded state. Named decision, see ambiguous
+ * decisions in the Phase 6c-C report. */
+export const FALLBACK_ANNOTATION_TYPES: readonly string[] = [
+  "observation",
+  "correction",
+  "question",
+  "friction",
+  "idea",
+  "era",
+  "transition",
+  "health_check",
+  "directory",
+  "steel_man",
+  "red_team",
+];
+
+/** One `VocabEntry` entry as returned by `GET /vocabulary/:vocab_kind`.
+ * Mirrors `VocabListItem` in `src-tauri/src/pyramid/vocab_entries.rs`. */
+export interface VocabEntry {
+  name: string;
+  description: string;
+  handler_chain_id: string | null;
+  reactive: boolean;
+  creates_delta: boolean;
+}
+
+/** Response shape from `GET /vocabulary/:vocab_kind`. */
+export interface VocabListResponse {
+  vocab_kind: string;
+  entries: VocabEntry[];
+}
+
+// ── Vocabulary Cache (Phase 6c-C) ────────────────────────────────────────────
+// Module-scope Map<vocab_kind, VocabCacheSlot> populated by
+// `fetchVocabulary`. Background refresh on a 60s TTL. Opportunistic
+// refresh when validation against a fresh caller-provided type fails.
+
+interface VocabCacheSlot {
+  entries: VocabEntry[];
+  names: Set<string>;
+  fetchedAt: number;
+  /** Whether the slot is a fallback (fetch failed). Helps callers decide
+   * whether to force-refresh on validation miss. */
+  isFallback: boolean;
+}
+
+const VOCAB_CACHE: Map<string, VocabCacheSlot> = new Map();
+const VOCAB_TTL_MS = 60_000; // 60s — vocab changes are rare but not unheard of
+
+/** Fetch a vocab kind from the Wire node. Zero-auth endpoint. Returns
+ * the parsed entries on success, or null on failure (caller applies
+ * fallback). */
+async function fetchVocabRaw(
+  vocabKind: string
+): Promise<VocabEntry[] | null> {
+  const url = `${getWireNodeBaseUrl()}/vocabulary/${encodeURIComponent(vocabKind)}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const resp = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (!resp.ok) return null;
+    const body = (await resp.json()) as VocabListResponse;
+    if (!Array.isArray(body?.entries)) return null;
+    return body.entries;
+  } catch {
+    clearTimeout(timeout);
+    return null;
+  }
+}
+
+/** Populate/refresh a vocab cache slot. Uses the Wire node endpoint
+ * and falls back to the hardcoded genesis set on failure (only for
+ * `annotation_type` — other kinds get an empty fallback). Returns the
+ * slot. */
+export async function refreshVocabulary(
+  vocabKind: string
+): Promise<VocabCacheSlot> {
+  const entries = await fetchVocabRaw(vocabKind);
+  if (entries !== null) {
+    const slot: VocabCacheSlot = {
+      entries,
+      names: new Set(entries.map((e) => e.name)),
+      fetchedAt: Date.now(),
+      isFallback: false,
+    };
+    VOCAB_CACHE.set(vocabKind, slot);
+    return slot;
+  }
+
+  // Fetch failed — install a fallback. We don't hard-fail MCP startup.
+  const fallbackNames =
+    vocabKind === "annotation_type" ? [...FALLBACK_ANNOTATION_TYPES] : [];
+  const slot: VocabCacheSlot = {
+    entries: fallbackNames.map((name) => ({
+      name,
+      description: "(fallback — Wire node unreachable at fetch time)",
+      handler_chain_id: null,
+      reactive: false,
+      creates_delta: name === "correction",
+    })),
+    names: new Set(fallbackNames),
+    fetchedAt: Date.now(),
+    isFallback: true,
+  };
+  VOCAB_CACHE.set(vocabKind, slot);
+  if (!process.env.PYRAMID_MCP_QUIET) {
+    console.error(
+      `[pyramid] WARNING: vocabulary fetch for '${vocabKind}' failed; ` +
+        `cache is serving a ${fallbackNames.length}-entry fallback. ` +
+        `Validation will still run against the fallback — newly-published ` +
+        `operator vocab entries will be rejected until the next successful fetch.`
+    );
+  }
+  return slot;
+}
+
+/** Get the current vocab cache slot for a kind, populating or
+ * refreshing it if empty / stale. If `forceRefresh` is true, bypass
+ * the TTL and hit the network. */
+async function getVocabSlot(
+  vocabKind: string,
+  forceRefresh = false
+): Promise<VocabCacheSlot> {
+  const existing = VOCAB_CACHE.get(vocabKind);
+  const stale =
+    !existing ||
+    Date.now() - existing.fetchedAt > VOCAB_TTL_MS ||
+    existing.isFallback;
+  if (!forceRefresh && existing && !stale) {
+    return existing;
+  }
+  return refreshVocabulary(vocabKind);
+}
+
+/** Get the currently-cached annotation type names. Dynamic version of
+ * the former static `ANNOTATION_TYPES`. Returns the cache (populating
+ * if empty) — callers that want a fresh read should first call
+ * `refreshAnnotationTypes()`. */
+export async function getAnnotationTypes(): Promise<readonly string[]> {
+  const slot = await getVocabSlot("annotation_type");
+  return Array.from(slot.names).sort();
+}
+
+/** Synchronous read from the cache. Returns null if the cache hasn't
+ * been populated yet. Used by help-text rendering paths where we don't
+ * want to async-wait. */
+export function getAnnotationTypesSync(): readonly string[] | null {
+  const slot = VOCAB_CACHE.get("annotation_type");
+  if (!slot) return null;
+  return Array.from(slot.names).sort();
+}
+
+/** Force a refresh of the annotation_type vocabulary. Called on
+ * startup and on opportunistic validation-miss (e.g. when a caller
+ * submits a type that's not in the current cache but may exist in a
+ * freshly-published vocab entry). */
+export async function refreshAnnotationTypes(): Promise<readonly string[]> {
+  const slot = await refreshVocabulary("annotation_type");
+  return Array.from(slot.names).sort();
+}
+
+/** Validate a candidate annotation type against the cache. If the
+ * type is missing from the current cache, force a refresh once and
+ * re-check — that handles the "operator just published a new vocab
+ * entry; cache is stale" path without a code deploy. Returns the
+ * canonical name on success, or a structured error with a helpful
+ * hint on failure. */
+export async function validateAnnotationType(
+  candidate: string
+): Promise<
+  | { ok: true; name: string }
+  | { ok: false; error: string; validTypes: readonly string[] }
+> {
+  let slot = await getVocabSlot("annotation_type");
+  if (!slot.names.has(candidate)) {
+    // Cache-miss refresh — maybe an operator just published it.
+    slot = await refreshVocabulary("annotation_type");
+  }
+  if (slot.names.has(candidate)) {
+    return { ok: true, name: candidate };
+  }
+  const validTypes = Array.from(slot.names).sort();
+  return {
+    ok: false,
+    validTypes,
+    error:
+      `Unknown annotation_type '${candidate}'. ` +
+      `Valid types: ${validTypes.join(", ")}. ` +
+      `To add a new type, publish a vocabulary_entry contribution ` +
+      `via the Rust API (pyramid::vocab_entries::publish_vocabulary_entry) — ` +
+      `no code deploy required.`,
+  };
+}
+
+/** Render a pipe-wrapped vocabulary list for help-text surfaces. Takes
+ * an explicit list so both sync (post-fetch) and fallback paths can
+ * share the wrap logic. */
+export function renderVocabTypeList(types: readonly string[], indent: string): string {
+  if (types.length === 0) {
+    return "(vocab not loaded yet — run `pyramid-cli annotate --help` after Wire node is up)";
+  }
+  const arr = [...types];
+  const first = arr.slice(0, 5).join(" | ");
+  const rest = arr.slice(5);
+  if (rest.length === 0) return first;
+  const mid = rest.slice(0, 4).join(" | ");
+  const last = rest.slice(4).join(" | ");
+  if (last.length === 0) return `${first} |\n${indent}${mid}`;
+  return `${first} |\n${indent}${mid} |\n${indent}${last}`;
+}
 
 // ── Auth Token Resolution ────────────────────────────────────────────────────
 
@@ -61,7 +301,7 @@ export async function pyramidFetch(
   options: { method?: string; body?: unknown; authToken: string }
 ): Promise<PyramidResponse> {
   const { method = "GET", body, authToken } = options;
-  const url = `${WIRE_NODE_BASE_URL}${path}`;
+  const url = `${getWireNodeBaseUrl()}${path}`;
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -401,7 +641,7 @@ export const TOOL_CATALOG: CatalogEntry[] = [
     flags: [
       { name: "question", type: "string", description: "Question this answers (triggers FAQ)" },
       { name: "author", type: "string", description: "Your agent name", default: "cli-agent" },
-      { name: "type", type: "string", description: "observation | correction | question | friction | idea", default: "observation" },
+      { name: "type", type: "string", description: "__DYNAMIC_ANNOTATION_TYPES__", default: "observation" },
     ],
     examples: ["pyramid-cli annotate my-pyramid L0-012 \"Finding text\" --question \"What does X do?\" --author my-agent --type observation"],
     related: ["annotations", "drill", "faq"],
@@ -743,6 +983,30 @@ export const TOOL_CATALOG: CatalogEntry[] = [
   },
 ];
 
+/** Replace the `__DYNAMIC_ANNOTATION_TYPES__` marker in a catalog entry
+ * with the currently-cached list. Rendered at catalog-lookup time so
+ * operators who publish a new type see it in `pyramid-cli help annotate`
+ * on the next CLI run (cache is per-process). */
+function expandDynamicCatalogEntry(entry: CatalogEntry): CatalogEntry {
+  if (!entry.flags || entry.flags.length === 0) return entry;
+  const types =
+    getAnnotationTypesSync() ?? [...FALLBACK_ANNOTATION_TYPES];
+  const rendered = types.join(" | ");
+  let touched = false;
+  const flags = entry.flags.map((f) => {
+    if (f.description === "__DYNAMIC_ANNOTATION_TYPES__") {
+      touched = true;
+      return { ...f, description: rendered };
+    }
+    return f;
+  });
+  return touched ? { ...entry, flags } : entry;
+}
+
+function expandDynamicCatalog(entries: CatalogEntry[]): CatalogEntry[] {
+  return entries.map(expandDynamicCatalogEntry);
+}
+
 /** Get the full structured catalog. */
 export function getToolCatalog(): {
   version: string;
@@ -754,16 +1018,17 @@ export function getToolCatalog(): {
     version: TOOL_CATALOG_VERSION,
     total_commands: TOOL_CATALOG.length,
     categories: TOOL_CATALOG_CATEGORIES,
-    commands: TOOL_CATALOG,
+    commands: expandDynamicCatalog(TOOL_CATALOG),
   };
 }
 
 /** Get catalog entries filtered by category. */
 export function getToolCatalogByCategory(category: string): CatalogEntry[] {
-  return TOOL_CATALOG.filter((e) => e.category === category);
+  return expandDynamicCatalog(TOOL_CATALOG.filter((e) => e.category === category));
 }
 
 /** Get catalog entry for a specific command (by CLI name or MCP tool name). */
 export function getToolCatalogEntry(name: string): CatalogEntry | undefined {
-  return TOOL_CATALOG.find((e) => e.cli === name || e.mcp === name);
+  const entry = TOOL_CATALOG.find((e) => e.cli === name || e.mcp === name);
+  return entry ? expandDynamicCatalogEntry(entry) : undefined;
 }

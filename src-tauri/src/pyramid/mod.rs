@@ -29,14 +29,10 @@ pub mod compute_market_ops;
 pub mod compute_quote_flow;
 pub mod config_contributions;
 pub mod config_helper;
-pub mod prompt_cache;
-pub mod pyramid_import;
-pub mod rotator_allocation;
-pub mod step_context;
-pub mod wire_native_metadata;
 pub mod converge_expand;
 pub mod cost_model;
 pub mod credentials;
+pub mod cross_pyramid_router;
 pub mod crystallization;
 pub mod dadbear_compiler;
 pub mod dadbear_extend;
@@ -44,23 +40,22 @@ pub mod dadbear_preview;
 pub mod dadbear_supervisor;
 pub mod db;
 pub mod defaults_adapter;
-pub mod demand_gen;
 pub mod delta;
+pub mod demand_gen;
 pub mod demand_signal;
-pub mod triage;
-pub mod reroll;
-pub mod cross_pyramid_router;
+pub mod dispatch_policy;
 pub mod event_bus;
 pub mod event_chain;
-pub mod public_html;
-pub mod question_build;
 pub mod evidence_answering;
 pub mod execution_plan;
 pub mod execution_state;
 pub mod expression;
 pub mod extraction_schema;
 pub mod faq;
+pub mod fleet_delivery_policy;
 pub mod fleet_identity;
+pub mod fleet_mps;
+pub mod fleet_outbox_sweep;
 pub mod folder_ingestion;
 pub mod generative_config;
 pub mod ingest;
@@ -69,73 +64,92 @@ pub mod local_mode;
 pub mod local_store;
 pub mod lock_manager;
 pub mod manifest;
-pub mod meta;
-pub mod migration_config;
-pub mod multi_chain_overlay;
-pub mod naming;
-pub mod observation_events;
-pub mod parity;
-pub mod payment_redeemer;
-pub mod preview;
-pub mod primer;
-pub mod provider;
-pub mod provider_health;
-pub mod openrouter_webhook;
-pub mod publication;
-pub mod query;
-pub mod question_compiler;
-pub mod reading_modes;
-pub mod question_decomposition;
-pub mod question_loader;
-pub mod question_retrieve;
-pub mod question_yaml;
-pub mod reconciliation;
-pub mod recovery;
-pub mod routes;
-pub mod routes_operator;
-pub mod slug;
-pub mod stale_engine;
-pub mod stale_helpers;
-pub mod stale_helpers_upper;
-pub mod staleness;
-pub mod staleness_bridge;
-pub mod supersession;
-pub mod sync;
-pub mod transform_runtime;
-pub mod tunnel_url;
-pub mod types;
-pub mod vine;
-pub mod vine_composition;
-pub mod vine_prompts;
-pub mod vocabulary;
-pub mod watcher;
-pub mod webbing;
-pub mod schema_registry;
-#[cfg(test)]
-pub mod test_phase9_wanderer;
-pub mod wire_discovery;
-pub mod wire_import;
-pub mod wire_migration;
-pub mod wire_publish;
-pub mod wire_pull;
-pub mod wire_update_poller;
-pub mod yaml_renderer;
-pub mod dispatch_policy;
-pub mod fleet_delivery_policy;
-pub mod fleet_mps;
-pub mod fleet_outbox_sweep;
 pub mod market_delivery;
 pub mod market_delivery_policy;
 pub mod market_dispatch;
 pub mod market_identity;
 pub mod market_mirror;
 pub mod market_surface_cache;
-pub mod pending_jobs;
-pub mod result_delivery_identity;
 pub mod messages;
+pub mod meta;
+pub mod migration_config;
+pub mod multi_chain_overlay;
+pub mod naming;
+pub mod observation_events;
+pub mod openrouter_webhook;
+pub mod parity;
+pub mod payment_redeemer;
+pub mod pending_jobs;
+pub mod preview;
+pub mod primer;
+pub mod prompt_cache;
 pub mod prompt_materializer;
+pub mod provider;
+pub mod provider_health;
 pub mod provider_pools;
+pub mod public_html;
+pub mod publication;
+pub mod purpose;
+pub mod pyramid_import;
+pub mod pyramid_scheduler;
+pub mod query;
+pub mod question_build;
+pub mod question_compiler;
+pub mod question_decomposition;
+pub mod question_loader;
+pub mod question_retrieve;
+pub mod question_yaml;
+pub mod reading_modes;
+pub mod reconciliation;
+pub mod recovery;
+pub mod reroll;
+pub mod result_delivery_identity;
+pub mod role_binding;
+pub mod rotator_allocation;
+pub mod routes;
+pub mod routes_operator;
+pub mod schema_registry;
+pub mod slug;
+pub mod stale_engine;
+pub mod stale_helpers;
+pub mod stale_helpers_upper;
+pub mod staleness;
+pub mod staleness_bridge;
+pub mod step_context;
+pub mod supersession;
+pub mod sync;
+#[cfg(test)]
+pub mod test_phase9_wanderer;
+pub mod transform_runtime;
+pub mod triage;
+pub mod tunnel_url;
+pub mod types;
+pub mod v3_migration;
+pub mod vine;
+pub mod vine_composition;
+pub mod vine_prompts;
 pub mod viz_config;
+pub mod vocab_entries;
+pub mod vocab_genesis;
+pub mod vocabulary;
+pub mod walker_breaker;
+pub mod walker_cache;
+pub mod walker_decision;
+pub mod walker_fleet_probe;
+pub mod walker_market_probe;
+pub mod walker_ollama_probe;
+pub mod walker_readiness;
+pub mod walker_resolver;
+pub mod watcher;
+pub mod webbing;
+pub mod wire_discovery;
+pub mod wire_import;
+pub mod wire_migration;
+pub mod wire_native_metadata;
+pub mod wire_publish;
+pub mod wire_pull;
+pub mod wire_update_poller;
+pub mod yaml_renderer;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -162,9 +176,15 @@ use self::watcher::PyramidFileWatcher;
 ///   Set via the desktop app Settings → API Key, or manually in the JSON file.
 ///   All requests must include header: `Authorization: Bearer <auth_token>`
 /// - `openrouter_api_key`: API key for LLM calls via OpenRouter.
-/// - `primary_model`: Default LLM model (default: `inception/mercury-2`).
 /// - `use_ir_executor`: Enable the IR-based chain executor (default: false).
 ///   Toggle at runtime via: `POST /pyramid/config` with `{"use_ir_executor": true}`
+///
+/// Walker v3 (W3c): the legacy `primary_model` / `fallback_model_1` /
+/// `fallback_model_2` fields were deleted. Model selection flows through
+/// the walker Decision spine: `walker_provider_openrouter.model_list[tier]`
+/// is the authoritative source. Pre-W3c configs with those fields on
+/// disk still parse (serde ignores unknown fields when `deny_unknown_fields`
+/// is absent); W4 rewrites the on-disk `pyramid_config.json` to drop them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PyramidConfig {
     #[serde(default)]
@@ -173,16 +193,16 @@ pub struct PyramidConfig {
     /// Set in this config file or via the desktop app Settings → API Key.
     #[serde(default)]
     pub auth_token: String,
-    #[serde(default = "default_primary_model")]
-    pub primary_model: String,
-    #[serde(default = "default_fallback_1")]
-    pub fallback_model_1: String,
-    #[serde(default = "default_fallback_2")]
-    pub fallback_model_2: String,
     #[serde(default = "default_partner_model")]
     pub partner_model: String,
     #[serde(default = "default_collapse_model")]
     pub collapse_model: String,
+    /// W3c: parsed-but-ignored serde residue. Preserves compat for old
+    /// install configs that have `{use_chain_engine: false}` persisted;
+    /// the chain engine is always on at runtime, so the value is never
+    /// read. Phase 6's chain-engine-enable-ack onboarding migrates old
+    /// configs out; the field will retire with that work.
+    #[allow(dead_code)]
     #[serde(default)]
     pub use_chain_engine: bool,
     #[serde(default)]
@@ -208,15 +228,6 @@ pub struct PyramidConfig {
     pub model_aliases: HashMap<String, String>,
 }
 
-fn default_primary_model() -> String {
-    "inception/mercury-2".into()
-}
-fn default_fallback_1() -> String {
-    "qwen/qwen3.5-flash-02-23".into()
-}
-fn default_fallback_2() -> String {
-    "x-ai/grok-4.20-beta".into()
-}
 fn default_partner_model() -> String {
     "xiaomi/mimo-v2-pro".into()
 }
@@ -553,9 +564,6 @@ impl Default for PyramidConfig {
         Self {
             openrouter_api_key: String::new(),
             auth_token: String::new(),
-            primary_model: default_primary_model(),
-            fallback_model_1: default_fallback_1(),
-            fallback_model_2: default_fallback_2(),
             partner_model: default_partner_model(),
             collapse_model: default_collapse_model(),
             use_chain_engine: true,
@@ -598,9 +606,15 @@ impl PyramidConfig {
         // machine. The canonical location is preferred; the legacy
         // location is a fallback so existing profile sets keep working
         // until the operator copies them over.
-        let canonical = data_dir.join("profiles").join(format!("{}.json", profile_name));
-        let legacy = dirs::home_dir()
-            .map(|h| h.join(".gemini").join("wire-node").join("profiles").join(format!("{}.json", profile_name)));
+        let canonical = data_dir
+            .join("profiles")
+            .join(format!("{}.json", profile_name));
+        let legacy = dirs::home_dir().map(|h| {
+            h.join(".gemini")
+                .join("wire-node")
+                .join("profiles")
+                .join(format!("{}.json", profile_name))
+        });
         let profile_path = if canonical.exists() {
             canonical
         } else if let Some(legacy_path) = legacy.filter(|p| p.exists()) {
@@ -614,7 +628,11 @@ impl PyramidConfig {
         };
 
         if !profile_path.exists() {
-            return Err(anyhow::anyhow!("Profile '{}' not found at {:?}", profile_name, profile_path));
+            return Err(anyhow::anyhow!(
+                "Profile '{}' not found at {:?}",
+                profile_name,
+                profile_path
+            ));
         }
 
         let contents = std::fs::read_to_string(&profile_path)?;
@@ -638,7 +656,7 @@ impl PyramidConfig {
 
         let mut current_json = serde_json::to_value(&*self)?;
         merge(&mut current_json, patch);
-        
+
         *self = serde_json::from_value(current_json)?;
         Ok(())
     }
@@ -681,11 +699,6 @@ impl PyramidConfig {
         LlmConfig {
             api_key: self.openrouter_api_key.clone(),
             auth_token: self.auth_token.clone(),
-            primary_model: self.primary_model.clone(),
-            fallback_model_1: self.fallback_model_1.clone(),
-            fallback_model_2: self.fallback_model_2.clone(),
-            primary_context_limit: self.operational.tier1.primary_context_limit,
-            fallback_1_context_limit: self.operational.tier1.fallback_1_context_limit,
             max_retries: self.operational.tier1.llm_max_retries,
             base_timeout_secs: self.operational.tier2.llm_base_timeout_secs,
             max_timeout_secs: self.operational.tier2.llm_max_timeout_secs,
@@ -731,36 +744,11 @@ impl PyramidConfig {
             cfg.api_key = secret.raw_clone();
         }
 
-        // ── Resolve cascade model fields from tier routing ──────────
-        // The cascade in call_model_unified picks primary/fallback_1/fallback_2
-        // based on input token count. Without this resolution, these fields
-        // carry OpenRouter slugs even when Ollama (or another provider) is
-        // active — the HTTP request goes to the right endpoint but sends a
-        // model name the provider doesn't recognize.
-        //
-        // Mapping: primary → mid, fallback_1 → high, fallback_2 → max.
-        // Failures are non-fatal: the field keeps its default (OpenRouter slug),
-        // which is correct when OpenRouter IS the active provider.
-        let tier_map: &[(&str, fn(&mut LlmConfig, String, Option<usize>))] = &[
-            ("mid", |c, model, ctx| {
-                c.primary_model = model;
-                if let Some(limit) = ctx { c.primary_context_limit = limit; }
-            }),
-            ("high", |c, model, ctx| {
-                c.fallback_model_1 = model;
-                if let Some(limit) = ctx { c.fallback_1_context_limit = limit; }
-            }),
-            ("max", |c, model, _ctx| {
-                c.fallback_model_2 = model;
-                // fallback_2 has no dedicated context_limit field — it's the
-                // "everything bigger than fallback_1_context_limit" bucket.
-            }),
-        ];
-        for &(tier_name, apply) in tier_map {
-            if let Ok(resolved) = provider_registry.resolve_tier(tier_name, None, None, None) {
-                apply(&mut cfg, resolved.tier.model_id.clone(), resolved.tier.context_limit);
-            }
-        }
+        // W3c: the legacy `primary_model` / `fallback_model_{1,2}` +
+        // `*_context_limit` fields are gone from `LlmConfig`. Walker v3's
+        // Decision spine pulls `model_list[tier]` from the active
+        // `walker_provider_openrouter` contribution at dispatch time;
+        // there is no config-level cascade to resolve here anymore.
 
         cfg
     }
@@ -860,7 +848,8 @@ pub struct PyramidState {
     /// DADBEAR supervisor handle (Phase 5). The supervisor runs alongside
     /// the extend loop during the transition period (Phases 5–7), handling
     /// dispatch + result application for work items created by the compiler.
-    pub dadbear_supervisor_handle: Arc<Mutex<Option<crate::pyramid::dadbear_supervisor::DadbearSupervisorHandle>>>,
+    pub dadbear_supervisor_handle:
+        Arc<Mutex<Option<crate::pyramid::dadbear_supervisor::DadbearSupervisorHandle>>>,
     /// Phase 1 fix: shared per-config DADBEAR dispatch in-flight flags, keyed by
     /// `pyramid_dadbear_config.id`.
     ///
@@ -883,11 +872,7 @@ pub struct PyramidState {
     /// observation of a config, and removed by the tick loop's cleanup pass
     /// when the corresponding config is gone (mirroring the `tickers`
     /// HashMap's `retain` call).
-    pub dadbear_in_flight: Arc<
-        std::sync::Mutex<
-            HashMap<i64, Arc<std::sync::atomic::AtomicBool>>,
-        >,
-    >,
+    pub dadbear_in_flight: Arc<std::sync::Mutex<HashMap<i64, Arc<std::sync::atomic::AtomicBool>>>>,
     /// Phase 3: provider registry. Holds all pyramid_providers +
     /// pyramid_tier_routing + pyramid_step_overrides rows in memory.
     /// Shared via Arc so build-scoped reader clones and IPC mutators
@@ -946,11 +931,8 @@ impl PyramidState {
         let cfg = self.config.read().await.clone();
         match self.data_dir.as_ref() {
             Some(dir) => {
-                let db_path: std::sync::Arc<str> = dir
-                    .join("pyramid.db")
-                    .to_string_lossy()
-                    .to_string()
-                    .into();
+                let db_path: std::sync::Arc<str> =
+                    dir.join("pyramid.db").to_string_lossy().to_string().into();
                 cfg.clone_with_cache_access(
                     slug.to_string(),
                     build_id.to_string(),
@@ -966,19 +948,11 @@ impl PyramidState {
     /// sites (stale_engine drain loops, routes.rs HTTP handlers that
     /// already hold a read-locked config). Takes the pre-cloned
     /// `LlmConfig` and the build_id + slug from the caller's scope.
-    pub fn attach_cache_access(
-        &self,
-        cfg: LlmConfig,
-        slug: &str,
-        build_id: &str,
-    ) -> LlmConfig {
+    pub fn attach_cache_access(&self, cfg: LlmConfig, slug: &str, build_id: &str) -> LlmConfig {
         match self.data_dir.as_ref() {
             Some(dir) => {
-                let db_path: std::sync::Arc<str> = dir
-                    .join("pyramid.db")
-                    .to_string_lossy()
-                    .to_string()
-                    .into();
+                let db_path: std::sync::Arc<str> =
+                    dir.join("pyramid.db").to_string_lossy().to_string().into();
                 cfg.clone_with_cache_access(
                     slug.to_string(),
                     build_id.to_string(),

@@ -43,7 +43,17 @@ export interface LiveNodeInfo {
     depth: number;
     headline: string;
     parent_id: string | null;
+    parent_ids?: string[];
     children: string[];
+    node_kind?: string | null;
+    question?: string | null;
+    question_about?: string | null;
+    question_creates?: string | null;
+    question_prompt_hint?: string | null;
+    answer_node_id?: string | null;
+    answer_headline?: string | null;
+    answer_distilled?: string | null;
+    answered?: boolean | null;
     status: string; // "complete" | "pending" | "superseded"
 }
 
@@ -84,6 +94,7 @@ export interface SpatialNode {
     depth: number;
     headline: string;
     parentId: string | null;
+    parentIds?: string[];
     children: string[];
     status: 'pending' | 'inflight' | 'complete' | 'failed';
     x: number;

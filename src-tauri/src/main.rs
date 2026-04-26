@@ -12,11 +12,11 @@ mod vocabulary;
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_updater::UpdaterExt;
 
+use futures_util::FutureExt;
 use std::sync::Arc;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager};
-use futures_util::FutureExt;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::RwLock;
 
@@ -2884,7 +2884,11 @@ async fn planner_call(
     tracing::info!(
         "Vocabulary loaded: {} domains, {} commands, prompt text {} chars",
         vocab_registry.domains.len(),
-        vocab_registry.domains.iter().map(|d| d.commands.len()).sum::<usize>(),
+        vocab_registry
+            .domains
+            .iter()
+            .map(|d| d.commands.len())
+            .sum::<usize>(),
         full_vocabulary.len(),
     );
 
@@ -2902,8 +2906,7 @@ async fn planner_call(
     };
 
     // Replace template placeholders
-    let context_json =
-        serde_json::to_string_pretty(&context).unwrap_or_else(|_| "{}".to_string());
+    let context_json = serde_json::to_string_pretty(&context).unwrap_or_else(|_| "{}".to_string());
     let system_prompt = system_template
         .replace("{{VOCABULARY}}", &full_vocabulary)
         .replace("{{WIDGET_CATALOG}}", PLANNER_WIDGET_CATALOG)
@@ -2915,14 +2918,33 @@ async fn planner_call(
         intent.len(),
     );
 
-    // Call LLM for plan generation — single call with full vocabulary
-    let response = llm::call_model_unified(
+    // walker-v3-completion Wave 7 hotfix: canonical dispatch via Decision
+    // spine. Previously bare call_model_unified with no ctx + no
+    // model_override → Wave 5 guard fires loud. Now resolves "max" tier
+    // via provider_registry and threads model_override through the
+    // unified path with ctx=None. Planner is judgment work → "max" tier.
+    let resolved = config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("max", None, None, None).ok())
+        .ok_or_else(|| {
+            "Planner: provider registry has no 'max' tier routing. \
+             Configure a walker_provider_openrouter contribution with \
+             a 'max' slot model_list entry."
+                .to_string()
+        })?;
+    let response = llm::call_model_unified_with_options_and_ctx(
         &config,
+        None, // one-shot planner call; no cache context
         &system_prompt,
         &intent,
         0.3,
         100_000, // Pillar 43: max_tokens is a safety ceiling, not a behavior control
         Some(&serde_json::json!({"type": "json_object"})), // Pillar 43: prompt controls output, not max_tokens
+        llm::LlmCallOptions {
+            model_override: Some(resolved.tier.model_id.clone()),
+            ..Default::default()
+        },
     )
     .await
     .map_err(|e| format!("Planner LLM call failed: {}", e))?;
@@ -3204,86 +3226,86 @@ async fn pyramid_reevaluate_deferred_questions(
     // through an owned path. Simpler: do the whole thing in the async
     // context by using a blocking-safe DB path read instead.
     let conn = writer.lock().await;
-    let result = tokio::task::block_in_place(move || -> Result<ReevaluateDeferredResult, String> {
-        let policy = db::load_active_evidence_policy(&conn, Some(&slug))
-            .map_err(|e| format!("load policy: {e}"))?;
-        let deferred = db::list_all_deferred(&conn, &slug).map_err(|e| e.to_string())?;
-        let mut result = ReevaluateDeferredResult {
-            evaluated: 0,
-            activated: 0,
-            still_deferred: 0,
-            skipped: 0,
-        };
-        // Phase 12 wanderer fix: evaluate has_demand_signals once at
-        // slug granularity, not per-question. Per-node aggregation
-        // by question.question_id never matched because question_id
-        // is a q-{sha256} hash while demand signals land on
-        // L{layer}-{seq} node ids. See
-        // evidence_answering::run_triage_gate for the matching fix
-        // and rationale.
-        let slug_has_demand_signals = policy.demand_signals.iter().any(|rule| {
-            let w = rule.window.trim();
-            let window = if w.starts_with('-') || w.contains(' ') {
-                w.to_string()
-            } else {
-                let (num_part, unit_part): (String, String) =
-                    w.chars().partition(|c| c.is_ascii_digit());
-                let n: i64 = num_part.parse().unwrap_or(14);
-                let (n, unit) = match unit_part.as_str() {
-                    "d" => (n, "days"),
-                    "h" => (n, "hours"),
-                    "w" => (n * 7, "days"),
-                    "m" => (n, "minutes"),
-                    _ => (n, "days"),
+    let result =
+        tokio::task::block_in_place(move || -> Result<ReevaluateDeferredResult, String> {
+            let policy = db::load_active_evidence_policy(&conn, Some(&slug))
+                .map_err(|e| format!("load policy: {e}"))?;
+            let deferred = db::list_all_deferred(&conn, &slug).map_err(|e| e.to_string())?;
+            let mut result = ReevaluateDeferredResult {
+                evaluated: 0,
+                activated: 0,
+                still_deferred: 0,
+                skipped: 0,
+            };
+            // Phase 12 wanderer fix: evaluate has_demand_signals once at
+            // slug granularity, not per-question. Per-node aggregation
+            // by question.question_id never matched because question_id
+            // is a q-{sha256} hash while demand signals land on
+            // L{layer}-{seq} node ids. See
+            // evidence_answering::run_triage_gate for the matching fix
+            // and rationale.
+            let slug_has_demand_signals = policy.demand_signals.iter().any(|rule| {
+                let w = rule.window.trim();
+                let window = if w.starts_with('-') || w.contains(' ') {
+                    w.to_string()
+                } else {
+                    let (num_part, unit_part): (String, String) =
+                        w.chars().partition(|c| c.is_ascii_digit());
+                    let n: i64 = num_part.parse().unwrap_or(14);
+                    let (n, unit) = match unit_part.as_str() {
+                        "d" => (n, "days"),
+                        "h" => (n, "hours"),
+                        "w" => (n * 7, "days"),
+                        "m" => (n, "minutes"),
+                        _ => (n, "days"),
+                    };
+                    format!("-{} {}", n, unit)
                 };
-                format!("-{} {}", n, unit)
-            };
-            db::sum_slug_demand_weight(&conn, &slug, &rule.r#type, &window)
-                .unwrap_or(0.0)
-                >= rule.threshold
-        });
+                db::sum_slug_demand_weight(&conn, &slug, &rule.r#type, &window).unwrap_or(0.0)
+                    >= rule.threshold
+            });
 
-        for row in deferred {
-            result.evaluated += 1;
-            let question: LayerQuestion = match serde_json::from_str(&row.question_json) {
-                Ok(q) => q,
-                Err(_) => continue,
-            };
-            let facts = TriageFacts {
-                question: &question,
-                target_node_distilled: None,
-                target_node_depth: Some(question.layer),
-                is_first_build: false,
-                is_stale_check: true,
-                has_demand_signals: slug_has_demand_signals,
-                evidence_question_trivial: None,
-                evidence_question_high_value: None,
-            };
-            match resolve_decision(&policy, &facts).map_err(|e| e.to_string())? {
-                TriageDecision::Answer { .. } => {
-                    if db::remove_deferred(&conn, &slug, &question.question_id).is_ok() {
-                        result.activated += 1;
+            for row in deferred {
+                result.evaluated += 1;
+                let question: LayerQuestion = match serde_json::from_str(&row.question_json) {
+                    Ok(q) => q,
+                    Err(_) => continue,
+                };
+                let facts = TriageFacts {
+                    question: &question,
+                    target_node_distilled: None,
+                    target_node_depth: Some(question.layer),
+                    is_first_build: false,
+                    is_stale_check: true,
+                    has_demand_signals: slug_has_demand_signals,
+                    evidence_question_trivial: None,
+                    evidence_question_high_value: None,
+                };
+                match resolve_decision(&policy, &facts).map_err(|e| e.to_string())? {
+                    TriageDecision::Answer { .. } => {
+                        if db::remove_deferred(&conn, &slug, &question.question_id).is_ok() {
+                            result.activated += 1;
+                        }
                     }
-                }
-                TriageDecision::Defer { check_interval, .. } => {
-                    let _ = db::update_deferred_next_check(
-                        &conn,
-                        &slug,
-                        &question.question_id,
-                        &check_interval,
-                        policy.contribution_id.as_deref(),
-                    );
-                    result.still_deferred += 1;
-                }
-                TriageDecision::Skip { .. } => {
-                    if db::remove_deferred(&conn, &slug, &question.question_id).is_ok() {
-                        result.skipped += 1;
+                    TriageDecision::Defer { check_interval, .. } => {
+                        let _ = db::update_deferred_next_check(
+                            &conn,
+                            &slug,
+                            &question.question_id,
+                            &check_interval,
+                            policy.contribution_id.as_deref(),
+                        );
+                        result.still_deferred += 1;
+                    }
+                    TriageDecision::Skip { .. } => {
+                        if db::remove_deferred(&conn, &slug, &question.question_id).is_ok() {
+                            result.skipped += 1;
+                        }
                     }
                 }
             }
-        }
-        Ok(result)
-    });
+            Ok(result)
+        });
     result
 }
 
@@ -3480,8 +3502,16 @@ async fn post_build_seed(
     {
         let conn = pyramid_state.writer.lock().await;
         match wire_node_lib::pyramid::vocabulary::refresh_vocabulary(&conn, slug) {
-            Ok((_, count)) => tracing::info!("Post-build: refreshed vocabulary for '{}' ({} entries)", slug, count),
-            Err(e) => tracing::warn!("Post-build: vocabulary refresh failed for '{}': {}", slug, e),
+            Ok((_, count)) => tracing::info!(
+                "Post-build: refreshed vocabulary for '{}' ({} entries)",
+                slug,
+                count
+            ),
+            Err(e) => tracing::warn!(
+                "Post-build: vocabulary refresh failed for '{}': {}",
+                slug,
+                e
+            ),
         }
     }
 
@@ -3496,7 +3526,11 @@ async fn post_build_seed(
                 let source_dir = std::path::Path::new(path_str);
                 // Use the parent directory if source_path is a file
                 let watch_dir = if source_dir.is_file() {
-                    source_dir.parent().unwrap_or(source_dir).to_string_lossy().to_string()
+                    source_dir
+                        .parent()
+                        .unwrap_or(source_dir)
+                        .to_string_lossy()
+                        .to_string()
                 } else {
                     path_str.clone()
                 };
@@ -3514,9 +3548,19 @@ async fn post_build_seed(
                     created_at: String::new(),
                     updated_at: String::new(),
                 };
-                match wire_node_lib::pyramid::db::save_dadbear_config_with_contributions(&conn, &config) {
-                    Ok(_) => tracing::info!("Post-build: DADBEAR watch config created for '{}' → '{}'", slug, watch_dir),
-                    Err(e) => tracing::warn!("Post-build: DADBEAR config creation failed for '{}': {}", slug, e),
+                match wire_node_lib::pyramid::db::save_dadbear_config_with_contributions(
+                    &conn, &config,
+                ) {
+                    Ok(_) => tracing::info!(
+                        "Post-build: DADBEAR watch config created for '{}' → '{}'",
+                        slug,
+                        watch_dir
+                    ),
+                    Err(e) => tracing::warn!(
+                        "Post-build: DADBEAR config creation failed for '{}': {}",
+                        slug,
+                        e
+                    ),
                 }
             }
         }
@@ -3528,7 +3572,9 @@ async fn post_build_seed(
                 let db_path_clone = db_path.clone();
                 let bus = pyramid_state.build_event_bus.clone();
                 let handle = wire_node_lib::pyramid::dadbear_extend::start_dadbear_extend_loop(
-                    pyramid_state.clone(), db_path_clone, bus,
+                    pyramid_state.clone(),
+                    db_path_clone,
+                    bus,
                 );
                 *dadbear = Some(handle);
                 tracing::info!("Post-build: DADBEAR extend loop started");
@@ -3550,7 +3596,24 @@ async fn post_build_seed(
         let cfg = pyramid_state.config.read().await;
         let base_id = format!("stale-{}", slug);
         let with_cache = pyramid_state.attach_cache_access(cfg.clone(), slug, &base_id);
-        let model = cfg.primary_model.clone();
+        // walker-v3 W3a (Pattern 4): resolve the model for this
+        // out-of-step-ctx bootstrap via walker_resolver reading the
+        // active walker_provider_openrouter contribution. The
+        // `.unwrap_or_else(config.primary_model)` legacy fallback stays
+        // until W3c deletes the field; cargo-check will then surface
+        // this closure for cleanup. A future phase may instead wire
+        // DispatchDecision::synthetic_for_preview(..) here.
+        let resolved = {
+            let conn = pyramid_state.reader.lock().await;
+            wire_node_lib::pyramid::walker_resolver::first_openrouter_model_from_db(&conn)
+        };
+        let model = resolved.unwrap_or_else(|| {
+            tracing::warn!(
+                event = "pattern4_no_openrouter_model",
+                "walker-v3: Pattern-4 site found no walker_provider_openrouter model; stamping '<unknown>' — downstream dispatch will surface no-model-available",
+            );
+            "<unknown>".to_string()
+        });
         (with_cache, model)
     };
 
@@ -3589,8 +3652,11 @@ async fn post_build_seed(
     drop(engines);
 
     if !source_paths.is_empty() {
-        let mut watcher =
-            wire_node_lib::pyramid::watcher::PyramidFileWatcher::new(slug, source_paths, &pyramid_state.operational.tier2);
+        let mut watcher = wire_node_lib::pyramid::watcher::PyramidFileWatcher::new(
+            slug,
+            source_paths,
+            &pyramid_state.operational.tier2,
+        );
 
         // Create mutation channel and wire it to the stale engine
         let (mutation_tx, mut mutation_rx) =
@@ -3750,6 +3816,47 @@ fn backfill_node_ids(conn: &rusqlite::Connection, slug: &str) -> Result<(), Stri
     Ok(())
 }
 
+// ── Walker v3 build-starter guards (Phase 0a-2 §2.17.1) ────────────────────
+//
+// Plan §2.17.1: "every current starter (HTTP build routes, Tauri
+// pyramid_build, question-build spawn, folder-ingestion initial-build
+// spawn, DADBEAR manual trigger, stale-engine startup reconciliation,
+// and any future spawn_*build* helper) must route through the same
+// guard helper so boot ordering and runtime gating cannot drift apart."
+//
+// Phase 0a-2 instruments the Tauri IPC build-starter commands here —
+// `pyramid_build`, `pyramid_question_build`, `pyramid_rebuild` — which
+// are the five-or-so entry points a user can hit before boot finishes.
+// Every call routes through `guard_app_ready(&state.app_mode)` and
+// refuses if AppMode != Ready.
+//
+// TODO(walker-v3 Phase 0b): extend the guard to the rest of the
+// inventory the plan calls out. These sites live in `pyramid/*.rs` and
+// are out of scope for WS5 (file scope restriction):
+//
+//   - `folder_ingestion::spawn_initial_builds` (invoked from main.rs
+//     ~L4401) — calls `question_build::spawn_question_build` for each
+//     ingestion apex. The lib-side helper has no AppState reference;
+//     WS5 can't plumb the guard without touching pyramid/*.rs.
+//   - `public_html/routes_ask.rs` — the /ask HTTP surface spawns
+//     question builds for public questions.
+//   - `dadbear_supervisor::start_dadbear_supervisor` — the runtime
+//     supervisor dispatches work items the compiler emits; manual
+//     triggers bypass the Tauri IPC layer.
+//   - `server::init_stale_engines` — stale-engine startup
+//     reconciliation ticks rebuild tasks 3s after boot. The 3s sleep
+//     happens to cover the typical boot window in practice, but the
+//     guard should be explicit so quarantine state can refuse stale
+//     rebuilds.
+//
+// Each of those will get `guard_app_ready(&state.app_mode).await?`
+// added at its entry in Phase 0b, when the WS plan covers pyramid/*.rs
+// edits. Until then, they rely on the implicit ordering: the boot
+// coordinator spawns BEFORE `init_stale_engines`'s 3s delay elapses,
+// and BEFORE the HTTP server accepts requests (see
+// `server::start_server` call site), so the practical window in which
+// a build-starter could run against `Booting` state is <100ms in
+// happy-path boot.
 #[tauri::command]
 async fn pyramid_build(
     state: tauri::State<'_, SharedState>,
@@ -3758,6 +3865,11 @@ async fn pyramid_build(
     stop_after: Option<String>,
     force_from: Option<String>,
 ) -> Result<BuildStatus, String> {
+    // Walker v3 §2.17.1: every build-starter routes through the Ready guard.
+    wire_node_lib::guard_app_ready(&state.app_mode)
+        .await
+        .map_err(|e| e.to_string())?;
+
     // Verify slug exists
     {
         let conn = state.pyramid.reader.lock().await;
@@ -3866,9 +3978,13 @@ async fn pyramid_build(
                             wire_node_lib::pyramid::build::WriteOp::UpdateStats { ref slug } => {
                                 wire_node_lib::pyramid::db::update_slug_stats(&conn, slug)
                             }
-                            wire_node_lib::pyramid::build::WriteOp::UpdateFileHash { ref slug, ref file_path, ref node_id } => {
-                                wire_node_lib::pyramid::db::append_node_id_to_file_hash(&conn, slug, file_path, node_id)
-                            }
+                            wire_node_lib::pyramid::build::WriteOp::UpdateFileHash {
+                                ref slug,
+                                ref file_path,
+                                ref node_id,
+                            } => wire_node_lib::pyramid::db::append_node_id_to_file_hash(
+                                &conn, slug, file_path, node_id,
+                            ),
                             wire_node_lib::pyramid::build::WriteOp::Flush { done } => {
                                 let _ = done.send(());
                                 Ok(())
@@ -3885,8 +4001,7 @@ async fn pyramid_build(
         // Create progress channel — tee'd onto build_event_bus so the public
         // web surface can subscribe per-slug while the desktop UI continues to
         // drain `progress_rx` exactly as before.
-        let (progress_tx, raw_progress_rx) =
-            tokio::sync::mpsc::channel::<BuildProgress>(64);
+        let (progress_tx, raw_progress_rx) = tokio::sync::mpsc::channel::<BuildProgress>(64);
         let mut progress_rx = wire_node_lib::pyramid::event_bus::tee_build_progress_to_bus(
             &pyramid_state.build_event_bus,
             slug.clone(),
@@ -3911,49 +4026,110 @@ async fn pyramid_build(
             while let Some(event) = layer_rx.recv().await {
                 let mut state = layer_drain_state.write().await;
                 match event {
-                    LayerEvent::Discovered { depth, step_name, estimated_nodes } => {
+                    LayerEvent::Discovered {
+                        depth,
+                        step_name,
+                        estimated_nodes,
+                    } => {
                         state.layers.push(LayerProgress {
-                            depth, step_name, estimated_nodes,
-                            completed_nodes: 0, failed_nodes: 0,
+                            depth,
+                            step_name,
+                            estimated_nodes,
+                            completed_nodes: 0,
+                            failed_nodes: 0,
                             status: "pending".into(),
-                            nodes: if estimated_nodes <= 50 { Some(Vec::new()) } else { None },
+                            nodes: if estimated_nodes <= 50 {
+                                Some(Vec::new())
+                            } else {
+                                None
+                            },
                         });
                     }
-                    LayerEvent::NodeCompleted { depth, step_name, node_id, label } => {
-                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                    LayerEvent::NodeCompleted {
+                        depth,
+                        step_name,
+                        node_id,
+                        label,
+                    } => {
+                        if let Some(layer) = state
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             layer.completed_nodes += 1;
                             layer.status = "active".into();
                             if let Some(ref mut nodes) = layer.nodes {
-                                nodes.push(NodeStatus { node_id, status: "complete".into(), label });
+                                nodes.push(NodeStatus {
+                                    node_id,
+                                    status: "complete".into(),
+                                    label,
+                                });
                             }
                         }
                     }
-                    LayerEvent::NodeFailed { depth, step_name, node_id } => {
-                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                    LayerEvent::NodeFailed {
+                        depth,
+                        step_name,
+                        node_id,
+                    } => {
+                        if let Some(layer) = state
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             layer.failed_nodes += 1;
                             if let Some(ref mut nodes) = layer.nodes {
-                                nodes.push(NodeStatus { node_id, status: "failed".into(), label: None });
+                                nodes.push(NodeStatus {
+                                    node_id,
+                                    status: "failed".into(),
+                                    label: None,
+                                });
                             }
                         }
                     }
                     LayerEvent::LayerCompleted { depth, step_name } => {
-                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                        if let Some(layer) = state
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             layer.status = "complete".into();
                         }
                     }
-                    LayerEvent::NodeStarted { depth, step_name, node_id, .. } => {
-                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                    LayerEvent::NodeStarted {
+                        depth,
+                        step_name,
+                        node_id,
+                        ..
+                    } => {
+                        if let Some(layer) = state
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             if let Some(ref mut nodes) = layer.nodes {
-                                nodes.push(NodeStatus { node_id, status: "pending".into(), label: None });
+                                nodes.push(NodeStatus {
+                                    node_id,
+                                    status: "pending".into(),
+                                    label: None,
+                                });
                             }
                         }
                     }
                     LayerEvent::StepStarted { step_name } => {
                         state.current_step = Some(step_name);
                     }
-                    LayerEvent::Log { elapsed_secs, message } => {
-                        state.log.push_back(LogEntry { elapsed_secs, message });
-                        if state.log.len() > 200 { state.log.pop_front(); }
+                    LayerEvent::Log {
+                        elapsed_secs,
+                        message,
+                    } => {
+                        state.log.push_back(LogEntry {
+                            elapsed_secs,
+                            message,
+                        });
+                        if state.log.len() > 200 {
+                            state.log.pop_front();
+                        }
                     }
                 }
             }
@@ -4182,6 +4358,17 @@ async fn pyramid_ingest(
     }))
 }
 
+// walker-v3 W3a (Cluster 1 / Option A — stub model writes): `pyramid_set_config`
+// is retained as a credentials + flags write path (api_key / auth_token /
+// use_ir_executor / auto_execute) because frontend PyramidFirstRun and
+// PyramidSettings still ride it. Model-slug writes (primary_model /
+// fallback_model_{1,2}) are now a hard error directing operators to edit
+// the walker_provider_openrouter contribution via Tools > Create. Phase 6
+// retires the whole IPC once the Settings UI rewrites to edit walker_*
+// contributions directly.
+// TODO(walker-v3 Phase 6): delete pyramid_set_config entirely — the
+// api_key / auth_token writes move to a dedicated credential-only IPC,
+// and auto_execute / use_ir_executor move to per-feature toggle IPCs.
 #[tauri::command]
 async fn pyramid_set_config(
     state: tauri::State<'_, SharedState>,
@@ -4193,7 +4380,20 @@ async fn pyramid_set_config(
     use_ir_executor: Option<bool>,
     auto_execute: Option<bool>,
 ) -> Result<(), String> {
-    // Update in-memory LLM config
+    // walker-v3 W3a: model-slug writes are no longer accepted — models
+    // are resolved from the active walker_provider_openrouter
+    // contribution at dispatch time. Surface a directed error so the
+    // operator knows where to edit instead.
+    if primary_model.is_some() || fallback_model_1.is_some() || fallback_model_2.is_some() {
+        return Err(
+            "Model selection moved to the walker_provider_openrouter contribution. \
+             Edit it via Tools > Create (schema: walker_provider_openrouter) or \
+             POST /config-contributions; this legacy field write was retired in \
+             walker-v3 W3a and will be deleted in Phase 6."
+                .to_string(),
+        );
+    }
+    // Update in-memory LLM config (credentials + flags only now).
     {
         let mut config = state.pyramid.config.write().await;
         if let Some(ref key) = api_key {
@@ -4201,15 +4401,6 @@ async fn pyramid_set_config(
         }
         if let Some(ref token) = auth_token {
             config.auth_token = token.clone();
-        }
-        if let Some(ref model) = primary_model {
-            config.primary_model = model.clone();
-        }
-        if let Some(ref model) = fallback_model_1 {
-            config.fallback_model_1 = model.clone();
-        }
-        if let Some(ref model) = fallback_model_2 {
-            config.fallback_model_2 = model.clone();
         }
     }
 
@@ -4220,7 +4411,10 @@ async fn pyramid_set_config(
             if let Ok(contents) = std::fs::read_to_string(&config_path) {
                 if let Ok(mut pconfig) = serde_json::from_str::<serde_json::Value>(&contents) {
                     pconfig["auto_execute"] = serde_json::Value::Bool(ae);
-                    let _ = std::fs::write(&config_path, serde_json::to_string_pretty(&pconfig).unwrap_or_default());
+                    let _ = std::fs::write(
+                        &config_path,
+                        serde_json::to_string_pretty(&pconfig).unwrap_or_default(),
+                    );
                 }
             }
         }
@@ -4257,13 +4451,15 @@ async fn pyramid_set_config(
     // Persist non-secret config to disk. Deliberately not updating
     // openrouter_api_key — credential store is SOT. Stale value
     // preserved as boot-time migration source.
+    //
+    // W3c: PyramidConfig no longer carries primary_model /
+    // fallback_model_{1,2}. Model selection lives in
+    // walker_provider_openrouter. We still write the other non-secret
+    // fields through.
     if let Some(ref data_dir) = state.pyramid.data_dir {
         let mut pyramid_config = wire_node_lib::pyramid::PyramidConfig::load(data_dir);
         let config = state.pyramid.config.read().await;
         pyramid_config.auth_token = config.auth_token.clone();
-        pyramid_config.primary_model = config.primary_model.clone();
-        pyramid_config.fallback_model_1 = config.fallback_model_1.clone();
-        pyramid_config.fallback_model_2 = config.fallback_model_2.clone();
         pyramid_config.use_ir_executor = state
             .pyramid
             .use_ir_executor
@@ -4357,7 +4553,10 @@ async fn pyramid_ingest_folder(
 
     let target = std::path::PathBuf::from(&input.target_folder);
     if !target.exists() {
-        return Err(format!("target folder does not exist: {}", input.target_folder));
+        return Err(format!(
+            "target folder does not exist: {}",
+            input.target_folder
+        ));
     }
 
     // Load the active folder_ingestion_heuristics contribution (or
@@ -4397,7 +4596,10 @@ async fn pyramid_ingest_folder(
     // EXISTING vine apex nodes. See `folder_ingestion::spawn_initial_builds`
     // for the full reasoning. The dispatch runs in a background task so
     // the IPC returns immediately after DB writes land.
-    if result.errors.is_empty() || !result.pyramids_created.is_empty() || !result.vines_created.is_empty() {
+    if result.errors.is_empty()
+        || !result.pyramids_created.is_empty()
+        || !result.vines_created.is_empty()
+    {
         folder_ingestion::spawn_initial_builds(&state.pyramid, &plan);
     }
 
@@ -4440,7 +4642,9 @@ async fn pyramid_find_claude_code_conversations(
         }
     }
 
-    Ok(folder_ingestion::describe_claude_code_dirs(&target, &config))
+    Ok(folder_ingestion::describe_claude_code_dirs(
+        &target, &config,
+    ))
 }
 
 #[tauri::command]
@@ -4463,8 +4667,12 @@ async fn pyramid_delete_slug(
     }
 
     let conn = state.pyramid.writer.lock().await;
-    let result =
-        wire_node_lib::pyramid::slug::archive_slug(&conn, &slug, Some(&state.pyramid.build_event_bus)).map_err(|e| e.to_string());
+    let result = wire_node_lib::pyramid::slug::archive_slug(
+        &conn,
+        &slug,
+        Some(&state.pyramid.build_event_bus),
+    )
+    .map_err(|e| e.to_string());
     drop(conn);
 
     result
@@ -4550,8 +4758,12 @@ async fn pyramid_archive_slug(
     }
 
     let conn = state.pyramid.writer.lock().await;
-    let result =
-        wire_node_lib::pyramid::slug::archive_slug(&conn, &slug, Some(&state.pyramid.build_event_bus)).map_err(|e| e.to_string());
+    let result = wire_node_lib::pyramid::slug::archive_slug(
+        &conn,
+        &slug,
+        Some(&state.pyramid.build_event_bus),
+    )
+    .map_err(|e| e.to_string());
     drop(conn);
 
     result
@@ -4724,6 +4936,11 @@ async fn pyramid_question_build(
     from_depth: Option<i64>,
     characterization: Option<wire_node_lib::pyramid::types::CharacterizationResult>,
 ) -> Result<serde_json::Value, String> {
+    // Walker v3 §2.17.1: every build-starter routes through the Ready guard.
+    wire_node_lib::guard_app_ready(&state.app_mode)
+        .await
+        .map_err(|e| e.to_string())?;
+
     pyramid_question_build_inner(
         &state,
         slug,
@@ -4768,6 +4985,11 @@ async fn pyramid_rebuild(
     state: tauri::State<'_, SharedState>,
     slug: String,
 ) -> Result<serde_json::Value, String> {
+    // Walker v3 §2.17.1: every build-starter routes through the Ready guard.
+    wire_node_lib::guard_app_ready(&state.app_mode)
+        .await
+        .map_err(|e| e.to_string())?;
+
     // Look up the question from the last build record, or fall back to
     // the default apex question for the slug's content type. This makes
     // rebuild work for pre-existing pyramids that were built before the
@@ -4781,10 +5003,9 @@ async fn pyramid_rebuild(
                  ORDER BY rowid DESC LIMIT 1",
             )
             .map_err(|e| format!("Failed to query build history: {e}"))?;
-        let result: Result<(String, String), _> = stmt.query_row(
-            rusqlite::params![&slug],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        );
+        let result: Result<(String, String), _> = stmt.query_row(rusqlite::params![&slug], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        });
         match result {
             Ok((q, _)) => q,
             Err(_) => {
@@ -4828,12 +5049,9 @@ async fn pyramid_rebuild(
     );
 
     pyramid_question_build_inner(
-        &state,
-        slug,
-        question,
-        3,  // granularity default
-        3,  // max_depth default
-        0,  // from_depth default
+        &state, slug, question, 3,    // granularity default
+        3,    // max_depth default
+        0,    // from_depth default
         None, // characterization: auto
     )
     .await
@@ -4960,7 +5178,20 @@ async fn pyramid_meta_run(
         .pyramid
         .llm_config_with_cache(&slug, &format!("meta-{}", slug))
         .await;
-    let model = base_config.primary_model.clone();
+    // walker-v3 W3a (Pattern 4): resolve via walker_resolver reading
+    // the active walker_provider_openrouter contribution. Legacy
+    // fallback removed by W3c once config.primary_model dies.
+    let resolved = {
+        let conn = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::walker_resolver::first_openrouter_model_from_db(&conn)
+    };
+    let model = resolved.unwrap_or_else(|| {
+        tracing::warn!(
+            event = "pattern4_no_openrouter_model",
+            "walker-v3: Pattern-4 site found no walker_provider_openrouter model; stamping '<unknown>'",
+        );
+        "<unknown>".to_string()
+    });
 
     let reader = state.pyramid.reader.clone();
     let writer = state.pyramid.writer.clone();
@@ -5294,7 +5525,13 @@ async fn pyramid_check_staleness(
     let slug_owned = slug.clone();
     let result = tokio::task::spawn_blocking(move || {
         let c = conn.blocking_lock();
-        staleness_bridge::run_staleness_check(&c, &slug_owned, &changed_files, threshold, dequeue_cap)
+        staleness_bridge::run_staleness_check(
+            &c,
+            &slug_owned,
+            &changed_files,
+            threshold,
+            dequeue_cap,
+        )
     })
     .await;
 
@@ -5343,8 +5580,9 @@ async fn pyramid_get_build_chain(
     let evidence_mode = "deep";
 
     // 2. Resolve chain_id via the three-tier resolver
-    let chain_id = chain_registry::resolve_chain_for_slug(&reader, &slug, content_type_str, evidence_mode)
-        .map_err(|e| format!("failed to resolve chain: {e}"))?;
+    let chain_id =
+        chain_registry::resolve_chain_for_slug(&reader, &slug, content_type_str, evidence_mode)
+            .map_err(|e| format!("failed to resolve chain: {e}"))?;
     drop(reader);
 
     // 3. Discover chains and find the YAML file path
@@ -5368,8 +5606,8 @@ async fn pyramid_get_build_chain(
     let raw_yaml = std::fs::read_to_string(yaml_path)
         .map_err(|e| format!("failed to read chain file: {e}"))?;
 
-    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&raw_yaml)
-        .map_err(|e| format!("failed to parse chain YAML: {e}"))?;
+    let yaml_value: serde_yaml::Value =
+        serde_yaml::from_str(&raw_yaml).map_err(|e| format!("failed to parse chain YAML: {e}"))?;
 
     let json_value = serde_json::to_value(yaml_value)
         .map_err(|e| format!("failed to convert YAML to JSON: {e}"))?;
@@ -5541,7 +5779,11 @@ async fn pyramid_remote_query(
     let result: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
 
     if !status.is_success() {
-        return Err(format!("Remote query returned {}: {}", status.as_u16(), result));
+        return Err(format!(
+            "Remote query returned {}: {}",
+            status.as_u16(),
+            result
+        ));
     }
 
     Ok(result)
@@ -5733,8 +5975,7 @@ async fn pyramid_open_web_as_owner(
         Some(u) => u,
         None => {
             return Err(
-                "No tunnel URL is set. Make sure the Cloudflare tunnel is running."
-                    .to_string(),
+                "No tunnel URL is set. Make sure the Cloudflare tunnel is running.".to_string(),
             );
         }
     };
@@ -5794,10 +6035,7 @@ async fn pyramid_open_web_as_owner(
 /// tauri-plugin-shell plugin. The Tauri 2 webview blocks `window.open`, so
 /// the React side must round-trip through this command to actually open URLs.
 #[tauri::command]
-async fn open_url_in_browser(
-    url: String,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
+async fn open_url_in_browser(url: String, app: tauri::AppHandle) -> Result<(), String> {
     use tauri_plugin_shell::ShellExt;
     app.shell()
         .open(&url, None)
@@ -5836,11 +6074,10 @@ async fn pyramid_get_cached_banner(
     slug: String,
     state: tauri::State<'_, SharedState>,
 ) -> Result<Option<String>, String> {
-    Ok(wire_node_lib::pyramid::public_html::ascii_art::get_banner_for_slug(
-        &state.pyramid,
-        &slug,
+    Ok(
+        wire_node_lib::pyramid::public_html::ascii_art::get_banner_for_slug(&state.pyramid, &slug)
+            .await,
     )
-    .await)
 }
 
 #[tauri::command]
@@ -5849,27 +6086,37 @@ async fn pyramid_get_config(
 ) -> Result<serde_json::Value, String> {
     let config = state.pyramid.config.read().await;
     // Read auto_execute from PyramidConfig file (not in-memory LlmConfig)
-    let auto_execute = state.pyramid.data_dir.as_ref()
+    let auto_execute = state
+        .pyramid
+        .data_dir
+        .as_ref()
         .and_then(|d| std::fs::read_to_string(d.join("pyramid_config.json")).ok())
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| v["auto_execute"].as_bool())
         .unwrap_or(false);
 
+    // walker-v3 W3c (Cluster 1): synthesize the legacy model triple from
+    // the active walker_provider_openrouter contribution so existing
+    // frontend Settings views keep rendering. No legacy fallback — when
+    // the contribution isn't present the Settings UI shows null for
+    // those fields and the operator follows up via Tools > Create.
+    let (primary_syn, fb1_syn, fb2_syn) = {
+        let conn = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::walker_resolver::synthesize_legacy_model_triple_from_db(&conn)
+    };
     Ok(serde_json::json!({
         "api_key_set": !config.api_key.is_empty(),
         "auth_token_set": !config.auth_token.is_empty(),
-        "primary_model": config.primary_model,
-        "fallback_model_1": config.fallback_model_1,
-        "fallback_model_2": config.fallback_model_2,
+        "primary_model": primary_syn,
+        "fallback_model_1": fb1_syn,
+        "fallback_model_2": fb2_syn,
         "auto_execute": auto_execute,
     }))
 }
 
 /// Return the pyramid auth token for use in frontend HTTP fetch calls.
 #[tauri::command]
-async fn pyramid_get_auth_token(
-    state: tauri::State<'_, SharedState>,
-) -> Result<String, String> {
+async fn pyramid_get_auth_token(state: tauri::State<'_, SharedState>) -> Result<String, String> {
     let config = state.pyramid.config.read().await;
     Ok(config.auth_token.clone())
 }
@@ -5886,7 +6133,9 @@ async fn pyramid_list_profiles(
         .data_dir
         .clone()
         .ok_or_else(|| "data_dir not configured".to_string())?;
-    Ok(wire_node_lib::pyramid::PyramidConfig::list_profiles(&data_dir))
+    Ok(wire_node_lib::pyramid::PyramidConfig::list_profiles(
+        &data_dir,
+    ))
 }
 
 /// Apply a model profile by name. Mutates the in-memory PyramidConfig +
@@ -5910,17 +6159,15 @@ async fn pyramid_apply_profile(
     // reads. We don't write the merged config back to disk — profiles
     // are non-destructive overlays.
     let config_path = data_dir.join("pyramid_config.json");
-    let mut pyramid_config: wire_node_lib::pyramid::PyramidConfig =
-        if config_path.exists() {
-            std::fs::read_to_string(&config_path)
-                .map_err(|e| format!("read pyramid_config.json: {}", e))
-                .and_then(|s| {
-                    serde_json::from_str(&s)
-                        .map_err(|e| format!("parse pyramid_config.json: {}", e))
-                })?
-        } else {
-            wire_node_lib::pyramid::PyramidConfig::default()
-        };
+    let mut pyramid_config: wire_node_lib::pyramid::PyramidConfig = if config_path.exists() {
+        std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("read pyramid_config.json: {}", e))
+            .and_then(|s| {
+                serde_json::from_str(&s).map_err(|e| format!("parse pyramid_config.json: {}", e))
+            })?
+    } else {
+        wire_node_lib::pyramid::PyramidConfig::default()
+    };
 
     pyramid_config
         .apply_profile(&profile, &data_dir)
@@ -5937,15 +6184,27 @@ async fn pyramid_apply_profile(
         state.pyramid.provider_registry.clone(),
         state.pyramid.credential_store.clone(),
     );
-    let mut live = state.pyramid.config.write().await;
-    let previous_live = live.clone();
-    *live = new_llm.with_runtime_overlays_from(&previous_live);
+    {
+        let mut live = state.pyramid.config.write().await;
+        let previous_live = live.clone();
+        *live = new_llm.with_runtime_overlays_from(&previous_live);
+    }
 
+    // walker-v3 W3c: operator-visible tracing log pulls the triple from
+    // the active walker_provider_openrouter contribution. No legacy
+    // fallback — LlmConfig.primary_model + friends are deleted.
+    // TODO(walker-v3 Phase 6): pyramid_apply_profile itself may retire
+    // entirely if profile semantics fold into walker_slot_policy /
+    // walker_provider_* contribution overlays.
+    let (primary_syn, fb1_syn, fb2_syn) = {
+        let conn = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::walker_resolver::synthesize_legacy_model_triple_from_db(&conn)
+    };
     tracing::info!(
         profile = %profile,
-        primary = %live.primary_model,
-        fallback_1 = %live.fallback_model_1,
-        fallback_2 = %live.fallback_model_2,
+        primary = ?primary_syn,
+        fallback_1 = ?fb1_syn,
+        fallback_2 = ?fb2_syn,
         "applied model profile",
     );
     Ok(())
@@ -6186,7 +6445,8 @@ async fn pyramid_vine_eras(
 ) -> Result<serde_json::Value, String> {
     let conn = state.pyramid.reader.lock().await;
     let eras =
-        pyramid_db::get_annotations_by_type(&conn, &slug, "era").map_err(|e| e.to_string())?;
+        pyramid_db::get_annotations_by_type(&conn, &slug, ANNOTATION_TYPE_ERA)
+            .map_err(|e| e.to_string())?;
     Ok(serde_json::to_value(&eras).map_err(|e| e.to_string())?)
 }
 
@@ -6256,7 +6516,7 @@ async fn pyramid_vine_drill(
     slug: String,
 ) -> Result<serde_json::Value, String> {
     let conn = state.pyramid.reader.lock().await;
-    let annotations = pyramid_db::get_annotations_by_type(&conn, &slug, "directory")
+    let annotations = pyramid_db::get_annotations_by_type(&conn, &slug, ANNOTATION_TYPE_DIRECTORY)
         .map_err(|e| e.to_string())?;
     Ok(serde_json::to_value(&annotations).map_err(|e| e.to_string())?)
 }
@@ -6440,9 +6700,9 @@ async fn pyramid_auto_update_config_set(
         }
 
         // Resolve current norms, apply user's changes, supersede the contribution.
-        let mut norms = wire_node_lib::pyramid::config_contributions::resolve_dadbear_norms(
-            &conn, Some(&slug),
-        ).unwrap_or_default();
+        let mut norms =
+            wire_node_lib::pyramid::config_contributions::resolve_dadbear_norms(&conn, Some(&slug))
+                .unwrap_or_default();
 
         // Apply the user's changes to the resolved norms
         if let Some(d) = debounce_minutes {
@@ -6460,9 +6720,14 @@ async fn pyramid_auto_update_config_set(
 
         // Find the active dadbear_norms contribution for this slug and supersede it,
         // or create a new one if none exists.
-        let existing = wire_node_lib::pyramid::config_contributions::load_active_config_contribution(
-            &conn, "dadbear_norms", Some(&slug),
-        ).ok().flatten();
+        let existing =
+            wire_node_lib::pyramid::config_contributions::load_active_config_contribution(
+                &conn,
+                "dadbear_norms",
+                Some(&slug),
+            )
+            .ok()
+            .flatten();
 
         if let Some(old_contrib) = existing {
             // Supersede with updated values
@@ -6473,7 +6738,8 @@ async fn pyramid_auto_update_config_set(
                 "Updated via DADBEAR panel config save",
                 "local",
                 Some("operator"),
-            ).map_err(|e: anyhow::Error| e.to_string())?;
+            )
+            .map_err(|e: anyhow::Error| e.to_string())?;
         } else {
             // Create new per-slug norms contribution
             wire_node_lib::pyramid::config_contributions::create_config_contribution(
@@ -6485,7 +6751,8 @@ async fn pyramid_auto_update_config_set(
                 "local",
                 Some("operator"),
                 "active",
-            ).map_err(|e: anyhow::Error| e.to_string())?;
+            )
+            .map_err(|e: anyhow::Error| e.to_string())?;
         }
 
         // Handle auto_update toggle: if turning off, place a frozen hold;
@@ -6493,12 +6760,18 @@ async fn pyramid_auto_update_config_set(
         if let Some(a) = auto_update {
             if !a {
                 wire_node_lib::pyramid::auto_update_ops::freeze(
-                    &conn, &state.pyramid.build_event_bus, &slug,
-                ).map_err(|e: anyhow::Error| e.to_string())?;
+                    &conn,
+                    &state.pyramid.build_event_bus,
+                    &slug,
+                )
+                .map_err(|e: anyhow::Error| e.to_string())?;
             } else {
                 wire_node_lib::pyramid::auto_update_ops::unfreeze(
-                    &conn, &state.pyramid.build_event_bus, &slug,
-                ).map_err(|e: anyhow::Error| e.to_string())?;
+                    &conn,
+                    &state.pyramid.build_event_bus,
+                    &slug,
+                )
+                .map_err(|e: anyhow::Error| e.to_string())?;
             }
         }
 
@@ -6517,8 +6790,7 @@ async fn pyramid_auto_update_config_set(
                     should_resume_breaker = true;
                 }
 
-                let refreshed =
-                    pyramid_db::get_auto_update_config(&conn, &slug).unwrap_or(config);
+                let refreshed = pyramid_db::get_auto_update_config(&conn, &slug).unwrap_or(config);
                 serde_json::to_value(&refreshed).map_err(|e| e.to_string())
             }
             None => Err(format!("No config for slug '{}'", slug)),
@@ -6546,10 +6818,7 @@ async fn pyramid_auto_update_config_set(
 ///
 /// Assumes `pyramid_dadbear_config` has already been seeded by
 /// `create_slug` — reads it back to construct the live engine config.
-async fn ensure_dadbear_running(
-    state: &SharedState,
-    slug: &str,
-) -> Result<(), String> {
+async fn ensure_dadbear_running(state: &SharedState, slug: &str) -> Result<(), String> {
     let slug_info = {
         let conn = state.pyramid.reader.lock().await;
         wire_node_lib::pyramid::slug::get_slug(&conn, slug)
@@ -6590,8 +6859,22 @@ async fn ensure_dadbear_running(
         let with_cache = state
             .pyramid
             .attach_cache_access(cfg.clone(), slug, &stale_build_id);
-        let model = cfg.primary_model.clone();
-        let defer = cfg.dispatch_policy
+        // walker-v3 W3a (Pattern 4): resolve via walker_resolver reading
+        // the active walker_provider_openrouter contribution. Legacy
+        // fallback removed by W3c once config.primary_model dies.
+        let resolved = {
+            let conn = state.pyramid.reader.lock().await;
+            wire_node_lib::pyramid::walker_resolver::first_openrouter_model_from_db(&conn)
+        };
+        let model = resolved.unwrap_or_else(|| {
+            tracing::warn!(
+                event = "pattern4_no_openrouter_model",
+                "walker-v3: Pattern-4 site found no walker_provider_openrouter model; stamping '<unknown>' — downstream dispatch will surface no-model-available",
+            );
+            "<unknown>".to_string()
+        });
+        let defer = cfg
+            .dispatch_policy
             .as_ref()
             .map(|p| p.build_coordination.defer_maintenance_during_build)
             .unwrap_or(false);
@@ -6614,24 +6897,22 @@ async fn ensure_dadbear_running(
     tracing::info!(slug = %slug, "DADBEAR engine started via ensure_dadbear_running");
 
     drop(engines);
-    let source_paths: Vec<String> =
-        wire_node_lib::pyramid::slug::resolve_validated_source_paths(
-            &slug_info.source_path,
-            &slug_info.content_type,
-            state.pyramid.data_dir.as_deref(),
-        )
-        .unwrap_or_default()
-        .into_iter()
-        .map(|path| path.to_string_lossy().to_string())
-        .collect();
+    let source_paths: Vec<String> = wire_node_lib::pyramid::slug::resolve_validated_source_paths(
+        &slug_info.source_path,
+        &slug_info.content_type,
+        state.pyramid.data_dir.as_deref(),
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .map(|path| path.to_string_lossy().to_string())
+    .collect();
 
     if !source_paths.is_empty() {
-        let mut watcher =
-            wire_node_lib::pyramid::watcher::PyramidFileWatcher::new(
-                slug,
-                source_paths,
-                &state.pyramid.operational.tier2,
-            );
+        let mut watcher = wire_node_lib::pyramid::watcher::PyramidFileWatcher::new(
+            slug,
+            source_paths,
+            &state.pyramid.operational.tier2,
+        );
         let (mutation_tx, mut mutation_rx) =
             tokio::sync::mpsc::unbounded_channel::<(String, i32)>();
         watcher.set_mutation_sender(mutation_tx);
@@ -6671,8 +6952,12 @@ async fn pyramid_auto_update_freeze(
         engine.freeze();
     } else {
         let conn = state.pyramid.writer.lock().await;
-        wire_node_lib::pyramid::auto_update_ops::freeze(&conn, &state.pyramid.build_event_bus, &slug)
-            .map_err(|e: anyhow::Error| e.to_string())?;
+        wire_node_lib::pyramid::auto_update_ops::freeze(
+            &conn,
+            &state.pyramid.build_event_bus,
+            &slug,
+        )
+        .map_err(|e: anyhow::Error| e.to_string())?;
         // Old WAL drain removed — holds projection anti-join prevents dispatch while frozen.
     }
     let mut watchers = state.pyramid.file_watchers.lock().await;
@@ -6692,8 +6977,12 @@ async fn pyramid_auto_update_unfreeze(
         engine.unfreeze();
     } else {
         let conn = state.pyramid.writer.lock().await;
-        wire_node_lib::pyramid::auto_update_ops::unfreeze(&conn, &state.pyramid.build_event_bus, &slug)
-            .map_err(|e: anyhow::Error| e.to_string())?;
+        wire_node_lib::pyramid::auto_update_ops::unfreeze(
+            &conn,
+            &state.pyramid.build_event_bus,
+            &slug,
+        )
+        .map_err(|e: anyhow::Error| e.to_string())?;
     }
     drop(engines);
 
@@ -6794,11 +7083,11 @@ async fn pyramid_step_cache_for_build(
     let conn = state.pyramid.reader.lock().await;
     match build_id.as_deref() {
         Some(bid) if !bid.is_empty() => {
-            pyramid_db::list_cache_entries_for_build(&conn, &slug, bid)
-                .map_err(|e| e.to_string())
+            pyramid_db::list_cache_entries_for_build(&conn, &slug, bid).map_err(|e| e.to_string())
         }
-        _ => pyramid_db::list_cache_entries_for_latest_build(&conn, &slug)
-            .map_err(|e| e.to_string()),
+        _ => {
+            pyramid_db::list_cache_entries_for_latest_build(&conn, &slug).map_err(|e| e.to_string())
+        }
     }
 }
 
@@ -6828,11 +7117,7 @@ async fn pyramid_reroll_node(
     // Attach the cache plumbing (DB path + bus) to the LlmConfig so
     // the reroll's LLM call flows through the content-addressable
     // cache and emits the full event set.
-    let build_id = format!(
-        "reroll-{}-{}",
-        slug,
-        chrono::Utc::now().timestamp_millis()
-    );
+    let build_id = format!("reroll-{}-{}", slug, chrono::Utc::now().timestamp_millis());
     let llm_config = state.pyramid.llm_config_with_cache(&slug, &build_id).await;
 
     let db_path = state
@@ -6882,10 +7167,7 @@ async fn pyramid_active_builds(
     for (slug, handle) in active_map.iter() {
         let status_guard = handle.status.read().await;
         let status = status_guard.status.clone();
-        let started_at = format!(
-            "{}s ago",
-            handle.started_at.elapsed().as_secs()
-        );
+        let started_at = format!("{}s ago", handle.started_at.elapsed().as_secs());
         let build_id = status_guard.slug.clone();
         let completed_steps = status_guard.progress.done;
         let total_steps = status_guard.progress.total;
@@ -6955,8 +7237,7 @@ async fn pyramid_cost_rollup(
     let (from_iso, to_iso) = resolve_cost_rollup_range(&args).map_err(|e| e.to_string())?;
 
     let conn = state.pyramid.reader.lock().await;
-    let buckets = pyramid_db::cost_rollup(&conn, &from_iso, &to_iso)
-        .map_err(|e| e.to_string())?;
+    let buckets = pyramid_db::cost_rollup(&conn, &from_iso, &to_iso).map_err(|e| e.to_string())?;
     drop(conn);
 
     let total_estimated: f64 = buckets.iter().map(|b| b.estimated).sum();
@@ -7020,7 +7301,10 @@ fn resolve_cost_rollup_range(args: &CostRollupArgs) -> anyhow::Result<(String, S
             ))
         }
     };
-    Ok((from.format("%Y-%m-%d %H:%M:%S").to_string(), to.format("%Y-%m-%d %H:%M:%S").to_string()))
+    Ok((
+        from.format("%Y-%m-%d %H:%M:%S").to_string(),
+        to.format("%Y-%m-%d %H:%M:%S").to_string(),
+    ))
 }
 
 /// Phase 13 + Phase 18c: bulk-pause DADBEAR across pyramids matching
@@ -7116,13 +7400,9 @@ async fn pyramid_count_dadbear_scope(
         ));
     }
     let conn = state.pyramid.reader.lock().await;
-    let count = pyramid_db::count_dadbear_scope(
-        &conn,
-        &scope,
-        scope_value.as_deref(),
-        target_pause,
-    )
-    .map_err(|e| e.to_string())?;
+    let count =
+        pyramid_db::count_dadbear_scope(&conn, &scope, scope_value.as_deref(), target_pause)
+            .map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "count": count }))
 }
 
@@ -7609,9 +7889,7 @@ async fn pyramid_dadbear_activity_v2(
                     event_type: format!("hold_{}", action),
                     slug: slug.clone(),
                     target_id: Some(hold),
-                    details: reason.map(|r| {
-                        serde_json::json!({ "reason": r }).to_string()
-                    }),
+                    details: reason.map(|r| serde_json::json!({ "reason": r }).to_string()),
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -7788,8 +8066,12 @@ async fn pyramid_breaker_resume(
         Ok(serde_json::json!({"status": "resumed", "slug": slug}))
     } else {
         let conn = state.pyramid.writer.lock().await;
-        wire_node_lib::pyramid::auto_update_ops::resume_breaker(&conn, &state.pyramid.build_event_bus, &slug)
-            .map_err(|e: anyhow::Error| e.to_string())?;
+        wire_node_lib::pyramid::auto_update_ops::resume_breaker(
+            &conn,
+            &state.pyramid.build_event_bus,
+            &slug,
+        )
+        .map_err(|e: anyhow::Error| e.to_string())?;
         Ok(
             serde_json::json!({"status": "resumed", "slug": slug, "note": "No active engine, breaker cleared in DB"}),
         )
@@ -7919,8 +8201,7 @@ async fn pyramid_dadbear_configs_for_slug(
     slug: String,
 ) -> Result<serde_json::Value, String> {
     let conn = state.pyramid.reader.lock().await;
-    let configs =
-        pyramid_db::get_dadbear_configs(&conn, &slug).map_err(|e| e.to_string())?;
+    let configs = pyramid_db::get_dadbear_configs(&conn, &slug).map_err(|e| e.to_string())?;
     serde_json::to_value(&configs).map_err(|e| e.to_string())
 }
 
@@ -7945,7 +8226,16 @@ async fn pyramid_auto_update_run_now(
     // + credential_store runtime handles. The old `api_key`/`model`
     // call into drain_and_dispatch was left dead by the fix pass;
     // Phase 4 picks it up here under the "fix all bugs found" rule.
-    let (db_path, base_config, model, semaphore, phase_arc, detail_arc, summary_arc, defer_maintenance) = {
+    let (
+        db_path,
+        base_config,
+        model,
+        semaphore,
+        phase_arc,
+        detail_arc,
+        summary_arc,
+        defer_maintenance,
+    ) = {
         let engines = state.pyramid.stale_engines.lock().await;
         let engine = engines
             .get(&slug)
@@ -8011,12 +8301,25 @@ async fn pyramid_auto_update_l0_sweep(
     let (tracked_files, enqueued, already_pending, r_new, r_changed, r_deleted) = {
         let conn = state.pyramid.writer.lock().await;
         wire_node_lib::pyramid::routes::enqueue_full_l0_sweep_with_reconciliation(
-            &conn, &slug, &source_paths, &ingested_extensions, &content_type,
+            &conn,
+            &slug,
+            &source_paths,
+            &ingested_extensions,
+            &content_type,
         )
     };
 
     // Phase 3 fix — `engine.api_key` is retired; use `base_config`.
-    let (db_path, base_config, model, semaphore, phase_arc, detail_arc, summary_arc, defer_maintenance) = {
+    let (
+        db_path,
+        base_config,
+        model,
+        semaphore,
+        phase_arc,
+        detail_arc,
+        summary_arc,
+        defer_maintenance,
+    ) = {
         let engines = state.pyramid.stale_engines.lock().await;
         let engine = engines
             .get(&slug)
@@ -8172,7 +8475,20 @@ async fn pyramid_faq_directory(
         .pyramid
         .llm_config_with_cache(&slug, &format!("faq-dir-{}", slug))
         .await;
-    let model = base_config.primary_model.clone();
+    // walker-v3 W3a (Pattern 4): resolve via walker_resolver reading
+    // the active walker_provider_openrouter contribution. Legacy
+    // fallback removed by W3c once config.primary_model dies.
+    let resolved = {
+        let conn = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::walker_resolver::first_openrouter_model_from_db(&conn)
+    };
+    let model = resolved.unwrap_or_else(|| {
+        tracing::warn!(
+            event = "pattern4_no_openrouter_model",
+            "walker-v3: Pattern-4 site found no walker_provider_openrouter model; stamping '<unknown>'",
+        );
+        "<unknown>".to_string()
+    });
 
     let directory = pyramid_faq::get_faq_directory(
         &state.pyramid.reader,
@@ -8219,10 +8535,7 @@ struct CredentialPreview {
 async fn pyramid_list_credentials(
     state: tauri::State<'_, SharedState>,
 ) -> Result<Vec<CredentialPreview>, String> {
-    let previews = state
-        .pyramid
-        .credential_store
-        .list_with_masked_previews();
+    let previews = state.pyramid.credential_store.list_with_masked_previews();
     Ok(previews
         .into_iter()
         .map(|(key, masked_preview)| CredentialPreview {
@@ -8516,9 +8829,8 @@ async fn pyramid_get_local_mode_status(
     // reader-bound IPC for up to 5 seconds while the probe ran.
     let snapshot = {
         let reader = state.pyramid.reader.lock().await;
-        let snapshot =
-            wire_node_lib::pyramid::local_mode::load_status_snapshot(&reader)
-                .map_err(|e| e.to_string())?;
+        let snapshot = wire_node_lib::pyramid::local_mode::load_status_snapshot(&reader)
+            .map_err(|e| e.to_string())?;
         drop(reader);
         snapshot
     };
@@ -8649,8 +8961,8 @@ async fn pyramid_get_model_details(
     base_url: String,
     model: String,
 ) -> Result<wire_node_lib::pyramid::local_mode::OllamaModelInfo, String> {
-    let normalized =
-        wire_node_lib::pyramid::local_mode::normalize_base_url(&base_url).map_err(|e| e.to_string())?;
+    let normalized = wire_node_lib::pyramid::local_mode::normalize_base_url(&base_url)
+        .map_err(|e| e.to_string())?;
     wire_node_lib::pyramid::local_mode::fetch_model_details(&normalized, &model)
         .await
         .map_err(|e| e.to_string())
@@ -8700,11 +9012,9 @@ async fn pyramid_switch_local_model(
         {
             let active = state.pyramid.active_build.read().await;
             if !active.is_empty() {
-                return Err(
-                    "A build started while probing the model — \
+                return Err("A build started while probing the model — \
                      cannot change routing while a build is in progress."
-                        .to_string(),
-                );
+                    .to_string());
             }
         }
 
@@ -8789,9 +9099,7 @@ async fn pyramid_ollama_pull_model(
 /// drops the response stream. Returns immediately; the pull IPC will return
 /// an error once it observes the flag.
 #[tauri::command]
-async fn pyramid_ollama_cancel_pull(
-    state: tauri::State<'_, SharedState>,
-) -> Result<(), String> {
+async fn pyramid_ollama_cancel_pull(state: tauri::State<'_, SharedState>) -> Result<(), String> {
     state
         .pyramid
         .ollama_pull_cancel
@@ -8866,11 +9174,9 @@ async fn pyramid_set_context_override(
         {
             let active = state.pyramid.active_build.read().await;
             if !active.is_empty() {
-                return Err(
-                    "A build started while acquiring the lock — \
+                return Err("A build started while acquiring the lock — \
                      cannot change context override while a build is in progress."
-                        .to_string(),
-                );
+                    .to_string());
             }
         }
 
@@ -8921,11 +9227,9 @@ async fn pyramid_set_concurrency_override(
         {
             let active = state.pyramid.active_build.read().await;
             if !active.is_empty() {
-                return Err(
-                    "A build started while acquiring the lock — \
+                return Err("A build started while acquiring the lock — \
                      cannot change concurrency override while a build is in progress."
-                        .to_string(),
-                );
+                    .to_string());
             }
         }
 
@@ -9112,9 +9416,7 @@ async fn compute_market_surface(
 /// `compute_participation_policy.allow_market_visibility` — that gate
 /// takes precedence.
 #[tauri::command]
-async fn compute_market_enable(
-    state: tauri::State<'_, SharedState>,
-) -> Result<(), String> {
+async fn compute_market_enable(state: tauri::State<'_, SharedState>) -> Result<(), String> {
     wire_node_lib::pyramid::compute_market_ops::set_serving(
         true,
         &state.compute_market_state,
@@ -9127,9 +9429,7 @@ async fn compute_market_enable(
 
 /// Toggle the runtime `is_serving` flag off.
 #[tauri::command]
-async fn compute_market_disable(
-    state: tauri::State<'_, SharedState>,
-) -> Result<(), String> {
+async fn compute_market_disable(state: tauri::State<'_, SharedState>) -> Result<(), String> {
     wire_node_lib::pyramid::compute_market_ops::set_serving(
         false,
         &state.compute_market_state,
@@ -9186,8 +9486,8 @@ async fn pyramid_get_visual_encoding_data(
     slug: String,
 ) -> Result<serde_json::Value, String> {
     let reader = state.pyramid.reader.lock().await;
-    let data = pyramid_query::get_visual_encoding_data(&reader, &slug)
-        .map_err(|e| e.to_string())?;
+    let data =
+        pyramid_query::get_visual_encoding_data(&reader, &slug).map_err(|e| e.to_string())?;
     serde_json::to_value(&data).map_err(|e| e.to_string())
 }
 
@@ -9257,8 +9557,7 @@ async fn pyramid_provider_health(
 ) -> Result<Vec<wire_node_lib::pyramid::db::ProviderHealthEntry>, String> {
     let conn = state.pyramid.reader.lock().await;
     // 24h window is what the spec's Oversight page shows by default.
-    wire_node_lib::pyramid::db::list_provider_health(&conn, 86_400)
-        .map_err(|e| e.to_string())
+    wire_node_lib::pyramid::db::list_provider_health(&conn, 86_400).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -9268,12 +9567,8 @@ async fn pyramid_acknowledge_provider_health(
 ) -> Result<(), String> {
     let writer = state.pyramid.writer.lock().await;
     let bus = state.pyramid.build_event_bus.clone();
-    wire_node_lib::pyramid::provider_health::acknowledge_provider(
-        &writer,
-        &provider_id,
-        Some(&bus),
-    )
-    .map_err(|e| e.to_string())
+    wire_node_lib::pyramid::provider_health::acknowledge_provider(&writer, &provider_id, Some(&bus))
+        .map_err(|e| e.to_string())
 }
 
 #[derive(serde::Serialize)]
@@ -9388,31 +9683,29 @@ async fn pyramid_create_config_contribution(
 ) -> Result<CreateConfigContributionResponse, String> {
     let writer = state.pyramid.writer.lock().await;
     let source_val = source.unwrap_or_else(|| "local".to_string());
-    let contribution_id =
-        wire_node_lib::pyramid::config_contributions::create_config_contribution(
-            &writer,
-            &schema_type,
-            slug.as_deref(),
-            &yaml_content,
-            note.as_deref(),
-            &source_val,
-            Some("user"),
-            "active",
-        )
-        .map_err(|e| e.to_string())?;
+    let contribution_id = wire_node_lib::pyramid::config_contributions::create_config_contribution(
+        &writer,
+        &schema_type,
+        slug.as_deref(),
+        &yaml_content,
+        note.as_deref(),
+        &source_val,
+        Some("user"),
+        "active",
+    )
+    .map_err(|e| e.to_string())?;
 
     // Phase 4 invariant: every write path to pyramid_config_contributions
     // that lands as `active` MUST sync to operational tables immediately.
     // Per the spec: "Write path: always write to pyramid_config_contributions
     // first, then sync to operational tables." Without this call the
     // operational tables stay stale and the executor reads prior values.
-    let contribution =
-        wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
-            &writer,
-            &contribution_id,
-        )
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "contribution disappeared immediately after create".to_string())?;
+    let contribution = wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+        &writer,
+        &contribution_id,
+    )
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "contribution disappeared immediately after create".to_string())?;
     wire_node_lib::pyramid::config_contributions::sync_config_to_operational(
         &writer,
         &state.pyramid.build_event_bus,
@@ -9451,13 +9744,12 @@ async fn pyramid_supersede_config(
     // next read. See `pyramid_create_config_contribution` for the
     // rationale — same invariant applies to every write path that
     // produces an `active` contribution.
-    let contribution =
-        wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
-            &writer,
-            &new_contribution_id,
-        )
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "contribution disappeared immediately after supersede".to_string())?;
+    let contribution = wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+        &writer,
+        &new_contribution_id,
+    )
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "contribution disappeared immediately after supersede".to_string())?;
     wire_node_lib::pyramid::config_contributions::sync_config_to_operational(
         &writer,
         &state.pyramid.build_event_bus,
@@ -9465,7 +9757,9 @@ async fn pyramid_supersede_config(
     )
     .map_err(|e| e.to_string())?;
 
-    Ok(SupersedeConfigResponse { new_contribution_id })
+    Ok(SupersedeConfigResponse {
+        new_contribution_id,
+    })
 }
 
 /// Wave 4 task 29 (walker-re-plan-wire-2.1 §8): flattened UI view of
@@ -9530,12 +9824,8 @@ async fn pyramid_get_config_history(
     limit: usize,
 ) -> Result<Vec<wire_node_lib::pyramid::config_contributions::ConfigHistoryEntry>, String> {
     let reader = state.pyramid.reader.lock().await;
-    wire_node_lib::pyramid::config_contributions::load_config_history(
-        &reader,
-        &schema_type,
-        limit,
-    )
-    .map_err(|e| e.to_string())
+    wire_node_lib::pyramid::config_contributions::load_config_history(&reader, &schema_type, limit)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -9551,18 +9841,17 @@ async fn pyramid_propose_config(
     wire_node_lib::pyramid::config_contributions::validate_note(&note)?;
 
     let writer = state.pyramid.writer.lock().await;
-    let contribution_id =
-        wire_node_lib::pyramid::config_contributions::create_config_contribution(
-            &writer,
-            &schema_type,
-            slug.as_deref(),
-            &yaml_content,
-            Some(&note),
-            "agent",
-            Some(&agent_name),
-            "proposed",
-        )
-        .map_err(|e| e.to_string())?;
+    let contribution_id = wire_node_lib::pyramid::config_contributions::create_config_contribution(
+        &writer,
+        &schema_type,
+        slug.as_deref(),
+        &yaml_content,
+        Some(&note),
+        "agent",
+        Some(&agent_name),
+        "proposed",
+    )
+    .map_err(|e| e.to_string())?;
     Ok(CreateConfigContributionResponse { contribution_id })
 }
 
@@ -9572,11 +9861,8 @@ async fn pyramid_pending_proposals(
     slug: Option<String>,
 ) -> Result<Vec<wire_node_lib::pyramid::config_contributions::ConfigContribution>, String> {
     let reader = state.pyramid.reader.lock().await;
-    wire_node_lib::pyramid::config_contributions::list_pending_proposals(
-        &reader,
-        slug.as_deref(),
-    )
-    .map_err(|e| e.to_string())
+    wire_node_lib::pyramid::config_contributions::list_pending_proposals(&reader, slug.as_deref())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -9594,13 +9880,12 @@ async fn pyramid_accept_proposal(
     // operational table keeps returning the prior (now-superseded)
     // row — which is exactly the bug the contribution pattern was
     // meant to eliminate.
-    let contribution =
-        wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
-            &writer,
-            &contribution_id,
-        )
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "contribution disappeared immediately after accept".to_string())?;
+    let contribution = wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+        &writer,
+        &contribution_id,
+    )
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "contribution disappeared immediately after accept".to_string())?;
     wire_node_lib::pyramid::config_contributions::sync_config_to_operational(
         &writer,
         &state.pyramid.build_event_bus,
@@ -9608,9 +9893,7 @@ async fn pyramid_accept_proposal(
     )
     .map_err(|e| e.to_string())?;
 
-    Ok(CreateConfigContributionResponse {
-        contribution_id,
-    })
+    Ok(CreateConfigContributionResponse { contribution_id })
 }
 
 #[tauri::command]
@@ -9713,11 +9996,10 @@ async fn pyramid_dry_run_publish(
     };
 
     // Deserialize canonical metadata from the JSON column.
-    let metadata =
-        wire_node_lib::pyramid::wire_native_metadata::WireNativeMetadata::from_json(
-            &contribution.wire_native_metadata_json,
-        )
-        .map_err(|e| format!("failed to parse wire_native_metadata_json: {e}"))?;
+    let metadata = wire_node_lib::pyramid::wire_native_metadata::WireNativeMetadata::from_json(
+        &contribution.wire_native_metadata_json,
+    )
+    .map_err(|e| format!("failed to parse wire_native_metadata_json: {e}"))?;
 
     // The publisher only needs the URL + auth for the real publish
     // path; dry-run is purely local. Construct a zero-auth publisher
@@ -9796,11 +10078,10 @@ async fn pyramid_publish_to_wire(
     };
 
     // Deserialize canonical metadata.
-    let metadata =
-        wire_node_lib::pyramid::wire_native_metadata::WireNativeMetadata::from_json(
-            &contribution.wire_native_metadata_json,
-        )
-        .map_err(|e| format!("failed to parse wire_native_metadata_json: {e}"))?;
+    let metadata = wire_node_lib::pyramid::wire_native_metadata::WireNativeMetadata::from_json(
+        &contribution.wire_native_metadata_json,
+    )
+    .map_err(|e| format!("failed to parse wire_native_metadata_json: {e}"))?;
 
     // Refuse to publish draft metadata without an explicit force flag.
     // (Phase 5 ships the hard refusal; Phase 10's UI can add the
@@ -9855,8 +10136,7 @@ async fn pyramid_publish_to_wire(
                     drop(conn);
                     out
                 };
-                manifest_result
-                    .map_err(|e| format!("failed to export cache manifest: {e}"))?
+                manifest_result.map_err(|e| format!("failed to export cache manifest: {e}"))?
             }
             _ => {
                 tracing::warn!(
@@ -9978,9 +10258,8 @@ async fn pyramid_wire_discover(
 ) -> Result<Vec<wire_node_lib::pyramid::wire_discovery::DiscoveryResult>, String> {
     let wire_auth = get_api_token(&state.auth).await.unwrap_or_default();
     let publisher = wire_publisher_from_state(&state, wire_auth);
-    let sort = wire_node_lib::pyramid::wire_discovery::DiscoverSortBy::from_str_lax(
-        sort_by.as_deref(),
-    );
+    let sort =
+        wire_node_lib::pyramid::wire_discovery::DiscoverSortBy::from_str_lax(sort_by.as_deref());
     let tags_ref: Option<&[String]> = tags.as_deref();
 
     // Load the weights synchronously, then drop the reader BEFORE the
@@ -10076,12 +10355,11 @@ async fn pyramid_wire_update_available(
     // contribution table (the cache row doesn't carry them directly).
     let mut out: Vec<WireUpdateEntry> = Vec::with_capacity(rows.len());
     for row in rows {
-        let contribution =
-            wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
-                &reader,
-                &row.local_contribution_id,
-            )
-            .map_err(|e| e.to_string())?;
+        let contribution = wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+            &reader,
+            &row.local_contribution_id,
+        )
+        .map_err(|e| e.to_string())?;
         let Some(c) = contribution else {
             continue;
         };
@@ -10138,10 +10416,7 @@ async fn pyramid_wire_auto_update_toggle(
     };
 
     let mut writer = state.pyramid.writer.lock().await;
-    let note = format!(
-        "Set auto-update for {} = {}",
-        schema_type, enabled
-    );
+    let note = format!("Set auto-update for {} = {}", schema_type, enabled);
     let new_contribution_id = if let Some(prior) = prior_id {
         wire_node_lib::pyramid::config_contributions::supersede_config_contribution(
             &mut writer,
@@ -10252,10 +10527,7 @@ async fn pyramid_wire_pull_latest(
     .map_err(|e| e.to_string())?;
 
     // Delete the cache entry — the pull is done, no further badge needed.
-    let _ = wire_node_lib::pyramid::db::delete_wire_update_cache(
-        &writer,
-        &local_contribution_id,
-    );
+    let _ = wire_node_lib::pyramid::db::delete_wire_update_cache(&writer, &local_contribution_id);
 
     Ok(PullLatestResponse {
         new_local_contribution_id: outcome.new_local_contribution_id,
@@ -10365,17 +10637,13 @@ async fn yaml_renderer_resolve_options(
     let registry = state.pyramid.provider_registry.clone();
     if let Some(provider_id) = source.strip_prefix("model_list:") {
         return Ok(
-            wire_node_lib::pyramid::yaml_renderer::resolve_model_list_only(
-                &registry,
-                provider_id,
-            )
-            .await,
+            wire_node_lib::pyramid::yaml_renderer::resolve_model_list_only(&registry, provider_id)
+                .await,
         );
     }
     let reader = state.pyramid.reader.lock().await;
-    let result = wire_node_lib::pyramid::yaml_renderer::resolve_option_source(
-        &reader, &registry, &source,
-    );
+    let result =
+        wire_node_lib::pyramid::yaml_renderer::resolve_option_source(&reader, &registry, &source);
     drop(reader);
     result.map_err(|e| e.to_string())
 }
@@ -10571,10 +10839,7 @@ async fn pyramid_active_config(
     state: tauri::State<'_, SharedState>,
     schema_type: String,
     slug: Option<String>,
-) -> Result<
-    Option<wire_node_lib::pyramid::generative_config::ActiveConfigResponse>,
-    String,
-> {
+) -> Result<Option<wire_node_lib::pyramid::generative_config::ActiveConfigResponse>, String> {
     let reader = state.pyramid.reader.lock().await;
     wire_node_lib::pyramid::generative_config::active_config_for(
         &reader,
@@ -10589,10 +10854,7 @@ async fn pyramid_config_versions(
     state: tauri::State<'_, SharedState>,
     schema_type: String,
     slug: Option<String>,
-) -> Result<
-    Vec<wire_node_lib::pyramid::config_contributions::ConfigContribution>,
-    String,
-> {
+) -> Result<Vec<wire_node_lib::pyramid::config_contributions::ConfigContribution>, String> {
     let reader = state.pyramid.reader.lock().await;
     wire_node_lib::pyramid::generative_config::config_version_history_for(
         &reader,
@@ -10605,13 +10867,12 @@ async fn pyramid_config_versions(
 #[tauri::command]
 async fn pyramid_config_schemas(
     state: tauri::State<'_, SharedState>,
-) -> Result<
-    Vec<wire_node_lib::pyramid::schema_registry::ConfigSchemaSummary>,
-    String,
-> {
-    Ok(wire_node_lib::pyramid::generative_config::list_config_schemas(
-        &state.pyramid.schema_registry,
-    ))
+) -> Result<Vec<wire_node_lib::pyramid::schema_registry::ConfigSchemaSummary>, String> {
+    Ok(
+        wire_node_lib::pyramid::generative_config::list_config_schemas(
+            &state.pyramid.schema_registry,
+        ),
+    )
 }
 
 // ── Phase 18d: Schema Migration UI IPC commands ─────────────────────────
@@ -10672,10 +10933,7 @@ struct RejectMigrationInput {
 #[tauri::command]
 async fn pyramid_list_configs_needing_migration(
     state: tauri::State<'_, SharedState>,
-) -> Result<
-    Vec<wire_node_lib::pyramid::migration_config::NeedsMigrationEntry>,
-    String,
-> {
+) -> Result<Vec<wire_node_lib::pyramid::migration_config::NeedsMigrationEntry>, String> {
     let reader = state.pyramid.reader.lock().await;
     wire_node_lib::pyramid::migration_config::list_configs_needing_migration(&reader)
         .map_err(|e| e.to_string())
@@ -10866,15 +11124,11 @@ async fn pyramid_import_progress(
     // manifest is still downloading — in that case progress is 0.
     let progress = {
         let node_frac = match row.nodes_total {
-            Some(total) if total > 0 => {
-                (row.nodes_processed as f64) / (total as f64)
-            }
+            Some(total) if total > 0 => (row.nodes_processed as f64) / (total as f64),
             _ => 0.0,
         };
         let entry_frac = match row.cache_entries_total {
-            Some(total) if total > 0 => {
-                (row.cache_entries_validated as f64) / (total as f64)
-            }
+            Some(total) if total > 0 => (row.cache_entries_validated as f64) / (total as f64),
             _ => 0.0,
         };
         (node_frac * 0.5 + entry_frac * 0.5).clamp(0.0, 1.0)
@@ -10896,11 +11150,9 @@ async fn pyramid_import_cancel(
     target_slug: String,
 ) -> Result<ImportCancelResponse, String> {
     let writer = state.pyramid.writer.lock().await;
-    let report = wire_node_lib::pyramid::pyramid_import::cancel_pyramid_import(
-        &writer,
-        &target_slug,
-    )
-    .map_err(|e| e.to_string())?;
+    let report =
+        wire_node_lib::pyramid::pyramid_import::cancel_pyramid_import(&writer, &target_slug)
+            .map_err(|e| e.to_string())?;
     Ok(ImportCancelResponse {
         cancelled: true,
         state_row_existed: report.state_row_existed,
@@ -10921,11 +11173,7 @@ async fn pyramid_open_window(
     // Unique label — only the first segment of a v4 UUID (8 hex chars) to keep it short.
     let label = format!(
         "pyramid-surface-{}",
-        uuid::Uuid::new_v4()
-            .to_string()
-            .split('-')
-            .next()
-            .unwrap()
+        uuid::Uuid::new_v4().to_string().split('-').next().unwrap()
     );
 
     // Build the frontend URL with query params so React knows what to render.
@@ -10935,21 +11183,18 @@ async fn pyramid_open_window(
         "index.html?window=pyramid-surface".to_string()
     };
 
-    let _window = tauri::WebviewWindowBuilder::new(
-        &app,
-        &label,
-        tauri::WebviewUrl::App(url.into()),
-    )
-    .title(if let Some(ref s) = slug {
-        format!("Pyramid: {}", s)
-    } else {
-        "Pyramid Surface".to_string()
-    })
-    .inner_size(1000.0, 700.0)
-    .resizable(true)
-    .decorations(true)
-    .build()
-    .map_err(|e| e.to_string())?;
+    let _window =
+        tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url.into()))
+            .title(if let Some(ref s) = slug {
+                format!("Pyramid: {}", s)
+            } else {
+                "Pyramid Surface".to_string()
+            })
+            .inner_size(1000.0, 700.0)
+            .resizable(true)
+            .decorations(true)
+            .build()
+            .map_err(|e| e.to_string())?;
 
     Ok(label)
 }
@@ -10957,10 +11202,7 @@ async fn pyramid_open_window(
 /// Closes a pyramid surface window by its Tauri label.  Silently succeeds if
 /// the window has already been closed.
 #[tauri::command]
-async fn pyramid_close_window(
-    app: tauri::AppHandle,
-    label: String,
-) -> Result<(), String> {
+async fn pyramid_close_window(app: tauri::AppHandle, label: String) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(&label) {
         window.close().map_err(|e| e.to_string())?;
     }
@@ -11124,9 +11366,7 @@ async fn pyramid_get_build_chronicle(
                 let verdict: String = row.get(3)?;
                 let weight: Option<f64> = row.get(4)?;
                 let reason: Option<String> = row.get(5)?;
-                let weight_str = weight
-                    .map(|w| format!(" (w={:.2})", w))
-                    .unwrap_or_default();
+                let weight_str = weight.map(|w| format!(" (w={:.2})", w)).unwrap_or_default();
                 Ok(serde_json::json!({
                     "timestamp": ts,
                     "kind": "decision",
@@ -11205,23 +11445,30 @@ async fn pyramid_get_build_chronicle(
                 let note: Option<String> = row.get(2)?;
 
                 // Parse yaml_content to extract orphan/central/gap counts
-                let headline = if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&yaml_content) {
-                    let orphans = doc.get("orphans")
-                        .and_then(|v| v.as_sequence())
-                        .map(|s| s.len())
-                        .unwrap_or(0);
-                    let central = doc.get("central_nodes")
-                        .and_then(|v| v.as_sequence())
-                        .map(|s| s.len())
-                        .unwrap_or(0);
-                    let gaps = doc.get("gaps")
-                        .and_then(|v| v.as_sequence())
-                        .map(|s| s.len())
-                        .unwrap_or(0);
-                    format!("Reconciliation: {} orphans, {} central, {} gaps", orphans, central, gaps)
-                } else {
-                    "Reconciliation summary".to_string()
-                };
+                let headline =
+                    if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&yaml_content) {
+                        let orphans = doc
+                            .get("orphans")
+                            .and_then(|v| v.as_sequence())
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                        let central = doc
+                            .get("central_nodes")
+                            .and_then(|v| v.as_sequence())
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                        let gaps = doc
+                            .get("gaps")
+                            .and_then(|v| v.as_sequence())
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                        format!(
+                            "Reconciliation: {} orphans, {} central, {} gaps",
+                            orphans, central, gaps
+                        )
+                    } else {
+                        "Reconciliation summary".to_string()
+                    };
 
                 Ok(serde_json::json!({
                     "timestamp": ts,
@@ -11342,7 +11589,10 @@ async fn get_compute_timeline(
     tokio::task::spawn_blocking(move || {
         let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
         wire_node_lib::pyramid::compute_chronicle::query_timeline(
-            &conn, &start, &end, bucket_size_minutes,
+            &conn,
+            &start,
+            &end,
+            bucket_size_minutes,
         )
         .map_err(|e| e.to_string())
     })
@@ -11371,7 +11621,9 @@ async fn get_chronicle_dimensions(
 // --- Fleet Roster IPC --------------------------------------------------------
 
 #[tauri::command]
-async fn get_fleet_roster(state: tauri::State<'_, SharedState>) -> Result<serde_json::Value, String> {
+async fn get_fleet_roster(
+    state: tauri::State<'_, SharedState>,
+) -> Result<serde_json::Value, String> {
     let roster = state.fleet_roster.read().await;
     serde_json::to_value(&*roster).map_err(|e| e.to_string())
 }
@@ -11447,11 +11699,16 @@ fn main() {
     let data_dir = config.data_dir();
     let initial_tunnel = tunnel::load_tunnel_state(&data_dir).unwrap_or_default();
 
-    // Hoist auth + tunnel into shared Arcs early so the ConfigSynced
-    // listener (spawned before AppState construction) can announce to
-    // fleet with real node_id and tunnel_url.
+    // Hoist auth + tunnel + credits into shared Arcs early so the
+    // ConfigSynced listener (spawned before AppState construction) can
+    // announce to fleet with real node_id and tunnel_url, and so the
+    // walker-v3 Phase 3 market-probe task (spawned alongside the
+    // MarketSurfaceCache poller) can read the live credit balance
+    // without reaching through AppState.
     let shared_auth: Arc<RwLock<auth::AuthState>> = Arc::new(RwLock::new(initial_auth.clone()));
     let shared_tunnel: Arc<RwLock<tunnel::TunnelState>> = Arc::new(RwLock::new(initial_tunnel));
+    let shared_credits_tracker: Arc<RwLock<credits::CreditTracker>> =
+        Arc::new(RwLock::new(initial_credits.clone()));
 
     // Hoist the shared WireNodeConfig and compute-market pending-jobs
     // map so the Phase B market integration has the same handles the
@@ -11459,15 +11716,17 @@ fn main() {
     // handle as AppState's fields — the inbound /v1/compute/job-result
     // handler looks up in AppState.pending_market_jobs, and the gate
     // reads AppState.config.api_url for dispatch.
-    let shared_config: Arc<RwLock<WireNodeConfig>> =
-        Arc::new(RwLock::new(config.clone()));
+    let shared_config: Arc<RwLock<WireNodeConfig>> = Arc::new(RwLock::new(config.clone()));
     let shared_pending_market_jobs: wire_node_lib::pyramid::pending_jobs::PendingJobs =
         wire_node_lib::pyramid::pending_jobs::PendingJobs::new();
 
     // Shared JWT public key and node ID for the server module.
     // Prefer the key from AuthState (persisted in session.json) over the config default.
     let jwt_public_key = Arc::new(RwLock::new(
-        initial_auth.jwt_public_key.clone().unwrap_or_else(|| config.jwt_public_key.clone())
+        initial_auth
+            .jwt_public_key
+            .clone()
+            .unwrap_or_else(|| config.jwt_public_key.clone()),
     ));
     // Same precedence as jwt_public_key — AuthState (session.json) over
     // config.node_id. Caught during the first-ever /fill attempt on
@@ -11483,7 +11742,10 @@ fn main() {
     // path exists for node_id (the heartbeat response doesn't echo it),
     // so getting this init right is load-bearing.
     let node_id_shared = Arc::new(RwLock::new(
-        initial_auth.node_id.clone().unwrap_or_else(|| config.node_id.clone())
+        initial_auth
+            .node_id
+            .clone()
+            .unwrap_or_else(|| config.node_id.clone()),
     ));
 
     // Initialize pyramid SQLite database (reader + writer connections)
@@ -11494,6 +11756,8 @@ fn main() {
         .expect("Failed to open pyramid.db writer connection");
     wire_node_lib::pyramid::db::init_pyramid_db(&pyramid_writer)
         .expect("Failed to initialize pyramid schema on writer");
+    wire_node_lib::pyramid::db::configure_pyramid_writer_connection(&pyramid_writer)
+        .expect("Failed to configure pyramid writer connection");
 
     let pyramid_reader = rusqlite::Connection::open(&pyramid_db_path)
         .expect("Failed to open pyramid.db reader connection");
@@ -11510,9 +11774,7 @@ fn main() {
     // prompt lookup would be dead code. Must be set BEFORE any chain
     // load attempt, which is safe here because the migration and
     // subsequent chain execution both happen after this point.
-    wire_node_lib::pyramid::prompt_cache::set_global_prompt_cache_db_path(
-        pyramid_db_path.clone(),
-    );
+    wire_node_lib::pyramid::prompt_cache::set_global_prompt_cache_db_path(pyramid_db_path.clone());
 
     // Load pyramid config from disk (or use defaults)
     let pyramid_config = wire_node_lib::pyramid::PyramidConfig::load(&config.data_dir());
@@ -11545,7 +11807,11 @@ fn main() {
     #[cfg(not(debug_assertions))]
     let source_chains_for_sync = {
         let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../chains");
-        if src.exists() { Some(src) } else { None }
+        if src.exists() {
+            Some(src)
+        } else {
+            None
+        }
     };
     if let Err(e) = wire_node_lib::pyramid::chain_loader::ensure_default_chains(
         &chains_dir,
@@ -11632,16 +11898,13 @@ fn main() {
     // Users upgrading to Phase 3 have their OpenRouter API key in the old
     // pyramid_config.json but the credential store is empty. Seed once so
     // the provider registry can resolve it at build time.
-    if !pyramid_config.openrouter_api_key.is_empty()
-        && !credential_store.contains("OPENROUTER_KEY")
+    if !pyramid_config.openrouter_api_key.is_empty() && !credential_store.contains("OPENROUTER_KEY")
     {
         match credential_store.set("OPENROUTER_KEY", &pyramid_config.openrouter_api_key) {
             Ok(()) => tracing::info!(
                 "Migrated OpenRouter API key from pyramid_config.json → .credentials"
             ),
-            Err(e) => tracing::warn!(
-                "Failed to migrate OpenRouter API key to .credentials: {e}"
-            ),
+            Err(e) => tracing::warn!("Failed to migrate OpenRouter API key to .credentials: {e}"),
         }
     }
 
@@ -11676,19 +11939,19 @@ fn main() {
     // are visible. The registry is held on PyramidState as an Arc so IPC
     // handlers (pyramid_config_schemas, pyramid_generate_config, etc.) can
     // share a single view without cloning on every call.
-    let schema_registry: std::sync::Arc<
-        wire_node_lib::pyramid::schema_registry::SchemaRegistry,
-    > = {
+    let schema_registry: std::sync::Arc<wire_node_lib::pyramid::schema_registry::SchemaRegistry> = {
         let registry = match wire_node_lib::pyramid::db::open_pyramid_connection(&pyramid_db_path) {
             Ok(conn) => {
-                wire_node_lib::pyramid::schema_registry::SchemaRegistry::hydrate_from_contributions(&conn)
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(
-                            "failed to hydrate Phase 9 schema registry: {}; starting empty",
-                            e
-                        );
-                        wire_node_lib::pyramid::schema_registry::SchemaRegistry::new()
-                    })
+                wire_node_lib::pyramid::schema_registry::SchemaRegistry::hydrate_from_contributions(
+                    &conn,
+                )
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "failed to hydrate Phase 9 schema registry: {}; starting empty",
+                        e
+                    );
+                    wire_node_lib::pyramid::schema_registry::SchemaRegistry::new()
+                })
             }
             Err(e) => {
                 tracing::warn!(
@@ -11704,12 +11967,10 @@ fn main() {
     let pyramid_state = Arc::new(wire_node_lib::pyramid::PyramidState {
         reader: Arc::new(tokio::sync::Mutex::new(pyramid_reader)),
         writer: Arc::new(tokio::sync::Mutex::new(pyramid_writer)),
-        config: Arc::new(RwLock::new(
-            pyramid_config.to_llm_config_with_runtime(
-                provider_registry.clone(),
-                credential_store.clone(),
-            ),
-        )),
+        config: Arc::new(RwLock::new(pyramid_config.to_llm_config_with_runtime(
+            provider_registry.clone(),
+            credential_store.clone(),
+        ))),
         active_build: Arc::new(RwLock::new(std::collections::HashMap::new())),
         data_dir: Some(config.data_dir()),
         stale_engines: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -11726,9 +11987,7 @@ fn main() {
         absorption_gate: Arc::new(tokio::sync::Mutex::new(
             wire_node_lib::pyramid::AbsorptionGate::new(),
         )),
-        build_event_bus: Arc::new(
-            wire_node_lib::pyramid::event_bus::BuildEventBus::new(),
-        ),
+        build_event_bus: Arc::new(wire_node_lib::pyramid::event_bus::BuildEventBus::new()),
         supabase_url: Some(config.supabase_url.clone()),
         supabase_anon_key: Some(config.supabase_anon_key.clone()),
         csrf_secret: {
@@ -11745,9 +12004,7 @@ fn main() {
         // Consulted by both the tick loop and `trigger_for_slug` so two
         // concurrent `run_tick_for_config` calls for the same config cannot
         // both reach dispatch (the HTTP-trigger-vs-auto-dispatch race).
-        dadbear_in_flight: Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        dadbear_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         provider_registry: provider_registry.clone(),
         credential_store: credential_store.clone(),
         schema_registry: schema_registry.clone(),
@@ -11794,24 +12051,27 @@ fn main() {
         match wire_node_lib::pyramid::db::open_pyramid_connection(&pyramid_db_path) {
             Ok(conn) => {
                 // Read policy — fall through to defaults on any failure.
-                let policy = match wire_node_lib::pyramid::fleet_delivery_policy::read_fleet_delivery_policy(&conn) {
-                    Ok(Some(p)) => {
-                        tracing::info!("Fleet delivery policy loaded from DB");
-                        p
-                    }
-                    Ok(None) => {
-                        tracing::info!(
+                let policy =
+                    match wire_node_lib::pyramid::fleet_delivery_policy::read_fleet_delivery_policy(
+                        &conn,
+                    ) {
+                        Ok(Some(p)) => {
+                            tracing::info!("Fleet delivery policy loaded from DB");
+                            p
+                        }
+                        Ok(None) => {
+                            tracing::info!(
                             "No fleet_delivery_policy row; using bootstrap defaults (seed will land once contribution is synced)"
                         );
-                        wire_node_lib::pyramid::fleet_delivery_policy::FleetDeliveryPolicy::default()
-                    }
-                    Err(e) => {
-                        tracing::warn!(
+                            wire_node_lib::pyramid::fleet_delivery_policy::FleetDeliveryPolicy::default()
+                        }
+                        Err(e) => {
+                            tracing::warn!(
                             "Failed to read fleet_delivery_policy from DB: {e}; using bootstrap defaults"
                         );
-                        wire_node_lib::pyramid::fleet_delivery_policy::FleetDeliveryPolicy::default()
-                    }
-                };
+                            wire_node_lib::pyramid::fleet_delivery_policy::FleetDeliveryPolicy::default()
+                        }
+                    };
                 // Peer startup recovery: stuck pending → ready with synth error.
                 match wire_node_lib::pyramid::db::fleet_outbox_startup_recovery(
                     &conn,
@@ -11858,8 +12118,12 @@ fn main() {
     {
         match wire_node_lib::pyramid::db::open_pyramid_connection(&pyramid_db_path) {
             Ok(conn) => {
-                if let Ok(Some(yaml_str)) = wire_node_lib::pyramid::db::read_dispatch_policy(&conn) {
-                    match serde_yaml::from_str::<wire_node_lib::pyramid::dispatch_policy::DispatchPolicyYaml>(&yaml_str) {
+                if let Ok(Some(yaml_str)) = wire_node_lib::pyramid::db::read_dispatch_policy(&conn)
+                {
+                    match serde_yaml::from_str::<
+                        wire_node_lib::pyramid::dispatch_policy::DispatchPolicyYaml,
+                    >(&yaml_str)
+                    {
                         Ok(yaml) => {
                             let local_mode_enabled =
                                 wire_node_lib::pyramid::db::load_local_mode_state(&conn)
@@ -11870,8 +12134,12 @@ fn main() {
                                     yaml,
                                     local_mode_enabled,
                                 );
-                            let policy = wire_node_lib::pyramid::dispatch_policy::DispatchPolicy::from_yaml(&effective_yaml);
-                            let pools = wire_node_lib::pyramid::provider_pools::ProviderPools::new(&policy);
+                            let policy =
+                                wire_node_lib::pyramid::dispatch_policy::DispatchPolicy::from_yaml(
+                                    &effective_yaml,
+                                );
+                            let pools =
+                                wire_node_lib::pyramid::provider_pools::ProviderPools::new(&policy);
                             let mut cfg = pyramid_state.config.blocking_write();
                             cfg.dispatch_policy = Some(std::sync::Arc::new(policy));
                             cfg.provider_pools = Some(std::sync::Arc::new(pools));
@@ -11895,7 +12163,9 @@ fn main() {
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to open pyramid connection for dispatch policy hydration: {e}");
+                tracing::warn!(
+                    "Failed to open pyramid connection for dispatch policy hydration: {e}"
+                );
             }
         }
         // Even when no dispatch policy exists (e.g. fresh install), wire
@@ -11940,7 +12210,148 @@ fn main() {
                 });
                 cfg.market_surface_cache = Some(cache);
             }
+
+            // Walker v3 Phase 3 (plan §2.6 + §3): spawn the market-probe
+            // refresh task. The sync walker_market_probe cache is what
+            // `MarketReadiness` reads synchronously during Decision
+            // build; this task projects the async MarketSurfaceCache
+            // snapshot + node handles + credit balance into that
+            // sync cache at a bounded cadence.
+            //
+            // Cadence: 60s matches the MarketSurfaceCache poll period
+            // (reading at higher frequency would be wasteful — the
+            // source data changes at 60s). The task also syncs
+            // self-handles + credit balance on every tick so handle
+            // rotation + balance drift land in readiness without a
+            // separate listener.
+            if let Some(surface_cache) = cfg.market_surface_cache.clone() {
+                let auth_for_probe = shared_auth.clone();
+                let credit_tracker = shared_credits_tracker.clone();
+                tauri::async_runtime::spawn(async move {
+                    // Run one initial refresh before the interval ticks.
+                    //
+                    // Self-handle for the self-dealing filter: the
+                    // MarketSurfaceOffer carries `node_handle`
+                    // (operator-scoped string). We populate the probe
+                    // with a composite that falls back to node_id when
+                    // the operator hasn't yet surfaced a public handle.
+                    {
+                        let auth = auth_for_probe.read().await;
+                        let node_handle = auth.node_id.clone().unwrap_or_default();
+                        let operator_handle = auth.operator_handle.clone().unwrap_or_default();
+                        drop(auth);
+                        wire_node_lib::pyramid::walker_market_probe::set_self_handles(
+                            &node_handle,
+                            &operator_handle,
+                        );
+                    }
+                    {
+                        let cr = credit_tracker.read().await;
+                        let balance = cr.server_credit_balance;
+                        drop(cr);
+                        // f64 credits → i64 for the integer-typed gate.
+                        // Negative balances (oversettlement edge-case)
+                        // clamp to 0 so "insufficient" gate fires.
+                        let bal_i64 = balance.max(0.0).round() as i64;
+                        wire_node_lib::pyramid::walker_market_probe::set_credit_balance(Some(
+                            bal_i64,
+                        ));
+                    }
+                    wire_node_lib::pyramid::walker_market_probe::refresh_from_surface_cache(
+                        &surface_cache,
+                    )
+                    .await;
+                    wire_node_lib::pyramid::walker_market_probe::record_network_success();
+
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                    // First tick fires immediately; skip.
+                    interval.tick().await;
+                    loop {
+                        interval.tick().await;
+                        // Re-read handles (operator might have rotated).
+                        let (node_handle, operator_handle) = {
+                            let auth = auth_for_probe.read().await;
+                            (
+                                auth.node_id.clone().unwrap_or_default(),
+                                auth.operator_handle.clone().unwrap_or_default(),
+                            )
+                        };
+                        wire_node_lib::pyramid::walker_market_probe::set_self_handles(
+                            &node_handle,
+                            &operator_handle,
+                        );
+                        // Re-read balance.
+                        let bal_i64 = {
+                            let cr = credit_tracker.read().await;
+                            cr.server_credit_balance.max(0.0).round() as i64
+                        };
+                        wire_node_lib::pyramid::walker_market_probe::set_credit_balance(Some(
+                            bal_i64,
+                        ));
+                        // Project the surface cache into the sync cache.
+                        wire_node_lib::pyramid::walker_market_probe::refresh_from_surface_cache(
+                            &surface_cache,
+                        )
+                        .await;
+                        // We don't attempt network here directly — the
+                        // MarketSurfaceCache poller + heartbeat own the
+                        // reachability signal. Record a success so the
+                        // counter stays clear during steady-state.
+                        wire_node_lib::pyramid::walker_market_probe::record_network_success();
+                    }
+                });
+                tracing::info!(
+                    event = "boot_step",
+                    step = "7.6",
+                    name = "walker_market_probe_task_spawned",
+                    "Walker v3 Phase 3 market-probe refresh task is up (60s cadence)"
+                );
+            }
         }
+    }
+
+    // Walker v3 Phase 4 (plan §2.6 + §3): spawn the fleet-probe refresh
+    // task. The sync walker_fleet_probe cache is what `FleetReadiness`
+    // reads synchronously during Decision build; this task projects the
+    // async FleetRoster (tokio RwLock) snapshot into that sync cache at
+    // a bounded cadence. Without this, the sync cache stays empty →
+    // FleetReadiness returns NoReachablePeer → fleet is never tried for
+    // dispatch in production. Mirror of the market-probe task at 7.6.
+    //
+    // Cadence: 15s. Fleet peers come/go faster than market offers
+    // (announces + heartbeats land every 5-10s in a healthy fleet).
+    // Shorter than Ollama's 300s default because fleet state is the
+    // most volatile of the three.
+    {
+        let roster_for_probe = fleet_roster.clone();
+        let refresh = |roster: Arc<tokio::sync::RwLock<wire_node_lib::fleet::FleetRoster>>| async move {
+            let guard = roster.read().await;
+            for peer in guard.peers.values() {
+                let is_v1 = peer.announce_protocol_version < 2;
+                let projected =
+                    wire_node_lib::pyramid::walker_fleet_probe::project_peer(peer, is_v1);
+                wire_node_lib::pyramid::walker_fleet_probe::write_cached_peer(projected);
+            }
+        };
+        tauri::async_runtime::spawn(async move {
+            // Run one initial refresh immediately.
+            refresh(roster_for_probe.clone()).await;
+
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            // First tick fires immediately; skip it since we already
+            // refreshed above.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                refresh(roster_for_probe.clone()).await;
+            }
+        });
+        tracing::info!(
+            event = "boot_step",
+            step = "7.7",
+            name = "walker_fleet_probe_task_spawned",
+            "Walker v3 Phase 4 fleet-probe refresh task is up (15s cadence)"
+        );
     }
 
     // Phase 1 daemon control plane (AD-8 Part 1): ConfigSynced listener for
@@ -11971,18 +12382,24 @@ fn main() {
                             if schema_type == "dispatch_policy" {
                                 // Read the updated YAML from the operational table.
                                 let yaml_opt = {
-                                    let conn_result = wire_node_lib::pyramid::db::open_pyramid_connection(
-                                        std::path::Path::new(&db_path),
-                                    );
+                                    let conn_result =
+                                        wire_node_lib::pyramid::db::open_pyramid_connection(
+                                            std::path::Path::new(&db_path),
+                                        );
                                     match conn_result {
-                                        Ok(conn) => wire_node_lib::pyramid::db::read_dispatch_policy(&conn)
-                                            .ok()
-                                            .flatten(),
+                                        Ok(conn) => {
+                                            wire_node_lib::pyramid::db::read_dispatch_policy(&conn)
+                                                .ok()
+                                                .flatten()
+                                        }
                                         Err(_) => None,
                                     }
                                 };
                                 if let Some(yaml_str) = yaml_opt {
-                                    match serde_yaml::from_str::<wire_node_lib::pyramid::dispatch_policy::DispatchPolicyYaml>(&yaml_str) {
+                                    match serde_yaml::from_str::<
+                                        wire_node_lib::pyramid::dispatch_policy::DispatchPolicyYaml,
+                                    >(&yaml_str)
+                                    {
                                         Ok(yaml) => {
                                             // Pillar 37 / Local Mode toggle fix: apply the
                                             // derived-view overlay before constructing the
@@ -11994,9 +12411,11 @@ fn main() {
                                             // is never mutated by Local Mode.
                                             let local_mode_enabled = {
                                                 let reader = ps.reader.lock().await;
-                                                wire_node_lib::pyramid::db::load_local_mode_state(&reader)
-                                                    .map(|row| row.enabled)
-                                                    .unwrap_or(false)
+                                                wire_node_lib::pyramid::db::load_local_mode_state(
+                                                    &reader,
+                                                )
+                                                .map(|row| row.enabled)
+                                                .unwrap_or(false)
                                             };
                                             let yaml = wire_node_lib::pyramid::dispatch_policy::apply_local_mode_overlay(
                                                 yaml,
@@ -12006,7 +12425,9 @@ fn main() {
                                             let pools = wire_node_lib::pyramid::provider_pools::ProviderPools::new(&policy);
 
                                             // Update stale engines' defer_maintenance atomic.
-                                            let new_defer = policy.build_coordination.defer_maintenance_during_build;
+                                            let new_defer = policy
+                                                .build_coordination
+                                                .defer_maintenance_during_build;
                                             {
                                                 let engines = ps.stale_engines.lock().await;
                                                 for engine in engines.values() {
@@ -12029,16 +12450,22 @@ fn main() {
                                                         _ => Vec::new(),
                                                     }
                                                 };
-                                                let serving_rules = wire_node_lib::fleet::derive_serving_rules(&policy, &loaded_models);
+                                                let serving_rules =
+                                                    wire_node_lib::fleet::derive_serving_rules(
+                                                        &policy,
+                                                        &loaded_models,
+                                                    );
                                                 let roster = config_fleet_roster.read().await;
                                                 if !roster.peers.is_empty() {
                                                     let total_queue_depth = {
-                                                        let q = config_compute_queue.queue.lock().await;
+                                                        let q =
+                                                            config_compute_queue.queue.lock().await;
                                                         q.total_depth()
                                                     };
                                                     // Queue depths for observability
                                                     let queue_depths = {
-                                                        let q = config_compute_queue.queue.lock().await;
+                                                        let q =
+                                                            config_compute_queue.queue.lock().await;
                                                         q.all_depths()
                                                     };
                                                     // Note: node_id and operator_id come from the roster's
@@ -12056,11 +12483,22 @@ fn main() {
                                                         };
                                                         if let Some(tunnel_url) = tunnel_url_opt {
                                                             let auth = config_auth.read().await;
-                                                            let self_node_id = auth.node_id.clone().unwrap_or_default();
-                                                            let self_operator_id = auth.operator_id.clone().unwrap_or_default();
-                                                            let self_operator_handle = auth.operator_handle.clone();
+                                                            let self_node_id = auth
+                                                                .node_id
+                                                                .clone()
+                                                                .unwrap_or_default();
+                                                            let self_operator_id = auth
+                                                                .operator_id
+                                                                .clone()
+                                                                .unwrap_or_default();
+                                                            let self_operator_handle =
+                                                                auth.operator_handle.clone();
                                                             drop(auth);
-                                                            let self_node_handle = Some(config_node_identity.node_handle.clone());
+                                                            let self_node_handle = Some(
+                                                                config_node_identity
+                                                                    .node_handle
+                                                                    .clone(),
+                                                            );
                                                             let announcement = wire_node_lib::fleet::FleetAnnouncement {
                                                                 node_id: self_node_id,
                                                                 name: None,
@@ -12072,6 +12510,7 @@ fn main() {
                                                                 queue_depths,
                                                                 total_queue_depth,
                                                                 operator_id: self_operator_id,
+                                                                announce_protocol_version: wire_node_lib::fleet::ANNOUNCE_PROTOCOL_VERSION,
                                                             };
                                                             wire_node_lib::fleet::announce_to_fleet(&roster, &announcement).await;
                                                             tracing::info!("ConfigSynced: re-announced to fleet with updated serving_rules");
@@ -12102,9 +12541,10 @@ fn main() {
                                 // Runs in parallel to the `dispatch_policy`
                                 // branch above; both arms are independent.
                                 let yaml_opt = {
-                                    let conn_result = wire_node_lib::pyramid::db::open_pyramid_connection(
-                                        std::path::Path::new(&db_path),
-                                    );
+                                    let conn_result =
+                                        wire_node_lib::pyramid::db::open_pyramid_connection(
+                                            std::path::Path::new(&db_path),
+                                        );
                                     match conn_result {
                                         Ok(conn) => wire_node_lib::pyramid::fleet_delivery_policy::read_fleet_delivery_policy(&conn)
                                             .ok()
@@ -12347,11 +12787,8 @@ fn main() {
         let ctx_clone = Arc::clone(&fleet_dispatch_ctx);
         let db_path_for_pending_sweep = Some(pyramid_db_path.to_path_buf());
         tauri::async_runtime::spawn(async move {
-            wire_node_lib::fleet::pending_jobs_sweep_loop(
-                ctx_clone,
-                db_path_for_pending_sweep,
-            )
-            .await;
+            wire_node_lib::fleet::pending_jobs_sweep_loop(ctx_clone, db_path_for_pending_sweep)
+                .await;
         });
     }
     {
@@ -12406,12 +12843,15 @@ fn main() {
                             let job_source = entry.source.clone();
 
                             // Emit QueueJobStarted event.
-                            let _ = bus.tx.send(wire_node_lib::pyramid::event_bus::TaggedBuildEvent {
+                            let _ = bus
+                                .tx
+                                .send(wire_node_lib::pyramid::event_bus::TaggedBuildEvent {
                                 slug: "__compute__".to_string(),
-                                kind: wire_node_lib::pyramid::event_bus::TaggedKind::QueueJobStarted {
-                                    model_id: model_id.clone(),
-                                    source: job_source.clone(),
-                                },
+                                kind:
+                                    wire_node_lib::pyramid::event_bus::TaggedKind::QueueJobStarted {
+                                        model_id: model_id.clone(),
+                                        source: job_source.clone(),
+                                    },
                             });
 
                             // WP-2: Chronicle started event
@@ -12431,11 +12871,20 @@ fn main() {
                                     .with_model_id(model_id.clone())
                                 };
                                 let chronicle_ctx = chronicle_ctx
-                                    .with_metadata(serde_json::json!({ "queue_wait_ms": queue_wait_ms }))
-                                    .with_work_item(entry.work_item_id.clone(), entry.attempt_id.clone());
+                                    .with_metadata(
+                                        serde_json::json!({ "queue_wait_ms": queue_wait_ms }),
+                                    )
+                                    .with_work_item(
+                                        entry.work_item_id.clone(),
+                                        entry.attempt_id.clone(),
+                                    );
                                 tokio::task::spawn_blocking(move || {
                                     if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                                        let _ = wire_node_lib::pyramid::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                                        let _ =
+                                            wire_node_lib::pyramid::compute_chronicle::record_event(
+                                                &conn,
+                                                &chronicle_ctx,
+                                            );
                                     }
                                 });
                             }
@@ -12463,7 +12912,7 @@ fn main() {
                                     entry.max_tokens,
                                     entry.response_format.as_ref(),
                                     entry.options.clone(),
-                                )
+                                ),
                             )
                             .catch_unwind()
                             .await
@@ -12505,7 +12954,10 @@ fn main() {
                                             "cost_usd": response.actual_cost_usd,
                                             "generation_id": response.generation_id,
                                         }))
-                                        .with_work_item(entry.work_item_id.clone(), entry.attempt_id.clone());
+                                        .with_work_item(
+                                            entry.work_item_id.clone(),
+                                            entry.attempt_id.clone(),
+                                        );
                                     tokio::task::spawn_blocking(move || {
                                         if let Ok(conn) = rusqlite::Connection::open(&db_path) {
                                             let _ = wire_node_lib::pyramid::compute_chronicle::record_event(&conn, &chronicle_ctx);
@@ -12532,7 +12984,10 @@ fn main() {
                                             "error": error_msg,
                                             "latency_ms": elapsed_ms,
                                         }))
-                                        .with_work_item(entry.work_item_id.clone(), entry.attempt_id.clone());
+                                        .with_work_item(
+                                            entry.work_item_id.clone(),
+                                            entry.attempt_id.clone(),
+                                        );
                                     tokio::task::spawn_blocking(move || {
                                         if let Ok(conn) = rusqlite::Connection::open(&db_path) {
                                             let _ = wire_node_lib::pyramid::compute_chronicle::record_event(&conn, &chronicle_ctx);
@@ -12575,11 +13030,15 @@ fn main() {
             if has_configs {
                 let bus = ps.build_event_bus.clone();
                 let handle = wire_node_lib::pyramid::dadbear_extend::start_dadbear_extend_loop(
-                    ps.clone(), db_path_str, bus,
+                    ps.clone(),
+                    db_path_str,
+                    bus,
                 );
                 let mut dh = ps.dadbear_handle.lock().await;
                 *dh = Some(handle);
-                tracing::info!("DADBEAR extend loop started on app launch (existing configs found)");
+                tracing::info!(
+                    "DADBEAR extend loop started on app launch (existing configs found)"
+                );
             }
         });
     }
@@ -12597,7 +13056,10 @@ fn main() {
         let bus = pyramid_state.build_event_bus.clone();
         tauri::async_runtime::spawn(async move {
             let handle = wire_node_lib::pyramid::dadbear_supervisor::start_dadbear_supervisor(
-                ps.clone(), cq, db_path_str, bus,
+                ps.clone(),
+                cq,
+                db_path_str,
+                bus,
             );
             let mut sh = ps.dadbear_supervisor_handle.lock().await;
             *sh = Some(handle);
@@ -12675,14 +13137,13 @@ fn main() {
     // the app — it aborts on app exit.
     {
         let ps = pyramid_state.clone();
-        let wire_url = std::env::var("WIRE_URL")
-            .unwrap_or_else(|_| "https://newsbleach.com".to_string());
+        let wire_url =
+            std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
         // We intentionally leak the handle here (forget) — the
         // background task lives for the whole app lifetime, matching
         // the other background workers above (dadbear, leak sweep).
-        let handle = wire_node_lib::pyramid::wire_update_poller::spawn_wire_update_poller(
-            ps, wire_url,
-        );
+        let handle =
+            wire_node_lib::pyramid::wire_update_poller::spawn_wire_update_poller(ps, wire_url);
         std::mem::forget(handle);
         tracing::info!("Phase 14 Wire update poller spawned");
     }
@@ -12746,10 +13207,9 @@ fn main() {
     // table seeded in WS0; on unavailable, fall back to the Default
     // sentinel (matches the bundled seed YAML per the
     // default_matches_seed_yaml test).
-    let compute_market_state_init = wire_node_lib::compute_market::ComputeMarketState::load(
-        &config.data_dir(),
-    )
-    .unwrap_or_default();
+    let compute_market_state_init =
+        wire_node_lib::compute_market::ComputeMarketState::load(&config.data_dir())
+            .unwrap_or_default();
     let market_delivery_policy_init = {
         let db_path = config.data_dir().join("pyramid.db");
         match wire_node_lib::pyramid::db::open_pyramid_connection(&db_path) {
@@ -12767,8 +13227,7 @@ fn main() {
             }
         }
     };
-    let compute_market_state_shared =
-        Arc::new(RwLock::new(compute_market_state_init));
+    let compute_market_state_shared = Arc::new(RwLock::new(compute_market_state_init));
     // Phase 2 WS6: construct the queue-mirror nudge channel BEFORE the
     // dispatch context so every mutation site has a live sender from
     // boot. The receiver is handed to `spawn_market_mirror_task` below
@@ -12788,21 +13247,26 @@ fn main() {
     let compute_market_dispatch_shared = Arc::new(
         wire_node_lib::pyramid::market_dispatch::MarketDispatchContext {
             tunnel_state: shared_tunnel.clone(),
-            pending: Arc::new(
-                wire_node_lib::pyramid::market_dispatch::PendingMarketJobs::new(),
-            ),
+            pending: Arc::new(wire_node_lib::pyramid::market_dispatch::PendingMarketJobs::new()),
             policy: Arc::new(RwLock::new(market_delivery_policy_init)),
             mirror_nudge: market_mirror_nudge_tx,
             delivery_nudge: market_delivery_nudge_tx,
         },
     );
 
+    // Walker v3 Phase 0a-2 §2.17.1: construct the AppMode handle BEFORE
+    // AppState so every build-starter can reach it via `state.app_mode`.
+    // Always starts at `Booting`; flipped to `Ready` by the boot
+    // coordinator (see `boot::run_walker_cache_boot` in the Tauri setup
+    // block below, canonical §2.17 step 9).
+    let app_mode_handle = wire_node_lib::app_mode::new_app_mode();
+
     let state = Arc::new(AppState {
         auth: shared_auth.clone(),
         sync_state: Arc::new(RwLock::new(
             sync::load_sync_state(&config.data_dir()).unwrap_or_default(),
         )),
-        credits: Arc::new(RwLock::new(initial_credits)),
+        credits: shared_credits_tracker.clone(),
         tunnel_state: shared_tunnel.clone(),
         market_state: Arc::new(RwLock::new(
             market::load_market_state(&config.data_dir()).unwrap_or_default(),
@@ -12822,6 +13286,10 @@ fn main() {
         // dispatches by design. See pyramid::pending_jobs for the
         // semantics rationale.
         pending_market_jobs: shared_pending_market_jobs.clone(),
+        // Walker v3 §2.17.1: in-memory AppMode state machine. Starts at
+        // `Booting`. The boot coordinator (spawned in `setup()` below)
+        // flips to `Ready` only after the scope_cache_reloader is live.
+        app_mode: app_mode_handle.clone(),
     });
 
     // ── Phase 2 WS6: queue mirror push task + market outbox sweep ──
@@ -12958,9 +13426,7 @@ fn main() {
                                     };
                                 if let Some(new_policy) = yaml_opt {
                                     *config_market_dispatch.policy.write().await = new_policy;
-                                    tracing::info!(
-                                        "ConfigSynced: market_delivery_policy reloaded"
-                                    );
+                                    tracing::info!("ConfigSynced: market_delivery_policy reloaded");
                                 } else {
                                     tracing::warn!(
                                         "ConfigSynced: market_delivery_policy broadcast but no row readable"
@@ -13009,6 +13475,71 @@ fn main() {
         .manage(state.clone())
         .setup(move |app| {
             let state = state.clone();
+
+            // ── Walker v3 Phase 0a-2 §2.17 boot coordinator ───────────────
+            //
+            // Runs the walker-v3-owned portion of the canonical 11-step
+            // boot sequence: step 3 (initial ScopeCache), step 4/5
+            // (migration phase scaffold + post-migration rebuild — both
+            // stubbed until Phase 0b/§5.3), step 6 (spawn
+            // scope_cache_reloader), step 7 (ConfigSynced →
+            // RebuildTrigger bridge), step 9 (transition AppMode →
+            // Ready). Steps 1-2 (DB open + bundled manifest walk via the
+            // envelope writer) + 8 (stale_engine rehydrate) + 10-11
+            // (HTTP listeners + DADBEAR + chain executor) already ran /
+            // are queued above/below this spawn.
+            //
+            // The coordinator is called via `tauri::async_runtime::spawn`
+            // so it yields to the reactor — the Tauri setup() callback
+            // itself is synchronous + non-async, which is why we defer.
+            // Any build-starter that lands before the coordinator flips
+            // AppMode → Ready is refused by `guard_app_ready` with a
+            // "node is not Ready" error (fail-fast, not hang).
+            //
+            // §2.17.3: if the DB probe fails, the coordinator returns
+            // `BootResult::Aborted`. We log `boot_aborted` and leave
+            // AppMode in `Booting` — build-starters will keep refusing
+            // and the operator sees the error in the log.
+            {
+                let boot_db_path = pyramid_db_path
+                    .to_string_lossy()
+                    .to_string();
+                let boot_app_mode = state.app_mode.clone();
+                let boot_event_bus = state.pyramid.build_event_bus.clone();
+                // Leak the handles into process-lifetime tasks — main.rs
+                // owns the Tauri event loop, and the reloader/relay/bridge
+                // all need to outlive setup(). Dropping the handles ends
+                // the tasks (JoinHandle drops abort on drop in tokio), so
+                // we hold them on a Box::leak'd slot.
+                tauri::async_runtime::spawn(async move {
+                    match wire_node_lib::boot::run_walker_cache_boot(
+                        boot_db_path,
+                        boot_app_mode,
+                        boot_event_bus,
+                    )
+                    .await
+                    {
+                        wire_node_lib::boot::BootResult::Ok(handles) => {
+                            // Stash handles so they outlive setup().
+                            // Box::leak is deliberate — process-lifetime
+                            // ownership, no clean shutdown path yet.
+                            let _: &'static mut wire_node_lib::boot::BootHandles =
+                                Box::leak(Box::new(handles));
+                            tracing::info!(
+                                event = "boot_complete",
+                                "walker-v3 boot coordinator complete; AppMode=Ready"
+                            );
+                        }
+                        wire_node_lib::boot::BootResult::Aborted(reason) => {
+                            tracing::error!(
+                                event = "boot_aborted",
+                                reason = %reason,
+                                "walker-v3 boot coordinator aborted; node will refuse build-starters"
+                            );
+                        }
+                    }
+                });
+            }
 
             // --- Phase 13: cross-pyramid event forwarder ---
             //
@@ -13294,6 +13825,16 @@ fn main() {
                     .await;
                 }
             });
+
+            // --- Post-build v5 Phase 9b-1: pyramid_scheduler periodic ticks ---
+            //
+            // Two tokio tasks (accretion + sweep) emit per-slug observation
+            // events on the operator-configured cadence. Periods + thresholds
+            // live in `scheduler_parameters` config contribution (DB-driven,
+            // operator-editable — Pillar 37). The tasks re-read the config
+            // each tick so supersessions land within one period.
+            let scheduler_db_path = config.data_dir().join("pyramid.db");
+            let _scheduler_handle = wire_node_lib::pyramid::pyramid_scheduler::spawn(scheduler_db_path);
 
             // --- Startup: refresh token, register node, start tunnel ---
             let startup_state = state.clone();
@@ -13735,6 +14276,7 @@ fn main() {
                                                 queue_depths,
                                                 total_queue_depth,
                                                 operator_id: self_operator_id,
+                                                announce_protocol_version: wire_node_lib::fleet::ANNOUNCE_PROTOCOL_VERSION,
                                             };
                                             wire_node_lib::fleet::announce_to_fleet(&roster, &announcement).await;
                                         }

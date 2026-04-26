@@ -35,7 +35,9 @@ use serde_json::Value;
 use super::db;
 use super::event_bus::{BuildEventBus, TaggedBuildEvent, TaggedKind};
 use super::llm::{call_model_unified_with_options_and_ctx, LlmCallOptions, LlmConfig, LlmResponse};
-use super::step_context::{CacheEntry, CachedStepOutput, StepContext};
+use super::step_context::{
+    with_dispatch_decision_if_available, CacheEntry, CachedStepOutput, StepContext,
+};
 
 // ── IPC contract types ─────────────────────────────────────────────
 
@@ -151,11 +153,15 @@ pub async fn reroll_node(
     //     cache_key and served the pre-reroll content.
     // The fix routes the DB write manually so the new row occupies
     // prior.cache_key with a proper supersedes_cache_id link.
-    let build_id = format!(
-        "reroll-{}-{}",
-        slug,
-        chrono::Utc::now().timestamp()
-    );
+    // walker-v3-completion Wave 3 exception: reroll intentionally bypasses
+    // the cache-aware path (empty prompt_hash → cache_is_usable() = false)
+    // so the manual supersession below lands at the prior cache_key. The
+    // canonical make_step_ctx_from_llm_config always computes prompt_hash
+    // from system_prompt, which would defeat this. Manual StepContext::new
+    // with explicit with_dispatch_decision_if_available is the canonical
+    // pattern for this edge case — Decision is still attached for the
+    // walker's full cascade; only the cache is bypassed.
+    let build_id = format!("reroll-{}-{}", slug, chrono::Utc::now().timestamp());
     let ctx = StepContext::new(
         slug.clone(),
         build_id.clone(),
@@ -172,6 +178,7 @@ pub async fn reroll_node(
     .with_model_resolution("reroll", prior.model_id.clone())
     .with_bus(bus.clone())
     .with_force_fresh(input.force_fresh);
+    let ctx = with_dispatch_decision_if_available(ctx).await;
     // Deliberately NOT calling `.with_prompt_hash(...)` — leaving
     // `prompt_hash = ""` flips `cache_is_usable()` to false.
     debug_assert!(
@@ -214,14 +221,8 @@ pub async fn reroll_node(
     // content-addressable invariant (key == hash of inputs) still
     // holds for the slot, just with the rerolled body.
     let latency_ms = call_started.elapsed().as_millis() as i64;
-    let new_cache_entry_id = write_reroll_cache_entry(
-        &db_path,
-        &prior,
-        &build_id,
-        &response,
-        &note,
-        latency_ms,
-    )?;
+    let new_cache_entry_id =
+        write_reroll_cache_entry(&db_path, &prior, &build_id, &response, &note, latency_ms)?;
 
     // 8. Node-level reroll also writes a change-manifest row with
     // the note populated. Intermediate (cache_key only) reroll
@@ -263,8 +264,7 @@ pub async fn reroll_node(
     // 11. Compute the rate-limit warning after the reroll has
     // landed so the count reflects the current write. Not a hard
     // block — just a hint for the UI.
-    let rate_limit_warning =
-        count_recent_rerolls_for_target(&db_path, &slug, &prior)? >= 3;
+    let rate_limit_warning = count_recent_rerolls_for_target(&db_path, &slug, &prior)? >= 3;
 
     Ok(RerollOutput {
         new_cache_entry_id,
@@ -278,10 +278,7 @@ pub async fn reroll_node(
 /// Load the cache entry the user is rerolling against. `node_id`
 /// resolves via the supersession chain (see spec); `cache_key` is a
 /// direct lookup.
-fn load_reroll_target(
-    input: &RerollInput,
-    db_path: &str,
-) -> Result<(CachedStepOutput, String)> {
+fn load_reroll_target(input: &RerollInput, db_path: &str) -> Result<(CachedStepOutput, String)> {
     let conn = db::open_pyramid_connection(Path::new(db_path))?;
 
     if let Some(ck) = input.cache_key.as_deref() {
@@ -391,8 +388,8 @@ fn build_reroll_prompts(
         prior.step_name, prior.depth, prior.chunk_index
     );
 
-    let prior_preview = serde_json::to_string_pretty(prior_content)
-        .unwrap_or_else(|_| prior.output_json.clone());
+    let prior_preview =
+        serde_json::to_string_pretty(prior_content).unwrap_or_else(|_| prior.output_json.clone());
 
     let note_section = if note.trim().is_empty() {
         "(no feedback provided — regenerate with fresh randomness)".to_string()
@@ -456,7 +453,11 @@ fn write_reroll_cache_entry(
     }))
     .ok();
 
-    let note_opt = if note.is_empty() { None } else { Some(note.to_string()) };
+    let note_opt = if note.is_empty() {
+        None
+    } else {
+        Some(note.to_string())
+    };
 
     let new_entry = CacheEntry {
         slug: prior.slug.clone(),
@@ -592,12 +593,8 @@ fn run_downstream_invalidation(
     // for the first N items in `downstream` regardless of whether
     // they were the ones that flipped, producing incorrect event
     // payloads when some entries were already invalidated.
-    let actually_flipped = db::invalidate_cache_entries_returning_flipped(
-        &conn,
-        slug,
-        &downstream,
-        origin_cache_key,
-    )?;
+    let actually_flipped =
+        db::invalidate_cache_entries_returning_flipped(&conn, slug, &downstream, origin_cache_key)?;
 
     for ck in &actually_flipped {
         let _ = bus.tx.send(TaggedBuildEvent {
@@ -737,7 +734,14 @@ mod tests {
     fn test_load_reroll_target_by_node_id_finds_producing_entry() {
         let (_dir, db_path) = temp_db();
         // Seed an entry whose output_json includes "L0-001"
-        let _ = seed_cache_entry(&db_path, "reroll-test", "extract_chunks", 0, 0, "has_L0-001");
+        let _ = seed_cache_entry(
+            &db_path,
+            "reroll-test",
+            "extract_chunks",
+            0,
+            0,
+            "has_L0-001",
+        );
 
         let input = RerollInput {
             slug: "reroll-test".into(),
@@ -881,14 +885,7 @@ mod tests {
     #[test]
     fn test_write_reroll_cache_entry_archives_prior_and_links_supersession() {
         let (_dir, db_path) = temp_db();
-        let prior_key = seed_cache_entry(
-            &db_path,
-            "reroll-test",
-            "synth",
-            2,
-            0,
-            "original_body",
-        );
+        let prior_key = seed_cache_entry(&db_path, "reroll-test", "synth", 2, 0, "original_body");
 
         // Grab the prior row so we can compare ids after the write.
         let prior = load_row_by_key(&db_path, "reroll-test", &prior_key).unwrap();
@@ -909,7 +906,10 @@ mod tests {
         // archived original.
         let new_row =
             load_row_by_key(&db_path, "reroll-test", &prior_key).expect("new row at prior key");
-        assert_eq!(new_row.id, new_id, "write_reroll_cache_entry returned id must match row at prior_key");
+        assert_eq!(
+            new_row.id, new_id,
+            "write_reroll_cache_entry returned id must match row at prior_key"
+        );
         assert_ne!(
             new_row.id, prior_id,
             "new row must have a distinct id from the archived prior"
@@ -923,7 +923,10 @@ mod tests {
         );
 
         // (c) force_fresh is set on the new row.
-        assert!(new_row.force_fresh, "rerolled row must have force_fresh=true");
+        assert!(
+            new_row.force_fresh,
+            "rerolled row must have force_fresh=true"
+        );
 
         // (d) The note landed on the new row (not the archived prior).
         assert_eq!(
@@ -938,7 +941,10 @@ mod tests {
         let archived_key = format!("archived:{}:{}", prior_id, prior_key);
         let archived = load_row_by_key(&db_path, "reroll-test", &archived_key)
             .expect("prior row should exist at archived cache_key");
-        assert_eq!(archived.id, prior_id, "archived row id matches the prior id");
+        assert_eq!(
+            archived.id, prior_id,
+            "archived row id matches the prior id"
+        );
         assert!(
             archived.output_json.contains("original_body"),
             "archived row preserves the pre-reroll content"
@@ -956,7 +962,10 @@ mod tests {
         let conn = db::open_pyramid_connection(Path::new(&db_path)).unwrap();
         let hit = db::check_cache(&conn, "reroll-test", &prior_key).unwrap();
         let hit = hit.expect("normal cache lookup must hit the rerolled row");
-        assert_eq!(hit.id, new_id, "normal cache lookup returns the rerolled row");
+        assert_eq!(
+            hit.id, new_id,
+            "normal cache lookup returns the rerolled row"
+        );
     }
 
     /// Wanderer regression: after the reroll lands,

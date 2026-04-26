@@ -55,9 +55,8 @@ use crate::WireNodeConfig;
 // ever drifts from the contracts crate, change the re-export to a local
 // struct here — no call-site churn.
 pub use agent_wire_contracts::{
-    AllOffersSaturatedDetail, ComputePurchaseBody, ComputePurchaseResponse,
-    ComputePurchaseTrigger, ComputeQuoteBody, ComputeQuotePriceBreakdown, ComputeQuoteResponse,
-    LatencyPreference,
+    AllOffersSaturatedDetail, ComputePurchaseBody, ComputePurchaseResponse, ComputePurchaseTrigger,
+    ComputeQuoteBody, ComputeQuotePriceBreakdown, ComputeQuoteResponse, LatencyPreference,
 };
 
 // ---------------------------------------------------------------------------
@@ -981,7 +980,10 @@ mod tests {
                 assert!(reason.contains("provider_error"));
                 assert!(reason.contains("oom"));
             }
-            other => panic!("expected RouteSkipped provider_returned_error, got {:?}", other),
+            other => panic!(
+                "expected RouteSkipped provider_returned_error, got {:?}",
+                other
+            ),
         }
     }
 
@@ -1029,8 +1031,10 @@ mod tests {
         // ceiling so Wire uses `max_tokens_quoted`).
         assert!(obj.contains_key("job_id"));
         assert!(obj.contains_key("messages"));
-        assert!(!obj.contains_key("max_tokens"),
-            "max_tokens must be omitted when None per spec §2.3");
+        assert!(
+            !obj.contains_key("max_tokens"),
+            "max_tokens must be omitted when None per spec §2.3"
+        );
         assert!(obj.contains_key("temperature"));
         assert!(obj.contains_key("relay_count"));
         assert!(obj.contains_key("privacy_tier"));
@@ -1039,15 +1043,25 @@ mod tests {
 
         // Walker-side fields MUST NOT appear in the wire body — they
         // live on `ComputeFillRequest`, not `ComputeFillBody`.
-        assert!(!obj.contains_key("request_id"),
-            "request_id is walker-internal; Wire reads it from the reserved job record");
-        assert!(!obj.contains_key("idempotency_key"),
-            "idempotency_key goes in the Idempotency-Key header, never the body");
+        assert!(
+            !obj.contains_key("request_id"),
+            "request_id is walker-internal; Wire reads it from the reserved job record"
+        );
+        assert!(
+            !obj.contains_key("idempotency_key"),
+            "idempotency_key goes in the Idempotency-Key header, never the body"
+        );
 
         // No OTHER top-level keys beyond the whitelist.
         let allowed = [
-            "job_id", "messages", "max_tokens", "temperature", "relay_count",
-            "privacy_tier", "input_token_count", "requester_callback_url",
+            "job_id",
+            "messages",
+            "max_tokens",
+            "temperature",
+            "relay_count",
+            "privacy_tier",
+            "input_token_count",
+            "requester_callback_url",
         ];
         for key in obj.keys() {
             assert!(allowed.contains(&key.as_str()),

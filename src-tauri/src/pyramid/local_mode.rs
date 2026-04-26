@@ -386,7 +386,10 @@ pub async fn fetch_model_details(base_url: &str, model: &str) -> Result<OllamaMo
         .await
         .with_context(|| format!("POST {url} for model {model} failed"))?;
     if !resp.status().is_success() {
-        bail!("POST {url} for model {model} returned status {}", resp.status());
+        bail!(
+            "POST {url} for model {model} returned status {}",
+            resp.status()
+        );
     }
     let v: serde_json::Value = resp
         .json()
@@ -750,14 +753,13 @@ pub fn commit_enable_local_mode(
 
     // Step 6: snapshot the prior active tier_routing + build_strategy
     // contributions before we supersede them.
-    let prior_tier_contribution =
-        load_active_config_contribution(conn, "tier_routing", None)?
-            .ok_or_else(|| {
-                anyhow!(
-                    "no active tier_routing contribution to supersede; \
+    let prior_tier_contribution = load_active_config_contribution(conn, "tier_routing", None)?
+        .ok_or_else(|| {
+            anyhow!(
+                "no active tier_routing contribution to supersede; \
                      bundled defaults should have created one on first boot"
-                )
-            })?;
+            )
+        })?;
     let prior_build_strategy_contribution =
         load_active_config_contribution(conn, "build_strategy", None)?;
 
@@ -767,15 +769,17 @@ pub fn commit_enable_local_mode(
     // contribution so chain steps that ask for `web` / `synth_heavy`
     // / etc. don't hit "tier not defined" errors.
     let prior_tier_yaml: TierRoutingYaml =
-        serde_yaml::from_str(&prior_tier_contribution.yaml_content)
-            .with_context(|| {
-                format!(
-                    "parsing prior tier_routing contribution {}",
-                    prior_tier_contribution.contribution_id
-                )
-            })?;
-    let mut prior_tier_names: std::collections::BTreeSet<String> =
-        prior_tier_yaml.entries.iter().map(|e| e.tier_name.clone()).collect();
+        serde_yaml::from_str(&prior_tier_contribution.yaml_content).with_context(|| {
+            format!(
+                "parsing prior tier_routing contribution {}",
+                prior_tier_contribution.contribution_id
+            )
+        })?;
+    let mut prior_tier_names: std::collections::BTreeSet<String> = prior_tier_yaml
+        .entries
+        .iter()
+        .map(|e| e.tier_name.clone())
+        .collect();
     // Always include the standard chain tiers so a chain step asking
     // for one of them (even if the prior contribution didn't list it)
     // still resolves cleanly. The prior contribution may have been
@@ -786,10 +790,10 @@ pub fn commit_enable_local_mode(
         "synth_heavy",
         "stale_remote",
         "stale_local",
-        "mid",        // code.yaml, document.yaml default tier
-        "extractor",  // conversation chain extraction tier
-        "high",       // cascade fallback tier (large context)
-        "max",        // cascade fallback tier (maximum context)
+        "mid",       // code.yaml, document.yaml default tier
+        "extractor", // conversation chain extraction tier
+        "high",      // cascade fallback tier (large context)
+        "max",       // cascade fallback tier (maximum context)
     ] {
         prior_tier_names.insert(required.to_string());
     }
@@ -804,15 +808,15 @@ pub fn commit_enable_local_mode(
             max_completion_tokens: None,
             pricing_json: Some("{}".to_string()),
             supported_parameters_json: Some(r#"["response_format"]"#.to_string()),
-            notes: Some(format!(
-                "local mode — routed via Ollama at {base_url}"
-            )),
+            notes: Some(format!("local mode — routed via Ollama at {base_url}")),
             priority: Some(1),
             prompt_price_per_token: Some(0.0),
             completion_price_per_token: Some(0.0),
         })
         .collect();
-    let new_tier_yaml = TierRoutingYaml { entries: new_entries };
+    let new_tier_yaml = TierRoutingYaml {
+        entries: new_entries,
+    };
     let new_tier_yaml_string = build_tier_routing_yaml_string(&new_tier_yaml)?;
 
     // Persist the prior contribution_ids in the state row BEFORE we
@@ -872,8 +876,9 @@ pub fn commit_enable_local_mode(
             "local_mode_toggle",
             Some("user"),
         )?;
-        let new_bs_contribution = load_contribution_by_id(conn, &new_bs_id)?
-            .ok_or_else(|| anyhow!("local-mode build_strategy contribution missing after supersede"))?;
+        let new_bs_contribution = load_contribution_by_id(conn, &new_bs_id)?.ok_or_else(|| {
+            anyhow!("local-mode build_strategy contribution missing after supersede")
+        })?;
         sync_config_to_operational(conn, bus, &new_bs_contribution)?;
     } else {
         // No prior build_strategy contribution? Create a fresh active
@@ -970,12 +975,9 @@ fn build_tier_routing_yaml_string(yaml: &TierRoutingYaml) -> Result<String> {
         serde_yaml::Value::String("schema_type".into()),
         serde_yaml::Value::String("tier_routing".into()),
     );
-    let entries_yaml = serde_yaml::to_value(&yaml.entries)
-        .context("serializing tier_routing entries")?;
-    root.insert(
-        serde_yaml::Value::String("entries".into()),
-        entries_yaml,
-    );
+    let entries_yaml =
+        serde_yaml::to_value(&yaml.entries).context("serializing tier_routing entries")?;
+    root.insert(serde_yaml::Value::String("entries".into()), entries_yaml);
     let value = serde_yaml::Value::Mapping(root);
     serde_yaml::to_string(&value).context("rendering tier_routing YAML")
 }
@@ -985,8 +987,8 @@ fn build_tier_routing_yaml_string(yaml: &TierRoutingYaml) -> Result<String> {
 /// Preserves every other field so a user who customized
 /// `evidence_mode` / `webbing` / `quality.*` keeps their tuning.
 fn build_local_mode_build_strategy_yaml(prior_yaml: &str) -> Result<String> {
-    let mut value: serde_yaml::Value = serde_yaml::from_str(prior_yaml)
-        .context("parsing prior build_strategy YAML")?;
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(prior_yaml).context("parsing prior build_strategy YAML")?;
     let map = value
         .as_mapping_mut()
         .ok_or_else(|| anyhow!("prior build_strategy YAML is not a mapping"))?;
@@ -1055,9 +1057,7 @@ pub fn commit_disable_local_mode(
             // supersede it with a copy of the saved YAML. Skip the
             // restore when there isn't an active one (defensive — the
             // dispatcher should always leave one behind).
-            if let Some(active_now) =
-                load_active_config_contribution(conn, "tier_routing", None)?
-            {
+            if let Some(active_now) = load_active_config_contribution(conn, "tier_routing", None)? {
                 let new_id = supersede_config_contribution(
                     conn,
                     &active_now.contribution_id,
@@ -1066,9 +1066,10 @@ pub fn commit_disable_local_mode(
                     "local_mode_toggle",
                     Some("user"),
                 )?;
-                let new_contribution = load_contribution_by_id(conn, &new_id)?.ok_or_else(|| {
-                    anyhow!("restored tier_routing contribution missing after supersede")
-                })?;
+                let new_contribution =
+                    load_contribution_by_id(conn, &new_id)?.ok_or_else(|| {
+                        anyhow!("restored tier_routing contribution missing after supersede")
+                    })?;
                 sync_config_to_operational(conn, bus, &new_contribution)?;
             }
         }
@@ -1096,9 +1097,10 @@ pub fn commit_disable_local_mode(
                     "local_mode_toggle",
                     Some("user"),
                 )?;
-                let new_contribution = load_contribution_by_id(conn, &new_id)?.ok_or_else(|| {
-                    anyhow!("restored dispatch_policy contribution missing after supersede")
-                })?;
+                let new_contribution =
+                    load_contribution_by_id(conn, &new_id)?.ok_or_else(|| {
+                        anyhow!("restored dispatch_policy contribution missing after supersede")
+                    })?;
                 sync_config_to_operational(conn, bus, &new_contribution)?;
             }
         }
@@ -1107,8 +1109,7 @@ pub fn commit_disable_local_mode(
     // Restore build_strategy.
     if let Some(restore_id) = row.restore_build_strategy_contribution_id.as_deref() {
         if let Some(restore) = load_contribution_by_id(conn, restore_id)? {
-            if let Some(active_now) =
-                load_active_config_contribution(conn, "build_strategy", None)?
+            if let Some(active_now) = load_active_config_contribution(conn, "build_strategy", None)?
             {
                 let new_id = supersede_config_contribution(
                     conn,
@@ -1118,9 +1119,10 @@ pub fn commit_disable_local_mode(
                     "local_mode_toggle",
                     Some("user"),
                 )?;
-                let new_contribution = load_contribution_by_id(conn, &new_id)?.ok_or_else(|| {
-                    anyhow!("restored build_strategy contribution missing after supersede")
-                })?;
+                let new_contribution =
+                    load_contribution_by_id(conn, &new_id)?.ok_or_else(|| {
+                        anyhow!("restored build_strategy contribution missing after supersede")
+                    })?;
                 sync_config_to_operational(conn, bus, &new_contribution)?;
             }
         }
@@ -1129,9 +1131,7 @@ pub fn commit_disable_local_mode(
     // Disable the local provider so active_provider_id() falls back to
     // openrouter. Without this, the provider row stays enabled and all
     // LLM calls continue routing to Ollama after the user toggles off.
-    if let Ok(Some(mut local_provider)) =
-        super::db::get_provider(conn, OLLAMA_LOCAL_PROVIDER_ID)
-    {
+    if let Ok(Some(mut local_provider)) = super::db::get_provider(conn, OLLAMA_LOCAL_PROVIDER_ID) {
         local_provider.enabled = false;
         super::db::save_provider(conn, &local_provider)?;
     }
@@ -1193,10 +1193,7 @@ pub use db::save_local_mode_state as write_state;
 /// Async prepare phase for model hot-swap. Validates the model name,
 /// checks Ollama reachability, verifies the model exists, and probes
 /// `/api/show` for the context window. No DB work.
-pub async fn prepare_switch_local_model(
-    base_url: &str,
-    model: &str,
-) -> Result<(String, usize)> {
+pub async fn prepare_switch_local_model(base_url: &str, model: &str) -> Result<(String, usize)> {
     if model.trim().is_empty() {
         bail!("Model name must not be empty");
     }
@@ -1205,7 +1202,9 @@ pub async fn prepare_switch_local_model(
     if !probe.reachable {
         return Err(anyhow!(
             "Cannot reach Ollama at {base_url}: {}. Is Ollama running?",
-            probe.reachability_error.unwrap_or_else(|| "unknown error".to_string())
+            probe
+                .reachability_error
+                .unwrap_or_else(|| "unknown error".to_string())
         ));
     }
     if !probe.available_models.iter().any(|m| m == model) {
@@ -1249,18 +1248,29 @@ pub fn commit_switch_local_model(
 
     // Find the currently-active tier_routing contribution (NOT restore_from —
     // that points at the PRE-local-mode contribution for the disable path).
-    let active_tier = load_active_config_contribution(conn, "tier_routing", None)?
-        .ok_or_else(|| anyhow!("no active tier_routing contribution to supersede during model switch"))?;
+    let active_tier =
+        load_active_config_contribution(conn, "tier_routing", None)?.ok_or_else(|| {
+            anyhow!("no active tier_routing contribution to supersede during model switch")
+        })?;
 
     // Build new tier_routing YAML with the new model + effective context.
-    let prior_tier_yaml: TierRoutingYaml =
-        serde_yaml::from_str(&active_tier.yaml_content)
-            .with_context(|| format!("parsing active tier_routing for model switch"))?;
-    let mut prior_tier_names: std::collections::BTreeSet<String> =
-        prior_tier_yaml.entries.iter().map(|e| e.tier_name.clone()).collect();
+    let prior_tier_yaml: TierRoutingYaml = serde_yaml::from_str(&active_tier.yaml_content)
+        .with_context(|| format!("parsing active tier_routing for model switch"))?;
+    let mut prior_tier_names: std::collections::BTreeSet<String> = prior_tier_yaml
+        .entries
+        .iter()
+        .map(|e| e.tier_name.clone())
+        .collect();
     for required in [
-        "fast_extract", "web", "synth_heavy", "stale_remote", "stale_local",
-        "mid", "extractor", "high", "max",
+        "fast_extract",
+        "web",
+        "synth_heavy",
+        "stale_remote",
+        "stale_local",
+        "mid",
+        "extractor",
+        "high",
+        "max",
     ] {
         prior_tier_names.insert(required.to_string());
     }
@@ -1274,20 +1284,24 @@ pub fn commit_switch_local_model(
             max_completion_tokens: None,
             pricing_json: Some("{}".to_string()),
             supported_parameters_json: Some(r#"["response_format"]"#.to_string()),
-            notes: Some(format!("local mode — model switch via Ollama at {base_url}")),
+            notes: Some(format!(
+                "local mode — model switch via Ollama at {base_url}"
+            )),
             priority: Some(1),
             prompt_price_per_token: Some(0.0),
             completion_price_per_token: Some(0.0),
         })
         .collect();
-    let new_tier_yaml = TierRoutingYaml { entries: new_entries };
+    let new_tier_yaml = TierRoutingYaml {
+        entries: new_entries,
+    };
     let new_tier_yaml_string = build_tier_routing_yaml_string(&new_tier_yaml)?;
 
     // Update provider config_json with num_ctx so Ollama allocates the context window.
     // Read-modify-write: preserve existing keys (e.g. extra_headers for nginx-fronted Ollama).
     if let Ok(Some(mut provider)) = super::db::get_provider(conn, OLLAMA_LOCAL_PROVIDER_ID) {
-        let mut cfg: serde_json::Value = serde_json::from_str(&provider.config_json)
-            .unwrap_or_else(|_| serde_json::json!({}));
+        let mut cfg: serde_json::Value =
+            serde_json::from_str(&provider.config_json).unwrap_or_else(|_| serde_json::json!({}));
         cfg["num_ctx"] = serde_json::json!(effective_context);
         provider.config_json = cfg.to_string();
         super::db::save_provider(conn, &provider)?;
@@ -1365,14 +1379,23 @@ pub fn set_context_override(
     let active_tier = load_active_config_contribution(conn, "tier_routing", None)?
         .ok_or_else(|| anyhow!("no active tier_routing contribution for context override"))?;
 
-    let prior_tier_yaml: TierRoutingYaml =
-        serde_yaml::from_str(&active_tier.yaml_content)
-            .with_context(|| "parsing active tier_routing for context override")?;
-    let mut prior_tier_names: std::collections::BTreeSet<String> =
-        prior_tier_yaml.entries.iter().map(|e| e.tier_name.clone()).collect();
+    let prior_tier_yaml: TierRoutingYaml = serde_yaml::from_str(&active_tier.yaml_content)
+        .with_context(|| "parsing active tier_routing for context override")?;
+    let mut prior_tier_names: std::collections::BTreeSet<String> = prior_tier_yaml
+        .entries
+        .iter()
+        .map(|e| e.tier_name.clone())
+        .collect();
     for required in [
-        "fast_extract", "web", "synth_heavy", "stale_remote", "stale_local",
-        "mid", "extractor", "high", "max",
+        "fast_extract",
+        "web",
+        "synth_heavy",
+        "stale_remote",
+        "stale_local",
+        "mid",
+        "extractor",
+        "high",
+        "max",
     ] {
         prior_tier_names.insert(required.to_string());
     }
@@ -1398,7 +1421,9 @@ pub fn set_context_override(
             completion_price_per_token: Some(0.0),
         })
         .collect();
-    let new_tier_yaml = TierRoutingYaml { entries: new_entries };
+    let new_tier_yaml = TierRoutingYaml {
+        entries: new_entries,
+    };
     let new_tier_yaml_string = build_tier_routing_yaml_string(&new_tier_yaml)?;
 
     let note = match limit {
@@ -1419,8 +1444,8 @@ pub fn set_context_override(
 
     // --- Update provider config_json num_ctx (read-modify-write) ---
     if let Ok(Some(mut provider)) = super::db::get_provider(conn, OLLAMA_LOCAL_PROVIDER_ID) {
-        let mut cfg: serde_json::Value = serde_json::from_str(&provider.config_json)
-            .unwrap_or_else(|_| serde_json::json!({}));
+        let mut cfg: serde_json::Value =
+            serde_json::from_str(&provider.config_json).unwrap_or_else(|_| serde_json::json!({}));
         cfg["num_ctx"] = serde_json::json!(effective_context);
         provider.config_json = cfg.to_string();
         super::db::save_provider(conn, &provider)?;
@@ -1503,7 +1528,10 @@ pub fn set_concurrency_override(
         .context("rendering build_strategy YAML for concurrency override")?;
 
     let bs_note = match concurrency {
-        Some(n) => format!("concurrency override set to {}", n.clamp(1, MAX_CONCURRENCY)),
+        Some(n) => format!(
+            "concurrency override set to {}",
+            n.clamp(1, MAX_CONCURRENCY)
+        ),
         None => "concurrency override cleared — restoring default 1".to_string(),
     };
     let new_bs_id = supersede_config_contribution(
@@ -1514,13 +1542,16 @@ pub fn set_concurrency_override(
         "local_mode_concurrency_override",
         Some("user"),
     )?;
-    let new_bs_contribution = load_contribution_by_id(conn, &new_bs_id)?
-        .ok_or_else(|| anyhow!("concurrency-override build_strategy contribution missing after supersede"))?;
+    let new_bs_contribution = load_contribution_by_id(conn, &new_bs_id)?.ok_or_else(|| {
+        anyhow!("concurrency-override build_strategy contribution missing after supersede")
+    })?;
     sync_config_to_operational(conn, bus, &new_bs_contribution)?;
 
     // --- Supersede dispatch_policy with updated provider_pools concurrency ---
-    let active_dp = load_active_config_contribution(conn, "dispatch_policy", None)?
-        .ok_or_else(|| anyhow!("no active dispatch_policy contribution for concurrency override"))?;
+    let active_dp =
+        load_active_config_contribution(conn, "dispatch_policy", None)?.ok_or_else(|| {
+            anyhow!("no active dispatch_policy contribution for concurrency override")
+        })?;
 
     // Parse, modify provider_pools.ollama-local.concurrency, re-serialize.
     let mut dp_value: serde_yaml::Value = serde_yaml::from_str(&active_dp.yaml_content)
@@ -1549,7 +1580,10 @@ pub fn set_concurrency_override(
         .context("rendering dispatch_policy YAML for concurrency override")?;
 
     let dp_note = match concurrency {
-        Some(n) => format!("concurrency override set to {} — pool updated", n.clamp(1, MAX_CONCURRENCY)),
+        Some(n) => format!(
+            "concurrency override set to {} — pool updated",
+            n.clamp(1, MAX_CONCURRENCY)
+        ),
         None => "concurrency override cleared — pool restored to 1".to_string(),
     };
     let new_dp_id = supersede_config_contribution(
@@ -1560,8 +1594,9 @@ pub fn set_concurrency_override(
         "local_mode_concurrency_override",
         Some("user"),
     )?;
-    let new_dp_contribution = load_contribution_by_id(conn, &new_dp_id)?
-        .ok_or_else(|| anyhow!("concurrency-override dispatch_policy contribution missing after supersede"))?;
+    let new_dp_contribution = load_contribution_by_id(conn, &new_dp_id)?.ok_or_else(|| {
+        anyhow!("concurrency-override dispatch_policy contribution missing after supersede")
+    })?;
     sync_config_to_operational(conn, bus, &new_dp_contribution)?;
 
     // --- Read-modify-write state row: set concurrency_override, preserve everything else ---
@@ -1745,9 +1780,7 @@ pub async fn delete_ollama_model(base_url: &str, model: &str) -> Result<()> {
             .text()
             .await
             .unwrap_or_else(|_| "(no body)".to_string());
-        bail!(
-            "DELETE {url} for model {model} returned status {status}: {body}"
-        );
+        bail!("DELETE {url} for model {model} returned status {status}: {body}");
     }
 
     Ok(())
@@ -1846,7 +1879,6 @@ pub struct ComputeParticipationPolicy {
     // them continue to deserialize cleanly. Getter fallbacks live in
     // `effective_booleans` via a parallel struct access pattern (see
     // MarketDispatchKnobs below).
-
     /// Wall-clock budget for a single market dispatch end-to-end
     /// (match + fill + await-push + fallback-poll-on-timeout). On
     /// timeout, the node falls back to local inference.
@@ -1942,7 +1974,9 @@ pub struct EffectiveParticipationPolicy {
 ///   - `hybrid`: all 8 = true.
 ///   - `worker`: all serving/hosting + market_visibility + relay_serving =
 ///     true; all dispatch/usage = false.
-pub fn project_mode(mode: ComputeParticipationMode) -> (bool, bool, bool, bool, bool, bool, bool, bool) {
+pub fn project_mode(
+    mode: ComputeParticipationMode,
+) -> (bool, bool, bool, bool, bool, bool, bool, bool) {
     match mode {
         ComputeParticipationMode::Coordinator => (
             true,  // allow_fleet_dispatch
@@ -2079,7 +2113,8 @@ pub fn set_compute_participation_policy(
             "active",
         )?;
     }
-    if let Some(contrib) = load_active_config_contribution(conn, "compute_participation_policy", None)?
+    if let Some(contrib) =
+        load_active_config_contribution(conn, "compute_participation_policy", None)?
     {
         sync_config_to_operational(conn, bus, &contrib)?;
     }
@@ -2145,40 +2180,33 @@ pub fn set_experimental_territory(
     Ok(())
 }
 
-// ── Cascade model field rebuild ─────────────────────────────────────────────
+// ── Cascade model field rebuild (W3c: logging-only) ─────────────────────────
 
 /// After a provider-registry refresh (local mode toggle, tier routing
-/// contribution apply), re-resolve the cascade model fields on the live
-/// `LlmConfig` from the current tier routing table. Ensures
-/// `call_model_unified`'s cascade sends the correct model name for
-/// whichever provider is now active.
-///
-/// Was previously in main.rs; moved here so HTTP route handlers can
-/// call the same logic without depending on the binary's `SharedState`
-/// alias.
+/// contribution apply), log the currently-resolved tier models from the
+/// provider registry. Pre-W3c this function mutated the cascade fields
+/// on the live `LlmConfig`; now that those fields are deleted the
+/// dispatch path reads the registry directly at call time, and this
+/// function exists only to emit a diagnostic trace after the refresh.
 pub async fn rebuild_cascade_from_registry(pyramid: &std::sync::Arc<super::PyramidState>) {
     let reg = &pyramid.provider_registry;
-    let mut live = pyramid.config.write().await;
-    if let Ok(r) = reg.resolve_tier("mid", None, None, None) {
-        live.primary_model = r.tier.model_id.clone();
-        if let Some(limit) = r.tier.context_limit {
-            live.primary_context_limit = limit;
-        }
-    }
-    if let Ok(r) = reg.resolve_tier("high", None, None, None) {
-        live.fallback_model_1 = r.tier.model_id.clone();
-        if let Some(limit) = r.tier.context_limit {
-            live.fallback_1_context_limit = limit;
-        }
-    }
-    if let Ok(r) = reg.resolve_tier("max", None, None, None) {
-        live.fallback_model_2 = r.tier.model_id.clone();
-    }
+    let mid = reg
+        .resolve_tier("mid", None, None, None)
+        .ok()
+        .map(|r| r.tier.model_id);
+    let high = reg
+        .resolve_tier("high", None, None, None)
+        .ok()
+        .map(|r| r.tier.model_id);
+    let max_model = reg
+        .resolve_tier("max", None, None, None)
+        .ok()
+        .map(|r| r.tier.model_id);
     tracing::info!(
-        primary = %live.primary_model,
-        fallback_1 = %live.fallback_model_1,
-        fallback_2 = %live.fallback_model_2,
-        "rebuilt cascade model fields from tier routing",
+        mid = ?mid,
+        high = ?high,
+        max = ?max_model,
+        "W3c: provider-registry tier routing after refresh (LlmConfig cascade fields deleted; registry is authoritative)",
     );
 }
 
@@ -2399,9 +2427,8 @@ mod tests {
 
         let bus = Arc::new(crate::pyramid::event_bus::BuildEventBus::new());
         let tmp = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(
-            crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
-        );
+        let store =
+            Arc::new(crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap());
         std::mem::forget(tmp);
         let registry = ProviderRegistry::new(store);
         registry.load_from_db(&conn).unwrap();
@@ -2547,16 +2574,17 @@ mod tests {
         // dead-end gate on every call.
         let p = ComputeParticipationPolicy::default();
         let eff = p.effective_booleans();
-        assert!(eff.allow_market_dispatch,
-            "fresh install must have market dispatch ENABLED by default (purpose lock)");
+        assert!(
+            eff.allow_market_dispatch,
+            "fresh install must have market dispatch ENABLED by default (purpose lock)"
+        );
     }
 
     #[test]
     fn project_mode_coordinator_matches_dd_i_spec() {
         // DD-I: coordinator = all *_dispatch + *_usage = true;
         // all *_serving + *_hosting + market_visibility + relay_serving = false.
-        let (fd, fs, md, mv, sp, sh, ru, rs) =
-            project_mode(ComputeParticipationMode::Coordinator);
+        let (fd, fs, md, mv, sp, sh, ru, rs) = project_mode(ComputeParticipationMode::Coordinator);
         assert!(fd, "coordinator.allow_fleet_dispatch");
         assert!(!fs, "coordinator.allow_fleet_serving");
         assert!(md, "coordinator.allow_market_dispatch");
@@ -2570,18 +2598,18 @@ mod tests {
     #[test]
     fn project_mode_hybrid_matches_dd_i_spec() {
         // DD-I: hybrid = all 8 projectable booleans = true.
-        let (fd, fs, md, mv, sp, sh, ru, rs) =
-            project_mode(ComputeParticipationMode::Hybrid);
-        assert!(fd && fs && md && mv && sp && sh && ru && rs,
-            "hybrid must project all 8 booleans to true");
+        let (fd, fs, md, mv, sp, sh, ru, rs) = project_mode(ComputeParticipationMode::Hybrid);
+        assert!(
+            fd && fs && md && mv && sp && sh && ru && rs,
+            "hybrid must project all 8 booleans to true"
+        );
     }
 
     #[test]
     fn project_mode_worker_matches_dd_i_spec() {
         // DD-I: worker = all *_serving + *_hosting + market_visibility +
         // relay_serving = true; all *_dispatch + *_usage = false.
-        let (fd, fs, md, mv, sp, sh, ru, rs) =
-            project_mode(ComputeParticipationMode::Worker);
+        let (fd, fs, md, mv, sp, sh, ru, rs) = project_mode(ComputeParticipationMode::Worker);
         assert!(!fd, "worker.allow_fleet_dispatch");
         assert!(fs, "worker.allow_fleet_serving");
         assert!(!md, "worker.allow_market_dispatch");
@@ -2602,8 +2630,8 @@ mod tests {
         let p = ComputeParticipationPolicy {
             schema_type: "compute_participation_policy".into(),
             mode: ComputeParticipationMode::Worker,
-            allow_fleet_dispatch: Some(true),   // explicit override
-            allow_fleet_serving: None,          // project from worker
+            allow_fleet_dispatch: Some(true), // explicit override
+            allow_fleet_serving: None,        // project from worker
             allow_market_dispatch: None,
             allow_market_visibility: None,
             allow_storage_pulling: None,
@@ -2615,10 +2643,22 @@ mod tests {
             market_saturation_patience_secs: 3600,
         };
         let eff = p.effective_booleans();
-        assert!(eff.allow_fleet_dispatch, "explicit true must win over worker projection");
-        assert!(eff.allow_fleet_serving, "None projects to worker default (true)");
-        assert!(!eff.allow_market_dispatch, "None projects to worker default (false)");
-        assert!(eff.allow_market_visibility, "None projects to worker default (true)");
+        assert!(
+            eff.allow_fleet_dispatch,
+            "explicit true must win over worker projection"
+        );
+        assert!(
+            eff.allow_fleet_serving,
+            "None projects to worker default (true)"
+        );
+        assert!(
+            !eff.allow_market_dispatch,
+            "None projects to worker default (false)"
+        );
+        assert!(
+            eff.allow_market_visibility,
+            "None projects to worker default (true)"
+        );
     }
 
     #[test]
@@ -2683,10 +2723,14 @@ mod tests {
         };
         let yaml = serde_yaml::to_string(&p).unwrap();
         // None fields are absent — no stray `null` or `~`.
-        assert!(!yaml.contains("allow_fleet_serving"),
-            "None field must not serialize:\n{yaml}");
-        assert!(!yaml.contains("allow_market_visibility"),
-            "None field must not serialize:\n{yaml}");
+        assert!(
+            !yaml.contains("allow_fleet_serving"),
+            "None field must not serialize:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("allow_market_visibility"),
+            "None field must not serialize:\n{yaml}"
+        );
         // Some fields render with their value.
         assert!(yaml.contains("allow_fleet_dispatch: true"));
         assert!(yaml.contains("allow_market_dispatch: false"));
@@ -2707,9 +2751,7 @@ mod tests {
             ("hybrid", ComputeParticipationMode::Hybrid),
             ("worker", ComputeParticipationMode::Worker),
         ] {
-            let yaml = format!(
-                "schema_type: compute_participation_policy\nmode: {mode_str}\n"
-            );
+            let yaml = format!("schema_type: compute_participation_policy\nmode: {mode_str}\n");
             let p: ComputeParticipationPolicy = serde_yaml::from_str(&yaml).unwrap();
             assert_eq!(p.mode, mode_enum);
             assert_eq!(p.allow_fleet_dispatch, None);
@@ -2790,8 +2832,10 @@ mod tests {
         assert_eq!(p.allow_relay_usage, None);
         assert_eq!(p.allow_relay_serving, None);
         let eff = p.effective_booleans();
-        assert!(eff.allow_market_visibility == false,
-            "explicit false in legacy YAML wins over hybrid projection");
+        assert!(
+            eff.allow_market_visibility == false,
+            "explicit false in legacy YAML wins over hybrid projection"
+        );
         // Unset new fields inherit hybrid's "all true" projection.
         // NOTE: this means a node with the old 6-field contribution
         // would, after upgrading to WS1a code, project market_dispatch
@@ -2878,9 +2922,8 @@ mod tests {
         crate::pyramid::db::init_pyramid_db(&conn).unwrap();
         let bus = Arc::new(crate::pyramid::event_bus::BuildEventBus::new());
         let tmp = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(
-            crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
-        );
+        let store =
+            Arc::new(crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap());
         std::mem::forget(tmp);
         let registry = ProviderRegistry::new(store);
 
@@ -2930,10 +2973,9 @@ mod tests {
         // the active contribution with unchanged yaml.
         let row_after_enable = load_local_mode_state(&conn).unwrap();
         assert!(row_after_enable.enabled, "enable did not flip state");
-        let dp_after_enable =
-            load_active_config_contribution(&conn, "dispatch_policy", None)
-                .unwrap()
-                .expect("authored dispatch_policy still active after enable");
+        let dp_after_enable = load_active_config_contribution(&conn, "dispatch_policy", None)
+            .unwrap()
+            .expect("authored dispatch_policy still active after enable");
         assert_eq!(
             dp_after_enable.contribution_id, authored_id,
             "enable must not supersede the authored dispatch_policy"
@@ -2951,10 +2993,9 @@ mod tests {
         // STILL the active contribution with unchanged yaml.
         let row_after_disable = load_local_mode_state(&conn).unwrap();
         assert!(!row_after_disable.enabled, "disable did not flip state");
-        let dp_after_disable =
-            load_active_config_contribution(&conn, "dispatch_policy", None)
-                .unwrap()
-                .expect("authored dispatch_policy still active after disable");
+        let dp_after_disable = load_active_config_contribution(&conn, "dispatch_policy", None)
+            .unwrap()
+            .expect("authored dispatch_policy still active after disable");
         assert_eq!(
             dp_after_disable.contribution_id, authored_id,
             "disable must leave the authored dispatch_policy as-is"

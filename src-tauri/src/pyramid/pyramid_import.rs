@@ -361,9 +361,7 @@ pub fn populate_from_import(
             }
         };
 
-        if normalize_hash(manifest_hash).to_ascii_lowercase()
-            != local_hash.to_ascii_lowercase()
-        {
+        if normalize_hash(manifest_hash).to_ascii_lowercase() != local_hash.to_ascii_lowercase() {
             debug!(
                 node_id = node.node_id,
                 manifest_hash = manifest_hash,
@@ -376,12 +374,8 @@ pub fn populate_from_import(
         }
 
         // Source matches — insert this L0 node's cache entries.
-        let inserted = insert_cache_entries(
-            conn,
-            target_slug,
-            &import_build_id,
-            &node.cache_entries,
-        )?;
+        let inserted =
+            insert_cache_entries(conn, target_slug, &import_build_id, &node.cache_entries)?;
         report.cache_entries_valid += inserted;
         report.nodes_with_valid_cache += 1;
     }
@@ -423,12 +417,8 @@ pub fn populate_from_import(
             report.cache_entries_stale += node.cache_entries.len() as u64;
             continue;
         }
-        let inserted = insert_cache_entries(
-            conn,
-            target_slug,
-            &import_build_id,
-            &node.cache_entries,
-        )?;
+        let inserted =
+            insert_cache_entries(conn, target_slug, &import_build_id, &node.cache_entries)?;
         report.cache_entries_valid += inserted;
         report.nodes_with_valid_cache += 1;
     }
@@ -843,10 +833,7 @@ pub struct ImportCancelReport {
 /// Idempotent: cancelling a slug with no import state and no imported
 /// cache rows is a no-op that returns `ImportCancelReport { state_row_existed:
 /// false, cache_rows_rolled_back: 0 }`.
-pub fn cancel_pyramid_import(
-    conn: &Connection,
-    target_slug: &str,
-) -> Result<ImportCancelReport> {
+pub fn cancel_pyramid_import(conn: &Connection, target_slug: &str) -> Result<ImportCancelReport> {
     // Resolve the wire_pyramid_id from the import state row so we know
     // which build_id prefix to filter on. If there's no state row, we
     // still attempt to delete any cache rows that look like imports
@@ -1014,12 +1001,7 @@ mod tests {
                     source_hash: Some(l0a_hash.into()),
                     source_size_bytes: Some(10),
                     derived_from: vec![],
-                    cache_entries: vec![make_imported_entry(
-                        "source_extract",
-                        0,
-                        0,
-                        "L0a-extract",
-                    )],
+                    cache_entries: vec![make_imported_entry("source_extract", 0, 0, "L0a-extract")],
                 },
                 ImportNodeEntry {
                     node_id: "L0b".into(),
@@ -1028,12 +1010,7 @@ mod tests {
                     source_hash: Some(l0b_hash.into()),
                     source_size_bytes: Some(20),
                     derived_from: vec![],
-                    cache_entries: vec![make_imported_entry(
-                        "source_extract",
-                        1,
-                        0,
-                        "L0b-extract",
-                    )],
+                    cache_entries: vec![make_imported_entry("source_extract", 1, 0, "L0b-extract")],
                 },
                 ImportNodeEntry {
                     node_id: "L0c".into(),
@@ -1042,12 +1019,7 @@ mod tests {
                     source_hash: Some(l0c_hash.into()),
                     source_size_bytes: Some(30),
                     derived_from: vec![],
-                    cache_entries: vec![make_imported_entry(
-                        "source_extract",
-                        2,
-                        0,
-                        "L0c-extract",
-                    )],
+                    cache_entries: vec![make_imported_entry("source_extract", 2, 0, "L0c-extract")],
                 },
                 ImportNodeEntry {
                     node_id: "L1a".into(),
@@ -1139,8 +1111,8 @@ mod tests {
             exported_at: "2026-04-09T15:30:00Z".into(),
             nodes: vec![],
         };
-        let err = populate_from_import(&conn, &manifest, "test-import", Path::new("/tmp"))
-            .unwrap_err();
+        let err =
+            populate_from_import(&conn, &manifest, "test-import", Path::new("/tmp")).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("unsupported manifest_version"),
@@ -1163,12 +1135,10 @@ mod tests {
         let _ = write_and_hash(&l0c_path, "gamma content (real)");
         let bogus_hash = "0000000000000000000000000000000000000000000000000000000000000000";
 
-        let manifest = build_mixed_manifest(
-            "a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", bogus_hash,
-        );
+        let manifest =
+            build_mixed_manifest("a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", bogus_hash);
 
-        let report =
-            populate_from_import(&conn, &manifest, "test-import", dir.path()).unwrap();
+        let report = populate_from_import(&conn, &manifest, "test-import", dir.path()).unwrap();
 
         // L0a + L0b cache-hit (2 entries), L0c is stale (1 entry dropped).
         // Of the upper layers: L1a derives from L0a + L0b (both fresh) →
@@ -1201,8 +1171,11 @@ mod tests {
         assert_eq!(row_count, 3, "expected 3 rows in pyramid_step_cache");
 
         // Verify the stale L1b entry is NOT in the cache.
-        let l1b_cache_key =
-            compute_cache_key("inputs:L1b-cluster", "prompt:L1b-cluster", "openrouter/test-1");
+        let l1b_cache_key = compute_cache_key(
+            "inputs:L1b-cluster",
+            "prompt:L1b-cluster",
+            "openrouter/test-1",
+        );
         let l1b_present: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pyramid_step_cache WHERE slug = 'test-import' AND cache_key = ?1",
@@ -1210,7 +1183,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(l1b_present, 0, "stale L1b cache entry should not be present");
+        assert_eq!(
+            l1b_present, 0,
+            "stale L1b cache entry should not be present"
+        );
     }
 
     #[test]
@@ -1223,11 +1199,15 @@ mod tests {
         let l0b_hash = "deadbeef".to_string();
 
         let manifest = build_mixed_manifest(
-            "a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", "more-deadbeef",
+            "a.txt",
+            &l0a_hash,
+            "b.txt",
+            &l0b_hash,
+            "c.txt",
+            "more-deadbeef",
         );
 
-        let report =
-            populate_from_import(&conn, &manifest, "test-import", dir.path()).unwrap();
+        let report = populate_from_import(&conn, &manifest, "test-import", dir.path()).unwrap();
 
         // Only L0a is valid (1 entry). Both L0b and L0c are stale, and
         // every upper layer that touches them propagates stale.
@@ -1251,13 +1231,11 @@ mod tests {
         let l0b_hash = write_and_hash(&l0b_path, "beta");
         let l0c_hash = write_and_hash(&l0c_path, "gamma");
 
-        let manifest = build_mixed_manifest(
-            "a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", &l0c_hash,
-        );
+        let manifest =
+            build_mixed_manifest("a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", &l0c_hash);
 
         // First import: all 5 nodes are valid (no stale L0s).
-        let r1 =
-            populate_from_import(&conn, &manifest, "test-import", dir.path()).unwrap();
+        let r1 = populate_from_import(&conn, &manifest, "test-import", dir.path()).unwrap();
         assert_eq!(r1.cache_entries_valid, 5);
 
         let row_count_after_first: i64 = conn
@@ -1273,8 +1251,7 @@ mod tests {
         // INSERT ... ON CONFLICT DO NOTHING on the unique (slug, cache_key)
         // constraint, so re-importing produces no duplicate rows AND
         // does not overwrite anything already present.
-        let r2 =
-            populate_from_import(&conn, &manifest, "test-import", dir.path()).unwrap();
+        let r2 = populate_from_import(&conn, &manifest, "test-import", dir.path()).unwrap();
         assert_eq!(r2.cache_entries_valid, 5);
 
         let row_count_after_second: i64 = conn
@@ -1314,14 +1291,12 @@ mod tests {
         let l0b_hash = write_and_hash(&l0b_path, "beta");
         let l0c_hash = write_and_hash(&l0c_path, "gamma");
 
-        let manifest = build_mixed_manifest(
-            "a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", &l0c_hash,
-        );
+        let manifest =
+            build_mixed_manifest("a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", &l0c_hash);
 
         // First import: all 5 nodes land in the cache with
         // force_fresh = 0 and the imported output_json.
-        let r1 =
-            populate_from_import(&conn, &manifest, "test-import", dir.path()).unwrap();
+        let r1 = populate_from_import(&conn, &manifest, "test-import", dir.path()).unwrap();
         assert_eq!(r1.cache_entries_valid, 5);
 
         // Simulate a local force-reroll on the L0a cache row. We reuse the
@@ -1330,8 +1305,11 @@ mod tests {
         // content-addressable key"). Going through `supersede_cache_entry`
         // archives the imported row and writes a fresh row at the same
         // cache_key with `force_fresh = 1` and a supersession link.
-        let l0a_cache_key =
-            compute_cache_key("inputs:L0a-extract", "prompt:L0a-extract", "openrouter/test-1");
+        let l0a_cache_key = compute_cache_key(
+            "inputs:L0a-extract",
+            "prompt:L0a-extract",
+            "openrouter/test-1",
+        );
 
         let rerolled = CacheEntry {
             slug: "test-import".into(),
@@ -1343,8 +1321,7 @@ mod tests {
             inputs_hash: "inputs:L0a-extract".into(),
             prompt_hash: "prompt:L0a-extract".into(),
             model_id: "openrouter/test-1".into(),
-            output_json:
-                serde_json::json!({"content":"REROLLED","usage":{}}).to_string(),
+            output_json: serde_json::json!({"content":"REROLLED","usage":{}}).to_string(),
             token_usage_json: Some("{}".into()),
             cost_usd: Some(0.005),
             latency_ms: Some(123),
@@ -1352,8 +1329,7 @@ mod tests {
             supersedes_cache_id: None,
             note: None,
         };
-        db::supersede_cache_entry(&conn, "test-import", &l0a_cache_key, &rerolled)
-            .unwrap();
+        db::supersede_cache_entry(&conn, "test-import", &l0a_cache_key, &rerolled).unwrap();
 
         // Sanity: the active row at the cache_key is now the rerolled one.
         let (active_output, active_force_fresh): (String, i64) = conn
@@ -1375,20 +1351,15 @@ mod tests {
 
         // Re-run the import. Under `store_cache_if_absent`, the re-import
         // must leave the rerolled row alone.
-        let r2 =
-            populate_from_import(&conn, &manifest, "test-import", dir.path()).unwrap();
+        let r2 = populate_from_import(&conn, &manifest, "test-import", dir.path()).unwrap();
         // Report still shows all 5 slots occupied — the importer counts
         // "entries now present" regardless of whether this call wrote them.
         assert_eq!(r2.cache_entries_valid, 5);
 
         // The row at the rerolled cache_key must still be the reroll, not
         // the re-imported copy.
-        let (preserved_output, preserved_force_fresh, preserved_build_id): (
-            String,
-            i64,
-            String,
-        ) = conn
-            .query_row(
+        let (preserved_output, preserved_force_fresh, preserved_build_id): (String, i64, String) =
+            conn.query_row(
                 "SELECT output_json, force_fresh, build_id FROM pyramid_step_cache
                  WHERE slug = 'test-import' AND cache_key = ?1",
                 [&l0a_cache_key],
@@ -1450,9 +1421,8 @@ mod tests {
         let l0b_hash = write_and_hash(&l0b_path, "beta");
         let l0c_hash = write_and_hash(&l0c_path, "gamma");
 
-        let manifest = build_mixed_manifest(
-            "a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", &l0c_hash,
-        );
+        let manifest =
+            build_mixed_manifest("a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", &l0c_hash);
 
         let report = import_pyramid(
             &conn,
@@ -1468,7 +1438,9 @@ mod tests {
         assert_eq!(report.cache_entries_stale, 0);
 
         // The import state row is now `complete`.
-        let state = db::load_import_state(&conn, "test-import").unwrap().unwrap();
+        let state = db::load_import_state(&conn, "test-import")
+            .unwrap()
+            .unwrap();
         assert_eq!(state.status, "complete");
         assert_eq!(state.nodes_total, Some(5));
         assert_eq!(state.cache_entries_total, Some(5));
@@ -1516,9 +1488,8 @@ mod tests {
         let l0b_hash = write_and_hash(&l0b_path, "beta");
         let l0c_hash = write_and_hash(&l0c_path, "gamma");
 
-        let manifest = build_mixed_manifest(
-            "a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", &l0c_hash,
-        );
+        let manifest =
+            build_mixed_manifest("a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", &l0c_hash);
 
         // First call lands a complete state row + cache.
         let _ = import_pyramid(
@@ -1574,9 +1545,8 @@ mod tests {
         let l0b_hash = write_and_hash(&l0b_path, "beta");
         let l0c_hash = write_and_hash(&l0c_path, "gamma");
 
-        let manifest = build_mixed_manifest(
-            "a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", &l0c_hash,
-        );
+        let manifest =
+            build_mixed_manifest("a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", &l0c_hash);
 
         // Land an import (5 cache rows + state row + dadbear contribution).
         let _ = import_pyramid(
@@ -1648,9 +1618,8 @@ mod tests {
         let l0b_hash = write_and_hash(&l0b_path, "beta");
         let l0c_hash = write_and_hash(&l0c_path, "gamma");
 
-        let manifest = build_mixed_manifest(
-            "a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", &l0c_hash,
-        );
+        let manifest =
+            build_mixed_manifest("a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", &l0c_hash);
 
         // Land an import.
         let _ = import_pyramid(
@@ -1696,7 +1665,10 @@ mod tests {
 
         // Cancel.
         let report = cancel_pyramid_import(&conn, "test-import").unwrap();
-        assert_eq!(report.cache_rows_rolled_back, 5, "5 imported rows rolled back");
+        assert_eq!(
+            report.cache_rows_rolled_back, 5,
+            "5 imported rows rolled back"
+        );
 
         // The locally-built row survives.
         let cache_count_after: i64 = conn
@@ -1744,9 +1716,8 @@ mod tests {
         let l0b_hash = write_and_hash(&l0b_path, "beta");
         let l0c_hash = write_and_hash(&l0c_path, "gamma");
 
-        let manifest = build_mixed_manifest(
-            "a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", &l0c_hash,
-        );
+        let manifest =
+            build_mixed_manifest("a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", &l0c_hash);
 
         // First import lands one active dadbear_policy contribution + one
         // synced pyramid_dadbear_config row.
@@ -1769,7 +1740,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(active_after_first, 1, "first import should land exactly 1 active contribution");
+        assert_eq!(
+            active_after_first, 1,
+            "first import should land exactly 1 active contribution"
+        );
 
         // Second import (same slug + same wire_pyramid_id → resume path).
         let _ = import_pyramid(
@@ -1913,13 +1887,8 @@ mod tests {
         let bus = make_bus();
         let dir = TempDir::new().unwrap();
 
-        enable_dadbear_via_contribution(
-            &conn,
-            &bus,
-            "test-import",
-            dir.path().to_str().unwrap(),
-        )
-        .unwrap();
+        enable_dadbear_via_contribution(&conn, &bus, "test-import", dir.path().to_str().unwrap())
+            .unwrap();
 
         // Look up the contribution and verify its metadata reflects
         // the canonical Wire Native Documents shape — non-empty JSON,
@@ -1938,7 +1907,10 @@ mod tests {
         assert!(row.0.contains("content_type"));
         assert!(row.0.contains("scan_interval_secs: 60"));
         assert_eq!(row.1, "import");
-        assert_ne!(row.2, "{}", "wire_native_metadata_json should not be the empty stub");
+        assert_ne!(
+            row.2, "{}",
+            "wire_native_metadata_json should not be the empty stub"
+        );
         assert!(
             row.2.contains("\"maturity\""),
             "wire_native_metadata_json should carry the canonical maturity field"

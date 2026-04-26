@@ -7,7 +7,7 @@
 // See docs/plans/action-chain-refactor-v3.md §Phase 4 for full specification.
 
 use anyhow::{anyhow, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -20,15 +20,83 @@ use super::execution_plan::{ModelRequirements, Step, StepOperation};
 use super::expression::ValueEnv;
 use super::llm::{self, AuditContext, LlmConfig, LlmResponse};
 use super::naming::headline_from_analysis;
-use super::step_context::{compute_prompt_hash, StepContext as CacheStepContext};
+use super::step_context::{
+    compute_cache_key, compute_inputs_hash, compute_prompt_hash, StepContext as CacheStepContext,
+};
 use super::transform_runtime;
-use super::types::{Correction, Decision, PyramidNode, Term, Topic};
+use super::types::{
+    Correction, DebatePosition, DebateTopic, Decision, GapTopic, MetaLayerTopic,
+    MetaLayerTopicEntry, NodeShape, PyramidNode, RedTeamEntry, ShapePayload, Term, Topic,
+    NODE_SHAPE_DEBATE, NODE_SHAPE_GAP, NODE_SHAPE_META_LAYER,
+};
+use super::walker_decision::DispatchDecision;
+use super::walker_resolver::ProviderType as WalkerProviderType;
 use super::{OperationalConfig, Tier1Config};
+
+// ── Walker v3 W2b: Decision-aware model read helpers ────────────────────────
+//
+// File-private helper that pulls the first OpenRouter model_list entry
+// from an attached DispatchDecision. Mirrors the private helper in
+// llm.rs (W2a scope) — duplicated here rather than exported because
+// W2a/b run in parallel and can't coordinate on a shared helper
+// location without creating merge seams. Removed in W3 when the
+// Decision becomes the sole source and the legacy fallback expressions
+// go.
+//
+// Callers chain `.unwrap_or_else(|| config.primary_model.clone())` (or
+// fall through to the provider-registry / legacy-match chain) to
+// preserve the Phase 1 legacy fallback — see §6 migration contract.
+
+fn first_openrouter_model_from_decision(
+    decision: Option<&Arc<DispatchDecision>>,
+) -> Option<String> {
+    decision
+        .and_then(|d| d.per_provider.get(&WalkerProviderType::OpenRouter))
+        .and_then(|p| p.model_list.as_ref())
+        .and_then(|ml| ml.first().cloned())
+}
+
+fn invalidate_cached_llm_response(
+    step_ctx: Option<&CacheStepContext>,
+    system_prompt: &str,
+    user_prompt: &str,
+    reason: &str,
+) {
+    let Some(sc) = step_ctx.filter(|sc| sc.cache_is_usable()) else {
+        return;
+    };
+    let Some(resolved_model) = sc
+        .resolved_model_id
+        .as_deref()
+        .filter(|model| !model.is_empty())
+    else {
+        return;
+    };
+
+    let inputs_hash = compute_inputs_hash(system_prompt, user_prompt);
+    let cache_key = compute_cache_key(&inputs_hash, &sc.prompt_hash, resolved_model);
+    let delete_result = super::db::open_pyramid_connection(std::path::Path::new(&sc.db_path))
+        .and_then(|conn| super::db::delete_cache_entry(&conn, &sc.slug, &cache_key));
+
+    match delete_result {
+        Ok(()) => warn!(
+            "[CHAIN] invalidated cached LLM response after parse failure slug={} step={} key={} reason={}",
+            sc.slug,
+            sc.step_name,
+            &cache_key[..cache_key.len().min(16)],
+            reason
+        ),
+        Err(e) => warn!(
+            "[CHAIN] failed to invalidate cached LLM response slug={} step={} reason={}: {}",
+            sc.slug, sc.step_name, reason, e
+        ),
+    }
+}
 
 // ── Step context ────────────────────────────────────────────────────────────
 
 /// Phase 6 fix pass: build-scoped cache plumbing plus lazy prompt/model
-/// hash caches. Lives on `chain_dispatch::StepContext` so every LLM call
+/// hash caches. Lives on `chain_dispatch::ChainDispatchContext` so every LLM call
 /// site in the dispatcher (dispatch_ir_llm, dispatch_llm) can construct
 /// a per-call `pyramid::step_context::StepContext` without re-hashing the
 /// prompt template or re-resolving the tier.
@@ -50,10 +118,10 @@ pub struct CacheDispatchBase {
     /// lookups and writes.
     pub bus: Option<Arc<BuildEventBus>>,
     /// Chain name for chronicle task context (e.g., "code-mechanical").
-    /// Flows through to StepContext.chain_name via CacheAccess.
+    /// Flows through to ChainDispatchContext.chain_name via CacheAccess.
     pub chain_name: Option<String>,
     /// Content type for chronicle task context (e.g., "code", "document").
-    /// Flows through to StepContext.content_type via CacheAccess.
+    /// Flows through to ChainDispatchContext.content_type via CacheAccess.
     pub content_type: Option<String>,
     /// Phase 6 lazy cache: prompt template path → SHA-256 hex. The same
     /// template path used by multiple steps in the same build hashes
@@ -121,7 +189,7 @@ impl CacheDispatchBase {
 
 /// Context available to all chain steps during execution.
 #[derive(Clone)]
-pub struct StepContext {
+pub struct ChainDispatchContext {
     pub db_reader: Arc<Mutex<Connection>>,
     pub db_writer: Arc<Mutex<Connection>>,
     pub slug: String,
@@ -143,6 +211,37 @@ pub struct StepContext {
     /// `min(step.concurrency, concurrency_cap)`. Local mode sets this to 1
     /// because Ollama processes one request at a time.
     pub concurrency_cap: Option<usize>,
+    /// Post-build accretion v5 Phase 6b: handle to the full `PyramidState`
+    /// so mechanical primitives can recurse into the starter-chain runner.
+    /// `call_starter_chain` is the first consumer — it re-invokes
+    /// `chain_executor::execute_chain_for_target` with a library chain
+    /// (e.g. `starter-evidence-tester`, `starter-reconciler`) so Phase 7
+    /// consumers like `debate_steward` / `meta_layer_oracle` can delegate
+    /// weighing evidence / merging positions to focused library chains.
+    ///
+    /// `None` on every dispatch path OTHER than the starter runner. The
+    /// full chain executor, IR executor, and dead-letter retry do not
+    /// invoke library chains. `call_starter_chain` raises loudly when
+    /// this field is `None` — see `feedback_loud_deferrals`.
+    pub state: Option<Arc<super::PyramidState>>,
+    /// Post-build accretion v5 Phase 6b: chains directory override. When
+    /// present, sub-chain invocation resolves `starter-*.yaml` via
+    /// `chain_loader::load_chain_by_id(chain_id, chains_dir)`. In practice
+    /// this always duplicates `ctx.state.as_ref().unwrap().chains_dir`,
+    /// but threading it explicitly keeps the dispatch-time call site one
+    /// hop away from the read.
+    pub chains_dir: Option<std::path::PathBuf>,
+    /// Post-build accretion v5 Phase 6b: the `target_id` that the starter
+    /// runner was invoked with. Sub-chain calls inherit this by default so
+    /// chain body steps that depend on `target_node_id` (e.g.,
+    /// `queue_re_distill_for_target`) keep working across the recursion.
+    pub target_id: Option<String>,
+    /// Post-build accretion v5 Phase 6b: current sub-chain nesting depth
+    /// as observed at THIS dispatch context. The runner increments this
+    /// by one when invoking a sub-chain, and the depth-guard in
+    /// `call_starter_chain` short-circuits at `MAX_SUB_CHAIN_DEPTH`.
+    /// `None` at the top level is treated as depth `0`.
+    pub sub_chain_depth: Option<usize>,
 }
 
 impl CacheDispatchBase {
@@ -172,6 +271,133 @@ impl CacheDispatchBase {
     }
 }
 
+// ── Walker v3 W1b: outer-step DispatchDecision builder ─────────────────────
+//
+// Plan rev 1.0.2 §2.9 DispatchDecision + §6 Phase 1: the Decision is built
+// ONCE per chain step at the outer LLM dispatch entry. Every CacheStepContext
+// constructed inside the step inherits the same `Arc<DispatchDecision>` via
+// `with_dispatch_decision`, so downstream consumers (W2's target) can reach
+// the pre-resolved per-provider params + effective call order without
+// re-walking the resolver.
+//
+// Permissive-on-failure: if `DispatchDecision::build` errors (e.g. cascade
+// exhausted, all providers NotReady, DB read failure), we log and return
+// `None`. The CacheStepContext still reaches consumers with
+// `dispatch_decision = None`; legacy consumers fall back to the
+// `config.primary_model / fallback_model_{1,2}` chain so steps don't
+// hard-fail before W2 migrates the last site. `EVENT_DECISION_BUILD_FAILED`
+// is emitted by `build()` itself for the cascade-exhausted case.
+//
+// `test_capture` module below lets the W1b integration test observe the
+// Decision that the executor built without running a real LLM dispatch.
+/// Walker v3 W1b: build the step's DispatchDecision at the outer LLM
+/// dispatch entry. Exposed as `pub` so the W1b integration test can
+/// observe the Decision attachment without running a real LLM dispatch.
+/// Production call sites are the private `dispatch_llm` / `dispatch_ir_llm`
+/// paths within this module.
+pub async fn build_step_dispatch_decision(
+    ctx: &ChainDispatchContext,
+    slot: &str,
+) -> Option<Arc<DispatchDecision>> {
+    let conn = ctx.db_reader.lock().await;
+    // Phase 5 §E: pass build_id so the Decision builder can consult the
+    // per-build circuit breaker. The cache_base carries the canonical
+    // build_id established by the outer chain executor; when absent
+    // (unit tests, bring-up paths) the breaker gate is skipped — a
+    // no-op, preserving prior behavior.
+    let build_id_owned: Option<String> = ctx.cache_base.as_ref().map(|cb| cb.build_id.clone());
+    let build_id_ref: Option<&str> = build_id_owned.as_deref();
+    match DispatchDecision::build_with_build_id(slot, build_id_ref, &conn) {
+        Ok(decision) => {
+            let arc = Arc::new(decision);
+            test_capture::record_if_enabled(slot, &arc);
+            Some(arc)
+        }
+        Err(e) => {
+            tracing::warn!(
+                event = "decision_build_failed_in_executor",
+                slot = %slot,
+                error = ?e,
+                "W1b: dispatch decision build failed; falling through to legacy dispatch"
+            );
+            None
+        }
+    }
+}
+
+#[doc(hidden)]
+pub mod test_capture {
+    //! Walker v3 W1b test-observability hook.
+    //!
+    //! The W1b integration test needs to observe that the executor built
+    //! and attached a DispatchDecision at outer-step entry, WITHOUT
+    //! running a real LLM dispatch (which would require an OpenRouter
+    //! key / network + full chain_executor wiring through a 15k-line
+    //! file). Gating this hook behind `CAPTURE_ENABLED` keeps the
+    //! production dispatch path zero-cost (a single `AtomicBool::load`
+    //! per step, opt-in only when a test explicitly calls `enable`).
+    //!
+    //! Production callers never flip `CAPTURE_ENABLED`. If you find
+    //! yourself tempted to enable capture from non-test code: don't —
+    //! the capture store grows unbounded and leaks across build runs.
+    use super::DispatchDecision;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    static CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+    #[derive(Debug, Clone)]
+    pub struct CapturedDecision {
+        pub slot: String,
+        pub decision: Arc<DispatchDecision>,
+    }
+
+    fn slot_store() -> &'static Mutex<Vec<CapturedDecision>> {
+        static STORE: OnceLock<Mutex<Vec<CapturedDecision>>> = OnceLock::new();
+        STORE.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub(super) fn record_if_enabled(slot: &str, decision: &Arc<DispatchDecision>) {
+        if !CAPTURE_ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut g) = slot_store().lock() {
+            g.push(CapturedDecision {
+                slot: slot.to_string(),
+                decision: decision.clone(),
+            });
+        }
+    }
+
+    /// Enable capture for the current process. Idempotent. Tests that
+    /// want the capture path must call this at start. Safe to leave
+    /// enabled for the duration of a test binary.
+    pub fn enable() {
+        CAPTURE_ENABLED.store(true, Ordering::Relaxed);
+    }
+
+    /// Disable capture and clear the store. Called at test teardown
+    /// when capture is no longer needed.
+    pub fn disable() {
+        CAPTURE_ENABLED.store(false, Ordering::Relaxed);
+        clear();
+    }
+
+    /// Clear any captured decisions. Tests call this at start so state
+    /// doesn't leak across tests within the same process.
+    pub fn clear() {
+        if let Ok(mut g) = slot_store().lock() {
+            g.clear();
+        }
+    }
+
+    /// Return the list of captured decisions so the test can assert on
+    /// count + per-slot Decision content.
+    pub fn snapshot() -> Vec<CapturedDecision> {
+        slot_store().lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
 // ── Top-level dispatcher ────────────────────────────────────────────────────
 
 /// Dispatch a chain step to either LLM or mechanical execution.
@@ -186,7 +412,7 @@ pub async fn dispatch_step(
     resolved_input: &Value,
     system_prompt: &str,
     defaults: &ChainDefaults,
-    ctx: &StepContext,
+    ctx: &ChainDispatchContext,
 ) -> Result<Value> {
     if step.mechanical {
         let fn_name = step
@@ -194,7 +420,7 @@ pub async fn dispatch_step(
             .as_deref()
             .ok_or_else(|| anyhow!("Mechanical step '{}' missing rust_function", step.name))?;
         info!("[CHAIN] step '{}' → mechanical fn '{}'", step.name, fn_name);
-        dispatch_mechanical(fn_name, resolved_input, ctx)
+        dispatch_mechanical(fn_name, resolved_input, ctx).await
     } else {
         dispatch_llm(step, resolved_input, system_prompt, defaults, ctx).await
     }
@@ -203,7 +429,19 @@ pub async fn dispatch_step(
 // ── LLM dispatch ────────────────────────────────────────────────────────────
 
 /// Resolve the model string from step overrides, tier routing, or defaults.
-fn resolve_model(step: &ChainStep, defaults: &ChainDefaults, config: &LlmConfig) -> String {
+///
+/// Walker v3 W2b: priority-2 consults the attached `DispatchDecision`'s
+/// per-provider `model_list[OpenRouter][0]` when one is available; the
+/// provider-registry path drops to priority-3, and the legacy
+/// `match tier => primary_model / fallback_model_{1,2}` stays as the
+/// final fallback for Decision-less call sites (unit tests, bring-up
+/// paths). W3 deletes that legacy match when the struct fields go.
+fn resolve_model(
+    step: &ChainStep,
+    defaults: &ChainDefaults,
+    config: &LlmConfig,
+    dispatch_decision: Option<&Arc<DispatchDecision>>,
+) -> String {
     // Direct model override on step takes highest precedence
     if let Some(ref model) = step.model {
         return model.clone();
@@ -220,27 +458,39 @@ fn resolve_model(step: &ChainStep, defaults: &ChainDefaults, config: &LlmConfig)
         .as_deref()
         .unwrap_or(defaults.model_tier.as_str());
 
-    // Phase 3: consult provider registry tier routing (canonical source)
+    // Walker v3 W2b priority 2: the pre-built DispatchDecision is the
+    // canonical source when present. Built once at the outer dispatch
+    // entry (W1b) and threaded via step_ctx.dispatch_decision.
+    if let Some(model) = first_openrouter_model_from_decision(dispatch_decision) {
+        return model;
+    }
+
+    // Phase 3: consult provider registry tier routing (transitional
+    // fallback when no Decision is attached — e.g. unit tests / bring-up).
     if let Some(ref registry) = config.provider_registry {
         if let Ok(resolved) = registry.resolve_tier(tier, None, None, None) {
             return resolved.tier.model_id;
         }
-        warn!("[CHAIN] tier '{}' not in registry, falling back to legacy resolution", tier);
+        warn!(
+            "[CHAIN] tier '{}' not in registry, falling back to legacy resolution",
+            tier
+        );
     }
 
-    // Legacy fallback: aliases then hardcoded mapping
+    // W3c: legacy `config.primary_model` / `fallback_model_{1,2}` arms
+    // deleted. Aliases remain as an operator-level escape hatch; if
+    // neither the Decision, registry, nor an alias covers the tier we
+    // stamp `<unknown>` — the call will fail at dispatch time via
+    // `call_model_unified`'s RouteSkipped path (no model_list → skip).
     if let Some(model) = config.model_aliases.get(tier) {
         return model.clone();
     }
-    match tier {
-        "low" | "mid" => config.primary_model.clone(),
-        "high" => config.fallback_model_1.clone(),
-        "max" => config.fallback_model_2.clone(),
-        other => {
-            warn!("[CHAIN] unknown tier '{}', using primary_model", other);
-            config.primary_model.clone()
-        }
-    }
+    warn!(
+        "[CHAIN] walker-v3: tier '{}' had no Decision, no registry row, and no alias; \
+         returning '<unknown>' — dispatch will surface no-model-available",
+        tier,
+    );
+    "<unknown>".to_string()
 }
 
 /// Resolve temperature from step override or defaults.
@@ -257,30 +507,37 @@ async fn dispatch_llm(
     resolved_input: &Value,
     system_prompt: &str,
     defaults: &ChainDefaults,
-    ctx: &StepContext,
+    ctx: &ChainDispatchContext,
 ) -> Result<Value> {
     let temperature = resolve_temperature(step, defaults);
-    let resolved_model = resolve_model(step, defaults, &ctx.config);
-    let resolved_limit = resolve_context_limit(step, defaults, &ctx.config, &ctx.tier1);
+
+    // Walker v3 W1b: build the step's DispatchDecision ONCE at the outer
+    // LLM entry. Every CacheStepContext constructed below inherits the
+    // same Arc via `.with_dispatch_decision`. Permissive on failure —
+    // see `build_step_dispatch_decision` for the fallback policy.
+    // `slot` mirrors the tier used by cache-site `with_model_resolution`
+    // calls so the Decision is keyed to the same scope as the LLM call.
+    //
+    // W2b reorder: built BEFORE resolve_model so the resolver can read
+    // the Decision's OpenRouter model_list as the canonical source.
+    let slot = step
+        .model_tier
+        .clone()
+        .unwrap_or_else(|| defaults.model_tier.clone());
+    let dispatch_decision = build_step_dispatch_decision(ctx, &slot).await;
+
+    let resolved_model = resolve_model(step, defaults, &ctx.config, dispatch_decision.as_ref());
+    let _resolved_limit = resolve_context_limit(step, defaults, &ctx.config, &ctx.tier1);
     let max_tokens: usize = ctx.tier1.ir_max_tokens;
 
-    // Apply model override: if the resolved model differs from the config's
-    // primary model, create a modified config so call_model() uses it.
-    // Uses clone_with_model_override to pin ALL model slots (primary +
-    // fallback_1 + fallback_2) to the resolved model, preventing the
-    // cascade from escaping to a different provider's models.
-    let config_ref;
-    let overridden_config;
-    if resolved_model != ctx.config.primary_model
-        || resolved_limit != ctx.config.primary_context_limit
-    {
-        let mut cfg = ctx.config.clone_with_model_override(&resolved_model);
-        cfg.primary_context_limit = resolved_limit;
-        overridden_config = cfg;
-        config_ref = &overridden_config;
-    } else {
-        config_ref = &ctx.config;
-    }
+    // W3c: the deleted `LlmConfig.primary_model` + `primary_context_limit`
+    // fields used to carry the resolved model/limit down into
+    // `call_model` via `clone_with_model_override`. The Decision attached
+    // to the cache StepContext is now the sole source — `call_model_unified`
+    // reads `model_list[0]` / `context_limit` from it directly, so the
+    // override clone is unnecessary. `resolved_model` is retained for
+    // tracing / cache-row model_resolution below.
+    let config_ref = &ctx.config;
 
     // Build user prompt from resolved input
     let user_prompt =
@@ -329,6 +586,10 @@ async fn dispatch_llm(
             if let Some(bus) = &cb.bus {
                 c = c.with_bus(bus.clone());
             }
+            // Walker v3 W1b: inherit the step's outer Decision.
+            if let Some(d) = &dispatch_decision {
+                c = c.with_dispatch_decision(d.clone());
+            }
             c
         });
         let response = llm::call_model_structured_and_ctx(
@@ -345,12 +606,27 @@ async fn dispatch_llm(
         match llm::extract_json(&response) {
             Ok(json) => return Ok(json),
             Err(e) => {
-                info!("[CHAIN] step '{}' parse failed, on_parse_error={:?}", step.name, step.on_parse_error);
+                invalidate_cached_llm_response(
+                    struct_ctx.as_ref(),
+                    system_prompt,
+                    &user_prompt,
+                    "structured_primary_json_parse_failed",
+                );
+                info!(
+                    "[CHAIN] step '{}' parse failed, on_parse_error={:?}",
+                    step.name, step.on_parse_error
+                );
                 if step.on_parse_error.as_deref() == Some("heal") {
                     info!("[CHAIN] step '{}' → parse failed ({}), attempting self-healing (1 max attempts)", step.name, e);
-                    let heal_instruction = step.heal_instruction.as_deref().unwrap_or("Fix the JSON.");
+                    let heal_instruction =
+                        step.heal_instruction.as_deref().unwrap_or("Fix the JSON.");
                     let heal_sys = format!("{}\n\n{}", system_prompt, heal_instruction);
-                    let heal_user = format!("Target Schema:\n{}\n\nMalformed Response:\n{}\n\nError:\n{}", serde_json::to_string_pretty(schema).unwrap_or_default(), response, e);
+                    let heal_user = format!(
+                        "Target Schema:\n{}\n\nMalformed Response:\n{}\n\nError:\n{}",
+                        serde_json::to_string_pretty(schema).unwrap_or_default(),
+                        response,
+                        e
+                    );
                     // Phase 12: heal path inherits the cache plumbing
                     // but with a different step_name so it gets its
                     // own cache row.
@@ -376,6 +652,10 @@ async fn dispatch_llm(
                         if let Some(bus) = &cb.bus {
                             c = c.with_bus(bus.clone());
                         }
+                        // Walker v3 W1b: inherit the step's outer Decision.
+                        if let Some(d) = &dispatch_decision {
+                            c = c.with_dispatch_decision(d.clone());
+                        }
                         c
                     });
                     let retry_resp = llm::call_model_and_ctx(
@@ -387,9 +667,28 @@ async fn dispatch_llm(
                         max_tokens,
                     )
                     .await?;
-                    return llm::extract_json(&retry_resp).map_err(|he| anyhow!("Step '{}': JSON parse failed after self-healing: {}", step.name, he));
+                    return match llm::extract_json(&retry_resp) {
+                        Ok(json) => Ok(json),
+                        Err(he) => {
+                            invalidate_cached_llm_response(
+                                heal_ctx.as_ref(),
+                                &heal_sys,
+                                &heal_user,
+                                "structured_heal_json_parse_failed",
+                            );
+                            Err(anyhow!(
+                                "Step '{}': JSON parse failed after self-healing: {}",
+                                step.name,
+                                he
+                            ))
+                        }
+                    };
                 } else {
-                    return Err(anyhow!("Step '{}': structured output JSON parse failed: {}", step.name, e));
+                    return Err(anyhow!(
+                        "Step '{}': structured output JSON parse failed: {}",
+                        step.name,
+                        e
+                    ));
                 }
             }
         }
@@ -400,10 +699,10 @@ async fn dispatch_llm(
     // executor always does). This turns the legacy v2 chain path into
     // a cache-reachable path.
     let dispatch_cache_ctx = ctx.cache_base.as_ref().map(|cb| {
-        let prompt_hash = cb.get_or_compute_prompt_hash(
-            step.instruction.as_deref().unwrap_or(&step.name),
-            || system_prompt.to_string(),
-        );
+        let prompt_hash = cb
+            .get_or_compute_prompt_hash(step.instruction.as_deref().unwrap_or(&step.name), || {
+                system_prompt.to_string()
+            });
         let mut c = CacheStepContext::new(
             ctx.slug.clone(),
             cb.build_id.clone(),
@@ -423,6 +722,10 @@ async fn dispatch_llm(
         }
         if let Some(bus) = &cb.bus {
             c = c.with_bus(bus.clone());
+        }
+        // Walker v3 W1b: inherit the step's outer Decision.
+        if let Some(d) = &dispatch_decision {
+            c = c.with_dispatch_decision(d.clone());
         }
         c
     });
@@ -458,12 +761,24 @@ async fn dispatch_llm(
             Ok(json)
         }
         Err(_first_err) => {
-            info!("[CHAIN] step '{}' parse failed, on_parse_error={:?}", step.name, step.on_parse_error);
+            invalidate_cached_llm_response(
+                dispatch_cache_ctx.as_ref(),
+                system_prompt,
+                &user_prompt,
+                "primary_json_parse_failed",
+            );
+            info!(
+                "[CHAIN] step '{}' parse failed, on_parse_error={:?}",
+                step.name, step.on_parse_error
+            );
             if step.on_parse_error.as_deref() == Some("heal") {
                 info!("[CHAIN] step '{}' → parse failed ({}), attempting self-healing (1 max attempts)", step.name, _first_err);
                 let heal_instruction = step.heal_instruction.as_deref().unwrap_or("Fix the JSON.");
                 let heal_sys = format!("{}\n\n{}", system_prompt, heal_instruction);
-                let heal_user = format!("Malformed Response:\n{}\n\nError:\n{}", response, _first_err);
+                let heal_user = format!(
+                    "Malformed Response:\n{}\n\nError:\n{}",
+                    response, _first_err
+                );
                 let heal_ctx = ctx.cache_base.as_ref().map(|cb| {
                     let prompt_hash = compute_prompt_hash(&heal_sys);
                     let mut c = CacheStepContext::new(
@@ -486,6 +801,10 @@ async fn dispatch_llm(
                     if let Some(bus) = &cb.bus {
                         c = c.with_bus(bus.clone());
                     }
+                    // Walker v3 W1b: inherit the step's outer Decision.
+                    if let Some(d) = &dispatch_decision {
+                        c = c.with_dispatch_decision(d.clone());
+                    }
                     c
                 });
                 let retry_resp = llm::call_model_and_ctx(
@@ -497,7 +816,22 @@ async fn dispatch_llm(
                     max_tokens,
                 )
                 .await?;
-                return llm::extract_json(&retry_resp).map_err(|he| anyhow!("Step '{}': JSON parse failed after self-healing: {}", step.name, he));
+                return match llm::extract_json(&retry_resp) {
+                    Ok(json) => Ok(json),
+                    Err(he) => {
+                        invalidate_cached_llm_response(
+                            heal_ctx.as_ref(),
+                            &heal_sys,
+                            &heal_user,
+                            "heal_json_parse_failed",
+                        );
+                        Err(anyhow!(
+                            "Step '{}': JSON parse failed after self-healing: {}",
+                            step.name,
+                            he
+                        ))
+                    }
+                };
             } else {
                 // JSON-retry guarantee: retry at temperature 0.1
                 info!(
@@ -531,6 +865,10 @@ async fn dispatch_llm(
                     if let Some(bus) = &cb.bus {
                         c = c.with_bus(bus.clone());
                     }
+                    // Walker v3 W1b: inherit the step's outer Decision.
+                    if let Some(d) = &dispatch_decision {
+                        c = c.with_dispatch_decision(d.clone());
+                    }
                     c
                 });
                 let retry_response = llm::call_model_and_ctx(
@@ -543,13 +881,22 @@ async fn dispatch_llm(
                 )
                 .await?;
 
-                llm::extract_json(&retry_response).map_err(|e| {
-                    anyhow!(
-                        "Step '{}': JSON parse failed after retry at temp 0.1: {}",
-                        step.name,
-                        e
-                    )
-                })
+                match llm::extract_json(&retry_response) {
+                    Ok(json) => Ok(json),
+                    Err(e) => {
+                        invalidate_cached_llm_response(
+                            retry_ctx.as_ref(),
+                            system_prompt,
+                            &user_prompt,
+                            "retry_json_parse_failed",
+                        );
+                        Err(anyhow!(
+                            "Step '{}': JSON parse failed after retry at temp 0.1: {}",
+                            step.name,
+                            e
+                        ))
+                    }
+                }
             }
         }
     }
@@ -563,20 +910,107 @@ fn short_model_name(model: &str) -> &str {
 // ── Mechanical dispatch ─────────────────────────────────────────────────────
 
 /// Known mechanical function names for the v1 registry.
+///
+/// Post-build accretion v5 Phase 5 adds three v5 targets used by
+/// the starter chains that back role_bound dispatches (cascade handlers, the
+/// meta-layer oracle, etc.). These are invoked from
+/// `chain_executor::execute_chain_for_target` via `dispatch_step` /
+/// `dispatch_mechanical`.
+///
+/// Post-build accretion v5 Phase 6b adds `call_starter_chain` — a sub-chain
+/// invocation primitive. Phase 7 consumers (debate_steward, meta-layer
+/// oracle, synthesizer) will author chains that call the library chains
+/// `starter-evidence-tester` and `starter-reconciler` through this primitive.
 const MECHANICAL_FUNCTIONS: &[&str] = &[
     "extract_import_graph",
     "extract_mechanical_metadata",
     "cluster_by_imports",
     "cluster_by_entity_overlap",
+    // Post-build accretion v5 Phase 5 — role_bound chain primitives.
+    "emit_cascade_handler_invoked",
+    "queue_re_distill_for_target",
+    "log_and_complete",
+    // Post-build accretion v5 Phase 6b — sub-chain invocation primitive.
+    "call_starter_chain",
+    // Post-build accretion v5 Phase 7a — debate_steward chain primitives.
+    "emit_debate_steward_invoked",
+    "load_annotation_and_target",
+    "append_annotation_to_debate_node",
+    // Post-build accretion v5 Phase 7b — meta_layer_oracle upgrade + synthesizer chain.
+    // v5 audit P4: `dispatch_synthesizer` wrapper removed — the oracle
+    // YAML now calls starter-synthesizer via call_starter_chain with
+    // $ref threading directly. The starter runner resolves $refs inside
+    // step.input as of P4, so the wrapper is no longer needed.
+    "emit_oracle_invoked",
+    "decide_crystallization",
+    "oracle_finalize",
+    "emit_synthesizer_invoked",
+    "load_substrate_nodes",
+    "create_meta_layer_node",
+    // Post-build accretion v5 Phase 7c — gap_dispatcher chain primitives.
+    "emit_dispatcher_invoked",
+    "load_gap_context",
+    "materialize_gap_node",
+    // Post-build accretion v5 Phase 7d — utility chain primitives (judge,
+    // authorize_question, accretion_handler, sweep). Phase 7d ships the
+    // four genesis-bound utility roles as real chains (judge + accretion +
+    // sweep + authorize_question), not placeholders. The judge chain's LLM
+    // step reuses the generic LLM dispatch path; the mechanical primitives
+    // below back the non-LLM steps.
+    "emit_judge_invoked",
+    "emit_authorize_invoked",
+    "load_slug_purpose",
+    "emit_accretion_invoked",
+    "load_recent_annotations_for_slug",
+    "emit_accretion_written",
+    "emit_sweep_invoked",
+    "count_stale_failed_work_items",
+    "reindex_vocab_cache",
+    // Post-build accretion v5 Phase 9b-3 — sweep archive mechanicals.
+    "archive_stale_failed_work_items",
+    "retire_superseded_contributions_past_retention",
+    // Post-build accretion v5 Phase 9c-1 — starter-debate-collapse primitives.
+    // Close the Phase 8-3 `emit_debate_collapsed` dormant-emitter gap.
+    // The collapse chain dispatches on the `debate_collapse` annotation
+    // type (vocab entry ships with handler_chain_id=starter-debate-collapse).
+    "emit_debate_collapse_invoked",
+    "load_collapse_context",
+    "finalize_debate_node",
 ];
+
+/// Post-build accretion v5 Phase 6b: hard ceiling on sub-chain recursion.
+///
+/// `call_starter_chain` lets one chain invoke another by id. Without a depth
+/// guard a cyclic chain graph (chain_A calls chain_B which calls chain_A)
+/// would recurse indefinitely. The guard is checked *before* the nested
+/// `execute_chain_for_target` invocation and raises loudly when the
+/// current `sub_chain_depth` reaches this ceiling.
+///
+/// This is a constraint on CHAIN BEHAVIOR (recursion depth of the orchestrator),
+/// NOT a constraint on LLM output — `feedback_pillar37_no_hedging` specifically
+/// exempts such mechanical guards. 5 is deep enough for any realistic
+/// evidence-tester→reconciler→synthesizer nesting the Phase 7 consumers
+/// would author, and shallow enough to surface a cycle long before it eats
+/// the stack.
+pub const MAX_SUB_CHAIN_DEPTH: usize = 5;
 
 /// Dispatch a mechanical step to a named Rust function.
 ///
 /// For v1, the actual build.rs functions require signatures that don't match
-/// the generic `(input: &Value, ctx: &StepContext) -> Result<Value>` contract.
+/// the generic `(input: &Value, ctx: &ChainDispatchContext) -> Result<Value>` contract.
 /// The dispatch framework is established here; actual wiring happens in Phase 5
 /// when the chain executor replaces the hardcoded build pipeline.
-fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &StepContext) -> Result<Value> {
+///
+/// Phase 5 post-build-accretion v5: made `async` so the v5 role_bound primitives
+/// (emit_cascade_handler_invoked, queue_re_distill_for_target) can `.await` the
+/// writer mutex and perform a short SQLite INSERT without resorting to
+/// `block_in_place` tricks. Existing placeholder arms don't await and are
+/// unaffected.
+async fn dispatch_mechanical(
+    function_name: &str,
+    input: &Value,
+    ctx: &ChainDispatchContext,
+) -> Result<Value> {
     match function_name {
         "extract_import_graph" => {
             info!("[mechanical] extract_import_graph (placeholder)");
@@ -613,6 +1047,4389 @@ fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &StepContext) ->
                 "_status": "placeholder",
                 "input": input,
             }))
+        }
+        // ── Post-build accretion v5 Phase 5 role_bound primitives ───────────
+        //
+        // These functions back the starter chains invoked by the supervisor's
+        // role_bound dispatch arm. The input shape is free-form JSON; each
+        // primitive reads only the fields it needs and tolerates missing
+        // ones (work items built by the compiler don't set every field).
+        "emit_cascade_handler_invoked" => {
+            // Writes a `cascade_handler_invoked` observation event for
+            // chronicle traceability. Every cascade handler (role_bound)
+            // starter chain emits this at step 1 so the chronicle records
+            // that a handler actually fired for the triggering target.
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str());
+            let reason = input
+                .get("reason")
+                .and_then(|v| v.as_str());
+            // Preserve any additional metadata already carried by the step's
+            // input (work item id, step name, etc.) so downstream observers
+                    // have full context.
+            let mut metadata = serde_json::Map::new();
+            if let Some(obj) = input.as_object() {
+                for (k, v) in obj {
+                    if k != "target_node_id" && k != "target_id" && k != "reason" {
+                        metadata.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            if let Some(r) = reason {
+                metadata.insert("reason".to_string(), Value::String(r.to_string()));
+            }
+            let metadata_json = if metadata.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&Value::Object(metadata))?)
+            };
+
+            info!(
+                "[mechanical] emit_cascade_handler_invoked slug={} target={:?} reason={:?}",
+                ctx.slug, target_node_id, reason
+            );
+            // Short INSERT via the writer mutex. The async lock awaits the
+            // writer briefly — OK because chain runners are already async
+            // and no other await happens while the guard is held.
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "cascade_handler_invoked",
+                None,
+                None,
+                None,
+                None,
+                target_node_id,
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+            Ok(serde_json::json!({ "emitted": true, "event_id": event_id }))
+        }
+        "queue_re_distill_for_target" => {
+            // Creates a `re_distill` work item for the target node. Preserves
+            // the pre-v5 cascade-always-re-distills behavior under the v5
+            // role-binding model — used by starter-cascade-immediate-redistill
+            // (the backfill default for existing pyramids).
+            //
+            // Schema of dadbear_work_items follows the Phase 3 supervisor's
+            // compile path (see db::init_pyramid_db for column list).
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "queue_re_distill_for_target: input missing target_node_id / target_id field"
+                ))?
+                .to_string();
+            let layer: i64 = input
+                .get("layer")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(1);
+            let reason = input
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("cascade re-distill via starter chain")
+                .to_string();
+            info!(
+                "[mechanical] queue_re_distill_for_target slug={} target={} layer={} reason={}",
+                ctx.slug, target_node_id, layer, reason
+            );
+            // Phase 8 tail-2: propagate observation_event_ids from the
+            // triggering (role_bound) work item onto the queued
+            // re_distill. This is the routing breadcrumb the supervisor
+            // arm uses to resolve `annotated_node_id` metadata when it
+            // calls `execute_supersession(..., annotated_node_ids=Some)`.
+            // Pre-tail-2 this field was hard-coded to "[]", so the
+            // supervisor had no way to find the descendant annotation —
+            // the re-distill target (an ancestor) holds no annotations
+            // of its own and the prompt's cascade_annotations section
+            // was empty, producing no-op manifests for 14/15 annotation
+            // types. Carrying the event ids forward closes the routing
+            // gap the Phase 8 wanderer flagged.
+            let triggering_wi_id = input
+                .get("work_item_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let wi_id = format!("wi-{}", uuid::Uuid::new_v4());
+            let conn_guard = ctx.db_writer.lock().await;
+            let propagated_obs_ids: String = if let Some(trig_id) =
+                triggering_wi_id.as_deref()
+            {
+                let obs_ids: Option<String> = conn_guard
+                    .query_row(
+                        "SELECT observation_event_ids FROM dadbear_work_items WHERE id = ?1",
+                        rusqlite::params![trig_id],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                match obs_ids {
+                    Some(s) if !s.trim().is_empty() => s,
+                    _ => "[]".to_string(),
+                }
+            } else {
+                "[]".to_string()
+            };
+            let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let epoch_id = format!("epoch-chain-{}", uuid::Uuid::new_v4());
+            let batch_id = format!("batch-chain-{}", uuid::Uuid::new_v4());
+            let metadata = serde_json::json!({
+                "queued_by_chain": "starter-chain",
+                "reason": reason,
+                "triggering_work_item_id": triggering_wi_id,
+            });
+            conn_guard.execute(
+                "INSERT INTO dadbear_work_items
+                    (id, slug, batch_id, epoch_id, step_name, primitive,
+                     layer, target_id, system_prompt, user_prompt, model_tier,
+                     result_json, observation_event_ids, compiled_at,
+                     state, state_changed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                         ?12, ?13, ?14, ?15, ?16)",
+                rusqlite::params![
+                    wi_id,              // ?1  id
+                    ctx.slug,           // ?2  slug
+                    batch_id,           // ?3  batch_id
+                    epoch_id,           // ?4  epoch_id
+                    "cascade_re_distill", // ?5 step_name
+                    "re_distill",       // ?6  primitive
+                    layer,              // ?7  layer
+                    target_node_id,     // ?8  target_id
+                    "",                 // ?9  system_prompt
+                    "",                 // ?10 user_prompt
+                    "mid",              // ?11 model_tier
+                    metadata.to_string(), // ?12 result_json
+                    propagated_obs_ids, // ?13 observation_event_ids
+                    now,                // ?14 compiled_at
+                    "compiled",         // ?15 state
+                    now,                // ?16 state_changed_at
+                ],
+            ).map_err(|e| anyhow!(
+                "queue_re_distill_for_target: failed to insert work item: {}", e
+            ))?;
+            drop(conn_guard);
+            Ok(serde_json::json!({ "queued": true, "work_item_id": wi_id }))
+        }
+        "log_and_complete" => {
+            // MVP starter-chain no-op: log the step name + a small input
+            // summary and return input unchanged. Starter chains whose v6+
+            // LLM logic is pending land here so the work item still CASes
+            // to `applied` (proving the pipeline) without a silent drop.
+            //
+            // feedback_loud_deferrals compliance: this is a deliberate,
+            // documented no-op that surfaces in the log — not a silent stub.
+            let summary = match input {
+                Value::Object(o) => {
+                    let mut keys: Vec<&str> = o.keys().map(|k| k.as_str()).collect();
+                    keys.sort();
+                    format!("object keys=[{}]", keys.join(", "))
+                }
+                Value::Array(a) => format!("array len={}", a.len()),
+                Value::String(s) => format!("string len={}", s.len()),
+                Value::Null => "null".to_string(),
+                other => format!("scalar={}", other),
+            };
+            info!(
+                "[mechanical] log_and_complete slug={} input_summary={}",
+                ctx.slug, summary
+            );
+            Ok(input.clone())
+        }
+        // ── Post-build accretion v5 Phase 7a: debate_steward primitives ─────
+        //
+        // The three primitives below back `starter-debate-steward.yaml`, the
+        // chain dispatched when a `steel_man` / `red_team` annotation fires
+        // `annotation_reacted`. Each accepts the starter-runner threaded
+        // input shape (target_node_id / work_item_id / slug merged by the
+        // executor) and reads what it needs. Loud-raise on missing required
+        // fields per `feedback_loud_deferrals`.
+        "emit_debate_steward_invoked" => {
+            // Chronicle-only observability event. Writes one row into
+            // `dadbear_observation_events` naming the target + annotation.
+            //
+            // Passes the input object through to the output so later steps
+            // in `starter-debate-steward` keep seeing the work_item_id /
+            // target_id / annotation_id fields the supervisor stamped on
+            // the initial call. The chain executor's step-to-step threading
+            // only re-merges `target_node_id` + `slug`; every other field
+            // (work_item_id, annotation_id, annotation_type) must survive
+            // via output. Without this merge `load_annotation_and_target`
+            // would lose `work_item_id` after step 1 and fail the
+            // triggering-event backfill.
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str());
+            let annotation_id = input.get("annotation_id").and_then(|v| v.as_i64());
+            let annotation_type = input
+                .get("annotation_type")
+                .and_then(|v| v.as_str());
+            let mut meta = serde_json::Map::new();
+            if let Some(tid) = target_node_id {
+                meta.insert(
+                    "target_node_id".to_string(),
+                    Value::String(tid.to_string()),
+                );
+            }
+            if let Some(aid) = annotation_id {
+                meta.insert("annotation_id".to_string(), Value::from(aid));
+            }
+            if let Some(at) = annotation_type {
+                meta.insert(
+                    "annotation_type".to_string(),
+                    Value::String(at.to_string()),
+                );
+            }
+            let metadata_json = if meta.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&Value::Object(meta))?)
+            };
+            info!(
+                "[mechanical] emit_debate_steward_invoked slug={} target={:?} annotation_id={:?} annotation_type={:?}",
+                ctx.slug, target_node_id, annotation_id, annotation_type
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "debate_steward_invoked",
+                None,
+                None,
+                None,
+                None,
+                target_node_id,
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            Ok(Value::Object(out))
+        }
+        "load_annotation_and_target" => {
+            // Resolves the triggering observation-event metadata (the
+            // annotation_id + annotation_type), loads the matching
+            // `pyramid_annotations` row, and reads the target node's
+            // shape + payload. Returned as a single object that the next
+            // step (append_annotation_to_debate_node) threads on.
+            //
+            // `annotation_id` / `annotation_type` can be provided directly
+            // in the input envelope (future callers) OR derived by looking
+            // up the triggering observation event via the work_item's
+            // observation_event_ids column (today's path — the supervisor
+            // role_bound arm builds input from only work_item_id/step_name/
+            // target_id/layer, so metadata is recovered here).
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "load_annotation_and_target: missing target_node_id"
+                ))?
+                .to_string();
+
+            let mut annotation_id = input.get("annotation_id").and_then(|v| v.as_i64());
+            let mut annotation_type = input
+                .get("annotation_type")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            // Back-fill from the triggering observation event if the
+            // caller didn't inline annotation metadata.
+            if annotation_id.is_none() || annotation_type.is_none() {
+                let work_item_id = input
+                    .get("work_item_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                if let Some(wid) = work_item_id.as_deref() {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    // Pull observation_event_ids; parse [N,...]; read the
+                    // first event's metadata_json for annotation_* fields.
+                    let obs_ids_json: Option<String> = conn_guard
+                        .query_row(
+                            "SELECT observation_event_ids FROM dadbear_work_items WHERE id = ?1",
+                            rusqlite::params![wid],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    if let Some(ids_json) = obs_ids_json {
+                        if let Ok(ids) = serde_json::from_str::<Vec<i64>>(&ids_json) {
+                            if let Some(eid) = ids.first() {
+                                let meta: Option<String> = conn_guard
+                                    .query_row(
+                                        "SELECT metadata_json FROM dadbear_observation_events WHERE id = ?1",
+                                        rusqlite::params![eid],
+                                        |row| row.get(0),
+                                    )
+                                    .ok()
+                                    .flatten();
+                                if let Some(m) = meta {
+                                    if let Ok(v) = serde_json::from_str::<Value>(&m) {
+                                        if annotation_id.is_none() {
+                                            annotation_id =
+                                                v.get("annotation_id").and_then(|x| x.as_i64());
+                                        }
+                                        if annotation_type.is_none() {
+                                            annotation_type = v
+                                                .get("annotation_type")
+                                                .and_then(|x| x.as_str())
+                                                .map(String::from);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    drop(conn_guard);
+                }
+            }
+
+            // Load the annotation body (if we have an id) and the target
+            // node's shape view.
+            let conn_guard = ctx.db_reader.lock().await;
+
+            let annotation_obj: Value = if let Some(aid) = annotation_id {
+                let row: Option<(i64, String, String, String, Option<String>, String, String, String)> = conn_guard
+                    .query_row(
+                        "SELECT id, slug, node_id, annotation_type, question_context, author,
+                                content, created_at
+                         FROM pyramid_annotations WHERE id = ?1",
+                        rusqlite::params![aid],
+                        |r| Ok((
+                            r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?,
+                            r.get(5)?, r.get(6)?, r.get(7)?,
+                        )),
+                    )
+                    .ok();
+                if let Some((id, slug, node_id, aty, qctx, author, content, created_at)) = row {
+                    // Keep annotation_type from the DB row canonical; the
+                    // metadata-derived value was only a hint.
+                    if annotation_type.as_deref() != Some(aty.as_str()) {
+                        annotation_type = Some(aty.clone());
+                    }
+                    serde_json::json!({
+                        "id": id,
+                        "slug": slug,
+                        "node_id": node_id,
+                        "annotation_type": aty,
+                        "question_context": qctx,
+                        "author": author,
+                        "content": content,
+                        "created_at": created_at,
+                    })
+                } else {
+                    Value::Null
+                }
+            } else {
+                Value::Null
+            };
+
+            // Target node: (depth, headline, distilled) + shape view.
+            let node_row: Option<(i64, String, String)> = conn_guard
+                .query_row(
+                    "SELECT depth, headline, distilled FROM pyramid_nodes
+                     WHERE slug = ?1 AND id = ?2",
+                    rusqlite::params![ctx.slug, target_node_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok();
+            let shape_view = super::db::get_node_shape(&conn_guard, &ctx.slug, &target_node_id)?;
+            drop(conn_guard);
+
+            let target_obj = if let Some((depth, headline, distilled)) = node_row {
+                let current_shape = shape_view
+                    .as_ref()
+                    .map(|v| v.shape.as_str().to_string())
+                    .unwrap_or_else(|| "scaffolding".to_string());
+                let current_payload = shape_view
+                    .as_ref()
+                    .and_then(|v| v.payload.as_ref())
+                    .and_then(|p| serde_json::to_value(p).ok())
+                    .unwrap_or(Value::Null);
+                serde_json::json!({
+                    "id": target_node_id,
+                    "depth": depth,
+                    "headline": headline,
+                    "distilled": distilled,
+                    "current_shape": current_shape,
+                    "current_payload": current_payload,
+                })
+            } else {
+                Value::Null
+            };
+
+            info!(
+                "[mechanical] load_annotation_and_target slug={} target={} annotation_id={:?} annotation_type={:?}",
+                ctx.slug, target_node_id, annotation_id, annotation_type,
+            );
+
+            // Preserve input fields so threading keeps work_item_id / layer
+            // / step_name alive for any downstream step that wants them.
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert(
+                "target_node_id".to_string(),
+                Value::String(target_node_id.clone()),
+            );
+            out.insert(
+                "annotation_id".to_string(),
+                annotation_id.map(Value::from).unwrap_or(Value::Null),
+            );
+            out.insert(
+                "annotation_type".to_string(),
+                annotation_type
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+            out.insert("annotation".to_string(), annotation_obj);
+            out.insert("target_node".to_string(), target_obj);
+            Ok(Value::Object(out))
+        }
+        "append_annotation_to_debate_node" => {
+            // Core write. Given the target node + a steel_man / red_team
+            // annotation, either:
+            //   (a) Upgrade a Scaffolding node to Debate, seeding the first
+            //       position (steel_man) or first red_team (red_team).
+            //   (b) Append to an existing Debate's positions[] /
+            //       red_teams[] (idempotent — the same annotation_id is
+            //       never added twice).
+            // Emits `debate_spawned` on the Scaffolding→Debate upgrade.
+            //
+            // The debate_role mapping (steel_man → position, red_team →
+            // red_team) is hardcoded in this primitive today because the
+            // vocabulary registry doesn't carry a `debate_role` field yet.
+            // Phase 7b+ should lift this to a vocab attribute so new
+            // debate-mode annotation types can be published without a
+            // code deploy (feedback_generalize_not_enumerate).
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "append_annotation_to_debate_node: missing target_node_id"
+                ))?
+                .to_string();
+            // Inputs may come as threaded context from load_annotation_and_target,
+            // or may be set directly by callers.
+            let annotation_id: Option<i64> = input.get("annotation_id").and_then(|v| v.as_i64());
+            let annotation_type: Option<String> = input
+                .get("annotation_type")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let annotation_obj = input.get("annotation").cloned().unwrap_or(Value::Null);
+
+            // No annotation context → idempotent no-op. This path is hit
+            // when the work item was compiled from a `debate_spawned`
+            // observation event (which carries no annotation), keeping
+            // the Phase 3 mapping stable while avoiding infinite
+            // re-spawn: the second pass finds the target already Debate
+            // AND no annotation to append, returns "no_op".
+            if annotation_id.is_none() {
+                info!(
+                    "[mechanical] append_annotation_to_debate_node slug={} target={} → no_op (no annotation_id in input — likely debate_spawned retrigger)",
+                    ctx.slug, target_node_id
+                );
+                return Ok(serde_json::json!({
+                    "action": "no_op",
+                    "reason": "no annotation_id in input",
+                }));
+            }
+            let annotation_id = annotation_id.unwrap();
+
+            // Pull annotation content + author, preferring the threaded
+            // `annotation` object from load_annotation_and_target; fall back
+            // to a DB read when absent.
+            //
+            // Verifier fix (Phase 7a): a missing annotation row was previously
+            // papered over with `unwrap_or_default()` → empty content/author.
+            // That's a silent deferral per feedback_loud_deferrals — the
+            // caller only saw the downstream "unsupported annotation_type ''"
+            // error without any pointer to the root cause (deleted / bad
+            // annotation_id). Loud-raise here so the operator sees the real
+            // issue.
+            let ann_content: String;
+            let ann_author: String;
+            let mut annotation_type_from_db: Option<String> = None;
+            {
+                let threaded_content = annotation_obj
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let threaded_author = annotation_obj
+                    .get("author")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                if let (Some(c), Some(a)) = (threaded_content, threaded_author) {
+                    ann_content = c;
+                    ann_author = a;
+                } else {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let row: Option<(String, String, String)> = conn_guard
+                        .query_row(
+                            "SELECT content, author, annotation_type FROM pyramid_annotations WHERE id = ?1",
+                            rusqlite::params![annotation_id],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        )
+                        .ok();
+                    drop(conn_guard);
+                    match row {
+                        Some((c, a, aty)) => {
+                            ann_content = c;
+                            ann_author = a;
+                            annotation_type_from_db = Some(aty);
+                        }
+                        None => {
+                            return Err(anyhow!(
+                                "append_annotation_to_debate_node: annotation_id={} not \
+                                 found in pyramid_annotations — stale event or deleted row. \
+                                 Target '{}' will not be mutated.",
+                                annotation_id,
+                                target_node_id,
+                            ));
+                        }
+                    }
+                }
+            };
+
+            // Resolve annotation_type: prefer threaded input, otherwise the
+            // DB-row capture above, otherwise a final direct lookup. Loud
+            // raise if all three paths yield None (bad id) or an empty string.
+            let annotation_type = match annotation_type
+                .or(annotation_type_from_db)
+            {
+                Some(t) if !t.is_empty() => t,
+                _ => {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let row: Option<String> = conn_guard
+                        .query_row(
+                            "SELECT annotation_type FROM pyramid_annotations WHERE id = ?1",
+                            rusqlite::params![annotation_id],
+                            |r| r.get(0),
+                        )
+                        .ok();
+                    drop(conn_guard);
+                    match row {
+                        Some(t) if !t.is_empty() => t,
+                        _ => {
+                            return Err(anyhow!(
+                                "append_annotation_to_debate_node: annotation_id={} has no \
+                                 annotation_type (row missing or empty). Target '{}' will \
+                                 not be mutated.",
+                                annotation_id,
+                                target_node_id,
+                            ));
+                        }
+                    }
+                }
+            };
+
+            // Hardcoded debate-role mapping (future: vocab-driven).
+            let is_steel_man = annotation_type == "steel_man";
+            let is_red_team = annotation_type == "red_team";
+            if !is_steel_man && !is_red_team {
+                return Err(anyhow!(
+                    "append_annotation_to_debate_node: unsupported annotation_type '{}' — \
+                     only steel_man / red_team carry a debate_role today. Publish a vocab \
+                     entry with a debate_role field (Phase 7b+) to extend.",
+                    annotation_type
+                ));
+            }
+
+            // Read current shape to decide create vs append. We use the
+            // writer mutex for the whole transition so concurrent
+            // annotations on the same target serialize.
+            let conn_guard = ctx.db_writer.lock().await;
+            let shape_view =
+                super::db::get_node_shape(&conn_guard, &ctx.slug, &target_node_id)?;
+            let current_shape = shape_view
+                .as_ref()
+                .map(|v| v.shape.clone())
+                .unwrap_or_else(NodeShape::scaffolding);
+
+            // Phase 9c-2-3: post-collapse append-race guard.
+            //
+            // finalize_debate_node collapses a Debate → Scaffolding and
+            // NULLs the shape_payload_json. Without this guard, an in-flight
+            // steel_man / red_team annotation arriving moments after the
+            // collapse would take the Scaffolding-branch below and
+            // RESURRECT the debate under a fresh DebateTopic — the lock
+            // prevents DB corruption but semantic ordering is wrong.
+            //
+            // Design: query the chronicle for the most recent
+            // `debate_collapsed` observation event on this (slug, node_id).
+            // If it fires within the operator-editable cooldown window
+            // (SchedulerConfig.collapse_cooldown_secs), loud-raise with
+            // the collapse timestamp + reason. Cooldown=0 disables the
+            // guard (deliberate operator choice).
+            //
+            // Runs only when current_shape is Scaffolding — an active
+            // Debate doesn't need the guard (collapse moved the shape
+            // away from Debate; if we're looking at Debate now, either no
+            // collapse happened or a post-collapse re-open is already
+            // complete).
+            if current_shape.is_scaffolding() {
+                let cooldown_secs = super::pyramid_scheduler::load_config(&conn_guard)
+                    .collapse_cooldown_secs;
+                if cooldown_secs > 0 {
+                    // Most recent debate_collapsed for this (slug, node_id).
+                    // `detected_at` is a SQLite `datetime('now')` string
+                    // (UTC, 1-second resolution). We compute age via
+                    // `strftime('%s','now') - strftime('%s', detected_at)`
+                    // which is seconds apart.
+                    let recent: Option<(i64, String, String)> = conn_guard
+                        .query_row(
+                            "SELECT id, detected_at, COALESCE(metadata_json, '{}')
+                               FROM dadbear_observation_events
+                              WHERE slug = ?1
+                                AND event_type = 'debate_collapsed'
+                                AND target_node_id = ?2
+                              ORDER BY id DESC
+                              LIMIT 1",
+                            rusqlite::params![ctx.slug, target_node_id],
+                            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+                        )
+                        .optional()?;
+                    if let Some((collapse_event_id, detected_at, metadata)) = recent {
+                        // Phase 9c-3-3: check for a debate_reopened event
+                        // AFTER the latest debate_collapsed on this node.
+                        // If present, the cooldown is bypassed — the
+                        // operator has signalled that the collapse should
+                        // not block further annotations. Strict `id >`
+                        // comparison rules out the reopened-then-collapsed
+                        // sequence (new collapse re-engages the cooldown;
+                        // operator can re-open again if legitimate).
+                        let reopened_since: Option<i64> = conn_guard
+                            .query_row(
+                                "SELECT id
+                                   FROM dadbear_observation_events
+                                  WHERE slug = ?1
+                                    AND event_type = 'debate_reopened'
+                                    AND target_node_id = ?2
+                                    AND id > ?3
+                                  ORDER BY id DESC
+                                  LIMIT 1",
+                                rusqlite::params![ctx.slug, target_node_id, collapse_event_id],
+                                |r| r.get::<_, i64>(0),
+                            )
+                            .optional()?;
+                        if reopened_since.is_some() {
+                            // Bypass: operator re-opened the debate after
+                            // the latest collapse. Proceed into the
+                            // scaffolding create-Debate branch below as
+                            // if no collapse happened.
+                            tracing::info!(
+                                slug = %ctx.slug,
+                                target_node_id = %target_node_id,
+                                collapse_event_id = collapse_event_id,
+                                reopen_event_id = reopened_since.unwrap(),
+                                "append_annotation_to_debate_node: post-collapse cooldown bypassed \
+                                 by debate_reopened event (Phase 9c-3-3)"
+                            );
+                        } else {
+                            let age_secs: i64 = conn_guard
+                                .query_row(
+                                    "SELECT CAST(strftime('%s', 'now') AS INTEGER)
+                                            - CAST(strftime('%s', ?1) AS INTEGER)",
+                                    rusqlite::params![detected_at],
+                                    |r| r.get::<_, i64>(0),
+                                )
+                                .unwrap_or(i64::MAX);
+                            if age_secs >= 0 && (age_secs as u64) < cooldown_secs {
+                                // Pull reason from the event's metadata_json
+                                // for the error message; default to "unknown"
+                                // if the blob is malformed.
+                                let reason = serde_json::from_str::<serde_json::Value>(&metadata)
+                                    .ok()
+                                    .and_then(|v| v.get("reason").cloned())
+                                    .and_then(|v| v.as_str().map(String::from))
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                drop(conn_guard);
+                                return Err(anyhow!(
+                                    "append_annotation_to_debate_node: cannot append \
+                                     {annotation_type} annotation to scaffolding node '{}' — \
+                                     debate was collapsed {age_secs}s ago (reason: {reason}) \
+                                     within the post-collapse cooldown window \
+                                     ({cooldown_secs}s). To re-open this debate, operator \
+                                     must POST /pyramid/<slug>/debates/<node_id>/reopen \
+                                     (Phase 9c-3-3) OR wait for the cooldown to elapse \
+                                     OR supersede SchedulerConfig.collapse_cooldown_secs. \
+                                     Feedback: a new annotation during the cooldown would \
+                                     resurrect the just-collapsed debate, inverting \
+                                     finalize_debate_node's semantic \
+                                     (feedback_loud_deferrals + 9c-1 verifier flag).",
+                                    target_node_id
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    // 9c-2 verifier Target 9: cooldown=0 fires on EVERY append
+                    // in the scaffolding branch — that's log-spam. Once per
+                    // process is enough to surface the disabled state per
+                    // feedback_loud_deferrals (loud enough to see, quiet
+                    // enough not to flood).
+                    static COOLDOWN_DISABLED_WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !COOLDOWN_DISABLED_WARNED
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        tracing::warn!(
+                            slug = %ctx.slug,
+                            target_node_id = %target_node_id,
+                            "append_annotation_to_debate_node: collapse_cooldown_secs=0 — \
+                             post-collapse append-race guard is DISABLED by operator config; \
+                             a steel_man/red_team annotation on a just-collapsed node will \
+                             resurrect the debate. This warning fires once per process \
+                             lifetime."
+                        );
+                    }
+                }
+            }
+
+            let position_label_for_steel_man = format!("annotation#{annotation_id}");
+            let red_team_from_position = "main";
+
+            let (action, updated_debate, shape_was_upgraded) = if current_shape.is_scaffolding() {
+                // Create fresh Debate.
+                let (positions, action_label) = if is_steel_man {
+                    // v5 audit P6: record the annotation id under the
+                    // dedicated `source_annotation_ids` channel. The
+                    // position-LABEL also carries `annotation#{id}` today
+                    // because a steel-manning position from an external
+                    // author has no named stance — that's a separate
+                    // labeling concern. `evidence_anchors` stays empty:
+                    // genuine node-id refs only.
+                    let annotation_token = format!("annotation#{annotation_id}");
+                    (
+                        vec![DebatePosition {
+                            label: position_label_for_steel_man.clone(),
+                            steel_manning: ann_content.clone(),
+                            red_teams: vec![],
+                            evidence_anchors: vec![],
+                            source_annotation_ids: vec![annotation_token],
+                        }],
+                        "created_debate",
+                    )
+                } else {
+                    // Red team without any existing position: seed an
+                    // empty "main" position carrying the red_team.
+                    // v5 audit P6: `annotation#{id}` goes on
+                    // `source_annotation_ids` for idempotency dedup;
+                    // `evidence_anchors` is reserved for genuine node-id
+                    // refs (empty on first seed).
+                    let annotation_token = format!("annotation#{annotation_id}");
+                    (
+                        vec![DebatePosition {
+                            label: red_team_from_position.to_string(),
+                            steel_manning: String::new(),
+                            red_teams: vec![RedTeamEntry {
+                                from_position: red_team_from_position.to_string(),
+                                argument: ann_content.clone(),
+                                evidence_anchors: vec![],
+                                source_annotation_ids: vec![annotation_token],
+                            }],
+                            evidence_anchors: vec![],
+                            source_annotation_ids: vec![],
+                        }],
+                        "created_debate",
+                    )
+                };
+                let concern_line = input
+                    .get("target_node")
+                    .and_then(|t| t.get("headline"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| {
+                        format!("Debate on node {}", target_node_id)
+                    });
+                let debate = DebateTopic {
+                    concern: concern_line,
+                    positions,
+                    cross_refs: vec![],
+                    vote_lean: None,
+                };
+                (action_label, debate, true)
+            } else if current_shape.as_str() == NODE_SHAPE_DEBATE {
+                // Mutate existing debate payload. Idempotent — we don't
+                // append if the annotation's author already appears for
+                // the same label.
+                let mut debate = match shape_view.unwrap().payload {
+                    Some(super::types::ShapePayload::Debate(d)) => d,
+                    other => {
+                        return Err(anyhow!(
+                            "append_annotation_to_debate_node: target '{}' is shape 'debate' but \
+                             payload does not deserialize as DebateTopic (got {:?})",
+                            target_node_id,
+                            other.is_some()
+                        ));
+                    }
+                };
+                let action_label = if is_steel_man {
+                    let label = position_label_for_steel_man.clone();
+                    let annotation_token = format!("annotation#{annotation_id}");
+                    // v5 audit P6: idempotency check widened to match the
+                    // new field (catch replays regardless of which side of
+                    // the split wrote the existing row, for forward/back
+                    // compat during rollover).
+                    let already = debate.positions.iter().any(|p| {
+                        p.label == label
+                            || (p.steel_manning == ann_content && !ann_content.is_empty())
+                            || p.source_annotation_ids
+                                .iter()
+                                .any(|a| a == &annotation_token)
+                    });
+                    if !already {
+                        debate.positions.push(DebatePosition {
+                            label,
+                            steel_manning: ann_content.clone(),
+                            red_teams: vec![],
+                            evidence_anchors: vec![],
+                            source_annotation_ids: vec![annotation_token],
+                        });
+                    }
+                    if already { "no_op" } else { "appended_position" }
+                } else {
+                    // red_team → append to the first (or "main") position's
+                    // red_teams[]. If none exist yet, seed one.
+                    //
+                    // Verifier fix (Phase 7a): `from_position` is a POSITION
+                    // LABEL per the schema (see the round-trip test at
+                    // `db::tests::parse_shape_payload_round_trips_populated_debate_with_red_teams_and_votes`
+                    // — "Pro" red-teams "Con", "Con" red-teams "Pro"). An
+                    // external (annotation-sourced) red_team has no opposing
+                    // position to attribute to, so we stamp the LABEL of the
+                    // position being red-teamed. This matches the
+                    // Scaffolding→Debate seed path (line below, `red_team_from_position = "main"`),
+                    // keeps the schema semantics consistent, and avoids
+                    // leaking the author's name into a position-label slot.
+                    if debate.positions.is_empty() {
+                        debate.positions.push(DebatePosition {
+                            label: red_team_from_position.to_string(),
+                            steel_manning: String::new(),
+                            red_teams: vec![],
+                            evidence_anchors: vec![],
+                            source_annotation_ids: vec![],
+                        });
+                    }
+                    let pos = debate.positions.first_mut().unwrap();
+                    let from_position_label = pos.label.clone();
+                    // v5 audit P6: idempotency now keyed on
+                    // `source_annotation_ids` (not `evidence_anchors` —
+                    // that field is for genuine node-id refs). Legacy
+                    // rows that stamped the token into `evidence_anchors`
+                    // still dedup under the second clause so rollover is
+                    // seamless during the migration window.
+                    let annotation_token = format!("annotation#{annotation_id}");
+                    let already = pos.red_teams.iter().any(|r| {
+                        r.argument == ann_content
+                            && (r.source_annotation_ids
+                                .iter()
+                                .any(|a| a == &annotation_token)
+                                || r.evidence_anchors.iter().any(|a| a == &annotation_token))
+                    });
+                    if !already {
+                        pos.red_teams.push(RedTeamEntry {
+                            from_position: from_position_label,
+                            argument: ann_content.clone(),
+                            evidence_anchors: vec![],
+                            source_annotation_ids: vec![annotation_token],
+                        });
+                    }
+                    if already { "no_op" } else { "appended_red_team" }
+                };
+                (action_label, debate, false)
+            } else {
+                return Err(anyhow!(
+                    "append_annotation_to_debate_node: target '{}' has shape '{}' — only \
+                     Scaffolding and Debate are supported by this primitive.",
+                    target_node_id,
+                    current_shape
+                ));
+            };
+
+            // Write back. Scaffolding → Debate sets node_shape =
+            // 'debate'; existing Debate just updates shape_payload_json.
+            let payload_json = serde_json::to_string(&updated_debate)?;
+            conn_guard.execute(
+                "UPDATE pyramid_nodes
+                 SET node_shape = ?1, shape_payload_json = ?2
+                 WHERE slug = ?3 AND id = ?4",
+                rusqlite::params![
+                    NODE_SHAPE_DEBATE,
+                    payload_json,
+                    ctx.slug,
+                    target_node_id,
+                ],
+            )?;
+
+            // Emit debate_spawned only on the shape upgrade (and only
+            // when we actually did a write — "no_op" still gets here but
+            // shape_was_upgraded is false).
+            let mut spawned_event_id: Option<i64> = None;
+            if shape_was_upgraded {
+                let initial_label = updated_debate
+                    .positions
+                    .first()
+                    .map(|p| p.label.clone())
+                    .unwrap_or_default();
+                let initial_kind = if is_steel_man { "steel_man" } else { "red_team" };
+                let meta = serde_json::json!({
+                    "target_node_id": target_node_id,
+                    "initial_position_label": initial_label,
+                    "initial_position_or_red_team": initial_kind,
+                    "annotation_id": annotation_id,
+                })
+                .to_string();
+                let eid = super::observation_events::write_observation_event(
+                    &conn_guard,
+                    &ctx.slug,
+                    "chain",
+                    "debate_spawned",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&target_node_id),
+                    None,
+                    Some(&meta),
+                )?;
+                spawned_event_id = Some(eid);
+            }
+            drop(conn_guard);
+
+            info!(
+                "[mechanical] append_annotation_to_debate_node slug={} target={} action={} debate_spawned_event_id={:?}",
+                ctx.slug, target_node_id, action, spawned_event_id
+            );
+
+            let updated_payload_value =
+                serde_json::to_value(&updated_debate).unwrap_or(Value::Null);
+            Ok(serde_json::json!({
+                "action": action,
+                "target_node_id": target_node_id,
+                "annotation_id": annotation_id,
+                "annotation_type": annotation_type,
+                "shape_was_upgraded": shape_was_upgraded,
+                "debate_spawned_event_id": spawned_event_id,
+                "updated_payload": updated_payload_value,
+            }))
+        }
+        // ── Post-build accretion v5 Phase 7b: meta_layer_oracle + synthesizer ─
+        //
+        // The six primitives below back two starter chains:
+        //   * starter-meta-layer-oracle.yaml — decides whether a
+        //     purpose_shifted / gap_resolved event warrants a meta-layer,
+        //     and hands off to the synthesizer when it does.
+        //   * starter-synthesizer.yaml — produces the new meta-layer node.
+        //
+        // Scope-boundary discipline (feedback_loud_deferrals):
+        //   - `decide_crystallization` uses a three-arm heuristic today.
+        //     An UNKNOWN event_type returns should_crystallize=false WITH
+        //     a non-empty reasoning string — this is a deliberate,
+        //     documented skip path, not a silent stub. Phase 8+ replaces
+        //     the heuristic with an LLM judge.
+        //   - `create_meta_layer_node` never hardcodes LLM-output shape
+        //     constraints (feedback_pillar37_no_hedging); counts /
+        //     token budgets stay in YAML.
+        "emit_oracle_invoked" => {
+            // Chronicle trace for the meta_layer_oracle role's first step.
+            // Stamps source=chain, event_type=meta_layer_oracle_invoked.
+            // Metadata carries source_event_id (from the work item's
+            // observation_event_ids column), purpose_id (resolved via
+            // load_or_create_purpose), and the triggering event_type so
+            // downstream observers can reconstruct what fired this chain
+            // without joining back through work_items.
+            //
+            // Preserves the full input object as the step's output so
+            // subsequent steps still see work_item_id / target_id / layer —
+            // same preserve-through-output pattern as
+            // emit_debate_steward_invoked (Phase 7a).
+            let work_item_id = input
+                .get("work_item_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str());
+
+            // Resolve source_event_id + trigger event_type via the work
+            // item's observation_event_ids column. Best-effort: a missing
+            // work_item_id / missing ids column degrades to None (still
+            // useful for the meta_layer_crystallized flow which comes in
+            // with an envelope rather than a work item).
+            let (source_event_id, trigger_event_type): (Option<i64>, Option<String>) =
+                if let Some(wid) = work_item_id.as_deref() {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let obs_ids_json: Option<String> = conn_guard
+                        .query_row(
+                            "SELECT observation_event_ids FROM dadbear_work_items WHERE id = ?1",
+                            rusqlite::params![wid],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    let first_id: Option<i64> = obs_ids_json
+                        .as_deref()
+                        .and_then(|j| serde_json::from_str::<Vec<i64>>(j).ok())
+                        .and_then(|v| v.first().copied());
+                    let event_type: Option<String> = if let Some(eid) = first_id {
+                        conn_guard
+                            .query_row(
+                                "SELECT event_type FROM dadbear_observation_events WHERE id = ?1",
+                                rusqlite::params![eid],
+                                |row| row.get(0),
+                            )
+                            .ok()
+                    } else {
+                        None
+                    };
+                    drop(conn_guard);
+                    (first_id, event_type)
+                } else {
+                    (None, None)
+                };
+
+            // Resolve purpose_id. load_or_create_purpose is the canonical
+            // read; we use the reader connection here because a stock
+            // self-heal insert is still fine on the reader (rusqlite
+            // sqlite3_open_v2 shares the same file; `create_slug` has
+            // already run).
+            let purpose_id: Option<i64> = {
+                let conn_guard = ctx.db_reader.lock().await;
+                super::purpose::load_or_create_purpose(&conn_guard, &ctx.slug)
+                    .ok()
+                    .map(|p| p.id)
+            };
+
+            let mut meta = serde_json::Map::new();
+            if let Some(eid) = source_event_id {
+                meta.insert("source_event_id".to_string(), Value::from(eid));
+            }
+            if let Some(pid) = purpose_id {
+                meta.insert("purpose_id".to_string(), Value::from(pid));
+            }
+            if let Some(ref t) = trigger_event_type {
+                meta.insert("trigger_event_type".to_string(), Value::String(t.clone()));
+            }
+            if let Some(tid) = target_node_id {
+                meta.insert("target_node_id".to_string(), Value::String(tid.to_string()));
+            }
+            let metadata_json = if meta.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&Value::Object(meta))?)
+            };
+
+            info!(
+                "[mechanical] emit_oracle_invoked slug={} trigger={:?} purpose_id={:?} source_event_id={:?}",
+                ctx.slug, trigger_event_type, purpose_id, source_event_id,
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "meta_layer_oracle_invoked",
+                None,
+                None,
+                None,
+                None,
+                target_node_id,
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+
+            // Preserve input fields so threading keeps work_item_id / target
+            // / trigger_event_type alive for subsequent steps (decide_
+            // crystallization, dispatch_synthesizer).
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            if let Some(eid) = source_event_id {
+                out.entry("source_event_id".to_string())
+                    .or_insert(Value::from(eid));
+            }
+            if let Some(pid) = purpose_id {
+                out.entry("purpose_id".to_string())
+                    .or_insert(Value::from(pid));
+            }
+            if let Some(ref t) = trigger_event_type {
+                out.entry("trigger_event_type".to_string())
+                    .or_insert(Value::String(t.clone()));
+            }
+            Ok(Value::Object(out))
+        }
+        "decide_crystallization" => {
+            // Heuristic decision: given the slug's active purpose + the
+            // triggering event type, return
+            //   { should_crystallize, purpose_question, reasoning,
+            //     covered_substrate_nodes: [...] }
+            //
+            // Rules (Phase 7b MVP):
+            //   purpose_shifted → always crystallize. The shift is a
+            //     deliberate operator signal; covered_substrate_nodes
+            //     defaults to the current L0 node ids (substrate for the
+            //     new meta-layer is the whole lower pyramid).
+            //   gap_resolved    → crystallize iff the originating gap
+            //     carried candidate_resolutions (there IS substrate to
+            //     synthesize on). If no candidates, skip with reasoning.
+            //   else            → skip with reasoning naming the event.
+            //
+            // UNKNOWN event types return should_crystallize=false WITH a
+            // non-empty `reasoning` field — this is a DELIBERATE skip
+            // path, not a silent stub (feedback_loud_deferrals). Skipping
+            // on unknown events is the correct semantic: the oracle only
+            // acts on events it understands. Adding a new crystallization
+            // trigger requires extending this heuristic (or Phase 8+'s
+            // LLM judge) explicitly.
+            //
+            // Note on feedback_generalize_not_enumerate: if this match
+            // grows beyond ~3 arms, lift it to a vocab lookup where each
+            // role-triggering event_type carries a crystallization hint
+            // in its vocab entry. Today the three arms are load-bearing
+            // and well-understood; extracting prematurely would add
+            // indirection without benefit.
+            let trigger_event_type = input
+                .get("trigger_event_type")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            // Load active purpose for the slug so purpose_question (the
+            // LLM input) is rooted in the operator's declaration rather
+            // than a stand-in.
+            let purpose = {
+                let conn_guard = ctx.db_reader.lock().await;
+                super::purpose::load_or_create_purpose(&conn_guard, &ctx.slug)?
+            };
+            let purpose_question = purpose.purpose_text.clone();
+            let purpose_id = purpose.id;
+
+            // Resolve covered_substrate_nodes from whatever context we have.
+            // For purpose_shifted events there's no target, so we default
+            // to the slug's current L0 node ids. For gap_resolved the
+            // target_node_id IS the gap, and its candidate_resolutions
+            // (read via get_node_shape) determine whether there's
+            // substrate.
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            let (should_crystallize, reasoning, covered_substrate_nodes): (
+                bool,
+                String,
+                Vec<String>,
+            ) = match trigger_event_type.as_deref() {
+                Some("purpose_shifted") => {
+                    // Full L0 is the substrate for a purpose-shift meta-layer.
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let nodes = super::db::get_nodes_at_depth(&conn_guard, &ctx.slug, 0)
+                        .unwrap_or_default();
+                    drop(conn_guard);
+                    let ids: Vec<String> = nodes.into_iter().map(|n| n.id).collect();
+                    if ids.is_empty() {
+                        // Phase 7b verifier: purpose_shifted on a slug with
+                        // no L0 substrate would have produced a meta-layer
+                        // synthesized over nothing — the writer now raises
+                        // on empty topics, but the oracle itself should
+                        // skip rather than dispatch the synthesizer into a
+                        // guaranteed failure. feedback_loud_deferrals: the
+                        // skip is visible via oracle_finalize's
+                        // meta_layer_oracle_skipped event.
+                        let reason =
+                            "purpose_shifted fired but slug has no L0 substrate to synthesize \
+                             over; skipping crystallization. Supersede purpose after at least \
+                             one L0 node exists for a meaningful meta-layer."
+                                .to_string();
+                        (false, reason, vec![])
+                    } else {
+                        let reason = format!(
+                            "purpose_shifted is a deliberate operator signal; crystallizing a \
+                             meta-layer over L0 substrate ({} node(s)) aligned to the new purpose.",
+                            ids.len()
+                        );
+                        (true, reason, ids)
+                    }
+                }
+                Some("gap_resolved") => {
+                    // Inspect the gap node's candidate_resolutions.
+                    let has_candidates = if let Some(tid) = target_node_id.as_deref() {
+                        let conn_guard = ctx.db_reader.lock().await;
+                        let view = super::db::get_node_shape(&conn_guard, &ctx.slug, tid).ok().flatten();
+                        drop(conn_guard);
+                        match view.and_then(|v| v.payload) {
+                            Some(super::types::ShapePayload::Gap(g)) => {
+                                !g.candidate_resolutions.is_empty()
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    };
+                    if has_candidates {
+                        let ids: Vec<String> = target_node_id
+                            .as_ref()
+                            .map(|t| vec![t.clone()])
+                            .unwrap_or_default();
+                        let reason = format!(
+                            "gap_resolved on '{}' carried candidate_resolutions — substrate \
+                             exists for a meta-layer synthesis.",
+                            target_node_id.as_deref().unwrap_or("<unknown>")
+                        );
+                        (true, reason, ids)
+                    } else {
+                        let reason = format!(
+                            "gap_resolved on '{}' has no candidate_resolutions — no substrate \
+                             to synthesize on; skipping crystallization.",
+                            target_node_id.as_deref().unwrap_or("<unknown>")
+                        );
+                        (false, reason, vec![])
+                    }
+                }
+                Some(other) => {
+                    let reason = format!(
+                        "event_type '{}' is not a crystallization trigger in the Phase 7b \
+                         heuristic — skipping. Extend decide_crystallization (or wait for \
+                         Phase 8+'s LLM judge) to opt new triggers in.",
+                        other
+                    );
+                    (false, reason, vec![])
+                }
+                None => {
+                    // No triggering event type visible — the chain was
+                    // invoked outside the normal observation-event path.
+                    // Skip with reasoning, don't raise: both the oracle's
+                    // own dispatch_synthesizer (when:-gated) and the
+                    // terminal log_and_complete still fire, CASing the
+                    // work item to `applied`.
+                    (
+                        false,
+                        "no trigger_event_type in input envelope — skipping crystallization \
+                         (chain invoked outside the observation-event path)."
+                            .to_string(),
+                        vec![],
+                    )
+                }
+            };
+
+            info!(
+                "[mechanical] decide_crystallization slug={} trigger={:?} should_crystallize={} \
+                 substrate_count={} purpose_id={}",
+                ctx.slug,
+                trigger_event_type,
+                should_crystallize,
+                covered_substrate_nodes.len(),
+                purpose_id,
+            );
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert(
+                "should_crystallize".to_string(),
+                Value::from(should_crystallize),
+            );
+            out.insert(
+                "purpose_question".to_string(),
+                Value::String(purpose_question),
+            );
+            out.insert("reasoning".to_string(), Value::String(reasoning));
+            out.insert(
+                "covered_substrate_nodes".to_string(),
+                Value::Array(
+                    covered_substrate_nodes
+                        .into_iter()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+            out.insert("purpose_id".to_string(), Value::from(purpose_id));
+            // v5 audit P4: explicitly set parent_meta_layer_id (null by
+            // default in the Phase 7b heuristic — no parent meta-layer
+            // lineage today) so downstream callers can $ref it without
+            // tripping the starter runner's loud-resolve. Phase 8+ LLM
+            // judge may populate it when chaining meta-layers.
+            if !out.contains_key("parent_meta_layer_id") {
+                out.insert("parent_meta_layer_id".to_string(), Value::Null);
+            }
+            Ok(Value::Object(out))
+        }
+        "emit_synthesizer_invoked" => {
+            // Chronicle trace for the synthesizer role's first step.
+            // source=chain, event_type=synthesizer_invoked.
+            // Metadata carries the purpose_question + covered_substrate_nodes
+            // count so chronicle consumers can see WHY the synthesizer
+            // fired without re-reading the work item's observation_event_ids.
+            let purpose_question = input
+                .get("purpose_question")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let covered_substrate_nodes: Vec<String> = input
+                .get("covered_substrate_nodes")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let parent_meta_layer_id = input
+                .get("parent_meta_layer_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            let mut meta = serde_json::Map::new();
+            if let Some(ref q) = purpose_question {
+                meta.insert(
+                    "purpose_question".to_string(),
+                    Value::String(q.chars().take(200).collect()),
+                );
+            }
+            meta.insert(
+                "covered_substrate_node_count".to_string(),
+                Value::from(covered_substrate_nodes.len() as i64),
+            );
+            if let Some(ref p) = parent_meta_layer_id {
+                meta.insert(
+                    "parent_meta_layer_id".to_string(),
+                    Value::String(p.clone()),
+                );
+            }
+            let metadata_json = Some(serde_json::to_string(&Value::Object(meta))?);
+
+            info!(
+                "[mechanical] emit_synthesizer_invoked slug={} substrate_count={} parent={:?}",
+                ctx.slug,
+                covered_substrate_nodes.len(),
+                parent_meta_layer_id,
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "synthesizer_invoked",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            Ok(Value::Object(out))
+        }
+        "load_substrate_nodes" => {
+            // Batch-read each node in `covered_substrate_nodes` + the
+            // slug's active purpose. Returned object is the envelope the
+            // synthesize_meta_layer LLM step receives as its prompt
+            // context:
+            //   {
+            //     purpose_question, purpose_text, parent_meta_layer_id,
+            //     nodes: [{id, distilled, topics}, ...],
+            //     covered_substrate_nodes
+            //   }
+            // feedback_loud_deferrals: if a covered id doesn't resolve,
+            // we omit it from `nodes` but keep it in `covered_substrate_nodes`
+            // so the LLM is aware the caller listed it. A fully-empty
+            // resolution set raises — the synthesizer has nothing to say.
+            let purpose_question = input
+                .get("purpose_question")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "load_substrate_nodes: missing `purpose_question` in input"
+                ))?
+                .to_string();
+            let parent_meta_layer_id = input
+                .get("parent_meta_layer_id")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let covered_substrate_nodes: Vec<String> = input
+                .get("covered_substrate_nodes")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Resolve purpose_text + purpose_id via the slug's active
+            // purpose. Audit pass note: purpose_id is carried through
+            // the synthesizer chain as an echo-passthrough field so the
+            // create_meta_layer_node writer can pin provenance to the
+            // purpose that drove THIS synthesis (and not whatever is
+            // active by the time the writer runs). This read happens
+            // once here at the top of the synthesizer chain; every
+            // downstream step (LLM echo + writer) keys off the value
+            // captured right here.
+            let (purpose_text, purpose_id, max_depth) = {
+                let conn_guard = ctx.db_reader.lock().await;
+                let p = super::purpose::load_or_create_purpose(&conn_guard, &ctx.slug)?;
+                // Find the max depth across covered substrate nodes while
+                // we're under the lock — create_meta_layer_node uses it to
+                // pin the new node's depth at parent_depth+1.
+                let mut max_depth: i64 = 0;
+                for id in &covered_substrate_nodes {
+                    let node = super::db::get_node(&conn_guard, &ctx.slug, id)?;
+                    if let Some(n) = node {
+                        if n.depth > max_depth {
+                            max_depth = n.depth;
+                        }
+                    }
+                }
+                (p.purpose_text, p.id, max_depth)
+            };
+
+            // Load each covered node's (distilled, topics) projection.
+            // We keep this read tight — no corrections / decisions —
+            // because the LLM prompt only needs distilled + topic labels.
+            let mut nodes_out: Vec<Value> = Vec::new();
+            {
+                let conn_guard = ctx.db_reader.lock().await;
+                for id in &covered_substrate_nodes {
+                    if let Some(node) = super::db::get_node(&conn_guard, &ctx.slug, id)? {
+                        let topics_json = serde_json::to_value(&node.topics).unwrap_or(Value::Null);
+                        nodes_out.push(serde_json::json!({
+                            "id": node.id,
+                            "distilled": node.distilled,
+                            "topics": topics_json,
+                        }));
+                    } else {
+                        warn!(
+                            "[mechanical] load_substrate_nodes slug={} id='{}' not found — \
+                             omitting from synthesis context (id will still appear in \
+                             covered_substrate_nodes so the LLM sees the ask).",
+                            ctx.slug, id
+                        );
+                    }
+                }
+                drop(conn_guard);
+            }
+
+            if covered_substrate_nodes.is_empty() {
+                // Phase 7b verifier (Audit Target 7): an empty covered
+                // list means the caller asked to synthesize over nothing.
+                // The oracle's purpose_shifted arm now pre-filters the
+                // empty-L0 case, so reaching this branch is an upstream
+                // contract bug — either decide_crystallization skipped
+                // the empty-substrate guard or a future direct-call path
+                // sent an unset/empty list. Raise rather than LLM-call
+                // with no context.
+                return Err(anyhow!(
+                    "load_substrate_nodes: covered_substrate_nodes is empty for slug '{}'. \
+                     A synthesizer run needs at least one substrate node; an empty envelope \
+                     means the oracle or caller is routing a crystallization with no grounding \
+                     input. Fix the upstream decide_crystallization rule or the caller's \
+                     envelope.",
+                    ctx.slug,
+                ));
+            }
+            if nodes_out.is_empty() {
+                return Err(anyhow!(
+                    "load_substrate_nodes: none of the {} covered substrate node ids resolved \
+                     against slug '{}' — the synthesizer has no substrate to synthesize on. \
+                     This is almost certainly an upstream bug in decide_crystallization or \
+                     the caller's envelope, not an expected empty state.",
+                    covered_substrate_nodes.len(),
+                    ctx.slug,
+                ));
+            }
+
+            info!(
+                "[mechanical] load_substrate_nodes slug={} covered={} resolved={} max_depth={}",
+                ctx.slug,
+                covered_substrate_nodes.len(),
+                nodes_out.len(),
+                max_depth,
+            );
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert(
+                "purpose_question".to_string(),
+                Value::String(purpose_question),
+            );
+            out.insert("purpose_text".to_string(), Value::String(purpose_text));
+            // Audit pass: also emit purpose_id so the LLM step's echo
+            // contract can pass it through to create_meta_layer_node.
+            // Without this value in the envelope, the LLM has nothing to
+            // echo and the writer's loud-raise on missing purpose_id
+            // would fire on every real run.
+            out.insert("purpose_id".to_string(), Value::from(purpose_id));
+            out.insert(
+                "parent_meta_layer_id".to_string(),
+                parent_meta_layer_id,
+            );
+            out.insert("nodes".to_string(), Value::Array(nodes_out));
+            out.insert(
+                "covered_substrate_nodes".to_string(),
+                Value::Array(
+                    covered_substrate_nodes
+                        .into_iter()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+            out.insert("_max_substrate_depth".to_string(), Value::from(max_depth));
+            Ok(Value::Object(out))
+        }
+        "create_meta_layer_node" => {
+            // Writer. Given the LLM step's output (headline, distilled,
+            // topics, covered_substrate_node_ids), construct a new
+            // MetaLayer node in pyramid_nodes and emit
+            // meta_layer_crystallized.
+            //
+            // Threading contract: the synthesize_meta_layer step's output
+            // is threaded in as `input`, BUT we also need context the LLM
+            // step didn't echo (purpose_question, parent_meta_layer_id,
+            // _max_substrate_depth). The starter runner re-merges only
+            // target_node_id + slug per-step, so we pull the missing
+            // context through the step_outputs accumulator via the
+            // threaded input's own fields when the caller preserved them,
+            // and we additionally tolerate them being provided inline in
+            // the input envelope by a future direct-call path.
+            //
+            // Two-column invariant: node_shape is stored as the canonical
+            // string (NODE_SHAPE_META_LAYER) + shape_payload_json carries
+            // a JSON-serialized MetaLayerTopic. pyramid_nodes uses a
+            // parallel (topics, corrections, ...) column set too; we
+            // leave those NULL/empty for meta-layer nodes — readers
+            // consult shape_payload_json via get_node_shape() for
+            // MetaLayer content.
+            let headline = input
+                .get("headline")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "create_meta_layer_node: missing `headline` string in input — \
+                     synthesize_meta_layer LLM step did not produce the required field."
+                ))?
+                .to_string();
+            let distilled = input
+                .get("distilled")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "create_meta_layer_node: missing `distilled` string in input"
+                ))?
+                .to_string();
+
+            // covered_substrate_node_ids comes from the LLM step (the
+            // audit trail: which substrate nodes actually shaped the
+            // synthesis). If missing, fall back to covered_substrate_nodes
+            // from the earlier load step so the payload never records an
+            // empty substrate list against a non-trivial meta-layer.
+            let covered_substrate_nodes: Vec<String> = input
+                .get("covered_substrate_node_ids")
+                .and_then(|v| v.as_array())
+                .or_else(|| input.get("covered_substrate_nodes").and_then(|v| v.as_array()))
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // topics carries the audit trail — each topic names a theme
+            // and lists anchor substrate node ids. The LLM step's
+            // response_schema declares `topics` required, but Phase 6a
+            // verifier flagged that response_schema is NOT enforced by
+            // the current LLM dispatch path. Without a check here a
+            // non-strict provider return (`{headline, distilled}` with
+            // topics omitted) would write a MetaLayer node with a
+            // silently-empty topics array — the prompt's core grounding
+            // contract (every topic anchors back to substrate ids) would
+            // be lost at the persistence boundary with no signal to the
+            // operator.
+            //
+            // feedback_loud_deferrals: raise loudly on missing /
+            // malformed-shaped topics. An empty topics array is also a
+            // failure (prompt explicitly calls it a failure mode); a
+            // meta-layer with zero topics is structurally meaningless.
+            let topics: Vec<MetaLayerTopicEntry> = match input.get("topics") {
+                Some(Value::Array(arr)) => arr
+                    .iter()
+                    .map(|entry| {
+                        serde_json::from_value::<MetaLayerTopicEntry>(entry.clone())
+                            .map_err(|e| anyhow!(
+                                "create_meta_layer_node: topics entry {:?} did not deserialize \
+                                 into MetaLayerTopicEntry: {}",
+                                entry, e,
+                            ))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                Some(other) => {
+                    return Err(anyhow!(
+                        "create_meta_layer_node: `topics` must be a JSON array per the \
+                         synthesize_meta_layer response_schema, got {:?}. This is the \
+                         audit trail between the synthesis and its substrate; failing \
+                         loudly rather than persist a meta-layer with floating claims.",
+                        other,
+                    ));
+                }
+                None => {
+                    return Err(anyhow!(
+                        "create_meta_layer_node: `topics` is missing from the synthesizer \
+                         LLM step output. The starter-synthesizer response_schema declares \
+                         it required, but the current LLM dispatch path does NOT enforce \
+                         response_schema yet (Phase 6a verifier flag). Refusing to persist \
+                         a meta-layer without the topic→anchor audit trail; fix the LLM \
+                         provider path or the synthesize_meta_layer prompt so topics is \
+                         always returned."
+                    ));
+                }
+            };
+            if topics.is_empty() {
+                return Err(anyhow!(
+                    "create_meta_layer_node: topics array is empty. The synthesize_meta_layer \
+                     prompt explicitly documents this as a failure mode (\"an empty anchor_nodes \
+                     list is a failure mode — the topic is floating\"); a meta-layer with zero \
+                     topics has no audit trail back to substrate. Re-prompt or surface the \
+                     synthesizer's refusal rather than write a hollow node."
+                ));
+            }
+            for t in &topics {
+                if t.anchor_nodes.is_empty() {
+                    return Err(anyhow!(
+                        "create_meta_layer_node: topic '{}' has no anchor_nodes. The \
+                         synthesize_meta_layer prompt requires each topic to anchor at least \
+                         one substrate node id; a floating topic breaks drill-down.",
+                        t.topic,
+                    ));
+                }
+            }
+
+            // Pull purpose_question + purpose_id + parent_meta_layer_id.
+            //
+            // Audit pass (race fix): these fields MUST arrive via the
+            // threaded input envelope. The prior self-resolve fallthrough
+            // (reading `purpose::load_or_create_purpose` here when the
+            // input was empty) raced concurrent `supersede_purpose`:
+            // between the oracle's decide_crystallization (which captured
+            // the purpose driving synthesis) and the writer (which runs
+            // after the LLM synthesize step), a second supersede could
+            // shift the slug's active purpose. The writer would then
+            // label the new MetaLayer with the NEW purpose text while
+            // its distilled/topics content was synthesized FROM the OLD
+            // purpose — semantically wrong provenance.
+            //
+            // Fix: load_substrate_nodes reads purpose ONCE at the top of
+            // the synthesizer chain and emits purpose_question +
+            // purpose_id into its output envelope. The LLM synthesize
+            // step's response_schema declares both as required echo
+            // passthrough fields (see starter-synthesizer.yaml +
+            // synthesize_meta_layer.md). The writer then consumes the
+            // echoed values directly — NO self-resolve. If either field
+            // is missing, raise loudly per feedback_loud_deferrals: it
+            // indicates the LLM dropped the echo or the chain was
+            // invoked via a direct-call path that bypassed
+            // load_substrate_nodes, and silently falling back to the
+            // active purpose reintroduces the race.
+            let purpose_question = input
+                .get("purpose_question")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow!(
+                    "create_meta_layer_node: missing / empty `purpose_question` in input. \
+                     The synthesizer's synthesize_meta_layer LLM step is required to echo \
+                     the purpose_question it was given verbatim so the writer pins \
+                     provenance to the purpose that drove synthesis — not whatever is \
+                     active by the time the writer runs (which could have been superseded \
+                     mid-chain). If you are calling create_meta_layer_node directly, pass \
+                     purpose_question in the input envelope. Do NOT self-resolve from the \
+                     slug's active purpose — that reintroduces the race this guard closes."
+                ))?
+                .to_string();
+            let parent_meta_layer_id = input
+                .get("parent_meta_layer_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let purpose_id = input
+                .get("purpose_id")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| anyhow!(
+                    "create_meta_layer_node: missing `purpose_id` (integer) in input. \
+                     Same echo-passthrough contract as `purpose_question`; see the \
+                     field's error above for full rationale."
+                ))?;
+
+            // Compute the new node's depth. Meta layers sit above their
+            // substrate, so depth = max(covered_substrate_depths) + 1.
+            // Prefer the _max_substrate_depth hint from load_substrate_nodes
+            // (single query, correct); fall back to a fresh read when the
+            // hint is absent (direct-call path).
+            let parent_depth: i64 = match input.get("_max_substrate_depth").and_then(|v| v.as_i64())
+            {
+                Some(d) => d,
+                None => {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let mut max_depth: i64 = 0;
+                    for id in &covered_substrate_nodes {
+                        if let Some(n) = super::db::get_node(&conn_guard, &ctx.slug, id)? {
+                            if n.depth > max_depth {
+                                max_depth = n.depth;
+                            }
+                        }
+                    }
+                    drop(conn_guard);
+                    max_depth
+                }
+            };
+            let node_depth = parent_depth + 1;
+
+            // New node id. Format: L{depth}-ML-{short-uuid}. The short-
+            // uuid tail keeps the id human-readable in chronicle traces
+            // while guaranteeing uniqueness across concurrent oracle runs
+            // on the same slug.
+            let short_uuid: String = uuid::Uuid::new_v4()
+                .to_string()
+                .chars()
+                .take(8)
+                .collect();
+            let node_id = format!("L{}-ML-{}", node_depth, short_uuid);
+
+            let payload = MetaLayerTopic {
+                purpose_question: purpose_question.clone(),
+                parent_meta_layer_id: parent_meta_layer_id.clone(),
+                covered_substrate_nodes: covered_substrate_nodes.clone(),
+                topics: topics.clone(),
+            };
+            let payload_json = serde_json::to_string(&payload)?;
+
+            info!(
+                "[mechanical] create_meta_layer_node slug={} id={} depth={} covered={} parent_ml={:?}",
+                ctx.slug,
+                node_id,
+                node_depth,
+                covered_substrate_nodes.len(),
+                parent_meta_layer_id,
+            );
+
+            let conn_guard = ctx.db_writer.lock().await;
+
+            // Scaffolding-default column set matches what test seeds use.
+            // `topics` / `corrections` / `decisions` / `terms` / `dead_ends`
+            // are NULL-safe: MetaLayer content lives in shape_payload_json.
+            conn_guard.execute(
+                "INSERT INTO pyramid_nodes
+                    (id, slug, depth, headline, distilled, self_prompt,
+                     build_version, node_shape, shape_payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, '', 1, ?6, ?7)",
+                rusqlite::params![
+                    node_id,
+                    ctx.slug,
+                    node_depth,
+                    headline,
+                    distilled,
+                    NODE_SHAPE_META_LAYER,
+                    payload_json,
+                ],
+            )
+            .map_err(|e| anyhow!(
+                "create_meta_layer_node: failed to insert pyramid_nodes row \
+                 (slug={} id={} depth={}): {}",
+                ctx.slug, node_id, node_depth, e,
+            ))?;
+
+            // ── Phase 9b-5: resolve covered Gap-shaped substrate nodes ──
+            //
+            // When the synthesizer covers a Gap node with a meta-layer,
+            // the gap's demand is satisfied by the crystallization.
+            // Two mutations, both under the same writer lock we already
+            // hold:
+            //   1. Flip the GapTopic.demand_state to "closed" (so the
+            //      node's shape payload reflects the resolution).
+            //   2. Call mark_gap_resolved_with_reason (closes
+            //      pyramid_gaps row + emits gap_resolved observation
+            //      event — the compiler routes that event via
+            //      role_for_event → meta_layer_oracle, closing the
+            //      feedback loop: synthesis covers gap → gap resolved
+            //      → oracle may crystallize further meta-layer).
+            //
+            // Multiple Gap-shaped covered nodes: each resolves
+            // independently, each gets its own `gap_resolved` event.
+            // Per Phase 8-4 contract: resolution_reason =
+            // "covered_by_meta_layer", resolved_by = "starter-synthesizer".
+            //
+            // Per-gap failure is non-fatal to the overall meta-layer
+            // create. Log loud and continue; the crystallized event
+            // still fires (operators see the pyramid state was
+            // updated) — re-running the chain can re-attempt any
+            // missed gaps.
+            let mut resolved_gaps: Vec<String> = Vec::new();
+            for covered_id in &covered_substrate_nodes {
+                let shape_view = match super::db::get_node_shape(&conn_guard, &ctx.slug, covered_id) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => continue,   // covered node missing (shouldn't happen; skip)
+                    Err(e) => {
+                        tracing::warn!(
+                            slug = %ctx.slug,
+                            node = %covered_id,
+                            error = %e,
+                            "create_meta_layer_node: get_node_shape failed for covered node — skipping gap-resolution attempt"
+                        );
+                        continue;
+                    }
+                };
+                if shape_view.shape.as_str() != NODE_SHAPE_GAP {
+                    continue;
+                }
+                // Unpack GapTopic for the demand_state transition.
+                let Some(ShapePayload::Gap(mut gap)) = shape_view.payload else {
+                    tracing::warn!(
+                        slug = %ctx.slug,
+                        node = %covered_id,
+                        "create_meta_layer_node: node shape='gap' but payload missing — skipping"
+                    );
+                    continue;
+                };
+                if gap.demand_state == "closed" {
+                    // Already resolved; still cheap to re-emit the
+                    // gap_resolved event so the oracle sees the
+                    // covering in THIS crystallization (idempotent).
+                } else {
+                    gap.demand_state = "closed".to_string();
+                    let new_payload = match serde_json::to_string(&gap) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(
+                                slug = %ctx.slug,
+                                node = %covered_id,
+                                error = %e,
+                                "create_meta_layer_node: failed to re-serialize GapTopic — skipping"
+                            );
+                            continue;
+                        }
+                    };
+                    if let Err(e) = conn_guard.execute(
+                        "UPDATE pyramid_nodes
+                            SET shape_payload_json = ?1
+                          WHERE slug = ?2 AND id = ?3",
+                        rusqlite::params![new_payload, ctx.slug, covered_id],
+                    ) {
+                        tracing::warn!(
+                            slug = %ctx.slug,
+                            node = %covered_id,
+                            error = %e,
+                            "create_meta_layer_node: GapTopic demand_state UPDATE failed — skipping"
+                        );
+                        continue;
+                    }
+                }
+                // Emit gap_resolved + best-effort update the legacy
+                // pyramid_gaps row. mark_gap_resolved_with_reason
+                // emits the observation event unconditionally; the
+                // UPDATE-by-key is best-effort (post-6c Gap-shaped
+                // nodes may not have a pyramid_gaps row at all — the
+                // shape payload is the authoritative source, not the
+                // legacy table). Node_id becomes the synthetic
+                // question_id so chronicle consumers can drill back.
+                //
+                // gap.concern is used for the UPDATE's question_id
+                // match so any legacy row seeded from the same
+                // annotation cohort is closed in the same call.
+                // Resolution reason + resolved_by are stable tokens
+                // per Phase 8-4 contract.
+                if let Err(e) = super::db::mark_gap_resolved_with_reason(
+                    &conn_guard,
+                    &ctx.slug,
+                    covered_id,
+                    &gap.description,
+                    "covered_by_meta_layer",
+                    "starter-synthesizer",
+                ) {
+                    tracing::warn!(
+                        slug = %ctx.slug,
+                        node = %covered_id,
+                        error = %e,
+                        "create_meta_layer_node: mark_gap_resolved_with_reason failed"
+                    );
+                } else {
+                    resolved_gaps.push(covered_id.clone());
+                }
+            }
+
+            // Emit meta_layer_crystallized observation event. Metadata
+            // carries the fields the downstream compiler's role_for_event
+            // arm will key off (+ purpose_id for chronicle drill-down).
+            let meta = serde_json::json!({
+                "meta_layer_node_id": node_id,
+                "covered_substrate_node_ids": covered_substrate_nodes,
+                "purpose_question": purpose_question,
+                "purpose_id": purpose_id,
+                "parent_meta_layer_id": parent_meta_layer_id,
+                "depth": node_depth,
+                "resolved_gap_node_ids": resolved_gaps,
+            })
+            .to_string();
+            let crystallized_event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "meta_layer_crystallized",
+                None,
+                None,
+                None,
+                None,
+                Some(&node_id),
+                Some(node_depth),
+                Some(&meta),
+            )?;
+            drop(conn_guard);
+
+            Ok(serde_json::json!({
+                "created": true,
+                "meta_layer_node_id": node_id,
+                "depth": node_depth,
+                "covered_substrate_node_ids": covered_substrate_nodes,
+                "crystallized_event_id": crystallized_event_id,
+                "resolved_gap_node_ids": resolved_gaps,
+            }))
+        }
+        "oracle_finalize" => {
+            // Terminal step for `starter-meta-layer-oracle`. Replaces the
+            // Phase 5 generic `log_and_complete` so a SKIP decision lands
+            // loudly in the chronicle.
+            //
+            // Why this exists (verifier Audit Target 1 + feedback_loud_deferrals):
+            //   decide_crystallization may legitimately return
+            //   should_crystallize=false (unknown trigger, gap with no
+            //   candidate_resolutions, chain invoked outside the
+            //   observation-event path). When that happens the
+            //   dispatch_synthesizer step is when-gated off, the chain
+            //   fast-forwards to this terminal step, and the work item
+            //   CASes to `applied`. Before this arm existed the only
+            //   signal was a single info!() line — operator-invisible in
+            //   the chronicle (which is where operators LOOK for
+            //   oracle activity). A skipped oracle run must leave a
+            //   visible mark.
+            //
+            // Behavior:
+            //   - If the threaded input carries should_crystallize=true
+            //     AND a meta_layer_node_id (i.e. create_meta_layer_node
+            //     already ran and emitted meta_layer_crystallized), we
+            //     don't double-emit; just pass through.
+            //   - Otherwise, emit a `meta_layer_oracle_skipped` event
+            //     carrying {reasoning, trigger_event_type, target_node_id,
+            //     source_event_id, purpose_id} so a chronicle reader can
+            //     reconstruct WHY the oracle declined.
+            let should_crystallize = input
+                .get("should_crystallize")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let created = input
+                .get("created")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || input.get("meta_layer_node_id").is_some();
+
+            if should_crystallize && created {
+                // Happy path already emitted meta_layer_crystallized via
+                // create_meta_layer_node. Nothing to add; threading forwards
+                // the writer's output verbatim.
+                info!(
+                    "[mechanical] oracle_finalize slug={} crystallize=true created=true (no-op pass-through)",
+                    ctx.slug,
+                );
+                return Ok(input.clone());
+            }
+
+            let reasoning = input
+                .get("reasoning")
+                .and_then(|v| v.as_str())
+                .unwrap_or("no reasoning carried through threading — likely an upstream author bug in the oracle chain")
+                .to_string();
+            let trigger_event_type = input
+                .get("trigger_event_type")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let source_event_id = input
+                .get("source_event_id")
+                .and_then(|v| v.as_i64());
+            let purpose_id = input
+                .get("purpose_id")
+                .and_then(|v| v.as_i64());
+
+            let mut meta = serde_json::Map::new();
+            meta.insert("reasoning".to_string(), Value::String(reasoning.clone()));
+            if let Some(ref t) = trigger_event_type {
+                meta.insert(
+                    "trigger_event_type".to_string(),
+                    Value::String(t.clone()),
+                );
+            }
+            if let Some(ref t) = target_node_id {
+                meta.insert("target_node_id".to_string(), Value::String(t.clone()));
+            }
+            if let Some(eid) = source_event_id {
+                meta.insert("source_event_id".to_string(), Value::from(eid));
+            }
+            if let Some(pid) = purpose_id {
+                meta.insert("purpose_id".to_string(), Value::from(pid));
+            }
+            let metadata_json = serde_json::to_string(&Value::Object(meta))?;
+
+            info!(
+                "[mechanical] oracle_finalize slug={} crystallize=false reasoning=\"{}\"",
+                ctx.slug, reasoning,
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "meta_layer_oracle_skipped",
+                None,
+                None,
+                None,
+                None,
+                target_node_id.as_deref(),
+                None,
+                Some(&metadata_json),
+            )?;
+            drop(conn_guard);
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert(
+                "oracle_finalized".to_string(),
+                Value::from(true),
+            );
+            out.insert(
+                "oracle_skipped_event_id".to_string(),
+                Value::from(event_id),
+            );
+            Ok(Value::Object(out))
+        }
+        // ── Post-build accretion v5 Phase 7c: gap_dispatcher primitives ─────
+        //
+        // Back starter-gap-dispatcher.yaml, the chain dispatched when a `gap`
+        // annotation fires annotation_reacted (vocab handler_chain_id points
+        // here). Mirrors the 7a debate_steward shape:
+        //   emit_dispatcher_invoked → load_gap_context → materialize_gap_node
+        //   → log_and_complete.
+        //
+        // Idempotency: `materialize_gap_node` keys off annotation id via an
+        // `annotation#{id}` evidence-anchor tag on each GapCandidate (same
+        // dedup pattern Phase 7a uses on RedTeamEntry.evidence_anchors). A
+        // re-compile of the same annotation will find the existing anchor
+        // and fall to no_op without re-emitting `gap_detected`.
+        //
+        // v5 audit P3: role_for_event(gap_detected) returns None — the
+        // chain's gap_detected emission is observability-only. The actual
+        // dispatch has already fired via annotation_reacted →
+        // handler_chain_id (6c-B flip), so there is nothing more to do
+        // than write the chronicle event. `gap_dispatcher_skipped` may
+        // still fire in the rare case of a direct chain invocation that
+        // carries no annotation_id; when that happens it is the loud
+        // deferral, not the norm.
+        // See project_auto_stale_system.md for the broader map.
+        "emit_dispatcher_invoked" => {
+            // Chronicle-only observability event — one row in
+            // dadbear_observation_events naming the target + annotation.
+            // Same threading discipline as emit_debate_steward_invoked: the
+            // input envelope's work_item_id / annotation_id / annotation_type
+            // fields are passed through so later steps can back-fill.
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str());
+            let annotation_id = input.get("annotation_id").and_then(|v| v.as_i64());
+            let annotation_type = input
+                .get("annotation_type")
+                .and_then(|v| v.as_str());
+            let mut meta = serde_json::Map::new();
+            if let Some(tid) = target_node_id {
+                meta.insert(
+                    "target_node_id".to_string(),
+                    Value::String(tid.to_string()),
+                );
+            }
+            if let Some(aid) = annotation_id {
+                meta.insert("annotation_id".to_string(), Value::from(aid));
+            }
+            if let Some(at) = annotation_type {
+                meta.insert(
+                    "annotation_type".to_string(),
+                    Value::String(at.to_string()),
+                );
+            }
+            let metadata_json = if meta.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&Value::Object(meta))?)
+            };
+            info!(
+                "[mechanical] emit_dispatcher_invoked slug={} target={:?} annotation_id={:?} annotation_type={:?}",
+                ctx.slug, target_node_id, annotation_id, annotation_type
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "gap_dispatcher_invoked",
+                None,
+                None,
+                None,
+                None,
+                target_node_id,
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            Ok(Value::Object(out))
+        }
+        "load_gap_context" => {
+            // Resolves the triggering annotation + target shape + existing
+            // GapTopic payload (if present). Similar pattern to
+            // load_annotation_and_target (7a) but also reads the Gap
+            // payload so the writer can dedup-append in place.
+            //
+            // annotation_id / annotation_type may arrive on the input
+            // envelope directly, OR be back-filled via the work_item's
+            // observation_event_ids column (matching the debate_steward
+            // backfill path).
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "load_gap_context: missing target_node_id"
+                ))?
+                .to_string();
+
+            let mut annotation_id = input.get("annotation_id").and_then(|v| v.as_i64());
+            let mut annotation_type = input
+                .get("annotation_type")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            if annotation_id.is_none() || annotation_type.is_none() {
+                let work_item_id = input
+                    .get("work_item_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                if let Some(wid) = work_item_id.as_deref() {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let obs_ids_json: Option<String> = conn_guard
+                        .query_row(
+                            "SELECT observation_event_ids FROM dadbear_work_items WHERE id = ?1",
+                            rusqlite::params![wid],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    if let Some(ids_json) = obs_ids_json {
+                        if let Ok(ids) = serde_json::from_str::<Vec<i64>>(&ids_json) {
+                            if let Some(eid) = ids.first() {
+                                let meta: Option<String> = conn_guard
+                                    .query_row(
+                                        "SELECT metadata_json FROM dadbear_observation_events WHERE id = ?1",
+                                        rusqlite::params![eid],
+                                        |row| row.get(0),
+                                    )
+                                    .ok()
+                                    .flatten();
+                                if let Some(m) = meta {
+                                    if let Ok(v) = serde_json::from_str::<Value>(&m) {
+                                        if annotation_id.is_none() {
+                                            annotation_id =
+                                                v.get("annotation_id").and_then(|x| x.as_i64());
+                                        }
+                                        if annotation_type.is_none() {
+                                            annotation_type = v
+                                                .get("annotation_type")
+                                                .and_then(|x| x.as_str())
+                                                .map(String::from);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    drop(conn_guard);
+                }
+            }
+
+            let conn_guard = ctx.db_reader.lock().await;
+
+            let annotation_obj: Value = if let Some(aid) = annotation_id {
+                let row: Option<(i64, String, String, String, Option<String>, String, String, String)> = conn_guard
+                    .query_row(
+                        "SELECT id, slug, node_id, annotation_type, question_context, author,
+                                content, created_at
+                         FROM pyramid_annotations WHERE id = ?1",
+                        rusqlite::params![aid],
+                        |r| Ok((
+                            r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?,
+                            r.get(5)?, r.get(6)?, r.get(7)?,
+                        )),
+                    )
+                    .ok();
+                if let Some((id, slug, node_id, aty, qctx, author, content, created_at)) = row {
+                    if annotation_type.as_deref() != Some(aty.as_str()) {
+                        annotation_type = Some(aty.clone());
+                    }
+                    serde_json::json!({
+                        "id": id,
+                        "slug": slug,
+                        "node_id": node_id,
+                        "annotation_type": aty,
+                        "question_context": qctx,
+                        "author": author,
+                        "content": content,
+                        "created_at": created_at,
+                    })
+                } else {
+                    Value::Null
+                }
+            } else {
+                Value::Null
+            };
+
+            let node_row: Option<(i64, String, String)> = conn_guard
+                .query_row(
+                    "SELECT depth, headline, distilled FROM pyramid_nodes
+                     WHERE slug = ?1 AND id = ?2",
+                    rusqlite::params![ctx.slug, target_node_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok();
+            let shape_view = super::db::get_node_shape(&conn_guard, &ctx.slug, &target_node_id)?;
+            drop(conn_guard);
+
+            let (current_shape, existing_gap_payload_json, target_obj) =
+                if let Some((depth, headline, distilled)) = node_row {
+                    let current_shape = shape_view
+                        .as_ref()
+                        .map(|v| v.shape.as_str().to_string())
+                        .unwrap_or_else(|| "scaffolding".to_string());
+                    let existing_gap_payload = match shape_view.as_ref().and_then(|v| v.payload.as_ref()) {
+                        Some(ShapePayload::Gap(g)) => serde_json::to_value(g).ok(),
+                        _ => None,
+                    };
+                    let current_payload = shape_view
+                        .as_ref()
+                        .and_then(|v| v.payload.as_ref())
+                        .and_then(|p| serde_json::to_value(p).ok())
+                        .unwrap_or(Value::Null);
+                    let target = serde_json::json!({
+                        "id": target_node_id,
+                        "depth": depth,
+                        "headline": headline,
+                        "distilled": distilled,
+                        "current_shape": current_shape,
+                        "current_payload": current_payload,
+                    });
+                    (current_shape, existing_gap_payload, target)
+                } else {
+                    ("scaffolding".to_string(), None, Value::Null)
+                };
+
+            info!(
+                "[mechanical] load_gap_context slug={} target={} annotation_id={:?} annotation_type={:?} current_shape={}",
+                ctx.slug, target_node_id, annotation_id, annotation_type, current_shape,
+            );
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert(
+                "target_node_id".to_string(),
+                Value::String(target_node_id.clone()),
+            );
+            out.insert(
+                "annotation_id".to_string(),
+                annotation_id.map(Value::from).unwrap_or(Value::Null),
+            );
+            out.insert(
+                "annotation_type".to_string(),
+                annotation_type
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+            out.insert("annotation".to_string(), annotation_obj);
+            out.insert("target_node".to_string(), target_obj);
+            out.insert("target_shape".to_string(), Value::String(current_shape));
+            out.insert(
+                "existing_gap_payload".to_string(),
+                existing_gap_payload_json.unwrap_or(Value::Null),
+            );
+            Ok(Value::Object(out))
+        }
+        "materialize_gap_node" => {
+            // Core Gap writer. Given a `gap` annotation + target node:
+            //   - Scaffolding → upgrade to Gap shape with a fresh GapTopic
+            //     seeded from the annotation, emit `gap_detected`.
+            //   - Gap → merge the annotation into the existing payload
+            //     (append a GapCandidate carrying an `annotation#{id}`
+            //     evidence tag for dedup). Do NOT re-emit `gap_detected`.
+            //   - Debate / MetaLayer → skip loud: these typed nodes have
+            //     semantic meaning the Gap writer can't safely overwrite.
+            //     Phase 8+ decides whether to create a sibling Gap node;
+            //     for now we return a no_op action with a reason so the
+            //     operator sees it in the chronicle.
+            //   - Unknown shape → raise (feedback_loud_deferrals).
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "materialize_gap_node: missing target_node_id"
+                ))?
+                .to_string();
+            let annotation_id: Option<i64> = input.get("annotation_id").and_then(|v| v.as_i64());
+            let annotation_obj = input.get("annotation").cloned().unwrap_or(Value::Null);
+
+            if annotation_id.is_none() {
+                // feedback_loud_deferrals: the "no annotation_id" path fires
+                // when something invokes the gap_dispatcher chain directly
+                // (outside the annotation_reacted → handler_chain_id path).
+                // Post-v5 audit, this is no longer the gap_detected retrigger
+                // — `role_for_event("gap_detected")` returns None — so if
+                // this arm fires in production it is a real anomaly, not a
+                // cheap expected no_op. Emit `gap_dispatcher_skipped` loudly.
+                info!(
+                    "[mechanical] materialize_gap_node slug={} target={} → no_op (no annotation_id in input — direct chain invocation without annotation context)",
+                    ctx.slug, target_node_id
+                );
+                let skip_meta = serde_json::json!({
+                    "target_node_id": target_node_id,
+                    "reason": "no_annotation_id",
+                    "detail": "work item carried no annotation_id. After v5 audit P3, role_for_event(gap_detected) returns None so this is not a retrigger cycle — investigate why the chain was dispatched without annotation context.",
+                })
+                .to_string();
+                let conn_guard = ctx.db_writer.lock().await;
+                let _ = super::observation_events::write_observation_event(
+                    &conn_guard,
+                    &ctx.slug,
+                    "chain",
+                    "gap_dispatcher_skipped",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&target_node_id),
+                    None,
+                    Some(&skip_meta),
+                );
+                drop(conn_guard);
+                return Ok(serde_json::json!({
+                    "action": "no_op",
+                    "reason": "no annotation_id in input",
+                }));
+            }
+            let annotation_id = annotation_id.unwrap();
+
+            // Pull annotation content + author, preferring threaded
+            // `annotation` object. Loud-raise on missing row per
+            // feedback_loud_deferrals (the verifier fix applied to Phase
+            // 7a's append_annotation_to_debate_node — same discipline here).
+            let ann_content: String;
+            let ann_author: String;
+            let ann_question_context: Option<String>;
+            {
+                let threaded_content = annotation_obj
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let threaded_author = annotation_obj
+                    .get("author")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let threaded_qctx = annotation_obj
+                    .get("question_context")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                if let (Some(c), Some(a)) = (threaded_content, threaded_author) {
+                    ann_content = c;
+                    ann_author = a;
+                    ann_question_context = threaded_qctx;
+                } else {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let row: Option<(String, String, Option<String>)> = conn_guard
+                        .query_row(
+                            "SELECT content, author, question_context FROM pyramid_annotations WHERE id = ?1",
+                            rusqlite::params![annotation_id],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        )
+                        .ok();
+                    drop(conn_guard);
+                    match row {
+                        Some((c, a, q)) => {
+                            ann_content = c;
+                            ann_author = a;
+                            ann_question_context = q;
+                        }
+                        None => {
+                            return Err(anyhow!(
+                                "materialize_gap_node: annotation_id={} not \
+                                 found in pyramid_annotations — stale event or deleted row. \
+                                 Target '{}' will not be mutated.",
+                                annotation_id,
+                                target_node_id,
+                            ));
+                        }
+                    }
+                }
+            };
+
+            // Concern line: prefer question_context (tends to be a
+            // question), fall back to target node's headline, fall back
+            // to a synthesized string. Description is the annotation body.
+            let concern_line = ann_question_context
+                .filter(|q| !q.is_empty())
+                .or_else(|| {
+                    input
+                        .get("target_node")
+                        .and_then(|t| t.get("headline"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or_else(|| format!("Gap at node {}", target_node_id));
+            let description = ann_content.clone();
+
+            // Serialize the transition under the writer mutex so
+            // concurrent `gap` annotations on the same target serialize.
+            let conn_guard = ctx.db_writer.lock().await;
+            let shape_view =
+                super::db::get_node_shape(&conn_guard, &ctx.slug, &target_node_id)?;
+            let current_shape = shape_view
+                .as_ref()
+                .map(|v| v.shape.clone())
+                .unwrap_or_else(NodeShape::scaffolding);
+
+            // Phase 7c verifier: the annotation anchor lived on
+            // `GapTopic.evidence_anchors` to avoid overloading
+            // `GapCandidate.resolution_type`. v5 audit P6 completes the
+            // split: annotation tokens move to `source_annotation_ids`,
+            // `evidence_anchors` is reserved for genuine node-id refs.
+            // Per `feedback_generalize_not_enumerate`: the right field
+            // for provenance is a dedicated provenance field.
+            let annotation_token = format!("annotation#{annotation_id}");
+
+            let (action, updated_gap, shape_was_upgraded) = if current_shape.is_scaffolding() {
+                // Fresh Gap. Seed empty candidate_resolutions (LLM's
+                // channel) + empty evidence_anchors (no node-id refs
+                // yet) + record the annotation token under
+                // source_annotation_ids for idempotent replay.
+                let gap = GapTopic {
+                    concern: concern_line,
+                    description: description.clone(),
+                    demand_state: "open".to_string(),
+                    candidate_resolutions: Vec::new(),
+                    evidence_anchors: Vec::new(),
+                    source_annotation_ids: vec![annotation_token.clone()],
+                };
+                ("created_gap", gap, true)
+            } else if current_shape.as_str() == NODE_SHAPE_GAP {
+                // Merge into existing GapTopic. Idempotent on the anchor.
+                let mut gap = match shape_view.unwrap().payload {
+                    Some(ShapePayload::Gap(g)) => g,
+                    other => {
+                        return Err(anyhow!(
+                            "materialize_gap_node: target '{}' is shape 'gap' but \
+                             payload does not deserialize as GapTopic (got {:?})",
+                            target_node_id,
+                            other.is_some()
+                        ));
+                    }
+                };
+                // v5 audit P6: dedup against BOTH the new
+                // source_annotation_ids channel AND the legacy
+                // evidence_anchors slot (for rollover compat: pre-audit
+                // rows carry the token on evidence_anchors).
+                let already = gap
+                    .source_annotation_ids
+                    .iter()
+                    .chain(gap.evidence_anchors.iter())
+                    .any(|a| a == &annotation_token);
+                if !already {
+                    // Append the token to the provenance channel. Don't
+                    // mutate concern / description of an existing gap
+                    // (the original concern is load-bearing for operators)
+                    // and don't touch candidate_resolutions (LLM channel).
+                    gap.source_annotation_ids.push(annotation_token.clone());
+                }
+                let action_label = if already { "no_op" } else { "appended_anchor" };
+                (action_label, gap, false)
+            } else if current_shape.as_str() == NODE_SHAPE_DEBATE
+                || current_shape.as_str() == NODE_SHAPE_META_LAYER
+            {
+                // Don't destroy typed nodes — no_op loud. Phase 8 decides
+                // whether to create a sibling Gap node (new id). Phase 7c
+                // verifier: emit a chronicle `gap_dispatcher_skipped` event
+                // alongside the tracing::warn so operators see the skip in
+                // the same surface as every other chain action
+                // (feedback_loud_deferrals). Mirrors the Phase 7b
+                // `meta_layer_oracle_skipped` pattern.
+                warn!(
+                    "[mechanical] materialize_gap_node slug={} target={} shape={} → skip (Phase 8 will decide sibling-Gap policy)",
+                    ctx.slug, target_node_id, current_shape,
+                );
+                let skip_meta = serde_json::json!({
+                    "target_node_id": target_node_id,
+                    "annotation_id": annotation_id,
+                    "existing_shape": current_shape.as_str(),
+                    "reason": "shape_incompatible",
+                    "detail": format!(
+                        "target '{}' is shape '{}' — gap_dispatcher will not overwrite \
+                         a typed node. Phase 8 may create a sibling Gap node.",
+                        target_node_id, current_shape,
+                    ),
+                })
+                .to_string();
+                let _ = super::observation_events::write_observation_event(
+                    &conn_guard,
+                    &ctx.slug,
+                    "chain",
+                    "gap_dispatcher_skipped",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&target_node_id),
+                    None,
+                    Some(&skip_meta),
+                );
+                drop(conn_guard);
+                return Ok(serde_json::json!({
+                    "action": "skipped_shape_incompatible",
+                    "reason": format!(
+                        "target '{}' is shape '{}' — gap_dispatcher will not overwrite \
+                         a typed node. Phase 8 may create a sibling Gap node.",
+                        target_node_id, current_shape,
+                    ),
+                    "target_node_id": target_node_id,
+                    "annotation_id": annotation_id,
+                }));
+            } else {
+                // Unknown shape (scaffolding / debate / meta_layer / gap are
+                // the genesis shapes; any other value is a vocab extension
+                // the writer doesn't know how to handle yet).
+                drop(conn_guard);
+                return Err(anyhow!(
+                    "materialize_gap_node: target '{}' has unknown shape '{}' — \
+                     only scaffolding / gap / debate / meta_layer are handled \
+                     (debate + meta_layer skip-loud; scaffolding + gap mutate). \
+                     Publish a gap_dispatcher extension before introducing new \
+                     node shapes.",
+                    target_node_id,
+                    current_shape
+                ));
+            };
+
+            // Write back (scaffolding → gap sets node_shape = 'gap';
+            // existing gap just updates shape_payload_json).
+            let payload_json = serde_json::to_string(&updated_gap)?;
+            conn_guard.execute(
+                "UPDATE pyramid_nodes
+                 SET node_shape = ?1, shape_payload_json = ?2
+                 WHERE slug = ?3 AND id = ?4",
+                rusqlite::params![
+                    NODE_SHAPE_GAP,
+                    payload_json,
+                    ctx.slug,
+                    target_node_id,
+                ],
+            )?;
+
+            // Emit gap_detected only on the shape upgrade (scaffolding→gap).
+            // Append-to-existing-gap does NOT re-emit (the chronicle already
+            // carries the original gap_detected).
+            //
+            // Phase 7c verifier: metadata carries `concern` in addition to
+            // the bookkeeping fields. Downstream consumers (FE gap surface,
+            // Phase 8 LLM candidate generation) need a human-readable
+            // summary line without a second DB read.
+            let mut gap_detected_event_id: Option<i64> = None;
+            if shape_was_upgraded {
+                let meta = serde_json::json!({
+                    "target_node_id": target_node_id,
+                    "annotation_id": annotation_id,
+                    "author": ann_author,
+                    "demand_state": updated_gap.demand_state,
+                    "concern": updated_gap.concern,
+                })
+                .to_string();
+                let eid = super::observation_events::write_observation_event(
+                    &conn_guard,
+                    &ctx.slug,
+                    "chain",
+                    "gap_detected",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&target_node_id),
+                    None,
+                    Some(&meta),
+                )?;
+                gap_detected_event_id = Some(eid);
+            }
+            drop(conn_guard);
+
+            info!(
+                "[mechanical] materialize_gap_node slug={} target={} action={} gap_detected_event_id={:?}",
+                ctx.slug, target_node_id, action, gap_detected_event_id
+            );
+
+            let updated_payload_value =
+                serde_json::to_value(&updated_gap).unwrap_or(Value::Null);
+            Ok(serde_json::json!({
+                "action": action,
+                "target_node_id": target_node_id,
+                "annotation_id": annotation_id,
+                "shape_was_upgraded": shape_was_upgraded,
+                "gap_detected_event_id": gap_detected_event_id,
+                "updated_payload": updated_payload_value,
+            }))
+        }
+        // ── Post-build accretion v5 Phase 9c-1: starter-debate-collapse ─────
+        //
+        // Closes the Phase 8-3 `emit_debate_collapsed` dormant-emitter gap.
+        // Three mechanicals back `starter-debate-collapse.yaml`. The chain
+        // fires on `annotation_reacted` events whose vocab entry nominates
+        // `starter-debate-collapse` (the `debate_collapse` annotation type).
+        // Separate from debate_steward because semantics are opposite —
+        // steward appends, collapser finalizes.
+        //
+        // Shape transition on finalize: Debate → Scaffolding + NULL payload
+        // (the debate is resolved; the node returns to scaffolding carrying
+        // the conclusion in the final distilled/annotation state). The
+        // emitted `debate_collapsed` event captures the terminal debate
+        // state (concern, position labels, vote_lean) in metadata for
+        // audit trail — no in-place "collapsed" marker on DebateTopic.
+        "emit_debate_collapse_invoked" => {
+            // Chronicle-only observability — mirrors emit_debate_steward_invoked's
+            // threading discipline so later steps still see work_item_id /
+            // annotation_id / annotation_type after this step's output.
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str());
+            let annotation_id = input.get("annotation_id").and_then(|v| v.as_i64());
+            let annotation_type = input
+                .get("annotation_type")
+                .and_then(|v| v.as_str());
+            let mut meta = serde_json::Map::new();
+            if let Some(tid) = target_node_id {
+                meta.insert(
+                    "target_node_id".to_string(),
+                    Value::String(tid.to_string()),
+                );
+            }
+            if let Some(aid) = annotation_id {
+                meta.insert("annotation_id".to_string(), Value::from(aid));
+            }
+            if let Some(at) = annotation_type {
+                meta.insert(
+                    "annotation_type".to_string(),
+                    Value::String(at.to_string()),
+                );
+            }
+            let metadata_json = if meta.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&Value::Object(meta))?)
+            };
+            info!(
+                "[mechanical] emit_debate_collapse_invoked slug={} target={:?} annotation_id={:?} annotation_type={:?}",
+                ctx.slug, target_node_id, annotation_id, annotation_type
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "debate_collapse_invoked",
+                None,
+                None,
+                None,
+                None,
+                target_node_id,
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            Ok(Value::Object(out))
+        }
+        "load_collapse_context" => {
+            // Resolves the triggering annotation + target shape + existing
+            // DebateTopic payload (if present). Mirrors load_gap_context /
+            // load_annotation_and_target back-fill pattern: annotation_id
+            // and annotation_type arrive directly on the input envelope OR
+            // get pulled from the triggering observation event's metadata
+            // via the work item's observation_event_ids column.
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "load_collapse_context: missing target_node_id"
+                ))?
+                .to_string();
+
+            let mut annotation_id = input.get("annotation_id").and_then(|v| v.as_i64());
+            let mut annotation_type = input
+                .get("annotation_type")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            if annotation_id.is_none() || annotation_type.is_none() {
+                let work_item_id = input
+                    .get("work_item_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                if let Some(wid) = work_item_id.as_deref() {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let obs_ids_json: Option<String> = conn_guard
+                        .query_row(
+                            "SELECT observation_event_ids FROM dadbear_work_items WHERE id = ?1",
+                            rusqlite::params![wid],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    if let Some(ids_json) = obs_ids_json {
+                        if let Ok(ids) = serde_json::from_str::<Vec<i64>>(&ids_json) {
+                            if let Some(eid) = ids.first() {
+                                let meta: Option<String> = conn_guard
+                                    .query_row(
+                                        "SELECT metadata_json FROM dadbear_observation_events WHERE id = ?1",
+                                        rusqlite::params![eid],
+                                        |row| row.get(0),
+                                    )
+                                    .ok()
+                                    .flatten();
+                                if let Some(m) = meta {
+                                    if let Ok(v) = serde_json::from_str::<Value>(&m) {
+                                        if annotation_id.is_none() {
+                                            annotation_id =
+                                                v.get("annotation_id").and_then(|x| x.as_i64());
+                                        }
+                                        if annotation_type.is_none() {
+                                            annotation_type = v
+                                                .get("annotation_type")
+                                                .and_then(|x| x.as_str())
+                                                .map(String::from);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    drop(conn_guard);
+                }
+            }
+
+            let conn_guard = ctx.db_reader.lock().await;
+
+            let annotation_obj: Value = if let Some(aid) = annotation_id {
+                let row: Option<(i64, String, String, String, Option<String>, String, String, String)> = conn_guard
+                    .query_row(
+                        "SELECT id, slug, node_id, annotation_type, question_context, author,
+                                content, created_at
+                         FROM pyramid_annotations WHERE id = ?1",
+                        rusqlite::params![aid],
+                        |r| Ok((
+                            r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?,
+                            r.get(5)?, r.get(6)?, r.get(7)?,
+                        )),
+                    )
+                    .ok();
+                if let Some((id, slug, node_id, aty, qctx, author, content, created_at)) = row {
+                    if annotation_type.as_deref() != Some(aty.as_str()) {
+                        annotation_type = Some(aty.clone());
+                    }
+                    serde_json::json!({
+                        "id": id,
+                        "slug": slug,
+                        "node_id": node_id,
+                        "annotation_type": aty,
+                        "question_context": qctx,
+                        "author": author,
+                        "content": content,
+                        "created_at": created_at,
+                    })
+                } else {
+                    Value::Null
+                }
+            } else {
+                Value::Null
+            };
+
+            let node_row: Option<(i64, String, String)> = conn_guard
+                .query_row(
+                    "SELECT depth, headline, distilled FROM pyramid_nodes
+                     WHERE slug = ?1 AND id = ?2",
+                    rusqlite::params![ctx.slug, target_node_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok();
+            let shape_view = super::db::get_node_shape(&conn_guard, &ctx.slug, &target_node_id)?;
+            drop(conn_guard);
+
+            let (current_shape, existing_debate_payload, target_obj) =
+                if let Some((depth, headline, distilled)) = node_row {
+                    let current_shape = shape_view
+                        .as_ref()
+                        .map(|v| v.shape.as_str().to_string())
+                        .unwrap_or_else(|| "scaffolding".to_string());
+                    let existing_debate = match shape_view.as_ref().and_then(|v| v.payload.as_ref()) {
+                        Some(ShapePayload::Debate(d)) => serde_json::to_value(d).ok(),
+                        _ => None,
+                    };
+                    let current_payload = shape_view
+                        .as_ref()
+                        .and_then(|v| v.payload.as_ref())
+                        .and_then(|p| serde_json::to_value(p).ok())
+                        .unwrap_or(Value::Null);
+                    let target = serde_json::json!({
+                        "id": target_node_id,
+                        "depth": depth,
+                        "headline": headline,
+                        "distilled": distilled,
+                        "current_shape": current_shape,
+                        "current_payload": current_payload,
+                    });
+                    (current_shape, existing_debate, target)
+                } else {
+                    ("scaffolding".to_string(), None, Value::Null)
+                };
+
+            info!(
+                "[mechanical] load_collapse_context slug={} target={} annotation_id={:?} annotation_type={:?} current_shape={}",
+                ctx.slug, target_node_id, annotation_id, annotation_type, current_shape,
+            );
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert(
+                "target_node_id".to_string(),
+                Value::String(target_node_id.clone()),
+            );
+            out.insert(
+                "annotation_id".to_string(),
+                annotation_id.map(Value::from).unwrap_or(Value::Null),
+            );
+            out.insert(
+                "annotation_type".to_string(),
+                annotation_type
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+            out.insert("annotation".to_string(), annotation_obj);
+            out.insert("target_node".to_string(), target_obj);
+            out.insert("target_shape".to_string(), Value::String(current_shape));
+            out.insert(
+                "existing_debate_payload".to_string(),
+                existing_debate_payload.unwrap_or(Value::Null),
+            );
+            Ok(Value::Object(out))
+        }
+        "finalize_debate_node" => {
+            // Core collapse writer. Given a `debate_collapse` annotation +
+            // target node:
+            //   - Debate → transition node_shape to 'scaffolding', NULL
+            //     the shape_payload_json. The resolved debate state
+            //     (concern, position labels, vote_lean) is preserved in
+            //     the emitted `debate_collapsed` observation event's
+            //     metadata for audit trail.
+            //   - Scaffolding / Gap / MetaLayer → skip loud (not
+            //     destructive): emit `debate_collapse_skipped` event
+            //     with a reason so the operator sees it in the
+            //     chronicle (feedback_loud_deferrals).
+            //   - Unknown shape → raise.
+            let target_node_id = input
+                .get("target_node_id")
+                .or_else(|| input.get("target_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "finalize_debate_node: missing target_node_id"
+                ))?
+                .to_string();
+            let annotation_id: Option<i64> = input.get("annotation_id").and_then(|v| v.as_i64());
+            let annotation_obj = input.get("annotation").cloned().unwrap_or(Value::Null);
+
+            // Pull annotation content + author. Prefer the threaded
+            // `annotation` object; fall back to a DB read. Loud-raise on
+            // missing row (same discipline as append_annotation_to_debate_node
+            // and materialize_gap_node).
+            let ann_content: Option<String>;
+            let ann_author: Option<String>;
+            {
+                let threaded_content = annotation_obj
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let threaded_author = annotation_obj
+                    .get("author")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                if threaded_content.is_some() && threaded_author.is_some() {
+                    ann_content = threaded_content;
+                    ann_author = threaded_author;
+                } else if let Some(aid) = annotation_id {
+                    let conn_guard = ctx.db_reader.lock().await;
+                    let row: Option<(String, String)> = conn_guard
+                        .query_row(
+                            "SELECT content, author FROM pyramid_annotations WHERE id = ?1",
+                            rusqlite::params![aid],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .ok();
+                    drop(conn_guard);
+                    match row {
+                        Some((c, a)) => {
+                            ann_content = Some(c);
+                            ann_author = Some(a);
+                        }
+                        None => {
+                            return Err(anyhow!(
+                                "finalize_debate_node: annotation_id={} not \
+                                 found in pyramid_annotations — stale event or deleted row. \
+                                 Target '{}' will not be mutated.",
+                                aid,
+                                target_node_id,
+                            ));
+                        }
+                    }
+                } else {
+                    // Direct invocation without annotation context is
+                    // acceptable for this chain — an operator may invoke
+                    // starter-debate-collapse as a library call. In that
+                    // case content/author are whatever the caller stamped
+                    // on annotation_obj, or None. Don't loud-raise.
+                    ann_content = None;
+                    ann_author = None;
+                }
+            }
+
+            // Serialize the transition under the writer mutex so concurrent
+            // collapse annotations on the same target don't race.
+            let conn_guard = ctx.db_writer.lock().await;
+            let shape_view =
+                super::db::get_node_shape(&conn_guard, &ctx.slug, &target_node_id)?;
+            let current_shape = shape_view
+                .as_ref()
+                .map(|v| v.shape.clone())
+                .unwrap_or_else(NodeShape::scaffolding);
+            let existing_debate: Option<DebateTopic> =
+                match shape_view.as_ref().and_then(|v| v.payload.as_ref()) {
+                    Some(ShapePayload::Debate(d)) => Some(d.clone()),
+                    _ => None,
+                };
+
+            if current_shape.as_str() == NODE_SHAPE_DEBATE {
+                // Canonical collapse path: transition to scaffolding, NULL
+                // the payload, emit `debate_collapsed` with the terminal
+                // debate state in metadata.
+                //
+                // v5 Phase 9c-1 verifier: the UPDATE + event-emit must be
+                // atomic. Without a transaction, a crash between the UPDATE
+                // and the event write leaves the node transitioned but the
+                // audit trail missing — worse than a pre-crash state because
+                // the terminal debate payload is already NULL in
+                // pyramid_nodes, so the debate content is unrecoverable.
+                // Wrap in SAVEPOINT so any mid-flight failure rolls BOTH
+                // back (feedback_loud_deferrals: integrity first).
+                let debate_ref = existing_debate.as_ref();
+                let position_labels: Vec<String> = debate_ref
+                    .map(|d| d.positions.iter().map(|p| p.label.clone()).collect())
+                    .unwrap_or_default();
+                let concern = debate_ref
+                    .map(|d| d.concern.clone())
+                    .unwrap_or_default();
+                let vote_lean_json = debate_ref
+                    .and_then(|d| d.vote_lean.as_ref())
+                    .and_then(|v| serde_json::to_value(v).ok())
+                    .unwrap_or(Value::Null);
+                let positions_remaining = position_labels.len();
+
+                // v5 Phase 9c-1 verifier: the debate payload is destroyed
+                // by the transition (shape_payload_json → NULL). Serialize
+                // the FULL DebateTopic (not just labels) into the
+                // observation event metadata so the chronicle carries every
+                // steel_manning argument, red_team rebuttal, evidence_anchor,
+                // and source_annotation_id. Without the full payload the
+                // audit trail is incomplete — a replay-for-accountability
+                // reader could reconstruct who argued what, not just the
+                // list of position names.
+                let final_debate_payload = debate_ref
+                    .and_then(|d| serde_json::to_value(d).ok())
+                    .unwrap_or(Value::Null);
+
+                // Compose the collapse reason + collapsed_by from the
+                // triggering annotation. Fall back to defaults when the
+                // chain is invoked without annotation context.
+                let reason = ann_content
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "operator_collapsed".to_string());
+                let collapsed_by = ann_author
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "starter-debate-collapse".to_string());
+
+                // Resolve layer BEFORE opening the savepoint so the
+                // read doesn't need to roll back on emit failure.
+                let layer: Option<i64> = conn_guard
+                    .query_row(
+                        "SELECT depth FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
+                        rusqlite::params![ctx.slug, target_node_id],
+                        |r| r.get(0),
+                    )
+                    .ok();
+
+                // Atomic: UPDATE + event emit inside a savepoint. rusqlite
+                // has no Savepoint::new_named on &Connection without &mut,
+                // so drive it via raw SQL.
+                conn_guard.execute_batch("SAVEPOINT finalize_debate_collapse")?;
+                let collapse_result: std::result::Result<i64, anyhow::Error> = (|| {
+                    conn_guard.execute(
+                        "UPDATE pyramid_nodes
+                         SET node_shape = 'scaffolding', shape_payload_json = NULL
+                         WHERE slug = ?1 AND id = ?2",
+                        rusqlite::params![ctx.slug, target_node_id],
+                    )?;
+                    let metadata = serde_json::json!({
+                        "debate_node_id": target_node_id,
+                        "reason": reason,
+                        "positions_remaining": positions_remaining,
+                        "collapsed_by": collapsed_by,
+                        "annotation_id": annotation_id,
+                        "final_concern": concern,
+                        "final_position_labels": position_labels,
+                        "final_vote_lean": vote_lean_json,
+                        // v5 Phase 9c-1 verifier: full payload for audit
+                        // reconstruction (steel_manning/red_teams/evidence_anchors/
+                        // source_annotation_ids all preserved here since the
+                        // node's shape_payload_json is about to be NULLed).
+                        "final_debate_payload": final_debate_payload,
+                    })
+                    .to_string();
+                    let event_id = super::observation_events::write_observation_event(
+                        &conn_guard,
+                        &ctx.slug,
+                        "chain",
+                        "debate_collapsed",
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(&target_node_id),
+                        layer,
+                        Some(&metadata),
+                    )?;
+                    Ok(event_id)
+                })();
+                let debate_collapsed_event_id = match collapse_result {
+                    Ok(eid) => {
+                        conn_guard
+                            .execute_batch("RELEASE SAVEPOINT finalize_debate_collapse")?;
+                        eid
+                    }
+                    Err(e) => {
+                        // Best-effort rollback; if this also fails the outer
+                        // error is the right one to surface.
+                        let _ = conn_guard.execute_batch(
+                            "ROLLBACK TO SAVEPOINT finalize_debate_collapse; \
+                             RELEASE SAVEPOINT finalize_debate_collapse",
+                        );
+                        return Err(anyhow!(
+                            "finalize_debate_node: atomic collapse failed for target '{}' — \
+                             rolled back to pre-transition state: {}",
+                            target_node_id,
+                            e
+                        ));
+                    }
+                };
+                drop(conn_guard);
+
+                info!(
+                    "[mechanical] finalize_debate_node slug={} target={} action=collapsed_to_scaffolding \
+                     debate_collapsed_event_id={} positions_remaining={}",
+                    ctx.slug, target_node_id, debate_collapsed_event_id, positions_remaining
+                );
+
+                Ok(serde_json::json!({
+                    "action": "collapsed_to_scaffolding",
+                    "target_node_id": target_node_id,
+                    "annotation_id": annotation_id,
+                    "debate_collapsed_event_id": debate_collapsed_event_id,
+                    "positions_remaining": positions_remaining,
+                    "final_concern": concern,
+                    "final_position_labels": position_labels,
+                }))
+            } else if current_shape.as_str() == "scaffolding"
+                || current_shape.as_str() == NODE_SHAPE_GAP
+                || current_shape.as_str() == NODE_SHAPE_META_LAYER
+            {
+                // Skip loud (not destructive). Emit chronicle event so the
+                // operator sees the skipped collapse attempt.
+                warn!(
+                    "[mechanical] finalize_debate_node slug={} target={} shape={} → skip \
+                     (debate_collapse annotation on a non-Debate target)",
+                    ctx.slug, target_node_id, current_shape,
+                );
+                let skip_meta = serde_json::json!({
+                    "target_node_id": target_node_id,
+                    "annotation_id": annotation_id,
+                    "existing_shape": current_shape.as_str(),
+                    "reason": "target_not_debate",
+                    "detail": format!(
+                        "target '{}' is shape '{}' — debate_collapse only applies \
+                         to Debate nodes. Non-destructive skip.",
+                        target_node_id, current_shape,
+                    ),
+                })
+                .to_string();
+                let _ = super::observation_events::write_observation_event(
+                    &conn_guard,
+                    &ctx.slug,
+                    "chain",
+                    "debate_collapse_skipped",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&target_node_id),
+                    None,
+                    Some(&skip_meta),
+                );
+                drop(conn_guard);
+                Ok(serde_json::json!({
+                    "action": "skipped_not_debate",
+                    "target_node_id": target_node_id,
+                    "annotation_id": annotation_id,
+                    "existing_shape": current_shape.as_str(),
+                    "reason": format!(
+                        "target '{}' is shape '{}' — only Debate nodes can be \
+                         collapsed. Non-destructive skip.",
+                        target_node_id, current_shape,
+                    ),
+                }))
+            } else {
+                // Unknown shape — raise loud (feedback_loud_deferrals).
+                drop(conn_guard);
+                Err(anyhow!(
+                    "finalize_debate_node: target '{}' has unknown shape '{}' — \
+                     debate_collapse only handles scaffolding / debate / gap / \
+                     meta_layer today. Publish a collapse extension before \
+                     introducing new node shapes.",
+                    target_node_id,
+                    current_shape
+                ))
+            }
+        }
+        // ── Post-build accretion v5 Phase 6b: sub-chain invocation ──────────
+        //
+        // Lets a parent chain call a library chain by id. Phase 7's
+        // debate_steward / meta_layer_oracle / synthesizer chains drive the
+        // post-build accretion judgement flow by wiring the two library
+        // chains `starter-evidence-tester` and `starter-reconciler` into
+        // their step graphs through `call_starter_chain` steps.
+        //
+        // Expected input envelope:
+        //
+        //     {
+        //       "chain_id": "starter-evidence-tester",
+        //       "input": { /* sub-chain's input object */ }
+        //     }
+        //
+        // Optional fields carried inside `input.input`:
+        //     - `_sub_chain_depth: usize` — recursion counter; absent → 0.
+        //
+        // Raises loudly (see `feedback_loud_deferrals`) when:
+        //     - `chain_id` is missing / non-string.
+        //     - `ctx.state` is None (the dispatch path wasn't created by the
+        //       starter runner — library chains are only callable from there).
+        //     - `MAX_SUB_CHAIN_DEPTH` would be reached or exceeded by the
+        //       nested call (cycle detected).
+        //     - `chain_loader::load_chain_by_id` returns an error (unknown
+        //       chain id OR ambiguity).
+        //     - The nested `execute_chain_for_target` call errors — the error
+        //       is propagated with a context prefix naming the chain.
+        "call_starter_chain" => {
+            let sub_chain_id = input
+                .get("chain_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "call_starter_chain: input missing required string field \
+                     `chain_id` (e.g. \"starter-evidence-tester\")"
+                ))?
+                .to_string();
+
+            // Pull the sub-chain's input envelope. `input.input` is what
+            // will be threaded to the library chain's first step; default
+            // to `{}` when unset (some library chains tolerate empty input).
+            //
+            // Phase 6b verifier fix: strict-typed envelope. The depth/target
+            // stamping below (`Value::Object(ref mut map) = sub_input`) is a
+            // no-op when `input` is present-but-non-object, which would silently
+            // drop the cycle-guard envelope and orphan any carried target_id.
+            // Raise loudly per feedback_loud_deferrals: the caller's chain YAML
+            // has a type bug that should surface at first-run rather than as a
+            // mysterious downstream failure.
+            let mut sub_input = match input.get("input") {
+                Some(v) if v.is_object() => v.clone(),
+                None => Value::Object(serde_json::Map::new()),
+                Some(other) => {
+                    return Err(anyhow!(
+                        "call_starter_chain: `input` field for sub-chain '{}' \
+                         must be a JSON object, got `{}`. Library chains receive \
+                         their step input through this envelope; non-object values \
+                         would silently drop the cycle-depth + target_id stamping \
+                         downstream.",
+                        sub_chain_id,
+                        match other {
+                            Value::String(_) => "string",
+                            Value::Number(_) => "number",
+                            Value::Bool(_) => "boolean",
+                            Value::Null => "null",
+                            Value::Array(_) => "array",
+                            Value::Object(_) => unreachable!(),
+                        },
+                    ));
+                }
+            };
+
+            // Depth guard: read `_sub_chain_depth` from the nested input if
+            // the caller already set one, otherwise from the dispatch ctx.
+            // The higher wins so a chain cannot reset the counter.
+            let ctx_depth = ctx.sub_chain_depth.unwrap_or(0);
+            let input_depth = sub_input
+                .get("_sub_chain_depth")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(0);
+            let current_depth = std::cmp::max(ctx_depth, input_depth);
+
+            if current_depth >= MAX_SUB_CHAIN_DEPTH {
+                return Err(anyhow!(
+                    "call_starter_chain: sub-chain recursion depth {} reached \
+                     MAX_SUB_CHAIN_DEPTH={} while invoking '{}' — probable chain cycle. \
+                     Document the intended parent/child chain graph; break the cycle \
+                     at the chain-authorship level.",
+                    current_depth, MAX_SUB_CHAIN_DEPTH, sub_chain_id,
+                ));
+            }
+
+            // ctx.state is threaded in only by the starter runner. The IR
+            // executor, legacy full executor, and dead-letter retry all set
+            // ctx.state = None — library-chain invocation is only available
+            // from the starter runner. feedback_loud_deferrals: raise
+            // instead of silently dropping.
+            let sub_state = ctx.state.as_ref().ok_or_else(|| anyhow!(
+                "call_starter_chain: no PyramidState wired into the dispatch \
+                 context — library-chain invocation is only available under \
+                 `chain_executor::execute_chain_for_target`. Cannot invoke \
+                 sub-chain '{}' from this dispatch path.",
+                sub_chain_id,
+            ))?;
+            let chains_dir = ctx.chains_dir.as_ref().cloned().unwrap_or_else(|| {
+                sub_state.chains_dir.clone()
+            });
+
+            // Load the sub-chain via chain_loader::load_chain_by_id so the
+            // same discovery semantics (defaults/ + defaults/starter/ +
+            // variants/ + ambiguity detection) apply at sub-chain entry.
+            let sub_chain = super::chain_loader::load_chain_by_id(
+                &sub_chain_id,
+                chains_dir.as_path(),
+            )
+            .map_err(|e| anyhow!(
+                "call_starter_chain: failed to load sub-chain '{}': {}",
+                sub_chain_id, e,
+            ))?;
+
+            // Stamp the incremented depth on the sub-input so nested
+            // `call_starter_chain` steps see a monotonic counter even when
+            // the dispatch ctx doesn't get rebuilt in between.
+            let new_depth = current_depth + 1;
+            if let Value::Object(ref mut map) = sub_input {
+                map.insert(
+                    "_sub_chain_depth".to_string(),
+                    Value::from(new_depth as u64),
+                );
+                // Carry forward the parent's target_node_id / target_id
+                // context if the parent had one and the sub-input doesn't
+                // already override it.
+                if let Some(ref tid) = ctx.target_id {
+                    map.entry("target_node_id".to_string())
+                        .or_insert_with(|| Value::String(tid.clone()));
+                }
+            }
+
+            info!(
+                "[mechanical] call_starter_chain slug={} sub_chain_id={} depth={}→{}",
+                ctx.slug, sub_chain_id, current_depth, new_depth,
+            );
+
+            // Recurse into the starter runner. The nested call builds a
+            // fresh ChainDispatchContext internally from `sub_state`, so the
+            // Arc is shared but no state mutation escapes the sub-chain.
+            //
+            // Box::pin is required by E0733: `dispatch_step → dispatch_mechanical
+            // → call_starter_chain → execute_chain_for_target → dispatch_step`
+            // is a recursive async-fn cycle, and Rust needs the returned future
+            // to be heap-allocated so the compiler can resolve its size. The
+            // depth guard above bounds the recursion so boxing cost is O(1)
+            // per level (max MAX_SUB_CHAIN_DEPTH boxes on the stack).
+            let sub_state_clone = sub_state.clone();
+            let slug_clone = ctx.slug.clone();
+            let target_id_clone = ctx.target_id.clone();
+            let sub_chain_id_for_err = sub_chain_id.clone();
+            let sub_output = Box::pin(async move {
+                super::chain_executor::execute_chain_for_target(
+                    &sub_state_clone,
+                    &sub_chain,
+                    &slug_clone,
+                    target_id_clone.as_deref(),
+                    sub_input,
+                )
+                .await
+            })
+            .await
+            .map_err(|e| anyhow!(
+                "call_starter_chain: sub-chain '{}' failed: {}",
+                sub_chain_id_for_err, e,
+            ))?;
+
+            // The parent chain sees the sub-chain's final output verbatim —
+            // threading behavior is the same as any other mechanical step.
+            Ok(sub_output)
+        }
+        // ── Post-build accretion v5 Phase 7d: utility chain primitives ──────
+        //
+        // The primitives below back the four Phase 7d starter chains —
+        // `starter-judge`, `starter-authorize-question`,
+        // `starter-accretion-handler`, and `starter-sweep`. Each follows
+        // the same threading contract as Phase 7a/7b/7c: read what you
+        // need from `input`, preserve the input fields you didn't consume
+        // in the output, loud-raise on missing required fields per
+        // `feedback_loud_deferrals`.
+        "emit_judge_invoked" => {
+            // Chronicle-only trace: records that the generalist `judge`
+            // library chain was invoked with a particular claim. The
+            // claim is threaded through to the LLM step unchanged.
+            let claim = input.get("claim").and_then(|v| v.as_str());
+            let criteria = input.get("criteria").and_then(|v| v.as_str());
+            let mut meta = serde_json::Map::new();
+            if let Some(c) = claim {
+                // Cap the claim preview in metadata so unusually-long
+                // claims don't bloat the chronicle row.
+                let preview: String = c.chars().take(500).collect();
+                meta.insert("claim_preview".to_string(), Value::String(preview));
+            }
+            if let Some(c) = criteria {
+                let preview: String = c.chars().take(300).collect();
+                meta.insert(
+                    "criteria_preview".to_string(),
+                    Value::String(preview),
+                );
+            }
+            let metadata_json = if meta.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&Value::Object(meta))?)
+            };
+            info!(
+                "[mechanical] emit_judge_invoked slug={} claim_present={} criteria_present={}",
+                ctx.slug,
+                claim.is_some(),
+                criteria.is_some(),
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "judge_invoked",
+                None,
+                None,
+                None,
+                None,
+                None, // judge is slug-level (or caller-level), not node-bound
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+            // Thread input through — the next LLM step needs claim/context/criteria.
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            Ok(Value::Object(out))
+        }
+        "emit_authorize_invoked" => {
+            // Chronicle-only trace: records that authorize_question was
+            // invoked for a slug + question pair. Threads input through
+            // so load_slug_purpose can read `slug` and the LLM step can
+            // read `question`.
+            let question = input.get("question").and_then(|v| v.as_str());
+            let slug_in = input.get("slug").and_then(|v| v.as_str());
+            let mut meta = serde_json::Map::new();
+            if let Some(q) = question {
+                let preview: String = q.chars().take(500).collect();
+                meta.insert(
+                    "question_preview".to_string(),
+                    Value::String(preview),
+                );
+            }
+            if let Some(s) = slug_in {
+                meta.insert("slug".to_string(), Value::String(s.to_string()));
+            }
+            let metadata_json = if meta.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&Value::Object(meta))?)
+            };
+            info!(
+                "[mechanical] emit_authorize_invoked slug={} question_present={}",
+                ctx.slug,
+                question.is_some(),
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "authorize_question_invoked",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            Ok(Value::Object(out))
+        }
+        "load_slug_purpose" => {
+            // Reads the active purpose row for `slug` via
+            // `purpose::load_or_create_purpose` (which seeds a stock
+            // purpose from ContentType if the slug has none). Returns
+            // the envelope with `purpose_text` + `stock_purpose_key`
+            // merged in so the LLM step sees the authoritative gating
+            // text.
+            //
+            // Input `slug` takes precedence over ctx.slug — the caller
+            // may be asking about a slug different from the one the
+            // chain was invoked against (library-chain pattern). Fall
+            // back to ctx.slug if not set.
+            let slug_for_purpose = input
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| ctx.slug.clone());
+
+            let (purpose_text, stock_purpose_key) = {
+                let conn_guard = ctx.db_reader.lock().await;
+                match super::purpose::load_or_create_purpose(
+                    &conn_guard,
+                    &slug_for_purpose,
+                ) {
+                    Ok(p) => (p.purpose_text, p.stock_purpose_key),
+                    Err(e) => {
+                        drop(conn_guard);
+                        // Loud raise: if the slug doesn't exist, this is
+                        // a caller bug. Per feedback_loud_deferrals we
+                        // don't paper over with an empty purpose.
+                        return Err(anyhow!(
+                            "load_slug_purpose: failed to load purpose for slug '{}': {}",
+                            slug_for_purpose,
+                            e,
+                        ));
+                    }
+                }
+            };
+
+            info!(
+                "[mechanical] load_slug_purpose slug={} purpose_len={} stock_key={:?}",
+                slug_for_purpose,
+                purpose_text.len(),
+                stock_purpose_key,
+            );
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("slug".to_string(), Value::String(slug_for_purpose));
+            out.insert(
+                "purpose_text".to_string(),
+                Value::String(purpose_text),
+            );
+            out.insert(
+                "stock_purpose_key".to_string(),
+                stock_purpose_key
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+            Ok(Value::Object(out))
+        }
+        "emit_accretion_invoked" => {
+            // Chronicle-only trace for the accretion_handler role.
+            let node_id = input.get("node_id").and_then(|v| v.as_str());
+            let window_n = input.get("window_n").and_then(|v| v.as_i64());
+            let mut meta = serde_json::Map::new();
+            if let Some(n) = node_id {
+                meta.insert("node_id".to_string(), Value::String(n.to_string()));
+            }
+            if let Some(w) = window_n {
+                meta.insert("window_n".to_string(), Value::from(w));
+            }
+            let metadata_json = if meta.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&Value::Object(meta))?)
+            };
+            info!(
+                "[mechanical] emit_accretion_invoked slug={} node_id={:?} window_n={:?}",
+                ctx.slug, node_id, window_n,
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "accretion_invoked",
+                None,
+                None,
+                None,
+                None,
+                node_id,
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            Ok(Value::Object(out))
+        }
+        "load_recent_annotations_for_slug" => {
+            // Reads up to `window_n` most recent annotations for the
+            // slug (optionally scoped to a single node_id) plus the
+            // slug's active purpose_text. Returns the envelope the LLM
+            // step needs to synthesize an accretion note.
+            //
+            // `window_n` is the hard cap on how many rows the LLM sees
+            // — it protects the prompt from runaway token spend on a
+            // slug with thousands of annotations. It shapes LLM input,
+            // so per `feedback_pillar37_no_hedging` the number MUST
+            // live in the caller's envelope (YAML step.input / chain
+            // caller) rather than be baked into Rust. We loud-raise
+            // when absent instead of defaulting silently.
+            //
+            // Phase 7d verifier fix (Pillar 37): was `unwrap_or(20)`
+            // which smuggled a token-budget knob into Rust. The 7d
+            // trigger wiring (Phase 9) is expected to pass `window_n`
+            // at its call site; when operators supersede the
+            // accretion_handler binding to a specialized chain, that
+            // chain's YAML encodes its own window.
+            let window_n = input
+                .get("window_n")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| anyhow!(
+                    "load_recent_annotations_for_slug: required field \
+                     `window_n` is missing from the input envelope. \
+                     Pass it from the caller (e.g. \
+                     `call_starter_chain` input: {{ window_n: N }}) or \
+                     from the chain-level initial input — baking a \
+                     default into Rust would violate Pillar 37 \
+                     (feedback_pillar37_no_hedging), since window_n \
+                     shapes the LLM synthesis prompt's token budget."
+                ))?
+                .max(1);
+            let node_id_filter = input
+                .get("node_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let slug_for_load = input
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| ctx.slug.clone());
+
+            // Load purpose + annotations under a single reader lock.
+            // v5 audit P10: accretion_cursor is now a DB column on
+            // pyramid_slugs. Read it here and filter annotations to
+            // `id > cursor` so repeated invocations don't reprocess the
+            // same rows. A fresh slug has cursor=0 (default) which
+            // matches every annotation.
+            let (purpose_text, annotations, total_count, accretion_cursor) = {
+                let conn_guard = ctx.db_reader.lock().await;
+                let p = super::purpose::load_or_create_purpose(
+                    &conn_guard,
+                    &slug_for_load,
+                )
+                .map_err(|e| anyhow!(
+                    "load_recent_annotations_for_slug: failed to load purpose for slug '{}': {}",
+                    slug_for_load, e,
+                ))?;
+
+                // Read the slug's current accretion cursor (default 0).
+                let cursor: i64 = conn_guard
+                    .query_row(
+                        "SELECT COALESCE(accretion_cursor, 0) FROM pyramid_slugs
+                          WHERE slug = ?1",
+                        rusqlite::params![slug_for_load],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+
+                // Count total annotations strictly beyond the cursor.
+                let total: i64 = if let Some(nid) = node_id_filter.as_deref() {
+                    conn_guard
+                        .query_row(
+                            "SELECT COUNT(*) FROM pyramid_annotations
+                              WHERE slug = ?1 AND node_id = ?2 AND id > ?3",
+                            rusqlite::params![slug_for_load, nid, cursor],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0)
+                } else {
+                    conn_guard
+                        .query_row(
+                            "SELECT COUNT(*) FROM pyramid_annotations
+                              WHERE slug = ?1 AND id > ?2",
+                            rusqlite::params![slug_for_load, cursor],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0)
+                };
+
+                // Load the window_n most recent annotations beyond cursor.
+                let mut anns: Vec<Value> = Vec::new();
+                if let Some(nid) = node_id_filter.as_deref() {
+                    let mut stmt = conn_guard.prepare(
+                        "SELECT id, node_id, annotation_type, content, author, created_at
+                           FROM pyramid_annotations
+                          WHERE slug = ?1 AND node_id = ?2 AND id > ?3
+                          ORDER BY id DESC LIMIT ?4",
+                    )?;
+                    let rows = stmt.query_map(
+                        rusqlite::params![slug_for_load, nid, cursor, window_n],
+                        |row| {
+                            Ok(serde_json::json!({
+                                "id": row.get::<_, i64>(0)?,
+                                "node_id": row.get::<_, String>(1)?,
+                                "annotation_type": row.get::<_, String>(2)?,
+                                "content": row.get::<_, String>(3)?,
+                                "author": row.get::<_, String>(4)?,
+                                "created_at": row.get::<_, String>(5)?,
+                            }))
+                        },
+                    )?;
+                    for r in rows {
+                        anns.push(r?);
+                    }
+                } else {
+                    let mut stmt = conn_guard.prepare(
+                        "SELECT id, node_id, annotation_type, content, author, created_at
+                           FROM pyramid_annotations
+                          WHERE slug = ?1 AND id > ?2
+                          ORDER BY id DESC LIMIT ?3",
+                    )?;
+                    let rows = stmt.query_map(
+                        rusqlite::params![slug_for_load, cursor, window_n],
+                        |row| {
+                            Ok(serde_json::json!({
+                                "id": row.get::<_, i64>(0)?,
+                                "node_id": row.get::<_, String>(1)?,
+                                "annotation_type": row.get::<_, String>(2)?,
+                                "content": row.get::<_, String>(3)?,
+                                "author": row.get::<_, String>(4)?,
+                                "created_at": row.get::<_, String>(5)?,
+                            }))
+                        },
+                    )?;
+                    for r in rows {
+                        anns.push(r?);
+                    }
+                }
+                (p.purpose_text, anns, total, cursor)
+            };
+
+            // Phase 7d verifier fix: compute the maximum annotation id
+            // in the loaded window so `emit_accretion_written` can
+            // stamp it as an `accretion_cursor` marker in the event
+            // metadata. No DB-backed cursor exists today (Phase 9
+            // decides cursor schema + atomic update semantics — see
+            // the chain YAML's trigger-investigation block), so until
+            // then repeated invocations reprocess the same annotations
+            // and emit duplicate accretion notes. Stamping the cursor
+            // value on the event gives operators (and future Phase 9
+            // wiring) the data needed to reconstruct a cursor from the
+            // chronicle without adding a schema migration in 7d.
+            // feedback_loud_deferrals: the limitation is now visible
+            // in the event stream, not hidden behind a stub.
+            let max_annotation_id: Option<i64> = annotations
+                .iter()
+                .filter_map(|a| a.get("id").and_then(|v| v.as_i64()))
+                .max();
+
+            info!(
+                "[mechanical] load_recent_annotations_for_slug slug={} loaded={} total={} max_id={:?} node_id_filter={:?}",
+                slug_for_load,
+                annotations.len(),
+                total_count,
+                max_annotation_id,
+                node_id_filter,
+            );
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert(
+                "slug".to_string(),
+                Value::String(slug_for_load),
+            );
+            out.insert(
+                "purpose_text".to_string(),
+                Value::String(purpose_text),
+            );
+            out.insert(
+                "annotations".to_string(),
+                Value::Array(annotations),
+            );
+            out.insert(
+                "annotation_count".to_string(),
+                Value::from(total_count),
+            );
+            out.insert(
+                "max_annotation_id".to_string(),
+                max_annotation_id
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
+            );
+            // v5 audit P10: thread the cursor value BEFORE this run so
+            // emit_accretion_written can confirm it was advanced.
+            out.insert(
+                "accretion_cursor_before".to_string(),
+                Value::from(accretion_cursor),
+            );
+            Ok(Value::Object(out))
+        }
+        "emit_accretion_written" => {
+            // Chronicle trace recording the accretion note the LLM
+            // step produced. The note body + references land in
+            // metadata so downstream FAQ / meta-layer consumers can
+            // find and cite it without a second DB read.
+            //
+            // Reads the LLM step's threaded output — specifically the
+            // `note` (string) and `references` (array of ints) fields
+            // the synthesize_accretion_note step returns. Missing
+            // `note` is loud-raised: an accretion_written event with
+            // no note is a dropped result, not a deferral target.
+            let note = input
+                .get("note")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "emit_accretion_written: missing `note` in input — the \
+                     synthesize_accretion_note LLM step must precede this \
+                     primitive and return a `note` field. Threading is \
+                     preserve-by-default in the chain executor; if the LLM \
+                     step succeeded but `note` is missing, the schema \
+                     enforcement failed upstream."
+                ))?
+                .to_string();
+            let references = input
+                .get("references")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(vec![]));
+            let slug_for_write = input
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| ctx.slug.clone());
+            let node_id = input.get("node_id").and_then(|v| v.as_str());
+
+            // v5 audit P10: accretion_cursor is a DB column on
+            // pyramid_slugs. Carry the maximum annotation id from the
+            // preceding load step as the new cursor value. The UPDATE +
+            // chronicle insert run in the SAME transaction so replay of
+            // the chronicle (without the UPDATE) can't duplicate-process.
+            // The chronicle metadata continues to stamp the cursor for
+            // audit trail / operator observability, but is no longer the
+            // authoritative source.
+            //
+            // Null max_annotation_id occurs when load_recent_annotations
+            // returned zero rows — in that case we should not advance
+            // the cursor (nothing was processed).
+            let new_cursor: Option<i64> = input
+                .get("max_annotation_id")
+                .and_then(|v| v.as_i64());
+            let accretion_cursor_value = new_cursor
+                .map(Value::from)
+                .unwrap_or(Value::Null);
+
+            let meta = serde_json::json!({
+                "note": note,
+                "references": references,
+                "accretion_cursor": accretion_cursor_value,
+            });
+            let metadata_json = serde_json::to_string(&meta)?;
+
+            info!(
+                "[mechanical] emit_accretion_written slug={} note_len={} references={} new_cursor={:?}",
+                slug_for_write,
+                note.len(),
+                meta["references"]
+                    .as_array()
+                    .map(|a| a.len())
+                    .unwrap_or(0),
+                new_cursor,
+            );
+            let mut conn_guard = ctx.db_writer.lock().await;
+            let tx = conn_guard.transaction()?;
+            let event_id = super::observation_events::write_observation_event(
+                &tx,
+                &slug_for_write,
+                "chain",
+                "accretion_written",
+                None,
+                None,
+                None,
+                None,
+                node_id,
+                None,
+                Some(&metadata_json),
+            )?;
+            // Advance the cursor atomically with the chronicle write.
+            // Monotonic-only: never rewind (defensive against out-of-order
+            // callers). NULL max_annotation_id → no advance.
+            if let Some(c) = new_cursor {
+                tx.execute(
+                    "UPDATE pyramid_slugs
+                        SET accretion_cursor = ?1
+                      WHERE slug = ?2
+                        AND COALESCE(accretion_cursor, 0) < ?1",
+                    rusqlite::params![c, slug_for_write],
+                )?;
+            }
+            tx.commit()?;
+            drop(conn_guard);
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            Ok(Value::Object(out))
+        }
+        "emit_sweep_invoked" => {
+            // Chronicle-only trace: a sweep has begun against this slug.
+            let stale_days = input
+                .get("stale_days")
+                .and_then(|v| v.as_i64());
+            let mut meta = serde_json::Map::new();
+            if let Some(d) = stale_days {
+                meta.insert("stale_days".to_string(), Value::from(d));
+            }
+            let metadata_json = if meta.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&Value::Object(meta))?)
+            };
+            info!(
+                "[mechanical] emit_sweep_invoked slug={} stale_days={:?}",
+                ctx.slug, stale_days,
+            );
+            let conn_guard = ctx.db_writer.lock().await;
+            let event_id = super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "sweep_invoked",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                metadata_json.as_deref(),
+            )?;
+            drop(conn_guard);
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("emitted".to_string(), Value::from(true));
+            out.insert("event_id".to_string(), Value::from(event_id));
+            Ok(Value::Object(out))
+        }
+        "count_stale_failed_work_items" => {
+            // Measurement-only (Phase 7d MVP): count
+            // `dadbear_work_items` in state='failed' whose
+            // state_changed_at is older than stale_days days old.
+            // Emits a `sweep_stale_failed_counted` chronicle event so
+            // operators can key on the number.
+            //
+            // No mutation — Phase 9 decides archive vs. delete
+            // semantics (deletion semantics interact with the
+            // supervisor's retry-back-off window). Per
+            // feedback_no_deferral_creep: this measurement IS the
+            // MVP deliverable, not a stub — a number is real
+            // operator signal.
+            //
+            // Phase 7d verifier fix (operator-policy separation, NOT
+            // Pillar 37): stale_days is a policy knob — "what counts
+            // as stale?" — that different operators will disagree on.
+            //
+            // Audit-pass clarification: Pillar 37's literal text is "a
+            // number constraining LLM output"; stale_days is a SQL
+            // threshold against state_changed_at, not an LLM input, so
+            // Pillar 37 doesn't apply. The right architectural principle
+            // here is the broader "dispatch code does not decide policy"
+            // rule (same rule that keeps temperature / max_tokens out of
+            // Rust, just for a different reason). Baking 30 days into the
+            // primitive would hard-code retention policy onto every
+            // operator that invokes the sweep chain.
+            //
+            // Loud-raise when absent: Phase 9 cron / schedule wiring
+            // passes the operator-specified value; per-slug superseding
+            // chains encode their own value in YAML (step.input or a
+            // chain-level default block when that schema extension lands).
+            // Today the sweep chain has no natural trigger, so the
+            // loud-raise fires only if someone invokes the primitive
+            // directly without stale_days — which is the author bug it's
+            // meant to catch.
+            let stale_days = input
+                .get("stale_days")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| anyhow!(
+                    "count_stale_failed_work_items: required field \
+                     `stale_days` is missing from the input envelope. \
+                     Pass it from the caller (e.g. chain-level \
+                     initial input or a `call_starter_chain` input \
+                     envelope with {{ stale_days: N }}). Operators \
+                     define `stale' — the dispatch code does not."
+                ))?
+                .max(0);
+            let slug_for_count = input
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| ctx.slug.clone());
+
+            // Threshold: "older than N days ago" → state_changed_at <
+            // datetime('now', '-N days').
+            let threshold_modifier = format!("-{} days", stale_days);
+            let count: i64 = {
+                let conn_guard = ctx.db_reader.lock().await;
+                conn_guard
+                    .query_row(
+                        // Phase 9b-3: exclude archived rows so the count
+                        // reflects live operator-actionable debt, not
+                        // sweep-accumulated cold storage.
+                        "SELECT COUNT(*) FROM dadbear_work_items
+                          WHERE slug = ?1
+                            AND state = 'failed'
+                            AND archived_at IS NULL
+                            AND state_changed_at < datetime('now', ?2)",
+                        rusqlite::params![slug_for_count, threshold_modifier],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0)
+            };
+
+            info!(
+                "[mechanical] count_stale_failed_work_items slug={} stale_days={} count={}",
+                slug_for_count, stale_days, count,
+            );
+
+            let meta = serde_json::json!({
+                "stale_days": stale_days,
+                "count": count,
+            });
+            let metadata_json = serde_json::to_string(&meta)?;
+            let conn_guard = ctx.db_writer.lock().await;
+            super::observation_events::write_observation_event(
+                &conn_guard,
+                &slug_for_count,
+                "chain",
+                "sweep_stale_failed_counted",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&metadata_json),
+            )?;
+            drop(conn_guard);
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("slug".to_string(), Value::String(slug_for_count));
+            out.insert("stale_days".to_string(), Value::from(stale_days));
+            out.insert(
+                "stale_failed_count".to_string(),
+                Value::from(count),
+            );
+            Ok(Value::Object(out))
+        }
+        "reindex_vocab_cache" => {
+            // Invalidates the vocab_entries process-wide cache and
+            // warms it by issuing a `list_vocabulary` for each of the
+            // three known vocab_kinds. Emits a
+            // `sweep_vocab_reindexed` chronicle event with per-kind
+            // counts in metadata.
+            super::vocab_entries::invalidate_cache();
+
+            let (ann_count, shape_count, role_count) = {
+                let conn_guard = ctx.db_reader.lock().await;
+                let a = super::vocab_entries::list_vocabulary(
+                    &conn_guard,
+                    super::vocab_entries::VOCAB_KIND_ANNOTATION_TYPE,
+                )
+                .map(|v| v.len() as i64)
+                .unwrap_or(0);
+                let s = super::vocab_entries::list_vocabulary(
+                    &conn_guard,
+                    super::vocab_entries::VOCAB_KIND_NODE_SHAPE,
+                )
+                .map(|v| v.len() as i64)
+                .unwrap_or(0);
+                let r = super::vocab_entries::list_vocabulary(
+                    &conn_guard,
+                    super::vocab_entries::VOCAB_KIND_ROLE_NAME,
+                )
+                .map(|v| v.len() as i64)
+                .unwrap_or(0);
+                (a, s, r)
+            };
+
+            info!(
+                "[mechanical] reindex_vocab_cache slug={} annotation_type={} node_shape={} role_name={}",
+                ctx.slug, ann_count, shape_count, role_count,
+            );
+
+            let meta = serde_json::json!({
+                "annotation_type": ann_count,
+                "node_shape": shape_count,
+                "role_name": role_count,
+            });
+            let metadata_json = serde_json::to_string(&meta)?;
+            let conn_guard = ctx.db_writer.lock().await;
+            super::observation_events::write_observation_event(
+                &conn_guard,
+                &ctx.slug,
+                "chain",
+                "sweep_vocab_reindexed",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&metadata_json),
+            )?;
+            drop(conn_guard);
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            let counts = serde_json::json!({
+                "annotation_type": ann_count,
+                "node_shape": shape_count,
+                "role_name": role_count,
+            });
+            out.insert("vocab_counts".to_string(), counts);
+            Ok(Value::Object(out))
+        }
+        "archive_stale_failed_work_items" => {
+            // Phase 9b-3: graduate the sweep chain from measurement to
+            // actual archival. Moves `dadbear_work_items` rows where
+            // state='failed' AND state_changed_at < (now - stale_days -
+            // retention_days) to `archived_at = now()`. The sweep
+            // chain's prior `count_stale_failed_work_items` step ran on
+            // stale_days; archival happens on the *longer* window so
+            // operators have a recovery period between "stale" and
+            // "archived" (count-only) during which they can manually
+            // retry / debug.
+            //
+            // Input envelope:
+            //   stale_days       — same as count step (sweep's "what's
+            //                      stale?" threshold; read from envelope).
+            //   retention_days   — extra days beyond stale before the
+            //                      row is archived. Loud-raises if absent.
+            //
+            // Both values come from the sweep chain's caller (today:
+            // pyramid_scheduler dispatch path — the SchedulerConfig's
+            // sweep_stale_days + sweep_retention_days) so the policy
+            // sits outside Rust.
+            //
+            // Emits `sweep_archived_failed_work_items` with the count.
+            // Idempotent: already-archived rows are filtered by the
+            // `archived_at IS NULL` predicate.
+            let stale_days = input
+                .get("stale_days")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| anyhow!(
+                    "archive_stale_failed_work_items: required field \
+                     `stale_days` is missing from the input envelope. \
+                     The sweep chain caller owns this policy knob \
+                     (scheduler_parameters.sweep_stale_days today)."
+                ))?
+                .max(0);
+            let retention_days = input
+                .get("retention_days")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| anyhow!(
+                    "archive_stale_failed_work_items: required field \
+                     `retention_days` is missing from the input \
+                     envelope. Operators define the recovery window \
+                     after `stale_days` before archival; the dispatch \
+                     code does not hardcode it \
+                     (scheduler_parameters.sweep_retention_days today)."
+                ))?
+                .max(0);
+            let slug_for_archive = input
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| ctx.slug.clone());
+            let total_days = stale_days.saturating_add(retention_days);
+            let threshold_modifier = format!("-{} days", total_days);
+
+            let archived_count: i64 = {
+                let conn_guard = ctx.db_writer.lock().await;
+                let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                let rows = conn_guard
+                    .execute(
+                        "UPDATE dadbear_work_items
+                            SET archived_at = ?1
+                          WHERE slug = ?2
+                            AND state = 'failed'
+                            AND archived_at IS NULL
+                            AND state_changed_at < datetime('now', ?3)",
+                        rusqlite::params![now, slug_for_archive, threshold_modifier],
+                    )
+                    .map_err(|e| anyhow!(
+                        "archive_stale_failed_work_items: UPDATE failed for slug={}: {}",
+                        slug_for_archive, e,
+                    ))?;
+                rows as i64
+            };
+
+            info!(
+                "[mechanical] archive_stale_failed_work_items slug={} stale_days={} retention_days={} archived={}",
+                slug_for_archive, stale_days, retention_days, archived_count,
+            );
+
+            let meta = serde_json::json!({
+                "stale_days": stale_days,
+                "retention_days": retention_days,
+                "threshold_days": total_days,
+                "archived_count": archived_count,
+            });
+            let metadata_json = serde_json::to_string(&meta)?;
+            let conn_guard = ctx.db_writer.lock().await;
+            super::observation_events::write_observation_event(
+                &conn_guard,
+                &slug_for_archive,
+                "chain",
+                "sweep_archived_failed_work_items",
+                None, None, None, None, None, None,
+                Some(&metadata_json),
+            )?;
+            drop(conn_guard);
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("slug".to_string(), Value::String(slug_for_archive));
+            out.insert("archived_count".to_string(), Value::from(archived_count));
+            out.insert("stale_days".to_string(), Value::from(stale_days));
+            out.insert("retention_days".to_string(), Value::from(retention_days));
+            Ok(Value::Object(out))
+        }
+        "retire_superseded_contributions_past_retention" => {
+            // Phase 9b-3: retire long-dead superseded contribution rows.
+            // When `status = 'superseded'` AND accepted_at < (now -
+            // retention_days), flip status to `retired`. Retirement is
+            // soft (no row deletion) — the supersession chain stays
+            // intact for audit, but a `retired` row is excluded from
+            // active-version queries (which already filter
+            // `status = 'active'`), so the semantic is preserved.
+            //
+            // Retention window lives on the input envelope
+            // (`contribution_retention_days`, operator-editable via the
+            // scheduler config). Absent or <= 0 → loud-raise (the
+            // primitive cannot invent a retention policy).
+            //
+            // Emits `sweep_retired_superseded_contributions` with the
+            // count.
+            let retention_days = input
+                .get("contribution_retention_days")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| anyhow!(
+                    "retire_superseded_contributions_past_retention: required \
+                     field `contribution_retention_days` is missing from the \
+                     input envelope. Operators define supersession retention; \
+                     the dispatch code does not hardcode it."
+                ))?;
+            if retention_days <= 0 {
+                return Err(anyhow!(
+                    "retire_superseded_contributions_past_retention: \
+                     contribution_retention_days must be > 0 (got {retention_days}). \
+                     Zero/negative retention would retire every superseded row \
+                     immediately; refusing per feedback_loud_deferrals."
+                ));
+            }
+            let slug_for_retire = input
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| ctx.slug.clone());
+            let threshold_modifier = format!("-{} days", retention_days);
+
+            let retired_count: i64 = {
+                let conn_guard = ctx.db_writer.lock().await;
+                // Scope the retire pass: either slug-scoped (non-NULL slug
+                // match) OR the global pool (slug IS NULL). The sweep
+                // chain caller may want both passes in turn; this
+                // primitive handles one call per invocation and we run
+                // it slug-scoped by default (sweep is a per-slug chain).
+                let rows = conn_guard
+                    .execute(
+                        "UPDATE pyramid_config_contributions
+                            SET status = 'retired'
+                          WHERE status = 'superseded'
+                            AND slug = ?1
+                            AND COALESCE(accepted_at, created_at) < datetime('now', ?2)",
+                        rusqlite::params![slug_for_retire, threshold_modifier],
+                    )
+                    .map_err(|e| anyhow!(
+                        "retire_superseded_contributions_past_retention: UPDATE failed for slug={}: {}",
+                        slug_for_retire, e,
+                    ))?;
+                rows as i64
+            };
+
+            info!(
+                "[mechanical] retire_superseded_contributions_past_retention slug={} retention_days={} retired={}",
+                slug_for_retire, retention_days, retired_count,
+            );
+
+            let meta = serde_json::json!({
+                "retention_days": retention_days,
+                "retired_count": retired_count,
+            });
+            let metadata_json = serde_json::to_string(&meta)?;
+            let conn_guard = ctx.db_writer.lock().await;
+            super::observation_events::write_observation_event(
+                &conn_guard,
+                &slug_for_retire,
+                "chain",
+                "sweep_retired_superseded_contributions",
+                None, None, None, None, None, None,
+                Some(&metadata_json),
+            )?;
+            drop(conn_guard);
+
+            let mut out = if let Value::Object(obj) = input {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("slug".to_string(), Value::String(slug_for_retire));
+            out.insert("retention_days".to_string(), Value::from(retention_days));
+            out.insert("retired_count".to_string(), Value::from(retired_count));
+            Ok(Value::Object(out))
         }
         unknown => Err(anyhow!("Unknown mechanical function: {}", unknown)),
     }
@@ -817,10 +5634,7 @@ pub fn build_node_from_output(
                             .and_then(|r| r.as_str())
                             .unwrap_or("")
                             .to_string(),
-                        importance: e
-                            .get("importance")
-                            .and_then(|i| i.as_f64())
-                            .unwrap_or(0.0),
+                        importance: e.get("importance").and_then(|i| i.as_f64()).unwrap_or(0.0),
                         liveness: e
                             .get("liveness")
                             .and_then(|l| l.as_str())
@@ -856,10 +5670,7 @@ pub fn build_node_from_output(
                             .and_then(|r| r.as_str())
                             .unwrap_or("")
                             .to_string(),
-                        importance: q
-                            .get("importance")
-                            .and_then(|i| i.as_f64())
-                            .unwrap_or(0.0),
+                        importance: q.get("importance").and_then(|i| i.as_f64()).unwrap_or(0.0),
                         chunk_ref: q
                             .get("at")
                             .or_else(|| q.get("chunk_ref"))
@@ -895,7 +5706,9 @@ pub fn build_node_from_output(
     if let Some(decs) = output.get("decisions").and_then(|d| d.as_array()) {
         // Only re-extract if we haven't already — check if the existing
         // decisions lack stance info (legacy extraction path)
-        let has_stance = decisions.iter().any(|d| !d.stance.is_empty() && d.stance != "other");
+        let has_stance = decisions
+            .iter()
+            .any(|d| !d.stance.is_empty() && d.stance != "other");
         if !has_stance {
             decisions.clear();
             for d in decs {
@@ -929,10 +5742,7 @@ pub fn build_node_from_output(
                         .and_then(|v| v.as_str())
                         .unwrap_or("other")
                         .to_string(),
-                    importance: d
-                        .get("importance")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0),
+                    importance: d.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.0),
                     ..Default::default()
                 });
             }
@@ -1052,37 +5862,68 @@ pub fn generate_node_id(pattern: &str, index: usize, depth: Option<i64>) -> Stri
 
 /// Resolve the model string from IR `ModelRequirements` and config.
 ///
-/// Priority:
-/// 1. `reqs.model` — direct model override on the step
-/// 2. `reqs.tier` — mapped through config tiers
-/// 3. Falls back to primary_model when tier is absent or unrecognized
-pub fn resolve_ir_model(reqs: &ModelRequirements, config: &LlmConfig) -> String {
-    // Direct model override takes highest precedence
+/// Priority (Walker v3 W2b):
+/// 1. `reqs.model` — operator-supplied explicit model override
+/// 2. `DispatchDecision.per_provider[OpenRouter].model_list[0]` — the
+///    canonical source when the outer dispatcher has built one
+///    (see §2.9 / §6 Phase 1 migration contract)
+/// 3. `config.provider_registry.resolve_tier(tier)` — transitional
+///    fallback when no Decision is attached (unit tests, bring-up)
+/// 4. Legacy hardcoded `match tier => primary_model / fallback_model_{1,2}`
+///    — final fallback; W3 removes the match when the struct fields go
+///
+/// Callers with a live `DispatchDecision` (the in-file `dispatch_ir_llm`
+/// at the outer dispatch entry) pass `Some(&arc)`; callers in
+/// `chain_executor.rs` (step-output provenance writes, cost-log rows)
+/// don't carry a Decision in scope and pass `None`, which routes them
+/// through the registry → legacy chain.
+pub fn resolve_ir_model(
+    reqs: &ModelRequirements,
+    config: &LlmConfig,
+    dispatch_decision: Option<&Arc<DispatchDecision>>,
+) -> String {
+    // Priority 1: operator-supplied explicit model override.
     if let Some(ref model) = reqs.model {
         return model.clone();
     }
+
+    // Priority 2: the pre-built DispatchDecision is the canonical source
+    // when the outer dispatcher has constructed one. Reads the first
+    // OpenRouter model_list entry — matches
+    // `first_openrouter_model_from_decision` in llm.rs so the dispatch
+    // path and the provenance path agree.
+    if let Some(model) = first_openrouter_model_from_decision(dispatch_decision) {
+        return model;
+    }
+
     let tier = reqs.tier.as_deref().unwrap_or("mid");
 
-    // Phase 3: consult provider registry tier routing (canonical source)
+    // Priority 3: consult provider registry tier routing (transitional
+    // fallback — used by unit tests and bring-up paths where no
+    // DispatchDecision is attached).
     if let Some(ref registry) = config.provider_registry {
         if let Ok(resolved) = registry.resolve_tier(tier, None, None, None) {
             return resolved.tier.model_id;
         }
-        warn!("[IR] tier '{}' not in registry, falling back to legacy resolution", tier);
+        warn!(
+            "[IR] tier '{}' not in registry, falling back to legacy resolution",
+            tier
+        );
     }
 
+    // W3c: legacy hardcoded per-tier match arms deleted. Aliases
+    // remain as the last escape hatch. Missing → `<unknown>` so
+    // dispatch surfaces "no model available" rather than silently
+    // picking up a hardcoded default.
     if let Some(model) = config.model_aliases.get(tier) {
         return model.clone();
     }
-    match tier {
-        "low" | "mid" => config.primary_model.clone(),
-        "high" => config.fallback_model_1.clone(),
-        "max" => config.fallback_model_2.clone(),
-        other => {
-            warn!("[IR] unknown tier '{}', using primary_model", other);
-            config.primary_model.clone()
-        }
-    }
+    warn!(
+        "[IR] walker-v3: tier '{}' had no Decision, no registry row, and no alias; \
+         returning '<unknown>' — dispatch will surface no-model-available",
+        tier,
+    );
+    "<unknown>".to_string()
 }
 
 /// Resolve the primary context limit (in estimated tokens) for an IR step's model.
@@ -1113,15 +5954,17 @@ fn resolve_ir_context_limit(
         }
     }
 
-    // Legacy fallback
+    // W3c: legacy fallback on `LlmConfig.primary_context_limit` replaced
+    // with Tier1Config's `primary_context_limit` (same numeric field,
+    // now authoritative in operational config).
     if config.model_aliases.contains_key(tier) {
         return tier1.high_tier_context_limit;
     }
     match tier {
-        "low" | "mid" => config.primary_context_limit,
+        "low" | "mid" => tier1.primary_context_limit,
         "high" => tier1.high_tier_context_limit,
         "max" => tier1.max_tier_context_limit,
-        _ => config.primary_context_limit,
+        _ => tier1.primary_context_limit,
     }
 }
 
@@ -1156,15 +5999,16 @@ fn resolve_context_limit(
         }
     }
 
-    // Legacy fallback
+    // W3c: legacy fallback on `LlmConfig.primary_context_limit` replaced
+    // with Tier1Config's `primary_context_limit`.
     if config.model_aliases.contains_key(tier) {
         return tier1.high_tier_context_limit;
     }
     match tier {
-        "low" | "mid" => config.primary_context_limit,
+        "low" | "mid" => tier1.primary_context_limit,
         "high" => tier1.high_tier_context_limit,
         "max" => tier1.max_tier_context_limit,
-        _ => config.primary_context_limit,
+        _ => tier1.primary_context_limit,
     }
 }
 
@@ -1189,7 +6033,10 @@ fn resolve_ir_llm_call_options(step: &Step, tier1: &Tier1Config) -> llm::LlmCall
         None
     };
 
-    llm::LlmCallOptions { min_timeout_secs, ..Default::default() }
+    llm::LlmCallOptions {
+        min_timeout_secs,
+        ..Default::default()
+    }
 }
 
 /// Dispatch an IR Step to the appropriate execution path.
@@ -1206,7 +6053,7 @@ pub async fn dispatch_ir_step(
     step: &Step,
     resolved_input: &Value,
     system_prompt: &str,
-    ctx: &StepContext,
+    ctx: &ChainDispatchContext,
 ) -> Result<(Value, Option<LlmResponse>)> {
     match step.operation {
         StepOperation::Llm => {
@@ -1229,7 +6076,7 @@ pub async fn dispatch_ir_step(
             Ok((result, None))
         }
         StepOperation::Mechanical => {
-            let result = dispatch_ir_mechanical(step, resolved_input, ctx)?;
+            let result = dispatch_ir_mechanical(step, resolved_input, ctx).await?;
             Ok((result, None))
         }
         StepOperation::Wire | StepOperation::Task | StepOperation::Game => Err(anyhow!(
@@ -1254,30 +6101,39 @@ pub async fn dispatch_ir_llm(
     step: &Step,
     resolved_input: &Value,
     system_prompt: &str,
-    ctx: &StepContext,
+    ctx: &ChainDispatchContext,
 ) -> Result<(Value, LlmResponse)> {
     let temperature = resolve_ir_temperature(&step.model_requirements, &ctx.tier1);
-    let resolved_model = resolve_ir_model(&step.model_requirements, &ctx.config);
+
+    // Walker v3 W1b: build the step's DispatchDecision ONCE at the outer
+    // IR LLM entry. See dispatch_llm for the symmetric wire-in; the same
+    // Arc is threaded into every CacheStepContext constructed for this
+    // step (structured/retry variants + the standard dispatch ctx).
+    //
+    // W2b reorder: built BEFORE resolve_ir_model so the resolver can
+    // read the Decision's OpenRouter model_list as the canonical source.
+    let slot = step
+        .model_requirements
+        .tier
+        .clone()
+        .unwrap_or_else(|| "mid".to_string());
+    let dispatch_decision = build_step_dispatch_decision(ctx, &slot).await;
+
+    let resolved_model = resolve_ir_model(
+        &step.model_requirements,
+        &ctx.config,
+        dispatch_decision.as_ref(),
+    );
     let resolved_limit =
         resolve_ir_context_limit(&step.model_requirements, &ctx.config, &ctx.tier1);
     let max_tokens = resolve_ir_max_tokens(step, &ctx.tier1);
     let llm_options = resolve_ir_llm_call_options(step, &ctx.tier1);
 
-    // Apply model override: pin ALL model slots (primary + fallback_1 +
-    // fallback_2) to the resolved model so cascade stays on the same
-    // provider. Also override context limit to match the resolved tier.
-    let config_ref;
-    let overridden_config;
-    if resolved_model != ctx.config.primary_model
-        || resolved_limit != ctx.config.primary_context_limit
-    {
-        let mut cfg = ctx.config.clone_with_model_override(&resolved_model);
-        cfg.primary_context_limit = resolved_limit;
-        overridden_config = cfg;
-        config_ref = &overridden_config;
-    } else {
-        config_ref = &ctx.config;
-    }
+    // W3c: legacy `clone_with_model_override` + `primary_context_limit`
+    // override removed. The Decision attached to the IR StepContext
+    // carries both slug and context_limit; `call_model_unified` reads
+    // those directly.
+    let config_ref = &ctx.config;
 
     let raw_input_len = serde_json::to_string(resolved_input)
         .unwrap_or_default()
@@ -1313,6 +6169,7 @@ pub async fn dispatch_ir_llm(
         &resolved_model,
         system_prompt,
         &user_prompt,
+        dispatch_decision.as_ref(),
     );
 
     // If step has a response_schema, use structured outputs for guaranteed JSON
@@ -1343,13 +6200,22 @@ pub async fn dispatch_ir_llm(
             llm_options,
         )
         .await?;
-        let parsed = llm::extract_json(&response.content).map_err(|e| {
-            anyhow!(
-                "IR step '{}': structured output JSON parse failed: {}",
-                step.id,
-                e
-            )
-        })?;
+        let parsed = match llm::extract_json(&response.content) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                invalidate_cached_llm_response(
+                    cache_ctx.as_ref(),
+                    system_prompt,
+                    &user_prompt,
+                    "ir_structured_json_parse_failed",
+                );
+                return Err(anyhow!(
+                    "IR step '{}': structured output JSON parse failed: {}",
+                    step.id,
+                    e
+                ));
+            }
+        };
         return Ok((parsed, response));
     }
 
@@ -1394,6 +6260,12 @@ pub async fn dispatch_ir_llm(
             Ok((json, response))
         }
         Err(_first_err) => {
+            invalidate_cached_llm_response(
+                cache_ctx.as_ref(),
+                system_prompt,
+                &user_prompt,
+                "ir_primary_json_parse_failed",
+            );
             // JSON-retry guarantee: retry at temperature 0.1
             info!(
                 "[IR] step '{}' → JSON parse failed, retrying at temp 0.1",
@@ -1411,13 +6283,22 @@ pub async fn dispatch_ir_llm(
             )
             .await?;
 
-            let parsed = llm::extract_json(&retry_response.content).map_err(|e| {
-                anyhow!(
-                    "IR step '{}': JSON parse failed after retry at temp 0.1: {}",
-                    step.id,
-                    e
-                )
-            })?;
+            let parsed = match llm::extract_json(&retry_response.content) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    invalidate_cached_llm_response(
+                        cache_ctx.as_ref(),
+                        system_prompt,
+                        &user_prompt,
+                        "ir_retry_json_parse_failed",
+                    );
+                    return Err(anyhow!(
+                        "IR step '{}': JSON parse failed after retry at temp 0.1: {}",
+                        step.id,
+                        e
+                    ));
+                }
+            };
             Ok((parsed, retry_response))
         }
     }
@@ -1441,11 +6322,12 @@ pub async fn dispatch_ir_llm(
 /// resolved model id is recorded against the tier, and the prompt hash
 /// is cached keyed on the instruction.
 fn build_cache_ctx_for_ir_step(
-    ctx: &StepContext,
+    ctx: &ChainDispatchContext,
     step: &Step,
     resolved_model: &str,
     system_prompt: &str,
     user_prompt: &str,
+    dispatch_decision: Option<&Arc<DispatchDecision>>,
 ) -> Option<CacheStepContext> {
     let base = ctx.cache_base.as_ref()?;
     if resolved_model.is_empty() {
@@ -1462,10 +6344,7 @@ fn build_cache_ctx_for_ir_step(
     // Instruction key: prefer the resolved instruction string (the
     // template body as supplied by the IR). Falls back to the step id
     // when no instruction is attached (mechanical-ish LLM steps).
-    let instruction_key = step
-        .instruction
-        .clone()
-        .unwrap_or_else(|| step.id.clone());
+    let instruction_key = step.instruction.clone().unwrap_or_else(|| step.id.clone());
     let prompt_hash = base.get_or_compute_prompt_hash(&instruction_key, || {
         // Include both the system prompt and the user prompt template
         // in the body snapshot. The caller above already substituted
@@ -1487,10 +6366,7 @@ fn build_cache_ctx_for_ir_step(
     // Step metadata — primitive defaults to the step id when the
     // step has no primitive attached (legacy chain steps that use
     // `rust_function` instead).
-    let primitive = step
-        .primitive
-        .clone()
-        .unwrap_or_else(|| step.id.clone());
+    let primitive = step.primitive.clone().unwrap_or_else(|| step.id.clone());
     let depth = step
         .storage_directive
         .as_ref()
@@ -1528,23 +6404,31 @@ fn build_cache_ctx_for_ir_step(
     if let Some(bus) = base.bus.as_ref() {
         cache_ctx = cache_ctx.with_bus(bus.clone());
     }
+    // Walker v3 W1b: inherit the step's outer Decision (built ONCE per
+    // step at the `dispatch_ir_llm` entry). Downstream consumers read
+    // `step_ctx.dispatch_decision`; legacy consumers whose site hasn't
+    // been migrated to W2 still see `config.primary_model / fallback_*`
+    // on the surrounding config, so behavior is unchanged until W2.
+    if let Some(d) = dispatch_decision {
+        cache_ctx = cache_ctx.with_dispatch_decision(d.clone());
+    }
     Some(cache_ctx)
 }
 
 /// Dispatch an IR mechanical step: look up `step.rust_function` in the registry.
 ///
 /// Same registry as the legacy `dispatch_mechanical` but reads from IR types.
-pub fn dispatch_ir_mechanical(
+pub async fn dispatch_ir_mechanical(
     step: &Step,
     resolved_input: &Value,
-    ctx: &StepContext,
+    ctx: &ChainDispatchContext,
 ) -> Result<Value> {
     let fn_name = step
         .rust_function
         .as_deref()
         .ok_or_else(|| anyhow!("IR mechanical step '{}' missing rust_function", step.id))?;
     info!("[IR] step '{}' → mechanical fn '{}'", step.id, fn_name);
-    dispatch_mechanical(fn_name, resolved_input, ctx)
+    dispatch_mechanical(fn_name, resolved_input, ctx).await
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -1586,6 +6470,71 @@ mod tests {
     }
 
     #[test]
+    fn test_invalidate_cached_llm_response_deletes_exact_cache_row() {
+        let db_file = tempfile::NamedTempFile::new().expect("temp db file");
+        let conn = super::super::db::open_pyramid_db(db_file.path()).expect("open temp db");
+        conn.execute(
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path)
+             VALUES ('cache-invalidate-test', 'document', '/tmp/source')",
+            [],
+        )
+        .expect("insert slug");
+
+        let system_prompt = "system prompt";
+        let user_prompt = "user prompt";
+        let prompt_hash = compute_prompt_hash("template body");
+        let inputs_hash = compute_inputs_hash(system_prompt, user_prompt);
+        let model_id = "test/model";
+        let cache_key = compute_cache_key(&inputs_hash, &prompt_hash, model_id);
+        let entry = super::super::step_context::CacheEntry {
+            slug: "cache-invalidate-test".to_string(),
+            build_id: "build-1".to_string(),
+            step_name: "source_extract".to_string(),
+            chunk_index: -1,
+            depth: 0,
+            cache_key: cache_key.clone(),
+            inputs_hash,
+            prompt_hash: prompt_hash.clone(),
+            model_id: model_id.to_string(),
+            output_json: serde_json::json!({
+                "content": "```json\n{\"headline\":\"bad\"\n```",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })
+            .to_string(),
+            token_usage_json: None,
+            cost_usd: None,
+            latency_ms: Some(1),
+            force_fresh: false,
+            supersedes_cache_id: None,
+            note: None,
+        };
+        super::super::db::store_cache(&conn, &entry).expect("store cache");
+
+        let step_ctx = CacheStepContext::new(
+            "cache-invalidate-test",
+            "build-1",
+            "source_extract",
+            "chain_llm",
+            0,
+            None,
+            db_file.path().to_string_lossy().to_string(),
+        )
+        .with_model_resolution("extractor", model_id)
+        .with_prompt_hash(prompt_hash);
+
+        invalidate_cached_llm_response(
+            Some(&step_ctx),
+            system_prompt,
+            user_prompt,
+            "test_parse_failure",
+        );
+
+        let remaining = super::super::db::check_cache(&conn, "cache-invalidate-test", &cache_key)
+            .expect("check cache");
+        assert!(remaining.is_none(), "bad cache row should be deleted");
+    }
+
+    #[test]
     fn test_normalize_node_id() {
         // Unpadded → padded
         assert_eq!(normalize_node_id("C-L0-70"), "C-L0-070");
@@ -1605,9 +6554,9 @@ mod tests {
         assert!(!is_known_mechanical_function("nonexistent_function"));
     }
 
-    #[test]
-    fn test_dispatch_mechanical_unknown_fn() {
-        let ctx = StepContext {
+    #[tokio::test]
+    async fn test_dispatch_mechanical_unknown_fn() {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
@@ -1617,8 +6566,12 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
-        let result = dispatch_mechanical("nonexistent", &serde_json::json!({}), &ctx);
+        let result = dispatch_mechanical("nonexistent", &serde_json::json!({}), &ctx).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -1626,9 +6579,9 @@ mod tests {
             .contains("Unknown mechanical function"));
     }
 
-    #[test]
-    fn test_dispatch_mechanical_known_fn() {
-        let ctx = StepContext {
+    #[tokio::test]
+    async fn test_dispatch_mechanical_known_fn() {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test-slug".into(),
@@ -1638,9 +6591,13 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let input = serde_json::json!({"files": ["main.rs"]});
-        let result = dispatch_mechanical("extract_import_graph", &input, &ctx).unwrap();
+        let result = dispatch_mechanical("extract_import_graph", &input, &ctx).await.unwrap();
         assert_eq!(result["_mechanical"], "extract_import_graph");
         assert_eq!(result["_status"], "placeholder");
         assert_eq!(result["slug"], "test-slug");
@@ -1697,11 +6654,21 @@ mod tests {
             on_error: "retry(2)".into(),
         };
         let config = LlmConfig::default();
-        assert_eq!(resolve_model(&step, &defaults, &config), "custom/model");
+        assert_eq!(
+            resolve_model(&step, &defaults, &config, None),
+            "custom/model"
+        );
     }
 
     #[test]
-    fn test_resolve_model_tier_mapping() {
+    fn test_resolve_model_tier_mapping_aliases() {
+        // W3c: legacy hardcoded `primary_model` / `fallback_model_{1,2}`
+        // fallbacks were deleted. The resolver consults:
+        //   1. `reqs.model` / step.model (direct override)
+        //   2. Decision (unit test has none)
+        //   3. provider_registry (unit test has none)
+        //   4. `config.model_aliases` (we seed these for the test)
+        //   5. `<unknown>` sentinel — tested in the sibling test below.
         let make_step = |tier: &str| ChainStep {
             name: "test".into(),
             primitive: "compress".into(),
@@ -1715,24 +6682,58 @@ mod tests {
             temperature: 0.3,
             on_error: "retry(2)".into(),
         };
-        let config = LlmConfig::default();
+        let mut config = LlmConfig::default();
+        config
+            .model_aliases
+            .insert("low".into(), "alias/low".into());
+        config
+            .model_aliases
+            .insert("mid".into(), "alias/mid".into());
+        config
+            .model_aliases
+            .insert("high".into(), "alias/high".into());
+        config
+            .model_aliases
+            .insert("max".into(), "alias/max".into());
 
         assert_eq!(
-            resolve_model(&make_step("low"), &defaults, &config),
-            config.primary_model
+            resolve_model(&make_step("low"), &defaults, &config, None),
+            "alias/low"
         );
         assert_eq!(
-            resolve_model(&make_step("mid"), &defaults, &config),
-            config.primary_model
+            resolve_model(&make_step("mid"), &defaults, &config, None),
+            "alias/mid"
         );
         assert_eq!(
-            resolve_model(&make_step("high"), &defaults, &config),
-            config.fallback_model_1
+            resolve_model(&make_step("high"), &defaults, &config, None),
+            "alias/high"
         );
         assert_eq!(
-            resolve_model(&make_step("max"), &defaults, &config),
-            config.fallback_model_2
+            resolve_model(&make_step("max"), &defaults, &config, None),
+            "alias/max"
         );
+    }
+
+    #[test]
+    fn test_resolve_model_no_decision_no_alias_returns_unknown_sentinel() {
+        // W3c: when neither Decision, registry, nor alias covers the tier,
+        // the resolver stamps `<unknown>`. `call_model_unified` turns that
+        // into a RouteSkipped at dispatch time.
+        let step = ChainStep {
+            name: "test".into(),
+            primitive: "compress".into(),
+            model_tier: Some("mid".into()),
+            instruction: Some("x".into()),
+            ..Default::default()
+        };
+        let defaults = ChainDefaults {
+            model_tier: "mid".into(),
+            model: None,
+            temperature: 0.3,
+            on_error: "retry(2)".into(),
+        };
+        let config = LlmConfig::default();
+        assert_eq!(resolve_model(&step, &defaults, &config, None), "<unknown>");
     }
 
     // ── IR dispatch tests ───────────────────────────────────────────────────
@@ -1777,12 +6778,25 @@ mod tests {
         };
         let config = LlmConfig::default();
         // Direct model override wins over tier
-        assert_eq!(resolve_ir_model(&reqs, &config), "custom/my-model");
+        assert_eq!(resolve_ir_model(&reqs, &config, None), "custom/my-model");
     }
 
     #[test]
-    fn test_resolve_ir_model_tier_mapping() {
-        let config = LlmConfig::default();
+    fn test_resolve_ir_model_tier_mapping_aliases() {
+        // W3c: aliases are the last escape hatch after Decision/registry.
+        let mut config = LlmConfig::default();
+        config
+            .model_aliases
+            .insert("low".into(), "alias/low".into());
+        config
+            .model_aliases
+            .insert("mid".into(), "alias/mid".into());
+        config
+            .model_aliases
+            .insert("high".into(), "alias/high".into());
+        config
+            .model_aliases
+            .insert("max".into(), "alias/max".into());
 
         let make_reqs = |tier: &str| ModelRequirements {
             tier: Some(tier.into()),
@@ -1791,41 +6805,42 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_ir_model(&make_reqs("low"), &config),
-            config.primary_model
+            resolve_ir_model(&make_reqs("low"), &config, None),
+            "alias/low"
         );
         assert_eq!(
-            resolve_ir_model(&make_reqs("mid"), &config),
-            config.primary_model
+            resolve_ir_model(&make_reqs("mid"), &config, None),
+            "alias/mid"
         );
         assert_eq!(
-            resolve_ir_model(&make_reqs("high"), &config),
-            config.fallback_model_1
+            resolve_ir_model(&make_reqs("high"), &config, None),
+            "alias/high"
         );
         assert_eq!(
-            resolve_ir_model(&make_reqs("max"), &config),
-            config.fallback_model_2
+            resolve_ir_model(&make_reqs("max"), &config, None),
+            "alias/max"
         );
     }
 
     #[test]
-    fn test_resolve_ir_model_default_tier() {
-        // When tier is None, defaults to "mid" → primary_model
+    fn test_resolve_ir_model_default_tier_no_decision_returns_unknown() {
+        // W3c: without Decision/registry/alias, default-tier "mid" resolves
+        // to `<unknown>` — dispatch surfaces RouteSkipped.
         let reqs = ModelRequirements::default();
         let config = LlmConfig::default();
-        assert_eq!(resolve_ir_model(&reqs, &config), config.primary_model);
+        assert_eq!(resolve_ir_model(&reqs, &config, None), "<unknown>");
     }
 
     #[test]
-    fn test_resolve_ir_model_unknown_tier() {
+    fn test_resolve_ir_model_unknown_tier_returns_unknown() {
+        // W3c: arbitrary tier without any resolver match → `<unknown>`.
         let reqs = ModelRequirements {
             tier: Some("ultra".into()),
             model: None,
             temperature: None,
         };
         let config = LlmConfig::default();
-        // Unknown tier falls back to primary
-        assert_eq!(resolve_ir_model(&reqs, &config), config.primary_model);
+        assert_eq!(resolve_ir_model(&reqs, &config, None), "<unknown>");
     }
 
     #[test]
@@ -1871,9 +6886,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_dispatch_ir_mechanical_routes_correctly() {
-        let ctx = StepContext {
+    #[tokio::test]
+    async fn test_dispatch_ir_mechanical_routes_correctly() {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "ir-test".into(),
@@ -1883,19 +6898,23 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let mut step = ir_step("mech_step", StepOperation::Mechanical);
         step.rust_function = Some("extract_import_graph".into());
         let input = serde_json::json!({"files": ["lib.rs"]});
-        let result = dispatch_ir_mechanical(&step, &input, &ctx).unwrap();
+        let result = dispatch_ir_mechanical(&step, &input, &ctx).await.unwrap();
         assert_eq!(result["_mechanical"], "extract_import_graph");
         assert_eq!(result["_status"], "placeholder");
         assert_eq!(result["slug"], "ir-test");
     }
 
-    #[test]
-    fn test_dispatch_ir_mechanical_missing_fn_name() {
-        let ctx = StepContext {
+    #[tokio::test]
+    async fn test_dispatch_ir_mechanical_missing_fn_name() {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
@@ -1905,10 +6924,14 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let step = ir_step("no_fn", StepOperation::Mechanical);
         // rust_function is None
-        let result = dispatch_ir_mechanical(&step, &serde_json::json!({}), &ctx);
+        let result = dispatch_ir_mechanical(&step, &serde_json::json!({}), &ctx).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -1916,9 +6939,9 @@ mod tests {
             .contains("missing rust_function"));
     }
 
-    #[test]
-    fn test_dispatch_ir_mechanical_unknown_fn() {
-        let ctx = StepContext {
+    #[tokio::test]
+    async fn test_dispatch_ir_mechanical_unknown_fn() {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
@@ -1928,10 +6951,14 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let mut step = ir_step("bad_fn", StepOperation::Mechanical);
         step.rust_function = Some("nonexistent_fn".into());
-        let result = dispatch_ir_mechanical(&step, &serde_json::json!({}), &ctx);
+        let result = dispatch_ir_mechanical(&step, &serde_json::json!({}), &ctx).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -1941,7 +6968,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_ir_step_transform_routes() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
@@ -1951,6 +6978,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let mut step = ir_step("count_step", StepOperation::Transform);
         step.transform = Some(TransformSpec {
@@ -1966,7 +6997,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_ir_step_transform_resolves_args_against_input() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
@@ -1976,6 +7007,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let mut step = ir_step("coalesce_step", StepOperation::Transform);
         step.transform = Some(TransformSpec {
@@ -1995,7 +7030,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_ir_step_transform_missing_spec() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
@@ -2005,6 +7040,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let step = ir_step("bad_transform", StepOperation::Transform);
         // transform is None
@@ -2018,7 +7057,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_ir_step_wire_not_implemented() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
@@ -2028,6 +7067,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let step = ir_step("wire_step", StepOperation::Wire);
         let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
@@ -2037,7 +7080,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_ir_step_task_not_implemented() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
@@ -2047,6 +7090,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let step = ir_step("task_step", StepOperation::Task);
         let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
@@ -2056,7 +7103,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_ir_step_game_not_implemented() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
@@ -2066,6 +7113,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let step = ir_step("game_step", StepOperation::Game);
         let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
@@ -2075,7 +7126,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_ir_step_mechanical_routes() {
-        let ctx = StepContext {
+        let ctx = ChainDispatchContext {
             db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "slug".into(),
@@ -2085,6 +7136,10 @@ mod tests {
             audit: None,
             cache_base: None,
             concurrency_cap: None,
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
         };
         let mut step = ir_step("mech", StepOperation::Mechanical);
         step.rust_function = Some("extract_mechanical_metadata".into());
@@ -2093,5 +7148,148 @@ mod tests {
             .unwrap();
         assert_eq!(result["_mechanical"], "extract_mechanical_metadata");
         assert!(llm_resp.is_none()); // mechanical steps don't produce LlmResponse
+    }
+
+    // ── Walker v3 W1b: outer-step DispatchDecision build + attach ───────
+    //
+    // `build_step_dispatch_decision` is the one place chain_executor wires
+    // the step's DispatchDecision. These unit tests exercise the
+    // happy-path (empty DB → SYSTEM_DEFAULTS Decision) and the
+    // permissive-on-failure path (uninitialized DB → None, fall-through).
+
+    fn make_w1b_seedable_ctx(conn: Connection) -> ChainDispatchContext {
+        ChainDispatchContext {
+            db_reader: Arc::new(Mutex::new(conn)),
+            db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            slug: "w1b-test".into(),
+            config: LlmConfig::default(),
+            tier1: Tier1Config::default(),
+            ops: OperationalConfig::default(),
+            audit: None,
+            cache_base: None,
+            concurrency_cap: None,
+            // Phase 6b: sub-chain recursion + starter-runner extensions.
+            // Unit tests don't invoke call_starter_chain so None is safe.
+            state: None,
+            chains_dir: None,
+            target_id: None,
+            sub_chain_depth: None,
+        }
+    }
+
+    fn make_pyramid_config_contributions_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pyramid_config_contributions (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 contribution_id TEXT NOT NULL UNIQUE,
+                 slug TEXT,
+                 schema_type TEXT NOT NULL,
+                 yaml_content TEXT NOT NULL,
+                 wire_native_metadata_json TEXT NOT NULL DEFAULT '{}',
+                 wire_publication_state_json TEXT NOT NULL DEFAULT '{}',
+                 supersedes_id TEXT,
+                 superseded_by_id TEXT,
+                 triggering_note TEXT,
+                 status TEXT NOT NULL DEFAULT 'active',
+                 source TEXT NOT NULL DEFAULT 'local',
+                 wire_contribution_id TEXT,
+                 created_by TEXT,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 accepted_at TEXT
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[tokio::test]
+    async fn test_w1b_build_step_dispatch_decision_empty_db_returns_some_default() {
+        // Acquire the global node-state lock so MarketReadiness's
+        // `network_failure_backoff_threshold` check reads stable state
+        // while other parallel tests mutate the walker_market_probe
+        // node_state cell. Without this, intermittent failures fire
+        // when the concurrent market tests trip the failure counter.
+        let _guard = crate::pyramid::walker_market_probe::node_state_test_lock()
+            .lock()
+            .unwrap();
+        crate::pyramid::walker_market_probe::clear_node_state_for_tests();
+
+        test_capture::enable();
+        test_capture::clear();
+        let conn = make_pyramid_config_contributions_db();
+        let ctx = make_w1b_seedable_ctx(conn);
+        let d = build_step_dispatch_decision(&ctx, "mid").await;
+        assert!(
+            d.is_some(),
+            "W1b: empty pyramid_config_contributions table means \
+             SYSTEM_DEFAULTS — Decision must build successfully"
+        );
+        let decision = d.unwrap();
+        assert_eq!(decision.slot, "mid");
+        assert!(!decision.synthetic, "runtime path is not synthetic");
+        // test_capture observed it
+        let snap = test_capture::snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].slot, "mid");
+        assert!(Arc::ptr_eq(&snap[0].decision, &decision));
+    }
+
+    #[tokio::test]
+    async fn test_w1b_build_step_dispatch_decision_missing_table_is_permissive() {
+        // No pyramid_config_contributions table exists. `build` must error
+        // (DB read fails) and our helper must log + return None so the
+        // legacy dispatch path continues.
+        test_capture::enable();
+        test_capture::clear();
+        let conn = Connection::open_in_memory().unwrap();
+        let ctx = make_w1b_seedable_ctx(conn);
+        let d = build_step_dispatch_decision(&ctx, "mid").await;
+        assert!(
+            d.is_none(),
+            "W1b: DB read failure must be permissive (None + log)"
+        );
+        // Capture hook must NOT have fired on a failed build.
+        assert!(test_capture::snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_w1b_decision_reflects_seeded_walker_provider_openrouter() {
+        // Seed walker_provider_openrouter.overrides.model_list[mid] =
+        // ["test-model-id"]. After build, per_provider[OpenRouter].model_list
+        // must surface that value.
+        test_capture::enable();
+        test_capture::clear();
+        let conn = make_pyramid_config_contributions_db();
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions (
+                 contribution_id, slug, schema_type, yaml_content, status, source
+             ) VALUES (?1, NULL, 'walker_provider_openrouter', ?2, 'active', 'bundled')",
+            rusqlite::params![
+                "w1b-or-ml",
+                r#"
+schema_type: walker_provider_openrouter
+version: 1
+overrides:
+  model_list:
+    mid: ["test-model-id"]
+"#
+            ],
+        )
+        .unwrap();
+        let ctx = make_w1b_seedable_ctx(conn);
+        let d = build_step_dispatch_decision(&ctx, "mid").await;
+        assert!(d.is_some());
+        let decision = d.unwrap();
+        use crate::pyramid::walker_resolver::ProviderType;
+        let or = decision
+            .per_provider
+            .get(&ProviderType::OpenRouter)
+            .expect("OpenRouter must be in effective call order");
+        assert_eq!(
+            or.model_list.as_deref(),
+            Some(&["test-model-id".to_string()][..]),
+            "W1b: seeded model_list must reach the Decision"
+        );
     }
 }

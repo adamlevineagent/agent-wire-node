@@ -116,8 +116,83 @@ const SLOW_ACQUIRE_WARN: Duration = Duration::from_secs(1);
 /// slug. The outer `Mutex` is held only long enough to look up / insert the
 /// per-slug entry; actual wait time for the write lock is spent on the
 /// per-slug `RwLock`, not the table.
+/// Phase 9c-3-2: shared book-keeping for "which slugs are currently held
+/// under a guard by some caller in this process". Stored on the
+/// LockManager itself AND cloned into each guard so the guard's Drop
+/// can decrement without needing a reference back to the manager. This
+/// pattern supports both `LockManager::new()` test instances and the
+/// `LockManager::global()` singleton on equal footing.
+#[derive(Default)]
+struct HeldBook {
+    /// Slugs currently under a write guard, count per slug.
+    ///
+    /// Uses a count to tolerate any future reentrant-via-Arc path — a
+    /// single boolean would spuriously clear under nested acquisitions.
+    /// `tokio::sync::RwLock` is non-reentrant so the count will usually
+    /// be 0 or 1, but the COUNT-based book-keeping is cheaper than
+    /// enforcing single-occupancy invariants here and is correct either
+    /// way.
+    write: Mutex<HashMap<String, u32>>,
+    /// Slugs under a read guard. Multiple readers → count > 1.
+    read: Mutex<HashMap<String, u32>>,
+}
+
+impl HeldBook {
+    fn is_write_locked(&self, slug: &str) -> bool {
+        self.write
+            .lock()
+            .map(|t| t.get(slug).copied().unwrap_or(0) > 0)
+            .unwrap_or(false)
+    }
+
+    fn is_read_locked(&self, slug: &str) -> bool {
+        self.read
+            .lock()
+            .map(|t| t.get(slug).copied().unwrap_or(0) > 0)
+            .unwrap_or(false)
+    }
+
+    fn incr_write(&self, slug: &str) {
+        let mut t = self.write.lock().expect("lock_manager write_held poisoned");
+        *t.entry(slug.to_string()).or_insert(0) += 1;
+    }
+
+    fn decr_write(&self, slug: &str) {
+        let mut t = self.write.lock().expect("lock_manager write_held poisoned");
+        if let Some(count) = t.get_mut(slug) {
+            if *count > 0 {
+                *count -= 1;
+            }
+            if *count == 0 {
+                t.remove(slug);
+            }
+        }
+    }
+
+    fn incr_read(&self, slug: &str) {
+        let mut t = self.read.lock().expect("lock_manager read_held poisoned");
+        *t.entry(slug.to_string()).or_insert(0) += 1;
+    }
+
+    fn decr_read(&self, slug: &str) {
+        let mut t = self.read.lock().expect("lock_manager read_held poisoned");
+        if let Some(count) = t.get_mut(slug) {
+            if *count > 0 {
+                *count -= 1;
+            }
+            if *count == 0 {
+                t.remove(slug);
+            }
+        }
+    }
+}
+
 pub struct LockManager {
     table: Mutex<HashMap<String, Arc<RwLock<()>>>>,
+    /// Phase 9c-3-2: shared book-keeping for active guards, cloned into
+    /// each guard so Drop can decrement without a back-reference to the
+    /// LockManager itself. See `HeldBook` doc for rationale.
+    held: Arc<HeldBook>,
 }
 
 impl LockManager {
@@ -126,7 +201,31 @@ impl LockManager {
     pub fn new() -> Self {
         Self {
             table: Mutex::new(HashMap::new()),
+            held: Arc::new(HeldBook::default()),
         }
+    }
+
+    /// Phase 9c-3-2: `true` iff the current process holds a WRITE guard
+    /// on `slug` via this manager. Used by defensive call-site assertions
+    /// (e.g. `execute_supersession`) to fail loud when a caller forgot
+    /// to acquire `LockManager::global().write(slug)` first.
+    ///
+    /// Caveat: this is a *process-wide* check, not a *task-wide* or
+    /// *thread-wide* one. If task A holds the guard and task B calls
+    /// `is_write_locked`, B sees true. The assertion is still useful —
+    /// the caller's contract is "some writer holds this slug" (the
+    /// guard is the serialization primitive), and a call site that
+    /// neglected to acquire a guard at all will observe FALSE.
+    pub fn is_write_locked(&self, slug: &str) -> bool {
+        self.held.is_write_locked(slug)
+    }
+
+    /// Phase 9c-3-2: `true` iff the current process holds a READ guard
+    /// on `slug` via this manager. Less useful than `is_write_locked`
+    /// — read guards coexist with each other — but exposed for
+    /// completeness and for diagnostics.
+    pub fn is_read_locked(&self, slug: &str) -> bool {
+        self.held.is_read_locked(slug)
     }
 
     /// Access the process-wide singleton. Used by every call site in
@@ -163,10 +262,12 @@ impl LockManager {
         let start = Instant::now();
         let guard = entry.clone().read_owned().await;
         log_wait("read", slug, start.elapsed());
+        self.held.incr_read(slug);
         SlugReadGuard {
             _entry: entry,
             _guard: guard,
             slug: slug.to_string(),
+            held: self.held.clone(),
         }
     }
 
@@ -183,10 +284,12 @@ impl LockManager {
         let start = Instant::now();
         let guard = entry.clone().write_owned().await;
         log_wait("write", slug, start.elapsed());
+        self.held.incr_write(slug);
         SlugWriteGuard {
             _entry: entry,
             _guard: guard,
             slug: slug.to_string(),
+            held: self.held.clone(),
         }
     }
 
@@ -199,10 +302,12 @@ impl LockManager {
         match tokio::time::timeout(timeout, entry.clone().write_owned()).await {
             Ok(guard) => {
                 log_wait("write", slug, start.elapsed());
+                self.held.incr_write(slug);
                 Some(SlugWriteGuard {
                     _entry: entry,
                     _guard: guard,
                     slug: slug.to_string(),
+                    held: self.held.clone(),
                 })
             }
             Err(_) => None,
@@ -216,10 +321,12 @@ impl LockManager {
         match tokio::time::timeout(timeout, entry.clone().read_owned()).await {
             Ok(guard) => {
                 log_wait("read", slug, start.elapsed());
+                self.held.incr_read(slug);
                 Some(SlugReadGuard {
                     _entry: entry,
                     _guard: guard,
                     slug: slug.to_string(),
+                    held: self.held.clone(),
                 })
             }
             Err(_) => None,
@@ -311,6 +418,22 @@ pub struct SlugWriteGuard {
     _guard: OwnedRwLockWriteGuard<()>,
     /// Slug this guard protects — exposed for logging/diagnostics.
     pub slug: String,
+    /// Phase 9c-3-2: shared book-keeping so Drop can decrement the
+    /// held-slugs counter without a reference back to the LockManager.
+    held: Arc<HeldBook>,
+}
+
+impl Drop for SlugWriteGuard {
+    fn drop(&mut self) {
+        // Decrement the held counter BEFORE the inner `_guard` drops.
+        // The order is not strictly load-bearing (the tokio lock's Drop
+        // and our book-keeping operate on distinct state) but decrementing
+        // first matches the intuition that the "held" flag tracks whether
+        // a guard value exists, and makes any concurrent
+        // `is_write_locked` observer see "not held" as soon as we begin
+        // tearing down.
+        self.held.decr_write(&self.slug);
+    }
 }
 
 /// Read guard for a single slug. Multiple may coexist; blocks any pending
@@ -320,6 +443,71 @@ pub struct SlugReadGuard {
     _guard: OwnedRwLockReadGuard<()>,
     /// Slug this guard protects — exposed for logging/diagnostics.
     pub slug: String,
+    /// Phase 9c-3-2: shared book-keeping so Drop can decrement the
+    /// read-held counter without a reference back to the LockManager.
+    held: Arc<HeldBook>,
+}
+
+impl Drop for SlugReadGuard {
+    fn drop(&mut self) {
+        self.held.decr_read(&self.slug);
+    }
+}
+
+/// Phase 9c-3-2: defensive runtime lock assertion.
+///
+/// Call at the top of functions that REQUIRE the caller to hold
+/// `LockManager::global().write(slug).await`. If the write guard is
+/// missing:
+/// - Under `debug_assertions` (dev + test builds): panic with a clear
+///   message naming the caller's obligation. Tests catch missing
+///   acquisitions loudly; non-compliant code never ships.
+/// - In release builds: `tracing::error!` + `anyhow::bail!`. Phase
+///   9c-3 verifier pass flipped this from "continue" to "bail" per
+///   `feedback_loud_deferrals` + `feedback_no_integrity_demotion`:
+///   a missing write guard is a correctness bug in the caller, not
+///   a recoverable condition. The original "continue" rationale
+///   ("the race window is already exposed") is wrong — `execute_
+///   supersession` returns `Result`, callers already handle failure,
+///   and silently proceeding into an un-serialized write risks DB
+///   corruption. Surface the error so the caller can abort the
+///   arm cleanly.
+///
+/// The canonical call sites that supply this invariant today:
+/// - `stale_helpers_upper::execute_supersession` (Phase 9a-2 lock
+///   contract — CALLER-HOLDS).
+///
+/// Discovered-wrong callers would otherwise violate the invariant
+/// silently until a race manifested as a DB inconsistency.
+pub fn assert_write_lock_held(slug: &str, caller: &str) -> anyhow::Result<()> {
+    if LockManager::global().is_write_locked(slug) {
+        return Ok(());
+    }
+    #[cfg(debug_assertions)]
+    {
+        panic!(
+            "{caller}: LockManager write guard is NOT held on slug='{slug}'. \
+             Callers must acquire `LockManager::global().write(slug).await` \
+             BEFORE invoking {caller} and hold the guard for the full call \
+             (Phase 9c-3-2 defensive assertion). See the Phase 9a-2 lock \
+             contract docs on `execute_supersession`."
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        tracing::error!(
+            slug = %slug,
+            caller = %caller,
+            "Phase 9c-3-2 lock-held assertion FAILED: caller did not acquire \
+             LockManager::global().write(slug) before calling. Refusing to \
+             proceed; fix the call site immediately."
+        );
+        anyhow::bail!(
+            "{caller}: LockManager write guard is NOT held on slug='{slug}'. \
+             Caller must acquire `LockManager::global().write(slug).await` \
+             before invoking {caller} (Phase 9c-3-2 / verifier pass)."
+        );
+    }
 }
 
 fn log_wait(kind: &str, slug: &str, waited: Duration) {
@@ -487,8 +675,7 @@ mod tests {
             sleep(Duration::from_millis(15)).await; // reader(s) already inside
             let _g = mgr_w.write("race05-vocab").await;
             // At this point no readers must be active.
-            *writer_started_after_w.lock().unwrap() =
-                Some(reader_overlap_w.load(Ordering::SeqCst));
+            *writer_started_after_w.lock().unwrap() = Some(reader_overlap_w.load(Ordering::SeqCst));
         });
 
         r1.await.unwrap();
@@ -596,9 +783,9 @@ mod tests {
         {
             let _g = mgr.write("drop-test").await;
         } // dropped here
-        // Second acquire must succeed immediately.
-        let acquired = tokio::time::timeout(Duration::from_millis(50), mgr.write("drop-test"))
-            .await;
+          // Second acquire must succeed immediately.
+        let acquired =
+            tokio::time::timeout(Duration::from_millis(50), mgr.write("drop-test")).await;
         assert!(acquired.is_ok(), "guard did not release on drop");
     }
 

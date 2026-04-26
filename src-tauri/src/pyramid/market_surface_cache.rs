@@ -104,10 +104,7 @@ impl MarketSurfaceCache {
     /// Construct an empty cache bound to shared auth + config handles.
     /// No background task is spawned; call `spawn_poller` separately
     /// (boot wiring from `main.rs`).
-    pub fn new(
-        auth: Arc<RwLock<AuthState>>,
-        config: Arc<RwLock<WireNodeConfig>>,
-    ) -> Self {
+    pub fn new(auth: Arc<RwLock<AuthState>>, config: Arc<RwLock<WireNodeConfig>>) -> Self {
         Self {
             data: Arc::new(RwLock::new(None)),
             last_refresh_at: Arc::new(RwLock::new(Instant::now())),
@@ -138,9 +135,7 @@ impl MarketSurfaceCache {
     /// answer until the Wave 4 poller populates the cell.
     pub async fn get_model(&self, model_id: &str) -> Option<MarketSurfaceModel> {
         let guard = self.data.read().await;
-        guard
-            .as_ref()
-            .and_then(|d| d.models.get(model_id).cloned())
+        guard.as_ref().and_then(|d| d.models.get(model_id).cloned())
     }
 
     /// Flattened read-only snapshot of the current cache state for
@@ -189,10 +184,9 @@ impl MarketSurfaceCache {
             .auth
             .as_ref()
             .ok_or_else(|| anyhow!("MarketSurfaceCache has no auth handle (test-only instance)"))?;
-        let config = self
-            .config
-            .as_ref()
-            .ok_or_else(|| anyhow!("MarketSurfaceCache has no config handle (test-only instance)"))?;
+        let config = self.config.as_ref().ok_or_else(|| {
+            anyhow!("MarketSurfaceCache has no config handle (test-only instance)")
+        })?;
 
         let api_url = {
             let cfg = config.read().await;
@@ -223,9 +217,53 @@ impl MarketSurfaceCache {
 
         // Re-index the `Vec<MarketSurfaceModel>` into a HashMap for O(1)
         // walker lookups. Contract returns `models` as Vec (rev 2.1 §3.1).
+        //
+        // Walker v3 fix (2026-04-23): Wire's bulk
+        // /api/v1/compute/market-surface (no filter) returns each model's
+        // catalog row (model_id + counts) WITHOUT the per-offer detail
+        // array. To get `model.offers` populated we must call
+        // ?model_id=X per known model. Walker v3's MarketReadiness
+        // requires `active_offers > 0` from the cached entry; without
+        // this per-model fetch, every model lands with offers=[],
+        // MarketReadiness drops Market with NoMarketOffersForSlot, and
+        // walker silently cascades to OpenRouter even when real market
+        // offers exist on Wire. Fixed by issuing per-model GETs when the
+        // bulk response gave us no offers (and the model has at least
+        // one active offer per the bulk-row counter).
         let mut models_map: HashMap<String, MarketSurfaceModel> =
             HashMap::with_capacity(parsed.models.len());
-        for m in parsed.models {
+        for mut m in parsed.models {
+            let needs_offer_fetch =
+                m.offers.as_ref().map(|o| o.is_empty()).unwrap_or(true) && m.active_offers > 0;
+            if needs_offer_fetch {
+                let path = format!(
+                    "/api/v1/compute/market-surface?model_id={}",
+                    urlencoding::encode(&m.model_id)
+                );
+                match send_api_request(&api_url, "GET", &path, &token, None, None).await {
+                    Ok((_, per_model_body)) => {
+                        match serde_json::from_value::<MarketSurfaceResponse>(per_model_body) {
+                            Ok(per_model_resp) => {
+                                if let Some(detail) = per_model_resp
+                                    .models
+                                    .into_iter()
+                                    .find(|d| d.model_id == m.model_id)
+                                {
+                                    m.offers = detail.offers;
+                                }
+                            }
+                            Err(e) => tracing::warn!(
+                                "market-surface per-model parse failed for {}: {e}",
+                                m.model_id
+                            ),
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        "market-surface per-model GET failed for {}: {e}",
+                        m.model_id
+                    ),
+                }
+            }
             models_map.insert(m.model_id.clone(), m);
         }
 
@@ -273,9 +311,7 @@ impl MarketSurfaceCache {
                         .as_ref()
                         .map(|d| d.models.len())
                         .unwrap_or(0);
-                    tracing::debug!(
-                        "MarketSurfaceCache initial refresh ok ({n} models)"
-                    );
+                    tracing::debug!("MarketSurfaceCache initial refresh ok ({n} models)");
                 }
                 Err(e) => {
                     tracing::warn!("MarketSurfaceCache initial refresh failed: {e}");
@@ -296,9 +332,7 @@ impl MarketSurfaceCache {
                             .as_ref()
                             .map(|d| d.models.len())
                             .unwrap_or(0);
-                        tracing::debug!(
-                            "MarketSurfaceCache refresh ok ({n} models)"
-                        );
+                        tracing::debug!("MarketSurfaceCache refresh ok ({n} models)");
                     }
                     Err(e) => {
                         tracing::warn!("MarketSurfaceCache refresh failed: {e}");
@@ -469,7 +503,8 @@ mod tests {
             "top_of_book": { "cheapest_with_headroom": null },
             "demand_24h": { "jobs_matched": 0, "jobs_settled": 0, "queue_fill_events": 0 },
             "last_offer_update_at": null,
-        })).expect("fixture shape");
+        }))
+        .expect("fixture shape");
 
         let model_b = test_model("provider/model-b", 2);
 

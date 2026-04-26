@@ -23,11 +23,13 @@ use super::ingest;
 use super::manifest;
 use super::meta;
 use super::multi_chain_overlay;
+use super::payment_redeemer;
 use super::preview;
 use super::primer;
 use super::publication;
 use super::query;
 use super::reading_modes;
+use super::recovery;
 use super::slug;
 use super::stale_engine;
 use super::staleness_bridge;
@@ -35,9 +37,7 @@ use super::types::CharacterizationResult;
 use super::types::*;
 use super::vine;
 use super::vocabulary;
-use super::recovery;
 use super::webbing;
-use super::payment_redeemer;
 use super::wire_import;
 use super::wire_publish;
 use super::PyramidState;
@@ -377,13 +377,9 @@ async fn enforce_access_tier(
             };
 
             // Billable route on a priced pyramid — payment token required.
-            let claims = validate_payment_token(
-                &pi.token,
-                auth_source,
-                &pi.jwt_public_key,
-                &pi.node_id,
-            )
-            .await;
+            let claims =
+                validate_payment_token(&pi.token, auth_source, &pi.jwt_public_key, &pi.node_id)
+                    .await;
 
             match claims {
                 Some(c) => Ok(Some(c)),
@@ -397,10 +393,7 @@ async fn enforce_access_tier(
                         operator_id = %operator_id,
                         "Priced pyramid payment enforcement: {}", msg
                     );
-                    Err(json_error(
-                        warp::http::StatusCode::PAYMENT_REQUIRED,
-                        msg,
-                    ))
+                    Err(json_error(warp::http::StatusCode::PAYMENT_REQUIRED, msg))
                 }
             }
         }
@@ -481,6 +474,30 @@ struct CreateSlugBody {
     source_path: String,
     #[serde(default)]
     referenced_slugs: Option<Vec<String>>,
+    /// Phase 9b-4: for `ContentType::Question` slugs, the natural-
+    /// language question text (optional — preserves backward compat
+    /// with pre-9b callers that only sent `slug` + `content_type`).
+    /// When present AND content_type == Question, the slug creation
+    /// path invokes the authorize_question chain and only persists
+    /// on approval. When absent for Question slugs, slug creation
+    /// proceeds ungated (legacy behavior).
+    #[serde(default)]
+    question: Option<String>,
+    /// Phase 9b-4: author credit carried into the authorize_question
+    /// chain's metadata + into the approved-question annotation.
+    #[serde(default)]
+    author: Option<String>,
+}
+
+/// Phase 9b-4: `POST /pyramid/:slug/propose_question` body.
+#[derive(Deserialize)]
+struct ProposeQuestionBody {
+    /// Free-text question proposed against the slug's purpose.
+    question: String,
+    /// Optional author credit — recorded on the resulting Question
+    /// slug / annotation.
+    #[serde(default)]
+    author: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -509,6 +526,43 @@ struct AnnotateBody {
     annotation_type: String,
     content: String,
     question_context: Option<String>,
+    author: Option<String>,
+}
+
+/// Post-build accretion v5 Phase 9c-1: `POST /pyramid/:slug/debates/:node_id/collapse`.
+/// Operator-facing admin endpoint to collapse a Debate node. Internally writes
+/// a `debate_collapse` annotation, which fires the canonical annotation hook
+/// → annotation_reacted → handler_chain_id=starter-debate-collapse → shape
+/// transition. The dual path (HTTP admin + annotation) is canonical per
+/// feedback_no_deferral_creep — the feature must be usable both from the
+/// substrate UI (annotation) and from the operator surface (HTTP).
+#[derive(Deserialize, Default)]
+struct CollapseDebateBody {
+    /// Short human-readable reason. Stored as the annotation `content`.
+    /// Defaults to `"operator_collapsed"` when empty.
+    #[serde(default)]
+    reason: Option<String>,
+    /// Optional operator identity for the annotation `author` field.
+    /// Defaults to `"operator"` when missing.
+    #[serde(default)]
+    author: Option<String>,
+}
+
+/// Post-build accretion v5 Phase 9c-3-3: `POST /pyramid/:slug/debates/:node_id/reopen`.
+/// Operator-facing admin endpoint to re-open a previously-collapsed debate.
+/// Writes a `debate_reopened` observation event; the next annotation append
+/// observes the event and bypasses the post-collapse cooldown check.
+///
+/// Does NOT re-create the debate node. The subsequent steel_man / red_team
+/// annotation (posted via /annotate) will take the Scaffolding branch,
+/// create a fresh DebateTopic, and re-elevate the node to debate shape.
+#[derive(Deserialize, Default)]
+struct ReopenDebateBody {
+    /// Short human-readable reason. Default `"operator_reopened"`.
+    #[serde(default)]
+    reason: Option<String>,
+    /// Optional operator identity. Default `"operator"`.
+    #[serde(default)]
     author: Option<String>,
 }
 
@@ -552,6 +606,13 @@ struct VineBuildBody {
     evidence_mode: String,
 }
 
+// walker-v3 W3a (Cluster 1 / Option A): `ConfigBody` is retained for the
+// credential + flag writes (openrouter_api_key / use_ir_executor);
+// model-slug writes (primary_model / fallback_model_{1,2}) are rejected
+// with a directed error pointing at the walker_provider_openrouter
+// contribution. Phase 6 deletes the whole route once the Settings UI
+// rewrites to edit walker_* contributions directly.
+// TODO(walker-v3 Phase 6): delete ConfigBody + POST /pyramid/config.
 #[derive(Deserialize)]
 struct ConfigBody {
     openrouter_api_key: Option<String>,
@@ -588,9 +649,15 @@ struct ReadingWalkQuery {
     limit: usize,
 }
 
-fn default_walk_layer() -> i64 { 1 }
-fn default_walk_direction() -> String { "newest".to_string() }
-fn default_walk_limit() -> usize { 20 }
+fn default_walk_layer() -> i64 {
+    1
+}
+fn default_walk_direction() -> String {
+    "newest".to_string()
+}
+fn default_walk_limit() -> usize {
+    20
+}
 
 #[derive(Deserialize)]
 struct ReadingThreadQuery {
@@ -615,7 +682,9 @@ struct ReadingSearchQuery {
     limit: usize,
 }
 
-fn default_search_limit() -> usize { 20 }
+fn default_search_limit() -> usize {
+    20
+}
 
 // ── Phase 5 & 6: Auto-update request/response types ─────────────────
 
@@ -653,7 +722,9 @@ struct QuestionBuildBody {
     #[serde(default = "default_evidence_mode")]
     evidence_mode: String,
 }
-fn default_evidence_mode() -> String { "deep".to_string() }
+fn default_evidence_mode() -> String {
+    "deep".to_string()
+}
 
 #[derive(Deserialize)]
 struct CharacterizeBody {
@@ -910,7 +981,10 @@ fn payment_settle(
 /// credits auto-release on TTL expiry at the Wire server. Without this,
 /// the sweeper would redeem the token and the operator would collect payment
 /// for a query that returned 404 or 500.
-fn payment_abort(state: &Arc<PyramidState>, payment_claims: &Option<crate::server::PaymentTokenClaims>) {
+fn payment_abort(
+    state: &Arc<PyramidState>,
+    payment_claims: &Option<crate::server::PaymentTokenClaims>,
+) {
     if let Some(claims) = payment_claims {
         if let Some(nonce) = &claims.nonce {
             let nonce = nonce.clone();
@@ -958,7 +1032,8 @@ struct QueryCostParams {
     /// Query type: "apex", "drill", "search", "export"
     query_type: Option<String>,
     /// Node ID (required for drill queries, used for handle-path resolution)
-    #[allow(dead_code)] // Deserialized from query params; not read in Rust but part of API contract
+    #[allow(dead_code)]
+    // Deserialized from query params; not read in Rust but part of API contract
     node_id: Option<String>,
 }
 
@@ -1757,7 +1832,12 @@ pub fn pyramid_routes(
     let r5 = drill.or(search).unify().boxed();
     let r6 = entities.or(resolved).unify().boxed();
     let r7 = corrections.or(terms).unify().boxed();
-    let r8 = ingest_route.or(config_route).unify().or(config_profile_route).unify().boxed();
+    let r8 = ingest_route
+        .or(config_route)
+        .unify()
+        .or(config_profile_route)
+        .unify()
+        .boxed();
     let r9 = threads.or(archive_slug_route).unify().boxed();
     let r31 = purge_slug_route.or(slug_references_route).unify().boxed();
     let r10 = annotate.or(annotations).unify().boxed();
@@ -1924,7 +2004,10 @@ pub fn pyramid_routes(
         .and_then(handle_chain_proposal_list));
 
     // Longest paths first: accept/reject/defer (3 segments), then get (2), then submit+list (1)
-    let cpr_a = chain_proposal_accept.or(chain_proposal_reject).unify().boxed();
+    let cpr_a = chain_proposal_accept
+        .or(chain_proposal_reject)
+        .unify()
+        .boxed();
     let cpr_b = cpr_a.or(chain_proposal_defer).unify().boxed();
     let cpr_c = cpr_b.or(chain_proposal_get).unify().boxed();
     let cpr_d = cpr_c.or(chain_proposal_submit).unify().boxed();
@@ -2678,7 +2761,10 @@ pub fn pyramid_routes(
         .and_then(handle_question_retrieve));
 
     // More-specific path (with question_id param) before bare /question
-    let qr = question_retrieve_poll.or(question_retrieve_submit).unify().boxed();
+    let qr = question_retrieve_poll
+        .or(question_retrieve_submit)
+        .unify()
+        .boxed();
     let top32 = top31.or(qr).unify().boxed();
 
     // ── WS-READING-MODES (Phase 4): Six reading mode routes ──────────────
@@ -2757,10 +2843,177 @@ pub fn pyramid_routes(
     let rm = rm_d.or(rm_c).unify().boxed();
     let top33 = top32.or(rm).unify().boxed();
 
+    // ── Post-build accretion v5 Phase 6c-A: vocabulary registry read ──
+    //
+    // GET /vocabulary/:vocab_kind — public read, NO AUTH. Exposes the
+    // contribution-driven vocabulary registry (annotation_type,
+    // node_shape, role_name) so MCP + frontend (6c-C) can discover
+    // valid values at runtime instead of hardcoding them. Top-level
+    // path (not under /pyramid/) because vocab is global, not
+    // per-slug.
+    //
+    // Distinct from the existing `/pyramid/:slug/vocabulary/*`
+    // routes (those expose the per-slug apex vocabulary catalog from
+    // `vocabulary.rs` — completely different concept).
+    let vocab_registry = route!(warp::path("vocabulary")
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::any().map({
+            let state = state.clone();
+            move || state.clone()
+        }))
+        .and_then(handle_vocab_registry_list));
+
+    let top34 = top33.or(vocab_registry).unify().boxed();
+
+    // ── Post-build accretion v5 Phase 9b-4: authorize_question route ──
+    //
+    // POST /pyramid/:slug/propose_question — gate a proposed question
+    // through the slug's authorize_question chain binding, then persist
+    // the approval decision + create a child Question slug on accept.
+    // Local-only auth (this is a mutation).
+    let propose_question = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("propose_question"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json::<ProposeQuestionBody>())
+        .and_then(handle_propose_question));
+
+    let top35 = top34.or(propose_question).unify().boxed();
+
+    // ── Post-build accretion v5 Phase 9c-1: operator debate collapse ──
+    //
+    // POST /pyramid/:slug/debates/:node_id/collapse — operator-facing
+    // admin path that writes a `debate_collapse` annotation on the
+    // target node, triggering the canonical starter-debate-collapse
+    // chain. Sibling of the annotation-based path; both paths shipped
+    // together per feedback_no_deferral_creep (the feature is not
+    // complete if an operator can only collapse via substrate UI).
+    // Local-only auth (mutation).
+    let collapse_debate = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("debates"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("collapse"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::content_length_limit(1_048_576))
+        .and(warp::body::json::<CollapseDebateBody>())
+        .and_then(handle_collapse_debate));
+
+    let top36 = top35.or(collapse_debate).unify().boxed();
+
+    // ── Post-build accretion v5 Phase 9c-3-3: operator debate reopen ──
+    //
+    // POST /pyramid/:slug/debates/:node_id/reopen — operator-facing
+    // admin path that writes a `debate_reopened` observation event on
+    // the target node. The next steel_man/red_team annotation append
+    // observes the event and bypasses the post-collapse cooldown.
+    // Does NOT itself recreate the debate — that happens when the
+    // operator POSTs the follow-up annotation. Local-only auth (mutation).
+    let reopen_debate = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("debates"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("reopen"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::content_length_limit(1_048_576))
+        .and(warp::body::json::<ReopenDebateBody>())
+        .and_then(handle_reopen_debate));
+
+    let top37 = top36.or(reopen_debate).unify().boxed();
+
+    // ── Post-build accretion v5 Phase 9 close-3: introspection GETs ──
+    //
+    // Three read-only operator endpoints that surface v5 state without
+    // requiring `sqlite3 pyramid.db` queries. Auth-gated (same
+    // `with_auth_state` as the existing annotation reads — these expose
+    // pyramid interiors so local-auth is the consistent floor).
+    //
+    //   GET /pyramid/:slug/debates/:node_id
+    //       — current debate state: shape, payload, recent observation
+    //         events, is_collapsed, cooldown_until
+    //   GET /pyramid/:slug/role_bindings
+    //       — active role bindings for the slug
+    //   GET /pyramid/:slug/synthesis_history/:node_id
+    //       — meta-layer node re-distill history from
+    //         dadbear_result_applications + recent cascade annotations
+    //
+    // 404 on missing slug / node, 400 on malformed params, 500 on DB.
+    // Per `feedback_loud_deferrals`: the debate handler 404s when the
+    // node is not a debate shape (vs returning a null payload) because
+    // "no debate here" is the actionable signal.
+    let debate_state_get = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("debates"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_get_debate_state));
+
+    let role_bindings_get = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("role_bindings"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_get_role_bindings));
+
+    let synthesis_history_get = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("synthesis_history"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_get_synthesis_history));
+
+    let intro_a = debate_state_get.or(role_bindings_get).unify().boxed();
+    let intro = intro_a.or(synthesis_history_get).unify().boxed();
+    let top38 = top37.or(intro).unify().boxed();
+
     // public_html is now mounted separately at the server level so it can
     // get a permissive CORS filter (the desktop API allowlist would block
     // form POSTs from the tunnel host).
-    top33
+    top38
+}
+
+/// GET /vocabulary/:vocab_kind — public read of the vocabulary
+/// registry. Returns active entries only. Zero auth required.
+/// Phase 6c-A.
+async fn handle_vocab_registry_list(
+    vocab_kind: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match crate::pyramid::vocab_entries::handle_get_vocabulary(&conn, &vocab_kind) {
+        Ok(response) => Ok(json_ok(&response)),
+        Err(e) => {
+            // Unknown vocab_kind → 400 Bad Request with the list of
+            // valid kinds enumerated, per feedback_loud_deferrals. Any
+            // other error → 500.
+            if e.downcast_ref::<crate::pyramid::vocab_entries::UnknownVocabKind>()
+                .is_some()
+            {
+                Ok(json_error(
+                    warp::http::StatusCode::BAD_REQUEST,
+                    &e.to_string(),
+                ))
+            } else {
+                Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ))
+            }
+        }
+    }
 }
 
 /// Mount the post-agents-retro `/p/` web surface routes. These are
@@ -2772,6 +3025,1127 @@ pub fn public_html_routes(
     jwt_public_key: Arc<tokio::sync::RwLock<String>>,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
     crate::pyramid::public_html::routes(state, jwt_public_key)
+}
+
+// ── Phase 9b-4: authorize_question shared helper ────────────────────
+
+/// Result of running the authorize_question chain.
+#[derive(Debug, Clone)]
+pub struct AuthorizeQuestionDecision {
+    pub approved: bool,
+    pub reasoning: String,
+    pub alternative_question_suggestion: Option<String>,
+}
+
+/// Shared helper: resolve the slug's `authorize_question` role
+/// binding, load the bound chain, and run it against the proposed
+/// question. Returns the chain's `{approved, reasoning,
+/// alternative_question_suggestion}` decoded into
+/// `AuthorizeQuestionDecision`.
+///
+/// Callers:
+///   - `handle_propose_question` — direct HTTP route (9b-4).
+///   - `handle_create_slug` for `ContentType::Question` — ingress
+///     gate on slug creation when the caller supplies a `question`
+///     field in the create body.
+///
+/// Any of:
+///   - unresolved binding
+///   - chain load failure
+///   - chain execution failure
+///   - malformed chain output (missing `approved`)
+/// become an `Err(anyhow)` and the HTTP layer maps that to 500.
+/// `feedback_loud_deferrals`: we do NOT silently fall through to
+/// an "approved by default" path when the chain can't run — the
+/// gate must be live.
+pub async fn run_authorize_question_chain(
+    state: &Arc<PyramidState>,
+    slug: &str,
+    question: &str,
+    author: Option<&str>,
+) -> anyhow::Result<AuthorizeQuestionDecision> {
+    // Resolve the slug's authorize_question binding — raises
+    // UnresolvedBinding if the slug has no active binding, which
+    // shouldn't happen for a v5 slug (genesis seed fires at
+    // create_slug time).
+    let chain_id = {
+        let conn = state.reader.lock().await;
+        super::role_binding::resolve_binding(&conn, slug, "authorize_question")?
+            .handler_chain_id
+    };
+
+    let chain = super::chain_loader::load_chain_by_id(&chain_id, &state.chains_dir)?;
+
+    let inputs = serde_json::json!({
+        "slug": slug,
+        "question": question,
+        "author": author,
+    });
+    let result = super::chain_executor::execute_chain_for_target(
+        state, &chain, slug, None, inputs,
+    )
+    .await?;
+
+    // Chain's final step is `log_and_complete` which passes the
+    // preceding `authorize_question` LLM step's output through
+    // verbatim. Expected shape:
+    //   {approved, reasoning, alternative_question_suggestion}
+    let approved = result
+        .get("approved")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "authorize_question chain '{chain_id}' for slug '{slug}' returned no \
+                 `approved` boolean — malformed output; refusing to gate"
+            )
+        })?;
+    let reasoning = result
+        .get("reasoning")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let alternative_question_suggestion = result
+        .get("alternative_question_suggestion")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    Ok(AuthorizeQuestionDecision {
+        approved,
+        reasoning,
+        alternative_question_suggestion,
+    })
+}
+
+/// Phase 9b-4: `POST /pyramid/:slug/propose_question`.
+///
+/// Runs the slug's authorize_question chain against the proposed
+/// question text. On approval:
+///   - Creates a `ContentType::Question` child slug referencing
+///     the parent slug (slug id derived from the question text).
+///   - Persists the question text as an annotation on the new
+///     child slug's L0 seed node (no L0 exists yet, so the
+///     annotation is node-less; the accretion / build pass picks
+///     it up on the next cycle).
+///   - Returns 200 + the new child slug id + the chain's reasoning.
+///
+/// On rejection: returns 400 + the reasoning + the chain's
+/// `alternative_question_suggestion` if any.
+async fn handle_propose_question(
+    slug_name: String,
+    state: Arc<PyramidState>,
+    body: ProposeQuestionBody,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Validate parent slug exists.
+    {
+        let conn = state.reader.lock().await;
+        match db::get_slug(&conn, &slug_name) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("slug '{slug_name}' not found"),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+    }
+
+    if body.question.trim().is_empty() {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "question must not be empty",
+        ));
+    }
+
+    // Derive the deterministic child slug id up-front so we can
+    // short-circuit idempotent repeat proposals BEFORE firing the
+    // authorize_question LLM chain. Without this the approved
+    // branch's "already exists" recovery path still costs one full
+    // LLM round-trip per repeat (chain execution happens before
+    // the create_slug collision is observed). Verifier fix: cost +
+    // latency are both paid by the caller — short-circuit is safe
+    // because the decision is already recorded in the parent's
+    // annotation stream and the child slug is the authoritative
+    // signal that the question was approved.
+    let child_slug_id = {
+        let mut hasher = sha2::Sha256::new();
+        use sha2::Digest;
+        hasher.update(body.question.as_bytes());
+        hasher.update(b":");
+        hasher.update(slug_name.as_bytes());
+        let digest = hasher.finalize();
+        format!("q-{}", hex::encode(&digest[..8]))
+    };
+
+    {
+        let conn = state.reader.lock().await;
+        if let Ok(Some(existing)) = db::get_slug(&conn, &child_slug_id) {
+            let payload = serde_json::json!({
+                "approved": true,
+                "reasoning": "idempotent repeat proposal — chain skipped; \
+                              existing child slug returned",
+                "child_slug_id": existing.slug,
+                "parent_slug": slug_name,
+                "idempotent": true,
+            });
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&payload),
+                warp::http::StatusCode::OK,
+            )
+            .into_response());
+        }
+    }
+
+    // Gate through authorize_question chain.
+    let decision = match run_authorize_question_chain(
+        &state,
+        &slug_name,
+        &body.question,
+        body.author.as_deref(),
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("authorize_question chain failed: {e}"),
+            ));
+        }
+    };
+
+    if !decision.approved {
+        let payload = serde_json::json!({
+            "approved": false,
+            "reasoning": decision.reasoning,
+            "alternative_question_suggestion": decision.alternative_question_suggestion,
+        });
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&payload),
+            warp::http::StatusCode::BAD_REQUEST,
+        )
+        .into_response());
+    }
+
+    let new_slug_info = {
+        let conn = state.writer.lock().await;
+        let create_result = slug::create_slug(
+            &conn,
+            &child_slug_id,
+            &ContentType::Question,
+            "",  // source_path — Question slugs don't have a filesystem source
+        );
+        match create_result {
+            Ok(info) => {
+                // Save the parent slug as a referenced slug so the
+                // question build knows which substrate to pull from.
+                if let Err(e) = db::save_slug_references(&conn, &info.slug, &[slug_name.clone()]) {
+                    return Ok(json_error(
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("slug created but failed to save references: {e}"),
+                    ));
+                }
+                info
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("already exists") {
+                    // Idempotent repeat proposal — return 200 with
+                    // the existing slug id.
+                    match db::get_slug(&conn, &child_slug_id) {
+                        Ok(Some(existing)) => existing,
+                        _ => {
+                            return Ok(json_error(
+                                warp::http::StatusCode::CONFLICT,
+                                &msg,
+                            ));
+                        }
+                    }
+                } else {
+                    return Ok(json_error(
+                        warp::http::StatusCode::BAD_REQUEST,
+                        &msg,
+                    ));
+                }
+            }
+        }
+    };
+
+    // Persist the question text as an annotation on the parent
+    // slug's root (no specific node_id — captures the proposal
+    // chronicle even before the child slug gets a build).
+    {
+        let conn = state.writer.lock().await;
+        let annotation = PyramidAnnotation {
+            id: 0,
+            slug: slug_name.clone(),
+            node_id: String::new(),
+            annotation_type: AnnotationType::from_db_string("question"),
+            content: body.question.clone(),
+            question_context: Some(child_slug_id.clone()),
+            author: body
+                .author
+                .clone()
+                .unwrap_or_else(|| "authorize_question".into()),
+            created_at: String::new(),
+        };
+        // Best-effort — primary state lives in the new slug +
+        // reference row; losing the annotation breadcrumb shouldn't
+        // fail the proposal.
+        if let Err(e) = db::save_annotation(&conn, &annotation) {
+            tracing::warn!(
+                slug = %slug_name,
+                child = %child_slug_id,
+                error = %e,
+                "propose_question: failed to persist question annotation on parent slug"
+            );
+        }
+    }
+
+    let payload = serde_json::json!({
+        "approved": true,
+        "reasoning": decision.reasoning,
+        "child_slug_id": new_slug_info.slug,
+        "parent_slug": slug_name,
+    });
+    Ok(warp::reply::with_status(
+        warp::reply::json(&payload),
+        warp::http::StatusCode::OK,
+    )
+    .into_response())
+}
+
+/// Post-build accretion v5 Phase 9c-1: operator-facing admin endpoint
+/// to collapse a Debate node back to Scaffolding.
+///
+/// POST /pyramid/:slug/debates/:node_id/collapse
+/// Body (all optional):
+///   { "reason": "Consensus reached on X.", "author": "alice" }
+///
+/// Internally this writes a `debate_collapse` annotation on the target
+/// node via the canonical annotation path. The annotation's
+/// `process_annotation_hook` stamps `handler_chain_id=starter-debate-collapse`
+/// onto the emitted `annotation_reacted` event; the next compile tick
+/// compiles that into a work item whose `starter-debate-collapse` chain
+/// fires `finalize_debate_node` and performs the Debate → Scaffolding
+/// transition + `debate_collapsed` event emission atomically.
+///
+/// The HTTP path is a sibling of the annotation path — same effect,
+/// different entry point. This covers operator UIs / CLIs that want a
+/// single-verb collapse call without constructing an annotation
+/// payload themselves. Local-only auth (mutation).
+///
+/// Returns 200 + the created annotation. Does NOT wait for the chain
+/// to finish — the hook fires in the background (mirrors
+/// `handle_annotate`). The client can poll
+/// `GET /pyramid/:slug/nodes/:id` to observe the shape transition, or
+/// the chronicle for the `debate_collapsed` event.
+///
+/// Status codes:
+///   200 — annotation saved + hook scheduled
+///   404 — slug or node not found
+///   400 — node is not a Debate shape (clients can still post, but
+///         the collapse chain will skip loud — we prefer a fast 400
+///         at the HTTP boundary for the common mis-click case)
+///   500 — persistence failure
+async fn handle_collapse_debate(
+    slug_name: String,
+    node_id: String,
+    state: Arc<PyramidState>,
+    body: CollapseDebateBody,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Validate slug + node + current shape up front.
+    {
+        let conn = state.reader.lock().await;
+        match slug::get_slug(&conn, &slug_name) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("slug '{slug_name}' not found"),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+        match db::get_node(&conn, &slug_name, &node_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("node '{node_id}' not found in slug '{slug_name}'"),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+        // Shape pre-check: fail fast with a 400 on non-Debate targets so the
+        // operator UX doesn't have to poll the chronicle to discover the
+        // skip. The chain-level skip path still fires defensively for
+        // direct annotation writes that bypass this endpoint — both
+        // surfaces stay loud per feedback_loud_deferrals.
+        match db::get_node_shape(&conn, &slug_name, &node_id) {
+            Ok(Some(shape_view)) => {
+                if !shape_view.shape.as_str().eq(NODE_SHAPE_DEBATE) {
+                    return Ok(json_error(
+                        warp::http::StatusCode::BAD_REQUEST,
+                        &format!(
+                            "node '{node_id}' has shape '{}' — only Debate nodes can be \
+                             collapsed via this endpoint. Write a `debate_collapse` \
+                             annotation via /annotate if you need the chronicle trail anyway.",
+                            shape_view.shape.as_str(),
+                        ),
+                    ));
+                }
+            }
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("node '{node_id}' shape row missing"),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+    }
+
+    let content = body
+        .reason
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "operator_collapsed".to_string());
+    let author = body
+        .author
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "operator".to_string());
+
+    let annotation = PyramidAnnotation {
+        id: 0,
+        slug: slug_name.clone(),
+        node_id: node_id.clone(),
+        annotation_type: AnnotationType::from_db_string("debate_collapse"),
+        content,
+        question_context: None,
+        author,
+        created_at: String::new(),
+    };
+
+    let saved = {
+        let conn = state.writer.lock().await;
+        match db::save_annotation(&conn, &annotation) {
+            Ok(a) => a,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to save debate_collapse annotation: {e}"),
+                ));
+            }
+        }
+    };
+
+    // Fire the canonical annotation hook in the background — mirrors
+    // handle_annotate so the admin path and the annotation path have
+    // identical dispatch semantics.
+    let annotation_clone = saved.clone();
+    let writer_clone = state.writer.clone();
+    let reader_clone = state.reader.clone();
+    let slug_clone = saved.slug.clone();
+    let annotation_build_id = format!("annotation-{}-{}", slug_clone, saved.id);
+    let base_config = state
+        .llm_config_with_cache(&slug_clone, &annotation_build_id)
+        .await;
+    // walker-v3 W3c: resolve via walker_resolver reading the active
+    // walker_provider_openrouter contribution. Legacy
+    // `base_config.primary_model` field was removed in W3c.
+    let resolved = {
+        let conn = state.reader.lock().await;
+        super::walker_resolver::first_openrouter_model_from_db(&conn)
+    };
+    let model = resolved.unwrap_or_else(|| {
+        tracing::warn!(
+            event = "pattern4_no_openrouter_model",
+            "walker-v3: Pattern-4 site (admin annotate) found no walker_provider_openrouter model; stamping '<unknown>' — downstream dispatch will surface no-model-available",
+        );
+        "<unknown>".to_string()
+    });
+    let ops_clone = state.operational.clone();
+    tokio::spawn(async move {
+        if let Err(e) = process_annotation_hook(
+            &reader_clone,
+            &writer_clone,
+            &slug_clone,
+            &annotation_clone,
+            &base_config,
+            &model,
+            &ops_clone,
+        )
+        .await
+        {
+            tracing::error!(
+                "[collapse-debate] post-save hook failed: {} (annotation saved but dispatch skipped)",
+                e
+            );
+        }
+    });
+
+    Ok(
+        warp::reply::with_status(warp::reply::json(&saved), warp::http::StatusCode::OK)
+            .into_response(),
+    )
+}
+
+/// Post-build accretion v5 Phase 9c-3-3: operator-facing admin endpoint
+/// to re-open a previously-collapsed debate.
+///
+/// POST /pyramid/:slug/debates/:node_id/reopen
+/// Body (all optional):
+///   { "reason": "New evidence surfaced.", "author": "alice" }
+///
+/// Writes a `debate_reopened` observation event on the target node.
+/// The next steel_man / red_team annotation append observes the event
+/// and bypasses the post-collapse cooldown check (Phase 9c-2-3 guard).
+/// Does NOT itself create the debate node — the operator's follow-up
+/// annotation is what takes the Scaffolding branch and re-materializes
+/// the DebateTopic. This split is deliberate: the reopen signal is
+/// operator-level intent; the substrate re-materialization is the
+/// annotation path, which already carries the position content and
+/// author attribution the debate needs to resume.
+///
+/// Status codes:
+///   200 — reopen event written, event id returned
+///   404 — slug or node not found
+///   400 — no prior `debate_collapsed` event exists for the node
+///         (nothing to reopen; operator likely intended a fresh debate
+///         via /annotate instead). Loud per feedback_loud_deferrals.
+///   500 — persistence failure
+async fn handle_reopen_debate(
+    slug_name: String,
+    node_id: String,
+    state: Arc<PyramidState>,
+    body: ReopenDebateBody,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Validate slug + node + prior-collapse exists.
+    let latest_collapse_event_id: i64;
+    {
+        let conn = state.reader.lock().await;
+        match slug::get_slug(&conn, &slug_name) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("slug '{slug_name}' not found"),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+        match db::get_node(&conn, &slug_name, &node_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("node '{node_id}' not found in slug '{slug_name}'"),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+        // Look up the most recent `debate_collapsed` event for this
+        // (slug, node_id). No prior collapse → 400. This is a loud
+        // deferral: the operator's intent (re-open a collapsed debate)
+        // is nonsensical if nothing was collapsed. feedback_loud_deferrals.
+        let most_recent: Option<i64> = match conn.query_row(
+            "SELECT id FROM dadbear_observation_events
+              WHERE slug = ?1
+                AND event_type = 'debate_collapsed'
+                AND target_node_id = ?2
+              ORDER BY id DESC
+              LIMIT 1",
+            rusqlite::params![slug_name, node_id],
+            |r| r.get::<_, i64>(0),
+        ) {
+            Ok(id) => Some(id),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to look up prior collapse event: {e}"),
+                ));
+            }
+        };
+        latest_collapse_event_id = match most_recent {
+            Some(id) => id,
+            None => {
+                return Ok(json_error(
+                    warp::http::StatusCode::BAD_REQUEST,
+                    &format!(
+                        "cannot reopen debate on node '{node_id}' — no prior \
+                         `debate_collapsed` event exists for this (slug, node). \
+                         To start a fresh debate, POST a steel_man / red_team \
+                         annotation via /annotate. (9c-3-3 loud-deferral.)"
+                    ),
+                ));
+            }
+        };
+    }
+
+    let reason = body
+        .reason
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "operator_reopened".to_string());
+    let author = body
+        .author
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "operator".to_string());
+
+    // Look up node layer for the event row (optional but preserves
+    // parity with emit_debate_collapsed).
+    let layer: Option<i64> = {
+        let conn = state.reader.lock().await;
+        conn.query_row(
+            "SELECT depth FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
+            rusqlite::params![slug_name, node_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok()
+    };
+
+    // Write the event.
+    let event_id = {
+        let conn = state.writer.lock().await;
+        match crate::pyramid::observation_events::emit_debate_reopened(
+            &conn,
+            &slug_name,
+            &node_id,
+            layer,
+            &reason,
+            &author,
+            Some(latest_collapse_event_id),
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to emit debate_reopened event: {e}"),
+                ));
+            }
+        }
+    };
+
+    let payload = serde_json::json!({
+        "event_id": event_id,
+        "slug": slug_name,
+        "node_id": node_id,
+        "referenced_collapse_event_id": latest_collapse_event_id,
+        "reason": reason,
+        "author": author,
+    });
+    Ok(
+        warp::reply::with_status(warp::reply::json(&payload), warp::http::StatusCode::OK)
+            .into_response(),
+    )
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Post-build accretion v5 Phase 9 close-3: introspection GET handlers
+// ════════════════════════════════════════════════════════════════════
+//
+// Three read-only endpoints for operator introspection without
+// sqlite3 queries. All local-auth, 404 on missing slug/node, 500 on
+// DB error.
+//
+// - handle_get_debate_state
+// - handle_get_role_bindings
+// - handle_get_synthesis_history
+
+/// GET /pyramid/:slug/debates/:node_id
+///
+/// Returns current Debate state plus recent observation events.
+/// Shape:
+///   {
+///     "node_id": "L1-007",
+///     "slug": "my-slug",
+///     "node_shape": "debate" | "scaffolding" | "meta_layer" | "gap",
+///     "payload": { /* DebateTopic JSON */ } | null,
+///     "recent_events": [{event_type, detected_at, metadata}, ...],
+///     "is_collapsed": bool,
+///     "cooldown_until": "2026-04-23T..." | null
+///   }
+///
+/// `is_collapsed` is true iff the most recent `debate_collapsed` event
+/// postdates the most recent `debate_reopened` (Phase 9c-3-3 semantics).
+/// `cooldown_until` is set iff collapsed AND `collapse_cooldown_secs`
+/// > 0 AND the cooldown has not expired.
+async fn handle_get_debate_state(
+    slug_name: String,
+    node_id: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+
+    // Validate slug.
+    match slug::get_slug(&conn, &slug_name) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                &format!("slug '{slug_name}' not found"),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ));
+        }
+    }
+
+    // Validate node + pull node_shape + shape_payload_json.
+    let (node_shape_str, shape_payload_json): (String, Option<serde_json::Value>) = match db::get_node_shape(&conn, &slug_name, &node_id) {
+        Ok(Some(view)) => {
+            let shape_str = view.shape.as_str().to_string();
+            let payload = view.payload.as_ref().map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null));
+            (shape_str, payload)
+        }
+        Ok(None) => {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                &format!("node '{node_id}' not found in slug '{slug_name}'"),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to read node shape: {e}"),
+            ));
+        }
+    };
+
+    // Pull the 10 most-recent relevant observation events for this
+    // node (debate_spawned / debate_collapsed / debate_reopened /
+    // annotation_written / annotation_superseded / annotation_reacted).
+    // Loud-raise on DB error — this is not a shortcut we silently skip.
+    let recent_events: Vec<serde_json::Value> = {
+        let mut stmt = match conn.prepare(
+            "SELECT event_type, detected_at, COALESCE(metadata_json, '{}')
+               FROM dadbear_observation_events
+              WHERE slug = ?1
+                AND target_node_id = ?2
+                AND event_type IN (
+                    'debate_spawned', 'debate_collapsed', 'debate_reopened',
+                    'annotation_written', 'annotation_superseded', 'annotation_reacted'
+                )
+              ORDER BY id DESC
+              LIMIT 10",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to prepare observation query: {e}"),
+                ));
+            }
+        };
+        let rows = match stmt.query_map(
+            rusqlite::params![slug_name, node_id],
+            |r| {
+                let event_type: String = r.get(0)?;
+                let detected_at: String = r.get(1)?;
+                let metadata_raw: String = r.get(2)?;
+                Ok((event_type, detected_at, metadata_raw))
+            },
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to query observation events: {e}"),
+                ));
+            }
+        };
+        let mut out = Vec::new();
+        for row in rows {
+            match row {
+                Ok((etype, detected, meta_raw)) => {
+                    let meta: serde_json::Value = serde_json::from_str(&meta_raw)
+                        .unwrap_or(serde_json::Value::Object(Default::default()));
+                    out.push(serde_json::json!({
+                        "event_type": etype,
+                        "detected_at": detected,
+                        "metadata": meta,
+                    }));
+                }
+                Err(e) => {
+                    return Ok(json_error(
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("failed to read observation row: {e}"),
+                    ));
+                }
+            }
+        }
+        out
+    };
+
+    // Determine is_collapsed: most recent debate_collapsed id > most
+    // recent debate_reopened id (Phase 9c-3-3 semantics). Also pull
+    // the latest collapse detected_at for cooldown_until computation.
+    let latest_collapse: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, detected_at
+               FROM dadbear_observation_events
+              WHERE slug = ?1
+                AND event_type = 'debate_collapsed'
+                AND target_node_id = ?2
+              ORDER BY id DESC
+              LIMIT 1",
+            rusqlite::params![slug_name, node_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )
+        .ok();
+    let latest_reopen: Option<i64> = conn
+        .query_row(
+            "SELECT id
+               FROM dadbear_observation_events
+              WHERE slug = ?1
+                AND event_type = 'debate_reopened'
+                AND target_node_id = ?2
+              ORDER BY id DESC
+              LIMIT 1",
+            rusqlite::params![slug_name, node_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok();
+    let is_collapsed = match (&latest_collapse, latest_reopen) {
+        (Some((collapse_id, _)), Some(reopen_id)) => *collapse_id > reopen_id,
+        (Some(_), None) => true,
+        _ => false,
+    };
+
+    // cooldown_until: if collapsed AND collapse_cooldown_secs > 0 AND
+    // the cooldown has not yet elapsed, compute the end timestamp.
+    // Format: SQLite datetime string (matches detected_at).
+    let cooldown_until: Option<String> = if is_collapsed {
+        let cooldown_secs = super::pyramid_scheduler::load_config(&conn).collapse_cooldown_secs;
+        if cooldown_secs > 0 {
+            if let Some((_, detected_at)) = &latest_collapse {
+                // Compute detected_at + cooldown_secs vs now; return Some
+                // only if still in cooldown. SQLite strftime handles the
+                // arithmetic.
+                let end_time: Option<String> = conn
+                    .query_row(
+                        "SELECT CASE
+                            WHEN strftime('%s','now') < strftime('%s', ?1) + ?2
+                            THEN datetime(?1, '+' || ?2 || ' seconds')
+                            ELSE NULL
+                         END",
+                        rusqlite::params![detected_at, cooldown_secs],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .ok()
+                    .flatten();
+                end_time
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let response = serde_json::json!({
+        "slug": slug_name,
+        "node_id": node_id,
+        "node_shape": node_shape_str,
+        "payload": shape_payload_json,
+        "recent_events": recent_events,
+        "is_collapsed": is_collapsed,
+        "cooldown_until": cooldown_until,
+    });
+    Ok(json_ok(&response))
+}
+
+/// GET /pyramid/:slug/role_bindings
+///
+/// Returns all active role bindings for the slug as:
+///   {
+///     "slug": "my-slug",
+///     "bindings": [
+///       {"role_name": "cascade_handler",
+///        "chain_id": "starter-cascade-judge-gated",
+///        "created_at": "..."},
+///       ...
+///     ]
+///   }
+async fn handle_get_role_bindings(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match slug::get_slug(&conn, &slug_name) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                &format!("slug '{slug_name}' not found"),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ));
+        }
+    }
+
+    match super::role_binding::list_bindings(&conn, &slug_name) {
+        Ok(bindings) => {
+            let items: Vec<serde_json::Value> = bindings
+                .into_iter()
+                .map(|b| serde_json::json!({
+                    "role_name": b.role_name,
+                    "chain_id": b.handler_chain_id,
+                    "created_at": b.created_at,
+                }))
+                .collect();
+            let response = serde_json::json!({
+                "slug": slug_name,
+                "bindings": items,
+            });
+            Ok(json_ok(&response))
+        }
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to list role bindings: {e}"),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/synthesis_history/:node_id
+///
+/// Returns the re-distill history for a node (including meta-layer
+/// nodes) from `dadbear_result_applications` plus the most-recent
+/// cascade-annotation events reaching this node.
+///
+/// Shape:
+///   {
+///     "slug": "my-slug",
+///     "node_id": "L2-META-abc",
+///     "node_shape": "meta_layer" | "scaffolding" | ...,
+///     "payload": { ... } | null,
+///     "re_distill_history": [
+///       {"applied_at": "...", "work_item_id": "...",
+///        "action": "redistilled", "new_contribution_id": "..."},
+///       ...
+///     ],
+///     "cascade_annotations_last_loaded": [
+///       {"event_type": "annotation_written", "detected_at": "...",
+///        "metadata": {...}},
+///       ...
+///     ]
+///   }
+async fn handle_get_synthesis_history(
+    slug_name: String,
+    node_id: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+
+    match slug::get_slug(&conn, &slug_name) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                &format!("slug '{slug_name}' not found"),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ));
+        }
+    }
+
+    let (node_shape_str, shape_payload_json): (String, Option<serde_json::Value>) = match db::get_node_shape(&conn, &slug_name, &node_id) {
+        Ok(Some(view)) => {
+            let s = view.shape.as_str().to_string();
+            let p = view.payload.as_ref().map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null));
+            (s, p)
+        }
+        Ok(None) => {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                &format!("node '{node_id}' not found in slug '{slug_name}'"),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to read node shape: {e}"),
+            ));
+        }
+    };
+
+    // Pull re-distill history from dadbear_result_applications.
+    // Ordered oldest → newest so readers see the timeline naturally.
+    let re_distill_history: Vec<serde_json::Value> = {
+        let mut stmt = match conn.prepare(
+            "SELECT work_item_id, action, old_contribution_id,
+                    new_contribution_id, applied_at
+               FROM dadbear_result_applications
+              WHERE slug = ?1 AND target_id = ?2
+              ORDER BY id ASC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to prepare history query: {e}"),
+                ));
+            }
+        };
+        let rows = match stmt.query_map(
+            rusqlite::params![slug_name, node_id],
+            |r| {
+                let work_item_id: String = r.get(0)?;
+                let action: String = r.get(1)?;
+                let old_id: Option<String> = r.get(2)?;
+                let new_id: Option<String> = r.get(3)?;
+                let applied_at: String = r.get(4)?;
+                Ok((work_item_id, action, old_id, new_id, applied_at))
+            },
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to query history: {e}"),
+                ));
+            }
+        };
+        let mut out = Vec::new();
+        for row in rows {
+            match row {
+                Ok((wi_id, act, old, new, applied)) => out.push(serde_json::json!({
+                    "work_item_id": wi_id,
+                    "action": act,
+                    "old_contribution_id": old,
+                    "new_contribution_id": new,
+                    "applied_at": applied,
+                })),
+                Err(e) => {
+                    return Ok(json_error(
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("failed to read history row: {e}"),
+                    ));
+                }
+            }
+        }
+        out
+    };
+
+    // Pull the most-recent 20 annotation-cascade events reaching this
+    // node (written / superseded / reacted). Useful for operators
+    // tracing "why did this synthesis run?"
+    let cascade_annotations_last_loaded: Vec<serde_json::Value> = {
+        let mut stmt = match conn.prepare(
+            "SELECT event_type, detected_at, COALESCE(metadata_json, '{}')
+               FROM dadbear_observation_events
+              WHERE slug = ?1
+                AND target_node_id = ?2
+                AND event_type IN (
+                    'annotation_written', 'annotation_superseded', 'annotation_reacted'
+                )
+              ORDER BY id DESC
+              LIMIT 20",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to prepare cascade-events query: {e}"),
+                ));
+            }
+        };
+        let rows = match stmt.query_map(
+            rusqlite::params![slug_name, node_id],
+            |r| {
+                let etype: String = r.get(0)?;
+                let detected: String = r.get(1)?;
+                let meta: String = r.get(2)?;
+                Ok((etype, detected, meta))
+            },
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to query cascade events: {e}"),
+                ));
+            }
+        };
+        let mut out = Vec::new();
+        for row in rows {
+            match row {
+                Ok((etype, detected, meta_raw)) => {
+                    let meta: serde_json::Value = serde_json::from_str(&meta_raw)
+                        .unwrap_or(serde_json::Value::Object(Default::default()));
+                    out.push(serde_json::json!({
+                        "event_type": etype,
+                        "detected_at": detected,
+                        "metadata": meta,
+                    }));
+                }
+                Err(e) => {
+                    return Ok(json_error(
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("failed to read cascade event row: {e}"),
+                    ));
+                }
+            }
+        }
+        out
+    };
+
+    let response = serde_json::json!({
+        "slug": slug_name,
+        "node_id": node_id,
+        "node_shape": node_shape_str,
+        "payload": shape_payload_json,
+        "re_distill_history": re_distill_history,
+        "cascade_annotations_last_loaded": cascade_annotations_last_loaded,
+    });
+    Ok(json_ok(&response))
 }
 
 // ── Route handlers ──────────────────────────────────────────────────
@@ -2811,6 +4185,60 @@ async fn handle_create_slug(
     } else {
         vec![]
     };
+
+    // ── Phase 9b-4: authorize_question gate on Question-typed slug creation ──
+    //
+    // When the caller supplies a `question` body field alongside
+    // `content_type=Question`, route the proposal through the parent
+    // slug's authorize_question chain before creating the slug. This
+    // is the second gate (sibling to the dedicated
+    // POST /pyramid/:slug/propose_question route) — whichever
+    // ingress path the caller uses, the chain evaluates the question.
+    // Creation proceeds only on `approved=true`.
+    //
+    // Callers that don't send `question` keep the legacy ungated
+    // behavior (e.g. pre-9b pinning / import flows creating an empty
+    // Question slug to be filled later). That keeps 9b additive.
+    if is_question {
+        if let Some(question_text) = body.question.as_deref() {
+            if question_text.trim().is_empty() {
+                return Ok(json_error(
+                    warp::http::StatusCode::BAD_REQUEST,
+                    "question must not be empty",
+                ));
+            }
+            let parent = &refs[0]; // refs is non-empty by the check above
+            let state_arc = state.clone();
+            let decision = match run_authorize_question_chain(
+                &state_arc,
+                parent,
+                question_text,
+                body.author.as_deref(),
+            )
+            .await
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    return Ok(json_error(
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("authorize_question chain failed: {e}"),
+                    ));
+                }
+            };
+            if !decision.approved {
+                let payload = serde_json::json!({
+                    "approved": false,
+                    "reasoning": decision.reasoning,
+                    "alternative_question_suggestion": decision.alternative_question_suggestion,
+                });
+                return Ok(warp::reply::with_status(
+                    warp::reply::json(&payload),
+                    warp::http::StatusCode::BAD_REQUEST,
+                )
+                .into_response());
+            }
+        }
+    }
 
     let normalized_source_path = match slug::normalize_and_validate_source_path(
         &body.source_path,
@@ -2907,12 +4335,22 @@ async fn handle_apex(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "apex").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "apex",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -2961,12 +4399,22 @@ async fn handle_node(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "node").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "node",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -3013,12 +4461,22 @@ async fn handle_tree(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "tree").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "tree",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -3026,7 +4484,13 @@ async fn handle_tree(
     match query::get_tree(&conn, &slug_name) {
         Ok(tree) => {
             if let Some(claims) = payment_claims {
-                payment_settle(state.clone(), claims, &payment_info, slug_name.clone(), "tree");
+                payment_settle(
+                    state.clone(),
+                    claims,
+                    &payment_info,
+                    slug_name.clone(),
+                    "tree",
+                );
             }
             Ok(json_ok(&tree))
         }
@@ -3052,12 +4516,22 @@ async fn handle_drill(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "drill").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "drill",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -3167,12 +4641,22 @@ async fn handle_search(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "search").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "search",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -3196,13 +4680,66 @@ async fn handle_search(
     if hits.is_empty() && params.semantic.unwrap_or(false) {
         let config = state.config.read().await;
         if !config.api_key.is_empty() {
-            let llm_config = config.clone();
+            let base_llm_config = config.clone();
             drop(config);
 
             let system = "You extract search keywords from natural language questions. Given a question, output 3-5 keyword phrases that would match technical documentation. Output one phrase per line, nothing else.";
             let user = &params.q;
 
-            match super::llm::call_model_unified(&llm_config, system, user, 0.0, 200, None).await {
+            // walker-v3-completion Wave 2: canonical dispatch via Decision spine.
+            // Query-time endpoint — attach ephemeral cache_access with a synthetic
+            // build_id, resolve "mid" tier through provider_registry, use the
+            // canonical make_step_ctx_from_llm_config so walker's full cascade
+            // (Market/Fleet/OR/Local) is available.
+            let query_build_id = format!(
+                "query-search-{}-{}",
+                slug_name,
+                chrono::Utc::now().timestamp()
+            );
+            let llm_config =
+                state.attach_cache_access(base_llm_config, &slug_name, &query_build_id);
+            let resolved_opt = llm_config
+                .provider_registry
+                .as_ref()
+                .and_then(|reg| reg.resolve_tier("mid", None, None, None).ok());
+            let cache_ctx = match &resolved_opt {
+                Some(resolved) => {
+                    super::step_context::make_step_ctx_from_llm_config(
+                        &llm_config,
+                        "search_keyword_rewrite",
+                        "query_search",
+                        0,
+                        None,
+                        system,
+                        "mid",
+                        Some(&resolved.tier.model_id),
+                        Some(&resolved.provider.id),
+                    )
+                    .await
+                }
+                None => {
+                    tracing::warn!(
+                        event = "search_keyword_rewrite_no_mid_tier",
+                        slug = %slug_name,
+                        "walker-v3-completion: no 'mid' tier routing; falling through to empty results"
+                    );
+                    None
+                }
+            };
+            // If no tier resolved, cache_ctx is None → walker runtime guard
+            // will fire and we'll land in the Err branch below (falls through
+            // to normal-path empty-results return).
+            match super::llm::call_model_unified_and_ctx(
+                &llm_config,
+                cache_ctx.as_ref(),
+                system,
+                user,
+                0.0,
+                200,
+                None,
+            )
+            .await
+            {
                 Ok(response) => {
                     // Re-acquire reader lock for keyword searches
                     let conn = state.reader.lock().await;
@@ -3302,12 +4839,22 @@ async fn handle_entities(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "entities").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "entities",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -3315,7 +4862,13 @@ async fn handle_entities(
     match query::entities(&conn, &slug_name) {
         Ok(entries) => {
             if let Some(claims) = payment_claims {
-                payment_settle(state.clone(), claims, &payment_info, slug_name.clone(), "entities");
+                payment_settle(
+                    state.clone(),
+                    claims,
+                    &payment_info,
+                    slug_name.clone(),
+                    "entities",
+                );
             }
             Ok(json_ok(&entries))
         }
@@ -3338,12 +4891,22 @@ async fn handle_resolved(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "resolved").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "resolved",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -3351,7 +4914,13 @@ async fn handle_resolved(
     match query::resolved(&conn, &slug_name) {
         Ok(entries) => {
             if let Some(claims) = payment_claims {
-                payment_settle(state.clone(), claims, &payment_info, slug_name.clone(), "resolved");
+                payment_settle(
+                    state.clone(),
+                    claims,
+                    &payment_info,
+                    slug_name.clone(),
+                    "resolved",
+                );
             }
             Ok(json_ok(&entries))
         }
@@ -3374,12 +4943,22 @@ async fn handle_corrections(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "corrections").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "corrections",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -3387,7 +4966,13 @@ async fn handle_corrections(
     match query::corrections(&conn, &slug_name) {
         Ok(entries) => {
             if let Some(claims) = payment_claims {
-                payment_settle(state.clone(), claims, &payment_info, slug_name.clone(), "corrections");
+                payment_settle(
+                    state.clone(),
+                    claims,
+                    &payment_info,
+                    slug_name.clone(),
+                    "corrections",
+                );
             }
             Ok(json_ok(&entries))
         }
@@ -3410,12 +4995,22 @@ async fn handle_terms(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "terms").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "terms",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -3423,7 +5018,13 @@ async fn handle_terms(
     match query::terms(&conn, &slug_name) {
         Ok(entries) => {
             if let Some(claims) = payment_claims {
-                payment_settle(state.clone(), claims, &payment_info, slug_name.clone(), "terms");
+                payment_settle(
+                    state.clone(),
+                    claims,
+                    &payment_info,
+                    slug_name.clone(),
+                    "terms",
+                );
             }
             Ok(json_ok(&entries))
         }
@@ -3568,9 +5169,11 @@ async fn handle_build(
                                 ref parent_id,
                             } => db::update_parent(&conn, slug, node_id, parent_id),
                             WriteOp::UpdateStats { ref slug } => db::update_slug_stats(&conn, slug),
-                            WriteOp::UpdateFileHash { ref slug, ref file_path, ref node_id } => {
-                                db::append_node_id_to_file_hash(&conn, slug, file_path, node_id)
-                            }
+                            WriteOp::UpdateFileHash {
+                                ref slug,
+                                ref file_path,
+                                ref node_id,
+                            } => db::append_node_id_to_file_hash(&conn, slug, file_path, node_id),
                             WriteOp::Flush { done } => {
                                 let _ = done.send(());
                                 Ok(())
@@ -3587,8 +5190,7 @@ async fn handle_build(
         // Create progress channel — forward updates into the build status,
         // and tee onto build_event_bus so the public web surface can subscribe
         // per-slug. The desktop UI consumer keeps reading from progress_rx.
-        let (progress_tx, raw_progress_rx) =
-            tokio::sync::mpsc::channel::<BuildProgress>(64);
+        let (progress_tx, raw_progress_rx) = tokio::sync::mpsc::channel::<BuildProgress>(64);
         let mut progress_rx = crate::pyramid::event_bus::tee_build_progress_to_bus(
             &build_state.build_event_bus,
             slug_name.clone(),
@@ -3605,58 +5207,118 @@ async fn handle_build(
         });
 
         // Create layer event channel for build visualization v2
-        let (layer_tx, mut layer_rx) =
-            tokio::sync::mpsc::channel::<super::types::LayerEvent>(256);
+        let (layer_tx, mut layer_rx) = tokio::sync::mpsc::channel::<super::types::LayerEvent>(256);
         let layer_drain_state = layer_state_for_build;
         let layer_drain_handle = tokio::spawn(async move {
             use super::types::{LayerEvent, LayerProgress, LogEntry, NodeStatus};
             while let Some(event) = layer_rx.recv().await {
                 let mut st = layer_drain_state.write().await;
                 match event {
-                    LayerEvent::Discovered { depth, step_name, estimated_nodes } => {
+                    LayerEvent::Discovered {
+                        depth,
+                        step_name,
+                        estimated_nodes,
+                    } => {
                         st.layers.push(LayerProgress {
-                            depth, step_name, estimated_nodes,
-                            completed_nodes: 0, failed_nodes: 0,
+                            depth,
+                            step_name,
+                            estimated_nodes,
+                            completed_nodes: 0,
+                            failed_nodes: 0,
                             status: "pending".into(),
-                            nodes: if estimated_nodes <= 50 { Some(Vec::new()) } else { None },
+                            nodes: if estimated_nodes <= 50 {
+                                Some(Vec::new())
+                            } else {
+                                None
+                            },
                         });
                     }
-                    LayerEvent::NodeCompleted { depth, step_name, node_id, label } => {
-                        if let Some(layer) = st.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                    LayerEvent::NodeCompleted {
+                        depth,
+                        step_name,
+                        node_id,
+                        label,
+                    } => {
+                        if let Some(layer) = st
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             layer.completed_nodes += 1;
                             layer.status = "active".into();
                             if let Some(ref mut nodes) = layer.nodes {
-                                nodes.push(NodeStatus { node_id, status: "complete".into(), label });
+                                nodes.push(NodeStatus {
+                                    node_id,
+                                    status: "complete".into(),
+                                    label,
+                                });
                             }
                         }
                     }
-                    LayerEvent::NodeFailed { depth, step_name, node_id } => {
-                        if let Some(layer) = st.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                    LayerEvent::NodeFailed {
+                        depth,
+                        step_name,
+                        node_id,
+                    } => {
+                        if let Some(layer) = st
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             layer.failed_nodes += 1;
                             if let Some(ref mut nodes) = layer.nodes {
-                                nodes.push(NodeStatus { node_id, status: "failed".into(), label: None });
+                                nodes.push(NodeStatus {
+                                    node_id,
+                                    status: "failed".into(),
+                                    label: None,
+                                });
                             }
                         }
                     }
                     LayerEvent::LayerCompleted { depth, step_name } => {
-                        if let Some(layer) = st.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                        if let Some(layer) = st
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             layer.status = "complete".into();
                         }
                     }
-                    LayerEvent::NodeStarted { depth, step_name, node_id, .. } => {
+                    LayerEvent::NodeStarted {
+                        depth,
+                        step_name,
+                        node_id,
+                        ..
+                    } => {
                         // Track in-flight nodes: add as "pending" status
-                        if let Some(layer) = st.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                        if let Some(layer) = st
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             if let Some(ref mut nodes) = layer.nodes {
-                                nodes.push(NodeStatus { node_id, status: "pending".into(), label: None });
+                                nodes.push(NodeStatus {
+                                    node_id,
+                                    status: "pending".into(),
+                                    label: None,
+                                });
                             }
                         }
                     }
                     LayerEvent::StepStarted { step_name } => {
                         st.current_step = Some(step_name);
                     }
-                    LayerEvent::Log { elapsed_secs, message } => {
-                        st.log.push_back(LogEntry { elapsed_secs, message });
-                        if st.log.len() > 200 { st.log.pop_front(); }
+                    LayerEvent::Log {
+                        elapsed_secs,
+                        message,
+                    } => {
+                        st.log.push_back(LogEntry {
+                            elapsed_secs,
+                            message,
+                        });
+                        if st.log.len() > 200 {
+                            st.log.pop_front();
+                        }
                     }
                 }
             }
@@ -3713,15 +5375,27 @@ async fn handle_build(
                             let conn = build_state.writer.lock().await;
                             // Auto-refresh vocabulary catalog from apex
                             match super::vocabulary::refresh_vocabulary(&conn, &slug_name) {
-                                Ok((_, count)) => tracing::info!("Post-build: vocabulary refreshed for '{}' ({} entries)", slug_name, count),
-                                Err(e) => tracing::warn!("Post-build: vocabulary refresh failed for '{}': {}", slug_name, e),
+                                Ok((_, count)) => tracing::info!(
+                                    "Post-build: vocabulary refreshed for '{}' ({} entries)",
+                                    slug_name,
+                                    count
+                                ),
+                                Err(e) => tracing::warn!(
+                                    "Post-build: vocabulary refresh failed for '{}': {}",
+                                    slug_name,
+                                    e
+                                ),
                             }
                             // Auto-create DADBEAR watch config for conversation slugs
                             if let Ok(Some(info)) = slug::get_slug(&conn, &slug_name) {
                                 if info.content_type == super::types::ContentType::Conversation {
                                     let source_dir = std::path::Path::new(&info.source_path);
                                     let watch_dir = if source_dir.is_file() {
-                                        source_dir.parent().unwrap_or(source_dir).to_string_lossy().to_string()
+                                        source_dir
+                                            .parent()
+                                            .unwrap_or(source_dir)
+                                            .to_string_lossy()
+                                            .to_string()
                                     } else {
                                         info.source_path.clone()
                                     };
@@ -3739,9 +5413,20 @@ async fn handle_build(
                                         created_at: String::new(),
                                         updated_at: String::new(),
                                     };
-                                    match db::save_dadbear_config_with_contributions(&conn, &dadbear_cfg) {
-                                        Ok(_) => tracing::info!("Post-build: DADBEAR config created for '{}' → '{}'", slug_name, watch_dir),
-                                        Err(e) => tracing::warn!("Post-build: DADBEAR config failed for '{}': {}", slug_name, e),
+                                    match db::save_dadbear_config_with_contributions(
+                                        &conn,
+                                        &dadbear_cfg,
+                                    ) {
+                                        Ok(_) => tracing::info!(
+                                            "Post-build: DADBEAR config created for '{}' → '{}'",
+                                            slug_name,
+                                            watch_dir
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            "Post-build: DADBEAR config failed for '{}': {}",
+                                            slug_name,
+                                            e
+                                        ),
                                     }
                                 }
                             }
@@ -3939,6 +5624,21 @@ async fn handle_config(
     state: Arc<PyramidState>,
     body: ConfigBody,
 ) -> Result<warp::reply::Response, warp::Rejection> {
+    // walker-v3 W3a: model-slug writes retired — direct operators to the
+    // walker_provider_openrouter contribution editor.
+    if body.primary_model.is_some()
+        || body.fallback_model_1.is_some()
+        || body.fallback_model_2.is_some()
+    {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "Model selection moved to the walker_provider_openrouter contribution. \
+             Edit it via Tools > Create (schema: walker_provider_openrouter) or \
+             POST /config-contributions; this legacy field write was retired in \
+             walker-v3 W3a and will be deleted in Phase 6.",
+        ));
+    }
+
     let mut config = state.config.write().await;
 
     if let Some(ref key) = body.openrouter_api_key {
@@ -3957,15 +5657,6 @@ async fn handle_config(
         // credential store at use-time) resolves this. The primary write
         // path (IPC pyramid_set_config) DOES sync the partner cache.
     }
-    if let Some(ref model) = body.primary_model {
-        config.primary_model = model.clone();
-    }
-    if let Some(ref model) = body.fallback_model_1 {
-        config.fallback_model_1 = model.clone();
-    }
-    if let Some(ref model) = body.fallback_model_2 {
-        config.fallback_model_2 = model.clone();
-    }
 
     if let Some(use_ir) = body.use_ir_executor {
         state
@@ -3977,11 +5668,13 @@ async fn handle_config(
     // Persist non-secret config to disk. Deliberately not updating
     // openrouter_api_key — credential store is SOT. Stale value
     // preserved as boot-time migration source.
+    //
+    // W3c: PyramidConfig no longer carries `primary_model` /
+    // `fallback_model_{1,2}`. Model selection lives in
+    // `walker_provider_openrouter`. We still write the other
+    // non-secret fields through.
     if let Some(ref data_dir) = state.data_dir {
         let mut pyramid_config = super::PyramidConfig::load(data_dir);
-        pyramid_config.primary_model = config.primary_model.clone();
-        pyramid_config.fallback_model_1 = config.fallback_model_1.clone();
-        pyramid_config.fallback_model_2 = config.fallback_model_2.clone();
         pyramid_config.use_ir_executor = state
             .use_ir_executor
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -3990,11 +5683,25 @@ async fn handle_config(
         }
     }
 
+    // walker-v3 W3c: response echoes synthesize the model triple from
+    // the active walker_provider_openrouter contribution. No legacy
+    // fallback — the Settings UI shows "not configured" (null) if the
+    // contribution is missing and the operator follows up via
+    // Tools > Create.
+    // TODO(walker-v3 Phase 6): drop this route entirely; operators
+    // observe walker_provider_* contributions via the standard
+    // config-contributions endpoints instead.
+    drop(config);
+    let (primary_syn, fb1_syn, fb2_syn) = {
+        let conn = state.reader.lock().await;
+        super::walker_resolver::synthesize_legacy_model_triple_from_db(&conn)
+    };
+
     Ok(json_ok(&serde_json::json!({
         "status": "updated",
-        "primary_model": config.primary_model,
-        "fallback_model_1": config.fallback_model_1,
-        "fallback_model_2": config.fallback_model_2,
+        "primary_model": primary_syn,
+        "fallback_model_1": fb1_syn,
+        "fallback_model_2": fb2_syn,
         "use_ir_executor": state.use_ir_executor.load(std::sync::atomic::Ordering::Relaxed),
     })))
 }
@@ -4004,10 +5711,10 @@ async fn handle_config_profile(
     state: Arc<PyramidState>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let mut config_lock = state.config.write().await;
-    
+
     if let Some(ref data_dir) = state.data_dir {
         let mut pyramid_config = super::PyramidConfig::load(data_dir);
-        
+
         if let Err(e) = pyramid_config.apply_profile(&profile_name, data_dir) {
             tracing::error!("Failed to apply profile '{}': {}", profile_name, e);
             return Ok(json_error(
@@ -4015,7 +5722,7 @@ async fn handle_config_profile(
                 &format!("Failed to apply profile: {e}"),
             ));
         }
-        
+
         if let Err(e) = pyramid_config.save(data_dir) {
             tracing::error!("Failed to save config after applying profile: {e}");
             return Ok(json_error(
@@ -4023,17 +5730,18 @@ async fn handle_config_profile(
                 &format!("Failed to save config: {e}"),
             ));
         }
-        
+
         // Update the running LlmConfig via to_llm_config_with_runtime
         // so model fields are resolved from the active tier routing
         // (not hardcoded OpenRouter slugs). Preserve api_key + auth_token
         // from the live config — profiles only override model selection.
         let previous_live = config_lock.clone();
-        *config_lock = pyramid_config.to_llm_config_with_runtime(
-            state.provider_registry.clone(),
-            state.credential_store.clone(),
-        )
-        .with_runtime_overlays_from(&previous_live);
+        *config_lock = pyramid_config
+            .to_llm_config_with_runtime(
+                state.provider_registry.clone(),
+                state.credential_store.clone(),
+            )
+            .with_runtime_overlays_from(&previous_live);
 
         Ok(json_ok(&serde_json::json!({
             "status": "profile_applied",
@@ -4180,12 +5888,22 @@ async fn handle_threads(
         let conn = state.reader.lock().await;
         read_access_tier(&conn, &slug_name)
     };
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "threads").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug_name,
+            "threads",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -4193,7 +5911,13 @@ async fn handle_threads(
     match db::get_threads(&conn, &slug_name) {
         Ok(threads) => {
             if let Some(claims) = payment_claims {
-                payment_settle(state.clone(), claims, &payment_info, slug_name.clone(), "threads");
+                payment_settle(
+                    state.clone(),
+                    claims,
+                    &payment_info,
+                    slug_name.clone(),
+                    "threads",
+                );
             }
             Ok(json_ok(&threads))
         }
@@ -4247,11 +5971,38 @@ async fn handle_annotate(
         }
     }
 
+    // Post-build accretion v5 Phase 6c-B: HTTP write path validates against
+    // the vocabulary registry (`pyramid_config_contributions` rows with
+    // schema_type `vocabulary_entry:annotation_type:*`). Agents who publish
+    // a new vocab entry can POST annotations of that type immediately — no
+    // code deploy. Pillar 38 absorbed bug: unknown types RAISE (the pre-v5
+    // lossy `from_str` silently mapped to Observation).
+    let annotation_type = {
+        let conn = state.reader.lock().await;
+        match AnnotationType::from_str_strict(&conn, &body.annotation_type) {
+            Ok(t) => t,
+            Err(e) => {
+                let valid = AnnotationType::all(&conn)
+                    .map(|types| {
+                        types
+                            .iter()
+                            .map(|t| t.as_str().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_else(|_| String::from("<vocab lookup failed>"));
+                return Ok(json_error(
+                    warp::http::StatusCode::BAD_REQUEST,
+                    &format!("{}. Valid types: {}", e, valid),
+                ));
+            }
+        }
+    };
     let annotation = PyramidAnnotation {
         id: 0, // will be set by DB
         slug: slug_name,
         node_id: body.node_id,
-        annotation_type: AnnotationType::from_str(&body.annotation_type),
+        annotation_type,
         content: body.content,
         question_context: body.question_context,
         author: body.author.unwrap_or_else(|| "system".to_string()),
@@ -4285,7 +6036,20 @@ async fn handle_annotate(
     let base_config = state
         .llm_config_with_cache(&slug_clone, &annotation_build_id)
         .await;
-    let model = base_config.primary_model.clone();
+    // walker-v3 W3a (Pattern 4): resolve via walker_resolver reading
+    // the active walker_provider_openrouter contribution. Legacy
+    // fallback removed by W3c once config.primary_model dies.
+    let resolved = {
+        let conn = state.reader.lock().await;
+        super::walker_resolver::first_openrouter_model_from_db(&conn)
+    };
+    let model = resolved.unwrap_or_else(|| {
+        tracing::warn!(
+            event = "pattern4_no_openrouter_model",
+            "walker-v3: Pattern-4 site found no walker_provider_openrouter model; stamping '<unknown>' — downstream dispatch will surface no-model-available",
+        );
+        "<unknown>".to_string()
+    });
     let ops_clone = state.operational.clone();
 
     tokio::spawn(async move {
@@ -4300,7 +6064,16 @@ async fn handle_annotate(
         )
         .await
         {
-            tracing::warn!("[annotation] post-save hook failed: {}", e);
+            // Phase 6c-B verifier: this log level matters — the vocab-
+            // dispatch hook now RAISES on missing vocab entry at hook
+            // time (race-or-direct-DB-write per the hook's contract).
+            // Use error! not warn! so a supersession-mid-flight is
+            // visible in the standard operator log tier; the warning
+            // stream is reserved for recoverable anomalies.
+            tracing::error!(
+                "[annotation] post-save hook failed: {} (annotation saved but dispatch skipped)",
+                e
+            );
         }
     });
 
@@ -4330,10 +6103,41 @@ async fn emit_annotation_observation_events(
     slug: &str,
     annotation: &PyramidAnnotation,
 ) -> anyhow::Result<()> {
-    let event_type = match annotation.annotation_type {
-        AnnotationType::Correction => "annotation_superseded",
-        _ => "annotation_written",
+    // Phase 9 close-2: event_type is vocab-driven.
+    //
+    // Pre-close-2, this branch was hardcoded as
+    // `correction → annotation_superseded`, else `annotation_written`
+    // (the Phase 6c-B FIXME). Lifting to vocab makes the routing
+    // contribution-driven: an operator publishing a new annotation type
+    // can claim supersession semantics (or any custom event_type) via
+    // the `event_type_on_emit` field without a code deploy.
+    //
+    // Lookup strategy:
+    //   - Read the annotation's type from the vocab registry.
+    //   - If the vocab entry has `event_type_on_emit: Some(s)`, use `s`.
+    //   - If `None` (genesis default for non-correction types +
+    //     pre-close-2 contributions without the field), emit the
+    //     default `annotation_written`.
+    //   - If the type isn't in the registry at all (shouldn't happen —
+    //     writes validate via `from_str_strict`), fall back to
+    //     `annotation_written` loudly (still emits so the cascade is
+    //     not silently dropped).
+    //
+    // feedback_everything_is_contribution + feedback_loud_deferrals.
+    let vocab_event_type_override: Option<String> = {
+        let conn = writer.lock().await;
+        super::vocab_entries::get_vocabulary_entry(
+            &conn,
+            super::vocab_entries::VOCAB_KIND_ANNOTATION_TYPE,
+            annotation.annotation_type.as_str(),
+        )
+        .ok()
+        .flatten()
+        .and_then(|entry| entry.event_type_on_emit)
     };
+    let event_type: &str = vocab_event_type_override
+        .as_deref()
+        .unwrap_or("annotation_written");
 
     let metadata_json = serde_json::json!({
         "annotation_id": annotation.id,
@@ -4392,12 +6196,12 @@ async fn emit_annotation_observation_events(
             slug,
             "annotation",
             event_type,
-            None,                    // source_path
-            None,                    // file_path
-            None,                    // content_hash
-            None,                    // previous_hash
-            Some(ancestor_id),       // target_node_id
-            Some(*ancestor_depth),   // layer
+            None,                  // source_path
+            None,                  // file_path
+            None,                  // content_hash
+            None,                  // previous_hash
+            Some(ancestor_id),     // target_node_id
+            Some(*ancestor_depth), // layer
             Some(&metadata_json),
         );
     }
@@ -4413,9 +6217,30 @@ async fn emit_annotation_observation_events(
     Ok(())
 }
 
-/// Background hook that runs after an annotation is saved.
-/// Correction annotations create deltas on the matching thread.
-/// Other types are logged for future FAQ/review processing.
+/// Phase 8 tail-2 — test-only wrapper exposing
+/// `emit_annotation_observation_events` so the cross-module integration
+/// test in `db.rs::phase8_post_build_tests` can drive the REAL emission
+/// path (walks parent_id chain, stamps `metadata_json.annotated_node_id`
+/// = annotation.node_id, skips the annotated node itself) rather than a
+/// test-only event writer that can silently drift from the production
+/// shape. `#[cfg(test)]` gated so it cannot leak into production API
+/// surface.
+#[cfg(test)]
+#[doc(hidden)]
+pub(crate) async fn emit_annotation_observation_events_test_only(
+    writer: &Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+    slug: &str,
+    annotation: &PyramidAnnotation,
+) -> anyhow::Result<()> {
+    emit_annotation_observation_events(writer, slug, annotation).await
+}
+
+/// Background hook that runs after an annotation is saved. Phase 6c-B
+/// flipped this from an 11-variant `AnnotationType` match to vocab-driven
+/// dispatch: the vocabulary registry is now the source of truth for which
+/// annotation types create deltas (`creates_delta`) and which are reactive
+/// (`reactive` → emits `annotation_reacted`). Publishing a new vocab entry
+/// with either flag works at runtime with no code deploy — the whole point.
 async fn process_annotation_hook(
     reader: &Arc<tokio::sync::Mutex<rusqlite::Connection>>,
     writer: &Arc<tokio::sync::Mutex<rusqlite::Connection>>,
@@ -4431,6 +6256,10 @@ async fn process_annotation_hook(
     // The annotated node itself is excluded — the annotation is already
     // attached to it; re-distillation only makes sense for the parents whose
     // summaries now depend on a fact they haven't seen.
+    //
+    // Every annotation emits `annotation_written` events regardless of
+    // vocab flags — this is the pre-v5 cascade contract and Phase 8 is
+    // what flips it to role_bound. Keep emission unconditional.
     if let Err(e) = emit_annotation_observation_events(writer, slug, annotation).await {
         tracing::warn!(
             "[annotation] failed to emit observation events for annotation #{}: {}",
@@ -4439,113 +6268,151 @@ async fn process_annotation_hook(
         );
     }
 
-    match annotation.annotation_type {
-        AnnotationType::Correction => {
-            // Correction annotations create deltas on the relevant thread
-            let threads = {
-                let conn = reader.lock().await;
-                db::get_threads(&conn, slug)?
-            };
+    // Vocab-driven dispatch. The vocab_kind=annotation_type entry was
+    // already validated at HTTP ingress (from_str_strict), so a missing
+    // entry here means either a race (supersession mid-flight) or a
+    // direct DB write that bypassed the ingress check. Per
+    // `feedback_loud_deferrals` we RAISE rather than silently skipping
+    // the dispatch — a missing entry at hook time is a bug the operator
+    // needs to see.
+    let type_str = annotation.annotation_type.as_str().to_string();
+    let vocab_entry = {
+        let conn = reader.lock().await;
+        super::vocab_entries::get_vocabulary_entry(
+            &conn,
+            super::vocab_entries::VOCAB_KIND_ANNOTATION_TYPE,
+            &type_str,
+        )?
+    };
+    let vocab_entry = vocab_entry.ok_or_else(|| {
+        anyhow::anyhow!(
+            "vocabulary entry missing for annotation_type '{type_str}' at hook time \
+             (annotation #{} on slug '{slug}') — validated at ingress, so this is a \
+             race or direct-DB write",
+            annotation.id
+        )
+    })?;
 
-            // Find the thread whose canonical node matches the annotated node
-            let target_thread = threads
-                .iter()
-                .find(|t| t.current_canonical_id == annotation.node_id);
-
-            if let Some(thread) = target_thread {
-                let delta_content = format!(
-                    "CORRECTION (from annotation #{}): {}",
-                    annotation.id, annotation.content
-                );
-
-                delta::create_delta(
-                    reader,
-                    writer,
-                    slug,
-                    &thread.thread_id,
-                    &delta_content,
-                    Some(&annotation.node_id),
-                    base_config,
-                    model,
-                    ops,
-                )
-                .await?;
-
-                tracing::info!(
-                    "[annotation] correction annotation #{} created delta on thread '{}'",
-                    annotation.id,
-                    thread.thread_id
-                );
-            } else {
-                tracing::info!("[annotation] correction annotation #{} on node '{}' — no matching thread found, skipping delta",
-                    annotation.id, annotation.node_id);
-            }
-        }
-
-        AnnotationType::Observation | AnnotationType::Idea => {
-            // Observations and ideas flag the thread for review
-            tracing::info!(
-                "[annotation] {} annotation #{} on node '{}' — logged for FAQ processing",
-                annotation.annotation_type.as_str(),
+    // ── (1) Delta creation — vocab-flagged ──────────────────────────
+    //
+    // Pre-v5 this was a hardcoded `AnnotationType::Correction =>
+    // create_delta(...)` arm. Now `creates_delta` on the vocab entry
+    // controls it — an operator publishing a new annotation type that
+    // should also spawn deltas just sets the flag; zero code change.
+    if vocab_entry.creates_delta {
+        let threads = {
+            let conn = reader.lock().await;
+            db::get_threads(&conn, slug)?
+        };
+        let target_thread = threads
+            .iter()
+            .find(|t| t.current_canonical_id == annotation.node_id);
+        if let Some(thread) = target_thread {
+            let delta_content = format!(
+                "{} (from annotation #{}): {}",
+                type_str.to_uppercase(),
                 annotation.id,
-                annotation.node_id
+                annotation.content
             );
-        }
-
-        AnnotationType::Question => {
-            // Questions get processed by the FAQ system (separate workstream)
+            delta::create_delta(
+                reader,
+                writer,
+                slug,
+                &thread.thread_id,
+                &delta_content,
+                Some(&annotation.node_id),
+                base_config,
+                model,
+                ops,
+            )
+            .await?;
             tracing::info!(
-                "[annotation] question annotation #{} on node '{}' — logged for FAQ processing",
+                "[annotation] {} annotation #{} created delta on thread '{}' (creates_delta=true)",
+                type_str,
                 annotation.id,
-                annotation.node_id
+                thread.thread_id
             );
-        }
-
-        AnnotationType::Friction => {
-            // Friction is logged but doesn't trigger deltas
+        } else {
             tracing::info!(
-                "[annotation] friction annotation #{} on node '{}' — logged",
-                annotation.id,
-                annotation.node_id
-            );
-        }
-
-        AnnotationType::Era => {
-            // ERA annotations mark project phase boundaries on vine nodes
-            tracing::info!(
-                "[annotation] ERA annotation #{} on node '{}' — vine intelligence",
-                annotation.id,
-                annotation.node_id
-            );
-        }
-
-        AnnotationType::Transition => {
-            // Transition annotations classify phase shifts between ERAs
-            tracing::info!(
-                "[annotation] transition annotation #{} on node '{}' — vine intelligence",
-                annotation.id,
-                annotation.node_id
-            );
-        }
-
-        AnnotationType::HealthCheck => {
-            // Health check results from vine integrity pass
-            tracing::info!(
-                "[annotation] health_check annotation #{} on node '{}' — vine integrity",
-                annotation.id,
-                annotation.node_id
-            );
-        }
-
-        AnnotationType::Directory => {
-            // Sub-apex directory wiring for vine navigation
-            tracing::info!(
-                "[annotation] directory annotation #{} on node '{}' — vine directory",
+                "[annotation] {} annotation #{} on node '{}' — creates_delta=true but no matching thread, skipping delta",
+                type_str,
                 annotation.id,
                 annotation.node_id
             );
         }
     }
+
+    // ── (2) Reactive emission — vocab-flagged ───────────────────────
+    //
+    // Phase 6c-B spec: reactive annotations emit `annotation_reacted`
+    // observation events with metadata carrying the annotation id, type,
+    // target node, and handler_chain_id (so Phase 7 consumers like the
+    // judge chain can dispatch without re-reading the vocab entry).
+    // Pre-v5 this was hidden under the SteelMan / RedTeam arms — now
+    // vocab-driven. `hypothesis` / `gap` / `purpose_declaration` /
+    // `purpose_shift` types can be added as a contribution and will
+    // immediately emit without a code deploy.
+    if vocab_entry.reactive {
+        let metadata_json = serde_json::json!({
+            "annotation_id": annotation.id,
+            "annotation_type": annotation.annotation_type.as_str(),
+            "target_node_id": annotation.node_id,
+            "handler_chain_id": vocab_entry.handler_chain_id,
+            "author": annotation.author,
+        })
+        .to_string();
+        let conn = writer.lock().await;
+        if let Err(e) = super::observation_events::write_observation_event(
+            &conn,
+            slug,
+            "annotation",                  // source
+            "annotation_reacted",          // event_type
+            None,                          // source_path
+            None,                          // file_path
+            None,                          // content_hash
+            None,                          // previous_hash
+            Some(&annotation.node_id),     // target_node_id — annotated node itself
+            None,                          // layer — not ancestry-scoped
+            Some(&metadata_json),
+        ) {
+            tracing::warn!(
+                "[annotation] failed to emit annotation_reacted for annotation #{}: {}",
+                annotation.id,
+                e
+            );
+        } else {
+            tracing::info!(
+                "[annotation] {} annotation #{} on node '{}' — emitted annotation_reacted (handler_chain={:?})",
+                type_str,
+                annotation.id,
+                annotation.node_id,
+                vocab_entry.handler_chain_id
+            );
+        }
+    } else {
+        // Non-reactive: logged only. The specific per-variant log
+        // messages the 11-arm match used to carry ("ERA annotation...
+        // vine intelligence", "health_check... vine integrity", etc.)
+        // are dropped in favor of a uniform message. That's a minor
+        // observability downgrade but the per-variant strings were
+        // diagnostic flavoring, not load-bearing. Restored as a single
+        // tag field below.
+        tracing::info!(
+            "[annotation] {} annotation #{} on node '{}' — logged (non-reactive)",
+            type_str,
+            annotation.id,
+            annotation.node_id
+        );
+    }
+
+    // Note on vocab_entry.handler_chain_id when !reactive: the vocab
+    // entry may declare a handler chain for types that aren't "reactive
+    // in the attention sense" (e.g. a future type that fires a chain
+    // after some other signal, not on every arrival). This hook does
+    // NOT dispatch such chains directly — chain dispatch is owned by
+    // the role-routing path (Phase 7 / Phase 8) which consumes
+    // observation events. Emitting annotation_reacted only when
+    // reactive=true keeps that contract clean.
 
     // FAQ processing — for any annotation with question_context
     if annotation.question_context.is_some() {
@@ -4568,6 +6435,70 @@ async fn process_annotation_hook(
                     "[annotation] FAQ processing failed for annotation #{}: {}",
                     annotation.id,
                     e
+                );
+            }
+        }
+    }
+
+    // ── Phase 9b-2: accretion volume-threshold trigger ──────────────
+    //
+    // Two triggers converge on the `accretion_handler` role:
+    //   (a) Scheduled `accretion_tick` (Phase 9b-1, every N minutes).
+    //   (b) Volume-threshold `accretion_threshold_hit` — when a slug
+    //       accumulates >= K annotations since its last
+    //       `accretion_cursor`, fire immediately.
+    //
+    // Threshold K lives in `scheduler_parameters`
+    // (accretion_threshold), operator-editable via contribution
+    // supersession. K=0 disables the volume path (tick-only).
+    //
+    // The count+cursor read uses the writer connection we already
+    // hold below for the emit, so the check is consistent with the
+    // annotation we just wrote. A follow-on ANOTHER annotation
+    // firing the same threshold is desirable: each threshold crossing
+    // is its own event, dedupe happens at the work-item layer via
+    // the distinct step_name `accretion_threshold_dispatch`.
+    let threshold_cfg = {
+        let conn = reader.lock().await;
+        super::pyramid_scheduler::load_config(&conn)
+    };
+    let threshold_k = threshold_cfg.accretion_threshold;
+    if threshold_k > 0 {
+        let conn = writer.lock().await;
+        match super::pyramid_scheduler::count_annotations_since_cursor(&conn, slug) {
+            Ok((count, cursor)) if count as u64 >= threshold_k => {
+                if let Err(e) = super::pyramid_scheduler::emit_accretion_threshold_hit(
+                    &conn,
+                    slug,
+                    annotation.id,
+                    count,
+                    cursor,
+                    threshold_k,
+                ) {
+                    tracing::warn!(
+                        slug = %slug,
+                        annotation_id = annotation.id,
+                        error = %e,
+                        "[annotation] failed to emit accretion_threshold_hit"
+                    );
+                } else {
+                    tracing::info!(
+                        "[annotation] accretion_threshold_hit: slug={} annotation#{} count={} cursor={} K={}",
+                        slug, annotation.id, count, cursor, threshold_k
+                    );
+                }
+            }
+            Ok((count, _cursor)) => {
+                tracing::debug!(
+                    "[annotation] accretion threshold not yet crossed: slug={} count={} K={}",
+                    slug, count, threshold_k
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    slug = %slug,
+                    error = %e,
+                    "[annotation] accretion threshold check failed"
                 );
             }
         }
@@ -4641,7 +6572,20 @@ async fn handle_meta_run(
     let base_config = state
         .llm_config_with_cache(&slug_name, &format!("meta-{}", slug_name))
         .await;
-    let model = base_config.primary_model.clone();
+    // walker-v3 W3a (Pattern 4): resolve via walker_resolver reading
+    // the active walker_provider_openrouter contribution. Legacy
+    // fallback removed by W3c once config.primary_model dies.
+    let resolved = {
+        let conn = state.reader.lock().await;
+        super::walker_resolver::first_openrouter_model_from_db(&conn)
+    };
+    let model = resolved.unwrap_or_else(|| {
+        tracing::warn!(
+            event = "pattern4_no_openrouter_model",
+            "walker-v3: Pattern-4 site found no walker_provider_openrouter model; stamping '<unknown>' — downstream dispatch will surface no-model-available",
+        );
+        "<unknown>".to_string()
+    });
 
     let reader = state.reader.clone();
     let writer = state.writer.clone();
@@ -4701,7 +6645,20 @@ async fn handle_match_faq(
     let base_config = state
         .llm_config_with_cache(&slug_name, &format!("faq-match-{}", slug_name))
         .await;
-    let model = base_config.primary_model.clone();
+    // walker-v3 W3a (Pattern 4): resolve via walker_resolver reading
+    // the active walker_provider_openrouter contribution. Legacy
+    // fallback removed by W3c once config.primary_model dies.
+    let resolved = {
+        let conn = state.reader.lock().await;
+        super::walker_resolver::first_openrouter_model_from_db(&conn)
+    };
+    let model = resolved.unwrap_or_else(|| {
+        tracing::warn!(
+            event = "pattern4_no_openrouter_model",
+            "walker-v3: Pattern-4 site found no walker_provider_openrouter model; stamping '<unknown>' — downstream dispatch will surface no-model-available",
+        );
+        "<unknown>".to_string()
+    });
 
     match faq::match_faq(
         &state.reader,
@@ -4735,7 +6692,20 @@ async fn handle_faq_directory(
     let base_config = state
         .llm_config_with_cache(&slug_name, &format!("faq-dir-{}", slug_name))
         .await;
-    let model = base_config.primary_model.clone();
+    // walker-v3 W3a (Pattern 4): resolve via walker_resolver reading
+    // the active walker_provider_openrouter contribution. Legacy
+    // fallback removed by W3c once config.primary_model dies.
+    let resolved = {
+        let conn = state.reader.lock().await;
+        super::walker_resolver::first_openrouter_model_from_db(&conn)
+    };
+    let model = resolved.unwrap_or_else(|| {
+        tracing::warn!(
+            event = "pattern4_no_openrouter_model",
+            "walker-v3: Pattern-4 site found no walker_provider_openrouter model; stamping '<unknown>' — downstream dispatch will surface no-model-available",
+        );
+        "<unknown>".to_string()
+    });
 
     match faq::get_faq_directory(
         &state.reader,
@@ -4856,7 +6826,10 @@ async fn handle_auto_update_config_post(
         Some(config) => Ok(json_ok(&config)),
         None => Ok(json_error(
             warp::http::StatusCode::NOT_FOUND,
-            &format!("No auto-update config for slug '{}'. Use contributions to configure.", slug_name),
+            &format!(
+                "No auto-update config for slug '{}'. Use contributions to configure.",
+                slug_name
+            ),
         )),
     }
 }
@@ -4901,7 +6874,8 @@ async fn handle_auto_update_unfreeze(
     } else {
         // No engine in memory — use auto_update_ops for DB write + event
         let conn = state.writer.lock().await;
-        if let Err(e) = super::auto_update_ops::unfreeze(&conn, &state.build_event_bus, &slug_name) {
+        if let Err(e) = super::auto_update_ops::unfreeze(&conn, &state.build_event_bus, &slug_name)
+        {
             tracing::warn!(slug = %slug_name, "auto_update_ops::unfreeze failed: {e}");
         }
     }
@@ -5110,7 +7084,14 @@ pub fn enqueue_full_l0_sweep_with_reconciliation(
     // but that the user wants force-checked)
     let (tracked, enqueued, already_pending) = enqueue_full_l0_sweep(conn, slug);
 
-    (tracked, enqueued, already_pending, r_new, r_changed, r_deleted)
+    (
+        tracked,
+        enqueued,
+        already_pending,
+        r_new,
+        r_changed,
+        r_deleted,
+    )
 }
 
 /// Recursively collect files from a directory, filtering by extension.
@@ -5136,9 +7117,9 @@ fn collect_files_recursive(
         if path.is_dir() {
             // Skip build artifacts, dependencies, and other non-source directories
             match fname.as_str() {
-                "node_modules" | "target" | "dist" | "build" | ".next" | "__pycache__"
-                | "venv" | ".venv" | "vendor" | "Pods" | ".gradle" | "out" | "bin"
-                | ".lab.bak" | ".claude" => continue,
+                "node_modules" | "target" | "dist" | "build" | ".next" | "__pycache__" | "venv"
+                | ".venv" | "vendor" | "Pods" | ".gradle" | "out" | "bin" | ".lab.bak"
+                | ".claude" => continue,
                 _ => {}
             }
             collect_files_recursive(&path, ingested_extensions, content_type, out);
@@ -5190,9 +7171,9 @@ pub fn reconcile_source_files(
 
     // Get file hashes from DB
     let mut tracked_hashes: HashMap<String, String> = HashMap::new();
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT file_path, hash FROM pyramid_file_hashes WHERE slug = ?1",
-    ) {
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT file_path, hash FROM pyramid_file_hashes WHERE slug = ?1")
+    {
         if let Ok(rows) = stmt.query_map(rusqlite::params![slug], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         }) {
@@ -5214,9 +7195,9 @@ pub fn reconcile_source_files(
                 "Backfilled pyramid_file_hashes from chunk headers"
             );
             // Re-read after backfill
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT file_path, hash FROM pyramid_file_hashes WHERE slug = ?1",
-            ) {
+            if let Ok(mut stmt) =
+                conn.prepare("SELECT file_path, hash FROM pyramid_file_hashes WHERE slug = ?1")
+            {
                 if let Ok(rows) = stmt.query_map(rusqlite::params![slug], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 }) {
@@ -5243,7 +7224,12 @@ pub fn reconcile_source_files(
         if !source_dir.is_dir() {
             continue;
         }
-        collect_files_recursive(source_dir, ingested_extensions, content_type, &mut disk_files);
+        collect_files_recursive(
+            source_dir,
+            ingested_extensions,
+            content_type,
+            &mut disk_files,
+        );
     }
 
     let tracked_keys: HashSet<String> = tracked_hashes.keys().cloned().collect();
@@ -5374,11 +7360,7 @@ pub fn reconcile_source_files(
 /// before file-hash tracking was added. Extracts `## FILE: path` from L0 chunks,
 /// resolves against source_paths, and inserts entries with the current hash.
 /// Returns the number of entries backfilled.
-fn backfill_file_hashes_from_chunks(
-    conn: &Connection,
-    slug: &str,
-    source_paths: &[String],
-) -> i64 {
+fn backfill_file_hashes_from_chunks(conn: &Connection, slug: &str, source_paths: &[String]) -> i64 {
     use std::path::Path;
 
     // Check if there are any L0 nodes — if not, nothing to backfill from
@@ -5508,7 +7490,9 @@ async fn handle_breaker_resume(
     } else {
         // No engine in memory — use auto_update_ops for DB write + event
         let conn = state.writer.lock().await;
-        if let Err(e) = super::auto_update_ops::resume_breaker(&conn, &state.build_event_bus, &slug_name) {
+        if let Err(e) =
+            super::auto_update_ops::resume_breaker(&conn, &state.build_event_bus, &slug_name)
+        {
             tracing::warn!(slug = %slug_name, "auto_update_ops::resume_breaker failed: {e}");
         }
         Ok(json_ok(
@@ -5852,11 +7836,7 @@ fn resolve_default_prices(state: &Arc<PyramidState>) -> (f64, f64) {
 /// Apply the seed JSON (cold-start) from `chains/defaults/pyramid_chain_cost_model_seed.json`.
 /// Idempotent: `apply_seed` only inserts rows for (chain_phase, model) pairs that
 /// don't already exist.
-fn seed_cost_model_if_needed(
-    conn: &rusqlite::Connection,
-    in_price: f64,
-    out_price: f64,
-) -> usize {
+fn seed_cost_model_if_needed(conn: &rusqlite::Connection, in_price: f64, out_price: f64) -> usize {
     let candidates = [
         std::path::PathBuf::from("chains/defaults/pyramid_chain_cost_model_seed.json"),
         std::path::PathBuf::from("../chains/defaults/pyramid_chain_cost_model_seed.json"),
@@ -5943,7 +7923,11 @@ async fn handle_auto_update_l0_sweep(
     let (tracked_files, enqueued, already_pending, r_new, r_changed, r_deleted) = {
         let conn = state.writer.lock().await;
         enqueue_full_l0_sweep_with_reconciliation(
-            &conn, &slug_name, &source_paths, &ingested_extensions, &content_type,
+            &conn,
+            &slug_name,
+            &source_paths,
+            &ingested_extensions,
+            &content_type,
         )
     };
 
@@ -6098,32 +8082,41 @@ async fn handle_vine_build(
     let evidence_mode = body.evidence_mode.clone();
 
     tokio::spawn(async move {
-        let (final_status, error_msg) =
-            match vine::build_vine(&state_clone, &slug_clone, &jsonl_dirs, &evidence_mode, &cancel_clone).await {
-                Ok(apex_id) => {
-                    tracing::info!("Vine build complete for '{}': apex={}", slug_clone, apex_id);
-                    // Post-vine-build: refresh vocabulary catalog from apex
-                    {
-                        let conn = state_clone.writer.lock().await;
-                        match super::vocabulary::refresh_vocabulary(&conn, &slug_clone) {
-                            Ok((_, count)) => tracing::info!(
-                                "Post-vine-build: vocabulary refreshed for '{}' ({} entries)",
-                                slug_clone, count
-                            ),
-                            Err(e) => tracing::warn!(
-                                "Post-vine-build: vocabulary refresh failed for '{}': {}",
-                                slug_clone, e
-                            ),
-                        }
+        let (final_status, error_msg) = match vine::build_vine(
+            &state_clone,
+            &slug_clone,
+            &jsonl_dirs,
+            &evidence_mode,
+            &cancel_clone,
+        )
+        .await
+        {
+            Ok(apex_id) => {
+                tracing::info!("Vine build complete for '{}': apex={}", slug_clone, apex_id);
+                // Post-vine-build: refresh vocabulary catalog from apex
+                {
+                    let conn = state_clone.writer.lock().await;
+                    match super::vocabulary::refresh_vocabulary(&conn, &slug_clone) {
+                        Ok((_, count)) => tracing::info!(
+                            "Post-vine-build: vocabulary refreshed for '{}' ({} entries)",
+                            slug_clone,
+                            count
+                        ),
+                        Err(e) => tracing::warn!(
+                            "Post-vine-build: vocabulary refresh failed for '{}': {}",
+                            slug_clone,
+                            e
+                        ),
                     }
-                    ("complete".to_string(), None)
                 }
-                Err(e) => {
-                    let msg = format!("{:#}", e);
-                    tracing::error!("Vine build failed for '{}': {}", slug_clone, msg);
-                    ("failed".to_string(), Some(msg))
-                }
-            };
+                ("complete".to_string(), None)
+            }
+            Err(e) => {
+                let msg = format!("{:#}", e);
+                tracing::error!("Vine build failed for '{}': {}", slug_clone, msg);
+                ("failed".to_string(), Some(msg))
+            }
+        };
         // Update status when build finishes
         let mut builds = state_clone.vine_builds.lock().await;
         if let Some(handle) = builds.get_mut(&slug_clone) {
@@ -6158,7 +8151,7 @@ async fn handle_vine_eras(
     state: Arc<PyramidState>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
-    match db::get_annotations_by_type(&conn, &slug_name, "era") {
+    match db::get_annotations_by_type(&conn, &slug_name, ANNOTATION_TYPE_ERA) {
         Ok(annotations) => Ok(json_ok(&annotations)),
         Err(e) => Ok(json_error(
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -6220,7 +8213,8 @@ async fn handle_vine_drill(
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
     // Read Directory annotations on sub-apex nodes and return as navigation structure
-    let directory_annotations = db::get_annotations_by_type(&conn, &slug_name, "directory");
+    let directory_annotations =
+        db::get_annotations_by_type(&conn, &slug_name, ANNOTATION_TYPE_DIRECTORY);
     match directory_annotations {
         Ok(dirs) => {
             // Build navigation structure from directory annotations
@@ -6486,8 +8480,7 @@ async fn handle_question_build(
     tokio::spawn(async move {
         let start = std::time::Instant::now();
 
-        let (progress_tx, raw_progress_rx) =
-            tokio::sync::mpsc::channel::<BuildProgress>(64);
+        let (progress_tx, raw_progress_rx) = tokio::sync::mpsc::channel::<BuildProgress>(64);
         let mut progress_rx = crate::pyramid::event_bus::tee_build_progress_to_bus(
             &build_state.build_event_bus,
             slug_name.clone(),
@@ -6504,57 +8497,117 @@ async fn handle_question_build(
         });
 
         // Create layer event channel for build visualization
-        let (layer_tx, mut layer_rx) =
-            tokio::sync::mpsc::channel::<super::types::LayerEvent>(256);
+        let (layer_tx, mut layer_rx) = tokio::sync::mpsc::channel::<super::types::LayerEvent>(256);
         let layer_drain_state = layer_state_for_build;
         let layer_drain_handle = tokio::spawn(async move {
             use super::types::{LayerEvent, LayerProgress, LogEntry, NodeStatus};
             while let Some(event) = layer_rx.recv().await {
                 let mut state = layer_drain_state.write().await;
                 match event {
-                    LayerEvent::Discovered { depth, step_name, estimated_nodes } => {
+                    LayerEvent::Discovered {
+                        depth,
+                        step_name,
+                        estimated_nodes,
+                    } => {
                         state.layers.push(LayerProgress {
-                            depth, step_name, estimated_nodes,
-                            completed_nodes: 0, failed_nodes: 0,
+                            depth,
+                            step_name,
+                            estimated_nodes,
+                            completed_nodes: 0,
+                            failed_nodes: 0,
                             status: "pending".into(),
-                            nodes: if estimated_nodes <= 50 { Some(Vec::new()) } else { None },
+                            nodes: if estimated_nodes <= 50 {
+                                Some(Vec::new())
+                            } else {
+                                None
+                            },
                         });
                     }
-                    LayerEvent::NodeCompleted { depth, step_name, node_id, label } => {
-                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                    LayerEvent::NodeCompleted {
+                        depth,
+                        step_name,
+                        node_id,
+                        label,
+                    } => {
+                        if let Some(layer) = state
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             layer.completed_nodes += 1;
                             layer.status = "active".into();
                             if let Some(ref mut nodes) = layer.nodes {
-                                nodes.push(NodeStatus { node_id, status: "complete".into(), label });
+                                nodes.push(NodeStatus {
+                                    node_id,
+                                    status: "complete".into(),
+                                    label,
+                                });
                             }
                         }
                     }
-                    LayerEvent::NodeFailed { depth, step_name, node_id } => {
-                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                    LayerEvent::NodeFailed {
+                        depth,
+                        step_name,
+                        node_id,
+                    } => {
+                        if let Some(layer) = state
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             layer.failed_nodes += 1;
                             if let Some(ref mut nodes) = layer.nodes {
-                                nodes.push(NodeStatus { node_id, status: "failed".into(), label: None });
+                                nodes.push(NodeStatus {
+                                    node_id,
+                                    status: "failed".into(),
+                                    label: None,
+                                });
                             }
                         }
                     }
                     LayerEvent::LayerCompleted { depth, step_name } => {
-                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                        if let Some(layer) = state
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             layer.status = "complete".into();
                         }
                     }
-                    LayerEvent::NodeStarted { depth, step_name, node_id, .. } => {
-                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                    LayerEvent::NodeStarted {
+                        depth,
+                        step_name,
+                        node_id,
+                        ..
+                    } => {
+                        if let Some(layer) = state
+                            .layers
+                            .iter_mut()
+                            .find(|l| l.depth == depth && l.step_name == step_name)
+                        {
                             if let Some(ref mut nodes) = layer.nodes {
-                                nodes.push(NodeStatus { node_id, status: "pending".into(), label: None });
+                                nodes.push(NodeStatus {
+                                    node_id,
+                                    status: "pending".into(),
+                                    label: None,
+                                });
                             }
                         }
                     }
                     LayerEvent::StepStarted { step_name } => {
                         state.current_step = Some(step_name);
                     }
-                    LayerEvent::Log { elapsed_secs, message } => {
-                        state.log.push_back(LogEntry { elapsed_secs, message });
-                        if state.log.len() > 200 { state.log.pop_front(); }
+                    LayerEvent::Log {
+                        elapsed_secs,
+                        message,
+                    } => {
+                        state.log.push_back(LogEntry {
+                            elapsed_secs,
+                            message,
+                        });
+                        if state.log.len() > 200 {
+                            state.log.pop_front();
+                        }
                     }
                 }
             }
@@ -7314,7 +9367,13 @@ async fn handle_check_staleness(
     let slug_owned = slug_name.clone();
     let result = tokio::task::spawn_blocking(move || {
         let c = conn.blocking_lock();
-        staleness_bridge::run_staleness_check(&c, &slug_owned, &changed_files, threshold, dequeue_cap)
+        staleness_bridge::run_staleness_check(
+            &c,
+            &slug_owned,
+            &changed_files,
+            threshold,
+            dequeue_cap,
+        )
     })
     .await;
 
@@ -7388,12 +9447,22 @@ async fn handle_export(
     };
 
     // WS-ONLINE-E/H: Access tier + payment enforcement (previously missing — fixed)
-    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
-        Ok(c) => c,
-        Err(response) => return Ok(response),
-    };
+    let payment_claims =
+        match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+            Ok(c) => c,
+            Err(response) => return Ok(response),
+        };
     if let Some(ref claims) = payment_claims {
-        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug, "export").await {
+        if let Err(response) = payment_insert_before_serve(
+            &state,
+            claims,
+            &payment_info,
+            &auth_source,
+            &slug,
+            "export",
+        )
+        .await
+        {
             return Ok(response);
         }
     }
@@ -7597,8 +9666,8 @@ async fn handle_remote_query(
         let auth = wire_auth.read().await;
         auth.api_token.clone().unwrap_or_default()
     };
-    let wire_server_url = std::env::var("WIRE_URL")
-        .unwrap_or_else(|_| "https://newsbleach.com".to_string());
+    let wire_server_url =
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
 
     if api_token.is_empty() {
         return Ok(json_error(
@@ -7610,7 +9679,10 @@ async fn handle_remote_query(
     // Step 1: Acquire a real Wire JWT from the pyramid-query-token endpoint
     let http_client = reqwest::Client::new();
     let token_resp = http_client
-        .post(format!("{}/api/v1/wire/pyramid-query-token", wire_server_url))
+        .post(format!(
+            "{}/api/v1/wire/pyramid-query-token",
+            wire_server_url
+        ))
         .header("Authorization", format!("Bearer {}", api_token))
         .json(&serde_json::json!({
             "slug": body.slug,
@@ -7921,30 +9993,45 @@ async fn handle_navigate(
             .join("\n\n---\n\n")
     );
 
-    // Phase C fix: Construct a synthetic StepContext so navigate gets caching.
-    let navigate_build_id = format!(
-        "navigate-{}-{}",
-        slug_name,
-        chrono::Utc::now().timestamp()
-    );
-    let db_path = state
-        .data_dir
+    // walker-v3-completion Wave 2: canonical dispatch via Decision spine.
+    // Previously: manual StepContext::new with empty model_tier → Decision
+    // attach early-returned → walker saw no cascade. Now: attach ephemeral
+    // cache_access, resolve "max" tier (judgment work), canonical helper.
+    let navigate_build_id = format!("navigate-{}-{}", slug_name, chrono::Utc::now().timestamp());
+    let navigate_llm_config =
+        state.attach_cache_access(llm_config.clone(), &slug_name, &navigate_build_id);
+    let resolved_opt = navigate_llm_config
+        .provider_registry
         .as_ref()
-        .and_then(|d| d.join("pyramid.db").to_str().map(String::from))
-        .unwrap_or_default();
-    let ctx = super::step_context::StepContext::new(
-        slug_name.clone(),
-        navigate_build_id,
-        "navigate",
-        "navigate",
-        0,
-        None,
-        db_path,
-    );
+        .and_then(|reg| reg.resolve_tier("max", None, None, None).ok());
+    let cache_ctx = match &resolved_opt {
+        Some(resolved) => {
+            super::step_context::make_step_ctx_from_llm_config(
+                &navigate_llm_config,
+                "navigate",
+                "navigate",
+                0,
+                None,
+                system,
+                "max",
+                Some(&resolved.tier.model_id),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => {
+            tracing::warn!(
+                event = "navigate_synthesis_no_max_tier",
+                slug = %slug_name,
+                "walker-v3-completion: no 'max' tier routing; navigate synthesis will fall back to error path"
+            );
+            None
+        }
+    };
 
     match super::llm::call_model_unified_and_ctx(
-        &llm_config,
-        Some(&ctx),
+        &navigate_llm_config,
+        cache_ctx.as_ref(),
         system,
         &user,
         0.2,
@@ -8282,9 +10369,7 @@ async fn handle_dead_letter_retry(
     match retry_result {
         Ok(output) => {
             let conn = state.writer.lock().await;
-            if let Err(e) =
-                db::update_dead_letter_status(&conn, &slug_name, id, "resolved", None)
-            {
+            if let Err(e) = db::update_dead_letter_status(&conn, &slug_name, id, "resolved", None) {
                 return Ok(json_error(
                     warp::http::StatusCode::INTERNAL_SERVER_ERROR,
                     &e.to_string(),
@@ -8320,7 +10405,10 @@ async fn handle_ingest_scan(
     let (source_path, content_type_str) = {
         let conn = state.reader.lock().await;
         match db::get_slug(&conn, &slug_name) {
-            Ok(Some(info)) => (info.source_path.clone(), info.content_type.as_str().to_string()),
+            Ok(Some(info)) => (
+                info.source_path.clone(),
+                info.content_type.as_str().to_string(),
+            ),
             Ok(None) => {
                 return Ok(json_error(
                     warp::http::StatusCode::NOT_FOUND,
@@ -8415,16 +10503,17 @@ async fn handle_ingest_scan(
     }
 
     // Emit event
-    let _ = state.build_event_bus.tx.send(
-        super::event_bus::TaggedBuildEvent {
+    let _ = state
+        .build_event_bus
+        .tx
+        .send(super::event_bus::TaggedBuildEvent {
             slug: slug_name.clone(),
             kind: super::event_bus::TaggedKind::IngestScanComplete {
                 new_count: change_set.new_files.len(),
                 modified_count: change_set.modified_files.len(),
                 deleted_count: change_set.deleted_paths.len(),
             },
-        },
-    );
+        });
 
     Ok(json_ok(&serde_json::json!({
         "slug": slug_name,
@@ -8711,11 +10800,21 @@ struct DadbearWatchBody {
     enabled: bool,
 }
 
-fn default_scan_interval() -> u64 { 10 }
-fn default_debounce() -> u64 { 30 }
-fn default_session_timeout() -> u64 { 1800 }
-fn default_batch_size() -> u32 { 1 }
-fn default_enabled() -> bool { true }
+fn default_scan_interval() -> u64 {
+    10
+}
+fn default_debounce() -> u64 {
+    30
+}
+fn default_session_timeout() -> u64 {
+    1800
+}
+fn default_batch_size() -> u32 {
+    1
+}
+fn default_enabled() -> bool {
+    true
+}
 
 /// POST /pyramid/:slug/dadbear/watch — add or update a DADBEAR watch config.
 async fn handle_dadbear_watch(
@@ -8727,7 +10826,10 @@ async fn handle_dadbear_watch(
     if ContentType::from_str(&body.content_type).is_none() {
         return Ok(json_error(
             warp::http::StatusCode::BAD_REQUEST,
-            &format!("Invalid content_type: {}. Must be one of: code, conversation, document", body.content_type),
+            &format!(
+                "Invalid content_type: {}. Must be one of: code, conversation, document",
+                body.content_type
+            ),
         ));
     }
 
@@ -8770,7 +10872,11 @@ async fn handle_dadbear_status(
     state: Arc<PyramidState>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let db_path = match &state.data_dir {
-        Some(d) => d.join("pyramid.db").to_str().unwrap_or_default().to_string(),
+        Some(d) => d
+            .join("pyramid.db")
+            .to_str()
+            .unwrap_or_default()
+            .to_string(),
         None => {
             return Ok(json_error(
                 warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -8800,7 +10906,11 @@ async fn handle_dadbear_trigger(
     state: Arc<PyramidState>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let db_path = match &state.data_dir {
-        Some(d) => d.join("pyramid.db").to_str().unwrap_or_default().to_string(),
+        Some(d) => d
+            .join("pyramid.db")
+            .to_str()
+            .unwrap_or_default()
+            .to_string(),
         None => {
             return Ok(json_error(
                 warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -8809,8 +10919,13 @@ async fn handle_dadbear_trigger(
         }
     };
 
-    match super::dadbear_extend::trigger_for_slug(&state, &db_path, &slug_name, &state.build_event_bus)
-        .await
+    match super::dadbear_extend::trigger_for_slug(
+        &state,
+        &db_path,
+        &slug_name,
+        &state.build_event_bus,
+    )
+    .await
     {
         Ok(result) => Ok(json_ok(&result)),
         Err(e) => Ok(json_error(
@@ -8859,8 +10974,7 @@ async fn handle_vine_add_bedrock(
         None => {
             // Auto-assign: one past the current max position
             let conn = state.reader.lock().await;
-            let bedrocks = db::get_vine_bedrocks(&conn, &vine_slug)
-                .unwrap_or_default();
+            let bedrocks = db::get_vine_bedrocks(&conn, &vine_slug).unwrap_or_default();
             bedrocks.iter().map(|b| b.position).max().unwrap_or(-1) + 1
         }
     };
@@ -9492,11 +11606,12 @@ async fn handle_recovery_force_delta(
         }
         Err(e) => {
             let msg = e.to_string();
-            let status_code = if msg.contains("No active composition") || msg.contains("has no apex") {
-                warp::http::StatusCode::NOT_FOUND
-            } else {
-                warp::http::StatusCode::INTERNAL_SERVER_ERROR
-            };
+            let status_code =
+                if msg.contains("No active composition") || msg.contains("has no apex") {
+                    warp::http::StatusCode::NOT_FOUND
+                } else {
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR
+                };
             Ok(json_error(status_code, &msg))
         }
     }
@@ -9752,13 +11867,8 @@ async fn handle_manifest_exec(
         ));
     }
 
-    match manifest::execute_manifest(
-        &state,
-        &slug,
-        body.operations,
-        body.session_id.as_deref(),
-    )
-    .await
+    match manifest::execute_manifest(&state, &slug, body.operations, body.session_id.as_deref())
+        .await
     {
         Ok(result) => Ok(json_ok(&result)),
         Err(e) => Ok(json_error(
@@ -9858,7 +11968,10 @@ async fn handle_overlay_remove(
         }))),
         Ok(false) => Ok(json_error(
             warp::http::StatusCode::NOT_FOUND,
-            &format!("No active overlay '{}' found for source '{}'", overlay_slug, slug),
+            &format!(
+                "No active overlay '{}' found for source '{}'",
+                overlay_slug, slug
+            ),
         )),
         Err(e) => Ok(json_error(
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -10033,9 +12146,15 @@ struct PreviewCommitBody {
     session_timeout_secs: u64,
 }
 
-fn default_preview_scan_interval() -> u64 { 10 }
-fn default_preview_debounce() -> u64 { 30 }
-fn default_preview_session_timeout() -> u64 { 1800 }
+fn default_preview_scan_interval() -> u64 {
+    10
+}
+fn default_preview_debounce() -> u64 {
+    30
+}
+fn default_preview_session_timeout() -> u64 {
+    1800
+}
 
 /// POST /pyramid/:slug/preview — generate a build preview.
 ///
@@ -10194,7 +12313,10 @@ async fn handle_question_retrieve_poll(
                 if job.slug != slug {
                     return Ok(json_error(
                         warp::http::StatusCode::NOT_FOUND,
-                        &format!("Job {question_id} belongs to slug '{}', not '{slug}'", job.slug),
+                        &format!(
+                            "Job {question_id} belongs to slug '{}', not '{slug}'",
+                            job.slug
+                        ),
                     ));
                 }
                 job
@@ -10237,13 +12359,11 @@ async fn handle_question_retrieve_poll(
                 )),
             }
         }
-        "failed" => {
-            Ok(json_ok(&serde_json::json!({
-                "job_id": question_id,
-                "status": "failed",
-                "error": job.error_message,
-            })))
-        }
+        "failed" => Ok(json_ok(&serde_json::json!({
+            "job_id": question_id,
+            "status": "failed",
+            "error": job.error_message,
+        }))),
         _ => {
             // Still queued or running
             Ok(json_ok(&serde_json::json!({
@@ -10360,6 +12480,33 @@ async fn handle_reading_search(
     }
 }
 
+// ── Test-only re-exports ─────────────────────────────────────────────────
+//
+// Phase 6c-B: `process_annotation_hook` is `async fn` private to this
+// module. The Phase 6c-B test module in `db.rs` needs to drive it to
+// prove vocab-driven dispatch end-to-end. Expose it through a tiny
+// `#[cfg(test)]` shim so the test-only surface is explicit and the
+// production callers keep the private path.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use super::*;
+
+    /// Invoke `process_annotation_hook` from a test context. Signature
+    /// mirrors the private function exactly; this is a no-op wrapper.
+    pub async fn run_process_annotation_hook(
+        reader: &Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+        writer: &Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+        slug: &str,
+        annotation: &PyramidAnnotation,
+        base_config: &super::super::llm::LlmConfig,
+        model: &str,
+        ops: &super::super::OperationalConfig,
+    ) -> anyhow::Result<()> {
+        super::process_annotation_hook(reader, writer, slug, annotation, base_config, model, ops)
+            .await
+    }
+}
+
 // ── annotation → observation → re_distill integration tests ──────────────
 //
 // Exercises the closed loop added in the annotation-cascade fix:
@@ -10375,7 +12522,7 @@ async fn handle_reading_search(
 #[cfg(test)]
 mod annotation_observation_tests {
     use super::*;
-    use crate::pyramid::{db as dbmod, dadbear_compiler};
+    use crate::pyramid::{dadbear_compiler, db as dbmod};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -10425,7 +12572,7 @@ mod annotation_observation_tests {
         seed_pyramid_with_tree(&raw, "anno-pyr");
         let writer = Arc::new(Mutex::new(raw));
 
-        let ann = make_annotation("L0-leaf", AnnotationType::Observation, 101);
+        let ann = make_annotation("L0-leaf", AnnotationType::new("observation"), 101);
         emit_annotation_observation_events(&writer, "anno-pyr", &ann)
             .await
             .unwrap();
@@ -10444,7 +12591,11 @@ mod annotation_observation_tests {
             .map(|r| r.unwrap())
             .collect();
 
-        assert_eq!(rows.len(), 2, "one event per ancestor (L1 + L2), skipping the leaf");
+        assert_eq!(
+            rows.len(),
+            2,
+            "one event per ancestor (L1 + L2), skipping the leaf"
+        );
         assert!(rows.iter().all(|r| r.0 == "annotation"));
         assert!(rows.iter().all(|r| r.1 == "annotation_written"));
         assert_eq!(rows[0].2.as_deref(), Some("L1-mid"));
@@ -10460,7 +12611,7 @@ mod annotation_observation_tests {
         seed_pyramid_with_tree(&raw, "anno-pyr");
         let writer = Arc::new(Mutex::new(raw));
 
-        let ann = make_annotation("L0-leaf", AnnotationType::Correction, 202);
+        let ann = make_annotation("L0-leaf", AnnotationType::new("correction"), 202);
         emit_annotation_observation_events(&writer, "anno-pyr", &ann)
             .await
             .unwrap();
@@ -10493,7 +12644,7 @@ mod annotation_observation_tests {
         .unwrap();
         let writer = Arc::new(Mutex::new(raw));
 
-        let ann = make_annotation("missing-id", AnnotationType::Observation, 303);
+        let ann = make_annotation("missing-id", AnnotationType::new("observation"), 303);
         emit_annotation_observation_events(&writer, "anno-pyr", &ann)
             .await
             .expect("missing nodes must not poison annotation save");
@@ -10510,14 +12661,38 @@ mod annotation_observation_tests {
     }
 
     #[tokio::test]
-    async fn compiler_turns_annotation_events_into_redistill_work_items() {
+    async fn compiler_turns_annotation_events_into_role_bound_work_items() {
+        // Phase 8-1 flip: annotation_written events now compile to `role_bound`
+        // work items that route through the cascade_handler binding. The bound
+        // chain (starter-cascade-judge-gated for new slugs, immediate-redistill
+        // for legacy) runs its terminal queue_re_distill_for_target step, which
+        // enqueues the actual re_distill work item for the supervisor's Phase
+        // 8-2 arm to apply.
+        //
+        // Pre-Phase-8 this test asserted `primitive == "re_distill"` with
+        // `step_name == "annotation_redistill"`. That legacy primitive fell
+        // through the supervisor's default arm and silently no-op'd — the
+        // original DADBEAR non-firing bug.
         let raw = rusqlite::Connection::open_in_memory().unwrap();
         dbmod::init_pyramid_db(&raw).unwrap();
         seed_pyramid_with_tree(&raw, "anno-pyr");
+        // Phase 8-1 regression fix: seed role bindings so the compiler can
+        // resolve cascade_handler. Without this the role_bound resolution
+        // fails, the cursor is held, and items_compiled = 0. `seed_pyramid_
+        // with_tree` uses a raw INSERT INTO pyramid_slugs so create_slug's
+        // cascade_handler seeding never ran; we bind it explicitly here.
+        crate::pyramid::role_binding::initialize_genesis_bindings(&raw, "anno-pyr").unwrap();
+        crate::pyramid::role_binding::set_binding(
+            &raw,
+            "anno-pyr",
+            "cascade_handler",
+            crate::pyramid::role_binding::CASCADE_HANDLER_NEW_DEFAULT,
+        )
+        .unwrap();
         let writer = Arc::new(Mutex::new(raw));
 
         // Write annotation observation events for two ancestors.
-        let ann = make_annotation("L0-leaf", AnnotationType::Observation, 404);
+        let ann = make_annotation("L0-leaf", AnnotationType::new("observation"), 404);
         emit_annotation_observation_events(&writer, "anno-pyr", &ann)
             .await
             .unwrap();
@@ -10526,7 +12701,7 @@ mod annotation_observation_tests {
         let conn = writer.lock().await;
         let result = dadbear_compiler::run_compilation_for_slug(&conn, "anno-pyr", None, None)
             .expect("compilation succeeds");
-        assert_eq!(result.items_compiled, 2, "one re_distill per ancestor");
+        assert_eq!(result.items_compiled, 2, "one role_bound per ancestor");
 
         let work_items: Vec<(String, String, i64, String)> = conn
             .prepare(
@@ -10542,8 +12717,9 @@ mod annotation_observation_tests {
             .collect();
 
         assert_eq!(work_items.len(), 2);
-        assert!(work_items.iter().all(|w| w.0 == "re_distill"));
-        assert!(work_items.iter().all(|w| w.1 == "annotation_redistill"));
+        // Phase 8-1: primitive is now `role_bound`, step_name is `annotation_cascade`.
+        assert!(work_items.iter().all(|w| w.0 == "role_bound"));
+        assert!(work_items.iter().all(|w| w.1 == "annotation_cascade"));
         assert_eq!(work_items[0].2, 1);
         assert_eq!(work_items[0].3, "L1-mid");
         assert_eq!(work_items[1].2, 2);
@@ -10552,13 +12728,28 @@ mod annotation_observation_tests {
 
     #[tokio::test]
     async fn multiple_annotations_same_parent_coalesce_to_one_work_item() {
+        // Phase 8-1 note: dedup still applies post-flip. annotation_written
+        // now compiles to role_bound+annotation_cascade; multiple events
+        // targeting the same ancestor still coalesce via has_active_work_item.
         let raw = rusqlite::Connection::open_in_memory().unwrap();
         dbmod::init_pyramid_db(&raw).unwrap();
         seed_pyramid_with_tree(&raw, "anno-pyr");
+        // Phase 8-1 regression fix: seed role bindings so the compiler can
+        // resolve cascade_handler. initialize_genesis_bindings skips
+        // cascade_handler (create_slug owns it), so set the binding
+        // explicitly — the raw-INSERT seed fixture never ran create_slug.
+        crate::pyramid::role_binding::initialize_genesis_bindings(&raw, "anno-pyr").unwrap();
+        crate::pyramid::role_binding::set_binding(
+            &raw,
+            "anno-pyr",
+            "cascade_handler",
+            crate::pyramid::role_binding::CASCADE_HANDLER_NEW_DEFAULT,
+        )
+        .unwrap();
         let writer = Arc::new(Mutex::new(raw));
 
         for id in [501i64, 502, 503] {
-            let ann = make_annotation("L0-leaf", AnnotationType::Observation, id);
+            let ann = make_annotation("L0-leaf", AnnotationType::new("observation"), id);
             emit_annotation_observation_events(&writer, "anno-pyr", &ann)
                 .await
                 .unwrap();
@@ -10576,11 +12767,17 @@ mod annotation_observation_tests {
         assert_eq!(event_count, 6);
 
         // ... but the compiler's has_active_work_item dedup means only 2
-        // work items (one per distinct ancestor).
+        // work items (one per distinct ancestor), each role_bound.
         let result = dadbear_compiler::run_compilation_for_slug(&conn, "anno-pyr", None, None)
             .expect("compilation succeeds");
-        assert_eq!(result.items_compiled, 2, "one re_distill per parent, not per annotation");
-        assert_eq!(result.deduped, 4, "second/third annotations coalesce per ancestor");
+        assert_eq!(
+            result.items_compiled, 2,
+            "one role_bound per parent, not per annotation"
+        );
+        assert_eq!(
+            result.deduped, 4,
+            "second/third annotations coalesce per ancestor"
+        );
 
         let wi_count: i64 = conn
             .query_row(

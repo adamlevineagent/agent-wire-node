@@ -166,9 +166,10 @@ impl ProviderPools {
         let mut pools = HashMap::new();
 
         for (provider_id, pool_cfg) in &policy.pool_configs {
-            let rate_limiter = pool_cfg.rate_limit.as_ref().map(|rl| {
-                SlidingWindowLimiter::new(rl.max_requests, rl.window_secs)
-            });
+            let rate_limiter = pool_cfg
+                .rate_limit
+                .as_ref()
+                .map(|rl| SlidingWindowLimiter::new(rl.max_requests, rl.window_secs));
 
             pools.insert(
                 provider_id.clone(),
@@ -266,8 +267,8 @@ impl ProviderPools {
 mod tests {
     use super::*;
     use crate::pyramid::dispatch_policy::{
-        BuildCoordinationConfig, DispatchPolicy, EscalationConfig, MatchConfig,
-        ProviderPoolConfig, RateLimitConfig, RouteEntry, RoutingRule, WorkType,
+        BuildCoordinationConfig, DispatchPolicy, EscalationConfig, MatchConfig, ProviderPoolConfig,
+        RateLimitConfig, RouteEntry, RoutingRule, WorkType,
     };
 
     fn test_policy() -> DispatchPolicy {
@@ -378,12 +379,10 @@ mod tests {
 
         let result = pools.acquire("nonexistent").await;
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("no pool configured")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no pool configured"));
     }
 
     // ── try_acquire_owned (non-blocking walker path) ─────────────────────────

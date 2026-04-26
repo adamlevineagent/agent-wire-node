@@ -1,0 +1,84 @@
+schema_version: 1
+id: starter-meta-layer-oracle
+name: Meta Layer Oracle — decide + dispatch synthesizer (Phase 7b)
+description: >
+  Starter binding for the meta_layer_oracle role. Fires on purpose_shifted
+  and gap_resolved events; the role's job is to decide whether the event
+  should trigger meta-layer synthesis and, if so, hand off to the
+  synthesizer chain.
+
+  Phase 7b flow:
+    1. emit_oracle_invoked — chronicle trace so a meta_layer_oracle_invoked
+       event lands in dadbear_observation_events against this slug.
+    2. decide_crystallization — heuristic decision producing
+       {should_crystallize, purpose_question, reasoning,
+        covered_substrate_nodes}. Today's rules:
+         * purpose_shifted → always crystallize (the shift is a deliberate
+           operator signal). covered_substrate_nodes defaults to the full
+           set of current L0 nodes; the synthesizer is free to narrow.
+         * gap_resolved    → crystallize iff the originating gap carried
+           candidate_resolutions (there is substrate to synthesize on).
+         * anything else   → skip (should_crystallize=false) — not a silent
+           stub: the synthesizer call is gated by a `when:` guard, and the
+           oracle_finalize step still fires so the work item CASes to
+           applied cleanly AND a `meta_layer_oracle_skipped` observation
+           event lands in the chronicle with the reasoning string (Phase
+           7b verifier — skip-path visibility per feedback_loud_deferrals).
+       Phase 8+ replaces the heuristic with an LLM judge step reading the
+       full purpose + substrate context.
+    3. call_synthesizer — invokes starter-synthesizer via call_starter_chain,
+       threading decide_crystallization's output into the synthesizer's
+       input envelope with $refs. Guarded by
+       `when: $decide_crystallization.should_crystallize == true`.
+    4. oracle_finalize — terminal step. On the happy path (synthesizer
+       created a meta-layer) it passes through; on the skip path it emits
+       a `meta_layer_oracle_skipped` chronicle event so the operator sees
+       WHY the oracle declined.
+
+  Notes:
+    - v5 audit P4: the starter runner NOW resolves $ref expressions
+      inside step.input (object values walked recursively; single-ref
+      strings preserve type; embedded refs interpolate). So this chain
+      uses call_starter_chain directly with $ref threading instead of
+      the bespoke dispatch_synthesizer wrapper primitive that used to
+      work around the limitation. Any future library-chain call can
+      follow the same pattern without shipping a Rust wrapper.
+    - Every step is mechanical; Phase 7b ships no LLM call at this layer.
+content_type: code
+version: "1.2.0"
+author: post-build-accretion-v5
+
+defaults:
+  model_tier: mid
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  - name: emit_oracle_invoked
+    primitive: custom
+    mechanical: true
+    rust_function: emit_oracle_invoked
+
+  - name: decide_crystallization
+    primitive: custom
+    mechanical: true
+    rust_function: decide_crystallization
+
+  - name: call_synthesizer
+    primitive: custom
+    mechanical: true
+    rust_function: call_starter_chain
+    when: $decide_crystallization.should_crystallize == true
+    input:
+      chain_id: starter-synthesizer
+      input:
+        purpose_question: $decide_crystallization.purpose_question
+        covered_substrate_nodes: $decide_crystallization.covered_substrate_nodes
+        parent_meta_layer_id: $decide_crystallization.parent_meta_layer_id
+
+  - name: oracle_finalize
+    primitive: custom
+    mechanical: true
+    rust_function: oracle_finalize
+
+post_build: []

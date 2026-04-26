@@ -99,7 +99,10 @@ impl fmt::Display for MarketAuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MarketAuthError::InvalidToken => {
-                write!(f, "market JWT decode failed (signature, aud, or exp invalid)")
+                write!(
+                    f,
+                    "market JWT decode failed (signature, aud, or exp invalid)"
+                )
             }
             MarketAuthError::ProviderMismatch => {
                 write!(f, "market JWT pid does not match this node's node_id")
@@ -267,8 +270,7 @@ mod tests {
 
     fn sign_token(claims: &TestClaims, private_pem: &str) -> String {
         let header = Header::new(Algorithm::EdDSA);
-        let encoding_key =
-            EncodingKey::from_ed_pem(private_pem.as_bytes()).expect("encoding key");
+        let encoding_key = EncodingKey::from_ed_pem(private_pem.as_bytes()).expect("encoding key");
         encode(&header, claims, &encoding_key).expect("sign token")
     }
 
@@ -291,9 +293,8 @@ mod tests {
         let claims = default_claims();
         let token = sign_token(&claims, &kp.private_pem);
 
-        let identity =
-            verify_market_identity(&token, &kp.public_pem, "node-provider-alpha")
-                .expect("should verify");
+        let identity = verify_market_identity(&token, &kp.public_pem, "node-provider-alpha")
+            .expect("should verify");
 
         assert_eq!(identity.pid(), "node-provider-alpha");
         assert_eq!(identity.sub_job_id(), "job-abc123");

@@ -17,14 +17,13 @@ use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use tracing::{info, warn};
 
-
 use super::config_helper::estimate_cost;
-use super::llm::{call_model_unified_and_ctx, extract_json, LlmConfig};
-use super::step_context::{compute_prompt_hash, StepContext};
+use super::llm::{call_model_unified_with_options_and_ctx, extract_json, LlmConfig};
 use super::naming::{headline_from_path, tombstone_headline};
 use super::stale_helpers_upper::{
     resolve_evidence_targets_for_node_ids, resolve_live_canonical_node_id,
 };
+use super::step_context::make_step_ctx_from_llm_config;
 use super::types::{FileStaleResult, PendingMutation, RenameResult, StaleCheckResult};
 
 // ── Utility Functions ────────────────────────────────────────────────────────
@@ -115,13 +114,13 @@ fn enqueue_parent_confirmed_stales(
             slug,
             "cascade",
             "cascade_stale",
-            None,          // source_path
-            None,          // file_path
-            None,          // content_hash
-            None,          // previous_hash
-            Some(target),  // target_node_id
-            Some(1),       // layer
-            Some(detail),  // metadata_json
+            None,         // source_path
+            None,         // file_path
+            None,         // content_hash
+            None,         // previous_hash
+            Some(target), // target_node_id
+            Some(1),      // layer
+            Some(detail), // metadata_json
         );
     }
 
@@ -297,28 +296,43 @@ Output JSON only. Array of objects, one per file:
         ));
     }
 
-    // Call LLM via the live config (preserves Phase 3 provider_registry +
-    // credential_store) with the model overridden to the per-call slug.
-    let config = base_config.clone_with_model_override(model);
-    let ctx = StepContext::new(
-        slug.clone(),
-        format!("stale-file-check-{}", slug),
-        "file_stale_check",
-        "stale_check",
-        0,
-        None,
-        db_path.to_string(),
-    )
-    .with_model_resolution("stale_local", model.to_string())
-    .with_prompt_hash(compute_prompt_hash(system_prompt));
-    let llm_resp = call_model_unified_and_ctx(
-        &config,
-        Some(&ctx),
+    // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+    // slot="stale_l0" (Rust rename of "stale_local"; first-class walker tier
+    // → minimax/minimax-m2.7). model_override preserves the caller's pre-
+    // resolved slug pin within the Decision-driven cascade.
+    let stale_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+    let ctx = match &stale_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "file_stale_check",
+                "stale_check",
+                0,
+                None,
+                system_prompt,
+                "stale_l0",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
+    let llm_resp = call_model_unified_with_options_and_ctx(
+        base_config,
+        ctx.as_ref(),
         system_prompt,
         &user_prompt,
         0.1,
         1024,
         None,
+        crate::pyramid::llm::LlmCallOptions {
+            model_override: Some(model.to_string()),
+            ..Default::default()
+        },
     )
     .await?;
     let response = llm_resp.content;
@@ -790,28 +804,40 @@ Output JSON only:
         old_path, old_distilled, new_path, new_content_head
     );
 
-    // Call LLM via the live config (preserves Phase 3 provider_registry +
-    // credential_store) with the model overridden to the per-call slug.
-    let config = base_config.clone_with_model_override(model);
-    let ctx = StepContext::new(
-        slug.clone(),
-        format!("stale-rename-check-{}", slug),
-        "rename_check",
-        "stale_check",
-        0,
-        None,
-        db_path.to_string(),
-    )
-    .with_model_resolution("stale_local", model.to_string())
-    .with_prompt_hash(compute_prompt_hash(system_prompt));
-    let llm_resp = call_model_unified_and_ctx(
-        &config,
-        Some(&ctx),
+    // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+    let stale_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+    let ctx = match &stale_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "rename_check",
+                "stale_check",
+                0,
+                None,
+                system_prompt,
+                "stale_l0",
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
+    let llm_resp = call_model_unified_with_options_and_ctx(
+        base_config,
+        ctx.as_ref(),
         system_prompt,
         &user_prompt,
         0.1,
         256,
         None,
+        crate::pyramid::llm::LlmCallOptions {
+            model_override: Some(model.to_string()),
+            ..Default::default()
+        },
     )
     .await?;
     let response = llm_resp.content;
@@ -870,7 +896,14 @@ Output JSON only:
     tokio::task::spawn_blocking(move || -> Result<()> {
         let conn = super::db::open_pyramid_connection(Path::new(&db))
             .context("Failed to open DB for rename post-processing")?;
-        apply_rename_result(&conn, &slug_c, &old_path_c, &new_path_c, result_c.rename, &result_c.reason)?;
+        apply_rename_result(
+            &conn,
+            &slug_c,
+            &old_path_c,
+            &new_path_c,
+            result_c.rename,
+            &result_c.reason,
+        )?;
         Ok(())
     })
     .await??;
@@ -903,8 +936,7 @@ pub(crate) fn apply_rename_result(
 
     if is_rename {
         // Confirmed rename: update thread key, update file_hashes, supersede old
-        let old_node_ids = get_file_node_ids(conn, slug, old_path)
-            .unwrap_or_default();
+        let old_node_ids = get_file_node_ids(conn, slug, old_path).unwrap_or_default();
 
         if let Some(old_node_id) = old_node_ids.first() {
             // Create a rename note node (sequential ID, not UUID)
@@ -919,11 +951,14 @@ pub(crate) fn apply_rename_result(
             let distilled_lines: Vec<&str> = new_content.lines().take(200).collect();
             let distilled = format!(
                 "File: {} (renamed from {})\n\n{}",
-                new_path, old_path, distilled_lines.join("\n")
+                new_path,
+                old_path,
+                distilled_lines.join("\n")
             );
 
             // Insert new L0 node
-            let headline = headline_from_path(new_path).unwrap_or_else(|| "Renamed File".to_string());
+            let headline =
+                headline_from_path(new_path).unwrap_or_else(|| "Renamed File".to_string());
             conn.execute(
                 "INSERT OR REPLACE INTO pyramid_nodes
                  (id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions,
@@ -970,13 +1005,8 @@ pub(crate) fn apply_rename_result(
                 rusqlite::params![new_path, new_node_id, now, slug, old_node_id],
             )?;
 
-            let parent_count = enqueue_parent_confirmed_stales(
-                conn,
-                slug,
-                &old_node_ids,
-                &rename_note,
-                &now,
-            )?;
+            let parent_count =
+                enqueue_parent_confirmed_stales(conn, slug, &old_node_ids, &rename_note, &now)?;
 
             if parent_count == 0 {
                 info!(old_path = %old_path, new_path = %new_path, "Rename completed without an existing parent thread target");
@@ -999,8 +1029,7 @@ pub(crate) fn apply_rename_result(
         );
 
         // Tombstone the old file
-        let old_node_ids = get_file_node_ids(conn, slug, old_path)
-            .unwrap_or_default();
+        let old_node_ids = get_file_node_ids(conn, slug, old_path).unwrap_or_default();
 
         if !old_node_ids.is_empty() {
             let old_distilled = old_node_ids
@@ -1062,11 +1091,7 @@ pub(crate) fn apply_rename_result(
             let new_node_id = super::db::next_sequential_node_id(conn, slug, 0, "");
 
             let distilled_lines: Vec<&str> = new_content.lines().take(200).collect();
-            let distilled = format!(
-                "File: {}\n\n{}",
-                new_path,
-                distilled_lines.join("\n")
-            );
+            let distilled = format!("File: {}\n\n{}", new_path, distilled_lines.join("\n"));
 
             let headline = headline_from_path(new_path).unwrap_or_else(|| "New File".to_string());
             conn.execute(
@@ -1234,28 +1259,40 @@ Output JSON only:
             context
         );
 
-        // Call LLM via the live config (preserves Phase 3 provider_registry +
-        // credential_store) with the model overridden to the per-call slug.
-        let config = base_config.clone_with_model_override(model);
-        let ctx = StepContext::new(
-            slug.clone(),
-            format!("stale-evidence-apex-{}", slug),
-            "evidence_apex_synthesis",
-            "stale_check",
-            0,
-            None,
-            db_path.to_string(),
-        )
-        .with_model_resolution("stale_local", model.to_string())
-        .with_prompt_hash(compute_prompt_hash(system_prompt));
-        let llm_resp = call_model_unified_and_ctx(
-            &config,
-            Some(&ctx),
+        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+        let stale_resolved = base_config
+            .provider_registry
+            .as_ref()
+            .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+        let ctx = match &stale_resolved {
+            Some(resolved) => {
+                make_step_ctx_from_llm_config(
+                    base_config,
+                    "evidence_apex_synthesis",
+                    "stale_check",
+                    0,
+                    None,
+                    system_prompt,
+                    "stale_l0",
+                    Some(model),
+                    Some(&resolved.provider.id),
+                )
+                .await
+            }
+            None => None,
+        };
+        let llm_resp = call_model_unified_with_options_and_ctx(
+            base_config,
+            ctx.as_ref(),
             system_prompt,
             &user_prompt,
             0.2,
             1024,
             None,
+            crate::pyramid::llm::LlmCallOptions {
+                model_override: Some(model.to_string()),
+                ..Default::default()
+            },
         )
         .await?;
         let response = llm_resp.content;
@@ -1517,28 +1554,40 @@ Output JSON only:
             self_prompt, distilled, file_content
         );
 
-        // Call LLM via the live config (preserves Phase 3 provider_registry +
-        // credential_store) with the model overridden to the per-call slug.
-        let config = base_config.clone_with_model_override(model);
-        let ctx = StepContext::new(
-            slug.clone(),
-            format!("stale-targeted-l0-{}", slug),
-            "targeted_l0_stale_check",
-            "stale_check",
-            0,
-            None,
-            db_path.to_string(),
-        )
-        .with_model_resolution("stale_local", model.to_string())
-        .with_prompt_hash(compute_prompt_hash(system_prompt));
-        let llm_resp = call_model_unified_and_ctx(
-            &config,
-            Some(&ctx),
+        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
+        let stale_resolved = base_config
+            .provider_registry
+            .as_ref()
+            .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+        let ctx = match &stale_resolved {
+            Some(resolved) => {
+                make_step_ctx_from_llm_config(
+                    base_config,
+                    "targeted_l0_stale_check",
+                    "stale_check",
+                    0,
+                    None,
+                    system_prompt,
+                    "stale_l0",
+                    Some(model),
+                    Some(&resolved.provider.id),
+                )
+                .await
+            }
+            None => None,
+        };
+        let llm_resp = call_model_unified_with_options_and_ctx(
+            base_config,
+            ctx.as_ref(),
             system_prompt,
             &user_prompt,
             0.1,
             256,
             None,
+            crate::pyramid::llm::LlmCallOptions {
+                model_override: Some(model.to_string()),
+                ..Default::default()
+            },
         )
         .await?;
         let response = llm_resp.content;

@@ -75,7 +75,10 @@ pub fn ws_route(
              jwt_pk: Arc<tokio::sync::RwLock<String>>| async move {
                 let auth = resolve_auth(&headers, peer, &state, &jwt_pk).await;
                 // Tier check: SOURCE pyramid governs visibility for V1.
-                if enforce_public_tier(&state, &source_slug, &auth).await.is_err() {
+                if enforce_public_tier(&state, &source_slug, &auth)
+                    .await
+                    .is_err()
+                {
                     let resp = warp::http::Response::builder()
                         .status(StatusCode::NOT_FOUND)
                         .body(warp::hyper::Body::empty())
@@ -91,8 +94,7 @@ pub fn ws_route(
                         .unwrap();
                     return Ok::<_, warp::Rejection>(resp);
                 }
-                let response =
-                    ws.on_upgrade(move |socket| handle_ws(socket, question_slug, state));
+                let response = ws.on_upgrade(move |socket| handle_ws(socket, question_slug, state));
                 Ok(warp::reply::Reply::into_response(response))
             },
         );
@@ -336,10 +338,7 @@ async fn handle_ws(socket: WebSocket, slug: String, state: Arc<PyramidState>) {
 
 /// Serialize a TaggedBuildEvent and send as a text frame. Returns false on
 /// send failure (caller should hang up the connection).
-async fn send_event(
-    ws_tx: &mut SplitSink<WebSocket, Message>,
-    event: &TaggedBuildEvent,
-) -> bool {
+async fn send_event(ws_tx: &mut SplitSink<WebSocket, Message>, event: &TaggedBuildEvent) -> bool {
     let json = match serde_json::to_string(event) {
         Ok(j) => j,
         Err(_) => return true, // skip malformed; keep the socket alive

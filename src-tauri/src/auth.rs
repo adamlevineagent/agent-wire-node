@@ -23,8 +23,8 @@ impl NodeIdentity {
         }
 
         // First launch or upgrade — derive handle
-        let handle = derive_handle_from_onboarding(data_dir)
-            .unwrap_or_else(generate_default_handle);
+        let handle =
+            derive_handle_from_onboarding(data_dir).unwrap_or_else(generate_default_handle);
         let token = generate_node_token();
 
         let identity = NodeIdentity {
@@ -37,7 +37,10 @@ impl NodeIdentity {
             tracing::error!("Failed to save node_identity.json: {}", e);
         }
 
-        tracing::info!("Generated new node identity: handle={}", identity.node_handle);
+        tracing::info!(
+            "Generated new node identity: handle={}",
+            identity.node_handle
+        );
         identity
     }
 
@@ -70,12 +73,16 @@ fn derive_handle_from_onboarding(data_dir: &Path) -> Option<String> {
 /// Generate a default handle from the system hostname (POSIX gethostname,
 /// NOT env vars — env vars are often empty in macOS GUI contexts).
 fn generate_default_handle() -> String {
-    let raw = gethostname::gethostname()
-        .to_string_lossy()
-        .to_lowercase();
+    let raw = gethostname::gethostname().to_string_lossy().to_lowercase();
     let sanitized: String = raw
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let trimmed = sanitized.trim_matches('-');
     if trimmed.is_empty() || trimmed == "localhost" {
@@ -92,7 +99,13 @@ fn sanitize_handle(raw: &str) -> String {
     let lower = raw.to_lowercase();
     let sanitized: String = lower
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let trimmed = sanitized.trim_matches('-');
     if trimmed.len() > 20 {
@@ -664,7 +677,11 @@ pub async fn set_tokens_from_deep_link(
         }
     };
 
-    tracing::info!("Deep link auth: user_id={:?}, email={:?}", user_id, email.as_deref().map(mask_email));
+    tracing::info!(
+        "Deep link auth: user_id={:?}, email={:?}",
+        user_id,
+        email.as_deref().map(mask_email)
+    );
 
     // Only update auth state after successful user verification
     let mut auth = app_state.auth.write().await;

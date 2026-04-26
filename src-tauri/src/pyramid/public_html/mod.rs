@@ -15,18 +15,18 @@
 //! `routes_read`). The chain order below puts the literal-prefix filters
 //! (assets, login, ws) ahead of the read routes for that reason.
 
+pub mod ascii_art;
 pub mod auth;
 pub mod etag;
 pub mod rate_limit;
 pub mod render;
 pub mod reserved;
+pub mod routes_ask;
 pub mod routes_assets;
 pub mod routes_login;
 pub mod routes_read;
-pub mod routes_ask;
 pub mod routes_ws;
-pub mod web_sessions;
-pub mod ascii_art; // WS-L (Phase 3)
+pub mod web_sessions; // WS-L (Phase 3)
 
 #[cfg(test)]
 mod integration_tests; // Phase 4
