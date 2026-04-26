@@ -558,9 +558,14 @@ pub fn validate_chain(def: &ChainDefinition) -> ValidationResult {
         if step.concurrency == 0 {
             errors.push(format!("{}: concurrency must be >= 1", prefix));
         }
-        if step.concurrency > 1 && step.for_each.is_none() && step.primitive != "web" {
+        let primitive_supports_internal_concurrency =
+            matches!(step.primitive.as_str(), "web" | "evidence_loop");
+        if step.concurrency > 1
+            && step.for_each.is_none()
+            && !primitive_supports_internal_concurrency
+        {
             errors.push(format!(
-                "{}: concurrency > 1 requires for_each (or web primitive)",
+                "{}: concurrency > 1 requires for_each or an internally-concurrent primitive",
                 prefix
             ));
         }
@@ -780,6 +785,15 @@ mod tests {
             .errors
             .iter()
             .any(|e| e.contains("concurrency > 1 requires for_each")));
+    }
+
+    #[test]
+    fn evidence_loop_concurrency_without_for_each_passes() {
+        let mut chain = minimal_chain();
+        chain.steps[0].primitive = "evidence_loop".into();
+        chain.steps[0].concurrency = 10;
+        let result = validate_chain(&chain);
+        assert!(result.valid, "unexpected validation errors: {:?}", result.errors);
     }
 
     #[test]
