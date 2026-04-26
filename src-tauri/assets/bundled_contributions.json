@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
-  "app_version": "0.2.0",
-  "generated_at": "2026-04-10T00:00:00Z",
+  "app_version": "0.3.0",
+  "generated_at": "2026-04-26T15:21:13Z",
   "contributions": [
     {
       "contribution_id": "bundled-skill-generation-evidence_policy-v1",
@@ -494,11 +494,11 @@
       ]
     },
     {
-      "contribution_id": "bundled-walker_provider_openrouter-default-v2",
+      "contribution_id": "bundled-walker_provider_openrouter-default-v3",
       "schema_type": "walker_provider_openrouter",
       "slug": null,
-      "yaml_content": "schema_type: walker_provider_openrouter\nversion: 1\n# Bundled Day-1 seed per \u00a74.1 + \u00a78 tester-smoke acceptance. Eleven slots\n# cover every tier referenced by bundled chain YAMLs + Rust-side\n# Pattern-4 dispatch helpers so fresh installs never emit\n# `tier_unresolved`.\n# - mid + extractor + fallback pinned to mercury-2 (project_model_defaults).\n# - synth_heavy + web are Adam's picks (2026-04-22).\n# - high + max are operator-expansion room \u2014 no bundled chain uses\n#   them today, but they're defined so operator-authored chains using\n#   them resolve on a fresh install.\n# - fallback is the last-resort slot when an operator-authored or Rust-side\n#   slot has no exact model_list entry.\n# - evidence_loop / stale_upper / stale_l0 / reroll added by walker-v3\n#   completion (2026-04-23) for Rust-side dispatch sites\n#   (evidence_answering, stale_helpers*, reroll). Explicit context_limit\n#   because mimo-v2.5-pro is 1M and minimax-m2.7 is 197k \u2014 SYSTEM_DEFAULT\n#   won't reflect either.\n# All other timing/retry params inherit SYSTEM_DEFAULTS from \u00a73.\noverrides:\n  model_list:\n    fallback:\n      - \"inception/mercury-2\"\n    max:\n      - \"x-ai/grok-4.20-beta\"\n    high:\n      - \"qwen/qwen3.6-plus\"\n    synth_heavy:\n      - \"moonshotai/kimi-k2.6\"\n    mid:\n      - \"inception/mercury-2\"\n    web:\n      - \"xiaomi/mimo-v2.5-pro\"\n    extractor:\n      - \"inception/mercury-2\"\n    evidence_loop:\n      - \"xiaomi/mimo-v2.5-pro\"\n    stale_l0:\n      - \"minimax/minimax-m2.7\"\n    stale_upper:\n      - \"xiaomi/mimo-v2.5-pro\"\n    reroll:\n      - \"xiaomi/mimo-v2.5-pro\"\n  context_limit:\n    evidence_loop: 1000000\n    stale_l0: 197000\n    stale_upper: 1000000\n    reroll: 1000000\n",
-      "triggering_note": "Bundled default walker_provider_openrouter (walker v3 Phase 0b)"
+      "yaml_content": "schema_type: walker_provider_openrouter\nversion: 1\n# Bundled Day-1 seed (v3, 2026-04-26): SOTA deepseek-v4 stack.\n# - synth_heavy / web / max / stale_upper \u2192 deepseek-v4-pro (the heavy reasoning slots)\n# - everything else \u2192 deepseek-v4-flash (extractor, mid, fallback, evidence_loop, stale_l0, reroll, high)\n# Replaces the v2 mixed-vendor seed (mercury-2 / grok / qwen / kimi / mimo / minimax).\n# Existing testers with a user-authored walker_provider_openrouter contribution\n# keep their customization \u2014 the bundled v-bump only takes effect for installs\n# that are still running the v2 bundled defaults.\noverrides:\n  model_list:\n    fallback:\n      - \"deepseek/deepseek-v4-flash\"\n    max:\n      - \"deepseek/deepseek-v4-pro\"\n    high:\n      - \"deepseek/deepseek-v4-flash\"\n    synth_heavy:\n      - \"deepseek/deepseek-v4-pro\"\n    mid:\n      - \"deepseek/deepseek-v4-flash\"\n    web:\n      - \"deepseek/deepseek-v4-pro\"\n    extractor:\n      - \"deepseek/deepseek-v4-flash\"\n    evidence_loop:\n      - \"deepseek/deepseek-v4-flash\"\n    stale_l0:\n      - \"deepseek/deepseek-v4-flash\"\n    stale_upper:\n      - \"deepseek/deepseek-v4-pro\"\n    reroll:\n      - \"deepseek/deepseek-v4-flash\"\n  context_limit:\n    extractor: 120000\n    mid: 120000\n    web: 2000000\n    evidence_loop: 1000000\n    stale_l0: 197000\n    stale_upper: 1000000\n    reroll: 1000000\n",
+      "triggering_note": "v3 bundled default (2026-04-26): SOTA deepseek-v4 stack \u2014 pro for heavy reasoning slots (synth_heavy/web/max/stale_upper), flash everywhere else"
     },
     {
       "contribution_id": "bundled-schema_definition-walker_provider_fleet-v1",
