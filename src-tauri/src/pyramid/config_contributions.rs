@@ -1804,6 +1804,20 @@ pub fn sync_config_to_operational_with_registry(
             db::upsert_tier_routing_from_contribution(conn, &yaml, &contribution.contribution_id)?;
             invalidate_provider_resolver_cache();
         }
+        other if is_walker_scope_config(other) => {
+            // Walker v3 config carriers are contribution-native:
+            // `walker_resolver::build_scope_cache_pair` reads the
+            // active `walker_provider_*`, `walker_call_order`, and
+            // `walker_slot_policy` rows directly from
+            // `pyramid_config_contributions`. Accept/supersession only
+            // needs to mark the provider resolver stale and emit the
+            // ConfigSynced event below.
+            invalidate_provider_resolver_cache();
+            debug!(
+                schema_type = %other,
+                "walker scope config synced; resolver reads active contribution store"
+            );
+        }
         "custom_prompts" => {
             let yaml: db::CustomPromptsYaml = serde_yaml::from_str(&contribution.yaml_content)?;
             db::upsert_custom_prompts(conn, &slug_opt, &yaml, &contribution.contribution_id)?;
@@ -2107,6 +2121,18 @@ pub fn sync_config_to_operational_with_registry(
     });
 
     Ok(())
+}
+
+pub(crate) fn is_walker_scope_config(schema_type: &str) -> bool {
+    matches!(
+        schema_type,
+        "walker_provider_local"
+            | "walker_provider_openrouter"
+            | "walker_provider_fleet"
+            | "walker_provider_market"
+            | "walker_call_order"
+            | "walker_slot_policy"
+    )
 }
 
 // ── Validation stub ───────────────────────────────────────────────────────────
@@ -3261,6 +3287,29 @@ mod tests {
         "triage_rules: []\ndemand_signals: []\nbudget: {}\n".to_string()
     }
 
+    fn sample_walker_scope_yaml(schema_type: &str) -> String {
+        match schema_type {
+            "walker_call_order" => "schema_type: walker_call_order\n\
+                 version: 1\n\
+                 order:\n\
+                   - openrouter\n\
+                   - local\n"
+                .to_string(),
+            "walker_slot_policy" => "schema_type: walker_slot_policy\n\
+                 version: 1\n\
+                 slots: []\n"
+                .to_string(),
+            other => format!(
+                "schema_type: {other}\n\
+                 version: 1\n\
+                 overrides:\n\
+                   model_list:\n\
+                     mid:\n\
+                       - deepseek/deepseek-v4-flash\n"
+            ),
+        }
+    }
+
     #[test]
     fn test_create_and_load_active_contribution() {
         let conn = mem_conn();
@@ -3622,6 +3671,50 @@ mod tests {
         // "[]" only on serialization failure, so `null` is the
         // expected value for the minimal YAML above.
         assert!(row.1 == "null" || row.1 == "[]");
+    }
+
+    #[test]
+    fn test_sync_walker_scope_configs_are_contribution_native() {
+        let conn = mem_conn();
+        let bus = mem_bus();
+
+        for schema_type in [
+            "walker_provider_local",
+            "walker_provider_openrouter",
+            "walker_provider_fleet",
+            "walker_provider_market",
+            "walker_call_order",
+            "walker_slot_policy",
+        ] {
+            let mut rx = bus.subscribe();
+            let id = create_config_contribution(
+                &conn,
+                schema_type,
+                None,
+                &sample_walker_scope_yaml(schema_type),
+                Some("walker scope sync"),
+                "local",
+                Some("user"),
+                "active",
+            )
+            .unwrap();
+            let contribution = load_contribution_by_id(&conn, &id).unwrap().unwrap();
+
+            sync_config_to_operational(&conn, &bus, &contribution).unwrap();
+
+            let event = rx.try_recv().expect("ConfigSynced event");
+            match event.kind {
+                TaggedKind::ConfigSynced {
+                    schema_type: synced,
+                    contribution_id,
+                    ..
+                } => {
+                    assert_eq!(synced, schema_type);
+                    assert_eq!(contribution_id, id);
+                }
+                other => panic!("expected ConfigSynced, got {other:?}"),
+            }
+        }
     }
 
     #[test]

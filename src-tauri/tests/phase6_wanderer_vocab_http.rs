@@ -71,18 +71,71 @@ async fn handle_vocab(
     }
 }
 
+async fn handle_vocab_publish(
+    state: Arc<VocabTestState>,
+    body: vocab_entries::VocabPublishRequest,
+) -> Result<warp::reply::Response, Infallible> {
+    let conn = state.reader.lock().await;
+    match vocab_entries::handle_publish_vocabulary(&conn, body) {
+        Ok(response) => Ok(wire_node_lib::http_utils::json_ok(&response)),
+        Err(e) => {
+            if e.downcast_ref::<vocab_entries::UnknownVocabKind>()
+                .is_some()
+                || e.downcast_ref::<vocab_entries::InvalidVocabPublish>()
+                    .is_some()
+            {
+                Ok(wire_node_lib::http_utils::json_error(
+                    warp::http::StatusCode::BAD_REQUEST,
+                    &e.to_string(),
+                ))
+            } else if e.downcast_ref::<vocab_entries::DuplicateVocabEntry>()
+                .is_some()
+            {
+                Ok(wire_node_lib::http_utils::json_error(
+                    warp::http::StatusCode::CONFLICT,
+                    &e.to_string(),
+                ))
+            } else {
+                Ok(wire_node_lib::http_utils::json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ))
+            }
+        }
+    }
+}
+
 /// Mirror of `routes::handle_vocab_registry_list`'s filter composition. Any
 /// divergence between this and prod would show up as a wanderer test failure,
 /// which is the point.
 fn vocab_filter(
     state: Arc<VocabTestState>,
 ) -> impl Filter<Extract = (warp::reply::Response,), Error = warp::Rejection> + Clone {
-    warp::path("vocabulary")
+    let get = warp::path("vocabulary")
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::any().map(move || state.clone()))
+        .and(warp::any().map({
+            let state = state.clone();
+            move || state.clone()
+        }))
         .and_then(handle_vocab)
+        .map(|r: warp::reply::Response| r)
+        .boxed();
+
+    let post = warp::path("api")
+        .and(warp::path("v1"))
+        .and(warp::path("pyramid"))
+        .and(warp::path("vocabulary"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::any().map(move || state.clone()))
+        .and(warp::body::json::<vocab_entries::VocabPublishRequest>())
+        .and_then(handle_vocab_publish)
+        .map(|r: warp::reply::Response| r)
+        .boxed();
+
+    get.or(post).unify().boxed()
 }
 
 /// Spin up a warp server on a system-picked port. Returns `(addr,
@@ -249,10 +302,9 @@ async fn publish_then_refetch_over_http_surfaces_new_entry() {
     let baseline_count = baseline["entries"].as_array().unwrap().len();
     assert_eq!(baseline_count, 16, "baseline must be 16");
 
-    // Publish a new entry through the normal write API. This mirrors what a
-    // publish-vocab-entry HTTP route would do (that route isn't yet wired —
-    // publishing is currently library-level only; Phase 7 will surface an
-    // HTTP route. For now, simulate the server-side write.)
+    // Publish a new entry through the normal write API. The API-v1 HTTP
+    // route below now covers the external write surface; this still guards
+    // the library writer + cache invalidation contract directly.
     {
         let conn = state_for_publish.reader.lock().await;
         let entry = vocab_entries::VocabEntry {
@@ -291,6 +343,147 @@ async fn publish_then_refetch_over_http_surfaces_new_entry() {
     assert_eq!(
         smoke["handler_chain_id"], "starter-debate-steward",
         "handler_chain_id must round-trip through HTTP"
+    );
+}
+
+#[tokio::test]
+async fn publish_vocab_entry_over_api_v1_http_surfaces_new_entry_and_contribution_id() {
+    let _l = cache_lock();
+    let state = Arc::new(VocabTestState {
+        reader: Arc::new(Mutex::new(seeded_conn())),
+    });
+    let addr = spawn_server(state.clone()).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/api/v1/pyramid/vocabulary", addr))
+        .json(&serde_json::json!({
+            "type": "annotation_type",
+            "term": "http_publish_type",
+            "definition": "HTTP-published annotation type",
+            "parent": "observation",
+            "handler_chain_id": "starter-debate-steward",
+            "reactive": true,
+            "creates_delta": false,
+            "include_in_cascade_prompt": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "publish route should accept aliases");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let contribution_id = body["contribution_id"]
+        .as_str()
+        .expect("publish response includes contribution_id");
+    assert!(
+        !contribution_id.is_empty(),
+        "contribution_id should be non-empty"
+    );
+    assert_eq!(body["vocab_kind"], "annotation_type");
+    assert_eq!(body["name"], "http_publish_type");
+
+    let listed: serde_json::Value = reqwest::get(&format!(
+        "http://{}/vocabulary/annotation_type",
+        addr
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let entry = listed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "http_publish_type")
+        .expect("HTTP-published vocab entry should be queryable via GET");
+    assert_eq!(entry["description"], "HTTP-published annotation type");
+    assert_eq!(entry["handler_chain_id"], "starter-debate-steward");
+    assert_eq!(entry["reactive"], true);
+
+    let conn = state.reader.lock().await;
+    let yaml: String = conn
+        .query_row(
+            "SELECT yaml_content FROM pyramid_config_contributions WHERE contribution_id = ?1",
+            rusqlite::params![contribution_id],
+            |row| row.get(0),
+        )
+        .expect("published contribution row exists");
+    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(yaml_value["vocab_kind"].as_str(), Some("annotation_type"));
+    assert_eq!(yaml_value["name"].as_str(), Some("http_publish_type"));
+    assert_eq!(
+        yaml_value["description"].as_str(),
+        Some("HTTP-published annotation type")
+    );
+    assert_eq!(yaml_value["reactive"].as_bool(), Some(true));
+}
+
+#[tokio::test]
+async fn publish_vocab_entry_rejects_alias_ambiguity_and_oversized_fields() {
+    let _l = cache_lock();
+    let state = Arc::new(VocabTestState {
+        reader: Arc::new(Mutex::new(seeded_conn())),
+    });
+    let addr = spawn_server(state).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{}/api/v1/pyramid/vocabulary", addr);
+
+    let alias_resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "vocab_kind": "annotation_type",
+            "type": "role_name",
+            "name": "ambiguous_type",
+            "description": "Should be rejected before publish",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(alias_resp.status(), 400);
+    let alias_body = alias_resp.text().await.unwrap();
+    assert!(
+        alias_body.contains("use only one of vocab_kind, kind, type"),
+        "alias ambiguity should be clear, got: {}",
+        alias_body
+    );
+
+    let long_name = "n".repeat(129);
+    let long_name_resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "vocab_kind": "annotation_type",
+            "name": long_name,
+            "description": "Name should be capped",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(long_name_resp.status(), 400);
+    let long_name_body = long_name_resp.text().await.unwrap();
+    assert!(
+        long_name_body.contains("name must be at most 128 characters"),
+        "name cap error should be clear, got: {}",
+        long_name_body
+    );
+
+    let long_description = "d".repeat(8193);
+    let long_description_resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "vocab_kind": "annotation_type",
+            "name": "oversized_description",
+            "description": long_description,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(long_description_resp.status(), 400);
+    let long_description_body = long_description_resp.text().await.unwrap();
+    assert!(
+        long_description_body.contains("description must be at most 8192 bytes"),
+        "description cap error should be clear, got: {}",
+        long_description_body
     );
 }
 

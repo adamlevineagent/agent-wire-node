@@ -528,11 +528,15 @@ fn phase_a_coexists_with_bundled_walker_rows() {
     // Phase A. We only need the walker_* schema_types that Phase A
     // writes; schema_annotation + schema_definition + skill rows aren't
     // relevant to the collision.
+    //
+    // The bundled OpenRouter default stays at YAML version: 1, but the
+    // contribution id is v2 because the bundled body now includes the
+    // fallback slot introduced by walker fallback resolution.
     for (contrib_id, schema_type, body) in [
         (
-            "bundled-walker_provider_openrouter-default-v1",
+            "bundled-walker_provider_openrouter-default-v2",
             "walker_provider_openrouter",
-            "schema_type: walker_provider_openrouter\nversion: 1\noverrides:\n  model_list:\n    mid:\n      - \"inception/mercury-2\"\n",
+            "schema_type: walker_provider_openrouter\nversion: 1\noverrides:\n  model_list:\n    fallback:\n      - \"inception/mercury-2\"\n    mid:\n      - \"inception/mercury-2\"\n",
         ),
         (
             "bundled-walker_provider_local-default-v1",
@@ -625,7 +629,7 @@ fn phase_a_coexists_with_bundled_walker_rows() {
         let bundled_forward: Option<String> = conn
             .query_row(
                 "SELECT superseded_by_id FROM pyramid_config_contributions \
-                 WHERE contribution_id = 'bundled-walker_provider_openrouter-default-v1'",
+                 WHERE contribution_id = 'bundled-walker_provider_openrouter-default-v2'",
                 [],
                 |row| row.get(0),
             )
@@ -634,7 +638,7 @@ fn phase_a_coexists_with_bundled_walker_rows() {
     };
     assert_eq!(
         new_supersedes.as_deref(),
-        Some("bundled-walker_provider_openrouter-default-v1"),
+        Some("bundled-walker_provider_openrouter-default-v2"),
         "new walker_provider_openrouter row must point supersedes_id at the bundled row"
     );
     assert!(

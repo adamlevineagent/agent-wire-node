@@ -45,6 +45,9 @@ use crate::pyramid::event_bus::{BuildEventBus, TaggedBuildEvent, TaggedKind};
 use crate::pyramid::llm::{DispatchOrigin, LlmCallOptions, LlmConfig, LlmResponse};
 use crate::pyramid::lock_manager::LockManager;
 use crate::pyramid::observation_events;
+use crate::pyramid::stale_check_decision::{
+    parse_stale_check_decision, StaleCheckDecisionKind,
+};
 use crate::pyramid::step_context::StepContext;
 use crate::pyramid::PyramidState;
 
@@ -1300,9 +1303,9 @@ impl DadbearSupervisor {
             match primitive.as_str() {
                 "stale_check" | "node_stale_check" => {
                     // Parse stale check response.
-                    let is_stale = parse_stale_check_result(content, &target_id);
+                    let decision = parse_stale_check_decision(content, &target_id);
 
-                    if is_stale {
+                    if decision.kind == StaleCheckDecisionKind::Stale {
                         // Node is stale — trigger supersession.
                         info!(
                             work_item_id = %work_item_id,
@@ -1351,6 +1354,14 @@ impl DadbearSupervisor {
                                 action = format!("supersession_failed:{}", e);
                             }
                         }
+                    } else if decision.kind == StaleCheckDecisionKind::Skip {
+                        action = "skipped".to_string();
+                        info!(
+                            work_item_id = %work_item_id,
+                            target_id = %target_id,
+                            reason = %decision.reason,
+                            "DADBEAR supervisor: stale check skip confirmed by LLM"
+                        );
                     } else {
                         action = "not_stale".to_string();
                         info!(
@@ -2817,59 +2828,6 @@ pub(crate) async fn run_re_distill_supervisor_arm(
                 target_err, slug_err,
             )))
         }
-    }
-}
-
-// ── LLM result parsers ────────────────────────────────────────────────────
-
-/// Parse a stale check LLM response to determine if the target is stale.
-///
-/// The response is expected to be JSON: `[{"file_path"|"node_id": "...", "stale": true/false, "reason": "..."}]`
-/// We look for the first entry matching the target_id, or fall back to the first entry.
-/// Returns true if the node is stale.
-fn parse_stale_check_result(content: &str, target_id: &str) -> bool {
-    // Try to extract JSON from the response.
-    let json_val = match super::llm::extract_json(content) {
-        Ok(v) => v,
-        Err(_) => {
-            // If we can't parse JSON, check for obvious indicators.
-            let lower = content.to_lowercase();
-            if lower.contains("\"stale\": true") || lower.contains("\"stale\":true") {
-                return true;
-            }
-            warn!(
-                target_id = %target_id,
-                "parse_stale_check_result: could not parse LLM response as JSON, defaulting to stale"
-            );
-            return true; // Default to stale when uncertain.
-        }
-    };
-
-    // Response could be an array or a single object.
-    let entries = if json_val.is_array() {
-        json_val.as_array().cloned().unwrap_or_default()
-    } else {
-        vec![json_val]
-    };
-
-    // Find matching entry.
-    let matching = entries
-        .iter()
-        .find(|e| {
-            e.get("file_path")
-                .and_then(|v| v.as_str())
-                .map(|s| s == target_id)
-                .unwrap_or(false)
-                || e.get("node_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s == target_id)
-                    .unwrap_or(false)
-        })
-        .or_else(|| entries.first());
-
-    match matching {
-        Some(entry) => entry.get("stale").and_then(|v| v.as_bool()).unwrap_or(true), // Default to stale when uncertain.
-        None => true,
     }
 }
 

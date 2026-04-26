@@ -11,6 +11,8 @@
 // Key design points:
 //   - Observations are grouped by event_type and mapped to primitives
 //   - Dedup check: skip if non-terminal work item already targets same (slug, target_id, step_name, layer)
+//     except per-arrival reactive annotations, whose observation event id is
+//     part of the work-item identity so every annotation can compile.
 //   - Semantic path IDs: {slug}:{epoch_short}:{primitive}:{layer}:{target_id}
 //     where epoch_short is the recipe_short segment of the epoch_id
 //   - Cross-layer deps: L1+ items depend on their L0 prerequisites being applied
@@ -40,6 +42,35 @@ pub fn work_item_id(
     target_id: &str,
 ) -> String {
     format!("{slug}:{epoch_short}:{primitive}:{layer}:{target_id}")
+}
+
+/// Construct the work item ID for a concrete observation event.
+///
+/// Most compiler events are target-scoped: while a non-terminal item for the
+/// same target/step/layer is live, later observations coalesce behind it. A
+/// reactive annotation is different: the event represents one specific
+/// annotation row. If two red_team annotations arrive on the same Debate node,
+/// both must compile, and retries of the same event must remain idempotent.
+/// Suffixing the stable observation id gives us both properties while keeping
+/// the `target_id` column itself as the real node id for dispatch.
+fn work_item_id_for_event(
+    slug: &str,
+    epoch_short: &str,
+    primitive: &str,
+    layer: i64,
+    target_id: &str,
+    event: &ObservationEvent,
+) -> String {
+    let base = work_item_id(slug, epoch_short, primitive, layer, target_id);
+    if is_event_scoped_work_item(event) {
+        format!("{base}/event/{}", event.id)
+    } else {
+        base
+    }
+}
+
+fn is_event_scoped_work_item(event: &ObservationEvent) -> bool {
+    event.event_type == "annotation_reacted"
 }
 
 /// Construct a batch ID.
@@ -205,6 +236,9 @@ pub(crate) fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, 
         "debate_steward_invoked" => {
             Some(("log_only", "debate_steward_invoked_log", "stale_remote"))
         }
+        "debate_steward_skipped" => {
+            Some(("log_only", "debate_steward_skipped_log", "stale_remote"))
+        }
         // v5 Phase 7 wanderer fix: every Phase 7 starter chain emits a
         // `*_invoked` / `*_skipped` / `*_written` observation event for
         // chronicle visibility. Those events land in dadbear_observation_events
@@ -274,6 +308,14 @@ pub(crate) fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, 
         "node_re_distilled" => {
             Some(("log_only", "node_redistilled_log", "stale_remote"))
         }
+        // D1 path C: a creates_delta annotation can be valid but have no
+        // exact or ancestor thread. The annotation hook emits this loud
+        // deferral instead of silently returning Ok. It is chronicle-only;
+        // without a log_only mapping the compiler's unknown-event hold
+        // would pin the slug cursor on an intentional diagnostic event.
+        "correction_delta_deferred_no_ancestor_thread" => {
+            Some(("log_only", "correction_delta_deferred_log", "stale_remote"))
+        }
         // Phase 9b-1: pyramid_scheduler tick events. Each is role_bound
         // so the slug's configured role binding (default: accretion_handler
         // → starter-accretion-handler, sweep → starter-sweep) dispatches.
@@ -320,6 +362,10 @@ pub(crate) fn map_event_to_primitive(event_type: &str) -> Option<(&'static str, 
 /// For rename events, target_id uses rename/{old}/{new} composite format.
 fn derive_target_id(event: &ObservationEvent) -> String {
     match event.event_type.as_str() {
+        "accretion_tick" | "accretion_threshold_hit" => {
+            format!("accretion:{}", event.slug)
+        }
+        "sweep_tick" => format!("sweep:{}", event.slug),
         "file_created" | "file_modified" | "file_deleted" | "full_sweep" => event
             .file_path
             .clone()
@@ -398,6 +444,191 @@ fn derive_layer(event: &ObservationEvent) -> i64 {
         "annotation_written" | "annotation_superseded" => event.layer.unwrap_or(0),
         _ => event.layer.unwrap_or(0),
     }
+}
+
+#[derive(Debug)]
+struct ActiveDebateCooldown {
+    collapse_event_id: i64,
+    collapse_detected_at: String,
+    cooldown_until: String,
+    reason: String,
+}
+
+fn metadata_string(event: &ObservationEvent, key: &str) -> Option<String> {
+    event
+        .metadata_json
+        .as_deref()
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+        .and_then(|v| {
+            v.get(key)
+                .and_then(|value| value.as_str())
+                .map(String::from)
+        })
+}
+
+fn metadata_i64(event: &ObservationEvent, key: &str) -> Option<i64> {
+    event
+        .metadata_json
+        .as_deref()
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+        .and_then(|v| v.get(key).and_then(|value| value.as_i64()))
+}
+
+fn active_debate_cooldown(
+    conn: &Connection,
+    slug: &str,
+    target_id: &str,
+) -> Result<Option<ActiveDebateCooldown>> {
+    let cooldown_secs = crate::pyramid::pyramid_scheduler::load_config(conn).collapse_cooldown_secs;
+    if cooldown_secs == 0 {
+        return Ok(None);
+    }
+    let cooldown_secs_i64 = i64::try_from(cooldown_secs).unwrap_or(i64::MAX);
+
+    let latest_collapse: Option<(i64, String, String)> = conn
+        .query_row(
+            "SELECT id, detected_at, COALESCE(metadata_json, '{}')
+               FROM dadbear_observation_events
+              WHERE slug = ?1
+                AND event_type = 'debate_collapsed'
+                AND target_node_id = ?2
+              ORDER BY id DESC
+              LIMIT 1",
+            params![slug, target_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok();
+
+    let Some((collapse_event_id, collapse_detected_at, metadata)) = latest_collapse else {
+        return Ok(None);
+    };
+
+    let reopened_since: Option<i64> = conn
+        .query_row(
+            "SELECT id
+               FROM dadbear_observation_events
+              WHERE slug = ?1
+                AND event_type = 'debate_reopened'
+                AND target_node_id = ?2
+                AND id > ?3
+              ORDER BY id DESC
+              LIMIT 1",
+            params![slug, target_id, collapse_event_id],
+            |row| row.get(0),
+        )
+        .ok();
+    if reopened_since.is_some() {
+        return Ok(None);
+    }
+
+    let cooldown_until: Option<String> = conn
+        .query_row(
+            "SELECT CASE
+                WHEN CAST(strftime('%s', 'now') AS INTEGER)
+                   < CAST(strftime('%s', ?1) AS INTEGER) + ?2
+                THEN datetime(?1, '+' || ?2 || ' seconds')
+                ELSE NULL
+             END",
+            params![collapse_detected_at, cooldown_secs_i64],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+
+    let Some(cooldown_until) = cooldown_until else {
+        return Ok(None);
+    };
+
+    let reason = serde_json::from_str::<serde_json::Value>(&metadata)
+        .ok()
+        .and_then(|v| {
+            v.get("reason")
+                .and_then(|value| value.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Ok(Some(ActiveDebateCooldown {
+        collapse_event_id,
+        collapse_detected_at,
+        cooldown_until,
+        reason,
+    }))
+}
+
+fn maybe_skip_debate_steward_for_cooldown(
+    conn: &Connection,
+    slug: &str,
+    event: &ObservationEvent,
+    resolved_chain_id: Option<&str>,
+    target_id: &str,
+    layer: i64,
+) -> Result<bool> {
+    if event.event_type != "annotation_reacted"
+        || resolved_chain_id != Some("starter-debate-steward")
+    {
+        return Ok(false);
+    }
+
+    let annotation_type = metadata_string(event, "annotation_type");
+    if !matches!(
+        annotation_type.as_deref(),
+        Some("steel_man") | Some("hypothesis") | Some("red_team")
+    ) {
+        return Ok(false);
+    }
+
+    let Some(cooldown) = active_debate_cooldown(conn, slug, target_id)? else {
+        return Ok(false);
+    };
+
+    let annotation_id = metadata_i64(event, "annotation_id");
+    let metadata = serde_json::json!({
+        "reason": "collapse_cooldown_active",
+        "detail": format!(
+            "debate_steward skipped {} annotation during active post-collapse cooldown",
+            annotation_type.as_deref().unwrap_or("reactive")
+        ),
+        "source_event_id": event.id,
+        "annotation_id": annotation_id,
+        "annotation_type": annotation_type,
+        "target_node_id": target_id,
+        "layer": layer,
+        "collapse_event_id": cooldown.collapse_event_id,
+        "collapse_detected_at": cooldown.collapse_detected_at,
+        "collapse_reason": cooldown.reason,
+        "cooldown_until": cooldown.cooldown_until,
+    })
+    .to_string();
+
+    crate::pyramid::observation_events::write_observation_event(
+        conn,
+        slug,
+        "dadbear",
+        "debate_steward_skipped",
+        None,
+        None,
+        None,
+        None,
+        Some(target_id),
+        Some(layer),
+        Some(&metadata),
+    )?;
+
+    info!(
+        slug = %slug,
+        target_id = %target_id,
+        event_id = event.id,
+        annotation_type = annotation_type.as_deref().unwrap_or("unknown"),
+        cooldown_until = %cooldown.cooldown_until,
+        "debate_steward compile skipped during active collapse cooldown"
+    );
+
+    Ok(true)
+}
+
+fn is_annotation_backed_debate_spawn(event: &ObservationEvent) -> bool {
+    event.event_type == "debate_spawned" && metadata_i64(event, "annotation_id").is_some()
 }
 
 // ── Epoch management ──────────────────────────────────────────────────────────
@@ -768,8 +999,39 @@ pub fn compile_observations(
         let target_id = derive_target_id(event);
         let layer = derive_layer(event);
 
-        // (c) Dedup check: skip if non-terminal work item already exists for same target
-        if has_active_work_item(conn, slug, &target_id, step_name, layer)? {
+        if is_annotation_backed_debate_spawn(event) {
+            debug!(
+                slug = %slug,
+                target_id = %target_id,
+                event_id = event.id,
+                "Skipping annotation-backed debate_spawned retrigger; annotation_reacted already compiled the steward work"
+            );
+            compiled_event_ids.push(event.id);
+            continue;
+        }
+
+        if maybe_skip_debate_steward_for_cooldown(
+            conn,
+            slug,
+            event,
+            resolved_chain_id.as_deref(),
+            &target_id,
+            layer,
+        )? {
+            compiled_event_ids.push(event.id);
+            continue;
+        }
+
+        // (c) Dedup check: skip if non-terminal work item already exists for same target.
+        //
+        // Reactive annotations are per-arrival work: a second red_team on
+        // the same Debate node is not a duplicate of the first. Their
+        // stable observation id is included in the work-item id below, so
+        // retries of the same event remain idempotent without coalescing
+        // distinct annotations behind an active target-scoped item.
+        if !is_event_scoped_work_item(event)
+            && has_active_work_item(conn, slug, &target_id, step_name, layer)?
+        {
             deduped += 1;
             debug!(
                 slug = %slug,
@@ -785,7 +1047,7 @@ pub fn compile_observations(
         }
 
         // (d) Construct semantic path ID
-        let wi_id = work_item_id(slug, &ep_short, primitive, layer, &target_id);
+        let wi_id = work_item_id_for_event(slug, &ep_short, primitive, layer, &target_id, event);
 
         // (e) Placeholder prompts — actual materialization at dispatch time (Phase 5)
         let system_prompt = format!(

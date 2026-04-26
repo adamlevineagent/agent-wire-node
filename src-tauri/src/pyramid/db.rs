@@ -6,9 +6,12 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::naming::{clean_headline, headline_for_node};
+use super::stale_check_decision::{
+    parse_stale_check_decision_value, StaleCheckDecisionKind,
+};
 use super::types::*;
 
 // ── Database Opening ─────────────────────────────────────────────────────────
@@ -7121,6 +7124,90 @@ pub fn get_thread(conn: &Connection, slug: &str, thread_id: &str) -> Result<Opti
     }
 }
 
+fn thread_id_for_current_canonical_id(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT thread_id
+         FROM pyramid_threads
+         WHERE slug = ?1 AND current_canonical_id = ?2
+         ORDER BY thread_name ASC, thread_id ASC
+         LIMIT 1",
+        rusqlite::params![slug, node_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Resolve the thread that should receive a delta created from an annotation.
+///
+/// Direct annotations on L1+ nodes preserve the existing behavior: the node's
+/// exact `current_canonical_id` match wins. Leaf/L0 annotations fall back to
+/// the nearest live ancestor that owns a thread. Returning `None` means there
+/// is no live ancestor thread, so the caller must defer loudly.
+pub fn resolve_annotation_delta_thread(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Option<String>> {
+    if let Some(thread_id) = thread_id_for_current_canonical_id(conn, slug, node_id)? {
+        return Ok(Some(thread_id));
+    }
+
+    let mut cursor = node_id.to_string();
+    let mut visited = HashSet::new();
+
+    while visited.insert(cursor.clone()) {
+        let parent_id = conn
+            .query_row(
+                "SELECT parent_id
+                 FROM pyramid_nodes
+                 WHERE slug = ?1
+                   AND id = ?2
+                   AND build_version > 0
+                   AND superseded_by IS NULL",
+                rusqlite::params![slug, cursor],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .filter(|parent| !parent.trim().is_empty());
+
+        let Some(parent_id) = parent_id else {
+            return Ok(None);
+        };
+
+        let parent_is_live = conn
+            .query_row(
+                "SELECT 1
+                 FROM pyramid_nodes
+                 WHERE slug = ?1
+                   AND id = ?2
+                   AND build_version > 0
+                   AND superseded_by IS NULL
+                 LIMIT 1",
+                rusqlite::params![slug, parent_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !parent_is_live {
+            return Ok(None);
+        }
+
+        if let Some(thread_id) = thread_id_for_current_canonical_id(conn, slug, &parent_id)? {
+            return Ok(Some(thread_id));
+        }
+
+        cursor = parent_id;
+    }
+
+    Ok(None)
+}
+
 /// Save (upsert) a thread.
 pub fn save_thread(conn: &Connection, thread: &PyramidThread) -> Result<()> {
     conn.execute(
@@ -8324,6 +8411,151 @@ pub fn get_auto_update_status(conn: &Connection, slug: &str) -> Result<Option<se
     })))
 }
 
+fn stale_log_json_value(result_json: &str) -> Option<serde_json::Value> {
+    let trimmed = result_json.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(outer) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(content) = outer.get("content").and_then(|v| v.as_str()) {
+            return super::llm::extract_json(content)
+                .ok()
+                .or_else(|| serde_json::from_str::<serde_json::Value>(content).ok());
+        }
+        return Some(outer);
+    }
+
+    super::llm::extract_json(trimmed).ok()
+}
+
+fn stale_log_entries(value: serde_json::Value) -> Vec<serde_json::Value> {
+    if value.is_array() {
+        value.as_array().cloned().unwrap_or_default()
+    } else {
+        vec![value]
+    }
+}
+
+fn stale_log_matching_entry<'a>(
+    entries: &'a [serde_json::Value],
+    target_id: Option<&str>,
+) -> Option<&'a serde_json::Value> {
+    target_id
+        .and_then(|target| {
+            entries.iter().find(|entry| {
+                entry
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == target)
+                    .unwrap_or(false)
+                    || entry
+                        .get("node_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s == target)
+                        .unwrap_or(false)
+            })
+        })
+        .or_else(|| entries.first())
+}
+
+fn stale_log_decision_from_result(
+    result_json: &str,
+    target_id: Option<&str>,
+) -> Option<StaleCheckDecisionKind> {
+    let value = stale_log_json_value(result_json)?;
+    parse_stale_check_decision_value(&value, target_id).map(|decision| decision.kind)
+}
+
+fn stale_log_status(
+    state: &str,
+    action: &str,
+    result_json: &str,
+    target_id: Option<&str>,
+) -> &'static str {
+    if action == "skipped" {
+        return "skipped";
+    }
+    if action == "not_stale" {
+        return "no";
+    }
+    if action.starts_with("superseded:") || action.starts_with("supersession_failed:") {
+        return "yes";
+    }
+
+    if let Some(decision) = stale_log_decision_from_result(result_json, target_id) {
+        return match decision {
+            StaleCheckDecisionKind::Stale => "yes",
+            StaleCheckDecisionKind::Pass => "no",
+            StaleCheckDecisionKind::Skip => "skipped",
+        };
+    }
+
+    match state {
+        "applied" => "yes",
+        "completed" => "no",
+        "failed" | "stale" => "skipped",
+        _ => "unknown",
+    }
+}
+
+fn stale_log_reason_from_result(result_json: &str, target_id: Option<&str>) -> Option<String> {
+    let trimmed = result_json.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(outer) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(reason) = outer.get("reason").and_then(|v| v.as_str()) {
+            return Some(reason.to_string());
+        }
+        if let Some(content) = outer.get("content").and_then(|v| v.as_str()) {
+            if let Some(value) = stale_log_json_value(content) {
+                let entries = stale_log_entries(value);
+                if let Some(reason) = stale_log_matching_entry(&entries, target_id)
+                    .and_then(|entry| entry.get("reason"))
+                    .and_then(|v| v.as_str())
+                {
+                    return Some(reason.to_string());
+                }
+            }
+            let content_trimmed = content.trim();
+            if !content_trimmed.is_empty() {
+                return Some(content_trimmed.to_string());
+            }
+        }
+
+        let entries = stale_log_entries(outer);
+        if let Some(reason) = stale_log_matching_entry(&entries, target_id)
+            .and_then(|entry| entry.get("reason"))
+            .and_then(|v| v.as_str())
+        {
+            return Some(reason.to_string());
+        }
+    }
+
+    if let Some(value) = stale_log_json_value(trimmed) {
+        let entries = stale_log_entries(value);
+        if let Some(reason) = stale_log_matching_entry(&entries, target_id)
+            .and_then(|entry| entry.get("reason"))
+            .and_then(|v| v.as_str())
+        {
+            return Some(reason.to_string());
+        }
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn stale_log_reason(result_json: &str, target_id: Option<&str>, status: &str) -> String {
+    stale_log_reason_from_result(result_json, target_id).unwrap_or_else(|| match status {
+        "skipped" => "Skipped stale check (reason unavailable from existing row)".to_string(),
+        "no" => "Stale check passed (reason unavailable from existing row)".to_string(),
+        "yes" => "Stale check marked stale (reason unavailable from existing row)".to_string(),
+        _ => String::new(),
+    })
+}
+
 /// Query stale check log entries from dadbear_work_items (canonical source).
 pub fn get_stale_log(
     conn: &Connection,
@@ -8338,10 +8570,14 @@ pub fn get_stale_log(
     let mut sql = String::from(
         "SELECT wi.id, wi.slug, wi.batch_id, wi.layer, wi.target_id,
                 wi.state, COALESCE(wi.result_json, ''),
+                COALESCE(app.action, ''),
                 wi.chunk_index, 1,
-                COALESCE(wi.completed_at, wi.compiled_at),
+                COALESCE(wi.completed_at, wi.applied_at, wi.compiled_at),
                 wi.result_tokens_in, wi.result_cost_usd
-         FROM dadbear_work_items wi WHERE wi.slug = ?1",
+         FROM dadbear_work_items wi
+         LEFT JOIN dadbear_result_applications app
+           ON app.work_item_id = wi.id
+         WHERE wi.slug = ?1",
     );
     let mut param_vals: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     param_vals.push(Box::new(slug.to_string()));
@@ -8351,14 +8587,22 @@ pub fn get_stale_log(
         sql.push_str(&format!(" AND wi.layer = ?{}", param_vals.len()));
     }
     if let Some(stale_str) = stale {
-        // Map old stale filter to work_item state filter
-        let state_filter: &str = match stale_str {
-            "yes" | "true" | "1" => "applied",
-            "no" | "false" | "0" => "completed",
-            _ => "applied",
+        let status_filter = match stale_str {
+            "yes" | "true" | "1" => {
+                " AND (app.action LIKE 'superseded:%'
+                       OR app.action LIKE 'supersession_failed:%'
+                       OR (app.action IS NULL AND wi.state = 'applied'))"
+            }
+            "no" | "false" | "0" => {
+                " AND (app.action = 'not_stale'
+                       OR (app.action IS NULL AND wi.state = 'completed'))"
+            }
+            "skipped" | "skip" | "5" => {
+                " AND (app.action = 'skipped' OR wi.state IN ('stale', 'failed'))"
+            }
+            _ => "",
         };
-        param_vals.push(Box::new(state_filter.to_string()));
-        sql.push_str(&format!(" AND wi.state = ?{}", param_vals.len()));
+        sql.push_str(status_filter);
     }
 
     param_vals.push(Box::new(limit));
@@ -8375,30 +8619,134 @@ pub fn get_stale_log(
 
     let rows: Vec<serde_json::Value> = stmt
         .query_map(param_refs.as_slice(), |row| {
+            let target_id = row.get::<_, Option<String>>(4)?;
+            let state = row.get::<_, String>(5)?;
+            let result_json = row.get::<_, String>(6)?;
+            let action = row.get::<_, String>(7)?;
+            let status =
+                stale_log_status(&state, &action, &result_json, target_id.as_deref());
+            let reason = stale_log_reason(&result_json, target_id.as_deref(), status);
+
             Ok(serde_json::json!({
                 "id": row.get::<_, String>(0)?,
                 "slug": row.get::<_, String>(1)?,
                 "batch_id": row.get::<_, String>(2)?,
                 "layer": row.get::<_, i32>(3)?,
-                "target_id": row.get::<_, Option<String>>(4)?,
-                "stale": match row.get::<_, String>(5)?.as_str() {
-                    "applied" => "yes",
-                    "completed" => "no",
-                    "failed" => "skipped",
-                    _ => "unknown",
-                },
-                "reason": row.get::<_, String>(6)?,
-                "checker_index": row.get::<_, Option<i32>>(7)?,
-                "checker_batch_size": row.get::<_, i32>(8)?,
-                "checked_at": row.get::<_, String>(9)?,
-                "cost_tokens": row.get::<_, Option<i64>>(10)?,
-                "cost_usd": row.get::<_, Option<f64>>(11)?,
+                "target_id": target_id,
+                "stale": status,
+                "reason": reason,
+                "checker_index": row.get::<_, Option<i32>>(8)?,
+                "checker_batch_size": row.get::<_, i32>(9)?,
+                "checked_at": row.get::<_, String>(10)?,
+                "cost_tokens": row.get::<_, Option<i64>>(11)?,
+                "cost_usd": row.get::<_, Option<f64>>(12)?,
             }))
         })
         .map(|iter| iter.filter_map(|r| r.ok()).collect())
         .unwrap_or_default();
 
     Ok(rows)
+}
+
+#[cfg(test)]
+mod stale_log_tests {
+    use super::*;
+    use rusqlite::params;
+
+    fn insert_work_item(
+        conn: &Connection,
+        id: &str,
+        target_id: &str,
+        result_json: &str,
+        action: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO dadbear_work_items
+                (id, slug, batch_id, epoch_id, step_name, primitive,
+                 layer, target_id, system_prompt, user_prompt, model_tier,
+                 result_json, compiled_at, state, state_changed_at,
+                 completed_at, applied_at)
+             VALUES (?1, 'stale-log', 'b1', 'e1', 'stale', 'stale_check',
+                     1, ?2, '', '', 'stale_remote',
+                     ?3, datetime('now'), 'applied', datetime('now'),
+                     datetime('now'), datetime('now'))",
+            params![id, target_id, result_json],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dadbear_result_applications
+                (work_item_id, slug, target_id, action, applied_at)
+             VALUES (?1, 'stale-log', ?2, ?3, datetime('now'))",
+            params![id, target_id, action],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stale_log_uses_llm_reason_and_application_action_for_status() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+
+        insert_work_item(
+            &conn,
+            "wi-skip",
+            "L1-skip",
+            r#"{"content":"[{\"node_id\":\"L1-skip\",\"decision\":\"skip\",\"stale\":false,\"reason\":\"LLM confirmed duplicate live thread.\"}]"}"#,
+            "skipped",
+        );
+        insert_work_item(
+            &conn,
+            "wi-pass",
+            "L1-pass",
+            r#"{"content":"[{\"node_id\":\"L1-pass\",\"stale\":false,\"reason\":\"LLM says the summary is still current.\"}]"}"#,
+            "not_stale",
+        );
+        insert_work_item(
+            &conn,
+            "wi-stale",
+            "L1-stale",
+            r#"{"content":"[{\"node_id\":\"L1-stale\",\"stale\":true,\"reason\":\"LLM found a semantic delta.\"}]"}"#,
+            "superseded:L1-stale-v2",
+        );
+
+        let rows = get_stale_log(&conn, "stale-log", None, None, 10, 0).unwrap();
+        let by_target = |target: &str| {
+            rows.iter()
+                .find(|row| row["target_id"].as_str() == Some(target))
+                .unwrap_or_else(|| panic!("missing target {target}: {rows:#?}"))
+        };
+
+        assert_eq!(by_target("L1-skip")["stale"].as_str(), Some("skipped"));
+        assert_eq!(
+            by_target("L1-skip")["reason"].as_str(),
+            Some("LLM confirmed duplicate live thread.")
+        );
+        assert_eq!(by_target("L1-pass")["stale"].as_str(), Some("no"));
+        assert_eq!(
+            by_target("L1-pass")["reason"].as_str(),
+            Some("LLM says the summary is still current.")
+        );
+        assert_eq!(by_target("L1-stale")["stale"].as_str(), Some("yes"));
+        assert_eq!(
+            by_target("L1-stale")["reason"].as_str(),
+            Some("LLM found a semantic delta.")
+        );
+
+        let skipped = get_stale_log(&conn, "stale-log", None, Some("skipped"), 10, 0).unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0]["target_id"].as_str(), Some("L1-skip"));
+    }
+
+    #[test]
+    fn stale_log_unknown_decision_uses_shared_boolean_fallback() {
+        let result_json =
+            r#"{"content":"[{\"node_id\":\"L1-pass\",\"decision\":\"unclear\",\"stale\":false,\"reason\":\"Boolean says current.\"}]"}"#;
+
+        assert_eq!(
+            stale_log_status("applied", "", result_json, Some("L1-pass")),
+            "no"
+        );
+    }
 }
 
 /// Insert a cost log entry with full P1.5 observatory columns.
@@ -10801,6 +11149,49 @@ pub fn mark_gap_resolved_with_reason(
     resolution_reason: &str,
     resolved_by: &str,
 ) -> Result<()> {
+    mark_gap_resolved_with_reason_inner(
+        conn,
+        slug,
+        question_id,
+        description,
+        resolution_reason,
+        resolved_by,
+        false,
+    )
+}
+
+/// Strict variant for atomic writer transactions: the `gap_resolved`
+/// observation event is part of the commit contract, so event-write failure
+/// must roll the caller's transaction back instead of being logged as
+/// best-effort telemetry.
+pub fn mark_gap_resolved_with_reason_strict_observation(
+    conn: &Connection,
+    slug: &str,
+    question_id: &str,
+    description: &str,
+    resolution_reason: &str,
+    resolved_by: &str,
+) -> Result<()> {
+    mark_gap_resolved_with_reason_inner(
+        conn,
+        slug,
+        question_id,
+        description,
+        resolution_reason,
+        resolved_by,
+        true,
+    )
+}
+
+fn mark_gap_resolved_with_reason_inner(
+    conn: &Connection,
+    slug: &str,
+    question_id: &str,
+    description: &str,
+    resolution_reason: &str,
+    resolved_by: &str,
+    strict_observation: bool,
+) -> Result<()> {
     conn.execute(
         "UPDATE pyramid_gaps SET resolved = 1, resolution_confidence = 1.0
          WHERE slug = ?1 AND question_id = ?2 AND description = ?3",
@@ -10828,11 +11219,21 @@ pub fn mark_gap_resolved_with_reason(
         slug,
         "dadbear",
         "gap_resolved",
-        None, None, None, None,
+        None,
+        None,
+        None,
+        None,
         None, // target_node_id unknown — gap is question-keyed, not node-keyed
         None, // layer unknown
         Some(&metadata),
     ) {
+        if strict_observation {
+            return Err(e).with_context(|| {
+                format!(
+                    "mark_gap_resolved: failed to emit strict gap_resolved observation event for {slug}/{question_id}"
+                )
+            });
+        }
         tracing::warn!(
             slug = %slug,
             question_id = %question_id,
@@ -16982,13 +17383,13 @@ pub fn sum_demand_weight(
 /// the helper the triage DSL's `has_demand_signals` condition uses —
 /// the per-node variant (`sum_demand_weight`) can't be used for
 /// deferred evidence questions because a `LayerQuestion.question_id`
-/// is a `q-{sha256}` hash, not the L{layer}-{seq} id that demand
-/// signals are recorded under. The two ID spaces never meet.
+/// is a question handle like `Q-L1-000`, not the L{layer}-{seq} id
+/// that demand signals are recorded under. The two ID spaces never meet.
 ///
 /// Aggregating per-slug matches the spec's intent ("drive re-check
 /// by demand") while staying correct in the only ID space we
 /// actually have at both sides of the join. When the pyramid grows
-/// a persistent q-hash → node-id map (Phase 13+), the per-node
+/// a persistent question-handle → answer-node map (Phase 13+), the per-node
 /// variant can be brought back for spatial precision.
 ///
 /// Returns 0.0 if no signals match (not an error).
@@ -17031,7 +17432,7 @@ pub fn list_slugs_with_deferred_questions(conn: &Connection) -> Result<Vec<Strin
 /// `check_interval IN ('never', 'on_demand')`. Used by the
 /// `record_demand_signal` on-demand reactivation hook. The previous
 /// `list_deferred_by_question_target` helper tried to join by
-/// question_id = node_id which never matches (q-hash vs L{}-{}),
+/// question_id = node_id which never matches (Q-L{}-{} vs L{}-{}),
 /// so the reactivation hook was a no-op. This helper drops the
 /// node_id filter and returns all slug-level `on_demand`/`never`
 /// rows — the demand signal handler then re-triages each with
@@ -20119,8 +20520,8 @@ mod phase13_tests {
         seed_dadbear_folder_hierarchy(&conn);
         // Freeze one slug via holds projection.
         conn.execute(
-            "INSERT INTO dadbear_holds_projection (slug, hold, source, acquired_at)
-             VALUES ('p18c-d', 'frozen', 'test', datetime('now'))",
+            "INSERT INTO dadbear_holds_projection (slug, hold, held_since, reason)
+             VALUES ('p18c-d', 'frozen', datetime('now'), 'test')",
             [],
         )
         .unwrap();
@@ -20146,8 +20547,8 @@ mod phase13_tests {
         // Freeze the /a slugs via holds projection (canonical path).
         for slug in &["p18c-a", "p18c-ab", "p18c-abc"] {
             conn.execute(
-                "INSERT INTO dadbear_holds_projection (slug, hold, source, acquired_at)
-                 VALUES (?1, 'frozen', 'test', datetime('now'))",
+                "INSERT INTO dadbear_holds_projection (slug, hold, held_since, reason)
+                 VALUES (?1, 'frozen', datetime('now'), 'test')",
                 rusqlite::params![slug],
             )
             .unwrap();
@@ -23265,6 +23666,7 @@ mod phase2_post_build_tests {
     //! Post-build accretion v5 Phase 2 tests — new annotation verbs.
     //! See .lab/architecture/agent-wire-node-post-build-plan-v5.md
     use super::*;
+    use super::post_build_test_support::test_lock;
     use crate::pyramid::types::{AnnotationType, ContentType, PyramidAnnotation};
 
     fn mem_conn() -> Connection {
@@ -23301,6 +23703,7 @@ mod phase2_post_build_tests {
 
     #[test]
     fn save_annotation_round_trip_all_sixteen_types() {
+        let _lock = test_lock();
         // Phase 7c verifier: extended from 11 → 15 types (adds gap /
         // hypothesis / purpose_declaration / purpose_shift as pure vocab
         // entries per 6c-B flip).
@@ -23345,6 +23748,7 @@ mod phase2_post_build_tests {
 
     #[test]
     fn annotation_type_from_str_strict_rejects_unknown() {
+        let _lock = test_lock();
         // Pillar 38 absorbed bug: from_str silently defaulted to Observation.
         // Phase 6c-B: from_str_strict is now vocab-backed — unknown strings
         // raise because no vocab entry matches. Genesis seeds 11 canonical
@@ -23369,6 +23773,7 @@ mod phase2_post_build_tests {
     /// `annotation_type`.
     #[test]
     fn annotation_type_all_matches_vocab_registry() {
+        let _lock = test_lock();
         let conn = mem_conn();
         // Full list from the vocab registry.
         let vocab_active: Vec<String> = crate::pyramid::vocab_entries::list_vocabulary(
@@ -23548,6 +23953,7 @@ mod phase3_post_build_tests {
         let chain_emitted: &[(&str, &str, &str)] = &[
             ("cascade_handler_invoked", "log_only", "cascade_invoked_log"),
             ("debate_steward_invoked", "log_only", "debate_steward_invoked_log"),
+            ("debate_steward_skipped", "log_only", "debate_steward_skipped_log"),
             ("meta_layer_oracle_invoked", "log_only", "oracle_invoked_log"),
             ("meta_layer_oracle_skipped", "log_only", "oracle_skipped_log"),
             ("synthesizer_invoked", "log_only", "synthesizer_invoked_log"),
@@ -28112,11 +28518,38 @@ mod phase6c_b_post_build_tests {
     }
 
     fn seed_target_node(conn: &Connection, slug: &str, node_id: &str) {
+        seed_node(conn, slug, node_id, 0, None);
+    }
+
+    fn seed_node(
+        conn: &Connection,
+        slug: &str,
+        node_id: &str,
+        depth: i64,
+        parent_id: Option<&str>,
+    ) {
         conn.execute(
             "INSERT INTO pyramid_nodes
-                (id, slug, depth, headline, distilled, self_prompt, build_version)
-             VALUES (?1, ?2, 0, '', '', '', 1)",
-            rusqlite::params![node_id, slug],
+                (id, slug, depth, headline, distilled, self_prompt, parent_id, build_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, 1)",
+            rusqlite::params![
+                node_id,
+                slug,
+                depth,
+                format!("headline for {node_id}"),
+                format!("distilled body for {node_id}"),
+                parent_id
+            ],
+        )
+        .unwrap();
+    }
+
+    fn seed_thread(conn: &Connection, slug: &str, thread_id: &str, node_id: &str, depth: i64) {
+        conn.execute(
+            "INSERT INTO pyramid_threads
+                (slug, thread_id, thread_name, current_canonical_id, depth, delta_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            rusqlite::params![slug, thread_id, format!("thread for {node_id}"), node_id, depth],
         )
         .unwrap();
     }
@@ -28218,6 +28651,55 @@ mod phase6c_b_post_build_tests {
         }
     }
 
+    #[test]
+    fn resolve_annotation_delta_thread_prefers_exact_thread_match() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+        let slug = "rh-delta-resolve-exact";
+        create_slug(&conn, slug, &ContentType::Code, "/tmp/x").unwrap();
+        seed_node(&conn, slug, "node-l1", 1, None);
+        seed_thread(&conn, slug, "thread-l1", "node-l1", 1);
+
+        let resolved = resolve_annotation_delta_thread(&conn, slug, "node-l1").unwrap();
+
+        assert_eq!(resolved.as_deref(), Some("thread-l1"));
+    }
+
+    #[test]
+    fn resolve_annotation_delta_thread_walks_to_nearest_ancestor_thread() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+        let slug = "rh-delta-resolve-ancestor";
+        create_slug(&conn, slug, &ContentType::Code, "/tmp/x").unwrap();
+        seed_node(&conn, slug, "node-l2", 2, None);
+        seed_node(&conn, slug, "node-l1", 1, Some("node-l2"));
+        seed_node(&conn, slug, "leaf-l0", 0, Some("node-l1"));
+        seed_thread(&conn, slug, "thread-l2", "node-l2", 2);
+        seed_thread(&conn, slug, "thread-l1", "node-l1", 1);
+
+        let resolved = resolve_annotation_delta_thread(&conn, slug, "leaf-l0").unwrap();
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some("thread-l1"),
+            "leaf correction should route to nearest ancestor thread"
+        );
+    }
+
+    #[test]
+    fn resolve_annotation_delta_thread_returns_none_without_ancestor_thread() {
+        let _lock = test_lock();
+        let conn = mem_conn();
+        let slug = "rh-delta-resolve-none";
+        create_slug(&conn, slug, &ContentType::Code, "/tmp/x").unwrap();
+        seed_node(&conn, slug, "node-l1", 1, None);
+        seed_node(&conn, slug, "leaf-l0", 0, Some("node-l1"));
+
+        let resolved = resolve_annotation_delta_thread(&conn, slug, "leaf-l0").unwrap();
+
+        assert_eq!(resolved, None);
+    }
+
     // ── Test 4 ─────────────────────────────────────────────────────────
     // When the vocab entry has `reactive: true`, `process_annotation_hook`
     // emits an `annotation_reacted` observation event. This is the
@@ -28313,20 +28795,12 @@ mod phase6c_b_post_build_tests {
     }
 
     // ── Test 6 ─────────────────────────────────────────────────────────
-    // When the vocab entry has `creates_delta: true` and a matching
-    // thread exists, a delta row is created. Uses a contrived inline
-    // delta bypass: we don't run the full LLM-powered create_delta —
-    // instead we assert the hook enters the delta branch (no thread
-    // matches → logs and skips, so deltas table stays empty but the
-    // code path was exercised). We supplement with a flag-level
-    // assertion: correction has creates_delta=true in vocab, observation
-    // has false. The flag IS what drives dispatch.
-    //
-    // This test explicitly asserts "correction enters creates_delta
-    // branch" via the hook path: we verify it doesn't panic + that for
-    // NO-matching-thread, the hook still completes Ok.
+    // A creates_delta annotation with no exact or ancestor thread is a
+    // loud deferral, not the old silent Ok branch. The hook still returns
+    // Ok so annotation save does not fail after the fact, but operators
+    // get an observation event plus warn! log.
     #[tokio::test]
-    async fn process_annotation_hook_handles_creates_delta_true_without_matching_thread() {
+    async fn process_annotation_hook_defers_loudly_without_matching_or_ancestor_thread() {
         let _lock = test_lock();
         let (reader, writer) = hook_setup_readers_and_writers();
         let slug = "rh-delta-no-thread";
@@ -28335,7 +28809,6 @@ mod phase6c_b_post_build_tests {
             create_slug(&conn, slug, &ContentType::Code, "/tmp/x").unwrap();
             seed_target_node(&conn, slug, "node-1");
         }
-        // correction is genesis creates_delta=true.
         let ann = {
             let conn = writer.lock().await;
             save_annotation(
@@ -28344,28 +28817,126 @@ mod phase6c_b_post_build_tests {
             )
             .unwrap()
         };
-        // No thread has current_canonical_id = "node-1", so delta creation
-        // is skipped with an info log — but the hook MUST have entered the
-        // creates_delta=true branch, not gone down a per-type match arm
-        // that no longer exists.
+
         run_hook(&reader, &writer, slug, &ann).await;
 
-        // Sanity: the annotation_superseded event was emitted on ancestors
-        // (correction has special event_type in emit_annotation_observation_events).
-        // Since node-1 has no parent in our setup, no event is emitted — that's OK.
-        // The real assertion here is that the hook completed without error,
-        // proving the dispatch path handles creates_delta=true uniformly.
         let conn = writer.lock().await;
-        // No annotation_reacted (correction.reactive=false).
-        let reacted_count: i64 = conn
+        let (deferred_count, metadata_json): (i64, Option<String>) = conn
             .query_row(
-                "SELECT COUNT(*) FROM dadbear_observation_events
-                  WHERE slug = ?1 AND event_type = 'annotation_reacted'",
+                "SELECT COUNT(*), MAX(metadata_json)
+                 FROM dadbear_observation_events
+                 WHERE slug = ?1
+                   AND event_type = 'correction_delta_deferred_no_ancestor_thread'
+                   AND target_node_id = 'node-1'",
+                rusqlite::params![slug],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            deferred_count, 1,
+            "missing exact/ancestor thread must emit a loud deferral event"
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_str(&metadata_json.unwrap()).unwrap();
+        assert_eq!(metadata["annotation_type"], "correction");
+        assert_eq!(metadata["target_node_id"], "node-1");
+        assert_eq!(metadata["reason"], "no_ancestor_thread");
+
+        let delta_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_deltas WHERE slug = ?1",
                 rusqlite::params![slug],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(reacted_count, 0, "correction is not reactive, no reacted event");
+        assert_eq!(delta_count, 0, "deferral must not write an orphan delta");
+    }
+
+    #[tokio::test]
+    async fn process_annotation_hook_routes_leaf_correction_delta_to_parent_thread() {
+        let _lock = test_lock();
+
+        let mut server = mockito::Server::new_async().await;
+        let mock_content = serde_json::json!({
+            "content": "mocked correction delta from leaf",
+            "relevance": "high",
+            "flag": null,
+            "distillation": "mocked cumulative distillation after correction",
+            "web_edge_notes": [],
+            "drift_detected": false
+        })
+        .to_string();
+        let llm_mock = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(super::phase6_post_build_tests::openrouter_body(&mock_content))
+            .expect(2)
+            .create_async()
+            .await;
+
+        let (reader, writer) = hook_setup_readers_and_writers();
+        let slug = "rh-delta-leaf-parent-thread";
+        {
+            let conn = writer.lock().await;
+            create_slug(&conn, slug, &ContentType::Code, "/tmp/x").unwrap();
+            seed_node(&conn, slug, "parent-l1", 1, None);
+            seed_node(&conn, slug, "leaf-l0", 0, Some("parent-l1"));
+            seed_thread(&conn, slug, "thread-parent-l1", "parent-l1", 1);
+        }
+        let ann = {
+            let conn = writer.lock().await;
+            save_annotation(
+                &conn,
+                &make_annotation(slug, "leaf-l0", AnnotationType::new("correction")),
+            )
+            .unwrap()
+        };
+
+        let config = super::phase6_post_build_tests::mocked_llm_config(server.url()).await;
+        run_hook_with_config(&reader, &writer, slug, &ann, &config, "openai/gpt-4o-mini").await;
+
+        let conn = writer.lock().await;
+        let (thread_id, source_node_id, content, relevance): (
+            String,
+            Option<String>,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT thread_id, source_node_id, content, relevance
+                 FROM pyramid_deltas
+                 WHERE slug = ?1
+                 ORDER BY id DESC
+                 LIMIT 1",
+                rusqlite::params![slug],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(thread_id, "thread-parent-l1");
+        assert_eq!(source_node_id.as_deref(), Some("leaf-l0"));
+        assert!(
+            content.contains("mocked correction delta from leaf"),
+            "delta content must come from mocked create_delta LLM response: {content}"
+        );
+        assert_eq!(relevance, "high");
+
+        let distillation: String = conn
+            .query_row(
+                "SELECT content
+                 FROM pyramid_distillations
+                 WHERE slug = ?1 AND thread_id = 'thread-parent-l1'",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            distillation,
+            "mocked cumulative distillation after correction"
+        );
+        drop(conn);
+
+        llm_mock.assert_async().await;
     }
 
     // ── Test 7 ─────────────────────────────────────────────────────────
@@ -28502,25 +29073,32 @@ mod phase6c_b_post_build_tests {
     }
 
     /// Call the real `process_annotation_hook` from `routes.rs` with a
-    /// stub LlmConfig + OperationalConfig — neither reactive nor the
-    /// no-matching-thread delta paths actually invoke an LLM. The
-    /// `model` string is only used if delta creation is attempted.
+    /// stub LlmConfig + OperationalConfig for non-LLM branches.
     async fn run_hook(
         reader: &std::sync::Arc<tokio::sync::Mutex<Connection>>,
         writer: &std::sync::Arc<tokio::sync::Mutex<Connection>>,
         slug: &str,
         annotation: &PyramidAnnotation,
     ) {
-        // Minimal stubs — the hook branches we exercise here don't dereference them.
         let base_config = crate::pyramid::llm::LlmConfig::default();
-        let model = "test-model";
+        run_hook_with_config(reader, writer, slug, annotation, &base_config, "test-model").await;
+    }
+
+    async fn run_hook_with_config(
+        reader: &std::sync::Arc<tokio::sync::Mutex<Connection>>,
+        writer: &std::sync::Arc<tokio::sync::Mutex<Connection>>,
+        slug: &str,
+        annotation: &PyramidAnnotation,
+        base_config: &crate::pyramid::llm::LlmConfig,
+        model: &str,
+    ) {
         let ops = crate::pyramid::OperationalConfig::default();
         crate::pyramid::routes::test_hooks::run_process_annotation_hook(
             reader,
             writer,
             slug,
             annotation,
-            &base_config,
+            base_config,
             model,
             &ops,
         )
@@ -29074,12 +29652,13 @@ mod phase6c_d_post_build_tests {
 // Phase 7a (post-build accretion v5): debate_steward chain + Debate writer.
 // Tests verify:
 //   1. steel_man annotation upgrades Scaffolding target to Debate
-//   2. red_team annotation on existing Debate appends red_team entry
-//   3. starter-debate-steward chain loads via chain_loader
-//   4. debate_spawned event is emitted on Scaffolding → Debate upgrade
-//   5. debate_spawned event does not cause infinite-recursion compile
-//   6. append_annotation_to_debate_node is idempotent on replay
-//   7. compiler routes annotation_reacted via vocab's handler_chain_id
+//   2. hypothesis annotation upgrades Scaffolding target to Debate position
+//   3. red_team annotation on existing Debate appends red_team entry
+//   4. starter-debate-steward chain loads via chain_loader
+//   5. debate_spawned event is emitted on Scaffolding → Debate upgrade
+//   6. debate_spawned event does not cause infinite-recursion compile
+//   7. append_annotation_to_debate_node is idempotent on replay
+//   8. compiler routes annotation_reacted via vocab's handler_chain_id
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
@@ -29320,7 +29899,220 @@ mod phase7a_post_build_tests {
         }
     }
 
-    // ── Test 2: RedTeam on existing Debate appends red_team ────────────
+    // ── Test 2: Hypothesis annotation upgrades Scaffolding to Debate ───
+
+    #[tokio::test]
+    async fn hypothesis_annotation_upgrades_scaffolding_to_debate_position() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7a1h", &ContentType::Code, "/tmp/p7a1h").unwrap();
+        seed_scaffolding_node(&conn, "p7a1h", "node-hypothesis-1");
+        let ann = save_ann(
+            &conn,
+            "p7a1h",
+            "node-hypothesis-1",
+            "hypothesis",
+            "Hypothesis: latency failures come from stale package artifacts.",
+            "newman",
+        );
+        let event_id = emit_annotation_reacted(
+            &conn,
+            "p7a1h",
+            &ann,
+            "starter-debate-steward",
+        );
+
+        let result =
+            dadbear_compiler::run_compilation_for_slug(&conn, "p7a1h", None, None).unwrap();
+        assert!(
+            result.items_compiled >= 1,
+            "hypothesis annotation_reacted must compile a steward work item"
+        );
+        let (wi_id, primitive, step_name, resolved_chain_id, state): (
+            String, String, String, Option<String>, String,
+        ) = conn
+            .query_row(
+                "SELECT id, primitive, step_name, resolved_chain_id, state
+                   FROM dadbear_work_items
+                  WHERE slug = 'p7a1h' AND step_name = 'cascade_reacted'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("role_bound work item for hypothesis annotation_reacted must exist");
+        assert_eq!(primitive, "role_bound");
+        assert_eq!(step_name, "cascade_reacted");
+        assert_eq!(resolved_chain_id.as_deref(), Some("starter-debate-steward"));
+        assert_eq!(state, "compiled");
+        assert!(
+            wi_id.ends_with(&format!("/event/{event_id}")),
+            "work item id must stay event-scoped for annotation_reacted: {wi_id}"
+        );
+
+        let state_pyr = test_pyramid_state(conn);
+        let chain = chain_loader::load_chain_by_id(
+            "starter-debate-steward",
+            &state_pyr.chains_dir,
+        )
+        .expect("starter-debate-steward must load");
+        chain_executor::execute_chain_for_target(
+            &state_pyr,
+            &chain,
+            "p7a1h",
+            Some("node-hypothesis-1"),
+            serde_json::json!({
+                "work_item_id": wi_id,
+                "step_name": step_name,
+                "target_id": "node-hypothesis-1",
+                "layer": 1,
+            }),
+        )
+        .await
+        .expect("debate_steward chain must succeed for hypothesis");
+
+        let writer = state_pyr.writer.lock().await;
+        let view = get_node_shape(&writer, "p7a1h", "node-hypothesis-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.shape.as_str(), "debate");
+        match view.payload {
+            Some(ShapePayload::Debate(d)) => {
+                assert_eq!(d.positions.len(), 1);
+                assert!(d.positions[0]
+                    .steel_manning
+                    .contains("stale package artifacts"));
+                assert!(
+                    d.positions[0].red_teams.is_empty(),
+                    "hypothesis seeds a position, not a red_team"
+                );
+                assert!(
+                    d.positions[0]
+                        .source_annotation_ids
+                        .iter()
+                        .any(|a| a == &format!("annotation#{}", ann.id)),
+                    "hypothesis position must retain source annotation provenance"
+                );
+            }
+            other => panic!("expected Debate payload, got {other:?}"),
+        }
+
+        let (count, metadata): (i64, Option<String>) = writer
+            .query_row(
+                "SELECT COUNT(*), MAX(metadata_json)
+                   FROM dadbear_observation_events
+                  WHERE slug = 'p7a1h' AND event_type = 'debate_spawned'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "hypothesis should spawn exactly one Debate");
+        let metadata: serde_json::Value =
+            serde_json::from_str(&metadata.expect("spawn metadata required")).unwrap();
+        assert_eq!(
+            metadata["initial_position_or_red_team"],
+            serde_json::json!("hypothesis"),
+            "spawn metadata must preserve hypothesis as the triggering annotation type"
+        );
+        assert_eq!(metadata["annotation_id"], serde_json::json!(ann.id));
+    }
+
+    #[tokio::test]
+    async fn hypothesis_annotation_on_existing_debate_appends_position() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7a1h2", &ContentType::Code, "/tmp/p7a1h2").unwrap();
+        let existing = DebateTopic {
+            concern: "Pre-existing concern".to_string(),
+            positions: vec![DebatePosition {
+                label: "main".to_string(),
+                steel_manning: "Initial position".to_string(),
+                red_teams: vec![],
+                evidence_anchors: vec![],
+                source_annotation_ids: vec![],
+            }],
+            cross_refs: vec![],
+            vote_lean: None,
+        };
+        seed_existing_debate_node(&conn, "p7a1h2", "node-hypothesis-2", &existing);
+        let ann = save_ann(
+            &conn,
+            "p7a1h2",
+            "node-hypothesis-2",
+            "hypothesis",
+            "Hypothesis: the market route skipped because fallback config was empty.",
+            "newman",
+        );
+        emit_annotation_reacted(&conn, "p7a1h2", &ann, "starter-debate-steward");
+
+        let result =
+            dadbear_compiler::run_compilation_for_slug(&conn, "p7a1h2", None, None).unwrap();
+        assert!(
+            result.items_compiled >= 1,
+            "hypothesis on existing debate must compile a steward work item"
+        );
+        let (wi_id, layer): (String, i64) = conn
+            .query_row(
+                "SELECT id, layer FROM dadbear_work_items
+                  WHERE slug = 'p7a1h2' AND step_name = 'cascade_reacted'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        let state_pyr = test_pyramid_state(conn);
+        let chain = chain_loader::load_chain_by_id(
+            "starter-debate-steward",
+            &state_pyr.chains_dir,
+        )
+        .expect("starter-debate-steward must load");
+        chain_executor::execute_chain_for_target(
+            &state_pyr,
+            &chain,
+            "p7a1h2",
+            Some("node-hypothesis-2"),
+            serde_json::json!({
+                "work_item_id": wi_id,
+                "step_name": "cascade_reacted",
+                "target_id": "node-hypothesis-2",
+                "layer": layer,
+            }),
+        )
+        .await
+        .expect("debate_steward chain must append hypothesis to existing debate");
+
+        let writer = state_pyr.writer.lock().await;
+        let view = get_node_shape(&writer, "p7a1h2", "node-hypothesis-2")
+            .unwrap()
+            .unwrap();
+        match view.payload {
+            Some(ShapePayload::Debate(d)) => {
+                assert_eq!(d.positions.len(), 2, "hypothesis appends a second position");
+                let appended = d
+                    .positions
+                    .iter()
+                    .find(|p| p.label == format!("annotation#{}", ann.id))
+                    .expect("appended hypothesis position must use annotation label");
+                assert!(
+                    appended
+                        .steel_manning
+                        .contains("fallback config was empty")
+                );
+                assert!(
+                    appended
+                        .source_annotation_ids
+                        .iter()
+                        .any(|a| a == &format!("annotation#{}", ann.id)),
+                    "existing-debate hypothesis append must retain source annotation provenance"
+                );
+                assert!(
+                    appended.red_teams.is_empty(),
+                    "hypothesis append creates a position, not a red_team"
+                );
+            }
+            other => panic!("expected Debate payload, got {other:?}"),
+        }
+    }
+
+    // ── Test 3: RedTeam on existing Debate appends red_team ────────────
 
     #[tokio::test]
     async fn red_team_annotation_on_existing_debate_appends_red_team() {
@@ -29428,7 +30220,130 @@ mod phase7a_post_build_tests {
         }
     }
 
-    // ── Test 3: debate_steward chain loads via chain_loader ─────────────
+    #[tokio::test]
+    async fn repeated_reactive_annotations_compile_and_execute_per_arrival() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7a2b", &ContentType::Code, "/tmp/p7a2b").unwrap();
+        let existing = DebateTopic {
+            concern: "Pre-existing concern".to_string(),
+            positions: vec![DebatePosition {
+                label: "main".to_string(),
+                steel_manning: "Initial position".to_string(),
+                red_teams: vec![],
+                evidence_anchors: vec![],
+                source_annotation_ids: vec![],
+            }],
+            cross_refs: vec![],
+            vote_lean: None,
+        };
+        seed_existing_debate_node(&conn, "p7a2b", "node-debate-2b", &existing);
+
+        let ann1 = save_ann(
+            &conn,
+            "p7a2b",
+            "node-debate-2b",
+            "red_team",
+            "First counter-argument.",
+            "bob",
+        );
+        let ann2 = save_ann(
+            &conn,
+            "p7a2b",
+            "node-debate-2b",
+            "red_team",
+            "Second counter-argument.",
+            "carol",
+        );
+        emit_annotation_reacted(&conn, "p7a2b", &ann1, "starter-debate-steward");
+        emit_annotation_reacted(&conn, "p7a2b", &ann2, "starter-debate-steward");
+
+        let result =
+            dadbear_compiler::run_compilation_for_slug(&conn, "p7a2b", None, None).unwrap();
+        assert_eq!(
+            result.items_compiled, 2,
+            "each annotation_reacted arrival must compile its own work item"
+        );
+        let wi_rows: Vec<(String, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, layer
+                       FROM dadbear_work_items
+                      WHERE slug = 'p7a2b'
+                        AND step_name = 'cascade_reacted'
+                        AND target_id = 'node-debate-2b'
+                      ORDER BY id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            wi_rows.len(),
+            2,
+            "distinct annotation arrivals must survive target dedup"
+        );
+        assert_ne!(
+            wi_rows[0].0, wi_rows[1].0,
+            "event-scoped work item IDs must differ by source event"
+        );
+
+        let state_pyr = test_pyramid_state(conn);
+        let chain = chain_loader::load_chain_by_id(
+            "starter-debate-steward",
+            &state_pyr.chains_dir,
+        )
+        .unwrap();
+        for (wi_id, layer) in wi_rows {
+            chain_executor::execute_chain_for_target(
+                &state_pyr,
+                &chain,
+                "p7a2b",
+                Some("node-debate-2b"),
+                serde_json::json!({
+                    "work_item_id": wi_id,
+                    "step_name": "cascade_reacted",
+                    "target_id": "node-debate-2b",
+                    "layer": layer,
+                }),
+            )
+            .await
+            .expect("debate_steward chain must execute for each arrival");
+        }
+
+        let writer = state_pyr.writer.lock().await;
+        let view =
+            get_node_shape(&writer, "p7a2b", "node-debate-2b").unwrap().unwrap();
+        assert_eq!(view.shape.as_str(), "debate");
+        match view.payload {
+            Some(ShapePayload::Debate(d)) => {
+                assert_eq!(d.positions.len(), 1);
+                assert_eq!(
+                    d.positions[0].red_teams.len(),
+                    2,
+                    "both red_team arrivals must be appended"
+                );
+                let arguments: Vec<&str> = d.positions[0]
+                    .red_teams
+                    .iter()
+                    .map(|entry| entry.argument.as_str())
+                    .collect();
+                assert!(
+                    arguments.contains(&"First counter-argument."),
+                    "first arrival missing from debate payload"
+                );
+                assert!(
+                    arguments.contains(&"Second counter-argument."),
+                    "second arrival missing from debate payload"
+                );
+            }
+            other => panic!("expected Debate payload, got {other:?}"),
+        }
+    }
+
+    // ── Test 4: debate_steward chain loads via chain_loader ─────────────
 
     #[test]
     fn debate_steward_chain_loads_via_chain_loader() {
@@ -29450,7 +30365,7 @@ mod phase7a_post_build_tests {
         );
     }
 
-    // ── Test 4: debate_spawned event emitted on shape upgrade ──────────
+    // ── Test 5: debate_spawned event emitted on shape upgrade ──────────
 
     #[tokio::test]
     async fn debate_spawned_event_emitted_on_shape_upgrade() {
@@ -29492,7 +30407,7 @@ mod phase7a_post_build_tests {
         );
     }
 
-    // ── Test 5: debate_spawned does not cause infinite recursion ────────
+    // ── Test 6: debate_spawned does not cause infinite recursion ────────
     //
     // Two distinct safety properties:
     //  (a) Running the `starter-debate-steward` chain a second time
@@ -29593,7 +30508,7 @@ mod phase7a_post_build_tests {
         );
     }
 
-    // ── Test 6: append_annotation_to_debate_node is idempotent ─────────
+    // ── Test 7: append_annotation_to_debate_node is idempotent ─────────
 
     #[tokio::test]
     async fn append_annotation_to_debate_node_is_idempotent() {
@@ -29646,7 +30561,7 @@ mod phase7a_post_build_tests {
         assert_eq!(spawn_count, 1);
     }
 
-    // ── Test 7: compiler routes annotation_reacted via vocab handler ────
+    // ── Test 8: compiler routes annotation_reacted via vocab handler ────
 
     #[tokio::test]
     async fn compiler_routes_annotation_reacted_via_vocab_handler_chain_id() {
@@ -29669,7 +30584,7 @@ mod phase7a_post_build_tests {
             "annotation_reacted must be routed via vocab handler_chain_id, not role_for_event");
     }
 
-    // ── Test 8: missing handler_chain_id in metadata is a loud hold ─────
+    // ── Test 9: missing handler_chain_id in metadata is a loud hold ─────
 
     #[test]
     fn compiler_holds_cursor_when_annotation_reacted_metadata_missing_handler() {
@@ -30010,6 +30925,81 @@ mod phase7b_post_build_tests {
                 .unwrap_or(false),
             "covered_substrate_nodes must resolve the slug's L0 ids"
         );
+    }
+
+    #[tokio::test]
+    async fn decide_crystallization_routes_purpose_annotations_from_annotation_reacted() {
+        let _lock = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p7b1a", &ContentType::Code, "/tmp/p7b1a").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L0-A', 'p7b1a', 0, 'L0 A', 'L0 A distilled', '', 1)",
+            [],
+        )
+        .unwrap();
+
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(
+            conn,
+            crate::pyramid::llm::LlmConfig::default(),
+        );
+        let chain = ChainDefinition {
+            schema_version: 1,
+            id: "p7b-decide-purpose-annotation".into(),
+            name: "Phase 7b decide purpose annotation".into(),
+            description: "annotation_reacted purpose trigger test".into(),
+            content_type: "code".into(),
+            version: "0.0.1".into(),
+            author: "phase7b-test".into(),
+            defaults: ChainDefaults {
+                model_tier: "mid".into(),
+                model: None,
+                temperature: 0.3,
+                on_error: "retry(2)".into(),
+            },
+            steps: vec![crate::pyramid::chain_engine::ChainStep {
+                name: "decide".into(),
+                primitive: "custom".into(),
+                mechanical: true,
+                rust_function: Some("decide_crystallization".into()),
+                ..Default::default()
+            }],
+            post_build: vec![],
+            audience: Default::default(),
+        };
+
+        for annotation_type in ["purpose_declaration", "purpose_shift"] {
+            let out = chain_executor::execute_chain_for_target(
+                &state,
+                &chain,
+                "p7b1a",
+                None,
+                json!({
+                    "trigger_event_type": "annotation_reacted",
+                    "annotation_type": annotation_type,
+                }),
+            )
+            .await
+            .expect("decide chain must run");
+            assert_eq!(
+                out["should_crystallize"],
+                json!(true),
+                "{annotation_type} annotation_reacted must crystallize"
+            );
+            let reasoning = out["reasoning"].as_str().unwrap_or("");
+            assert!(
+                reasoning.contains("annotation_reacted") && reasoning.contains(annotation_type),
+                "reasoning should cite annotation_reacted + {annotation_type}, got: {reasoning}"
+            );
+            assert!(
+                out["covered_substrate_nodes"]
+                    .as_array()
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false),
+                "covered_substrate_nodes must resolve the slug's L0 ids"
+            );
+        }
     }
 
     // ── 7b-7.4: decide_crystallization — unknown event skips ───────────────
@@ -30872,6 +31862,18 @@ mod phase7b_post_build_tests {
                 "exactly one '{event_type}' event must have landed"
             );
         }
+        let skipped_count: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE slug = 'p7bcj' AND event_type = 'meta_layer_oracle_skipped'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            skipped_count, 0,
+            "successful purpose_shifted crystallization must not also emit a skip"
+        );
 
         // CAS the oracle work item to applied to mirror the supervisor arm.
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -35152,6 +36154,7 @@ mod phase9b_post_build_tests {
     use crate::pyramid::chain_dispatch;
     use crate::pyramid::chain_engine::{ChainStep, ChainDefinition, ChainDefaults};
     use crate::pyramid::chain_executor;
+    use crate::pyramid::dadbear_compiler;
     use crate::pyramid::pyramid_scheduler;
     use crate::pyramid::types::{ContentType, NODE_SHAPE_GAP, GapTopic, NODE_SHAPE_META_LAYER};
     use crate::pyramid::vocab_entries;
@@ -35255,6 +36258,241 @@ mod phase9b_post_build_tests {
                 .unwrap();
             assert_eq!(count, 1, "accretion_tick emit for slug {slug}");
         }
+    }
+
+    #[test]
+    fn accretion_tick_compiles_to_accretion_handler_role_bound() {
+        let _g = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p9b-acc-tick", &ContentType::Code, "/tmp/p9b-acc-tick").unwrap();
+
+        // Live regression: scheduler ticks used to derive target_id="unknown".
+        // If any older role_bound row already owned the semantic id
+        // `{slug}:00000000:role_bound:0:unknown`, INSERT OR IGNORE treated
+        // the accretion tick as idempotent and advanced the cursor without
+        // ever dispatching starter-accretion-handler.
+        conn.execute(
+            "INSERT INTO dadbear_work_items
+                (id, slug, batch_id, epoch_id, step_name, primitive, layer,
+                 target_id, system_prompt, user_prompt, model_tier,
+                 compiled_at, state, state_changed_at, applied_at,
+                 resolved_chain_id)
+             VALUES ('p9b-acc-tick:00000000:role_bound:0:unknown',
+                     'p9b-acc-tick', 'old-batch', 'old-epoch',
+                     'oracle_gap_resolved', 'role_bound', 0,
+                     'unknown', '', '', 'stale_remote',
+                     datetime('now', '-1 day'), 'applied',
+                     datetime('now', '-1 day'), datetime('now', '-1 day'),
+                     'starter-meta-layer-oracle')",
+            [],
+        )
+        .unwrap();
+
+        pyramid_scheduler::emit_accretion_tick(&conn).unwrap();
+        let res = dadbear_compiler::run_compilation_for_slug(
+            &conn,
+            "p9b-acc-tick",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            res.items_compiled, 1,
+            "scheduler accretion_tick must compile into one role_bound work item"
+        );
+
+        let (step_name, primitive, target_id, state, resolved_chain_id, observation_event_ids): (
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT step_name, primitive, target_id, state, resolved_chain_id,
+                        observation_event_ids
+                   FROM dadbear_work_items
+                  WHERE slug = 'p9b-acc-tick'
+                    AND step_name = 'accretion_tick_dispatch'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .expect("accretion_tick must create a work item");
+        assert_eq!(step_name, "accretion_tick_dispatch");
+        assert_eq!(primitive, "role_bound");
+        assert_eq!(target_id.as_deref(), Some("accretion:p9b-acc-tick"));
+        assert_eq!(state, "compiled");
+        assert_eq!(resolved_chain_id.as_deref(), Some("starter-accretion-handler"));
+
+        let event_id: i64 = conn
+            .query_row(
+                "SELECT id FROM dadbear_observation_events
+                  WHERE slug = 'p9b-acc-tick' AND event_type = 'accretion_tick'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            observation_event_ids,
+            format!("[{event_id}]"),
+            "work item must point at the scheduler tick event"
+        );
+    }
+
+    #[tokio::test]
+    async fn accretion_tick_role_bound_chain_advances_cursor() {
+        let _g = test_lock();
+        let conn = fresh_db();
+        create_slug(&conn, "p9b-acc-e2e", &ContentType::Code, "/tmp/p9b-acc-e2e").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('node-acc', 'p9b-acc-e2e', 0, 'node', 'distilled', '', 1)",
+            [],
+        )
+        .unwrap();
+
+        let mut max_id = 0i64;
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO pyramid_annotations
+                    (slug, node_id, annotation_type, content, author)
+                 VALUES ('p9b-acc-e2e', 'node-acc', 'observation', ?1, 'test')",
+                rusqlite::params![format!("scheduler accretion annotation {i}")],
+            )
+            .unwrap();
+            max_id = conn.last_insert_rowid();
+        }
+
+        pyramid_scheduler::emit_accretion_tick(&conn).unwrap();
+        let res = dadbear_compiler::run_compilation_for_slug(
+            &conn,
+            "p9b-acc-e2e",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(res.items_compiled, 1);
+
+        let (wi_id, step_name, target_id, resolved_chain_id, observation_event_ids): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT id, step_name, target_id, resolved_chain_id,
+                        observation_event_ids
+                   FROM dadbear_work_items
+                  WHERE slug = 'p9b-acc-e2e'
+                    AND step_name = 'accretion_tick_dispatch'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("accretion_tick must compile a dispatch work item");
+        assert_eq!(target_id.as_deref(), Some("accretion:p9b-acc-e2e"));
+        assert_eq!(resolved_chain_id.as_deref(), Some("starter-accretion-handler"));
+
+        let event_ids: Vec<i64> = serde_json::from_str(&observation_event_ids).unwrap();
+        let event_id = *event_ids.first().expect("source event id");
+        let metadata_json: String = conn
+            .query_row(
+                "SELECT metadata_json FROM dadbear_observation_events WHERE id = ?1",
+                rusqlite::params![event_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let trigger_md: serde_json::Value = serde_json::from_str(&metadata_json).unwrap();
+        assert_eq!(
+            trigger_md["window_n"].as_i64(),
+            Some(pyramid_scheduler::DEFAULT_ACCRETION_TICK_WINDOW_N as i64),
+            "scheduler metadata must carry window_n for the accretion handler"
+        );
+
+        let mut server = mockito::Server::new_async().await;
+        let mock_content = format!(
+            r#"{{
+                "note":"Mocked scheduler accretion note.",
+                "references":[{max_id}]
+            }}"#
+        );
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(super::phase6_post_build_tests::openrouter_body(&mock_content))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let config = super::phase6_post_build_tests::mocked_llm_config(server.url()).await;
+        let state = super::phase6_post_build_tests::pyramid_state_with_llm_config(conn, config);
+        let chain = crate::pyramid::chain_loader::load_chain_by_id(
+            resolved_chain_id.as_deref().unwrap(),
+            &state.chains_dir,
+        )
+        .expect("starter-accretion-handler must load");
+
+        let mut chain_input = json!({
+            "work_item_id": wi_id,
+            "step_name": step_name,
+            "target_id": target_id.clone(),
+            "layer": 0,
+            "trigger_event_metadata": trigger_md.clone(),
+        });
+        if let Some(obj) = trigger_md.as_object() {
+            for (k, v) in obj {
+                if chain_input.get(k).is_none() {
+                    chain_input[k.as_str()] = v.clone();
+                }
+            }
+        }
+
+        let out = chain_executor::execute_chain_for_target(
+            &state,
+            &chain,
+            "p9b-acc-e2e",
+            target_id.as_deref(),
+            chain_input,
+        )
+        .await
+        .expect("scheduler-bound accretion chain must run");
+        assert_eq!(out["note"].as_str(), Some("Mocked scheduler accretion note."));
+
+        let writer = state.writer.lock().await;
+        let invoked_count: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE slug = 'p9b-acc-e2e' AND event_type = 'accretion_invoked'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(invoked_count, 1, "chain must emit accretion_invoked");
+        let written_count: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_observation_events
+                  WHERE slug = 'p9b-acc-e2e' AND event_type = 'accretion_written'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(written_count, 1, "chain must emit accretion_written");
+        let cursor: i64 = writer
+            .query_row(
+                "SELECT accretion_cursor FROM pyramid_slugs WHERE slug = 'p9b-acc-e2e'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cursor, max_id,
+            "starter-accretion-handler must atomically advance the slug cursor"
+        );
+        drop(writer);
+        mock.assert_async().await;
     }
 
     // ── 9b-1c: sweep_tick emits with policy knobs in metadata ────────────
@@ -36430,6 +37668,10 @@ mod phase9c1_post_build_tests {
         );
         assert_eq!(m["collapsed_by"], serde_json::json!("user"));
         assert_eq!(m["positions_remaining"], serde_json::json!(2));
+        assert!(
+            m["cooldown_until"].as_str().is_some(),
+            "debate_collapsed metadata must set cooldown_until for post-collapse guards"
+        );
         let labels = m["final_position_labels"].as_array().unwrap();
         assert_eq!(labels.len(), 2);
 
@@ -36643,8 +37885,9 @@ mod phase9c2_post_build_tests {
     use super::*;
     use super::post_build_test_support::test_lock;
     use crate::pyramid::types::{
-        parse_shape_payload, shape_handler_registry, ContentType, DebatePosition, DebateTopic,
-        GapTopic, MetaLayerTopic, MetaLayerTopicEntry, NodeShape, ShapePayload,
+        parse_shape_payload, shape_handler_registry, AnnotationType, ContentType, DebatePosition,
+        DebateTopic, GapTopic, MetaLayerTopic, MetaLayerTopicEntry, NodeShape, PyramidAnnotation,
+        ShapePayload,
         NODE_SHAPE_DEBATE, NODE_SHAPE_GAP, NODE_SHAPE_META_LAYER,
     };
     use crate::pyramid::vocab_entries::{
@@ -36982,6 +38225,236 @@ mod phase9c2_post_build_tests {
             "immediate collapse-then-check should be inside the cooldown window: \
              age={age_secs}s, cooldown={}s",
             cfg.collapse_cooldown_secs
+        );
+    }
+
+    #[test]
+    fn compiler_skips_debate_steward_arrival_during_collapse_cooldown() {
+        use crate::pyramid::observation_events;
+        let _lock = test_lock();
+        let conn = fresh_conn();
+        create_slug(&conn, "p9c23compile", &ContentType::Code, "/tmp/p9c23compile").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L2-COLD', 'p9c23compile', 2, 'hl', 'd', '', 1)",
+            [],
+        )
+        .unwrap();
+
+        let collapse_id = observation_events::emit_debate_collapsed(
+            &conn,
+            "p9c23compile",
+            "L2-COLD",
+            Some(2),
+            "consensus reached",
+            1,
+            "operator",
+        )
+        .unwrap();
+        crate::pyramid::dadbear_compiler::run_compilation_for_slug(
+            &conn,
+            "p9c23compile",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let ann = PyramidAnnotation {
+            id: 0,
+            slug: "p9c23compile".to_string(),
+            node_id: "L2-COLD".to_string(),
+            annotation_type: AnnotationType::new("red_team"),
+            content: "Late counter-argument during cooldown.".to_string(),
+            question_context: None,
+            author: "bob".to_string(),
+            created_at: String::new(),
+        };
+        let saved = save_annotation(&conn, &ann).unwrap();
+        let metadata = serde_json::json!({
+            "annotation_id": saved.id,
+            "annotation_type": "red_team",
+            "target_node_id": "L2-COLD",
+            "handler_chain_id": "starter-debate-steward",
+            "author": "bob",
+        })
+        .to_string();
+        observation_events::write_observation_event(
+            &conn,
+            "p9c23compile",
+            "annotation",
+            "annotation_reacted",
+            None,
+            None,
+            None,
+            None,
+            Some("L2-COLD"),
+            Some(2),
+            Some(&metadata),
+        )
+        .unwrap();
+
+        let result = crate::pyramid::dadbear_compiler::run_compilation_for_slug(
+            &conn,
+            "p9c23compile",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            result.items_compiled, 0,
+            "debate steward annotation_reacted must be skipped during collapse cooldown"
+        );
+        let steward_items: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_work_items
+                  WHERE slug = 'p9c23compile'
+                    AND step_name = 'cascade_reacted'
+                    AND resolved_chain_id = 'starter-debate-steward'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            steward_items, 0,
+            "cooldown skip must not compile a debate steward work item"
+        );
+
+        let skip_meta: String = conn
+            .query_row(
+                "SELECT metadata_json FROM dadbear_observation_events
+                  WHERE slug = 'p9c23compile'
+                    AND event_type = 'debate_steward_skipped'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("cooldown skip event must be logged");
+        let skip: serde_json::Value = serde_json::from_str(&skip_meta).unwrap();
+        assert_eq!(
+            skip["reason"],
+            serde_json::json!("collapse_cooldown_active")
+        );
+        assert_eq!(skip["collapse_event_id"], serde_json::json!(collapse_id));
+        assert_eq!(skip["annotation_id"], serde_json::json!(saved.id));
+        assert_eq!(skip["annotation_type"], serde_json::json!("red_team"));
+        assert!(
+            skip["cooldown_until"].as_str().is_some(),
+            "skip metadata must carry cooldown_until"
+        );
+    }
+
+    #[test]
+    fn compiler_skips_hypothesis_arrival_during_collapse_cooldown() {
+        use crate::pyramid::observation_events;
+        let _lock = test_lock();
+        let conn = fresh_conn();
+        create_slug(&conn, "p9c23hyp", &ContentType::Code, "/tmp/p9c23hyp").unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+                (id, slug, depth, headline, distilled, self_prompt, build_version)
+             VALUES ('L2-HYP', 'p9c23hyp', 2, 'hl', 'd', '', 1)",
+            [],
+        )
+        .unwrap();
+
+        let collapse_id = observation_events::emit_debate_collapsed(
+            &conn,
+            "p9c23hyp",
+            "L2-HYP",
+            Some(2),
+            "consensus reached",
+            1,
+            "operator",
+        )
+        .unwrap();
+        crate::pyramid::dadbear_compiler::run_compilation_for_slug(
+            &conn,
+            "p9c23hyp",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let ann = PyramidAnnotation {
+            id: 0,
+            slug: "p9c23hyp".to_string(),
+            node_id: "L2-HYP".to_string(),
+            annotation_type: AnnotationType::new("hypothesis"),
+            content: "Hypothesis during collapse cooldown.".to_string(),
+            question_context: None,
+            author: "newman".to_string(),
+            created_at: String::new(),
+        };
+        let saved = save_annotation(&conn, &ann).unwrap();
+        let metadata = serde_json::json!({
+            "annotation_id": saved.id,
+            "annotation_type": "hypothesis",
+            "target_node_id": "L2-HYP",
+            "handler_chain_id": "starter-debate-steward",
+            "author": "newman",
+        })
+        .to_string();
+        observation_events::write_observation_event(
+            &conn,
+            "p9c23hyp",
+            "annotation",
+            "annotation_reacted",
+            None,
+            None,
+            None,
+            None,
+            Some("L2-HYP"),
+            Some(2),
+            Some(&metadata),
+        )
+        .unwrap();
+
+        let result = crate::pyramid::dadbear_compiler::run_compilation_for_slug(
+            &conn,
+            "p9c23hyp",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            result.items_compiled, 0,
+            "hypothesis must be refused during collapse cooldown"
+        );
+        let steward_items: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dadbear_work_items
+                  WHERE slug = 'p9c23hyp'
+                    AND step_name = 'cascade_reacted'
+                    AND resolved_chain_id = 'starter-debate-steward'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            steward_items, 0,
+            "cooldown skip must not compile a hypothesis debate steward work item"
+        );
+
+        let skip_meta: String = conn
+            .query_row(
+                "SELECT metadata_json FROM dadbear_observation_events
+                  WHERE slug = 'p9c23hyp'
+                    AND event_type = 'debate_steward_skipped'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("hypothesis cooldown skip event must be logged");
+        let skip: serde_json::Value = serde_json::from_str(&skip_meta).unwrap();
+        assert_eq!(
+            skip["reason"],
+            serde_json::json!("collapse_cooldown_active")
+        );
+        assert_eq!(skip["collapse_event_id"], serde_json::json!(collapse_id));
+        assert_eq!(skip["annotation_id"], serde_json::json!(saved.id));
+        assert_eq!(skip["annotation_type"], serde_json::json!("hypothesis"));
+        assert!(
+            skip["cooldown_until"].as_str().is_some(),
+            "hypothesis skip metadata must carry cooldown_until"
         );
     }
 

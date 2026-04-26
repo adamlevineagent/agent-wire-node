@@ -76,6 +76,12 @@ pub struct SchemaAnnotation {
     /// on each field annotation.
     #[serde(default)]
     pub fields: BTreeMap<String, FieldAnnotation>,
+    /// Walker-v3 bundled annotations used `parameters:` for shape
+    /// metadata before the renderer settled on `fields:`. We ingest it
+    /// and translate it to rendered field paths, but never serialize it
+    /// back to the frontend.
+    #[serde(default, skip_serializing)]
+    pub parameters: BTreeMap<String, FieldAnnotation>,
 }
 
 /// Per-field annotation describing how to render a single field. The
@@ -244,16 +250,43 @@ pub fn load_schema_annotation_for(
 /// parse failure or on a mismatch — the caller is responsible for
 /// logging its own diagnostic.
 fn try_parse_annotation(yaml_content: &str, target_schema_type: &str) -> Option<SchemaAnnotation> {
-    let annotation: SchemaAnnotation = serde_yaml::from_str(yaml_content).ok()?;
+    let mut annotation: SchemaAnnotation = serde_yaml::from_str(yaml_content).ok()?;
     let effective_target = annotation
         .applies_to
         .as_deref()
         .unwrap_or(annotation.schema_type.as_str());
     if effective_target == target_schema_type {
+        normalize_annotation_fields(&mut annotation, target_schema_type);
         Some(annotation)
     } else {
         None
     }
+}
+
+fn normalize_annotation_fields(annotation: &mut SchemaAnnotation, target_schema_type: &str) {
+    if !annotation.fields.is_empty() && !annotation.parameters.is_empty() {
+        debug!(
+            target_schema_type,
+            fields_count = annotation.fields.len(),
+            parameters_count = annotation.parameters.len(),
+            "schema_annotation has both fields and legacy parameters; keeping fields"
+        );
+    }
+
+    if !annotation.fields.is_empty() || annotation.parameters.is_empty() {
+        return;
+    }
+
+    let prefix = if target_schema_type.starts_with("walker_provider_") {
+        "overrides."
+    } else {
+        ""
+    };
+    annotation.fields = annotation
+        .parameters
+        .iter()
+        .map(|(path, field)| (format!("{prefix}{path}"), field.clone()))
+        .collect();
 }
 
 /// Look up the active annotation contribution by its raw
@@ -274,8 +307,13 @@ pub fn load_annotation_by_contribution_id(
     let Some(yaml_content) = row else {
         return Ok(None);
     };
-    let annotation: SchemaAnnotation = serde_yaml::from_str(&yaml_content)
+    let mut annotation: SchemaAnnotation = serde_yaml::from_str(&yaml_content)
         .map_err(|e| anyhow!("schema_annotation body failed to parse: {e}"))?;
+    let target_schema_type = annotation
+        .applies_to
+        .clone()
+        .unwrap_or_else(|| annotation.schema_type.clone());
+    normalize_annotation_fields(&mut annotation, &target_schema_type);
     Ok(Some(annotation))
 }
 
@@ -1100,6 +1138,42 @@ fields:
     }
 
     #[test]
+    fn test_load_walker_provider_annotation_parameters_render_under_overrides() {
+        let conn = mem_conn();
+
+        let yaml = r#"
+schema_type: schema_annotation
+applies_to: walker_provider_openrouter
+version: 1
+label: "Walker Provider OpenRouter"
+parameters:
+  model_list:
+    label: "Model List"
+    help: "Per-tier model slugs"
+    widget: code
+    visibility: basic
+  context_limit:
+    label: "Context Limit"
+    help: "Per-tier context limit"
+    widget: code
+    visibility: advanced
+"#;
+        let _id = seed_annotation(&conn, "walker_provider_openrouter", yaml);
+
+        let loaded = load_schema_annotation_for(&conn, "walker_provider_openrouter")
+            .expect("load should succeed")
+            .expect("annotation should be present");
+
+        assert!(loaded.fields.contains_key("overrides.model_list"));
+        assert!(loaded.fields.contains_key("overrides.context_limit"));
+        assert!(!loaded.fields.contains_key("model_list"));
+        assert_eq!(
+            loaded.fields["overrides.model_list"].visibility,
+            "basic".to_string()
+        );
+    }
+
+    #[test]
     fn test_load_schema_annotation_missing_returns_none() {
         let conn = mem_conn();
         let loaded = load_schema_annotation_for(&conn, "nonexistent_config").unwrap();
@@ -1157,10 +1231,10 @@ fields:
         let registry = empty_registry();
 
         // `init_pyramid_db` auto-seeds the default provider +
-        // 4 tier_routing rows (`fast_extract`, `web`, `synth_heavy`,
-        // `stale_remote`) via `seed_default_provider_registry`. Upsert
-        // our known pricing/context into the `fast_extract` row so the
-        // test assertions don't depend on the seed's exact values.
+        // 8 tier_routing rows via `seed_default_provider_registry`.
+        // Upsert our known pricing/context into the `fast_extract`
+        // row so the test assertions don't depend on the seed's exact
+        // values.
         use crate::pyramid::provider::TierRoutingEntry;
         let tier_a = TierRoutingEntry {
             tier_name: "fast_extract".into(),
@@ -1176,9 +1250,9 @@ fields:
 
         registry.load_from_db(&conn).unwrap();
 
-        // There are 4 seeded tiers from init_pyramid_db.
+        // There are 8 seeded tiers from init_pyramid_db.
         let tier_options = resolve_option_source(&conn, &registry, "tier_registry").unwrap();
-        assert_eq!(tier_options.len(), 4);
+        assert_eq!(tier_options.len(), 8);
         let by_tier: std::collections::HashMap<String, _> = tier_options
             .iter()
             .map(|o| (o.value.clone(), o.clone()))
@@ -1187,6 +1261,10 @@ fields:
         assert!(by_tier.contains_key("synth_heavy"));
         assert!(by_tier.contains_key("web"));
         assert!(by_tier.contains_key("stale_remote"));
+        assert!(by_tier.contains_key("mid"));
+        assert!(by_tier.contains_key("extractor"));
+        assert!(by_tier.contains_key("high"));
+        assert!(by_tier.contains_key("max"));
 
         // Our upserted fast_extract row carries the expected metadata.
         let fast_meta = by_tier["fast_extract"].meta.as_ref().unwrap();
@@ -1210,7 +1288,7 @@ fields:
         assert_eq!(provider_options[0].label, "OpenRouter");
 
         // `model_list:openrouter` returns one entry per unique model
-        // across the 4 seeded tiers.
+        // across the seeded tiers.
         let model_options =
             resolve_option_source(&conn, &registry, "model_list:openrouter").unwrap();
         assert!(!model_options.is_empty());

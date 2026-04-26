@@ -27,6 +27,7 @@ use super::payment_redeemer;
 use super::preview;
 use super::primer;
 use super::publication;
+use super::purpose;
 use super::query;
 use super::reading_modes;
 use super::recovery;
@@ -36,6 +37,7 @@ use super::staleness_bridge;
 use super::types::CharacterizationResult;
 use super::types::*;
 use super::vine;
+use super::vocab_entries;
 use super::vocabulary;
 use super::webbing;
 use super::wire_import;
@@ -487,6 +489,11 @@ struct CreateSlugBody {
     /// chain's metadata + into the approved-question annotation.
     #[serde(default)]
     author: Option<String>,
+    /// Optional initial purpose declaration. When provided, slug
+    /// creation supersedes the stock content-type purpose immediately
+    /// and emits the canonical purpose_shifted observation event.
+    #[serde(default)]
+    purpose_text: Option<String>,
 }
 
 /// Phase 9b-4: `POST /pyramid/:slug/propose_question` body.
@@ -2865,7 +2872,38 @@ pub fn pyramid_routes(
         }))
         .and_then(handle_vocab_registry_list));
 
-    let top34 = top33.or(vocab_registry).unify().boxed();
+    // POST /api/v1/pyramid/vocabulary — local-only publish of a
+    // contribution-backed vocabulary_entry. This is the write sibling
+    // of the public GET /vocabulary/:vocab_kind read surface above.
+    let vocab_registry_publish_api_v1 = route!(warp::path("api")
+        .and(warp::path("v1"))
+        .and(prefix)
+        .and(warp::path("vocabulary"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::content_length_limit(1_048_576))
+        .and(warp::body::json::<vocab_entries::VocabPublishRequest>())
+        .and_then(handle_vocab_registry_publish));
+
+    // Back-compat local alias for the rest of the /pyramid CLI surface.
+    let vocab_registry_publish = route!(prefix
+        .and(warp::path("vocabulary"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::content_length_limit(1_048_576))
+        .and(warp::body::json::<vocab_entries::VocabPublishRequest>())
+        .and_then(handle_vocab_registry_publish));
+
+    let vocab_routes = vocab_registry
+        .or(vocab_registry_publish_api_v1)
+        .unify()
+        .or(vocab_registry_publish)
+        .unify()
+        .boxed();
+
+    let top34 = top33.or(vocab_routes).unify().boxed();
 
     // ── Post-build accretion v5 Phase 9b-4: authorize_question route ──
     //
@@ -3004,6 +3042,52 @@ async fn handle_vocab_registry_list(
             {
                 Ok(json_error(
                     warp::http::StatusCode::BAD_REQUEST,
+                    &e.to_string(),
+                ))
+            } else {
+                Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ))
+            }
+        }
+    }
+}
+
+/// POST /api/v1/pyramid/vocabulary — publish a contribution-backed
+/// vocabulary entry, returning its local contribution_id.
+async fn handle_vocab_registry_publish(
+    state: Arc<PyramidState>,
+    body: vocab_entries::VocabPublishRequest,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.writer.lock().await;
+    match vocab_entries::handle_publish_vocabulary(&conn, body) {
+        Ok(response) => {
+            tracing::info!(
+                target: "pyramid.vocabulary",
+                operator = "local_auth",
+                vocab_kind = %response.vocab_kind,
+                name = %response.name,
+                contribution_id = %response.contribution_id,
+                "published vocabulary_entry contribution"
+            );
+            Ok(json_ok(&response))
+        }
+        Err(e) => {
+            if e.downcast_ref::<vocab_entries::UnknownVocabKind>()
+                .is_some()
+                || e.downcast_ref::<vocab_entries::InvalidVocabPublish>()
+                    .is_some()
+            {
+                Ok(json_error(
+                    warp::http::StatusCode::BAD_REQUEST,
+                    &e.to_string(),
+                ))
+            } else if e.downcast_ref::<vocab_entries::DuplicateVocabEntry>()
+                .is_some()
+            {
+                Ok(json_error(
+                    warp::http::StatusCode::CONFLICT,
                     &e.to_string(),
                 ))
             } else {
@@ -3855,6 +3939,7 @@ async fn handle_get_debate_state(
     let cooldown_until: Option<String> = if is_collapsed {
         let cooldown_secs = super::pyramid_scheduler::load_config(&conn).collapse_cooldown_secs;
         if cooldown_secs > 0 {
+            let cooldown_secs_i64 = i64::try_from(cooldown_secs).unwrap_or(i64::MAX);
             if let Some((_, detected_at)) = &latest_collapse {
                 // Compute detected_at + cooldown_secs vs now; return Some
                 // only if still in cooldown. SQLite strftime handles the
@@ -3862,11 +3947,12 @@ async fn handle_get_debate_state(
                 let end_time: Option<String> = conn
                     .query_row(
                         "SELECT CASE
-                            WHEN strftime('%s','now') < strftime('%s', ?1) + ?2
+                            WHEN CAST(strftime('%s','now') AS INTEGER)
+                               < CAST(strftime('%s', ?1) AS INTEGER) + ?2
                             THEN datetime(?1, '+' || ?2 || ' seconds')
                             ELSE NULL
                          END",
-                        rusqlite::params![detected_at, cooldown_secs],
+                        rusqlite::params![detected_at, cooldown_secs_i64],
                         |r| r.get::<_, Option<String>>(0),
                     )
                     .ok()
@@ -4296,6 +4382,26 @@ async fn handle_create_slug(
                     return Ok(json_error(
                         warp::http::StatusCode::INTERNAL_SERVER_ERROR,
                         &format!("Slug created but failed to save references: {}", e),
+                    ));
+                }
+            }
+            if let Some(purpose_text) = body
+                .purpose_text
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+            {
+                if let Err(e) = purpose::supersede_purpose(
+                    &conn,
+                    &info.slug,
+                    purpose_text,
+                    Some("initial-purpose-declaration"),
+                    None,
+                    None,
+                ) {
+                    return Ok(json_error(
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("Slug created but failed to declare purpose: {e}"),
                     ));
                 }
             }
@@ -6300,14 +6406,11 @@ async fn process_annotation_hook(
     // controls it — an operator publishing a new annotation type that
     // should also spawn deltas just sets the flag; zero code change.
     if vocab_entry.creates_delta {
-        let threads = {
+        let target_thread_id = {
             let conn = reader.lock().await;
-            db::get_threads(&conn, slug)?
+            db::resolve_annotation_delta_thread(&conn, slug, &annotation.node_id)?
         };
-        let target_thread = threads
-            .iter()
-            .find(|t| t.current_canonical_id == annotation.node_id);
-        if let Some(thread) = target_thread {
+        if let Some(thread_id) = target_thread_id {
             let delta_content = format!(
                 "{} (from annotation #{}): {}",
                 type_str.to_uppercase(),
@@ -6318,7 +6421,7 @@ async fn process_annotation_hook(
                 reader,
                 writer,
                 slug,
-                &thread.thread_id,
+                &thread_id,
                 &delta_content,
                 Some(&annotation.node_id),
                 base_config,
@@ -6330,11 +6433,38 @@ async fn process_annotation_hook(
                 "[annotation] {} annotation #{} created delta on thread '{}' (creates_delta=true)",
                 type_str,
                 annotation.id,
-                thread.thread_id
+                thread_id
             );
         } else {
-            tracing::info!(
-                "[annotation] {} annotation #{} on node '{}' — creates_delta=true but no matching thread, skipping delta",
+            let metadata_json = serde_json::json!({
+                "annotation_id": annotation.id,
+                "annotation_type": annotation.annotation_type.as_str(),
+                "target_node_id": annotation.node_id,
+                "reason": "no_ancestor_thread",
+            })
+            .to_string();
+            let conn = writer.lock().await;
+            if let Err(e) = super::observation_events::write_observation_event(
+                &conn,
+                slug,
+                "annotation",
+                "correction_delta_deferred_no_ancestor_thread",
+                None,
+                None,
+                None,
+                None,
+                Some(&annotation.node_id),
+                None,
+                Some(&metadata_json),
+            ) {
+                tracing::warn!(
+                    "[annotation] failed to emit correction_delta_deferred_no_ancestor_thread for annotation #{}: {}",
+                    annotation.id,
+                    e
+                );
+            }
+            tracing::warn!(
+                "[annotation] {} annotation #{} on node '{}' — creates_delta=true but no exact or ancestor thread, deferred delta",
                 type_str,
                 annotation.id,
                 annotation.node_id

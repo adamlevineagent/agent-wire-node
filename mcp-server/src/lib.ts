@@ -29,8 +29,8 @@ export const REQUEST_TIMEOUT_MS = 10_000;
  * text, TOOL_CATALOG render — without a code deploy.
  *
  * The fallback below is genesis parity for the failure-mode case: if the
- * Wire node is down at MCP startup we keep the 11 known-good types so
- * the MCP server doesn't hard-fail. Any drift here silently divergens
+ * Wire node is down at MCP startup we keep the genesis known-good types so
+ * the MCP server doesn't hard-fail. Any drift here silently diverges
  * from the genesis seed; keep the list exactly in lock-step with
  * `src-tauri/src/pyramid/vocab_genesis.rs::GENESIS_ANNOTATION_TYPES`.
  *
@@ -54,6 +54,11 @@ export const FALLBACK_ANNOTATION_TYPES: readonly string[] = [
   "directory",
   "steel_man",
   "red_team",
+  "gap",
+  "hypothesis",
+  "purpose_declaration",
+  "purpose_shift",
+  "debate_collapse",
 ];
 
 /** One `VocabEntry` entry as returned by `GET /vocabulary/:vocab_kind`.
@@ -64,6 +69,8 @@ export interface VocabEntry {
   handler_chain_id: string | null;
   reactive: boolean;
   creates_delta: boolean;
+  include_in_cascade_prompt?: boolean;
+  event_type_on_emit?: string | null;
 }
 
 /** Response shape from `GET /vocabulary/:vocab_kind`. */
@@ -150,8 +157,8 @@ export async function refreshVocabulary(
     console.error(
       `[pyramid] WARNING: vocabulary fetch for '${vocabKind}' failed; ` +
         `cache is serving a ${fallbackNames.length}-entry fallback. ` +
-        `Validation will still run against the fallback — newly-published ` +
-        `operator vocab entries will be rejected until the next successful fetch.`
+        `Unknown annotation types will be sent to the Wire node for ` +
+        `server-side validation until the next successful fetch.`
     );
   }
   return slot;
@@ -222,6 +229,9 @@ export async function validateAnnotationType(
   if (slot.names.has(candidate)) {
     return { ok: true, name: candidate };
   }
+  if (slot.isFallback) {
+    return { ok: true, name: candidate };
+  }
   const validTypes = Array.from(slot.names).sort();
   return {
     ok: false,
@@ -230,7 +240,7 @@ export async function validateAnnotationType(
       `Unknown annotation_type '${candidate}'. ` +
       `Valid types: ${validTypes.join(", ")}. ` +
       `To add a new type, publish a vocabulary_entry contribution ` +
-      `via the Rust API (pyramid::vocab_entries::publish_vocabulary_entry) — ` +
+      `via pyramid-cli vocab publish or POST /api/v1/pyramid/vocabulary — ` +
       `no code deploy required.`,
   };
 }
@@ -847,6 +857,32 @@ export const TOOL_CATALOG: CatalogEntry[] = [
     args: [{ name: "slug", type: "string", required: true, description: "Pyramid slug identifier" }],
     examples: ["pyramid-cli vocab my-pyramid"],
     related: ["vocab-recognize", "vocab-diff", "terms"],
+  },
+  {
+    cli: "vocab publish", mcp: "", category: "vocabulary",
+    description: "Publish a contribution-backed vocabulary_entry into the runtime registry. Prints the local contribution_id. Use only one spelling from each alias group: kind/vocab-kind/type, name/term, description/definition.",
+    args: [],
+    flags: [
+      { name: "kind", type: "string", description: "Vocabulary kind: annotation_type, node_shape, or role_name. Aliases: --vocab-kind, --type; use only one." },
+      { name: "vocab-kind", type: "string", description: "Alias for --kind; use only one of --kind, --vocab-kind, --type." },
+      { name: "type", type: "string", description: "Alias for --kind; use only one of --kind, --vocab-kind, --type." },
+      { name: "name", type: "string", description: "Canonical registry name, max 128 characters. Alias: --term; use only one." },
+      { name: "term", type: "string", description: "Alias for --name; use only one of --name, --term." },
+      { name: "description", type: "string", description: "Definition shown by /vocabulary/:kind, max 8192 bytes. Alias: --definition; use only one." },
+      { name: "definition", type: "string", description: "Alias for --description; use only one of --description, --definition." },
+      { name: "handler-chain-id", type: "string", description: "Starter chain binding for reactive entries or roles" },
+      { name: "reactive", type: "boolean", description: "Whether annotation arrival emits annotation_reacted" },
+      { name: "creates-delta", type: "boolean", description: "Whether annotation save creates a thread delta" },
+      { name: "include-in-cascade-prompt", type: "boolean", description: "Whether annotation content flows into ancestor re-distill prompts" },
+      { name: "event-type-on-emit", type: "string", description: "Observation event type override" },
+      { name: "parent", type: "string", description: "Existing parent entry to validate before publish" },
+      { name: "parent-kind", type: "string", description: "Kind for --parent, defaults to --kind" },
+    ],
+    examples: [
+      "pyramid-cli vocab publish --kind annotation_type --name my_custom --description \"Custom annotation\"",
+      "pyramid-cli vocab publish --type annotation_type --term my_custom --definition \"Custom annotation\" --reactive true --handler-chain-id starter-debate-steward",
+    ],
+    related: ["annotate"],
   },
   {
     cli: "vocab-recognize", mcp: "pyramid_vocab_recognize", category: "vocabulary",

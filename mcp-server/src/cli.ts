@@ -29,22 +29,32 @@ import {
 const rawArgs = process.argv.slice(2);
 
 /** Extract --flag value pairs, returning remaining positional args. */
-function parseArgs(args: string[]): { positional: string[]; flags: Record<string, string> } {
+function parseArgs(args: string[]): {
+  positional: string[];
+  flags: Record<string, string>;
+  flagCounts: Record<string, number>;
+} {
   const positional: string[] = [];
   const flags: Record<string, string> = {};
+  const flagCounts: Record<string, number> = {};
+
+  function setFlag(name: string, value: string): void {
+    flags[name] = value;
+    flagCounts[name] = (flagCounts[name] ?? 0) + 1;
+  }
 
   let i = 0;
   while (i < args.length) {
     const arg = args[i];
     if (arg === "-h") {
-      flags["help"] = "true";
+      setFlag("help", "true");
       i += 1;
     } else if (arg.startsWith("--") && i + 1 < args.length && !args[i + 1].startsWith("--")) {
-      flags[arg.slice(2)] = args[i + 1];
+      setFlag(arg.slice(2), args[i + 1]);
       i += 2;
     } else if (arg.startsWith("--")) {
       // Boolean flag (e.g. --compact, --help)
-      flags[arg.slice(2)] = "true";
+      setFlag(arg.slice(2), "true");
       i += 1;
     } else {
       positional.push(arg);
@@ -52,10 +62,10 @@ function parseArgs(args: string[]): { positional: string[]; flags: Record<string
     }
   }
 
-  return { positional, flags };
+  return { positional, flags, flagCounts };
 }
 
-const { positional, flags } = parseArgs(rawArgs);
+const { positional, flags, flagCounts } = parseArgs(rawArgs);
 const command = positional[0];
 
 // Pretty is the default; --compact turns it off
@@ -69,7 +79,9 @@ const pretty = flags.compact !== "true";
 // If the Wire node is unreachable, `refreshAnnotationTypes` installs the
 // hardcoded genesis fallback and the CLI proceeds in graceful-degraded
 // mode — the user still gets working help text + validation of the genesis
-// set, just not of any newly-published operator types.
+// set. Unknown types are passed through to the Rust API for final
+// server-side validation so a stale client fallback cannot veto a live
+// registry entry.
 //
 // Single source of truth: the Wire node's `GET /vocabulary/annotation_type`
 // endpoint (6c-A). Eliminates the old triple-duplication (Rust enum +
@@ -617,14 +629,45 @@ Arguments:
 Example:
   pyramid-cli manifest my-pyramid '[{"op":"read","path":"apex"}]'`,
 
-  vocab: `vocab — Get full vocabulary
+  vocab: `vocab — Get full vocabulary or publish a vocabulary entry
 
 Usage: pyramid-cli vocab <slug>
+       pyramid-cli vocab publish --kind <kind> --name <name> --description "..."
 
 Arguments:
   <slug>      Pyramid slug
 
-Returns all recognized terms and definitions for the pyramid.`,
+Returns all recognized terms and definitions for the pyramid.
+Use the publish subcommand to add a contribution-backed registry entry.`,
+
+  "vocab publish": `vocab publish — Publish a vocabulary_entry contribution
+
+Usage: pyramid-cli vocab publish --kind <kind> --name <name> --description "..." [options]
+
+Required:
+  --kind <kind>             annotation_type | node_shape | role_name
+  --name <name>             Canonical registry name, max 128 characters
+  --description "..."       Definition shown by /vocabulary/:kind, max 8192 bytes
+
+Aliases:
+  --vocab-kind <kind>       Alias for --kind
+  --type <kind>             Alias for --kind
+  --term <name>             Alias for --name
+  --definition "..."        Alias for --description
+
+Use only one spelling from each alias group:
+  --kind | --vocab-kind | --type
+  --name | --term
+  --description | --definition
+
+Options:
+  --handler-chain-id <id>   Starter chain binding for reactive entries or roles
+  --reactive true|false
+  --creates-delta true|false
+  --include-in-cascade-prompt true|false
+  --event-type-on-emit <event>
+  --parent <name>           Validate an existing parent entry before publish
+  --parent-kind <kind>      Parent kind (defaults to --kind)`,
 
   "vocab-recognize": `vocab-recognize — Check if a term is recognized
 
@@ -798,6 +841,28 @@ function enc(s: string): string {
   return encodeURIComponent(s);
 }
 
+function optionalBooleanFlag(flagName: string): boolean | undefined {
+  const raw = flags[flagName];
+  if (raw === undefined) return undefined;
+  const normalized = raw.toLowerCase();
+  if (["true", "1", "yes", "on"].includes(normalized)) return true;
+  if (["false", "0", "no", "off"].includes(normalized)) return false;
+  process.stderr.write(`Error: --${flagName} must be true or false (got '${raw}')\n`);
+  process.exit(1);
+}
+
+function oneOfFlag(names: string[]): string | undefined {
+  const provided = names.filter((name) => (flagCounts[name] ?? 0) > 0);
+  const repeated = provided.some((name) => (flagCounts[name] ?? 0) > 1);
+  if (provided.length > 1 || repeated) {
+    process.stderr.write(
+      `Error: use only one of ${names.map((name) => `--${name}`).join(", ")}\n`,
+    );
+    process.exit(1);
+  }
+  return provided.length === 0 ? undefined : flags[provided[0]];
+}
+
 // ── Command Dispatch ─────────────────────────────────────────────────────────
 
 async function run(): Promise<void> {
@@ -821,6 +886,8 @@ async function run(): Promise<void> {
     const help =
       command === "annotate"
         ? renderAnnotateHelp()
+        : command === "vocab" && positional[1] === "publish"
+          ? COMMAND_HELP["vocab publish"]
         : COMMAND_HELP[command];
     if (help && help !== "__DYNAMIC_ANNOTATE_HELP__") {
       process.stderr.write(help + "\n");
@@ -1642,6 +1709,45 @@ async function run(): Promise<void> {
     }
 
     case "vocab": {
+      if (positional[1] === "publish") {
+        const vocabKind = oneOfFlag(["kind", "vocab-kind", "type"]);
+        const name = oneOfFlag(["name", "term"]);
+        const description = oneOfFlag(["description", "definition"]);
+        if (!vocabKind) {
+          process.stderr.write("Error: --kind <kind> is required (or --vocab-kind/--type)\n");
+          process.exit(1);
+        }
+        if (!name) {
+          process.stderr.write("Error: --name <name> is required (or --term)\n");
+          process.exit(1);
+        }
+        if (!description) {
+          process.stderr.write("Error: --description \"...\" is required (or --definition)\n");
+          process.exit(1);
+        }
+
+        const body: Record<string, unknown> = {
+          vocab_kind: vocabKind,
+          name,
+          description,
+        };
+        if (flags["handler-chain-id"]) body.handler_chain_id = flags["handler-chain-id"];
+        if (flags.parent) body.parent = flags.parent;
+        if (flags["parent-kind"]) body.parent_kind = flags["parent-kind"];
+        if (flags["event-type-on-emit"]) body.event_type_on_emit = flags["event-type-on-emit"];
+
+        const reactive = optionalBooleanFlag("reactive");
+        if (reactive !== undefined) body.reactive = reactive;
+        const createsDelta = optionalBooleanFlag("creates-delta");
+        if (createsDelta !== undefined) body.creates_delta = createsDelta;
+        const includeInCascade = optionalBooleanFlag("include-in-cascade-prompt");
+        if (includeInCascade !== undefined) {
+          body.include_in_cascade_prompt = includeInCascade;
+        }
+
+        output(await pf("/api/v1/pyramid/vocabulary", { method: "POST", body }));
+        break;
+      }
       const slug = requireArg(1, "slug");
       output(await pf(`/pyramid/${enc(slug)}/vocabulary`), slug);
       break;
@@ -2125,6 +2231,7 @@ Manifest/Runtime Commands:
 
 Vocabulary Commands:
   vocab <slug>                         Get full vocabulary
+  vocab publish --kind K --name N --description "..."  Publish a registry entry
   vocab-recognize <slug> <term>        Check if a term is recognized
   vocab-diff <slug> <since>            Vocabulary changes since a point in time
 

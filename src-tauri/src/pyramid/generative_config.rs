@@ -48,9 +48,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::pyramid::config_contributions::{
-    create_config_contribution_with_metadata, load_active_config_contribution,
-    load_config_version_history, load_contribution_by_id, sync_config_to_operational_with_registry,
-    validate_note, ConfigContribution,
+    create_config_contribution_with_metadata, is_walker_scope_config,
+    load_active_config_contribution, load_config_version_history, load_contribution_by_id,
+    sync_config_to_operational_with_registry, validate_note, ConfigContribution,
 };
 use crate::pyramid::event_bus::BuildEventBus;
 use crate::pyramid::llm::{call_model_unified_with_options_and_ctx, LlmCallOptions, LlmConfig};
@@ -1125,6 +1125,9 @@ fn reload_hooks_for(schema_type: &str) -> Vec<String> {
         "tier_routing" | "step_overrides" => {
             vec!["invalidate_provider_resolver_cache".to_string()]
         }
+        other if is_walker_scope_config(other) => {
+            vec!["invalidate_provider_resolver_cache".to_string()]
+        }
         "custom_prompts" | "skill" | "custom_chains" => {
             vec!["invalidate_prompt_cache".to_string()]
         }
@@ -2012,8 +2015,35 @@ mod tests {
         assert!(names.contains(&"evidence_policy"));
         assert!(names.contains(&"build_strategy"));
         assert!(names.contains(&"dadbear_policy"));
-        assert!(names.contains(&"tier_routing"));
         assert!(names.contains(&"custom_prompts"));
+        assert!(names.contains(&"walker_provider_local"));
+        assert!(names.contains(&"walker_provider_openrouter"));
+        assert!(names.contains(&"walker_provider_fleet"));
+        assert!(names.contains(&"walker_provider_market"));
+        assert!(
+            !names.contains(&"tier_routing"),
+            "tier_routing is retired from the generative config schema picker"
+        );
+    }
+
+    #[test]
+    fn test_load_generation_inputs_rejects_retired_tier_routing() {
+        let conn = mem_conn();
+        walk_bundled_contributions_manifest(&conn).unwrap();
+        let registry = SchemaRegistry::hydrate_from_contributions(&conn).unwrap();
+
+        let err = load_generation_inputs(
+            &conn,
+            &registry,
+            "tier_routing",
+            None,
+            "switch all OpenRouter slots to DeepSeek",
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("no active schema found for schema_type \"tier_routing\""));
     }
 
     #[test]
@@ -2104,6 +2134,61 @@ mod tests {
             .unwrap();
         assert_eq!(contribution.status, "active");
         assert_eq!(contribution.created_by.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn test_accept_walker_provider_draft_activates_contribution_native_config() {
+        let mut conn = mem_conn();
+        walk_bundled_contributions_manifest(&conn).unwrap();
+        let registry = Arc::new(SchemaRegistry::hydrate_from_contributions(&conn).unwrap());
+        let bus = Arc::new(BuildEventBus::new());
+
+        let prior_active =
+            load_active_config_contribution(&conn, "walker_provider_openrouter", None)
+                .unwrap()
+                .unwrap();
+        let draft_yaml = "schema_type: walker_provider_openrouter\n\
+                          version: 1\n\
+                          overrides:\n\
+                            model_list:\n\
+                              mid:\n\
+                                - deepseek/deepseek-v4-flash\n\
+                              high:\n\
+                                - deepseek/deepseek-v4-pro\n";
+
+        let draft_id =
+            create_draft_supersession(&mut conn, &prior_active, draft_yaml, "switch to deepseek")
+                .unwrap();
+
+        let resp = accept_config_draft(
+            &mut conn,
+            &bus,
+            &registry,
+            "walker_provider_openrouter".to_string(),
+            None,
+            None,
+            Some("accepted walker provider draft".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(resp.contribution_id, draft_id);
+        assert_eq!(resp.status, "active");
+        assert_eq!(resp.sync_result.operational_table, "");
+        assert_eq!(
+            resp.sync_result.reload_triggered,
+            vec!["invalidate_provider_resolver_cache".to_string()]
+        );
+
+        let active = load_active_config_contribution(&conn, "walker_provider_openrouter", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.contribution_id, draft_id);
+
+        let prior = load_contribution_by_id(&conn, &prior_active.contribution_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prior.status, "superseded");
+        assert_eq!(prior.superseded_by_id.as_deref(), Some(draft_id.as_str()));
     }
 
     #[test]

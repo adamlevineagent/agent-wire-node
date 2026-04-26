@@ -167,6 +167,13 @@ impl SchemaRegistry {
                 );
                 continue;
             };
+            if is_retired_config_schema(&target_schema_type) {
+                debug!(
+                    schema_type = %target_schema_type,
+                    "SchemaRegistry: skipping retired config schema"
+                );
+                continue;
+            }
 
             // Skip if we already have an entry for this target (first-
             // seen wins per the ORDER BY created_at DESC).
@@ -245,6 +252,10 @@ impl SchemaRegistry {
     pub fn invalidate(&self, conn: &Connection) -> Result<()> {
         self.reload(conn)
     }
+}
+
+pub(crate) fn is_retired_config_schema(schema_type: &str) -> bool {
+    matches!(schema_type, "tier_routing")
 }
 
 // ── Helper queries ───────────────────────────────────────────────────
@@ -689,9 +700,12 @@ mod tests {
     }
 
     #[test]
-    fn test_hydrate_from_bundled_manifest() {
+    fn test_hydrate_from_bundled_manifest_skips_retired_tier_routing() {
         // Run the Phase 9 bundled migration and verify the registry
-        // picks up all 5 schema types from the shipped manifest.
+        // picks up active user-facing schema types from the shipped
+        // manifest. `tier_routing` still exists as a legacy bundled
+        // contribution for migration/local-mode compatibility, but it
+        // is retired from the generative config surface.
         let conn = mem_conn();
         let report = walk_bundled_contributions_manifest(&conn).unwrap();
         assert!(
@@ -707,13 +721,18 @@ mod tests {
         assert!(schema_types.contains(&"evidence_policy"));
         assert!(schema_types.contains(&"build_strategy"));
         assert!(schema_types.contains(&"dadbear_policy"));
-        assert!(schema_types.contains(&"tier_routing"));
         assert!(schema_types.contains(&"custom_prompts"));
+        assert!(!schema_types.contains(&"tier_routing"));
 
-        // Every resolved schema should have a generation skill and a
-        // bundled default (annotation may be optional for some types
-        // where Phase 8 already seeded them).
-        for summary in &summaries {
+        // The bundled generative config schemas should have generation
+        // skills and bundled defaults. Other schema_definition rows
+        // may be non-generative system schemas.
+        for summary in summaries.iter().filter(|summary| {
+            matches!(
+                summary.schema_type.as_str(),
+                "evidence_policy" | "build_strategy" | "dadbear_policy" | "custom_prompts"
+            )
+        }) {
             assert!(
                 summary.has_generation_skill,
                 "{} has no generation skill",

@@ -36,7 +36,8 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{OnceLock, RwLock};
@@ -73,6 +74,9 @@ pub const VOCAB_KINDS: &[&str] = &[
     VOCAB_KIND_NODE_SHAPE,
     VOCAB_KIND_ROLE_NAME,
 ];
+
+const VOCAB_NAME_MAX_CHARS: usize = 128;
+const VOCAB_DESCRIPTION_MAX_BYTES: usize = 8 * 1024;
 
 /// Returns true if `kind` is one of the three whitelisted vocab_kinds.
 /// Used by the HTTP handler to reject unknown kinds loud (feedback_loud_deferrals)
@@ -245,6 +249,130 @@ pub struct VocabListItem {
     /// default written signal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_type_on_emit: Option<String>,
+}
+
+/// Request shape for publishing a new vocabulary entry over HTTP/CLI.
+///
+/// The canonical Rust field names are `vocab_kind`, `name`, and
+/// `description`. The route also accepts operator-friendly aliases
+/// (`type`/`kind`, `term`, `definition`) so the surface can match the
+/// vocabulary-entry language without adding a parallel schema.
+#[derive(Debug, Clone)]
+pub struct VocabPublishRequest {
+    pub vocab_kind: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub handler_chain_id: Option<String>,
+    pub reactive: bool,
+    pub creates_delta: bool,
+    pub include_in_cascade_prompt: bool,
+    pub event_type_on_emit: Option<String>,
+    /// Optional parent entry guard. Vocabulary entries are global today,
+    /// so this validates the reference exists but does not persist a new
+    /// hierarchy field.
+    pub parent: Option<String>,
+    pub parent_kind: Option<String>,
+    /// Accepted for future slug-scoped clients. Current vocabulary rows
+    /// remain global (`slug = NULL`) per the existing contribution model.
+    pub slug: Option<String>,
+    parse_error: Option<String>,
+}
+
+fn parse_nullable_json_field<T>(
+    map: &serde_json::Map<String, serde_json::Value>,
+    field_name: &str,
+) -> std::result::Result<Option<T>, String>
+where
+    T: DeserializeOwned,
+{
+    let Some(value) = map.get(field_name) else {
+        return Ok(None);
+    };
+    serde_json::from_value::<Option<T>>(value.clone())
+        .map_err(|e| format!("{field_name}: {e}"))
+}
+
+fn parse_alias_string(
+    map: &serde_json::Map<String, serde_json::Value>,
+    aliases: &[&str],
+    parse_error: &mut Option<String>,
+) -> std::result::Result<Option<String>, String> {
+    let present: Vec<&str> = aliases
+        .iter()
+        .copied()
+        .filter(|field_name| map.contains_key(*field_name))
+        .collect();
+    if present.len() > 1 && parse_error.is_none() {
+        *parse_error = Some(format!("use only one of {}", aliases.join(", ")));
+    }
+    match present.first() {
+        Some(field_name) => parse_nullable_json_field::<String>(map, field_name),
+        None => Ok(None),
+    }
+}
+
+impl<'de> Deserialize<'de> for VocabPublishRequest {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let map = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("vocabulary publish body must be a JSON object"))?;
+        let mut parse_error = None;
+
+        Ok(Self {
+            vocab_kind: parse_alias_string(map, &["vocab_kind", "kind", "type"], &mut parse_error)
+                .map_err(serde::de::Error::custom)?,
+            name: parse_alias_string(map, &["name", "term"], &mut parse_error)
+                .map_err(serde::de::Error::custom)?,
+            description: parse_alias_string(map, &["description", "definition"], &mut parse_error)
+                .map_err(serde::de::Error::custom)?,
+            handler_chain_id: parse_nullable_json_field(map, "handler_chain_id")
+                .map_err(serde::de::Error::custom)?,
+            reactive: parse_nullable_json_field(map, "reactive")
+                .map_err(serde::de::Error::custom)?
+                .unwrap_or(false),
+            creates_delta: parse_nullable_json_field(map, "creates_delta")
+                .map_err(serde::de::Error::custom)?
+                .unwrap_or(false),
+            include_in_cascade_prompt: parse_nullable_json_field(
+                map,
+                "include_in_cascade_prompt",
+            )
+            .map_err(serde::de::Error::custom)?
+            .unwrap_or_else(default_include_in_cascade_prompt),
+            event_type_on_emit: parse_nullable_json_field(map, "event_type_on_emit")
+                .map_err(serde::de::Error::custom)?,
+            parent: parse_nullable_json_field(map, "parent").map_err(serde::de::Error::custom)?,
+            parent_kind: parse_nullable_json_field(map, "parent_kind")
+                .map_err(serde::de::Error::custom)?,
+            slug: parse_nullable_json_field(map, "slug").map_err(serde::de::Error::custom)?,
+            parse_error,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VocabPublishResponse {
+    pub contribution_id: String,
+    pub vocab_kind: String,
+    pub name: String,
+    pub entry: VocabListItem,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid vocabulary publish request: {message}")]
+pub struct InvalidVocabPublish {
+    pub message: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("vocabulary_entry ({vocab_kind}, {name}) already exists")]
+pub struct DuplicateVocabEntry {
+    pub vocab_kind: String,
+    pub name: String,
 }
 
 // ── Cache ───────────────────────────────────────────────────────────
@@ -518,6 +646,27 @@ fn lookup_id_by_contribution_id(conn: &Connection, contribution_id: &str) -> Res
     Ok(result)
 }
 
+fn required_trimmed(value: Option<String>, field_name: &str) -> Result<String> {
+    let Some(raw) = value else {
+        return Err(anyhow::Error::new(InvalidVocabPublish {
+            message: format!("missing required field {field_name}"),
+        }));
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::Error::new(InvalidVocabPublish {
+            message: format!("{field_name} must be non-empty"),
+        }));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn optional_trimmed(value: Option<String>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Read one vocabulary row (active or superseded) and materialize a
 /// `VocabEntry`. Returns None if the row doesn't exist.
 fn load_entry_by_schema_type(
@@ -616,6 +765,116 @@ pub fn get_vocabulary_entry(
 }
 
 // ── Write API ───────────────────────────────────────────────────────
+
+/// Shared HTTP/CLI publish body. Validates the operator request, writes
+/// through the existing vocabulary contribution writer, and returns the
+/// local contribution id the caller can quote or inspect later.
+pub fn handle_publish_vocabulary(
+    conn: &Connection,
+    request: VocabPublishRequest,
+) -> Result<VocabPublishResponse> {
+    if let Some(message) = request.parse_error.as_deref() {
+        return Err(anyhow::Error::new(InvalidVocabPublish {
+            message: message.to_string(),
+        }));
+    }
+
+    let vocab_kind = required_trimmed(request.vocab_kind, "vocab_kind")?;
+    if !is_known_vocab_kind(&vocab_kind) {
+        return Err(anyhow::Error::new(UnknownVocabKind {
+            kind: vocab_kind,
+            valid: VOCAB_KINDS,
+        }));
+    }
+
+    let name = required_trimmed(request.name, "name")?;
+    let description = required_trimmed(request.description, "description")?;
+    if name.chars().count() > VOCAB_NAME_MAX_CHARS {
+        return Err(anyhow::Error::new(InvalidVocabPublish {
+            message: format!("name must be at most {VOCAB_NAME_MAX_CHARS} characters"),
+        }));
+    }
+    if description.len() > VOCAB_DESCRIPTION_MAX_BYTES {
+        return Err(anyhow::Error::new(InvalidVocabPublish {
+            message: format!(
+                "description must be at most {VOCAB_DESCRIPTION_MAX_BYTES} bytes"
+            ),
+        }));
+    }
+    let handler_chain_id = optional_trimmed(request.handler_chain_id);
+    let event_type_on_emit = optional_trimmed(request.event_type_on_emit);
+    let parent = optional_trimmed(request.parent);
+    let parent_kind = optional_trimmed(request.parent_kind).unwrap_or_else(|| vocab_kind.clone());
+    let _slug_scope = optional_trimmed(request.slug);
+
+    validate_vocab_identifiers(&vocab_kind, &name)?;
+    if get_vocabulary_entry(conn, &vocab_kind, &name)?.is_some() {
+        return Err(anyhow::Error::new(DuplicateVocabEntry {
+            vocab_kind,
+            name,
+        }));
+    }
+
+    if !is_known_vocab_kind(&parent_kind) {
+        return Err(anyhow::Error::new(UnknownVocabKind {
+            kind: parent_kind,
+            valid: VOCAB_KINDS,
+        }));
+    }
+    if let Some(parent_name) = parent.as_deref() {
+        validate_vocab_identifiers(&parent_kind, parent_name)?;
+        if get_vocabulary_entry(conn, &parent_kind, parent_name)?.is_none() {
+            return Err(anyhow::Error::new(InvalidVocabPublish {
+                message: format!(
+                    "parent vocabulary_entry ({parent_kind}, {parent_name}) does not exist"
+                ),
+            }));
+        }
+    }
+
+    let requested = VocabEntry {
+        id: 0,
+        vocab_kind: vocab_kind.clone(),
+        name: name.clone(),
+        description,
+        handler_chain_id,
+        reactive: request.reactive,
+        creates_delta: request.creates_delta,
+        include_in_cascade_prompt: request.include_in_cascade_prompt,
+        event_type_on_emit,
+        created_at: String::new(),
+        superseded_by: None,
+        supersede_reason: None,
+    };
+    let saved = publish_vocabulary_entry(conn, &requested)?;
+    let contribution_id: String = conn
+        .query_row(
+            "SELECT contribution_id FROM pyramid_config_contributions WHERE id = ?1",
+            rusqlite::params![saved.id],
+            |row| row.get(0),
+        )
+        .with_context(|| {
+            format!(
+                "failed to load contribution_id for vocabulary_entry ({}, {})",
+                saved.vocab_kind, saved.name
+            )
+        })?;
+
+    Ok(VocabPublishResponse {
+        contribution_id,
+        vocab_kind: saved.vocab_kind.clone(),
+        name: saved.name.clone(),
+        entry: VocabListItem {
+            name: saved.name,
+            description: saved.description,
+            handler_chain_id: saved.handler_chain_id,
+            reactive: saved.reactive,
+            creates_delta: saved.creates_delta,
+            include_in_cascade_prompt: saved.include_in_cascade_prompt,
+            event_type_on_emit: saved.event_type_on_emit,
+        },
+    })
+}
 
 /// Publish a new vocabulary entry. Fails loud if `(vocab_kind, name)`
 /// already has an active entry — callers must use

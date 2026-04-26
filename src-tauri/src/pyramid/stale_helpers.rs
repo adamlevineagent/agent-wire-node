@@ -26,6 +26,8 @@ use super::stale_helpers_upper::{
 use super::step_context::make_step_ctx_from_llm_config;
 use super::types::{FileStaleResult, PendingMutation, RenameResult, StaleCheckResult};
 
+const LOWER_STALE_TIER: &str = "stale_l0";
+
 // ── Utility Functions ────────────────────────────────────────────────────────
 
 /// Read file content from disk. Returns an error if the file cannot be read.
@@ -297,13 +299,13 @@ Output JSON only. Array of objects, one per file:
     }
 
     // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
-    // slot="stale_l0" (Rust rename of "stale_local"; first-class walker tier
+    // LOWER_STALE_TIER is the Rust rename of "stale_local"; first-class walker tier
     // → minimax/minimax-m2.7). model_override preserves the caller's pre-
     // resolved slug pin within the Decision-driven cascade.
     let stale_resolved = base_config
         .provider_registry
         .as_ref()
-        .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+        .and_then(|reg| reg.resolve_tier(LOWER_STALE_TIER, None, None, None).ok());
     let ctx = match &stale_resolved {
         Some(resolved) => {
             make_step_ctx_from_llm_config(
@@ -313,7 +315,7 @@ Output JSON only. Array of objects, one per file:
                 0,
                 None,
                 system_prompt,
-                "stale_l0",
+                LOWER_STALE_TIER,
                 Some(model),
                 Some(&resolved.provider.id),
             )
@@ -409,6 +411,79 @@ Output JSON only. Array of objects, one per file:
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LOWER_STALE_TIER;
+    use rusqlite::Connection;
+    use std::collections::HashSet;
+
+    #[test]
+    fn lower_helper_source_has_no_local_stale_tier_literal() {
+        let source = include_str!("stale_helpers.rs");
+        let literal = ["stale", "_", "l0"].concat();
+        let occurrences = source.match_indices(&literal).count();
+        let declaration = format!("const LOWER_STALE_TIER: &str = \"{literal}\";");
+
+        assert_eq!(
+            occurrences, 1,
+            "lower helper must keep the local stale tier literal only in LOWER_STALE_TIER"
+        );
+        assert!(
+            source.contains(&declaration),
+            "single local stale tier literal must be the LOWER_STALE_TIER declaration"
+        );
+    }
+
+    #[test]
+    fn lower_stale_tier_resolves_from_seeded_registry() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+        crate::pyramid::wire_migration::walk_bundled_contributions_manifest(&conn).unwrap();
+
+        let mut tiers = HashSet::new();
+        let mut stmt = conn
+            .prepare(
+                "SELECT yaml_content FROM pyramid_config_contributions
+                 WHERE schema_type LIKE 'walker_provider_%'
+                   AND status = 'active'
+                   AND superseded_by_id IS NULL
+                   AND source = 'bundled'",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap();
+        for yaml in rows {
+            collect_model_list_tiers(&yaml.unwrap(), &mut tiers);
+        }
+
+        assert!(
+            tiers.contains(LOWER_STALE_TIER),
+            "bundled walker provider registry must cover {LOWER_STALE_TIER}; covered tiers: {tiers:?}"
+        );
+    }
+
+    fn collect_model_list_tiers(yaml: &str, out: &mut HashSet<String>) {
+        let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+            return;
+        };
+        let Some(overrides) = doc.get("overrides") else {
+            return;
+        };
+        let Some(model_list) = overrides.get("model_list") else {
+            return;
+        };
+        let Some(map) = model_list.as_mapping() else {
+            return;
+        };
+        for (key, _value) in map {
+            if let Some(tier) = key.as_str() {
+                out.insert(tier.to_string());
+            }
+        }
+    }
 }
 
 // ── dispatch_new_file_ingest ─────────────────────────────────────────────────
@@ -808,7 +883,7 @@ Output JSON only:
     let stale_resolved = base_config
         .provider_registry
         .as_ref()
-        .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+        .and_then(|reg| reg.resolve_tier(LOWER_STALE_TIER, None, None, None).ok());
     let ctx = match &stale_resolved {
         Some(resolved) => {
             make_step_ctx_from_llm_config(
@@ -818,7 +893,7 @@ Output JSON only:
                 0,
                 None,
                 system_prompt,
-                "stale_l0",
+                LOWER_STALE_TIER,
                 Some(model),
                 Some(&resolved.provider.id),
             )
@@ -1263,7 +1338,7 @@ Output JSON only:
         let stale_resolved = base_config
             .provider_registry
             .as_ref()
-            .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+            .and_then(|reg| reg.resolve_tier(LOWER_STALE_TIER, None, None, None).ok());
         let ctx = match &stale_resolved {
             Some(resolved) => {
                 make_step_ctx_from_llm_config(
@@ -1273,7 +1348,7 @@ Output JSON only:
                     0,
                     None,
                     system_prompt,
-                    "stale_l0",
+                    LOWER_STALE_TIER,
                     Some(model),
                     Some(&resolved.provider.id),
                 )
@@ -1558,7 +1633,7 @@ Output JSON only:
         let stale_resolved = base_config
             .provider_registry
             .as_ref()
-            .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+            .and_then(|reg| reg.resolve_tier(LOWER_STALE_TIER, None, None, None).ok());
         let ctx = match &stale_resolved {
             Some(resolved) => {
                 make_step_ctx_from_llm_config(
@@ -1568,7 +1643,7 @@ Output JSON only:
                     0,
                     None,
                     system_prompt,
-                    "stale_l0",
+                    LOWER_STALE_TIER,
                     Some(model),
                     Some(&resolved.provider.id),
                 )

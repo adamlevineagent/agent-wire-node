@@ -34,11 +34,17 @@ use super::types::{
 };
 use super::OperationalConfig;
 
-/// Check if an L0 node ID is a targeted re-examination (L0-{uuid} format).
+/// Check if an L0 node ID is a targeted re-examination.
 /// Canonical L0 nodes use patterns like C-L0-001, D-L0-042, or short sequential IDs.
-/// Targeted evidence nodes use L0-{uuid} where the UUID part is 36 chars.
+/// Targeted evidence nodes historically used L0-{uuid}; current gap filling
+/// allocates transaction-scoped L0-TNNN IDs.
 fn is_targeted_l0_id(id: &str) -> bool {
-    // Targeted: "L0-" followed by a UUID (36 chars with hyphens, e.g., L0-491a10ef-4b59-...)
+    if let Some(suffix) = id.strip_prefix("L0-T") {
+        return !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
+    }
+
+    // Targeted legacy: "L0-" followed by a UUID (36 chars with hyphens,
+    // e.g., L0-491a10ef-4b59-...).
     if let Some(suffix) = id.strip_prefix("L0-") {
         suffix.len() >= 36 && suffix.chars().nth(8) == Some('-')
     } else {
@@ -293,33 +299,21 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
             questions_text, nodes_text
         );
 
-        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
-        // Previously: manual StepContext::new + with_model_resolution("fast_extract")
-        // without with_dispatch_decision_if_available → Decision=None → walker
-        // skipped every provider silently. Now: canonical helper with slot=
-        // "evidence_loop" (Rust rename of "fast_extract"; first-class walker
-        // tier per bundled walker_provider_openrouter → xiaomi/mimo-v2.5-pro).
-        let pre_map_resolved = llm_config
-            .provider_registry
-            .as_ref()
-            .and_then(|reg| reg.resolve_tier("evidence_loop", None, None, None).ok());
-        let pre_map_ctx = match &pre_map_resolved {
-            Some(resolved) => {
-                make_step_ctx_from_llm_config(
-                    llm_config,
-                    &format!("evidence_pre_map_{}", batch_idx),
-                    "evidence_pre_map",
-                    0,
-                    Some(batch_idx as i64),
-                    &system_prompt,
-                    "evidence_loop",
-                    Some(&resolved.tier.model_id),
-                    Some(&resolved.provider.id),
-                )
-                .await
-            }
-            None => None,
-        };
+        // walker-v3-completion: canonical dispatch via Decision spine.
+        // Do not pre-gate on legacy pyramid_tier_routing; evidence_loop
+        // lives in walker_provider_* and may resolve through fallback.
+        let pre_map_ctx = make_step_ctx_from_llm_config(
+            llm_config,
+            &format!("evidence_pre_map_{}", batch_idx),
+            "evidence_pre_map",
+            0,
+            Some(batch_idx as i64),
+            &system_prompt,
+            "evidence_loop",
+            None,
+            None,
+        )
+        .await;
         let pre_map_audit_ctx = audit.map(|ctx| AuditContext {
             call_purpose: format!("pre_map_batch_{}", batch_idx),
             step_name: "evidence_pre_map".to_string(),
@@ -1032,28 +1026,19 @@ Respond with ONLY a JSON object:
         // builds also benefit from the Phase 6 content-addressable
         // cache. Audited cache hits write a `cache_hit = 1` audit row
         // so the audit trail stays contiguous.
-        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
-        let answer_resolved = llm_config
-            .provider_registry
-            .as_ref()
-            .and_then(|reg| reg.resolve_tier("evidence_loop", None, None, None).ok());
-        let answer_ctx = match &answer_resolved {
-            Some(resolved) => {
-                make_step_ctx_from_llm_config(
-                    llm_config,
-                    &format!("evidence_answer_batch_{}", batch_idx),
-                    "evidence_answer",
-                    question.layer as i64,
-                    Some(batch_idx as i64),
-                    &system_prompt,
-                    "evidence_loop",
-                    Some(&resolved.tier.model_id),
-                    Some(&resolved.provider.id),
-                )
-                .await
-            }
-            None => None,
-        };
+        // walker-v3-completion: canonical dispatch via Decision spine.
+        let answer_ctx = make_step_ctx_from_llm_config(
+            llm_config,
+            &format!("evidence_answer_batch_{}", batch_idx),
+            "evidence_answer",
+            question.layer as i64,
+            Some(batch_idx as i64),
+            &system_prompt,
+            "evidence_loop",
+            None,
+            None,
+        )
+        .await;
         let answer_audit_ctx = audit.map(|ctx| {
             ctx.for_node(
                 &node_id,
@@ -1535,28 +1520,19 @@ Respond with ONLY a JSON object:
         serde_json::to_string_pretty(items).unwrap_or_default(),
     );
 
-    // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
-    let merge_resolved = llm_config
-        .provider_registry
-        .as_ref()
-        .and_then(|reg| reg.resolve_tier("evidence_loop", None, None, None).ok());
-    let merge_ctx = match &merge_resolved {
-        Some(resolved) => {
-            make_step_ctx_from_llm_config(
-                llm_config,
-                "evidence_answer_merge",
-                "evidence_answer_merge",
-                question.layer as i64,
-                None,
-                &merge_system,
-                "evidence_loop",
-                Some(&resolved.tier.model_id),
-                Some(&resolved.provider.id),
-            )
-            .await
-        }
-        None => None,
-    };
+    // walker-v3-completion: canonical dispatch via Decision spine.
+    let merge_ctx = make_step_ctx_from_llm_config(
+        llm_config,
+        "evidence_answer_merge",
+        "evidence_answer_merge",
+        question.layer as i64,
+        None,
+        &merge_system,
+        "evidence_loop",
+        None,
+        None,
+    )
+    .await;
     let merge_audit_ctx =
         audit.map(|ctx| ctx.for_node(node_id, "answer_merge", question.layer as i64));
     let response = llm::call_model_unified_with_audit_and_ctx(
@@ -1689,7 +1665,9 @@ pub async fn targeted_reexamination(
         return Ok(Vec::new());
     }
 
-    // Counter for sequential node IDs within this batch of targeted extractions
+    // Draft IDs are intentionally not final node IDs. The DB writer allocates
+    // canonical L0-TNNN IDs inside the serialized commit so parallel/file-local
+    // calls cannot collide.
     let mut targeted_node_counter: usize = 0;
 
     // ── Build template variables ────────────────────────────────────────
@@ -1751,28 +1729,19 @@ Respond with ONLY a JSON object:
     for (file_path, content) in source_candidates {
         let user_prompt = format!("SOURCE FILE: {}\n\n{}", file_path, content);
 
-        // walker-v3-completion Wave 3: canonical dispatch via Decision spine.
-        let target_resolved = llm_config
-            .provider_registry
-            .as_ref()
-            .and_then(|reg| reg.resolve_tier("evidence_loop", None, None, None).ok());
-        let target_ctx = match &target_resolved {
-            Some(resolved) => {
-                make_step_ctx_from_llm_config(
-                    llm_config,
-                    "targeted_reexamination",
-                    "evidence_answer",
-                    0,
-                    None,
-                    &system_prompt,
-                    "evidence_loop",
-                    Some(&resolved.tier.model_id),
-                    Some(&resolved.provider.id),
-                )
-                .await
-            }
-            None => None,
-        };
+        // walker-v3-completion: canonical dispatch via Decision spine.
+        let target_ctx = make_step_ctx_from_llm_config(
+            llm_config,
+            "targeted_reexamination",
+            "evidence_answer",
+            0,
+            None,
+            &system_prompt,
+            "evidence_loop",
+            None,
+            None,
+        )
+        .await;
         let target_audit_ctx = audit.map(|ctx| AuditContext {
             call_purpose: "gap_answer".to_string(),
             step_name: "targeted_reexamination".to_string(),
@@ -1793,8 +1762,9 @@ Respond with ONLY a JSON object:
         {
             Ok(r) => r,
             Err(e) => {
-                warn!(file_path = %file_path, error = %e, "targeted extraction LLM call failed, skipping file");
-                continue;
+                return Err(anyhow!(
+                    "targeted extraction LLM call failed for {file_path}: {e}"
+                ));
             }
         };
 
@@ -1809,24 +1779,18 @@ Respond with ONLY a JSON object:
         let json_value = match llm::extract_json(&response.content) {
             Ok(v) => v,
             Err(e) => {
-                warn!(
-                    file_path = %file_path,
-                    error = %e,
-                    "targeted extraction JSON parse failed, skipping file"
-                );
-                continue;
+                return Err(anyhow!(
+                    "targeted extraction JSON parse failed for {file_path}: {e}"
+                ));
             }
         };
 
         let raw: RawTargetedExtraction = match serde_json::from_value(json_value) {
             Ok(r) => r,
             Err(e) => {
-                warn!(
-                    file_path = %file_path,
-                    error = %e,
-                    "targeted extraction deserialization failed, skipping file"
-                );
-                continue;
+                return Err(anyhow!(
+                    "targeted extraction deserialization failed for {file_path}: {e}"
+                ));
             }
         };
 
@@ -1846,7 +1810,7 @@ Respond with ONLY a JSON object:
                 .collect();
 
             let node = PyramidNode {
-                id: format!("L0-T{:03}", targeted_node_counter),
+                id: format!("__draft-targeted-{:03}", targeted_node_counter),
                 slug: target_slug.to_string(),
                 depth: 0,
                 chunk_index: None,
@@ -1916,7 +1880,8 @@ pub fn resolve_files_for_gap(
 
     // ── 2. For each base slug, get canonical L0 nodes ──
     // Canonical L0 nodes are from the original extraction (C-L0-*, D-L0-*, or short index IDs).
-    // Targeted evidence L0 nodes (from gap re-examination) use L0-{uuid} format (long UUID).
+    // Targeted evidence L0 nodes (from gap re-examination) use transaction-scoped
+    // L0-TNNN IDs (or legacy L0-{uuid} IDs on older pyramids).
     // We include ALL L0 that are NOT targeted evidence — self_prompt is NOT a reliable
     // discriminator because canonical nodes also have self_prompt populated (orientation text).
     for base_slug in base_slugs {
@@ -1980,11 +1945,9 @@ pub fn resolve_files_for_gap(
                     results.push((slug.clone(), path, content));
                 }
                 Err(e) => {
-                    warn!(
-                        file_path = %path,
-                        error = %e,
-                        "failed to read source file for gap resolution, skipping"
-                    );
+                    return Err(anyhow!(
+                        "failed to read source file for gap resolution {path}: {e}"
+                    ));
                 }
             }
         }
@@ -2057,6 +2020,140 @@ mod tests {
         let raw: PreMapResponse = serde_json::from_str(json).unwrap();
         assert_eq!(raw.mappings.len(), 2);
         assert_eq!(raw.mappings["q1"].len(), 2);
+    }
+
+    #[test]
+    fn targeted_l0_id_detector_handles_transaction_scoped_ids() {
+        assert!(is_targeted_l0_id("L0-T000"));
+        assert!(is_targeted_l0_id("L0-T042"));
+        assert!(is_targeted_l0_id("L0-491a10ef-4b59-401e-9b88-8fa1bc9d0f88"));
+        assert!(!is_targeted_l0_id("L0-000"));
+        assert!(!is_targeted_l0_id("C-L0-000"));
+        assert!(!is_targeted_l0_id("L0-TOMB000"));
+    }
+
+    #[test]
+    fn resolve_files_for_gap_surfaces_source_read_failures() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+        crate::pyramid::db::create_slug(
+            &conn,
+            "gap-io",
+            &crate::pyramid::types::ContentType::Code,
+            "/tmp/gap-io",
+        )
+        .unwrap();
+
+        let canonical = PyramidNode {
+            id: "L0-000".to_string(),
+            slug: "gap-io".to_string(),
+            depth: 0,
+            chunk_index: None,
+            headline: "missing targeted evidence".to_string(),
+            distilled: "This canonical node mentions the missing targeted evidence.".to_string(),
+            topics: Vec::new(),
+            corrections: Vec::new(),
+            decisions: Vec::new(),
+            terms: Vec::new(),
+            dead_ends: Vec::new(),
+            self_prompt: "orientation text".to_string(),
+            children: Vec::new(),
+            parent_id: None,
+            superseded_by: None,
+            build_id: Some("build-gap-io".to_string()),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            ..Default::default()
+        };
+        crate::pyramid::db::save_node(&conn, &canonical, None).unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing_path = tmp.path().join("missing-source.rs");
+        crate::pyramid::db::append_node_id_to_file_hash(
+            &conn,
+            "gap-io",
+            &missing_path.to_string_lossy(),
+            "L0-000",
+        )
+        .unwrap();
+
+        let err = resolve_files_for_gap(
+            &conn,
+            &["gap-io".to_string()],
+            "missing targeted evidence",
+            &[],
+            1,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to read source file"),
+            "expected source-read failure, got {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_pre_map_ctx_uses_walker_fallback_without_legacy_tier() {
+        let temp_db = tempfile::NamedTempFile::new().expect("temp db");
+        let conn = rusqlite::Connection::open(temp_db.path()).expect("open temp db");
+        conn.execute_batch(
+            "CREATE TABLE pyramid_config_contributions (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 contribution_id TEXT NOT NULL UNIQUE,
+                 slug TEXT,
+                 schema_type TEXT NOT NULL,
+                 yaml_content TEXT NOT NULL,
+                 wire_native_metadata_json TEXT NOT NULL DEFAULT '{}',
+                 wire_publication_state_json TEXT NOT NULL DEFAULT '{}',
+                 supersedes_id TEXT,
+                 superseded_by_id TEXT,
+                 triggering_note TEXT,
+                 status TEXT NOT NULL DEFAULT 'active',
+                 source TEXT NOT NULL DEFAULT 'local',
+                 wire_contribution_id TEXT,
+                 created_by TEXT,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 accepted_at TEXT
+             );",
+        )
+        .expect("create contributions table");
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions
+                 (contribution_id, schema_type, yaml_content, status, accepted_at)
+             VALUES (?1, ?2, ?3, 'active', datetime('now'))",
+            rusqlite::params![
+                "fallback-only-openrouter",
+                "walker_provider_openrouter",
+                "schema_type: walker_provider_openrouter\nversion: 1\noverrides:\n  model_list:\n    fallback:\n      - \"fallback/evidence-model\"\n"
+            ],
+        )
+        .expect("insert fallback provider");
+
+        let config = crate::pyramid::llm::LlmConfig::default().clone_with_cache_access(
+            "evidence-pre-map-fallback",
+            "build-evidence-pre-map-fallback",
+            temp_db.path().to_string_lossy().to_string(),
+            None,
+        );
+
+        let ctx = make_step_ctx_from_llm_config(
+            &config,
+            "evidence_pre_map_0",
+            "evidence_pre_map",
+            0,
+            Some(0),
+            "system prompt",
+            "evidence_loop",
+            None,
+            None,
+        )
+        .await
+        .expect("evidence pre-map ctx");
+
+        assert_eq!(ctx.model_tier, "evidence_loop");
+        assert_eq!(ctx.resolved_model_id.as_deref(), Some("fallback/evidence-model"));
+        assert!(
+            ctx.dispatch_decision.is_some(),
+            "evidence pre-map should not require legacy pyramid_tier_routing"
+        );
     }
 
     #[test]
@@ -2217,11 +2314,10 @@ pub fn run_triage_gate(
     // ONCE per triage pass, at slug granularity, not per-question.
     //
     // The per-node `sum_demand_weight(slug, node_id, ...)` can't be
-    // used here because `LayerQuestion.question_id` is a `q-{sha256}`
-    // hash (`make_question_id` in question_decomposition.rs), while
-    // demand signals land on `pyramid_demand_signals.node_id` under
-    // the pyramid node's `L{layer}-{seq}` id that `answer_single_question`
-    // assigns at answering time. The two ID spaces never meet, so
+    // used here because `LayerQuestion.question_id` is a question handle
+    // like `Q-L1-000`, while demand signals land on
+    // `pyramid_demand_signals.node_id` under the answered pyramid node's
+    // `L{layer}-{seq}` id. The two ID spaces never meet, so
     // the previous per-question lookup always returned 0.0 and
     // `has_demand_signals` was effectively dead.
     //
@@ -2229,7 +2325,7 @@ pub fn run_triage_gate(
     // by demand") while staying correct in the only ID space the
     // demand signals actually live in. The spatial precision the
     // spec implies will come back in Phase 13+ when a persistent
-    // q-hash → node-id map is added.
+    // question-handle → answer-node map is added.
     let slug_has_demand_signals = policy.demand_signals.iter().any(|rule| {
         let window = normalize_window(&rule.window);
         let sum = db::sum_slug_demand_weight(&conn, slug, &rule.r#type, &window).unwrap_or(0.0);

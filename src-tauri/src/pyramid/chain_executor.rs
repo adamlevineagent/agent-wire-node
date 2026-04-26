@@ -6678,6 +6678,120 @@ async fn execute_evidence_loop(
     Ok(result)
 }
 
+#[derive(Debug, Clone)]
+struct GapFileDraftEvidence {
+    base_slug: String,
+    file_path: String,
+    nodes: Vec<PyramidNode>,
+}
+
+/// Finalize one gap in a single writer transaction.
+///
+/// Targeted re-examination produces draft L0 nodes with temporary IDs. The
+/// final L0-TNNN IDs are allocated here while the writer holds a serialized
+/// transaction, so parallel LLM/file work cannot collide on local counters.
+/// The gap is marked resolved in the same commit as the evidence rows and
+/// file-hash links; any failure rolls the whole resolution back.
+fn commit_gap_resolution(
+    conn: &Connection,
+    gap_slug: &str,
+    gap_question_id: &str,
+    gap_description: &str,
+    build_id: &str,
+    draft_evidence: &[GapFileDraftEvidence],
+) -> Result<usize> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| -> Result<usize> {
+        let mut saved_count = 0usize;
+        for batch in draft_evidence {
+            for draft in &batch.nodes {
+                let mut node = draft.clone();
+                node.slug = batch.base_slug.clone();
+                node.depth = 0;
+                node.id = db::next_sequential_node_id(conn, &batch.base_slug, 0, "T");
+                if node.created_at.is_empty() {
+                    node.created_at = chrono::Utc::now().to_rfc3339();
+                }
+                if node.build_id.is_none() {
+                    node.build_id = Some(build_id.to_string());
+                }
+
+                db::save_node(conn, &node, None).with_context(|| {
+                    format!(
+                        "failed to save targeted gap node {} for slug {}",
+                        node.id, batch.base_slug
+                    )
+                })?;
+                db::append_node_id_to_file_hash(
+                    conn,
+                    &batch.base_slug,
+                    &batch.file_path,
+                    &node.id,
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to link targeted gap node {} to {}",
+                        node.id, batch.file_path
+                    )
+                })?;
+                if !node.self_prompt.is_empty() {
+                    let evidence_detail = serde_json::json!({
+                        "reason": "targeted_reexamination",
+                        "build_id": build_id,
+                        "node_id": node.id,
+                        "gap_question_id": gap_question_id,
+                        "gap_description": gap_description,
+                        "file_path": batch.file_path,
+                    })
+                    .to_string();
+                    super::observation_events::write_observation_event(
+                        conn,
+                        &batch.base_slug,
+                        "evidence",
+                        "evidence_growth",
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(&node.id),
+                        Some(0),
+                        Some(&evidence_detail),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to emit evidence_growth for targeted gap node {}",
+                            node.id
+                        )
+                    })?;
+                }
+                saved_count += 1;
+            }
+        }
+
+        db::mark_gap_resolved_with_reason_strict_observation(
+            conn,
+            gap_slug,
+            gap_question_id,
+            gap_description,
+            "targeted_reexamination",
+            "process_gaps_chain_step",
+        )?;
+
+        Ok(saved_count)
+    })();
+
+    match result {
+        Ok(saved_count) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(saved_count)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
+}
+
 /// Process unresolved gaps by targeted re-examination of source files.
 /// Wraps the gap processing logic from build_runner.rs: load gaps, resolve files,
 /// call targeted_reexamination per file, persist new L0 nodes and mutations.
@@ -6816,6 +6930,12 @@ async fn execute_process_gaps(
 
     let mut gaps_processed = 0;
     let mut gaps_with_new_evidence = 0;
+    let mut gaps_failed = 0;
+    let gap_llm_concurrency = state.operational.tier1.answer_concurrency.max(1);
+    info!(
+        slug,
+        gap_llm_concurrency, "gap targeted re-examination concurrency resolved"
+    );
 
     for gap in &unresolved_gaps {
         if cancel.is_cancelled() {
@@ -6870,41 +6990,46 @@ async fn execute_process_gaps(
         let resolved_files = match resolved_files {
             Ok(files) => files,
             Err(e) => {
+                gaps_failed += 1;
                 warn!(
                     slug,
                     question_id = %gap.question_id,
                     error = %e,
-                    "gap file resolution failed, skipping"
+                    "gap file resolution failed; leaving gap unresolved"
                 );
                 continue;
             }
         };
 
         if resolved_files.is_empty() {
-            // Mark gap resolved with no new evidence
+            // Explicit no-candidate outcome: close the gap, but still use
+            // the atomic commit helper so the gap_resolved chronicle event
+            // is part of the same serialized write.
             let conn = state.writer.clone();
             let slug_owned = slug.to_string();
             let gap_qid = gap.question_id.clone();
             let gap_desc = gap.description.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            let bid = build_id.clone();
+            let gap_save_result = tokio::task::spawn_blocking(move || {
                 let c = conn.blocking_lock();
-                db::mark_gap_resolved(&c, &slug_owned, &gap_qid, &gap_desc)
+                commit_gap_resolution(&c, &slug_owned, &gap_qid, &gap_desc, &bid, &[])
             })
             .await;
-            gaps_processed += 1;
+            match gap_save_result {
+                Ok(Ok(_)) => {
+                    gaps_processed += 1;
+                }
+                Ok(Err(e)) => {
+                    gaps_failed += 1;
+                    warn!(slug, question_id = %gap.question_id, error = %e, "no-candidate gap close failed; leaving unresolved");
+                }
+                Err(e) => {
+                    gaps_failed += 1;
+                    warn!(slug, question_id = %gap.question_id, error = %e, "no-candidate gap close panicked; leaving unresolved");
+                }
+            }
             continue;
         }
-
-        // d. Group by slug and call targeted_reexamination per file
-        let mut files_by_slug: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        for (file_slug, path, content) in resolved_files {
-            files_by_slug
-                .entry(file_slug)
-                .or_default()
-                .push((path, content));
-        }
-
-        let mut gap_produced_nodes = false;
 
         // Build audit context for gap processing
         let gap_audit_ctx = super::llm::AuditContext {
@@ -6917,137 +7042,131 @@ async fn execute_process_gaps(
             depth: None,
         };
 
-        for (base_slug, file_candidates) in &files_by_slug {
-            for (file_path, content) in file_candidates {
-                let single_file = vec![(file_path.clone(), content.clone())];
-                let new_nodes = match super::evidence_answering::targeted_reexamination(
+        // d. Run the expensive targeted LLM calls in bounded parallel. DB
+        // writes remain serialized below.
+        let semaphore = Arc::new(Semaphore::new(gap_llm_concurrency));
+        let llm_config = Arc::new(llm_config.clone());
+        let operational = state.operational.clone();
+        let chains_dir = Arc::new(state.chains_dir.clone());
+        let question_text = Arc::new(question_text);
+        let gap_description = Arc::new(gap.description.clone());
+        let build_id_for_tasks = Arc::new(build_id.clone());
+        let audience_for_tasks = Arc::new(audience.clone());
+        let audit_for_tasks = Arc::new(gap_audit_ctx);
+        let mut handles = Vec::new();
+
+        for (base_slug, file_path, content) in resolved_files {
+            let semaphore = semaphore.clone();
+            let llm_config = llm_config.clone();
+            let operational = operational.clone();
+            let chains_dir = chains_dir.clone();
+            let question_text = question_text.clone();
+            let gap_description = gap_description.clone();
+            let build_id_for_tasks = build_id_for_tasks.clone();
+            let audience_for_tasks = audience_for_tasks.clone();
+            let audit_for_tasks = audit_for_tasks.clone();
+            let handle = tokio::spawn(async move {
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("gap semaphore should remain open");
+                let single_file = vec![(file_path.clone(), content)];
+                let nodes = super::evidence_answering::targeted_reexamination(
                     &question_text,
-                    &gap.description,
+                    &gap_description,
                     &single_file,
                     &llm_config,
-                    base_slug,
-                    &build_id,
-                    audience.as_deref(),
-                    Some(&state.chains_dir),
-                    &state.operational,
-                    Some(&gap_audit_ctx),
+                    &base_slug,
+                    &build_id_for_tasks,
+                    audience_for_tasks.as_deref(),
+                    Some(chains_dir.as_ref()),
+                    &operational,
+                    Some(audit_for_tasks.as_ref()),
                 )
-                .await
-                {
-                    Ok(nodes) => nodes,
-                    Err(e) => {
-                        warn!(
-                            slug,
-                            base_slug = %base_slug,
-                            question_id = %gap.question_id,
-                            file_path = %file_path,
-                            error = %e,
-                            "targeted re-examination failed"
-                        );
-                        continue;
-                    }
-                };
-
-                if new_nodes.is_empty() {
-                    continue;
-                }
-                gap_produced_nodes = true;
-
-                // e. Save new L0 nodes + register in file hashes + queue mutation
-                let conn = state.writer.clone();
-                let base_slug_owned = base_slug.clone();
-                let bid = build_id.clone();
-                let nodes_owned = new_nodes;
-                let file_path_owned = file_path.clone();
-                let now = chrono::Utc::now().to_rfc3339();
-                let gap_save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    let c = conn.blocking_lock();
-                    c.execute_batch("BEGIN")?;
-                    let result = (|| -> anyhow::Result<()> {
-                        for node in nodes_owned.iter() {
-                            db::save_node(&c, node, None)?;
-                            db::append_node_id_to_file_hash(
-                                &c,
-                                &base_slug_owned,
-                                &file_path_owned,
-                                &node.id,
-                            )?;
-                            if !node.self_prompt.is_empty() {
-                                let evidence_detail = serde_json::json!({
-                                    "reason": "targeted_reexamination",
-                                    "build_id": bid,
-                                    "node_id": node.id,
-                                })
-                                .to_string();
-                                // Canonical write: observation event (old WAL INSERT removed)
-                                let _ = super::observation_events::write_observation_event(
-                                    &c,
-                                    &base_slug_owned,
-                                    "evidence",
-                                    "evidence_growth",
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    Some(&node.self_prompt),
-                                    Some(0),
-                                    Some(&evidence_detail),
-                                );
-                            }
-                        }
-                        Ok(())
-                    })();
-                    match result {
-                        Ok(()) => {
-                            c.execute_batch("COMMIT")?;
-                            Ok(())
-                        }
-                        Err(e) => {
-                            let _ = c.execute_batch("ROLLBACK");
-                            Err(e)
-                        }
-                    }
+                .await?;
+                Ok::<GapFileDraftEvidence, anyhow::Error>(GapFileDraftEvidence {
+                    base_slug,
+                    file_path,
+                    nodes,
                 })
-                .await;
-                match gap_save_result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        warn!(slug, question_id = %gap.question_id, error = %e, "gap node save failed");
-                    }
-                    Err(e) => {
-                        warn!(slug, question_id = %gap.question_id, error = %e, "gap node save panicked");
-                    }
+            });
+            handles.push(handle);
+        }
+
+        let mut draft_evidence = Vec::new();
+        let mut gap_had_failure = false;
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(batch)) => draft_evidence.push(batch),
+                Ok(Err(e)) => {
+                    gap_had_failure = true;
+                    warn!(
+                        slug,
+                        question_id = %gap.question_id,
+                        error = %e,
+                        "targeted re-examination failed; leaving gap unresolved"
+                    );
+                }
+                Err(e) => {
+                    gap_had_failure = true;
+                    warn!(
+                        slug,
+                        question_id = %gap.question_id,
+                        error = %e,
+                        "targeted re-examination task panicked; leaving gap unresolved"
+                    );
                 }
             }
         }
 
-        // f. Mark gap resolved
+        if gap_had_failure || cancel.is_cancelled() {
+            gaps_failed += 1;
+            continue;
+        }
+
+        // e. Serialize all DB writes for this gap in one commit. Empty
+        // draft batches mean the LLM explicitly found no new evidence, which
+        // is a valid closure outcome when there were no failures.
         let conn = state.writer.clone();
         let slug_owned = slug.to_string();
         let gap_qid = gap.question_id.clone();
         let gap_desc = gap.description.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        let bid = build_id.clone();
+        let gap_save_result = tokio::task::spawn_blocking(move || {
             let c = conn.blocking_lock();
-            db::mark_gap_resolved(&c, &slug_owned, &gap_qid, &gap_desc)
+            commit_gap_resolution(&c, &slug_owned, &gap_qid, &gap_desc, &bid, &draft_evidence)
         })
         .await;
 
+        let saved_nodes = match gap_save_result {
+            Ok(Ok(saved_nodes)) => saved_nodes,
+            Ok(Err(e)) => {
+                gaps_failed += 1;
+                warn!(slug, question_id = %gap.question_id, error = %e, "gap evidence commit failed; leaving unresolved");
+                continue;
+            }
+            Err(e) => {
+                gaps_failed += 1;
+                warn!(slug, question_id = %gap.question_id, error = %e, "gap evidence commit panicked; leaving unresolved");
+                continue;
+            }
+        };
+
         gaps_processed += 1;
-        if gap_produced_nodes {
+        if saved_nodes > 0 {
             gaps_with_new_evidence += 1;
         }
 
         info!(
             slug,
             question_id = %gap.question_id,
-            gap_produced_nodes,
+            saved_nodes,
             "gap processed"
         );
     }
 
     info!(
-        slug,
-        gaps_processed, gaps_with_new_evidence, "gap processing pass complete"
+        slug, gaps_processed, gaps_with_new_evidence, gaps_failed, "gap processing pass complete"
     );
 
     // Phase 13: emit GapProcessing { action: "fill" } at the end so
@@ -7070,6 +7189,7 @@ async fn execute_process_gaps(
     Ok(serde_json::json!({
         "gaps_processed": gaps_processed,
         "gaps_with_new_evidence": gaps_with_new_evidence,
+        "gaps_failed": gaps_failed,
     }))
 }
 
@@ -14797,10 +14917,19 @@ async fn execute_chain_for_target_inner(
         // Stash the output under step.name so downstream `when:` guards can
         // reference `$step_name.decision` etc. Also thread it forward as
         // `current` for the next step's default input.
+        //
+        // Starter-chain threading is preserve-by-default for object
+        // envelopes: mechanical loaders often add fields that later LLM
+        // steps do not echo (e.g. max_annotation_id), but terminal
+        // mechanical writers still need them. Merge the prior step input
+        // with the step output, with output keys winning, so structured LLM
+        // responses can add/override fields without dropping the runtime
+        // context that the chain already earned.
+        let threaded_output = merge_starter_threaded_output(&resolved_input, output);
         if !step.name.is_empty() {
-            step_outputs.insert(step.name.clone(), output.clone());
+            step_outputs.insert(step.name.clone(), threaded_output.clone());
         }
-        current = output;
+        current = threaded_output;
     }
 
     info!(
@@ -14808,6 +14937,19 @@ async fn execute_chain_for_target_inner(
         chain.id, slug, target_id
     );
     Ok(current)
+}
+
+fn merge_starter_threaded_output(input: &Value, output: Value) -> Value {
+    match (input, output) {
+        (Value::Object(input_map), Value::Object(output_map)) => {
+            let mut merged = input_map.clone();
+            for (k, v) in output_map {
+                merged.insert(k, v);
+            }
+            Value::Object(merged)
+        }
+        (_, other) => other,
+    }
 }
 
 /// Outcome of a starter-chain `when:` evaluation.
@@ -17968,5 +18110,178 @@ mod tests {
             !is_sqlite_busy(&other),
             "unrelated errors must not classify as busy"
         );
+    }
+
+    fn test_gap_node(slug: &str, id: &str, headline: &str) -> PyramidNode {
+        PyramidNode {
+            id: id.to_string(),
+            slug: slug.to_string(),
+            depth: 0,
+            chunk_index: None,
+            headline: headline.to_string(),
+            distilled: format!("distilled {headline}"),
+            topics: Vec::new(),
+            corrections: Vec::new(),
+            decisions: Vec::new(),
+            terms: Vec::new(),
+            dead_ends: Vec::new(),
+            self_prompt: "What evidence fills the gap?".to_string(),
+            children: Vec::new(),
+            parent_id: None,
+            superseded_by: None,
+            build_id: Some("build-gap-test".to_string()),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            ..Default::default()
+        }
+    }
+
+    fn seed_gap(conn: &Connection, slug: &str) {
+        crate::pyramid::db::create_slug(
+            conn,
+            slug,
+            &crate::pyramid::types::ContentType::Code,
+            "/tmp/gap-test",
+        )
+        .unwrap();
+        let gap = crate::pyramid::types::GapReport {
+            question_id: "Q-gap".to_string(),
+            description: "missing targeted evidence".to_string(),
+            layer: 1,
+            resolved: false,
+            resolution_confidence: 0.0,
+        };
+        crate::pyramid::db::save_gap(conn, slug, &gap, Some("build-gap-test")).unwrap();
+    }
+
+    #[test]
+    fn commit_gap_resolution_allocates_unique_l0_t_ids_across_draft_batches() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+        seed_gap(&conn, "gap-id-test");
+
+        let existing = test_gap_node("gap-id-test", "L0-T000", "existing targeted");
+        crate::pyramid::db::save_node(&conn, &existing, None).unwrap();
+
+        let draft_a = test_gap_node("gap-id-test", "__draft-targeted-000", "draft a");
+        let draft_b = test_gap_node("gap-id-test", "__draft-targeted-000", "draft b");
+        let batches = vec![
+            GapFileDraftEvidence {
+                base_slug: "gap-id-test".to_string(),
+                file_path: "/tmp/gap-a.rs".to_string(),
+                nodes: vec![draft_a],
+            },
+            GapFileDraftEvidence {
+                base_slug: "gap-id-test".to_string(),
+                file_path: "/tmp/gap-b.rs".to_string(),
+                nodes: vec![draft_b],
+            },
+        ];
+
+        let saved = commit_gap_resolution(
+            &conn,
+            "gap-id-test",
+            "Q-gap",
+            "missing targeted evidence",
+            "build-gap-test",
+            &batches,
+        )
+        .unwrap();
+        assert_eq!(saved, 2);
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM pyramid_nodes
+                 WHERE slug = 'gap-id-test' AND depth = 0 AND id LIKE 'L0-T%'
+                 ORDER BY id",
+            )
+            .unwrap();
+        let ids: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(ids, vec!["L0-T000", "L0-T001", "L0-T002"]);
+
+        let draft_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_nodes
+                 WHERE slug = 'gap-id-test' AND id LIKE '__draft-targeted-%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(draft_count, 0, "draft IDs must never be persisted");
+
+        let resolved: i64 = conn
+            .query_row(
+                "SELECT resolved FROM pyramid_gaps
+                 WHERE slug = 'gap-id-test' AND question_id = 'Q-gap'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved, 1);
+
+        let linked_ids_json: String = conn
+            .query_row(
+                "SELECT node_ids FROM pyramid_file_hashes
+                 WHERE slug = 'gap-id-test' AND file_path = '/tmp/gap-a.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            linked_ids_json.contains("L0-T001"),
+            "file hash should link the committed final ID, got {linked_ids_json}"
+        );
+    }
+
+    #[test]
+    fn commit_gap_resolution_rolls_back_and_leaves_gap_unresolved_on_commit_failure() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+        seed_gap(&conn, "gap-rollback-test");
+        conn.execute_batch("DROP TABLE dadbear_observation_events")
+            .unwrap();
+
+        let draft = test_gap_node("gap-rollback-test", "__draft-targeted-000", "draft");
+        let batches = vec![GapFileDraftEvidence {
+            base_slug: "gap-rollback-test".to_string(),
+            file_path: "/tmp/gap-fail.rs".to_string(),
+            nodes: vec![draft],
+        }];
+
+        let err = commit_gap_resolution(
+            &conn,
+            "gap-rollback-test",
+            "Q-gap",
+            "missing targeted evidence",
+            "build-gap-test",
+            &batches,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("observation"),
+            "expected observation failure, got {err:#}"
+        );
+
+        let node_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_nodes WHERE slug = 'gap-rollback-test'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(node_count, 0, "node insert must roll back on commit failure");
+
+        let resolved: i64 = conn
+            .query_row(
+                "SELECT resolved FROM pyramid_gaps
+                 WHERE slug = 'gap-rollback-test' AND question_id = 'Q-gap'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved, 0, "failed gap must remain unresolved");
     }
 }

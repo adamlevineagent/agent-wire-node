@@ -11,6 +11,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::Connection;
+use serde::Deserialize;
 use tracing::{error, info, warn};
 
 use super::config_helper::estimate_cost;
@@ -28,11 +29,39 @@ use super::types::{
     NodeStaleResult, PendingMutation, StaleCheckResult, Topic,
 };
 
+const UPPER_STALE_TIER: &str = "stale_remote";
+
 #[derive(Debug, Clone)]
 struct ThreadTarget {
     thread_id: String,
     canonical_node_id: String,
     depth: i32,
+}
+
+#[derive(Debug, Clone)]
+struct NodeStalePromptNode {
+    source_index: usize,
+    requested_target_id: String,
+    canonical_node_id: String,
+    thread_id: String,
+    distilled: String,
+    delta_content: String,
+    depth: i32,
+}
+
+#[derive(Debug, Clone)]
+struct SkippedNodeStaleCandidate {
+    source_index: usize,
+    node_id: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SkipAdjudicationResult {
+    node_id: String,
+    decision: Option<String>,
+    stale: Option<bool>,
+    reason: String,
 }
 
 fn lookup_thread_target_by_canonical(
@@ -432,25 +461,7 @@ pub async fn dispatch_node_stale_check(
     let node_ids: Vec<String> = batch.iter().map(|m| m.target_ref.clone()).collect();
     let slugs: Vec<String> = batch.iter().map(|m| m.slug.clone()).collect();
 
-    #[derive(Debug, Clone)]
-    struct PromptNode {
-        source_index: usize,
-        requested_target_id: String,
-        canonical_node_id: String,
-        thread_id: String,
-        distilled: String,
-        delta_content: String,
-        depth: i32,
-    }
-
-    #[derive(Debug, Clone)]
-    struct SkippedNode {
-        source_index: usize,
-        node_id: String,
-        reason: String,
-    }
-
-    let (node_data, skipped_nodes) = tokio::task::spawn_blocking(move || -> Result<(Vec<PromptNode>, Vec<SkippedNode>)> {
+    let (node_data, skipped_nodes) = tokio::task::spawn_blocking(move || -> Result<(Vec<NodeStalePromptNode>, Vec<SkippedNodeStaleCandidate>)> {
         let conn = super::db::open_pyramid_connection(Path::new(&db)).context("Failed to open DB for node stale-check")?;
         let mut results = Vec::new();
         let mut skipped = Vec::new();
@@ -469,7 +480,7 @@ pub async fn dispatch_node_stale_check(
                 .unwrap_or_else(|_| (String::new(), 0));
 
             let Some(thread_target) = thread_target else {
-                skipped.push(SkippedNode {
+                skipped.push(SkippedNodeStaleCandidate {
                     source_index: i,
                     node_id: node_id.clone(),
                     reason: "Skipped stale check: target does not map to a live thread in this pyramid.".to_string(),
@@ -478,7 +489,7 @@ pub async fn dispatch_node_stale_check(
             };
 
             if !covered_threads.insert(thread_target.thread_id.clone()) {
-                skipped.push(SkippedNode {
+                skipped.push(SkippedNodeStaleCandidate {
                     source_index: i,
                     node_id: node_id.clone(),
                     reason: format!(
@@ -519,7 +530,7 @@ pub async fn dispatch_node_stale_check(
                 }
             }
 
-            results.push(PromptNode {
+            results.push(NodeStalePromptNode {
                 source_index: i,
                 requested_target_id: node_id.clone(),
                 canonical_node_id: thread_target.canonical_node_id.clone(),
@@ -535,29 +546,16 @@ pub async fn dispatch_node_stale_check(
     .await??;
 
     if node_data.is_empty() {
-        let results: Vec<StaleCheckResult> = skipped_nodes
-            .into_iter()
-            .map(|skipped| {
-                let m = &batch[skipped.source_index];
-                StaleCheckResult {
-                    id: 0,
-                    slug: m.slug.clone(),
-                    batch_id: m.batch_id.clone().unwrap_or_default(),
-                    layer: m.layer,
-                    target_id: skipped.node_id,
-                    stale: 5, // skipped — node didn't map to a live thread
-                    reason: skipped.reason,
-                    checker_index: skipped.source_index as i32,
-                    checker_batch_size: batch_size,
-                    checked_at: now.clone(),
-                    cost_tokens: None,
-                    cost_usd: None,
-                    cascade_depth: m.cascade_depth,
-                }
-            })
-            .collect();
-
-        return Ok(results);
+        return adjudicate_skipped_node_stale_checks(
+            skipped_nodes,
+            &batch,
+            batch_size,
+            db_path,
+            base_config,
+            model,
+            &now,
+        )
+        .await;
     }
 
     // Build Template 2 prompt
@@ -603,7 +601,7 @@ pub async fn dispatch_node_stale_check(
     let stale_resolved = base_config
         .provider_registry
         .as_ref()
-        .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+        .and_then(|reg| reg.resolve_tier(UPPER_STALE_TIER, None, None, None).ok());
     let ctx = match &stale_resolved {
         Some(resolved) => {
             make_step_ctx_from_llm_config(
@@ -613,7 +611,7 @@ pub async fn dispatch_node_stale_check(
                 batch[0].layer as i64,
                 None,
                 system_prompt,
-                "stale_l0",
+                UPPER_STALE_TIER,
                 Some(model),
                 Some(&resolved.provider.id),
             )
@@ -702,24 +700,19 @@ pub async fn dispatch_node_stale_check(
         })
         .collect();
 
-    results.extend(skipped_nodes.into_iter().map(|skipped| {
-        let m = &batch[skipped.source_index];
-        StaleCheckResult {
-            id: 0,
-            slug: m.slug.clone(),
-            batch_id: m.batch_id.clone().unwrap_or_default(),
-            layer: m.layer,
-            target_id: skipped.node_id,
-            stale: 5, // skipped — node didn't map to a live thread
-            reason: skipped.reason,
-            checker_index: skipped.source_index as i32,
-            checker_batch_size: batch_size,
-            checked_at: now.clone(),
-            cost_tokens: None,
-            cost_usd: None,
-            cascade_depth: m.cascade_depth,
-        }
-    }));
+    if !skipped_nodes.is_empty() {
+        let mut adjudicated_skips = adjudicate_skipped_node_stale_checks(
+            skipped_nodes,
+            &batch,
+            batch_size,
+            db_path,
+            base_config,
+            model,
+            &now,
+        )
+        .await?;
+        results.append(&mut adjudicated_skips);
+    }
 
     info!(
         count = results.len(),
@@ -728,6 +721,210 @@ pub async fn dispatch_node_stale_check(
     );
 
     Ok(results)
+}
+
+async fn adjudicate_skipped_node_stale_checks(
+    skipped_nodes: Vec<SkippedNodeStaleCandidate>,
+    batch: &[PendingMutation],
+    batch_size: i32,
+    db_path: &str,
+    base_config: &LlmConfig,
+    model: &str,
+    checked_at: &str,
+) -> Result<Vec<StaleCheckResult>> {
+    if skipped_nodes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let system_prompt = "\
+You are adjudicating node stale-check candidates that the resolver could not \
+check normally. Do not skip mechanically. Decide whether each candidate should \
+be skipped, marked stale, or treated as passing. Output JSON only.";
+    let mut user_prompt = String::from(
+        "Each candidate below appeared skippable before the LLM step. Confirm or deny that skip.\n\n\
+Use decision \"skip\" only when no meaningful stale check can be performed for the candidate. \
+Use decision \"stale\" when the candidate should still force repair or operator attention. \
+Use decision \"pass\" when the candidate is valid and current.\n\n---\n\n",
+    );
+    for (i, skipped) in skipped_nodes.iter().enumerate() {
+        let m = &batch[skipped.source_index];
+        user_prompt.push_str(&format!(
+            "CANDIDATE {} of {}:\nSlug: {}\nLayer: L{}\nNode ID: {}\nResolver reason: {}\n\n---\n\n",
+            i + 1,
+            skipped_nodes.len(),
+            m.slug,
+            m.layer,
+            skipped.node_id,
+            skipped.reason
+        ));
+    }
+    user_prompt.push_str(
+        "Output JSON only. Array of objects, one per candidate:\n\
+[{\"node_id\":\"...\",\"decision\":\"skip\",\"stale\":false,\"reason\":\"one sentence, verbatim for the Stale Check Log\"}]",
+    );
+
+    let stale_resolved = base_config
+        .provider_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve_tier(UPPER_STALE_TIER, None, None, None).ok());
+    let ctx = match &stale_resolved {
+        Some(resolved) => {
+            make_step_ctx_from_llm_config(
+                base_config,
+                "node_stale_check_skip_adjudication",
+                "stale_check",
+                batch[0].layer as i64,
+                None,
+                system_prompt,
+                UPPER_STALE_TIER,
+                Some(model),
+                Some(&resolved.provider.id),
+            )
+            .await
+        }
+        None => None,
+    };
+
+    let llm_resp = call_model_unified_with_options_and_ctx(
+        base_config,
+        ctx.as_ref(),
+        system_prompt,
+        &user_prompt,
+        0.1,
+        1024,
+        None,
+        LlmCallOptions {
+            model_override: Some(model.to_string()),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let usage = llm_resp.usage;
+    let generation_id = llm_resp.generation_id;
+    let cost = estimate_cost(&usage);
+
+    {
+        let db_cost = db_path.to_string();
+        let slug_cost = batch[0].slug.clone();
+        let model_cost = model.to_string();
+        let pt = usage.prompt_tokens;
+        let ct = usage.completion_tokens;
+        let lyr = batch[0].layer;
+        let gen_id = generation_id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db_cost)) {
+                let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                let _ = conn.execute(
+                    "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, ?10, NULL)",
+                    rusqlite::params![slug_cost, "stale_check", model_cost, pt, ct, cost, lyr, "node_stale_skip_adjudication", now, gen_id],
+                );
+            }
+        }).await;
+    }
+
+    let (parsed_results, parse_error) = parse_skip_adjudication_results(&llm_resp.content);
+
+    Ok(skipped_nodes
+        .into_iter()
+        .enumerate()
+        .map(|(skip_index, skipped)| {
+            let m = &batch[skipped.source_index];
+            let matched = parsed_results
+                .iter()
+                .find(|r| r.node_id == skipped.node_id)
+                .or_else(|| parsed_results.get(skip_index))
+                .or_else(|| parsed_results.first());
+            let (stale, reason) = matched
+                .map(|result| {
+                    (
+                        stale_code_from_skip_adjudication(result),
+                        result.reason.clone(),
+                    )
+                })
+                .or_else(|| {
+                    parse_error
+                        .as_ref()
+                        .map(|err| (1, format!("LLM adjudication failed: {err}")))
+                })
+                .unwrap_or_else(|| {
+                    (
+                        5,
+                        format!(
+                            "LLM skip adjudication omitted target {}; original resolver reason: {}",
+                            skipped.node_id, skipped.reason
+                        ),
+                    )
+                });
+
+            StaleCheckResult {
+                id: 0,
+                slug: m.slug.clone(),
+                batch_id: m.batch_id.clone().unwrap_or_default(),
+                layer: m.layer,
+                target_id: skipped.node_id,
+                stale,
+                reason,
+                checker_index: skipped.source_index as i32,
+                checker_batch_size: batch_size,
+                checked_at: checked_at.to_string(),
+                cost_tokens: Some(usage.prompt_tokens + usage.completion_tokens),
+                cost_usd: Some(cost),
+                cascade_depth: m.cascade_depth,
+            }
+        })
+        .collect())
+}
+
+fn parse_skip_adjudication_results(
+    content: &str,
+) -> (Vec<SkipAdjudicationResult>, Option<String>) {
+    let json = match extract_json(content) {
+        Ok(json) => json,
+        Err(e) => return (Vec::new(), Some(e.to_string())),
+    };
+    let values = if let Some(array) = json.as_array() {
+        array.clone()
+    } else {
+        vec![json]
+    };
+
+    let mut results = Vec::new();
+    let mut errors = Vec::new();
+    for (i, value) in values.into_iter().enumerate() {
+        match serde_json::from_value::<SkipAdjudicationResult>(value) {
+            Ok(result) => results.push(result),
+            Err(e) => errors.push(format!("entry {i}: {e}")),
+        }
+    }
+
+    let error = if errors.is_empty() {
+        None
+    } else {
+        Some(errors.join("; "))
+    };
+    (results, error)
+}
+
+fn stale_code_from_skip_adjudication(result: &SkipAdjudicationResult) -> i32 {
+    let decision = result
+        .decision
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase().replace('-', "_"));
+
+    match decision.as_deref() {
+        Some("skip") | Some("skipped") => 5,
+        Some("stale") | Some("yes") => 1,
+        Some("pass") | Some("passed") | Some("current") | Some("not_stale")
+        | Some("not stale") | Some("no") => 0,
+        _ => {
+            if result.stale.unwrap_or(false) {
+                1
+            } else {
+                5
+            }
+        }
+    }
 }
 
 // ── 2. Connection Check (Template 3) ─────────────────────────────────────────
@@ -946,7 +1143,7 @@ pub async fn dispatch_connection_check(
         let stale_resolved = base_config
             .provider_registry
             .as_ref()
-            .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+            .and_then(|reg| reg.resolve_tier(UPPER_STALE_TIER, None, None, None).ok());
         let ctx = match &stale_resolved {
             Some(resolved) => {
                 make_step_ctx_from_llm_config(
@@ -956,7 +1153,7 @@ pub async fn dispatch_connection_check(
                     old_depth as i64,
                     None,
                     system_prompt,
-                    "stale_l0",
+                    UPPER_STALE_TIER,
                     Some(model),
                     Some(&resolved.provider.id),
                 )
@@ -1303,7 +1500,7 @@ pub async fn dispatch_edge_stale_check(
         let stale_resolved = base_config
             .provider_registry
             .as_ref()
-            .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+            .and_then(|reg| reg.resolve_tier(UPPER_STALE_TIER, None, None, None).ok());
         let ctx = match &stale_resolved {
             Some(resolved) => {
                 make_step_ctx_from_llm_config(
@@ -1313,7 +1510,7 @@ pub async fn dispatch_edge_stale_check(
                     mutation.layer as i64,
                     None,
                     system_prompt,
-                    "stale_l0",
+                    UPPER_STALE_TIER,
                     Some(model),
                     Some(&resolved.provider.id),
                 )
@@ -1388,7 +1585,7 @@ pub async fn dispatch_edge_stale_check(
             let re_eval_resolved = base_config
                 .provider_registry
                 .as_ref()
-                .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+                .and_then(|reg| reg.resolve_tier(UPPER_STALE_TIER, None, None, None).ok());
             let re_eval_ctx = match &re_eval_resolved {
                 Some(resolved) => {
                     make_step_ctx_from_llm_config(
@@ -1398,7 +1595,7 @@ pub async fn dispatch_edge_stale_check(
                         mutation.layer as i64,
                         None,
                         system_prompt,
-                        "stale_l0",
+                        UPPER_STALE_TIER,
                         Some(model),
                         Some(&resolved.provider.id),
                     )
@@ -1842,20 +2039,95 @@ pub async fn generate_change_manifest(
     }
 
     let json = extract_json(&response)?;
+    let manifest =
+        parse_generated_change_manifest(json, &input.node_id, input.expected_build_version)?;
+
+    Ok(manifest)
+}
+
+fn parse_generated_change_manifest(
+    json: serde_json::Value,
+    node_id: &str,
+    expected_build_version: i64,
+) -> Result<ChangeManifest> {
     let mut manifest: ChangeManifest = serde_json::from_value(json.clone()).with_context(|| {
         format!(
             "change-manifest JSON missing or malformed for node {}: {}",
-            input.node_id,
+            node_id,
             serde_json::to_string(&json).unwrap_or_default()
         )
     })?;
 
-    // Normalize the echoed node_id to the one we asked about — the LLM
-    // sometimes drops the slug prefix or otherwise mangles it. Downstream
-    // validation operates on the node_id we know is live.
-    manifest.node_id = input.node_id.clone();
-
+    // Treat echoed identifiers and versions as runtime-owned bookkeeping. The
+    // model may mangle the target id or invent a non-contiguous build_version;
+    // validation should operate on the live node we actually requested.
+    manifest.node_id = node_id.to_string();
+    manifest.build_version = expected_build_version;
     Ok(manifest)
+}
+
+fn rewrite_identity_change_evidence_links(
+    conn: &Connection,
+    slug: &str,
+    old_node_id: &str,
+    new_node_id: &str,
+) -> Result<usize> {
+    let source_rows: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT build_id, target_node_id
+             FROM pyramid_evidence
+             WHERE slug = ?1 AND source_node_id = ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![slug, old_node_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    let mut rewritten = 0usize;
+    for (build_id, target_node_id) in source_rows {
+        conn.execute(
+            "DELETE FROM pyramid_evidence
+             WHERE slug = ?1 AND build_id = ?2 AND source_node_id = ?3 AND target_node_id = ?4",
+            rusqlite::params![slug, build_id, new_node_id, target_node_id],
+        )?;
+        rewritten += conn.execute(
+            "UPDATE pyramid_evidence
+             SET source_node_id = ?1
+             WHERE slug = ?2 AND build_id = ?3 AND source_node_id = ?4 AND target_node_id = ?5",
+            rusqlite::params![new_node_id, slug, build_id, old_node_id, target_node_id],
+        )?;
+    }
+
+    let target_rows: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT build_id, source_node_id
+             FROM pyramid_evidence
+             WHERE slug = ?1 AND target_node_id = ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![slug, old_node_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    for (build_id, source_node_id) in target_rows {
+        conn.execute(
+            "DELETE FROM pyramid_evidence
+             WHERE slug = ?1 AND build_id = ?2 AND source_node_id = ?3 AND target_node_id = ?4",
+            rusqlite::params![slug, build_id, source_node_id, new_node_id],
+        )?;
+        rewritten += conn.execute(
+            "UPDATE pyramid_evidence
+             SET target_node_id = ?1
+             WHERE slug = ?2 AND build_id = ?3 AND source_node_id = ?4 AND target_node_id = ?5",
+            rusqlite::params![new_node_id, slug, build_id, source_node_id, old_node_id],
+        )?;
+    }
+
+    Ok(rewritten)
 }
 
 /// Synchronous structural validation of a change manifest against the live
@@ -3941,7 +4213,7 @@ async fn execute_supersession_identity_change(
     let supersession_resolved = base_config
         .provider_registry
         .as_ref()
-        .and_then(|reg| reg.resolve_tier("stale_l0", None, None, None).ok());
+        .and_then(|reg| reg.resolve_tier(UPPER_STALE_TIER, None, None, None).ok());
     let supersession_ctx = match &supersession_resolved {
         Some(resolved) => {
             make_step_ctx_from_llm_config(
@@ -3951,7 +4223,7 @@ async fn execute_supersession_identity_change(
                 node_data.depth,
                 None,
                 system_prompt,
-                "stale_l0",
+                UPPER_STALE_TIER,
                 Some(model),
                 Some(&resolved.provider.id),
             )
@@ -4047,6 +4319,7 @@ async fn execute_supersession_identity_change(
         let conn = super::db::open_pyramid_connection(Path::new(&db))
             .context("Failed to open DB for identity-change supersession write")?;
         let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
 
         conn.execute(
             "INSERT INTO pyramid_nodes
@@ -4202,6 +4475,18 @@ async fn execute_supersession_identity_change(
             );
         }
 
+        let evidence_rewrites =
+            rewrite_identity_change_evidence_links(&conn, &s, &nid, &new_nid)?;
+        if evidence_rewrites > 0 {
+            info!(
+                slug = %s,
+                old_node_id = %nid,
+                new_node_id = %new_nid,
+                evidence_rewrites,
+                "rewrote pyramid_evidence links for identity-change supersession"
+            );
+        }
+
         if let Some(ref tid) = nd.self_thread_id {
             let mut stmt = conn.prepare(
                 "SELECT id FROM pyramid_web_edges
@@ -4230,6 +4515,7 @@ async fn execute_supersession_identity_change(
             }
         }
 
+        conn.execute_batch("COMMIT;")?;
         Ok(())
     })
     .await??;
@@ -4265,8 +4551,10 @@ mod tests {
     use super::{
         apply_supersession_manifest, build_changed_children_from_deltas,
         handle_manifest_generation_failure, load_supersession_node_context,
-        lookup_source_file_path_for_node, resolve_live_canonical_node_id,
-        rewrite_file_hash_node_reference, validate_change_manifest,
+        lookup_source_file_path_for_node, parse_skip_adjudication_results,
+        resolve_live_canonical_node_id, stale_code_from_skip_adjudication, SkipAdjudicationResult,
+        rewrite_file_hash_node_reference, rewrite_identity_change_evidence_links,
+        validate_change_manifest, UPPER_STALE_TIER,
     };
     use crate::pyramid::db::{
         get_change_manifests_for_node, get_latest_manifest_for_node, open_pyramid_db,
@@ -4277,6 +4565,7 @@ mod tests {
         ChangeManifest, ChildSwap, ContentUpdates, ManifestValidationError, TopicOp,
     };
     use rusqlite::{params, Connection};
+    use std::sync::Arc;
     use tempfile::NamedTempFile;
 
     fn setup_test_db() -> (NamedTempFile, Connection) {
@@ -4289,6 +4578,39 @@ mod tests {
         )
         .expect("insert slug");
         (file, conn)
+    }
+
+    #[test]
+    fn upper_helper_source_has_no_local_stale_tier_literal() {
+        let forbidden = ["stale", "_", "l0"].concat();
+
+        assert!(
+            !include_str!("stale_helpers_upper.rs").contains(&forbidden),
+            "upper-helper stale checks must resolve through UPPER_STALE_TIER"
+        );
+    }
+
+    #[test]
+    fn upper_stale_tier_resolves_from_seeded_registry() {
+        use crate::pyramid::credentials::CredentialStore;
+        use crate::pyramid::provider::ProviderRegistry;
+
+        let conn = Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(CredentialStore::load(tmp.path()).unwrap());
+        store.set("OPENROUTER_KEY", "sk-or-v1-test").unwrap();
+        std::mem::forget(tmp);
+
+        let registry = ProviderRegistry::new(store);
+        registry.load_from_db(&conn).unwrap();
+
+        let resolved = registry
+            .resolve_tier(UPPER_STALE_TIER, None, None, None)
+            .expect("UPPER_STALE_TIER must resolve from seeded registry");
+        assert_eq!(resolved.tier.tier_name, UPPER_STALE_TIER);
+        assert_eq!(resolved.provider.id, "openrouter");
     }
 
     fn insert_node(conn: &Connection, node_id: &str, parent_id: Option<&str>) {
@@ -4370,6 +4692,101 @@ mod tests {
         }
     }
 
+    async fn mocked_llm_config(base_url: String) -> LlmConfig {
+        use crate::pyramid::credentials::CredentialStore;
+        use crate::pyramid::dispatch_policy::{
+            BuildCoordinationConfig, DispatchPolicy, EscalationConfig, MatchConfig,
+            ProviderPoolConfig, RouteEntry, RoutingRule,
+        };
+        use crate::pyramid::provider::{Provider, ProviderRegistry, ProviderType};
+
+        let cred_tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(CredentialStore::load(cred_tmp.path()).unwrap());
+        store.set("STALE_HELPERS_TEST_KEY", "sk-or-test-stale").unwrap();
+        std::mem::forget(cred_tmp);
+
+        let reg_conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&reg_conn).unwrap();
+        let registry = Arc::new(ProviderRegistry::new(store));
+        registry
+            .save_provider(
+                &reg_conn,
+                Provider {
+                    id: "openrouter".into(),
+                    display_name: "OpenRouter (stale helper mock)".into(),
+                    provider_type: ProviderType::Openrouter,
+                    base_url,
+                    api_key_ref: Some("STALE_HELPERS_TEST_KEY".into()),
+                    auto_detect_context: false,
+                    supports_broadcast: false,
+                    broadcast_config_json: None,
+                    config_json: "{}".into(),
+                    enabled: true,
+                },
+            )
+            .unwrap();
+
+        let mut pool_configs = std::collections::BTreeMap::new();
+        pool_configs.insert(
+            "openrouter".into(),
+            ProviderPoolConfig {
+                concurrency: 1,
+                rate_limit: None,
+            },
+        );
+        let policy = Arc::new(DispatchPolicy {
+            rules: vec![RoutingRule {
+                name: "stale_helper_mock".into(),
+                match_config: MatchConfig {
+                    work_type: None,
+                    min_depth: None,
+                    step_pattern: None,
+                },
+                route_to: vec![RouteEntry {
+                    provider_id: "openrouter".into(),
+                    model_id: Some("openai/gpt-4o-mini".into()),
+                    tier_name: None,
+                    is_local: false,
+                    max_budget_credits: None,
+                }],
+                bypass_pool: false,
+                sequential: false,
+            }],
+            escalation: EscalationConfig::default(),
+            build_coordination: BuildCoordinationConfig::default(),
+            pool_configs,
+            max_batch_cost_usd: None,
+            max_daily_cost_usd: None,
+        });
+        let pools = Arc::new(crate::pyramid::provider_pools::ProviderPools::new(policy.as_ref()));
+
+        LlmConfig {
+            api_key: "sk-or-test-stale".into(),
+            provider_registry: Some(registry),
+            dispatch_policy: Some(policy),
+            provider_pools: Some(pools),
+            max_retries: 1,
+            retry_base_sleep_secs: 0,
+            ..Default::default()
+        }
+    }
+
+    fn openrouter_body(content: &str) -> String {
+        let escaped = serde_json::to_string(content).unwrap();
+        format!(
+            r#"{{
+                "id":"resp-stale-helper",
+                "model":"openai/gpt-4o-mini",
+                "choices":[{{
+                    "index":0,
+                    "message":{{"role":"assistant","content":{escaped}}},
+                    "finish_reason":"stop"
+                }}],
+                "usage":{{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}
+            }}"#
+        )
+    }
+
     #[test]
     fn resolves_live_canonical_for_thread_and_historical_ids() {
         let (_file, conn) = setup_test_db();
@@ -4413,6 +4830,136 @@ mod tests {
             resolve_live_canonical_node_id(&conn, "test-slug", "missing").unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn skip_adjudication_decision_maps_to_skipped_stale_code() {
+        let result = SkipAdjudicationResult {
+            node_id: "L1-skip".to_string(),
+            decision: Some("skip".to_string()),
+            stale: Some(false),
+            reason: "LLM confirmed duplicate live thread.".to_string(),
+        };
+
+        assert_eq!(stale_code_from_skip_adjudication(&result), 5);
+    }
+
+    #[test]
+    fn skip_adjudication_parser_preserves_valid_entries_when_one_entry_fails() {
+        let content = r#"[
+            {"node_id":"L1-ok","decision":"skip","stale":false,"reason":"Valid entry."},
+            {"node_id":"L1-bad","decision":"skip","stale":false}
+        ]"#;
+
+        let (parsed, error) = parse_skip_adjudication_results(content);
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].node_id, "L1-ok");
+        assert!(
+            error.as_deref().unwrap_or_default().contains("entry 1"),
+            "expected per-entry parse error, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_node_stale_check_llm_adjudicates_missing_thread_skip() {
+        let mut server = mockito::Server::new_async().await;
+        let mock_content = r#"[{
+            "node_id":"missing-node",
+            "decision":"skip",
+            "stale":false,
+            "reason":"LLM confirmed the target has no live thread."
+        }]"#;
+        let _m = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openrouter_body(mock_content))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let (file, _conn) = setup_test_db();
+        let config = mocked_llm_config(server.url()).await;
+        let batch = vec![crate::pyramid::types::PendingMutation {
+            id: 1,
+            slug: "test-slug".to_string(),
+            layer: 1,
+            mutation_type: "node_stale_check".to_string(),
+            target_ref: "missing-node".to_string(),
+            detail: None,
+            cascade_depth: 0,
+            detected_at: "2026-04-25 00:00:00".to_string(),
+            processed: false,
+            batch_id: Some("batch-skip".to_string()),
+        }];
+
+        let results = super::dispatch_node_stale_check(
+            batch,
+            &file.path().to_string_lossy(),
+            &config,
+            "openai/gpt-4o-mini",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].target_id, "missing-node");
+        assert_eq!(results[0].stale, 5);
+        assert_eq!(
+            results[0].reason,
+            "LLM confirmed the target has no live thread."
+        );
+        assert_eq!(results[0].cost_tokens, Some(7));
+    }
+
+    #[tokio::test]
+    async fn dispatch_node_stale_check_defaults_stale_when_skip_adjudication_is_unparseable() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(openrouter_body("not json at all"))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let (file, _conn) = setup_test_db();
+        let config = mocked_llm_config(server.url()).await;
+        let batch = vec![crate::pyramid::types::PendingMutation {
+            id: 1,
+            slug: "test-slug".to_string(),
+            layer: 1,
+            mutation_type: "node_stale_check".to_string(),
+            target_ref: "missing-node".to_string(),
+            detail: None,
+            cascade_depth: 0,
+            detected_at: "2026-04-25 00:00:00".to_string(),
+            processed: false,
+            batch_id: Some("batch-skip".to_string()),
+        }];
+
+        let results = super::dispatch_node_stale_check(
+            batch,
+            &file.path().to_string_lossy(),
+            &config,
+            "openai/gpt-4o-mini",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].target_id, "missing-node");
+        assert_eq!(results[0].stale, 1);
+        assert!(
+            results[0]
+                .reason
+                .starts_with("LLM adjudication failed:"),
+            "expected explicit LLM parse-failure reason, got {}",
+            results[0].reason
+        );
+        assert_eq!(results[0].cost_tokens, Some(7));
     }
 
     #[test]
@@ -5482,6 +6029,107 @@ mod tests {
         assert_eq!(ctx.primitive, "manifest_generation");
         assert_eq!(ctx.depth, 2);
         assert_eq!(ctx.chunk_index, None);
+    }
+
+    #[test]
+    fn test_parse_generated_manifest_tolerates_llm_nulls_and_normalizes_bookkeeping() {
+        let raw = serde_json::json!({
+            "node_id": "wrong-node-id",
+            "identity_changed": false,
+            "content_updates": {
+                "distilled": null,
+                "headline": null,
+                "topics": null,
+                "terms": null,
+                "decisions": null,
+                "dead_ends": null
+            },
+            "children_swapped": null,
+            "reason": "No substantive update needed.",
+            "build_version": 99
+        });
+
+        let manifest =
+            super::parse_generated_change_manifest(raw, "L2-real", 2).expect("manifest parses");
+
+        assert_eq!(manifest.node_id, "L2-real");
+        assert_eq!(manifest.build_version, 2);
+        assert!(manifest.children_swapped.is_empty());
+        assert_eq!(manifest.content_updates, ContentUpdates::default());
+        assert_eq!(manifest.reason, "No substantive update needed.");
+    }
+
+    #[test]
+    fn test_identity_change_evidence_rewrite_preserves_tree_links() {
+        let (_tmp, conn) = setup_test_db();
+        insert_upper_node(&conn, "L0-child", 0, "[]", &[]);
+        insert_upper_node(&conn, "L1-old", 1, "[]", &["L0-child"]);
+        insert_upper_node(&conn, "L1-new", 1, "[]", &["L0-child"]);
+        insert_upper_node(&conn, "L2-parent", 2, "[]", &["L1-old"]);
+
+        conn.execute(
+            "UPDATE pyramid_nodes SET superseded_by = 'L1-new'
+              WHERE slug = 'test-slug' AND id = 'L1-old'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_evidence
+             (slug, build_id, source_node_id, target_node_id, verdict, weight, reason)
+             VALUES
+             ('test-slug', 'b1', 'L0-child', 'L1-old', 'KEEP', 1.0, 'child to old'),
+             ('test-slug', 'b1', 'L1-old', 'L2-parent', 'KEEP', 1.0, 'old to parent'),
+             ('test-slug', 'b1', 'L1-new', 'L2-parent', 'KEEP', 0.5, 'pre-existing conflict')",
+            [],
+        )
+        .unwrap();
+
+        let rewritten =
+            rewrite_identity_change_evidence_links(&conn, "test-slug", "L1-old", "L1-new").unwrap();
+
+        assert_eq!(rewritten, 2);
+        let old_refs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_evidence
+                  WHERE slug = 'test-slug'
+                    AND (source_node_id = 'L1-old' OR target_node_id = 'L1-old')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_refs, 0);
+
+        let child_to_new: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_evidence
+                  WHERE slug = 'test-slug'
+                    AND source_node_id = 'L0-child'
+                    AND target_node_id = 'L1-new'
+                    AND verdict = 'KEEP'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_to_new, 1);
+
+        let new_to_parent: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_evidence
+                  WHERE slug = 'test-slug'
+                    AND source_node_id = 'L1-new'
+                    AND target_node_id = 'L2-parent'
+                    AND verdict = 'KEEP'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_to_parent, 1);
+
+        let tree = crate::pyramid::query::get_tree(&conn, "test-slug").unwrap();
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].id, "L2-parent");
+        assert_eq!(tree[0].children[0].id, "L1-new");
+        assert_eq!(tree[0].children[0].children[0].id, "L0-child");
     }
 
     /// Phase 13 verifier fix: the bus-variant of `persist_change_manifest`
