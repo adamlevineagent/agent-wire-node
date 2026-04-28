@@ -11,7 +11,7 @@
 // answering. Each upper-layer node is the answer to a specific question, grounded
 // in weighted evidence links to lower-layer nodes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -33,6 +33,115 @@ use super::types::{
     FailedQuestion, LayerQuestion, ProvenanceKind, PyramidNode,
 };
 use super::OperationalConfig;
+
+const PRE_MAP_SAVE_MAX_RETRIES: u32 = 3;
+const PRE_MAP_SAVE_BACKOFF_MS: [u64; 3] = [100, 500, 2000];
+
+fn is_sqlite_busy_error(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_ascii_lowercase();
+    message.contains("database is locked")
+        || message.contains("database busy")
+        || message.contains("database is busy")
+}
+
+fn valid_candidate_links_for_batch(
+    mappings: &HashMap<String, Vec<String>>,
+    valid_ids: &HashSet<&str>,
+) -> HashMap<String, Vec<String>> {
+    let mut filtered = HashMap::new();
+    for (question_id, candidates) in mappings {
+        let mut valid: Vec<String> = candidates
+            .iter()
+            .filter_map(|id| {
+                let trimmed = id.trim();
+                if trimmed.is_empty() || !valid_ids.contains(trimmed) {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            })
+            .collect();
+        valid.sort();
+        valid.dedup();
+        if !valid.is_empty() {
+            filtered.insert(question_id.clone(), valid);
+        }
+    }
+    filtered
+}
+
+async fn persist_pre_map_candidate_links(
+    audit_ctx: Option<&AuditContext>,
+    layer: i64,
+    batch_idx: usize,
+    audit_id: Option<i64>,
+    mappings: HashMap<String, Vec<String>>,
+) -> Result<usize> {
+    if mappings.is_empty() {
+        return Ok(0);
+    }
+    let Some(audit_ctx) = audit_ctx else {
+        return Ok(0);
+    };
+
+    let conn = Arc::clone(&audit_ctx.conn);
+    let slug = audit_ctx.slug.clone();
+    let build_id = audit_ctx.build_id.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let c = conn.blocking_lock();
+        for attempt in 0..=PRE_MAP_SAVE_MAX_RETRIES {
+            let tx_result = (|| -> Result<usize> {
+                c.execute_batch("BEGIN IMMEDIATE")?;
+                let inner = db::save_candidate_link_batch(
+                    &c,
+                    &slug,
+                    &build_id,
+                    layer,
+                    batch_idx as i64,
+                    "pre_map",
+                    audit_id,
+                    &mappings,
+                );
+                match inner {
+                    Ok(saved) => {
+                        if let Err(e) = c.execute_batch("COMMIT") {
+                            let _ = c.execute_batch("ROLLBACK");
+                            Err(e.into())
+                        } else {
+                            Ok(saved)
+                        }
+                    }
+                    Err(e) => {
+                        let _ = c.execute_batch("ROLLBACK");
+                        Err(e)
+                    }
+                }
+            })();
+
+            match tx_result {
+                Ok(saved) => return Ok(saved),
+                Err(e) if is_sqlite_busy_error(&e) && attempt < PRE_MAP_SAVE_MAX_RETRIES => {
+                    warn!(
+                        slug = %slug,
+                        batch = batch_idx,
+                        attempt,
+                        backoff_ms = PRE_MAP_SAVE_BACKOFF_MS[attempt as usize],
+                        "pre-map candidate-link save hit database-locked, retrying"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        PRE_MAP_SAVE_BACKOFF_MS[attempt as usize],
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(0)
+    })
+    .await
+    .map_err(|e| anyhow!("pre-map candidate-link save panicked: {e}"))?
+}
 
 /// Check if an L0 node ID is a targeted re-examination.
 /// Canonical L0 nodes use patterns like C-L0-001, D-L0-042, or short sequential IDs.
@@ -237,6 +346,8 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
     for q in questions {
         merged_mappings.entry(q.question_id.clone()).or_default();
     }
+    let layer = questions.first().map(|q| q.layer).unwrap_or_default();
+    let valid_ids: HashSet<&str> = lower_layer_nodes.iter().map(|n| n.id.as_str()).collect();
 
     for (batch_idx, batch) in batches.iter().enumerate() {
         let empty_batch = Vec::new();
@@ -340,29 +451,54 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
             "pre-mapping batch complete"
         );
 
-        // Parse and merge this batch's mappings
-        if let Ok(json_value) = llm::extract_json(&response.content) {
-            if let Ok(raw) = serde_json::from_value::<PreMapResponse>(json_value) {
-                for (q_id, candidates) in raw.mappings {
-                    merged_mappings.entry(q_id).or_default().extend(candidates);
-                }
-            } else {
+        // Parse, durably capture this batch's candidate links, then merge into
+        // the in-memory map used by answer_questions. The capture is per-batch
+        // so a later LLM/DB failure cannot erase earlier pre-map work.
+        let json_value = match llm::extract_json(&response.content) {
+            Ok(value) => value,
+            Err(e) => {
                 warn!(
                     batch = batch_idx,
+                    error = %e,
+                    "Failed to extract JSON from pre-mapping batch response"
+                );
+                continue;
+            }
+        };
+        let raw = match serde_json::from_value::<PreMapResponse>(json_value) {
+            Ok(raw) => raw,
+            Err(e) => {
+                warn!(
+                    batch = batch_idx,
+                    error = %e,
                     "Failed to parse pre-mapping batch response"
                 );
+                continue;
             }
-        } else {
-            warn!(
+        };
+        let valid_batch_mappings = valid_candidate_links_for_batch(&raw.mappings, &valid_ids);
+        let captured_links = persist_pre_map_candidate_links(
+            pre_map_audit_ctx.as_ref(),
+            layer,
+            batch_idx,
+            response.audit_id,
+            valid_batch_mappings,
+        )
+        .await?;
+        if captured_links > 0 {
+            info!(
                 batch = batch_idx,
-                "Failed to extract JSON from pre-mapping batch response"
+                candidate_links = captured_links,
+                audit_id = ?response.audit_id,
+                "pre-mapping candidate links captured"
             );
+        }
+        for (q_id, candidates) in raw.mappings {
+            merged_mappings.entry(q_id).or_default().extend(candidates);
         }
     }
 
     // Filter out any node IDs that don't actually exist in the lower layer
-    let valid_ids: std::collections::HashSet<&str> =
-        lower_layer_nodes.iter().map(|n| n.id.as_str()).collect();
     let raw_total: usize = merged_mappings.values().map(|v| v.len()).sum();
     for candidates in merged_mappings.values_mut() {
         candidates.retain(|id| valid_ids.contains(id.as_str()));

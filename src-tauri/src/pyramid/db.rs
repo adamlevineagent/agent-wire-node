@@ -10245,6 +10245,53 @@ pub fn save_evidence_link(conn: &Connection, link: &EvidenceLink) -> Result<()> 
     Ok(())
 }
 
+/// Persist one pre-map batch's candidate links. The caller owns transaction
+/// boundaries so each batch can commit independently.
+pub fn save_candidate_link_batch(
+    conn: &Connection,
+    slug: &str,
+    build_id: &str,
+    layer: i64,
+    batch_idx: i64,
+    source: &str,
+    audit_id: Option<i64>,
+    mappings: &HashMap<String, Vec<String>>,
+) -> Result<usize> {
+    let mut stmt = conn.prepare(
+        "INSERT INTO pyramid_candidate_links
+            (slug, build_id, layer, question_id, candidate_node_id, batch_idx, source, confidence, audit_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)
+         ON CONFLICT(slug, build_id, layer, question_id, candidate_node_id, source)
+         DO UPDATE SET
+            batch_idx = excluded.batch_idx,
+            confidence = excluded.confidence,
+            audit_id = excluded.audit_id",
+    )?;
+
+    let mut saved = 0usize;
+    for (question_id, candidates) in mappings {
+        let mut seen = HashSet::new();
+        for candidate_node_id in candidates.iter().map(|id| id.trim()) {
+            if candidate_node_id.is_empty() || !seen.insert(candidate_node_id.to_string()) {
+                continue;
+            }
+            stmt.execute(rusqlite::params![
+                slug,
+                build_id,
+                layer,
+                question_id,
+                candidate_node_id,
+                batch_idx,
+                source,
+                audit_id,
+            ])?;
+            saved += 1;
+        }
+    }
+
+    Ok(saved)
+}
+
 /// Persist answered-node material before draining it into canonical graph
 /// tables. This makes expensive LLM answer work durable even if the later
 /// `pyramid_nodes` / evidence / gap transaction is delayed or fails.
@@ -12897,6 +12944,85 @@ mod tests {
             duplicate.is_err(),
             "candidate links must be unique per source/question/candidate"
         );
+    }
+
+    #[test]
+    fn test_candidate_link_batch_upserts_with_audit_id() {
+        let conn = test_conn();
+        create_slug(&conn, "qslug", &ContentType::Question, "").unwrap();
+        let audit_id_1 = insert_llm_audit_pending(
+            &conn,
+            "qslug",
+            "build-1",
+            None,
+            "evidence_pre_map",
+            "pre_map_batch_0",
+            Some(1),
+            "test-model",
+            "system",
+            "user",
+        )
+        .unwrap();
+        let audit_id_2 = insert_llm_audit_pending(
+            &conn,
+            "qslug",
+            "build-1",
+            None,
+            "evidence_pre_map",
+            "pre_map_batch_1",
+            Some(1),
+            "test-model",
+            "system",
+            "user",
+        )
+        .unwrap();
+
+        let batch_0 = std::collections::HashMap::from([
+            (
+                "docpyramidv1/0/Q-L1-000".to_string(),
+                vec![
+                    "docpyramidv1/0/L0-001".to_string(),
+                    "docpyramidv1/0/L0-002".to_string(),
+                    "docpyramidv1/0/L0-002".to_string(),
+                ],
+            ),
+            ("docpyramidv1/0/Q-L1-001".to_string(), Vec::new()),
+        ]);
+        let saved =
+            save_candidate_link_batch(&conn, "qslug", "build-1", 1, 0, "pre_map", Some(audit_id_1), &batch_0)
+                .unwrap();
+        assert_eq!(saved, 2);
+
+        let batch_1 = std::collections::HashMap::from([(
+            "docpyramidv1/0/Q-L1-000".to_string(),
+            vec!["docpyramidv1/0/L0-002".to_string()],
+        )]);
+        let saved =
+            save_candidate_link_batch(&conn, "qslug", "build-1", 1, 1, "pre_map", Some(audit_id_2), &batch_1)
+                .unwrap();
+        assert_eq!(saved, 1);
+
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pyramid_candidate_links", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(row_count, 2);
+
+        let (batch_idx, audit_id): (i64, i64) = conn
+            .query_row(
+                "SELECT batch_idx, audit_id
+                 FROM pyramid_candidate_links
+                 WHERE slug = 'qslug'
+                   AND build_id = 'build-1'
+                   AND question_id = 'docpyramidv1/0/Q-L1-000'
+                   AND candidate_node_id = 'docpyramidv1/0/L0-002'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(batch_idx, 1);
+        assert_eq!(audit_id, audit_id_2);
     }
 
     #[test]
