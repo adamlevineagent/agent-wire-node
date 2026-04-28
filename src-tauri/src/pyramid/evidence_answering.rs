@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use rusqlite;
 
 use super::db;
+use super::event_bus::{EvidenceLinkEvent, TaggedBuildEvent, TaggedKind};
 use super::llm::{self, AuditContext, LlmConfig};
 use super::question_decomposition::render_prompt_template;
 use super::step_context::make_step_ctx_from_llm_config;
@@ -75,7 +76,7 @@ async fn persist_pre_map_candidate_links(
     layer: i64,
     batch_idx: usize,
     audit_id: Option<i64>,
-    mappings: HashMap<String, Vec<String>>,
+    mappings: &HashMap<String, Vec<String>>,
 ) -> Result<usize> {
     if mappings.is_empty() {
         return Ok(0);
@@ -87,6 +88,7 @@ async fn persist_pre_map_candidate_links(
     let conn = Arc::clone(&audit_ctx.conn);
     let slug = audit_ctx.slug.clone();
     let build_id = audit_ctx.build_id.clone();
+    let mappings = mappings.clone();
 
     tokio::task::spawn_blocking(move || {
         let c = conn.blocking_lock();
@@ -217,6 +219,24 @@ pub async fn pre_map_layer(
             .collect();
         return Ok(CandidateMap { mappings });
     }
+
+    let bus_for_events = llm_config
+        .cache_access
+        .as_ref()
+        .and_then(|ca| ca.bus.clone());
+    let event_slug = llm_config
+        .cache_access
+        .as_ref()
+        .map(|ca| ca.slug.clone())
+        .or_else(|| audit.map(|ctx| ctx.slug.clone()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let build_id_for_events = llm_config
+        .cache_access
+        .as_ref()
+        .map(|ca| ca.build_id.clone())
+        .or_else(|| audit.map(|ctx| ctx.build_id.clone()))
+        .unwrap_or_else(|| format!("{}-evidence", event_slug));
+    let step_name_for_events = "evidence_pre_map".to_string();
 
     // ── Build question listing ──────────────────────────────────────────
     let questions_text = questions
@@ -482,10 +502,33 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
             layer,
             batch_idx,
             response.audit_id,
-            valid_batch_mappings,
+            &valid_batch_mappings,
         )
         .await?;
         if captured_links > 0 {
+            if let Some(bus) = bus_for_events.as_ref() {
+                for (question_id, candidate_node_ids) in &valid_batch_mappings {
+                    for candidate_node_id in candidate_node_ids {
+                        let _ = bus.tx.send(TaggedBuildEvent {
+                            slug: event_slug.clone(),
+                            kind: TaggedKind::EvidenceLinkEvent {
+                                slug: event_slug.clone(),
+                                build_id: build_id_for_events.clone(),
+                                step_name: step_name_for_events.clone(),
+                                event: EvidenceLinkEvent::Formed,
+                                question_id: question_id.clone(),
+                                candidate_node_id: candidate_node_id.clone(),
+                                target_node_id: None,
+                                layer,
+                                batch_idx: Some(batch_idx as i64),
+                                audit_id: response.audit_id,
+                                weight: None,
+                                reason: None,
+                            },
+                        });
+                    }
+                }
+            }
             info!(
                 batch = batch_idx,
                 candidate_links = captured_links,
@@ -833,6 +876,28 @@ pub async fn answer_questions(
                                 weight: ev.weight,
                                 source_headline,
                                 target_headline,
+                            },
+                        });
+                        let event = match &ev.verdict {
+                            EvidenceVerdict::Keep => EvidenceLinkEvent::Confirmed,
+                            EvidenceVerdict::Disconnect => EvidenceLinkEvent::Discarded,
+                            EvidenceVerdict::Missing => continue,
+                        };
+                        let _ = bus.tx.send(TaggedBuildEvent {
+                            slug: slug.clone(),
+                            kind: TaggedKind::EvidenceLinkEvent {
+                                slug: slug.clone(),
+                                build_id: build_id_for_events.clone(),
+                                step_name: step_name_for_events.clone(),
+                                event,
+                                question_id: q_id.clone(),
+                                candidate_node_id: ev.source_node_id.clone(),
+                                target_node_id: Some(ev.target_node_id.clone()),
+                                layer: q_layer,
+                                batch_idx: None,
+                                audit_id: answered.audit_id,
+                                weight: ev.weight,
+                                reason: ev.reason.clone(),
                             },
                         });
                     }

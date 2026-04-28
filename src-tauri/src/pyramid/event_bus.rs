@@ -1,11 +1,20 @@
 use crate::pyramid::types::{BuildProgress, BuildProgressV2};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TaggedBuildEvent {
     pub slug: String,
     pub kind: TaggedKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceLinkEvent {
+    Formed,
+    Confirmed,
+    Discarded,
+    GapDiagnosed,
 }
 
 /// Event kinds broadcast on the build event bus.
@@ -469,6 +478,25 @@ pub enum TaggedKind {
         target_headline: Option<String>,
     },
 
+    /// Lifecycle event for a candidate/confirmed evidence link. `Formed`
+    /// records the pre-map candidate relation before answer synthesis;
+    /// `Confirmed`/`Discarded` mirror KEEP/DISCONNECT verdicts; `GapDiagnosed`
+    /// is reserved for the gap path once repair dispatch lands.
+    EvidenceLinkEvent {
+        slug: String,
+        build_id: String,
+        step_name: String,
+        event: EvidenceLinkEvent,
+        question_id: String,
+        candidate_node_id: String,
+        target_node_id: Option<String>,
+        layer: i64,
+        batch_idx: Option<i64>,
+        audit_id: Option<i64>,
+        weight: Option<f64>,
+        reason: Option<String>,
+    },
+
     /// Emitted after build_node_from_output produces a node. Carries the
     /// node's headline so the chronicle can show what was produced, not
     /// just IDs and stats.
@@ -876,6 +904,35 @@ mod phase13_tests {
         assert_eq!(json["source_headline"], "Source node");
         assert_eq!(json["target_headline"], "Target node");
         assert!(kind.is_discrete());
+    }
+
+    #[test]
+    fn test_evidence_link_event_serde() {
+        let kind = TaggedKind::EvidenceLinkEvent {
+            slug: "s".into(),
+            build_id: "b".into(),
+            step_name: "evidence_pre_map".into(),
+            event: EvidenceLinkEvent::Formed,
+            question_id: "Q-L2-001".into(),
+            candidate_node_id: "L1-003".into(),
+            target_node_id: None,
+            layer: 2,
+            batch_idx: Some(4),
+            audit_id: Some(99),
+            weight: None,
+            reason: None,
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "evidence_link_event");
+        assert_eq!(json["event"], "formed");
+        assert_eq!(json["question_id"], "Q-L2-001");
+        assert_eq!(json["candidate_node_id"], "L1-003");
+        assert_eq!(json["batch_idx"], 4);
+        assert!(json["target_node_id"].is_null());
+        assert!(kind.is_discrete());
+
+        let gap = serde_json::to_value(EvidenceLinkEvent::GapDiagnosed).unwrap();
+        assert_eq!(gap, "gap_diagnosed");
     }
 
     #[test]
