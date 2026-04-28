@@ -823,6 +823,52 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_evidence_source ON pyramid_evidence(slug, source_node_id);
         -- NOTE: idx_evidence_build is created by migrate_evidence_pk AFTER build_id column exists
 
+        -- Capture-on-formation: every candidate link inferred by pre-map.
+        CREATE TABLE IF NOT EXISTS pyramid_candidate_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            build_id TEXT NOT NULL,
+            layer INTEGER NOT NULL,
+            question_id TEXT NOT NULL,
+            candidate_node_id TEXT NOT NULL,
+            batch_idx INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            confidence REAL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            audit_id INTEGER REFERENCES pyramid_llm_audit(id),
+            UNIQUE(slug, build_id, layer, question_id, candidate_node_id, source)
+        );
+        CREATE INDEX IF NOT EXISTS idx_candidate_links_layer
+            ON pyramid_candidate_links(slug, build_id, layer);
+
+        -- Parse-fail recovery queue.
+        CREATE TABLE IF NOT EXISTS pyramid_pending_repairs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            build_id TEXT NOT NULL,
+            audit_id INTEGER NOT NULL REFERENCES pyramid_llm_audit(id),
+            step_name TEXT NOT NULL,
+            raw_response TEXT NOT NULL,
+            parse_error TEXT NOT NULL,
+            repair_attempted INTEGER NOT NULL DEFAULT 0,
+            repair_outcome TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        -- Diagnostic verdicts when evidence is missing.
+        CREATE TABLE IF NOT EXISTS pyramid_evidence_diagnoses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            build_id TEXT NOT NULL,
+            layer INTEGER NOT NULL,
+            question_id TEXT NOT NULL,
+            diagnosis_kind TEXT NOT NULL,
+            diagnosis_text TEXT NOT NULL,
+            broadening_action TEXT,
+            audit_id INTEGER NOT NULL REFERENCES pyramid_llm_audit(id),
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
         -- Durable answered-node material produced by the evidence loop before
         -- it is drained into canonical graph tables. This is an internal
         -- outbox/WAL, not a user-facing data model.
@@ -12743,6 +12789,114 @@ mod tests {
             .unwrap();
         assert_eq!(stored_audit_id, Some(audit_id));
         assert_eq!(stored_kind, "llm");
+    }
+
+    #[test]
+    fn test_evidence_loop_w1_spine_tables_initialized() {
+        let conn = test_conn();
+        create_slug(&conn, "qslug", &ContentType::Question, "").unwrap();
+        let audit_id = insert_llm_audit_pending(
+            &conn,
+            "qslug",
+            "build-1",
+            None,
+            "evidence_pre_map",
+            "pre_map_batch_0",
+            Some(1),
+            "test-model",
+            "system",
+            "user",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO pyramid_candidate_links
+                (slug, build_id, layer, question_id, candidate_node_id, batch_idx, source, confidence, audit_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                "qslug",
+                "build-1",
+                1_i64,
+                "docpyramidv1/0/Q-L1-000",
+                "docpyramidv1/0/L0-001",
+                0_i64,
+                "pre_map",
+                1.0_f64,
+                audit_id,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_pending_repairs
+                (slug, build_id, audit_id, step_name, raw_response, parse_error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "qslug",
+                "build-1",
+                audit_id,
+                "evidence_pre_map",
+                "{not json",
+                "expected object",
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_evidence_diagnoses
+                (slug, build_id, layer, question_id, diagnosis_kind, diagnosis_text, broadening_action, audit_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                "qslug",
+                "build-1",
+                1_i64,
+                "docpyramidv1/0/Q-L1-000",
+                "missing_domain",
+                "candidate pool lacks this domain",
+                "none",
+                audit_id,
+            ],
+        )
+        .unwrap();
+
+        let candidate_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pyramid_candidate_links", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let repair_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pyramid_pending_repairs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let diagnosis_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_evidence_diagnoses",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(candidate_count, 1);
+        assert_eq!(repair_count, 1);
+        assert_eq!(diagnosis_count, 1);
+
+        let duplicate = conn.execute(
+            "INSERT INTO pyramid_candidate_links
+                (slug, build_id, layer, question_id, candidate_node_id, batch_idx, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "qslug",
+                "build-1",
+                1_i64,
+                "docpyramidv1/0/Q-L1-000",
+                "docpyramidv1/0/L0-001",
+                0_i64,
+                "pre_map",
+            ],
+        );
+        assert!(
+            duplicate.is_err(),
+            "candidate links must be unique per source/question/candidate"
+        );
     }
 
     #[test]
