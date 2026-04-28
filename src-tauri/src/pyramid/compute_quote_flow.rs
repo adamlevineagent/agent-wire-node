@@ -351,6 +351,7 @@ pub async fn await_result(
                 provider_id: Some(format!("market:{}", model_used)),
                 fleet_peer_id: None,
                 fleet_peer_model: None,
+                audit_id: None,
             }),
             DeliveryPayload::Failure { code, message } => {
                 // Provider's inference failed. Other routes may succeed

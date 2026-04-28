@@ -864,6 +864,7 @@ mod tests {
             provider_id: Some("openrouter".to_string()),
             fleet_peer_id: None,
             fleet_peer_model: None,
+            audit_id: None,
         }
     }
 

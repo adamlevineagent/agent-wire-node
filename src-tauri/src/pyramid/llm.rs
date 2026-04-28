@@ -94,6 +94,11 @@ fn audit_response_parsed_ok(
     }
 }
 
+fn with_audit_id(mut response: LlmResponse, audit_id: Option<i64>) -> LlmResponse {
+    response.audit_id = audit_id;
+    response
+}
+
 /// Clone the full OpenRouter `model_list` from the current
 /// `DispatchDecision`. Used by sites that need the whole cascade
 /// (context-exceeded model promotion / context-limit lookup).
@@ -593,6 +598,7 @@ async fn dispatch_fleet_entry(
                                 .unwrap_or_else(|| peer.node_id.clone()),
                         ),
                         fleet_peer_model: fleet_resp.peer_model.clone(),
+                        audit_id: None,
                     })
                 }
                 Ok(crate::fleet::FleetAsyncResult::Error(err_msg)) => {
@@ -1292,6 +1298,10 @@ pub struct LlmResponse {
     /// Fleet provenance: model the peer actually used (returned in
     /// the fleet dispatch response). None for non-fleet calls.
     pub fleet_peer_model: Option<String>,
+    /// Row id in `pyramid_llm_audit` for audited calls. None for
+    /// non-audited calls and for cached response payloads before the
+    /// audited cache-hit row is written for this call.
+    pub audit_id: Option<i64>,
 }
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -2220,7 +2230,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
     // contiguous and DADBEAR Oversight can show cache savings.
     let probe_started = std::time::Instant::now();
     let cache_lookup = match try_cache_lookup_or_key(ctx, system_prompt, user_prompt) {
-        CacheProbeOutcome::Hit(response) => {
+        CacheProbeOutcome::Hit(mut response) => {
             if let Some(audit_ctx) = audit {
                 // W3c: Decision-resolved model after step-local id.
                 // Legacy `config.primary_model` fallback removed —
@@ -2242,7 +2252,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     .or(response.fleet_peer_model.as_deref())
                     .unwrap_or(model_for_row.as_str());
                 let parsed_ok = audit_response_parsed_ok(audit, response_format, &response.content);
-                let _ = super::db::insert_llm_audit_cache_hit(
+                response.audit_id = super::db::insert_llm_audit_cache_hit(
                     &conn,
                     &audit_ctx.slug,
                     &audit_ctx.build_id,
@@ -2259,7 +2269,8 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     response.usage.completion_tokens,
                     latency_ms,
                     response.generation_id.as_deref(),
-                );
+                )
+                .ok();
             }
             return Ok(response);
         }
@@ -2852,7 +2863,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         }),
                     );
 
-                    return Ok(response);
+                    return Ok(with_audit_id(response, audit_id));
                 }
                 Err(EntryError::Retryable { reason }) => {
                     // Per-slug specific event FIRST (additive) so
@@ -3262,7 +3273,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         metadata,
                     );
 
-                    return Ok(response);
+                    return Ok(with_audit_id(response, audit_id));
                 }
                 Err(EntryError::Retryable { reason }) => {
                     // Phase 5 §F: fleet Retryable = genuine peer-side
@@ -3549,7 +3560,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                             }),
                         );
 
-                        return Ok(response);
+                        return Ok(with_audit_id(response, audit_id));
                     }
                     Ok(Err(err)) => {
                         let reason = format!("{err}");
@@ -4313,6 +4324,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     provider_id: Some(entry_provider_type.as_str().to_string()),
                     fleet_peer_id: None,
                     fleet_peer_model: None,
+                    audit_id: None,
                 };
 
                 // Cache store on success.
@@ -4437,7 +4449,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
                     }),
                 );
 
-                return Ok(response);
+                return Ok(with_audit_id(response, audit_id));
             }
             Err(EntryError::Retryable { reason }) => {
                 // Phase 5 §F: pool Retryable = genuine HTTP failure
@@ -4614,6 +4626,7 @@ fn parse_cached_response(cached: &super::step_context::CachedStepOutput) -> Resu
             .get("fleet_peer_model")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        audit_id: None,
     })
 }
 
@@ -5369,10 +5382,10 @@ impl AuditContext {
 ///      complete-row dance for wire calls.
 ///
 /// This wrapper preserves the legacy `(LlmResponse, audit_id)` return
-/// shape so existing callers compile, but the returned id is `0` —
-/// production callers always pattern-match `(resp, _)` and ignore it.
-/// New retrofit sites should call `call_model_unified_with_audit_and_ctx`
-/// directly so they can thread a `StepContext` for cache reachability.
+/// shape for older callers. Phase W1.4 restored the real id by reading
+/// the `audit_id` surfaced on `LlmResponse`; new retrofit sites should
+/// call `call_model_unified_with_audit_and_ctx` directly so they can
+/// thread a `StepContext` for cache reachability.
 ///
 /// LEAVING THIS WRAPPER IN PLACE WITHOUT THREADING A StepContext IS A
 /// CACHE GAP. Every production call site MUST migrate to the unified
@@ -5402,13 +5415,8 @@ pub async fn call_model_audited(
         LlmCallOptions::default(),
     )
     .await?;
-    // Phase 18b: the audit row id is no longer surfaced — the cache-hit
-    // path inserts a single complete row in one statement and the
-    // wire-call path goes through pending → complete inside
-    // `call_model_unified_with_audit_and_ctx`. Production callers ignore
-    // the returned id; tests that need it should query
-    // `pyramid_llm_audit` by `(slug, build_id)`.
-    Ok((resp, 0))
+    let audit_id = resp.audit_id.unwrap_or(0);
+    Ok((resp, audit_id))
 }
 
 // ── JSON extraction ──────────────────────────────────────────────────────────
@@ -6555,6 +6563,7 @@ routing_rules:
             provider_id: Some("market:gemma4:26b".into()),
             fleet_peer_id: None,
             fleet_peer_model: None,
+            audit_id: None,
         };
         assert_eq!(market_response_model_id(&response), Some("gemma4:26b"));
     }
@@ -7110,6 +7119,18 @@ routing_rules:
         parsed_ok != 0
     }
 
+    fn latest_audit_id(db_path: &std::path::Path, slug: &str) -> i64 {
+        let conn = super::super::db::open_pyramid_db(db_path).expect("reopen for audit row");
+        conn.query_row(
+            "SELECT id FROM pyramid_llm_audit
+             WHERE slug = ?1
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![slug],
+            |r| r.get(0),
+        )
+        .expect("latest audit row")
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_phase18b_audited_cache_hit_writes_cache_hit_audit_row() {
         // L8 acceptance: when an audited LLM call serves from cache,
@@ -7194,6 +7215,11 @@ routing_rules:
             count_audit_rows(db.path(), "p18b-l8", None),
             1,
             "exactly one audit row total"
+        );
+        assert_eq!(
+            response.audit_id,
+            Some(latest_audit_id(db.path(), "p18b-l8")),
+            "audited cache hits must surface the cache-hit audit row id"
         );
     }
 
@@ -8266,6 +8292,7 @@ routing_rules:
                         provider_id: Some("ollama-local".into()),
                         fleet_peer_id: None,
                         fleet_peer_model: None,
+                        audit_id: None,
                     };
                     let _ = entry.result_tx.send(Ok(response));
                     return;
