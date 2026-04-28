@@ -3943,6 +3943,8 @@ async fn pyramid_build(
                             wire_node_lib::pyramid::build::WriteOp::SaveNode {
                                 ref node,
                                 ref topics_json,
+                                audit_id: _,
+                                provenance_kind: _,
                             } => wire_node_lib::pyramid::db::save_node(
                                 &conn,
                                 node,

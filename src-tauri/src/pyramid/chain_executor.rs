@@ -34,11 +34,22 @@ use super::chain_resolve::{resolve_prompt_template, ChainContext};
 use super::config_contributions::create_config_contribution;
 use super::db;
 use super::stale_helpers_upper::resolve_stale_target_for_node;
-use super::types::{BuildProgress, LayerEvent, PyramidNode, ReconciliationResult, WebEdge};
+use super::types::{
+    BuildProgress, LayerEvent, ProvenanceKind, PyramidNode, ReconciliationResult, WebEdge,
+};
 use super::PyramidState;
 
 const CODE_THREAD_SPLIT_PROMPT: &str =
     include_str!("../../../chains/prompts/code/code_thread_split.md");
+
+fn node_write_provenance(
+    llm_response: Option<&super::llm::LlmResponse>,
+) -> (Option<i64>, ProvenanceKind) {
+    match llm_response {
+        Some(response) => (response.audit_id, ProvenanceKind::Llm),
+        None => (None, ProvenanceKind::Manual),
+    }
+}
 
 // ── Phase 9 close-1: per-task "I hold this chain-slug guard" tracking ─────
 //
@@ -2700,6 +2711,8 @@ fn spawn_write_drain(
                     WriteOp::SaveNode {
                         ref node,
                         ref topics_json,
+                        audit_id: _,
+                        provenance_kind: _,
                     } => db::save_node(&conn, node, topics_json.as_deref()),
                     WriteOp::SaveStep {
                         ref slug,
@@ -3581,7 +3594,14 @@ async fn execute_container_step(
                             let topics_json = serde_json::to_string(
                                 last_output.get("topics").unwrap_or(&serde_json::json!([])),
                             )?;
-                            send_save_node(writer_tx, node, Some(topics_json)).await;
+                            send_save_node(
+                                writer_tx,
+                                node,
+                                Some(topics_json),
+                                None,
+                                ProvenanceKind::Llm,
+                            )
+                            .await;
                             *done += 1;
                             send_progress(progress_tx, *done, *total).await;
                             let label = last_output
@@ -4025,6 +4045,28 @@ async fn dispatch_with_retry(
     error_strategy: &ErrorStrategy,
     fallback_key: &str,
 ) -> Result<Value> {
+    let (value, _) = dispatch_with_retry_with_response(
+        step,
+        resolved_input,
+        system_prompt,
+        defaults,
+        dispatch_ctx,
+        error_strategy,
+        fallback_key,
+    )
+    .await?;
+    Ok(value)
+}
+
+async fn dispatch_with_retry_with_response(
+    step: &ChainStep,
+    resolved_input: &Value,
+    system_prompt: &str,
+    defaults: &super::chain_engine::ChainDefaults,
+    dispatch_ctx: &chain_dispatch::ChainDispatchContext,
+    error_strategy: &ErrorStrategy,
+    fallback_key: &str,
+) -> Result<(Value, Option<super::llm::LlmResponse>)> {
     let max_attempts = match error_strategy {
         ErrorStrategy::Retry(n) => *n,
         _ => 1,
@@ -4032,7 +4074,7 @@ async fn dispatch_with_retry(
 
     let mut last_err = None;
     for attempt in 0..max_attempts {
-        match chain_dispatch::dispatch_step(
+        match chain_dispatch::dispatch_step_with_response(
             step,
             resolved_input,
             system_prompt,
@@ -4041,8 +4083,8 @@ async fn dispatch_with_retry(
         )
         .await
         {
-            Ok(v) => match validate_step_output(step, &v) {
-                Ok(()) => return Ok(v),
+            Ok((v, llm_response)) => match validate_step_output(step, &v) {
+                Ok(()) => return Ok((v, llm_response)),
                 Err(e) => {
                     warn!(
                         "  Dispatch attempt {}/{} validation failed for {fallback_key}: {e}",
@@ -4278,7 +4320,7 @@ async fn carry_node_up(
     node.depth = target_depth;
     node.chunk_index = None;
     node.children = children.iter().map(|s| s.to_string()).collect();
-    send_save_node(writer_tx, node, None).await;
+    send_save_node(writer_tx, node, None, None, ProvenanceKind::Manual).await;
 
     for child_id in children {
         send_update_parent(writer_tx, slug, child_id, new_id).await;
@@ -7804,7 +7846,14 @@ async fn execute_for_each(
                             let topics_json = serde_json::to_string(
                                 sub_output.get("topics").unwrap_or(&serde_json::json!([])),
                             )?;
-                            send_save_node(writer_tx, node, Some(topics_json)).await;
+                            send_save_node(
+                                writer_tx,
+                                node,
+                                Some(topics_json),
+                                None,
+                                ProvenanceKind::Llm,
+                            )
+                            .await;
                         }
                         outputs.push(decorated);
                     }
@@ -7857,7 +7906,14 @@ async fn execute_for_each(
                     let topics_json = serde_json::to_string(
                         analysis.get("topics").unwrap_or(&serde_json::json!([])),
                     )?;
-                    send_save_node(writer_tx, node, Some(topics_json)).await;
+                    send_save_node(
+                        writer_tx,
+                        node,
+                        Some(topics_json),
+                        None,
+                        ProvenanceKind::Llm,
+                    )
+                    .await;
                 }
 
                 if step.sequential {
@@ -7894,7 +7950,7 @@ async fn execute_for_each(
         let fallback_key = format!("{}-{index}", step.name);
         let t0 = Instant::now();
 
-        match dispatch_with_retry(
+        match dispatch_with_retry_with_response(
             step,
             &resolved_input,
             &system_prompt,
@@ -7905,7 +7961,7 @@ async fn execute_for_each(
         )
         .await
         {
-            Ok(analysis) => {
+            Ok((analysis, llm_response)) => {
                 validate_step_output(step, &analysis)?;
                 let elapsed = t0.elapsed().as_secs_f64();
                 let decorated_output =
@@ -8019,7 +8075,15 @@ async fn execute_for_each(
                     )?;
                     // Wire parent_id on children
                     let child_ids = node.children.clone();
-                    send_save_node(writer_tx, node, Some(topics_json)).await;
+                    let (audit_id, provenance_kind) = node_write_provenance(llm_response.as_ref());
+                    send_save_node(
+                        writer_tx,
+                        node,
+                        Some(topics_json),
+                        audit_id,
+                        provenance_kind,
+                    )
+                    .await;
                     for child_id in &child_ids {
                         send_update_parent(writer_tx, &ctx.slug, child_id, &node_id).await;
                     }
@@ -8505,8 +8569,14 @@ async fn execute_for_each_concurrent(
                                                 .unwrap_or(&serde_json::json!([])),
                                         )
                                         .unwrap_or_default();
-                                        send_save_node(&writer_tx_work, node, Some(topics_json))
-                                            .await;
+                                        send_save_node(
+                                            &writer_tx_work,
+                                            node,
+                                            Some(topics_json),
+                                            None,
+                                            ProvenanceKind::Llm,
+                                        )
+                                        .await;
                                     }
                                     Err(e) => {
                                         warn!("[CHAIN] [{}] {node_id}: build_node_from_output failed: {e}", step_work.name);
@@ -8578,8 +8648,14 @@ async fn execute_for_each_concurrent(
                                                 .unwrap_or(&serde_json::json!([])),
                                         )
                                         .unwrap_or_default();
-                                        send_save_node(&writer_tx_work, node, Some(topics_json))
-                                            .await;
+                                        send_save_node(
+                                            &writer_tx_work,
+                                            node,
+                                            Some(topics_json),
+                                            None,
+                                            ProvenanceKind::Llm,
+                                        )
+                                        .await;
                                     }
                                 }
                                 if first_decorated.is_none() {
@@ -8656,8 +8732,14 @@ async fn execute_for_each_concurrent(
                                                 .unwrap_or(&serde_json::json!([])),
                                         )
                                         .unwrap_or_default();
-                                        send_save_node(&writer_tx_work, node, Some(topics_json))
-                                            .await;
+                                        send_save_node(
+                                            &writer_tx_work,
+                                            node,
+                                            Some(topics_json),
+                                            None,
+                                            ProvenanceKind::Llm,
+                                        )
+                                        .await;
                                     }
                                     Err(e) => {
                                         warn!("[CHAIN] [{}] {node_id}: build_node_from_output failed: {e}", step_work.name);
@@ -8870,7 +8952,7 @@ async fn execute_for_each_work_item(
         ctx
     };
 
-    let analysis = dispatch_with_retry(
+    let (analysis, llm_response) = dispatch_with_retry_with_response(
         step,
         &work.resolved_input,
         &work.system_prompt,
@@ -9004,7 +9086,15 @@ async fn execute_for_each_work_item(
         let topics_json =
             serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([])))?;
         let child_ids = node.children.clone();
-        send_save_node(writer_tx, node, Some(topics_json)).await;
+        let (audit_id, provenance_kind) = node_write_provenance(llm_response.as_ref());
+        send_save_node(
+            writer_tx,
+            node,
+            Some(topics_json),
+            audit_id,
+            provenance_kind,
+        )
+        .await;
         for child_id in &child_ids {
             send_update_parent(writer_tx, &ctx_snapshot.slug, child_id, &work.node_id).await;
         }
@@ -9374,7 +9464,7 @@ async fn dispatch_pair(
     let fallback_key = format!("{}-d{target_depth}-{pair_idx}", step.name);
     let t0 = Instant::now();
 
-    let analysis = dispatch_with_retry(
+    let (analysis, llm_response) = dispatch_with_retry_with_response(
         step,
         &resolved_input,
         &system_prompt,
@@ -9423,7 +9513,15 @@ async fn dispatch_pair(
         );
         let topics_json =
             serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([])))?;
-        send_save_node(writer_tx, node, Some(topics_json)).await;
+        let (audit_id, provenance_kind) = node_write_provenance(llm_response.as_ref());
+        send_save_node(
+            writer_tx,
+            node,
+            Some(topics_json),
+            audit_id,
+            provenance_kind,
+        )
+        .await;
 
         send_update_parent(writer_tx, &ctx.slug, &left.id, node_id).await;
         send_update_parent(writer_tx, &ctx.slug, &right.id, node_id).await;
@@ -10669,7 +10767,7 @@ async fn dispatch_group(
     let fallback_key = format!("{}-d{target_depth}-g{group_idx}", step.name);
     let t0 = Instant::now();
 
-    let analysis = dispatch_with_retry(
+    let (analysis, llm_response) = dispatch_with_retry_with_response(
         step,
         &resolved_input,
         &system_prompt,
@@ -10718,7 +10816,15 @@ async fn dispatch_group(
         );
         let topics_json =
             serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([])))?;
-        send_save_node(writer_tx, node, Some(topics_json)).await;
+        let (audit_id, provenance_kind) = node_write_provenance(llm_response.as_ref());
+        send_save_node(
+            writer_tx,
+            node,
+            Some(topics_json),
+            audit_id,
+            provenance_kind,
+        )
+        .await;
 
         // Update parent pointers for all children
         for child in nodes {
@@ -11279,7 +11385,7 @@ async fn execute_single(
     let fallback_key = format!("{}-single", step.name);
     let t0 = Instant::now();
 
-    let analysis = dispatch_with_retry(
+    let (analysis, llm_response) = dispatch_with_retry_with_response(
         step,
         &resolved_input,
         &system_prompt,
@@ -11338,7 +11444,15 @@ async fn execute_single(
         );
         let topics_json =
             serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([])))?;
-        send_save_node(writer_tx, node, Some(topics_json)).await;
+        let (audit_id, provenance_kind) = node_write_provenance(llm_response.as_ref());
+        send_save_node(
+            writer_tx,
+            node,
+            Some(topics_json),
+            audit_id,
+            provenance_kind,
+        )
+        .await;
     }
 
     if saves_node {
@@ -13038,8 +13152,11 @@ async fn execute_ir_single(
         );
 
         // Wire children
+        let (audit_id, provenance_kind) = node_write_provenance(llm_response.as_ref());
         let children = node.children.clone();
-        exec_state.send_save_node(node, None).await;
+        exec_state
+            .send_save_node(node, None, audit_id, provenance_kind)
+            .await;
 
         for child_id in &children {
             exec_state.send_update_parent(child_id, &node_id).await;
@@ -13215,7 +13332,7 @@ async fn execute_ir_parallel_foreach(
             let elapsed = start.elapsed().as_secs_f64();
 
             match dispatch_result {
-                Ok((mut output, _llm_response)) => {
+                Ok((mut output, llm_response)) => {
                     output = decorate_ir_step_output(output, &node_id_clone, chunk_index);
 
                     // Save step record
@@ -13276,10 +13393,14 @@ async fn execute_ir_parallel_foreach(
                                 },
                             );
                             let children = node.children.clone();
+                            let (audit_id, provenance_kind) =
+                                node_write_provenance(llm_response.as_ref());
                             if let Err(e) = writer_tx
                                 .send(IrWriteOp::SaveNode {
                                     node,
                                     topics_json: None,
+                                    audit_id,
+                                    provenance_kind,
                                 })
                                 .await
                             {
@@ -13559,7 +13680,10 @@ async fn execute_ir_sequential_foreach(
                         },
                     );
                     let children = node.children.clone();
-                    exec_state.send_save_node(node, None).await;
+                    let (audit_id, provenance_kind) = node_write_provenance(llm_response.as_ref());
+                    exec_state
+                        .send_save_node(node, None, audit_id, provenance_kind)
+                        .await;
                     for child_id in &children {
                         exec_state.send_update_parent(child_id, &node_id).await;
                     }

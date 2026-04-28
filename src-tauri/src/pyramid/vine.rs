@@ -53,6 +53,8 @@ fn spawn_write_drain(
                     build::WriteOp::SaveNode {
                         ref node,
                         ref topics_json,
+                        audit_id: _,
+                        provenance_kind: _,
                     } => db::save_node(&conn, node, topics_json.as_deref()),
                     build::WriteOp::SaveStep {
                         ref slug,
@@ -906,6 +908,8 @@ pub async fn build_bunch(
                 build::WriteOp::SaveNode {
                     ref node,
                     ref topics_json,
+                    audit_id: _,
+                    provenance_kind: _,
                 } => db::save_node(&conn, node, topics_json.as_deref()),
                 build::WriteOp::SaveStep {
                     ref slug,
@@ -1418,7 +1422,14 @@ pub async fn build_vine_l1(
                     .first()
                     .map(|l| l.text.clone())
                     .unwrap_or_default();
-                build::send_save_node(&write_tx, node, Some(topics_json)).await;
+                build::send_save_node(
+                    &write_tx,
+                    node,
+                    Some(topics_json),
+                    None,
+                    ProvenanceKind::Llm,
+                )
+                .await;
 
                 // Set parent pointers on L0 nodes
                 for child_id in &children {
@@ -1599,7 +1610,14 @@ pub async fn build_vine_upper(
                             fallback.depth = next_depth;
                             fallback.chunk_index = None;
                             fallback.children = vec![left.id.clone(), right.id.clone()];
-                            build::send_save_node(&write_tx, fallback, None).await;
+                            build::send_save_node(
+                                &write_tx,
+                                fallback,
+                                None,
+                                None,
+                                ProvenanceKind::Manual,
+                            )
+                            .await;
                             build::send_update_parent(&write_tx, vine_slug, &left.id, &node_id)
                                 .await;
                             build::send_update_parent(&write_tx, vine_slug, &right.id, &node_id)
@@ -1617,7 +1635,14 @@ pub async fn build_vine_upper(
                         .first()
                         .map(|l| l.text.clone())
                         .unwrap_or_default();
-                    build::send_save_node(&write_tx, node, Some(topics_json)).await;
+                    build::send_save_node(
+                        &write_tx,
+                        node,
+                        Some(topics_json),
+                        None,
+                        ProvenanceKind::Llm,
+                    )
+                    .await;
                     build::send_update_parent(&write_tx, vine_slug, &left.id, &node_id).await;
                     build::send_update_parent(&write_tx, vine_slug, &right.id, &node_id).await;
                 } else {
@@ -1631,7 +1656,8 @@ pub async fn build_vine_upper(
                     node.depth = next_depth;
                     node.chunk_index = None;
                     node.children = vec![left.id.clone(), right.id.clone()];
-                    build::send_save_node(&write_tx, node, None).await;
+                    build::send_save_node(&write_tx, node, None, None, ProvenanceKind::Manual)
+                        .await;
                     build::send_update_parent(&write_tx, vine_slug, &left.id, &node_id).await;
                     build::send_update_parent(&write_tx, vine_slug, &right.id, &node_id).await;
                 }
@@ -1646,7 +1672,7 @@ pub async fn build_vine_upper(
                 node.depth = next_depth;
                 node.chunk_index = None;
                 node.children = vec![carry.id.clone()];
-                build::send_save_node(&write_tx, node, None).await;
+                build::send_save_node(&write_tx, node, None, None, ProvenanceKind::Manual).await;
                 build::send_update_parent(&write_tx, vine_slug, &carry.id, &node_id).await;
                 i += 1;
             }
@@ -1736,7 +1762,7 @@ pub async fn build_vine_upper(
                 weight: top_nodes.iter().map(|n| n.weight).sum(),
                 ..Default::default()
             };
-            build::send_save_node(&write_tx, apex_node, None).await;
+            build::send_save_node(&write_tx, apex_node, None, None, ProvenanceKind::Manual).await;
             for n in &top_nodes {
                 build::send_update_parent(&write_tx, vine_slug, &n.id, &forced_id).await;
             }

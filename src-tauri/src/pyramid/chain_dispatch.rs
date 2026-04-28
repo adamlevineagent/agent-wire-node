@@ -414,13 +414,27 @@ pub async fn dispatch_step(
     defaults: &ChainDefaults,
     ctx: &ChainDispatchContext,
 ) -> Result<Value> {
+    let (value, _) =
+        dispatch_step_with_response(step, resolved_input, system_prompt, defaults, ctx).await?;
+    Ok(value)
+}
+
+pub async fn dispatch_step_with_response(
+    step: &ChainStep,
+    resolved_input: &Value,
+    system_prompt: &str,
+    defaults: &ChainDefaults,
+    ctx: &ChainDispatchContext,
+) -> Result<(Value, Option<LlmResponse>)> {
     if step.mechanical {
         let fn_name = step
             .rust_function
             .as_deref()
             .ok_or_else(|| anyhow!("Mechanical step '{}' missing rust_function", step.name))?;
         info!("[CHAIN] step '{}' → mechanical fn '{}'", step.name, fn_name);
-        dispatch_mechanical(fn_name, resolved_input, ctx).await
+        dispatch_mechanical(fn_name, resolved_input, ctx)
+            .await
+            .map(|value| (value, None))
     } else {
         dispatch_llm(step, resolved_input, system_prompt, defaults, ctx).await
     }
@@ -508,7 +522,7 @@ async fn dispatch_llm(
     system_prompt: &str,
     defaults: &ChainDefaults,
     ctx: &ChainDispatchContext,
-) -> Result<Value> {
+) -> Result<(Value, Option<LlmResponse>)> {
     let temperature = resolve_temperature(step, defaults);
 
     // Walker v3 W1b: build the step's DispatchDecision ONCE at the outer
@@ -551,6 +565,12 @@ async fn dispatch_llm(
         user_prompt.len()
     );
 
+    let dispatch_audit_ctx = ctx.audit.as_ref().map(|audit| AuditContext {
+        step_name: step.name.clone(),
+        call_purpose: "chain_dispatch".to_string(),
+        ..audit.clone()
+    });
+
     // If step has a response_schema, use structured outputs for guaranteed JSON
     if let Some(ref schema) = step.response_schema {
         let schema_name = step.name.replace('-', "_");
@@ -558,6 +578,14 @@ async fn dispatch_llm(
             "[CHAIN] step '{}' → using structured output (schema: {})",
             step.name, schema_name
         );
+        let response_format = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_name,
+                "strict": true,
+                "schema": schema
+            }
+        });
         // Phase 12: route through the cache-aware structured variant
         // when the dispatch context carries cache_base. See dispatch_ir_llm
         // for the fix-pass retrofit pattern that mirrors this.
@@ -592,19 +620,21 @@ async fn dispatch_llm(
             }
             c
         });
-        let response = llm::call_model_structured_and_ctx(
+        let response = llm::call_model_unified_with_audit_and_ctx(
             config_ref,
             struct_ctx.as_ref(),
+            dispatch_audit_ctx.as_ref(),
             system_prompt,
             &user_prompt,
             temperature,
             max_tokens,
-            schema,
-            &schema_name,
+            Some(&response_format),
+            llm::LlmCallOptions::default(),
         )
         .await?;
-        match llm::extract_json(&response) {
-            Ok(json) => return Ok(json),
+        let response_content = response.content.clone();
+        match llm::extract_json(&response_content) {
+            Ok(json) => return Ok((json, Some(response))),
             Err(e) => {
                 invalidate_cached_llm_response(
                     struct_ctx.as_ref(),
@@ -624,7 +654,7 @@ async fn dispatch_llm(
                     let heal_user = format!(
                         "Target Schema:\n{}\n\nMalformed Response:\n{}\n\nError:\n{}",
                         serde_json::to_string_pretty(schema).unwrap_or_default(),
-                        response,
+                        response_content,
                         e
                     );
                     // Phase 12: heal path inherits the cache plumbing
@@ -658,17 +688,24 @@ async fn dispatch_llm(
                         }
                         c
                     });
-                    let retry_resp = llm::call_model_and_ctx(
+                    let heal_audit_ctx = dispatch_audit_ctx
+                        .as_ref()
+                        .map(|audit| audit.with_step(&format!("{}_heal", step.name)));
+                    let retry_resp = llm::call_model_unified_with_audit_and_ctx(
                         config_ref,
                         heal_ctx.as_ref(),
+                        heal_audit_ctx.as_ref(),
                         &heal_sys,
                         &heal_user,
                         0.1,
                         max_tokens,
+                        None,
+                        llm::LlmCallOptions::default(),
                     )
                     .await?;
-                    return match llm::extract_json(&retry_resp) {
-                        Ok(json) => Ok(json),
+                    let retry_content = retry_resp.content.clone();
+                    return match llm::extract_json(&retry_content) {
+                        Ok(json) => Ok((json, Some(retry_resp))),
                         Err(he) => {
                             invalidate_cached_llm_response(
                                 heal_ctx.as_ref(),
@@ -736,11 +773,6 @@ async fn dispatch_llm(
     // also benefit from the content-addressable cache. The dispatch
     // ctx already builds a `dispatch_cache_ctx` above for the
     // non-audited path; we reuse it for both branches now.
-    let dispatch_audit_ctx = ctx.audit.as_ref().map(|audit| AuditContext {
-        step_name: step.name.clone(),
-        call_purpose: "chain_dispatch".to_string(),
-        ..audit.clone()
-    });
     let resp = llm::call_model_unified_with_audit_and_ctx(
         config_ref,
         dispatch_cache_ctx.as_ref(),
@@ -753,12 +785,12 @@ async fn dispatch_llm(
         llm::LlmCallOptions::default(),
     )
     .await?;
-    let response = resp.content;
+    let response = resp.content.clone();
 
     match llm::extract_json(&response) {
         Ok(json) => {
             info!("[CHAIN] step '{}' → JSON parsed OK", step.name);
-            Ok(json)
+            Ok((json, Some(resp)))
         }
         Err(_first_err) => {
             invalidate_cached_llm_response(
@@ -807,17 +839,24 @@ async fn dispatch_llm(
                     }
                     c
                 });
-                let retry_resp = llm::call_model_and_ctx(
+                let heal_audit_ctx = dispatch_audit_ctx
+                    .as_ref()
+                    .map(|audit| audit.with_step(&format!("{}_heal_standard", step.name)));
+                let retry_resp = llm::call_model_unified_with_audit_and_ctx(
                     config_ref,
                     heal_ctx.as_ref(),
+                    heal_audit_ctx.as_ref(),
                     &heal_sys,
                     &heal_user,
                     0.1,
                     max_tokens,
+                    None,
+                    llm::LlmCallOptions::default(),
                 )
                 .await?;
-                return match llm::extract_json(&retry_resp) {
-                    Ok(json) => Ok(json),
+                let retry_content = retry_resp.content.clone();
+                return match llm::extract_json(&retry_content) {
+                    Ok(json) => Ok((json, Some(retry_resp))),
                     Err(he) => {
                         invalidate_cached_llm_response(
                             heal_ctx.as_ref(),
@@ -871,18 +910,25 @@ async fn dispatch_llm(
                     }
                     c
                 });
-                let retry_response = llm::call_model_and_ctx(
+                let retry_audit_ctx = dispatch_audit_ctx
+                    .as_ref()
+                    .map(|audit| audit.with_step(&format!("{}_retry_temp01", step.name)));
+                let retry_response = llm::call_model_unified_with_audit_and_ctx(
                     config_ref,
                     retry_ctx.as_ref(),
+                    retry_audit_ctx.as_ref(),
                     system_prompt,
                     &user_prompt,
                     0.1,
                     max_tokens,
+                    None,
+                    llm::LlmCallOptions::default(),
                 )
                 .await?;
+                let retry_content = retry_response.content.clone();
 
-                match llm::extract_json(&retry_response) {
-                    Ok(json) => Ok(json),
+                match llm::extract_json(&retry_content) {
+                    Ok(json) => Ok((json, Some(retry_response))),
                     Err(e) => {
                         invalidate_cached_llm_response(
                             retry_ctx.as_ref(),

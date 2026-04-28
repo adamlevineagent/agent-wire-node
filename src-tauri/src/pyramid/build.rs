@@ -36,6 +36,8 @@ pub enum WriteOp {
     SaveNode {
         node: PyramidNode,
         topics_json: Option<String>,
+        audit_id: Option<i64>,
+        provenance_kind: ProvenanceKind,
     },
     SaveStep {
         slug: String,
@@ -145,9 +147,16 @@ pub(crate) async fn send_save_node(
     writer_tx: &mpsc::Sender<WriteOp>,
     node: PyramidNode,
     topics_json: Option<String>,
+    audit_id: Option<i64>,
+    provenance_kind: ProvenanceKind,
 ) {
     if let Err(e) = writer_tx
-        .send(WriteOp::SaveNode { node, topics_json })
+        .send(WriteOp::SaveNode {
+            node,
+            topics_json,
+            audit_id,
+            provenance_kind,
+        })
         .await
     {
         warn!("Writer channel closed, SaveNode dropped: {e}");

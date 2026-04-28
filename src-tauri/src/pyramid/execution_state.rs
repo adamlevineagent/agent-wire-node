@@ -25,7 +25,7 @@ use tracing::{error, warn};
 use super::chain_executor::ChunkProvider;
 use super::db;
 use super::execution_plan::{AccumulatorConfig, Step, StorageKind};
-use super::types::{BuildProgress, PyramidNode};
+use super::types::{BuildProgress, ProvenanceKind, PyramidNode};
 use crate::utils::safe_slice_end;
 
 // ── IR-specific WriteOp ─────────────────────────────────────────────────────
@@ -38,6 +38,8 @@ pub enum IrWriteOp {
     SaveNode {
         node: PyramidNode,
         topics_json: Option<String>,
+        audit_id: Option<i64>,
+        provenance_kind: ProvenanceKind,
     },
     SaveStep {
         slug: String,
@@ -365,10 +367,21 @@ impl ExecutionState {
     // ── Write drain helpers ─────────────────────────────────────────────
 
     /// Send a SaveNode operation through the write drain.
-    pub async fn send_save_node(&self, node: PyramidNode, topics_json: Option<String>) {
+    pub async fn send_save_node(
+        &self,
+        node: PyramidNode,
+        topics_json: Option<String>,
+        audit_id: Option<i64>,
+        provenance_kind: ProvenanceKind,
+    ) {
         if let Err(e) = self
             .writer_tx
-            .send(IrWriteOp::SaveNode { node, topics_json })
+            .send(IrWriteOp::SaveNode {
+                node,
+                topics_json,
+                audit_id,
+                provenance_kind,
+            })
             .await
         {
             warn!("IR writer channel closed, SaveNode dropped: {e}");
@@ -634,6 +647,8 @@ fn spawn_write_drain_ir(
                     IrWriteOp::SaveNode {
                         ref node,
                         ref topics_json,
+                        audit_id: _,
+                        provenance_kind: _,
                     } => db::save_node(&conn, node, topics_json.as_deref()),
                     IrWriteOp::SaveStep {
                         ref slug,

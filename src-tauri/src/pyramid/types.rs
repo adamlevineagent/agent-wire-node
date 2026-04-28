@@ -65,6 +65,26 @@ impl ContentType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceKind {
+    Llm,
+    Manual,
+    StubLegacy,
+    CrossBuildReuse,
+}
+
+impl ProvenanceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProvenanceKind::Llm => "llm",
+            ProvenanceKind::Manual => "manual",
+            ProvenanceKind::StubLegacy => "stub_legacy",
+            ProvenanceKind::CrossBuildReuse => "cross_build_reuse",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PyramidNode {
     pub id: String,
