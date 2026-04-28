@@ -647,9 +647,9 @@ fn spawn_write_drain_ir(
                     IrWriteOp::SaveNode {
                         ref node,
                         ref topics_json,
-                        audit_id: _,
-                        provenance_kind: _,
-                    } => db::save_node(&conn, node, topics_json.as_deref()),
+                        audit_id,
+                        provenance_kind,
+                    } => db::save_node(&conn, node, topics_json.as_deref(), audit_id, provenance_kind),
                     IrWriteOp::SaveStep {
                         ref slug,
                         ref step_type,

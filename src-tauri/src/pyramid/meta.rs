@@ -426,7 +426,7 @@ async fn save_meta_node(
     };
 
     let conn = writer.lock().await;
-    db::save_node(&conn, &node, None)?;
+    db::save_node(&conn, &node, None, None, ProvenanceKind::Llm)?;
 
     Ok(())
 }

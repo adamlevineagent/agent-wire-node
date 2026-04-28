@@ -53,9 +53,9 @@ fn spawn_write_drain(
                     build::WriteOp::SaveNode {
                         ref node,
                         ref topics_json,
-                        audit_id: _,
-                        provenance_kind: _,
-                    } => db::save_node(&conn, node, topics_json.as_deref()),
+                        audit_id,
+                        provenance_kind,
+                    } => db::save_node(&conn, node, topics_json.as_deref(), audit_id, provenance_kind),
                     build::WriteOp::SaveStep {
                         ref slug,
                         ref step_type,
@@ -491,6 +491,8 @@ pub fn assemble_vine_l0(
             conn,
             &apex_l0_node,
             Some(&serde_json::to_string(&apex.topics)?),
+            None,
+            ProvenanceKind::CrossBuildReuse,
         )?;
         l0_to_bunch.insert(apex_l0_id, bunch.bunch_index);
         global_index += 1;
@@ -536,6 +538,8 @@ pub fn assemble_vine_l0(
                     conn,
                     &pen_l0_node,
                     Some(&serde_json::to_string(&pn.topics)?),
+                    None,
+                    ProvenanceKind::CrossBuildReuse,
                 )?;
                 l0_to_bunch.insert(pen_l0_id, bunch.bunch_index);
                 global_index += 1;
@@ -908,9 +912,9 @@ pub async fn build_bunch(
                 build::WriteOp::SaveNode {
                     ref node,
                     ref topics_json,
-                    audit_id: _,
-                    provenance_kind: _,
-                } => db::save_node(&conn, node, topics_json.as_deref()),
+                    audit_id,
+                    provenance_kind,
+                } => db::save_node(&conn, node, topics_json.as_deref(), audit_id, provenance_kind),
                 build::WriteOp::SaveStep {
                     ref slug,
                     ref step_type,
@@ -3101,6 +3105,8 @@ pub async fn notify_vine_of_bunch_change(
             &conn,
             &apex_l0_node,
             Some(&serde_json::to_string(&apex_node.topics)?),
+            None,
+            ProvenanceKind::CrossBuildReuse,
         )?;
         global_index += 1;
 
@@ -3144,6 +3150,8 @@ pub async fn notify_vine_of_bunch_change(
                     &conn,
                     &pen_l0_node,
                     Some(&serde_json::to_string(&pn.topics)?),
+                    None,
+                    ProvenanceKind::CrossBuildReuse,
                 )?;
                 global_index += 1;
             }

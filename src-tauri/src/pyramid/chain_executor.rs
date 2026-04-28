@@ -2711,9 +2711,9 @@ fn spawn_write_drain(
                     WriteOp::SaveNode {
                         ref node,
                         ref topics_json,
-                        audit_id: _,
-                        provenance_kind: _,
-                    } => db::save_node(&conn, node, topics_json.as_deref()),
+                        audit_id,
+                        provenance_kind,
+                    } => db::save_node(&conn, node, topics_json.as_deref(), audit_id, provenance_kind),
                     WriteOp::SaveStep {
                         ref slug,
                         ref step_type,
@@ -6260,7 +6260,13 @@ async fn execute_evidence_loop(
                         let tx_result = (|| -> anyhow::Result<()> {
                             c.execute_batch("BEGIN IMMEDIATE")?;
                             let inner = (|| -> anyhow::Result<()> {
-                                db::save_node(&c, &durable.node, None)?;
+                                db::save_node(
+                                    &c,
+                                    &durable.node,
+                                    None,
+                                    durable.audit_id,
+                                    durable.provenance_kind,
+                                )?;
                                 for child_id in &durable.node.children {
                                     if child_id.contains('/') {
                                         continue;
@@ -6649,7 +6655,7 @@ async fn execute_evidence_loop(
                 let node = apex_node;
                 tokio::task::spawn_blocking(move || {
                     let c = conn.blocking_lock();
-                    db::save_node(&c, &node, None)?;
+                    db::save_node(&c, &node, None, None, ProvenanceKind::Manual)?;
                     // Update children to point to new apex
                     for child_id in &children_ids {
                         let _ = db::update_parent(&c, &node.slug, child_id, &node.id);
@@ -6758,7 +6764,7 @@ fn commit_gap_resolution(
                     node.build_id = Some(build_id.to_string());
                 }
 
-                db::save_node(conn, &node, None).with_context(|| {
+                db::save_node(conn, &node, None, None, ProvenanceKind::Manual).with_context(|| {
                     format!(
                         "failed to save targeted gap node {} for slug {}",
                         node.id, batch.base_slug
@@ -16424,8 +16430,8 @@ mod tests {
             ..Default::default()
         };
 
-        crate::pyramid::db::save_node(&conn, &l0, None).unwrap();
-        crate::pyramid::db::save_node(&conn, &l1, None).unwrap();
+        crate::pyramid::db::save_node(&conn, &l0, None, None, ProvenanceKind::Manual).unwrap();
+        crate::pyramid::db::save_node(&conn, &l1, None, None, ProvenanceKind::Manual).unwrap();
 
         conn.execute(
             "INSERT INTO pyramid_threads (slug, thread_id, thread_name, current_canonical_id, depth)
@@ -18284,7 +18290,8 @@ mod tests {
         seed_gap(&conn, "gap-id-test");
 
         let existing = test_gap_node("gap-id-test", "L0-T000", "existing targeted");
-        crate::pyramid::db::save_node(&conn, &existing, None).unwrap();
+        crate::pyramid::db::save_node(&conn, &existing, None, None, ProvenanceKind::Manual)
+            .unwrap();
 
         let draft_a = test_gap_node("gap-id-test", "__draft-targeted-000", "draft a");
         let draft_b = test_gap_node("gap-id-test", "__draft-targeted-000", "draft b");

@@ -30,7 +30,7 @@ use super::question_decomposition::render_prompt_template;
 use super::step_context::make_step_ctx_from_llm_config;
 use super::types::{
     AnswerBatchResult, AnsweredNode, CandidateMap, EvidenceLink, EvidenceSet, EvidenceVerdict,
-    FailedQuestion, LayerQuestion, PyramidNode,
+    FailedQuestion, LayerQuestion, ProvenanceKind, PyramidNode,
 };
 use super::OperationalConfig;
 
@@ -799,6 +799,8 @@ async fn answer_single_question(
                 created_at: chrono::Utc::now().to_rfc3339(),
                 ..Default::default()
             },
+            audit_id: None,
+            provenance_kind: ProvenanceKind::StubLegacy,
             evidence: vec![],
             missing: vec![format!(
                 "No candidate evidence was mapped during pre-mapping for question: {}",
@@ -960,6 +962,7 @@ Respond with ONLY a JSON object:
 
     // ── Call LLM per batch ──────────────────────────────────────────────
     let mut batch_results: Vec<RawAnswerResponse> = Vec::new();
+    let mut direct_answer_audit_id: Option<i64> = None;
 
     for (batch_idx, batch) in batches.iter().enumerate() {
         let empty = Vec::new();
@@ -1058,6 +1061,9 @@ Respond with ONLY a JSON object:
             llm::LlmCallOptions::default(),
         )
         .await?;
+        if num_batches == 1 {
+            direct_answer_audit_id = response.audit_id;
+        }
 
         info!(
             question_id = %question.question_id,
@@ -1082,7 +1088,8 @@ Respond with ONLY a JSON object:
     }
 
     // ── Merge batch results ─────────────────────────────────────────────
-    let raw = if batch_results.len() == 1 {
+    let single_batch_answer = batch_results.len() == 1;
+    let raw = if single_batch_answer {
         // Single batch — no merge needed
         batch_results.into_iter().next().unwrap()
     } else {
@@ -1239,6 +1246,12 @@ Respond with ONLY a JSON object:
 
     Ok(AnsweredNode {
         node,
+        audit_id: if single_batch_answer {
+            direct_answer_audit_id
+        } else {
+            None
+        },
+        provenance_kind: ProvenanceKind::Llm,
         evidence,
         missing,
     })
@@ -2064,7 +2077,8 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
             ..Default::default()
         };
-        crate::pyramid::db::save_node(&conn, &canonical, None).unwrap();
+        crate::pyramid::db::save_node(&conn, &canonical, None, None, ProvenanceKind::Manual)
+            .unwrap();
 
         let tmp = tempfile::TempDir::new().unwrap();
         let missing_path = tmp.path().join("missing-source.rs");

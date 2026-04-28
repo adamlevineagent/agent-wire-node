@@ -3943,12 +3943,14 @@ async fn pyramid_build(
                             wire_node_lib::pyramid::build::WriteOp::SaveNode {
                                 ref node,
                                 ref topics_json,
-                                audit_id: _,
-                                provenance_kind: _,
+                                audit_id,
+                                provenance_kind,
                             } => wire_node_lib::pyramid::db::save_node(
                                 &conn,
                                 node,
                                 topics_json.as_deref(),
+                                audit_id,
+                                provenance_kind,
                             ),
                             wire_node_lib::pyramid::build::WriteOp::SaveStep {
                                 ref slug,

@@ -85,6 +85,12 @@ impl ProvenanceKind {
     }
 }
 
+impl Default for ProvenanceKind {
+    fn default() -> Self {
+        ProvenanceKind::Llm
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PyramidNode {
     pub id: String,
@@ -1271,6 +1277,12 @@ pub struct CandidateMap {
 pub struct AnsweredNode {
     /// The pyramid node created from answering the question.
     pub node: PyramidNode,
+    /// Row id in pyramid_llm_audit for the LLM call that produced this node.
+    #[serde(default)]
+    pub audit_id: Option<i64>,
+    /// Provenance marker for placeholder/manual answered-node outputs.
+    #[serde(default)]
+    pub provenance_kind: ProvenanceKind,
     /// Evidence links (KEEP/DISCONNECT verdicts) from the answering step.
     pub evidence: Vec<EvidenceLink>,
     /// Descriptions of missing evidence the LLM wished it had.

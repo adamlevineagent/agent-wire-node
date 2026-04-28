@@ -395,6 +395,7 @@ fn enqueue_vine_manifest_mutations(
 mod tests {
     use super::*;
     use crate::pyramid::db;
+    use crate::pyramid::types::ProvenanceKind;
 
     /// Helper: create an in-memory DB and init schema.
     fn test_db() -> rusqlite::Connection {
@@ -692,8 +693,8 @@ mod tests {
             created_at: String::new(),
             ..Default::default()
         };
-        db::save_node(&conn, &keep_node, None).unwrap();
-        db::save_node(&conn, &disconnect_node, None).unwrap();
+        db::save_node(&conn, &keep_node, None, None, ProvenanceKind::Manual).unwrap();
+        db::save_node(&conn, &disconnect_node, None, None, ProvenanceKind::Manual).unwrap();
 
         // Insert KEEP and DISCONNECT evidence rows that both reference the
         // bedrock apex. Only the KEEP row should trigger an enqueue —
@@ -892,7 +893,7 @@ mod tests {
             created_at: String::new(),
             ..Default::default()
         };
-        db::save_node(&writer, &node, None).unwrap();
+        db::save_node(&writer, &node, None, None, ProvenanceKind::Manual).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

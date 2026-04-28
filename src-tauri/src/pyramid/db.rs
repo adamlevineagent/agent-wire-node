@@ -111,6 +111,8 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             children TEXT,
             parent_id TEXT,
             build_version INTEGER NOT NULL DEFAULT 1,
+            audit_id INTEGER REFERENCES pyramid_llm_audit(id),
+            provenance_kind TEXT NOT NULL DEFAULT 'llm',
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (slug, id)
         );
@@ -1102,6 +1104,22 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         );
         ",
     )?;
+    // Evidence-loop provenance: every node row carries either the audit row
+    // that produced it or an explicit non-LLM provenance marker.
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_nodes ADD COLUMN audit_id INTEGER REFERENCES pyramid_llm_audit(id)",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_nodes ADD COLUMN provenance_kind TEXT NOT NULL DEFAULT 'llm'",
+        [],
+    );
+    let _ = conn.execute(
+        "UPDATE pyramid_nodes
+         SET provenance_kind = 'llm'
+         WHERE provenance_kind IS NULL OR provenance_kind = ''",
+        [],
+    );
 
     // Phase 18b: idempotent migration adding the `cache_hit` distinction to
     // pyramid_llm_audit. Pre-Phase-18b rows default to `0` (treated as
@@ -5609,7 +5627,13 @@ const NODE_SELECT_COLS: &str =
 /// The optional `topics_json` parameter allows passing a pre-serialized topics
 /// string (useful when the build pipeline already has the raw JSON). If None,
 /// topics are serialized from `node.topics`.
-pub fn save_node(conn: &Connection, node: &PyramidNode, topics_json: Option<&str>) -> Result<()> {
+pub fn save_node(
+    conn: &Connection,
+    node: &PyramidNode,
+    topics_json: Option<&str>,
+    audit_id: Option<i64>,
+    provenance_kind: ProvenanceKind,
+) -> Result<()> {
     // WS-SCHEMA-V2 (§15.7 "Unified write path"): if a row already exists for
     // (slug, id), route the write through apply_supersession so the prior
     // content is snapshotted into pyramid_node_versions before the UPDATE.
@@ -5632,6 +5656,7 @@ pub fn save_node(conn: &Connection, node: &PyramidNode, topics_json: Option<&str
         )?;
         if is_provisional {
             mutate_provisional_node(conn, &node.slug, &node.id, node)?;
+            set_node_provenance(conn, &node.slug, &node.id, audit_id, provenance_kind)?;
         } else {
             // WS-IMMUTABILITY-ENFORCE: bedrock L0/L1 nodes (depth <= 1) are
             // permanently immutable once written canonically. Only provisional
@@ -5647,6 +5672,7 @@ pub fn save_node(conn: &Connection, node: &PyramidNode, topics_json: Option<&str
             // reason (delta, collapse, promotion, agent_writeback,
             // stale_refresh) should invoke apply_supersession directly.
             apply_supersession(conn, &node.slug, &node.id, node, "rebuild", "rebuild", "")?;
+            set_node_provenance(conn, &node.slug, &node.id, audit_id, provenance_kind)?;
         }
         return Ok(());
     }
@@ -5680,9 +5706,9 @@ pub fn save_node(conn: &Connection, node: &PyramidNode, topics_json: Option<&str
              terms, dead_ends, self_prompt, source_question_id, children, parent_id, superseded_by, build_id,
              time_range_start, time_range_end, weight, provisional, promoted_from,
              narrative_json, entities_json, key_quotes_json, transitions_json,
-             current_version, current_version_chain_phase)
+             current_version, current_version_chain_phase, audit_id, provenance_kind)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
         rusqlite::params![
             node.id,
             node.slug,
@@ -5712,9 +5738,28 @@ pub fn save_node(conn: &Connection, node: &PyramidNode, topics_json: Option<&str
             transitions_json,
             1_i64,
             node.current_version_chain_phase,
+            audit_id,
+            provenance_kind.as_str(),
         ],
     )?;
 
+    Ok(())
+}
+
+fn set_node_provenance(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+    audit_id: Option<i64>,
+    provenance_kind: ProvenanceKind,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_nodes
+         SET audit_id = ?3,
+             provenance_kind = ?4
+         WHERE slug = ?1 AND id = ?2",
+        rusqlite::params![slug, node_id, audit_id, provenance_kind.as_str()],
+    )?;
     Ok(())
 }
 
@@ -12244,7 +12289,13 @@ pub fn upsert_pinned_nodes(conn: &Connection, slug: &str, nodes: &[PyramidNode])
         // Ensure the node's slug matches the target slug
         let mut pinned_node = node.clone();
         pinned_node.slug = slug.to_string();
-        save_node(conn, &pinned_node, None)?;
+        save_node(
+            conn,
+            &pinned_node,
+            None,
+            None,
+            ProvenanceKind::CrossBuildReuse,
+        )?;
         count += 1;
     }
 
@@ -12652,6 +12703,49 @@ mod tests {
     }
 
     #[test]
+    fn test_save_node_persists_provenance() {
+        let conn = test_conn();
+        create_slug(&conn, "s", &ContentType::Code, "").unwrap();
+        let audit_id = insert_llm_audit_pending(
+            &conn,
+            "s",
+            "build-1",
+            Some("L2-000"),
+            "unit",
+            "unit_test",
+            Some(2),
+            "test-model",
+            "system",
+            "user",
+        )
+        .unwrap();
+        let node = PyramidNode {
+            id: "L2-000".to_string(),
+            slug: "s".to_string(),
+            depth: 2,
+            headline: "LLM node".to_string(),
+            distilled: "body".to_string(),
+            build_id: Some("build-1".to_string()),
+            created_at: "2026-04-28T00:00:00Z".to_string(),
+            ..Default::default()
+        };
+
+        save_node(&conn, &node, None, Some(audit_id), ProvenanceKind::Llm).unwrap();
+
+        let (stored_audit_id, stored_kind): (Option<i64>, String) = conn
+            .query_row(
+                "SELECT audit_id, provenance_kind
+                 FROM pyramid_nodes
+                 WHERE slug = 's' AND id = 'L2-000'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_audit_id, Some(audit_id));
+        assert_eq!(stored_kind, "llm");
+    }
+
+    #[test]
     fn test_slug_crud() {
         let conn = test_conn();
 
@@ -12731,7 +12825,7 @@ mod tests {
             ..Default::default()
         };
 
-        save_node(&conn, &node, None).unwrap();
+        save_node(&conn, &node, None, None, ProvenanceKind::Manual).unwrap();
 
         let got = get_node(&conn, "s", "n1").unwrap().unwrap();
         assert_eq!(got.distilled, "Test distillation");
@@ -12769,7 +12863,7 @@ mod tests {
                 created_at: String::new(),
                 ..Default::default()
             };
-            save_node(&conn, &node, None).unwrap();
+            save_node(&conn, &node, None, None, ProvenanceKind::Manual).unwrap();
         }
 
         let depth0 = get_nodes_at_depth(&conn, "s", 0).unwrap();
@@ -12827,8 +12921,8 @@ mod tests {
             ..Default::default()
         };
 
-        save_node(&conn, &first, None).unwrap();
-        save_node(&conn, &second, None).unwrap();
+        save_node(&conn, &first, None, None, ProvenanceKind::Manual).unwrap();
+        save_node(&conn, &second, None, None, ProvenanceKind::Manual).unwrap();
 
         assert_eq!(
             get_node_id_by_depth_and_chunk_index(&conn, "s", 0, 1).unwrap(),
@@ -12866,7 +12960,7 @@ mod tests {
                 created_at: String::new(),
                 ..Default::default()
             };
-            save_node(&conn, &node, None).unwrap();
+            save_node(&conn, &node, None, None, ProvenanceKind::Manual).unwrap();
         }
 
         let deleted = delete_nodes_above(&conn, "s", 1).unwrap();
@@ -12991,7 +13085,7 @@ mod tests {
                 created_at: String::new(),
                 ..Default::default()
             };
-            save_node(&conn, &node, None).unwrap();
+            save_node(&conn, &node, None, None, ProvenanceKind::Manual).unwrap();
         }
         let apex = PyramidNode {
             id: "apex".to_string(),
@@ -13013,7 +13107,7 @@ mod tests {
             created_at: String::new(),
             ..Default::default()
         };
-        save_node(&conn, &apex, None).unwrap();
+        save_node(&conn, &apex, None, None, ProvenanceKind::Manual).unwrap();
 
         update_slug_stats(&conn, "s").unwrap();
 
@@ -13076,11 +13170,11 @@ mod tests {
             created_at: String::new(),
             ..Default::default()
         };
-        save_node(&conn, &node, None).unwrap();
+        save_node(&conn, &node, None, None, ProvenanceKind::Manual).unwrap();
 
         // Upsert with new content
         node.distilled = "Version 2".to_string();
-        save_node(&conn, &node, None).unwrap();
+        save_node(&conn, &node, None, None, ProvenanceKind::Manual).unwrap();
 
         let got = get_node(&conn, "s", "n1").unwrap().unwrap();
         assert_eq!(got.distilled, "Version 2");
@@ -13118,7 +13212,7 @@ mod tests {
                 created_at: String::new(),
                 ..Default::default()
             };
-            save_node(&conn, &node, None).unwrap();
+            save_node(&conn, &node, None, None, ProvenanceKind::Manual).unwrap();
 
             let thread = PyramidThread {
                 slug: "s".into(),
@@ -13335,6 +13429,8 @@ mod tests {
                 created_at: "2026-04-23T00:00:00Z".to_string(),
                 ..Default::default()
             },
+            audit_id: Some(42),
+            provenance_kind: ProvenanceKind::Llm,
             evidence: vec![EvidenceLink {
                 slug: "qslug".to_string(),
                 source_node_id: "Q-L0-000".to_string(),
@@ -13434,7 +13530,7 @@ mod tests {
             current_version: 1,
             ..Default::default()
         };
-        save_node(&conn, &node, None).unwrap();
+        save_node(&conn, &node, None, None, ProvenanceKind::Manual).unwrap();
 
         // Round-trip read: every new field survives INSERT + SELECT.
         let loaded = get_node(&conn, "vt", "n-1").unwrap().unwrap();
@@ -13458,7 +13554,7 @@ mod tests {
         node.headline = "second".to_string();
         node.distilled = "second version".to_string();
         node.narrative.levels[0].text = "zoom-0 revised".to_string();
-        save_node(&conn, &node, None).unwrap();
+        save_node(&conn, &node, None, None, ProvenanceKind::Manual).unwrap();
 
         // Live row is the new content, current_version bumped.
         let live = get_node(&conn, "vt", "n-1").unwrap().unwrap();
@@ -13541,12 +13637,12 @@ mod tests {
             ..Default::default()
         };
         // First write succeeds (INSERT path).
-        save_node(&conn, &node, None).unwrap();
+        save_node(&conn, &node, None, None, ProvenanceKind::Manual).unwrap();
 
         // Second write should fail — canonical L0 is immutable.
         let mut updated = node.clone();
         updated.distilled = "mutated".to_string();
-        let err = save_node(&conn, &updated, None);
+        let err = save_node(&conn, &updated, None, None, ProvenanceKind::Manual);
         assert!(
             err.is_err(),
             "Expected immutability error for canonical L0 update"
@@ -13578,7 +13674,7 @@ mod tests {
             provisional: true,
             ..Default::default()
         };
-        save_node(&conn, &node, None).unwrap();
+        save_node(&conn, &node, None, None, ProvenanceKind::Manual).unwrap();
 
         // Update via mutate_provisional_node should succeed.
         let mut updated = node.clone();
@@ -13592,7 +13688,7 @@ mod tests {
         // Update via save_node should also succeed (routes through mutate_provisional_node).
         let mut updated2 = node.clone();
         updated2.distilled = "mutated again".to_string();
-        save_node(&conn, &updated2, None).unwrap();
+        save_node(&conn, &updated2, None, None, ProvenanceKind::Manual).unwrap();
 
         let got2 = get_node(&conn, "s", "prov-l0").unwrap().unwrap();
         assert_eq!(got2.distilled, "mutated again");
@@ -13614,7 +13710,7 @@ mod tests {
             provisional: true,
             ..Default::default()
         };
-        save_node(&conn, &node, None).unwrap();
+        save_node(&conn, &node, None, None, ProvenanceKind::Manual).unwrap();
 
         // Promote: provisional -> canonical.
         let promoted = promote_provisional_node(&conn, "s", "prom-l0").unwrap();
@@ -13628,7 +13724,7 @@ mod tests {
         let mut updated = node.clone();
         updated.distilled = "mutated after promotion".to_string();
         updated.provisional = false; // reflect the promoted state
-        let err = save_node(&conn, &updated, None);
+        let err = save_node(&conn, &updated, None, None, ProvenanceKind::Manual);
         assert!(err.is_err(), "Expected immutability error after promotion");
         let msg = err.unwrap_err().to_string();
         assert!(
@@ -13658,7 +13754,7 @@ mod tests {
             distilled: "original L2".to_string(),
             ..Default::default()
         };
-        save_node(&conn, &node, None).unwrap();
+        save_node(&conn, &node, None, None, ProvenanceKind::Manual).unwrap();
 
         // Update via apply_supersession — L2 is mutable.
         let mut updated = node.clone();
@@ -13681,7 +13777,7 @@ mod tests {
         // Also test via save_node (routes through apply_supersession for non-provisional).
         let mut updated2 = node.clone();
         updated2.distilled = "superseded L2 again".to_string();
-        save_node(&conn, &updated2, None).unwrap();
+        save_node(&conn, &updated2, None, None, ProvenanceKind::Manual).unwrap();
 
         let got2 = get_node(&conn, "s", "l2-node").unwrap().unwrap();
         assert_eq!(got2.distilled, "superseded L2 again");
@@ -13703,7 +13799,7 @@ mod tests {
             provisional: false,
             ..Default::default()
         };
-        save_node(&conn, &node, None).unwrap();
+        save_node(&conn, &node, None, None, ProvenanceKind::Manual).unwrap();
 
         // Attempt promotion on a non-provisional node.
         let result = promote_provisional_node(&conn, "s", "canon-l0").unwrap();
@@ -13771,7 +13867,7 @@ mod tests {
             provisional: true,
             ..Default::default()
         };
-        save_node(&conn, &node1, None).unwrap();
+        save_node(&conn, &node1, None, None, ProvenanceKind::Manual).unwrap();
         add_provisional_node_to_session(&conn, sid, "prov-a").unwrap();
 
         let node2 = PyramidNode {
@@ -13783,7 +13879,7 @@ mod tests {
             provisional: true,
             ..Default::default()
         };
-        save_node(&conn, &node2, None).unwrap();
+        save_node(&conn, &node2, None, None, ProvenanceKind::Manual).unwrap();
         add_provisional_node_to_session(&conn, sid, "prov-b").unwrap();
 
         // Verify nodes are provisional
@@ -13836,13 +13932,13 @@ mod tests {
             provisional: true,
             ..Default::default()
         };
-        save_node(&conn, &node, None).unwrap();
+        save_node(&conn, &node, None, None, ProvenanceKind::Manual).unwrap();
         add_provisional_node_to_session(&conn, sid, "prom-mut").unwrap();
 
         // While provisional: mutation should work (via mutate_provisional_node)
         let mut updated = node.clone();
         updated.distilled = "mutated while provisional".to_string();
-        save_node(&conn, &updated, None).unwrap();
+        save_node(&conn, &updated, None, None, ProvenanceKind::Manual).unwrap();
         let got = get_node(&conn, "ps3", "prom-mut").unwrap().unwrap();
         assert_eq!(got.distilled, "mutated while provisional");
 
@@ -13853,7 +13949,7 @@ mod tests {
         let mut post_promote = node.clone();
         post_promote.distilled = "should fail".to_string();
         post_promote.provisional = false;
-        let err = save_node(&conn, &post_promote, None);
+        let err = save_node(&conn, &post_promote, None, None, ProvenanceKind::Manual);
         assert!(
             err.is_err(),
             "Mutation of promoted L0 should fail with immutability error"
@@ -13884,7 +13980,7 @@ mod tests {
             provisional: true,
             ..Default::default()
         };
-        save_node(&conn, &node, None).unwrap();
+        save_node(&conn, &node, None, None, ProvenanceKind::Manual).unwrap();
         add_provisional_node_to_session(&conn, sid, "prov-idem").unwrap();
 
         // First promotion
@@ -14757,7 +14853,7 @@ pub fn save_provisional_node(
     }
 
     // Save via the standard path (which will INSERT since it's new, with provisional=1)
-    save_node(conn, node, None)?;
+    save_node(conn, node, None, None, ProvenanceKind::Manual)?;
 
     // Track in the session
     add_provisional_node_to_session(conn, session_id, &node.id)?;

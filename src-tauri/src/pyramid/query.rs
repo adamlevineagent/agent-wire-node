@@ -1167,8 +1167,8 @@ mod tests {
 
         let node_a = test_node("s", "L1-000", 1, "Alpha Thread");
         let node_b = test_node("s", "L1-001", 1, "Beta Thread");
-        db::save_node(&conn, &node_a, None).unwrap();
-        db::save_node(&conn, &node_b, None).unwrap();
+        db::save_node(&conn, &node_a, None, None, ProvenanceKind::Manual).unwrap();
+        db::save_node(&conn, &node_b, None, None, ProvenanceKind::Manual).unwrap();
         db::save_thread(&conn, &test_thread("s", "L1-000", "Alpha Thread", 1)).unwrap();
         db::save_thread(&conn, &test_thread("s", "L1-001", "Beta Thread", 1)).unwrap();
         db::save_web_edge(
@@ -1209,9 +1209,9 @@ mod tests {
         };
         let child = test_node("s", "L0-000", 0, "Leaf");
         let sibling = test_node("s", "L1-001", 1, "Sibling");
-        db::save_node(&conn, &parent, None).unwrap();
-        db::save_node(&conn, &child, None).unwrap();
-        db::save_node(&conn, &sibling, None).unwrap();
+        db::save_node(&conn, &parent, None, None, ProvenanceKind::Manual).unwrap();
+        db::save_node(&conn, &child, None, None, ProvenanceKind::Manual).unwrap();
+        db::save_node(&conn, &sibling, None, None, ProvenanceKind::Manual).unwrap();
         db::save_thread(&conn, &test_thread("s", "L1-000", "Parent", 1)).unwrap();
         db::save_thread(&conn, &test_thread("s", "L1-001", "Sibling", 1)).unwrap();
         db::save_web_edge(

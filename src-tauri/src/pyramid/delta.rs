@@ -887,7 +887,7 @@ Output valid JSON matching this schema:
         let tx = conn.unchecked_transaction()?;
 
         // 7. Save new node
-        db::save_node(&tx, &new_node, None)?;
+        db::save_node(&tx, &new_node, None, None, ProvenanceKind::Llm)?;
 
         // 8. Mark old canonical as superseded
         tx.execute(
