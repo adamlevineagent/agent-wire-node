@@ -145,6 +145,50 @@ async fn persist_pre_map_candidate_links(
     .map_err(|e| anyhow!("pre-map candidate-link save panicked: {e}"))?
 }
 
+async fn load_durable_candidate_map_for_layer(
+    audit_ctx: Option<&AuditContext>,
+    llm_config: &LlmConfig,
+    fallback_slug: &str,
+    fallback_build_id: &str,
+    layer: i64,
+) -> Result<Option<CandidateMap>> {
+    if let Some(audit_ctx) = audit_ctx {
+        let conn = Arc::clone(&audit_ctx.conn);
+        let slug = audit_ctx.slug.clone();
+        let build_id = audit_ctx.build_id.clone();
+        let mappings = tokio::task::spawn_blocking(move || {
+            let c = conn.blocking_lock();
+            db::load_candidate_link_map_for_layer(&c, &slug, &build_id, layer)
+        })
+        .await
+        .map_err(|e| anyhow!("candidate-link DB load panicked: {e}"))??;
+        return Ok(Some(CandidateMap { mappings }));
+    }
+
+    if let Some(ca) = llm_config.cache_access.as_ref() {
+        let db_path = ca.db_path.to_string();
+        let slug = if ca.slug.is_empty() {
+            fallback_slug.to_string()
+        } else {
+            ca.slug.clone()
+        };
+        let build_id = if ca.build_id.is_empty() {
+            fallback_build_id.to_string()
+        } else {
+            ca.build_id.clone()
+        };
+        let mappings = tokio::task::spawn_blocking(move || {
+            let conn = db::open_pyramid_connection(std::path::Path::new(&db_path))?;
+            db::load_candidate_link_map_for_layer(&conn, &slug, &build_id, layer)
+        })
+        .await
+        .map_err(|e| anyhow!("candidate-link DB load panicked: {e}"))??;
+        return Ok(Some(CandidateMap { mappings }));
+    }
+
+    Ok(None)
+}
+
 /// Check if an L0 node ID is a targeted re-examination.
 /// Canonical L0 nodes use patterns like C-L0-001, D-L0-042, or short sequential IDs.
 /// Targeted evidence nodes historically used L0-{uuid}; current gap filling
@@ -627,6 +671,7 @@ pub async fn answer_questions(
         .cache_access
         .as_ref()
         .map(|ca| ca.build_id.clone())
+        .or_else(|| audit.map(|ctx| ctx.build_id.clone()))
         .unwrap_or_else(|| format!("{}-evidence", slug));
     let step_name_for_events = "answer_questions".to_string();
 
@@ -727,6 +772,28 @@ pub async fn answer_questions(
     // bucket. `questions` shadows the original slice with a
     // `Vec<LayerQuestion>`.
     let questions: &[LayerQuestion] = &triaged_questions;
+    let answer_layer = questions.first().map(|q| q.layer).unwrap_or_default();
+    let durable_candidate_map = load_durable_candidate_map_for_layer(
+        audit,
+        llm_config,
+        slug,
+        &build_id_for_events,
+        answer_layer,
+    )
+    .await?;
+    let candidate_map = if let Some(map) = durable_candidate_map.as_ref() {
+        let durable_links: usize = map.mappings.values().map(|candidates| candidates.len()).sum();
+        info!(
+            slug,
+            build_id = %build_id_for_events,
+            layer = answer_layer,
+            candidate_links = durable_links,
+            "answer_questions consuming durable candidate links from DB"
+        );
+        map
+    } else {
+        candidate_map
+    };
 
     // Phase 13: emit EvidenceProcessing { action: "answer" } at the
     // start of the parallel answering loop. `question_count` is the
@@ -775,7 +842,10 @@ pub async fn answer_questions(
             let candidate_nodes: Vec<PyramidNode> = candidate_ids
                 .iter()
                 .filter_map(|id| {
-                    node_map.get(id.as_str()).map(|n| {
+                    let lookup_id = db::parse_handle_path(id)
+                        .map(|(_slug, _depth, node_id)| node_id)
+                        .unwrap_or(id.as_str());
+                    node_map.get(lookup_id).map(|n| {
                         let mut node = (*n).clone();
                         // If candidate comes from a different slug, rewrite its ID to handle-path
                         if node.slug != answer_slug_owned {
@@ -2368,6 +2438,59 @@ mod tests {
         assert!(
             ctx.dispatch_decision.is_some(),
             "evidence pre-map should not require legacy pyramid_tier_routing"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_candidate_map_loads_from_db_for_restart() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open db");
+        db::init_pyramid_db(&conn).expect("init db");
+        let durable = HashMap::from([
+            (
+                "Q-L1-000".to_string(),
+                vec!["L0-002".to_string(), "L0-001".to_string()],
+            ),
+            ("Q-L1-001".to_string(), vec!["L0-003".to_string()]),
+        ]);
+        db::save_candidate_link_batch(
+            &conn,
+            "qslug",
+            "build-1",
+            1,
+            0,
+            "pre_map",
+            None,
+            &durable,
+        )
+        .expect("save durable candidate links");
+
+        let audit = AuditContext {
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            slug: "qslug".to_string(),
+            build_id: "build-1".to_string(),
+            node_id: None,
+            step_name: "answer_questions".to_string(),
+            call_purpose: "answer".to_string(),
+            depth: Some(1),
+        };
+        let loaded = load_durable_candidate_map_for_layer(
+            Some(&audit),
+            &LlmConfig::default(),
+            "fallback-slug",
+            "fallback-build",
+            1,
+        )
+        .await
+        .expect("load durable candidate map")
+        .expect("audit context should activate DB consumer");
+
+        assert_eq!(
+            loaded.mappings.get("Q-L1-000").cloned().unwrap_or_default(),
+            vec!["L0-001".to_string(), "L0-002".to_string()]
+        );
+        assert_eq!(
+            loaded.mappings.get("Q-L1-001").cloned().unwrap_or_default(),
+            vec!["L0-003".to_string()]
         );
     }
 

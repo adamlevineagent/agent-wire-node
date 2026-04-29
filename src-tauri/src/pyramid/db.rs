@@ -10292,6 +10292,49 @@ pub fn save_candidate_link_batch(
     Ok(saved)
 }
 
+/// Load the durable candidate map for one answer layer. This is the restart
+/// boundary for W1.3: answer steps consume these rows instead of trusting the
+/// caller's in-memory CandidateMap.
+pub fn load_candidate_link_map_for_layer(
+    conn: &Connection,
+    slug: &str,
+    build_id: &str,
+    layer: i64,
+) -> Result<HashMap<String, Vec<String>>> {
+    let mut stmt = conn.prepare(
+        "SELECT question_id, candidate_node_id
+         FROM pyramid_candidate_links
+         WHERE slug = ?1
+           AND build_id = ?2
+           AND layer = ?3
+         ORDER BY question_id ASC, batch_idx ASC, id ASC",
+    )?;
+
+    let rows = stmt.query_map(rusqlite::params![slug, build_id, layer], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    let mut mappings: HashMap<String, Vec<String>> = HashMap::new();
+    for row in rows {
+        let (question_id, candidate_node_id) = row?;
+        let trimmed = candidate_node_id.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        mappings
+            .entry(question_id)
+            .or_default()
+            .push(trimmed.to_string());
+    }
+
+    for candidates in mappings.values_mut() {
+        candidates.sort();
+        candidates.dedup();
+    }
+
+    Ok(mappings)
+}
+
 /// Persist answered-node material before draining it into canonical graph
 /// tables. This makes expensive LLM answer work durable even if the later
 /// `pyramid_nodes` / evidence / gap transaction is delayed or fails.
@@ -13023,6 +13066,74 @@ mod tests {
             .unwrap();
         assert_eq!(batch_idx, 1);
         assert_eq!(audit_id, audit_id_2);
+    }
+
+    #[test]
+    fn test_candidate_link_map_for_layer_is_deterministic_and_scoped() {
+        let conn = test_conn();
+        create_slug(&conn, "qslug", &ContentType::Question, "").unwrap();
+
+        let batch_0 = std::collections::HashMap::from([
+            (
+                "Q-L1-000".to_string(),
+                vec![
+                    "L0-002".to_string(),
+                    "L0-001".to_string(),
+                    "L0-001".to_string(),
+                ],
+            ),
+            ("Q-L1-001".to_string(), Vec::new()),
+        ]);
+        save_candidate_link_batch(&conn, "qslug", "build-1", 1, 0, "pre_map", None, &batch_0)
+            .unwrap();
+
+        let duplicate_source =
+            std::collections::HashMap::from([("Q-L1-000".to_string(), vec!["L0-002".to_string()])]);
+        save_candidate_link_batch(
+            &conn,
+            "qslug",
+            "build-1",
+            1,
+            1,
+            "broadened_pre_map",
+            None,
+            &duplicate_source,
+        )
+        .unwrap();
+        save_candidate_link_batch(
+            &conn,
+            "qslug",
+            "other-build",
+            1,
+            0,
+            "pre_map",
+            None,
+            &duplicate_source,
+        )
+        .unwrap();
+        save_candidate_link_batch(
+            &conn,
+            "qslug",
+            "build-1",
+            2,
+            0,
+            "pre_map",
+            None,
+            &duplicate_source,
+        )
+        .unwrap();
+
+        let loaded =
+            load_candidate_link_map_for_layer(&conn, "qslug", "build-1", 1).unwrap();
+        assert_eq!(
+            loaded.get("Q-L1-000").cloned().unwrap_or_default(),
+            vec!["L0-001".to_string(), "L0-002".to_string()]
+        );
+        assert!(!loaded.contains_key("Q-L1-001"));
+        assert_eq!(
+            loaded,
+            load_candidate_link_map_for_layer(&conn, "qslug", "build-1", 1).unwrap()
+        );
     }
 
     #[test]
