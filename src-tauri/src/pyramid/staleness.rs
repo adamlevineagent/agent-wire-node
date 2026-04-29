@@ -340,15 +340,44 @@ pub fn process_staleness_queue(
 /// Normalize a file path for consistent lookup: strip trailing slashes and
 /// resolve `.` / `..` components without touching the filesystem.
 fn normalize_file_path(path: &str) -> String {
-    use std::path::PathBuf;
-    let p = PathBuf::from(path);
+    use std::{
+        ffi::{OsStr, OsString},
+        path::{Component, Path, PathBuf},
+    };
 
-    // PathBuf already handles trailing slash normalization on construction,
-    // but we also want to collapse `.` and `..` segments lexically.
-    // `components()` gives us normalized segments.
-    let normalized: PathBuf = p.components().collect();
+    let p = Path::new(path);
+    let mut has_root = false;
+    let mut prefix: Option<OsString> = None;
+    let mut parts: Vec<OsString> = Vec::new();
 
-    // Convert back to string; fall back to original if OsStr conversion fails
+    for component in p.components() {
+        match component {
+            Component::Prefix(value) => prefix = Some(value.as_os_str().to_os_string()),
+            Component::RootDir => has_root = true,
+            Component::CurDir => {}
+            Component::ParentDir => match parts.last() {
+                Some(last) if last.as_os_str() != OsStr::new("..") => {
+                    parts.pop();
+                }
+                _ if !has_root => parts.push(OsString::from("..")),
+                _ => {}
+            },
+            Component::Normal(part) => parts.push(part.to_os_string()),
+        }
+    }
+
+    let mut normalized = PathBuf::new();
+    if let Some(prefix) = prefix {
+        normalized.push(prefix);
+    }
+    if has_root {
+        normalized.push(std::path::MAIN_SEPARATOR.to_string());
+    }
+    for part in parts {
+        normalized.push(part);
+    }
+
+    // Convert back to string; fall back to original if OsStr conversion fails.
     normalized.to_str().unwrap_or(path).to_string()
 }
 
@@ -846,13 +875,52 @@ mod tests {
                 last_ingested_at TEXT NOT NULL DEFAULT (datetime('now')),
                 PRIMARY KEY (slug, file_path)
             );
+            CREATE TABLE IF NOT EXISTS pyramid_nodes (
+                id TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                depth INTEGER NOT NULL,
+                chunk_index INTEGER,
+                headline TEXT NOT NULL DEFAULT '',
+                distilled TEXT NOT NULL DEFAULT '',
+                topics TEXT NOT NULL DEFAULT '[]',
+                corrections TEXT NOT NULL DEFAULT '[]',
+                decisions TEXT NOT NULL DEFAULT '[]',
+                terms TEXT NOT NULL DEFAULT '[]',
+                dead_ends TEXT NOT NULL DEFAULT '[]',
+                self_prompt TEXT NOT NULL DEFAULT '',
+                source_question_id TEXT,
+                children TEXT NOT NULL DEFAULT '[]',
+                parent_id TEXT,
+                build_version INTEGER NOT NULL DEFAULT 1,
+                superseded_by TEXT DEFAULT NULL,
+                build_id TEXT DEFAULT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                time_range_start TEXT,
+                time_range_end TEXT,
+                weight REAL,
+                provisional INTEGER NOT NULL DEFAULT 0,
+                promoted_from TEXT,
+                narrative_json TEXT,
+                entities_json TEXT,
+                key_quotes_json TEXT,
+                transitions_json TEXT,
+                current_version INTEGER NOT NULL DEFAULT 1,
+                current_version_chain_phase TEXT,
+                PRIMARY KEY (slug, id)
+            );
+            CREATE VIEW IF NOT EXISTS live_pyramid_nodes AS
+                SELECT * FROM pyramid_nodes
+                WHERE build_version > 0 AND superseded_by IS NULL;
             CREATE TABLE IF NOT EXISTS pyramid_evidence (
                 slug TEXT NOT NULL,
+                build_id TEXT NOT NULL DEFAULT '',
                 source_node_id TEXT NOT NULL,
                 target_node_id TEXT NOT NULL,
                 verdict TEXT NOT NULL,
                 weight REAL,
-                reason TEXT
+                reason TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (slug, build_id, source_node_id, target_node_id)
             );
             CREATE TABLE IF NOT EXISTS pyramid_source_deltas (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -870,7 +938,8 @@ mod tests {
                 reason TEXT NOT NULL,
                 channel TEXT NOT NULL,
                 priority REAL NOT NULL DEFAULT 0.0,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(slug, question_id)
             );
             ",
         )
